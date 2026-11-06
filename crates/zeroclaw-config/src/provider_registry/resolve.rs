@@ -280,22 +280,37 @@ impl ResolvedChat<'_> {
         self.selection.model.upstream_model()
     }
 
+    /// Resolve explicit API/preset/model options over provider defaults.
+    #[must_use]
+    pub fn text_extraction(&self) -> super::TextExtraction {
+        let defaults = super::TextExtraction::for_provider(
+            self.selection.connection.kind(),
+            self.wire_api,
+            self.options.native_tools,
+        );
+        super::TextExtraction {
+            reasoning: self
+                .options
+                .extract_text_reasoning
+                .unwrap_or(defaults.reasoning),
+            tool_calls: self
+                .options
+                .extract_text_tool_calls
+                .unwrap_or(defaults.tool_calls),
+        }
+    }
+
     /// Whether textual `<think>` blocks are extracted from the response.
-    /// Text extraction remains enabled by default for backward compatibility.
     #[must_use]
     pub fn extract_text_reasoning(&self) -> bool {
-        self.options
-            .extract_text_reasoning
-            .unwrap_or(super::TextExtraction::default().reasoning)
+        self.text_extraction().reasoning
     }
 
     /// Whether textual XML/JSON tool-call envelopes are extracted from the
     /// response. Native tool calls are unaffected by this setting.
     #[must_use]
     pub fn extract_text_tool_calls(&self) -> bool {
-        self.options
-            .extract_text_tool_calls
-            .unwrap_or(super::TextExtraction::default().tool_calls)
+        self.text_extraction().tool_calls
     }
 }
 

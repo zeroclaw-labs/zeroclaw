@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::Override;
-use crate::schema::{CacheTtl, ToolResultImagePolicy};
+use crate::schema::{CacheTtl, ToolResultImagePolicy, WireApi};
 
 macro_rules! options_patch {
     ($name:ident { $($field:ident: $type:ty),* $(,)? }) => {
@@ -53,17 +53,51 @@ options_patch!(ChatOptionsPatch {
 
 /// Effective model-owned textual extraction policy. Missing options inherit;
 /// explicit values are ordinary booleans and never accept the `"null"` sentinel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TextExtraction {
     pub reasoning: bool,
     pub tool_calls: bool,
 }
 
-impl Default for TextExtraction {
-    fn default() -> Self {
+impl TextExtraction {
+    /// Provider-specific baselines for the two model options. This is the
+    /// sole declaration of these defaults, shared by canonical and legacy
+    /// selections; it does not describe the upstream's native capabilities.
+    pub(crate) fn for_provider(
+        kind: &str,
+        wire_api: Option<WireApi>,
+        native_tools: Option<bool>,
+    ) -> Self {
+        // MiniMax's unsplit reasoning and Groq's raw reasoning format put
+        // <think> blocks in content. Other providers must
+        // opt in when a particular model/server emits inline reasoning.
+        let reasoning = matches!(kind, "minimax" | "groq");
+        // These adapters currently use prompt-guided tool calls by default.
+        // Several upstreams also support native tools; enabling that mode
+        // removes the need to infer calls from arbitrary response text.
+        let native_tool_mode = match kind {
+            "groq" => native_tools == Some(true),
+            "venice" | "atomic_chat" => {
+                native_tools == Some(true) || wire_api == Some(WireApi::Responses)
+            }
+            _ => false,
+        };
+        let tool_calls = !native_tool_mode
+            && matches!(
+                kind,
+                "ollama"
+                    | "hailo_ollama"
+                    | "gemini"
+                    | "gemini_cli"
+                    | "grok_cli"
+                    | "kilocli"
+                    | "groq"
+                    | "venice"
+                    | "atomic_chat"
+            );
         Self {
-            reasoning: true,
-            tool_calls: true,
+            reasoning,
+            tool_calls,
         }
     }
 }
@@ -141,6 +175,162 @@ mod tests {
         for field in ["extract_text_reasoning", "extract_text_tool_calls"] {
             assert!(toml::from_str::<ChatOptionsPatch>(&format!("{field} = \"null\"")).is_err());
         }
+    }
+
+    #[test]
+    fn text_extraction_is_opt_in_outside_documented_or_prompt_guided_defaults() {
+        assert_eq!(
+            TextExtraction::default(),
+            TextExtraction {
+                reasoning: false,
+                tool_calls: false
+            }
+        );
+        for (kind, reasoning, tool_calls) in [
+            ("openai", false, false),
+            ("anthropic", false, false),
+            ("deepseek", false, false),
+            ("qwen", false, false),
+            ("vllm", false, false),
+            ("openai-compatible", false, false),
+            ("minimax", true, false),
+            ("groq", true, true),
+            ("ollama", false, true),
+            ("hailo_ollama", false, true),
+            ("gemini", false, true),
+            ("gemini_cli", false, true),
+            ("grok_cli", false, true),
+            ("kilocli", false, true),
+            ("venice", false, true),
+            ("atomic_chat", false, true),
+            ("custom", false, false),
+        ] {
+            let registry: crate::provider_registry::ProviderRegistry = toml::from_str(&format!(
+                r#"
+[connections."provider.prod"]
+kind = "{kind}"
+[models."chat.main"]
+capability = "chat"
+provider = "provider.prod"
+model = "test-model"
+"#
+            ))
+            .unwrap();
+            assert_eq!(
+                registry
+                    .resolve_chat(&"chat.main".into())
+                    .unwrap()
+                    .text_extraction(),
+                TextExtraction {
+                    reasoning,
+                    tool_calls
+                },
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_wire_modes_disable_only_the_implicit_tool_extraction_default() {
+        let registry: crate::provider_registry::ProviderRegistry = toml::from_str(
+            r#"
+[connections."gateway.prod"]
+kind = "custom"
+uri = "https://example.test/v1"
+[connections."gateway.prod".api.chat]
+
+[models."chat.default"]
+capability = "chat"
+provider = "gateway.prod"
+model = "shared-model"
+
+[models."chat.native"]
+capability = "chat"
+provider = "gateway.prod"
+model = "shared-model"
+options = { native_tools = true }
+
+[models."chat.responses"]
+capability = "chat"
+provider = "gateway.prod"
+model = "shared-model"
+api = { wire_api = "responses" }
+
+[models."chat.explicit"]
+capability = "chat"
+provider = "gateway.prod"
+model = "shared-model"
+api = { wire_api = "responses" }
+options = { extract_text_tool_calls = true }
+"#,
+        )
+        .unwrap();
+        for (name, tool_calls) in [
+            ("chat.default", false),
+            ("chat.native", false),
+            ("chat.responses", false),
+            ("chat.explicit", true),
+        ] {
+            assert_eq!(
+                registry
+                    .resolve_chat(&name.into())
+                    .unwrap()
+                    .text_extraction(),
+                TextExtraction {
+                    reasoning: false,
+                    tool_calls
+                },
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_extraction_defaults_use_the_selected_driver_and_model_options() {
+        let mut config = crate::schema::Config::default();
+        let provider = config
+            .providers
+            .models
+            .ensure("openai", "proxy.prod")
+            .unwrap();
+        provider.kind = Some("groq".to_owned());
+        assert_eq!(
+            config.model_text_extraction("openai.proxy.prod"),
+            TextExtraction {
+                reasoning: true,
+                tool_calls: true
+            }
+        );
+        let provider = config
+            .providers
+            .models
+            .ensure("openai", "proxy.prod")
+            .unwrap();
+        provider.models.insert(
+            "native.model".to_owned(),
+            crate::schema::ModelEntryConfig {
+                native_tools: Some(true),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            config.model_text_extraction("openai.proxy.prod"),
+            TextExtraction {
+                reasoning: true,
+                tool_calls: false
+            }
+        );
+        assert_eq!(
+            config.model_text_extraction("openai.proxy.prod.native.model"),
+            TextExtraction {
+                reasoning: true,
+                tool_calls: false
+            }
+        );
+        assert_eq!(
+            config.model_text_extraction("not-configured"),
+            TextExtraction::default()
+        );
     }
 
     #[test]

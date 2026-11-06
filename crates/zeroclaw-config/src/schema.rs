@@ -4849,8 +4849,8 @@ impl Config {
     }
 
     /// Resolve model-owned text extraction after API/preset/model overlays.
-    /// Legacy selections keep both extractors enabled. Exact keys containing
-    /// dots are resolved by the registry without splitting them.
+    /// Canonical and legacy selections share the same provider defaults.
+    /// Exact keys containing dots are resolved without splitting them.
     #[must_use]
     pub fn model_text_extraction(
         &self,
@@ -4862,12 +4862,24 @@ impl Config {
                 registry
                     .resolve_chat(&crate::provider_registry::ModelRef::from(model_ref))
                     .ok()
-                    .map(|chat| crate::provider_registry::TextExtraction {
-                        reasoning: chat.extract_text_reasoning(),
-                        tool_calls: chat.extract_text_tool_calls(),
-                    })
+                    .map(|chat| chat.text_extraction())
             })
-            .unwrap_or_default()
+            .or_else(|| {
+                self.resolve_model_selection(model_ref).map(|selection| {
+                    let native_tools = selection
+                        .model_entry
+                        .and_then(|model| model.native_tools)
+                        .or(selection.entry.native_tools);
+                    crate::provider_registry::TextExtraction::for_provider(
+                        selection.entry.kind.as_deref().unwrap_or(selection.family),
+                        selection.entry.wire_api,
+                        native_tools,
+                    )
+                })
+            })
+            .unwrap_or_else(|| {
+                crate::provider_registry::TextExtraction::for_provider(model_ref, None, None)
+            })
     }
 
     /// Resolve a model's configured temperature from the canonical registry,

@@ -130,8 +130,23 @@ Family-specific entries add their own typed fields on top of these shared fields
 
 The chat `options` object accepts two ordinary boolean extraction switches:
 
-- `extract_text_reasoning`: remove `<think>...</think>` blocks from textual content. Defaults to `true`; native reasoning fields are unaffected.
-- `extract_text_tool_calls`: recognize XML/JSON tool-call envelopes in textual content. Defaults to `true`; native structured tool calls are unaffected.
+- `extract_text_reasoning`: remove `<think>...</think>` blocks from textual content. Defaults to `false`, except for the `minimax` and `groq` connection kinds, whose documented output formats can carry inline reasoning. Native reasoning fields are unaffected.
+- `extract_text_tool_calls`: recognize XML/JSON tool-call envelopes in textual content. Defaults to `false`, with the adapter-specific defaults below. Native structured tool calls are unaffected.
+
+| Connection kind | Reasoning extraction | Text tool-call extraction |
+| --- | --- | --- |
+| `minimax` | `true` | `false` |
+| `groq` | `true` | `true` |
+| `ollama`, `hailo_ollama`, `gemini`, `gemini_cli`, `grok_cli`, `kilocli`, `venice`, `atomic_chat` | `false` | `true` |
+| All other kinds, including `openai`, `openai-compatible`, `vllm`, `deepseek`, and `qwen` | `false` | `false` |
+
+Text tool-call defaults preserve the listed adapters' current prompt-guided
+tool protocol. They do not imply that the upstream lacks native function
+calling. For adapters that support the corresponding override, selecting
+`native_tools = true` or `wire_api = "responses"` disables that implicit text
+tool-call default; an explicit extraction option still wins. For a model
+served without a server-side reasoning or tool parser, enable the required
+extractor explicitly in its options or preset.
 
 Both fields can be shared through `providers.model_presets.<id>.options`, set as
 connection defaults in `api.chat.options`, and overridden in each chat model's

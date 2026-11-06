@@ -154,7 +154,7 @@ impl ResolvedModelAccess<'_> {
                 // but cannot be accepted. Keep it out of context-window fill
                 // and successful response telemetry before returning its typed
                 // cause to every one-shot caller.
-                if response.is_semantically_empty_terminal() {
+                if response.is_semantically_empty_terminal_with(false) {
                     crate::agent::cost::settle_provider_attempts(attempts, None);
                     extend_rejected_summaries(settled_out, attempts);
                     return Err(anyhow::Error::new(SemanticEmptyTerminalCompletion));

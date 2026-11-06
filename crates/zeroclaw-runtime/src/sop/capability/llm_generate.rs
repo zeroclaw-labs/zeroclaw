@@ -180,7 +180,7 @@ impl SopCapability for LlmGenerateCapability {
             usage: None,
             reasoning_content: None,
         };
-        if response.is_semantically_empty_terminal() {
+        if response.is_semantically_empty_terminal_with(false) {
             return Ok(CapabilityResult::failure(format!(
                 "llm.generate: model call failed: {}",
                 crate::agent::semantic_empty_terminal_completion_message(None)

@@ -1730,12 +1730,28 @@ fn context_failure_aggregate(message: &str, failures: &FailureEvents) -> String 
     )
 }
 
-fn is_empty_completion(resp: &ChatResponse) -> bool {
-    resp.is_semantically_empty_terminal()
+fn is_empty_completion(resp: &ChatResponse, model: &str) -> bool {
+    resp.is_semantically_empty_terminal_with(zeroclaw_api::text_extraction_reasoning_for(model))
 }
 
-fn is_empty_text_completion(text: &str) -> bool {
-    zeroclaw_api::model_provider::strip_think_tags(text).is_empty()
+fn normalize_completion(resp: &mut ChatResponse, model: &str) {
+    resp.normalize_text_for_policy(zeroclaw_api::text_extraction_reasoning_for(model));
+}
+
+fn is_empty_text_completion(text: &str, model: &str) -> bool {
+    if zeroclaw_api::text_extraction_reasoning_for(model) {
+        zeroclaw_api::model_provider::strip_think_tags(text).is_empty()
+    } else {
+        text.trim().is_empty()
+    }
+}
+
+fn normalize_text_completion(text: String, model: &str) -> String {
+    if zeroclaw_api::text_extraction_reasoning_for(model) {
+        zeroclaw_api::model_provider::strip_think_tags(&text)
+    } else {
+        text
+    }
 }
 
 fn is_semantic_empty_completion_error(error: &anyhow::Error) -> bool {
@@ -2619,7 +2635,8 @@ impl ModelProvider for ReliableModelProvider {
                     .await
                     {
                         Ok(resp) => {
-                            if is_empty_text_completion(&resp) {
+                            let resp = normalize_text_completion(resp, current_model);
+                            if is_empty_text_completion(&resp, current_model) {
                                 if attempt < self.max_retries {
                                     self.backoff_after_empty_completion(
                                         &mut failures,
@@ -2925,7 +2942,8 @@ impl ModelProvider for ReliableModelProvider {
                     .await
                     {
                         Ok(resp) => {
-                            if is_empty_text_completion(&resp) {
+                            let resp = normalize_text_completion(resp, current_model);
+                            if is_empty_text_completion(&resp, current_model) {
                                 if attempt < self.max_retries {
                                     self.backoff_after_empty_completion(
                                         &mut failures,
@@ -3382,7 +3400,8 @@ impl ModelProvider for ReliableModelProvider {
                     .await
                     {
                         Ok(mut resp) => {
-                            if is_empty_completion(&resp) {
+                            normalize_completion(&mut resp, current_model);
+                            if is_empty_completion(&resp, current_model) {
                                 if let Some(usage) = resp.usage.clone()
                                     && !has_reliable_call_accounting()
                                 {
@@ -3785,7 +3804,8 @@ impl ModelProvider for ReliableModelProvider {
                     .await
                     {
                         Ok(mut resp) => {
-                            if is_empty_completion(&resp) {
+                            normalize_completion(&mut resp, current_model);
+                            if is_empty_completion(&resp, current_model) {
                                 if let Some(usage) = resp.usage.clone()
                                     && !has_reliable_call_accounting()
                                 {
@@ -7284,7 +7304,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_with_system_retries_think_only_text_then_succeeds() {
+    async fn chat_with_system_keeps_think_only_text_without_admitted_policy() {
         let calls = Arc::new(AtomicUsize::new(0));
         let model_provider = ReliableModelProvider::new(
             "test",
@@ -7300,14 +7320,14 @@ mod tests {
         let result = model_provider
             .chat_with_system(None, "hello", "test", Some(0.0))
             .await
-            .expect("think-only text must retry through the Reliable path");
+            .expect("config-free injection must not infer a reasoning parser");
 
-        assert_eq!(result, "recovered");
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(result, "<think>internal reasoning</think>");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
-    async fn chat_with_system_falls_back_after_think_only_text() {
+    async fn chat_with_system_does_not_fallback_for_unparsed_think_text() {
         let primary_calls = Arc::new(AtomicUsize::new(0));
         let fallback_calls = Arc::new(AtomicUsize::new(0));
         let model_provider = ReliableModelProvider::new(
@@ -7339,11 +7359,11 @@ mod tests {
         let result = model_provider
             .chat_with_system(None, "hello", "test", Some(0.0))
             .await
-            .expect("think-only text must advance to provider fallback");
+            .expect("config-free injection must accept ordinary text");
 
-        assert_eq!(result, "from fallback");
+        assert_eq!(result, "<think>internal reasoning</think>");
         assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

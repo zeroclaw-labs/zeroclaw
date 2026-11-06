@@ -4,6 +4,14 @@ use regex::Regex;
 use std::{collections::HashSet, sync::LazyLock};
 pub use zeroclaw_api::model_provider::strip_think_tags;
 
+pub mod protocol_detect;
+pub mod stream_guard;
+
+pub use stream_guard::{
+    ProtocolSuppressionDiagnostic, StreamTerminalMarkerStripper, StreamTextGuard,
+    StreamThinkTagStripper,
+};
+
 /// A single parsed tool call extracted from LLM output.
 #[derive(Debug, Clone)]
 pub struct ParsedToolCall {

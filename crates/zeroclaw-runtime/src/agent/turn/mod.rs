@@ -1933,9 +1933,8 @@ async fn run_tool_call_loop_impl<'a>(
         dedup_exempt_tools,
         pacing,
         text_tool_calls_disabled,
-        extract_text_reasoning: config.map_or(true, |config| {
-            config.model_text_extraction(provider_name).reasoning
-        }),
+        extract_text_reasoning: config
+            .is_some_and(|config| config.model_text_extraction(provider_name).reasoning),
         channel,
         draft_reasoning: knobs.draft_reasoning,
         turn_id,
@@ -2966,7 +2965,7 @@ async fn run_tool_call_loop_impl<'a>(
             {
                 return Err(single_tool_round_error());
             }
-            if response.is_semantically_empty_terminal() {
+            if response.is_semantically_empty_terminal_with(ctx.extract_text_reasoning) {
                 return Err(anyhow::Error::new(
                     zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
                 ));

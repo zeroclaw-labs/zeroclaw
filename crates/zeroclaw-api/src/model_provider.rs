@@ -220,12 +220,34 @@ impl ChatResponse {
 
     /// True when this response cannot make progress or complete a turn.
     ///
-    /// Reasoning content is intentionally excluded: it may need to be
-    /// round-tripped to a provider, but it is not a user-visible final answer.
-    /// A response containing one or more tool calls remains valid even when
-    /// its text is empty.
+    /// This deliberately performs only the unconditional check. Inline
+    /// reasoning is treated as ordinary text until the admitted model policy
+    /// is applied through [`Self::is_semantically_empty_terminal_with`]. A
+    /// response containing one or more tool calls remains valid even when its
+    /// text is empty.
     pub fn is_semantically_empty_terminal(&self) -> bool {
-        strip_think_tags(self.text_or_empty()).is_empty() && self.tool_calls.is_empty()
+        self.is_semantically_empty_terminal_with(false)
+    }
+
+    /// Classify a response after the caller has applied its admitted text
+    /// extraction policy. Providers must parse/normalize first; this method
+    /// only decides whether the normalized result can make progress.
+    pub fn is_semantically_empty_terminal_with(&self, extract_reasoning: bool) -> bool {
+        let text = if extract_reasoning {
+            strip_think_tags(self.text_or_empty())
+        } else {
+            self.text_or_empty().trim().to_owned()
+        };
+        text.is_empty() && self.tool_calls.is_empty()
+    }
+
+    /// Apply the admitted textual reasoning parser once at the provider
+    /// boundary. Runtime then receives a clean answer and only handles tool
+    /// admission, execution, events, and cancellation.
+    pub fn normalize_text_for_policy(&mut self, extract_reasoning: bool) {
+        if extract_reasoning && let Some(text) = self.text.as_mut() {
+            *text = strip_think_tags(text);
+        }
     }
 }
 
@@ -1081,6 +1103,8 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
                 usage: None,
                 reasoning_content: None,
             };
+            let mut response = response;
+            response.normalize_text_for_policy(crate::text_extraction_reasoning_for(model));
             return (!response.is_semantically_empty_terminal())
                 .then_some(response)
                 .ok_or_else(|| anyhow::Error::new(SemanticEmptyTerminalCompletion));
@@ -1095,6 +1119,8 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
             usage: None,
             reasoning_content: None,
         };
+        let mut response = response;
+        response.normalize_text_for_policy(crate::text_extraction_reasoning_for(model));
         (!response.is_semantically_empty_terminal())
             .then_some(response)
             .ok_or_else(|| anyhow::Error::new(SemanticEmptyTerminalCompletion))
@@ -1131,6 +1157,8 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
             usage: None,
             reasoning_content: None,
         };
+        let mut response = response;
+        response.normalize_text_for_policy(crate::text_extraction_reasoning_for(model));
         (!response.is_semantically_empty_terminal())
             .then_some(response)
             .ok_or_else(|| anyhow::Error::new(SemanticEmptyTerminalCompletion))
@@ -1697,7 +1725,7 @@ mod turn_order_tests {
     }
 
     #[test]
-    fn semantic_empty_terminal_uses_display_text_after_think_tag_stripping() {
+    fn semantic_empty_terminal_requires_the_admitted_reasoning_policy() {
         let response = ChatResponse {
             text: Some("<think>internal reasoning</think>".to_string()),
             tool_calls: Vec::new(),
@@ -1705,7 +1733,8 @@ mod turn_order_tests {
             reasoning_content: None,
         };
 
-        assert!(response.is_semantically_empty_terminal());
+        assert!(!response.is_semantically_empty_terminal());
+        assert!(response.is_semantically_empty_terminal_with(true));
     }
 
     #[test]

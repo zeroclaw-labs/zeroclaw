@@ -2558,8 +2558,10 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
             .context("failed to deserialize as V2 schema")?;
         v2.migrate().context("failed to migrate V2 → V3")
     },
-    // V3 → V4: no shape change; the chain applies the V4 entries in
-    // `RETIRED_KEYS` after this step.
+    // V3 → V4: canonical provider definitions are already TOML-keyed and
+    // therefore need no lossy family/alias reshaping. The step stamps the
+    // version and lets the V4 retirement pass remove only keys that are no
+    // longer part of the current schema.
     |value| stamp_schema_version(value, 4),
 ];
 
@@ -6079,6 +6081,36 @@ model = "fast-model"
         assert_eq!(
             migrated["providers"]["models"]["chat.fast.prod"]["model"].as_str(),
             Some("fast-model")
+        );
+    }
+
+    #[test]
+    fn explicit_v3_canonical_registry_is_stamped_without_splitting_dotted_keys() {
+        let raw = r#"
+schema_version = 3
+
+[providers.connections."gateway.prod"]
+kind = "custom"
+uri = "https://gateway.example/v1"
+
+[providers.models."chat.fast.prod"]
+capability = "chat"
+provider = "gateway.prod"
+model = "fast-model"
+"#;
+        let (migrated, notices) = migrate_file_with_notices(raw).unwrap().unwrap();
+        assert!(notices.is_empty());
+        let migrated: toml::Value = toml::from_str(&migrated).unwrap();
+        assert_eq!(migrated["schema_version"].as_integer(), Some(4));
+        assert!(
+            migrated["providers"]["connections"]
+                .as_table()
+                .is_some_and(|connections| connections.contains_key("gateway.prod"))
+        );
+        assert!(
+            migrated["providers"]["models"]
+                .as_table()
+                .is_some_and(|models| models.contains_key("chat.fast.prod"))
         );
     }
 

@@ -313,6 +313,45 @@ pub(crate) async fn call_provider(
     iteration: usize,
     guard_tools: Option<&[ToolSpec]>,
 ) -> Result<ProviderCallOutcome> {
+    let resolver = config.cloned().map(|config| {
+        let config = std::sync::Arc::new(config);
+        std::sync::Arc::new(move |model: &str| config.model_text_extraction(model).reasoning)
+            as std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>
+    });
+    zeroclaw_api::scope_text_extraction(
+        resolver,
+        call_provider_inner(
+            ctx,
+            config,
+            active_model_provider,
+            active_model_provider_name,
+            active_model,
+            active_dispatch_model,
+            original_request,
+            image_recovery_messages,
+            should_consume_provider_stream,
+            policy,
+            iteration,
+            guard_tools,
+        ),
+    )
+    .await
+}
+
+async fn call_provider_inner(
+    ctx: &TurnCtx<'_>,
+    config: Option<&zeroclaw_config::schema::Config>,
+    active_model_provider: &dyn ModelProvider,
+    active_model_provider_name: &str,
+    active_model: &str,
+    active_dispatch_model: &str,
+    original_request: ChatRequest<'_>,
+    image_recovery_messages: Option<&[ChatMessage]>,
+    should_consume_provider_stream: bool,
+    policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    iteration: usize,
+    guard_tools: Option<&[ToolSpec]>,
+) -> Result<ProviderCallOutcome> {
     let mut streamed_live_deltas = false;
     let mut streamed_protocol_suppressed = false;
     let mut streamed_visible_text = String::new();
@@ -555,7 +594,9 @@ pub(crate) async fn call_provider(
                                 let result = if recover_images {
                                     match recovery_result {
                                         Ok(response)
-                                            if !response.is_semantically_empty_terminal() =>
+                                            if !response.is_semantically_empty_terminal_with(
+                                                ctx.extract_text_reasoning,
+                                            ) =>
                                         {
                                             Ok(response)
                                         }
@@ -634,7 +675,11 @@ pub(crate) async fn call_provider(
                         )
                         .await;
                         match recovery {
-                            Ok(response) if !response.is_semantically_empty_terminal() => {
+                            Ok(response)
+                                if !response.is_semantically_empty_terminal_with(
+                                    ctx.extract_text_reasoning,
+                                ) =>
+                            {
                                 image_recovery_succeeded = true;
                                 Ok(response)
                             }
