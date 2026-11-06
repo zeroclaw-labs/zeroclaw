@@ -1720,7 +1720,10 @@ channel-approval-opt-reject-with-edit = Reject with edit
 # ── Peer-agent delivery ──
 peer-delivery-control-plane-unavailable = in-process peer delivery requires an available durable task store: {$error}
 peer-delivery-registration-failed = peer delivery rejected: {$error}
-peer-delivery-discord-external-peer = target {$target} is a Discord external peer (a user ID), but Discord delivery needs a channel or thread ID, so this send cannot be delivered; bots cannot DM other bots, and peer groups carry no channel mapping. Post in a channel or thread the peer shares with this agent and mention the peer there instead
+peer-delivery-discord-external-peer = target {$target} is a Discord external peer (a user ID) with no route, so this send cannot be delivered: Discord delivery needs a channel or thread ID, and bots cannot DM other bots. Configure where messages to this peer are posted with a route in a peer group that lists this agent, [peer_groups.<name>.routes."<peer ID>"] destination = "<channel or thread ID>", or post in a channel or thread the peer shares with this agent and mention the peer there
+peer-delivery-route-conflict = target {$target} is routed differently on {$channel} by peer groups {$groups}; make those routes agree or keep the route in one group
+peer-delivery-routed = delivered to external peer {$target} on {$channel} by posting in {$destination}, the channel or thread its route names (readable by everyone there)
+peer-delivery-routed-failed = could not deliver to external peer {$target} on {$channel} in {$destination}, the channel or thread its route names: {$error}
 peer-delivery-accepted = accepted for in-process delivery to peer agent "{$recipient}" (task_id={$task_id})
 tool-git-operations-error-docker-runtime-write-unsupported = Git write commands are unavailable with the Docker runtime because they cannot be confined to its container.
 

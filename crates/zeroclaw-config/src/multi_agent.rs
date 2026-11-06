@@ -3,7 +3,7 @@
 //! [`crate::schema::AliasedAgentConfig`] and [`crate::schema::Config`].
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use zeroclaw_macros::Configurable;
 
@@ -179,6 +179,167 @@ pub struct PeerGroupConfig {
     /// duplicate sender list.
     #[serde(default)]
     pub admin_for_agent_scope: bool,
+    /// Explicit outbound delivery addresses for external peers, keyed by an
+    /// exact `external_peers` entry. `external_peers` stays admission data: a
+    /// route never authorizes anyone, and a peer that `ignore` covers is not
+    /// routable. Supported on Discord peer groups only.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub routes: HashMap<String, PeerRouteConfig>,
+}
+
+/// `[peer_groups.<name>.routes."<peer>"]` — where messages addressed to one
+/// external peer of the group are posted.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "peer_group.routes"]
+#[serde(default)]
+pub struct PeerRouteConfig {
+    /// Destination the operator chose for messages to this peer. On Discord,
+    /// the ID of the channel or thread to post in; the sender posts directly
+    /// to it, even outside the channel's `channel_ids` listening filter.
+    /// Everyone with access to the destination can read routed messages.
+    pub destination: String,
+    /// Discord: prefix a mention of this peer and allow only that user to be
+    /// pinged. When `false` or unset, routed messages ping nobody.
+    pub mention: bool,
+}
+
+impl PeerGroupConfig {
+    /// Whether this group's `channel` covers `channel_key`: an exact dotted
+    /// alias, or a bare type covering every alias of that type.
+    #[must_use]
+    pub fn covers_channel(&self, channel_key: &str) -> bool {
+        let group_channel = self.channel.as_str();
+        if group_channel == channel_key {
+            return true;
+        }
+        !group_channel.contains('.')
+            && channel_key
+                .split_once('.')
+                .is_some_and(|(channel_type, _)| channel_type == group_channel)
+    }
+
+    /// This group's route for `peer`, if the route key names one of the
+    /// group's `external_peers` (never a wildcard). Ignore lists are applied by
+    /// the callers, which know the authorized scope.
+    fn route_for(&self, peer: &str) -> Option<ResolvedPeerRoute> {
+        let wanted = peer_identity_key(peer);
+        if wanted.is_empty() || wanted == "*" {
+            return None;
+        }
+        let listed = self
+            .external_peers
+            .iter()
+            .any(|entry| peer_identity_key(entry.as_str()) == wanted);
+        if !listed {
+            return None;
+        }
+        self.routes
+            .iter()
+            .find(|(key, _)| peer_identity_key(key) == wanted)
+            .map(|(key, route)| ResolvedPeerRoute {
+                peer: key.trim().to_string(),
+                destination: route.destination.trim().to_string(),
+                mention: route.mention,
+            })
+    }
+}
+
+/// An external peer's configured route, resolved for one send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedPeerRoute {
+    /// The peer the route addresses, as written in the route key.
+    pub peer: String,
+    /// Where the message is posted.
+    pub destination: String,
+    /// Whether the message mentions the peer.
+    pub mention: bool,
+}
+
+/// Result of looking up an external peer's route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerRouteLookup {
+    /// Exactly one destination applies.
+    Routed(ResolvedPeerRoute),
+    /// No group in scope routes the peer, or the peer is ignored there.
+    Unrouted,
+    /// Groups in scope route the peer differently; their names, sorted.
+    Conflict(Vec<String>),
+}
+
+/// Identity comparison for peer entries: case-insensitive, with surrounding
+/// whitespace and a leading `@` removed, as `ignore` matching does.
+fn peer_identity_key(entry: &str) -> String {
+    entry.trim().trim_start_matches('@').to_lowercase()
+}
+
+/// Whether any group in scope covering `channel_key` ignores `peer`, either by
+/// name or with an `ignore = ["*"]` wildcard.
+fn ignored_in_scope<'a>(
+    scope: impl IntoIterator<Item = &'a PeerGroupConfig>,
+    channel_key: &str,
+    peer: &str,
+) -> bool {
+    let wanted = peer_identity_key(peer);
+    scope
+        .into_iter()
+        .filter(|group| group.covers_channel(channel_key))
+        .flat_map(|group| group.ignore.iter())
+        .map(|entry| peer_identity_key(entry.as_str()))
+        .any(|entry| entry == "*" || entry == wanted)
+}
+
+/// Look up `peer`'s route on `channel_key`.
+///
+/// `scope` must already be limited to the peer groups the sending agent
+/// belongs to: route lookup and conflict checks stay inside that authorized
+/// scope. Groups covering the channel by bare type and by dotted alias are both
+/// considered, and a peer ignored by any of them is unrouted.
+pub fn lookup_peer_route<'a>(
+    scope: impl IntoIterator<Item = (&'a str, &'a PeerGroupConfig)> + Clone,
+    channel_key: &str,
+    peer: &str,
+) -> PeerRouteLookup {
+    if ignored_in_scope(scope.clone().into_iter().map(|(_, g)| g), channel_key, peer) {
+        return PeerRouteLookup::Unrouted;
+    }
+    let mut found: Vec<(&str, ResolvedPeerRoute)> = scope
+        .into_iter()
+        .filter(|(_, group)| group.covers_channel(channel_key))
+        .filter_map(|(name, group)| group.route_for(peer).map(|route| (name, route)))
+        .collect();
+    found.sort_by(|a, b| a.0.cmp(b.0));
+    let Some((_, first)) = found.first() else {
+        return PeerRouteLookup::Unrouted;
+    };
+    let agrees = found
+        .iter()
+        .all(|(_, route)| route.destination == first.destination && route.mention == first.mention);
+    if agrees {
+        PeerRouteLookup::Routed(first.clone())
+    } else {
+        PeerRouteLookup::Conflict(found.iter().map(|(name, _)| (*name).to_string()).collect())
+    }
+}
+
+/// External peers of `group` with an eligible route on `channel_key`, sorted:
+/// the route key names one of the group's `external_peers`, and no group in
+/// `scope` (the sending agent's groups) ignores the peer on that channel.
+pub fn routed_peers_of_group<'a>(
+    group: &PeerGroupConfig,
+    scope: impl IntoIterator<Item = &'a PeerGroupConfig> + Clone,
+    channel_key: &str,
+) -> Vec<String> {
+    let mut peers: Vec<String> = group
+        .routes
+        .keys()
+        .filter_map(|key| group.route_for(key).map(|route| route.peer))
+        .filter(|peer| !ignored_in_scope(scope.clone(), channel_key, peer))
+        .collect();
+    peers.sort();
+    peers.dedup_by(|a, b| peer_identity_key(a) == peer_identity_key(b));
+    peers
 }
 
 /// Inbound A2A discovery server configuration.
@@ -721,5 +882,207 @@ exposed_skills = ["research", "summarize"]
         assert_eq!(parsed.exposed_skills.len(), 2);
         assert_eq!(parsed.exposed_skills[0], "research");
         assert_eq!(parsed.exposed_skills[1], "summarize");
+    }
+
+    fn routed_group(
+        channel: &str,
+        agent: &str,
+        peers: &[&str],
+        routes: &[(&str, &str, bool)],
+    ) -> PeerGroupConfig {
+        PeerGroupConfig {
+            channel: channel.into(),
+            agents: vec![AgentAlias::new(agent)],
+            external_peers: peers.iter().map(|p| PeerUsername::new(*p)).collect(),
+            routes: routes
+                .iter()
+                .map(|(peer, destination, mention)| {
+                    (
+                        (*peer).to_string(),
+                        PeerRouteConfig {
+                            destination: (*destination).to_string(),
+                            mention: *mention,
+                        },
+                    )
+                })
+                .collect(),
+            ..PeerGroupConfig::default()
+        }
+    }
+
+    const PEER: &str = "111111111111111111";
+    const OTHER: &str = "222222222222222222";
+
+    #[test]
+    fn peer_routes_round_trip_and_are_omitted_when_empty() {
+        let toml_input = r#"
+channel = "discord.main"
+agents = ["assistant"]
+external_peers = ["111111111111111111"]
+
+[routes."111111111111111111"]
+destination = "333333333333333333"
+mention = true
+"#;
+        let parsed: PeerGroupConfig = toml::from_str(toml_input).unwrap();
+        assert_eq!(
+            parsed.routes.get(PEER),
+            Some(&PeerRouteConfig {
+                destination: "333333333333333333".to_string(),
+                mention: true,
+            })
+        );
+        let back: PeerGroupConfig = toml::from_str(&toml::to_string(&parsed).unwrap()).unwrap();
+        assert_eq!(back.routes, parsed.routes);
+
+        // A group without routes serialises exactly as before the field existed.
+        let plain = routed_group("discord.main", "assistant", &[PEER], &[]);
+        let serialised = toml::to_string(&plain).unwrap();
+        assert!(!serialised.contains("routes"), "{serialised}");
+        let mention_default: PeerRouteConfig =
+            toml::from_str("destination = \"333333333333333333\"").unwrap();
+        assert!(!mention_default.mention, "mention must default to off");
+    }
+
+    #[test]
+    fn lookup_routes_a_listed_peer_through_a_bare_type_or_dotted_group() {
+        for channel in ["discord", "discord.main"] {
+            let group = routed_group(channel, "assistant", &[PEER], &[(PEER, " 333 ", true)]);
+            let lookup = lookup_peer_route([("bots", &group)], "discord.main", PEER);
+            assert_eq!(
+                lookup,
+                PeerRouteLookup::Routed(ResolvedPeerRoute {
+                    peer: PEER.to_string(),
+                    destination: "333".to_string(),
+                    mention: true,
+                }),
+                "group channel {channel}"
+            );
+        }
+    }
+
+    #[test]
+    fn lookup_ignores_groups_on_other_channels_and_unlisted_route_keys() {
+        let elsewhere = routed_group(
+            "discord.other",
+            "assistant",
+            &[PEER],
+            &[(PEER, "333", false)],
+        );
+        assert_eq!(
+            lookup_peer_route([("elsewhere", &elsewhere)], "discord.main", PEER),
+            PeerRouteLookup::Unrouted
+        );
+        // A route never admits a peer: its key must be one of the group's
+        // external_peers.
+        let unlisted = routed_group(
+            "discord.main",
+            "assistant",
+            &[OTHER],
+            &[(PEER, "333", false)],
+        );
+        assert_eq!(
+            lookup_peer_route([("unlisted", &unlisted)], "discord.main", PEER),
+            PeerRouteLookup::Unrouted
+        );
+        // A wildcard admission entry is not an address.
+        let wildcard = routed_group("discord.main", "assistant", &["*"], &[("*", "333", false)]);
+        assert_eq!(
+            lookup_peer_route([("wildcard", &wildcard)], "discord.main", "*"),
+            PeerRouteLookup::Unrouted
+        );
+    }
+
+    #[test]
+    fn lookup_leaves_an_ignored_peer_unrouted_whichever_group_ignores_it() {
+        let routed = routed_group(
+            "discord.main",
+            "assistant",
+            &[PEER],
+            &[(PEER, "333", false)],
+        );
+        let mut ignoring = routed_group("discord", "assistant", &[], &[]);
+        ignoring.ignore = vec![PeerUsername::new(format!("@{PEER}"))];
+        assert_eq!(
+            lookup_peer_route(
+                [("routed", &routed), ("ignoring", &ignoring)],
+                "discord.main",
+                PEER
+            ),
+            PeerRouteLookup::Unrouted
+        );
+        let mut ignore_all = routed_group("discord.main", "assistant", &[], &[]);
+        ignore_all.ignore = vec![PeerUsername::new("*")];
+        assert_eq!(
+            lookup_peer_route(
+                [("routed", &routed), ("all", &ignore_all)],
+                "discord.main",
+                PEER
+            ),
+            PeerRouteLookup::Unrouted
+        );
+        assert!(routed_peers_of_group(&routed, [&routed, &ignoring], "discord.main").is_empty());
+    }
+
+    #[test]
+    fn lookup_fails_closed_when_bare_type_and_dotted_groups_disagree() {
+        let typed = routed_group("discord", "assistant", &[PEER], &[(PEER, "333", false)]);
+        let dotted = routed_group(
+            "discord.main",
+            "assistant",
+            &[PEER],
+            &[(PEER, "444", false)],
+        );
+        assert_eq!(
+            lookup_peer_route([("zeta", &typed), ("alpha", &dotted)], "discord.main", PEER),
+            PeerRouteLookup::Conflict(vec!["alpha".to_string(), "zeta".to_string()])
+        );
+        // The same destination with a different mention setting also disagrees.
+        let mentioning = routed_group("discord.main", "assistant", &[PEER], &[(PEER, "333", true)]);
+        assert!(matches!(
+            lookup_peer_route(
+                [("typed", &typed), ("mentioning", &mentioning)],
+                "discord.main",
+                PEER
+            ),
+            PeerRouteLookup::Conflict(_)
+        ));
+        // Identical routes in two groups are one route.
+        let same = routed_group(
+            "discord.main",
+            "assistant",
+            &[PEER],
+            &[(PEER, "333", false)],
+        );
+        assert!(matches!(
+            lookup_peer_route([("typed", &typed), ("same", &same)], "discord.main", PEER),
+            PeerRouteLookup::Routed(_)
+        ));
+    }
+
+    #[test]
+    fn routed_peers_of_group_lists_only_eligible_routes() {
+        let group = routed_group(
+            "discord.main",
+            "assistant",
+            &[PEER, OTHER],
+            &[(PEER, "333", false), ("999999999999999999", "444", false)],
+        );
+        assert_eq!(
+            routed_peers_of_group(&group, [&group], "discord.main"),
+            vec![PEER.to_string()]
+        );
+
+        // Another of the agent's groups ignoring the peer on the same channel
+        // (by bare type here) makes the route ineligible; one on a different
+        // channel does not.
+        let mut deny = routed_group("discord", "assistant", &[], &[]);
+        deny.ignore = vec![PeerUsername::new(PEER)];
+        assert!(routed_peers_of_group(&group, [&group, &deny], "discord.main").is_empty());
+        deny.channel = "discord.other".into();
+        assert_eq!(
+            routed_peers_of_group(&group, [&group, &deny], "discord.main"),
+            vec![PEER.to_string()]
+        );
     }
 }

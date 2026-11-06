@@ -10215,10 +10215,15 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
     #[cfg(feature = "agent-runtime")]
     {
         zeroclaw_runtime::cron::scheduler::register_delivery_fn(Box::new(
-            |config, channel, target, thread_id, output| {
+            |config, channel, target, thread_id, output, allowed_mentions| {
                 Box::pin(async move {
-                    zeroclaw_channels::orchestrator::deliver_announcement(
-                        &config, &channel, &target, thread_id, &output,
+                    zeroclaw_channels::orchestrator::deliver_announcement_with_mentions(
+                        &config,
+                        &channel,
+                        &target,
+                        thread_id,
+                        &output,
+                        allowed_mentions,
                     )
                     .await
                 })

@@ -1169,6 +1169,31 @@ fn channel_passes_filter(
     false
 }
 
+/// The payload for chunk `index` of an outgoing message. The first chunk
+/// carries the message's embeds and components (attachments ride along with it
+/// at the call site); every chunk carries the sender's mention policy, so a
+/// later chunk cannot ping anyone the policy excludes.
+fn chunk_payload(
+    index: usize,
+    chunk: &str,
+    embeds: &[DiscordEmbed],
+    components: &[components::DiscordActionRow],
+    allowed_mentions: Option<&[String]>,
+) -> DiscordOutgoing {
+    let first = index == 0;
+    DiscordOutgoing {
+        content: Some(chunk.to_string()),
+        embeds: if first { embeds.to_vec() } else { Vec::new() },
+        components: if first {
+            components.to_vec()
+        } else {
+            Vec::new()
+        },
+        allowed_mentions: allowed_mentions.map(<[String]>::to_vec),
+        ..Default::default()
+    }
+}
+
 /// Resolve the recipient a Discord send targets. A non-empty per-message
 /// recipient is authoritative; when it is empty (e.g. an escalation alert that
 /// carries no per-message target), fall back to the channel's first configured
@@ -1925,44 +1950,30 @@ impl Channel for DiscordChannel {
                 }
             };
         for (i, chunk) in chunks.iter().enumerate() {
-            let message_id = if i == 0 && (!embeds.is_empty() || !component_action_rows.is_empty())
-            {
-                let payload = DiscordOutgoing {
-                    content: Some(chunk.clone()),
-                    embeds: embeds.clone(),
-                    components: component_action_rows.clone(),
-                    ..Default::default()
-                };
-                if local_files.is_empty() {
-                    send_discord_message_payload(
-                        &client,
-                        &self.bot_token,
-                        effective_recipient,
-                        &payload,
-                    )
-                    .await?
-                } else {
-                    send_discord_message_payload_with_files(
-                        &client,
-                        &self.bot_token,
-                        effective_recipient,
-                        &payload,
-                        &local_files,
-                    )
-                    .await?
-                }
-            } else if i == 0 && !local_files.is_empty() {
+            let payload = chunk_payload(
+                i,
+                chunk,
+                &embeds,
+                &component_action_rows,
+                message.allowed_mentions.as_deref(),
+            );
+            let message_id = if i == 0 && !local_files.is_empty() {
                 send_discord_message_payload_with_files(
                     &client,
                     &self.bot_token,
                     effective_recipient,
-                    &DiscordOutgoing::text(chunk.clone()),
+                    &payload,
                     &local_files,
                 )
                 .await?
             } else {
-                send_discord_message_json(&client, &self.bot_token, effective_recipient, chunk)
-                    .await?
+                send_discord_message_payload(
+                    &client,
+                    &self.bot_token,
+                    effective_recipient,
+                    &payload,
+                )
+                .await?
             };
             if first_message_id.is_none() {
                 first_message_id = Some(message_id);
@@ -4136,6 +4147,7 @@ impl Channel for DiscordChannel {
             }],
             components: vec![components::action_row(buttons)],
             flags: Default::default(),
+            allowed_mentions: None,
         };
         let message_id = rest::send_discord_outgoing(
             &self.http_client(),
@@ -4231,6 +4243,58 @@ impl Channel for DiscordChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_payload_carries_the_mention_policy_on_every_chunk() {
+        let embeds = vec![embed::DiscordEmbed {
+            title: Some("t".to_string()),
+            ..Default::default()
+        }];
+        let users = vec!["111111111111111111".to_string()];
+        let first = chunk_payload(0, "a", &embeds, &[], Some(users.as_slice())).to_rest_json();
+        let later = chunk_payload(1, "b", &embeds, &[], Some(users.as_slice())).to_rest_json();
+        let policy = serde_json::json!({"parse": [], "users": ["111111111111111111"]});
+        assert_eq!(first["allowed_mentions"], policy);
+        assert_eq!(
+            later["allowed_mentions"], policy,
+            "later chunks keep the policy"
+        );
+        assert!(
+            first.get("embeds").is_some(),
+            "the first chunk carries the embeds"
+        );
+        assert!(later.get("embeds").is_none(), "embeds are sent once");
+        // The multipart form used with attachments carries the same payload.
+        let multipart: serde_json::Value =
+            serde_json::from_str(&chunk_payload(0, "a", &[], &[], Some(&[][..])).payload_json())
+                .unwrap();
+        assert_eq!(
+            multipart["allowed_mentions"],
+            serde_json::json!({"parse": [], "users": []})
+        );
+    }
+
+    #[test]
+    fn chunk_payload_without_a_policy_keeps_the_legacy_shape() {
+        // Plain chunks used to go out as `DiscordOutgoing::text`; the shared
+        // payload builder must produce the same request body for them.
+        let embeds = vec![embed::DiscordEmbed {
+            title: Some("t".to_string()),
+            ..Default::default()
+        }];
+        assert_eq!(
+            chunk_payload(0, "a", &[], &[], None).to_rest_json(),
+            DiscordOutgoing::text("a".to_string()).to_rest_json()
+        );
+        assert_eq!(
+            chunk_payload(1, "b", &embeds, &[], None).to_rest_json(),
+            DiscordOutgoing::text("b".to_string()).to_rest_json()
+        );
+        assert_eq!(
+            chunk_payload(1, "b", &[], &[], None).to_rest_json(),
+            serde_json::json!({"content": "b"})
+        );
+    }
 
     #[test]
     fn effective_recipient_prefers_per_message_target() {
@@ -4911,6 +4975,7 @@ mod tests {
             in_reply_to: None,
             references: Vec::new(),
             force_voice: false,
+            allowed_mentions: None,
             suppress_voice: false,
         };
         let err = ch.send(&msg).await.unwrap_err();
