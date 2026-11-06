@@ -146,6 +146,7 @@ export function parseOidcSession(value: unknown): OidcSession | null {
       chat: flags.chat === true,
       operator_pages: flags.operator_pages === true,
       core_sessions: flags.core_sessions === true,
+      config: flags.config === true,
     },
   };
 }

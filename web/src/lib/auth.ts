@@ -34,6 +34,8 @@ export interface OidcSession {
     /** Chat goes through the core, one conversation per chat socket: nothing
      * to load, list or resume. Absent on servers without core-path chat. */
     core_sessions?: boolean;
+    /** May read config: the config routes' own rule. Absent means no. */
+    config?: boolean;
   };
 }
 
