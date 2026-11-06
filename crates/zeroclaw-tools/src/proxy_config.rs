@@ -444,6 +444,12 @@ impl ProxyConfigTool {
 
 #[async_trait]
 impl Tool for ProxyConfigTool {
+    fn requires_unrestricted_principal(&self) -> bool {
+        // Saving config changes every agent's later runs, which RPC gates
+        // behind `config:update`; the caller's principal does not reach them.
+        true
+    }
+
     fn name(&self) -> &str {
         "proxy_config"
     }
@@ -567,6 +573,13 @@ mod tests {
         };
         config.save().await.unwrap();
         Arc::new(config)
+    }
+
+    #[tokio::test]
+    async fn proxy_config_requires_an_unrestricted_principal() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ProxyConfigTool::new(test_config(&tmp).await, test_security());
+        assert!(tool.requires_unrestricted_principal());
     }
 
     #[test]
