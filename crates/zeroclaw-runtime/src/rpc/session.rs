@@ -2037,10 +2037,10 @@ impl SessionStore {
     }
 
     fn owned(id: &str, session: &RpcSession) -> Option<OwnedSession> {
-        session.owner_tui_id.as_ref().map(|owner| OwnedSession {
+        session.owner_tui_id().map(|owner| OwnedSession {
             id: id.to_string(),
             generation: session.generation,
-            owner_tui_id: owner.clone(),
+            owner_tui_id: owner.to_owned(),
             last_active: session.last_active,
         })
     }
