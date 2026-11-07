@@ -268,6 +268,10 @@ impl RuntimeAdapter for DockerRuntime {
         ShellDialect::Posix
     }
 
+    fn shell_launcher_env_vars(&self) -> &'static [&'static str] {
+        &["CONTAINER_HOST", "DOCKER_HOST"]
+    }
+
     fn build_shell_command(
         &self,
         command: &str,
