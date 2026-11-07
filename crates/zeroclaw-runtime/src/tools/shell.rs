@@ -14,9 +14,46 @@ use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, with_ephemeral_workspace_
 /// Maximum output size in bytes (1MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
 const POST_EXIT_DRAIN: Duration = Duration::from_millis(250);
+/// Default grace between the `SIGTERM` sweep of a returned command's process
+/// group and the `SIGKILL` escalation. Mirrors
+/// `[shell_tool].reap_grace_secs`.
+const DEFAULT_BACKGROUND_REAP_GRACE: Duration = Duration::from_secs(2);
+/// How often the sweep re-checks whether the signalled group has drained.
+const BACKGROUND_REAP_POLL: Duration = Duration::from_millis(20);
+
+/// Assemble the tool result from a command's exit status and captured output.
+fn command_result(
+    status: std::process::ExitStatus,
+    stdout_capture: DrainOutput,
+    stderr_capture: DrainOutput,
+) -> ToolResult {
+    let mut stdout = decode_capture(&stdout_capture);
+    let mut stderr = decode_capture(&stderr_capture);
+
+    if stdout_capture.truncated || stdout.len() > MAX_OUTPUT_BYTES {
+        append_truncation_marker(&mut stdout, "\n... [output truncated at 1MB]");
+    }
+    if stderr_capture.truncated || stderr.len() > MAX_OUTPUT_BYTES {
+        append_truncation_marker(&mut stderr, "\n... [stderr truncated at 1MB]");
+    }
+
+    ToolResult {
+        success: status.success(),
+        output: stdout.into(),
+        error: if stderr.is_empty() {
+            None
+        } else {
+            Some(stderr)
+        },
+    }
+}
 
 /// Drop guard that SIGKILLs the child's process group on cancel/timeout paths.
-/// Disarmed after `child.wait()` returns so it never signals a recycled PID.
+/// Disarmed once the group has been drained on the normal-return path.
+///
+/// The pid it holds is also the group id, so the guard may only fire while the
+/// group is still the one `setsid()` created — see
+/// [`process_group_alive`] for why that stays true after the leader is reaped.
 #[cfg(unix)]
 struct ChildGroupGuard {
     pgid: std::sync::atomic::AtomicI32,
@@ -29,6 +66,13 @@ impl ChildGroupGuard {
         Self {
             pgid: std::sync::atomic::AtomicI32::new(pgid),
         }
+    }
+
+    /// The group `setsid()` gave the child, or `0` when it is unknown. Stays
+    /// readable while the guard is armed so the normal-return path can sweep
+    /// the group before disarming it.
+    fn pgid(&self) -> i32 {
+        self.pgid.load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn disarm(&self) {
@@ -59,6 +103,182 @@ impl Drop for ChildGroupGuard {
     }
 }
 
+/// True when `pgid` names a real process group that is not the daemon's own.
+///
+/// `kill(0, …)` and `kill(getpgrp(), …)` both signal *this* process, so a
+/// group id that is not positive and foreign would turn a cleanup sweep into a
+/// self-signal. `setsid()` is checked at spawn, so a published group is always
+/// a fresh foreign session; this refuses the degenerate ids anyway, because
+/// `ChildGroupGuard` also stores `0` for "unknown".
+#[cfg(unix)]
+fn is_foreign_process_group(pgid: i32) -> bool {
+    pgid > 0
+        // SAFETY: `getpgrp()` reads the caller's own group id and takes no
+        // arguments or pointers.
+        && unsafe { libc::getpgrp() } != pgid
+}
+
+/// True while at least one process remains in `pgid`.
+///
+/// `kill(-pgid, 0)` reports `EPERM` for a group that exists but holds nothing
+/// this caller may signal; that still means the group is populated. Only
+/// `ESRCH` — every member has exited — reports a drained group.
+///
+/// This check is also what makes the number safe to signal, which matters
+/// because a process group is addressed by its leader's PID and the leader is
+/// reaped as soon as the command exits. The number only becomes reusable when
+/// the group is *empty*:
+///
+/// - `copy_process` attaches every new member to its group's pid with
+///   `attach_pid(p, PIDTYPE_PGID)`, so a group with members holds a reference
+///   to the leader's `struct pid` on each member's behalf;
+/// - `__change_pid` walks the other pid types and returns early while any of
+///   them still references that struct, so `detach_pid(…, PIDTYPE_PID)` at
+///   leader exit leaves the number allocated;
+/// - `free_pid` — the only thing that returns a number to the pool — is
+///   reached from there, and so runs when the last member leaves, which is
+///   also the moment the group stops existing.
+///
+/// So a group reported as populated here is still addressable as *this*
+/// command's group, no matter how long ago its leader was reaped, and a
+/// recycled id is only reachable once nothing is left to sweep. What is left
+/// is the gap between this check and the signal that follows it: the group
+/// would have to empty inside those few instructions, and the id be reassigned
+/// inside them too. Callers therefore check immediately before each signal and
+/// nothing else touches `-pgid`.
+#[cfg(unix)]
+fn process_group_alive(pgid: i32) -> bool {
+    // SAFETY: signal 0 performs the existence and permission check and
+    // delivers nothing to the group.
+    if unsafe { libc::kill(-pgid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Signal every member of `pgid`, which must already have passed
+/// [`is_foreign_process_group`].
+#[cfg(unix)]
+fn signal_process_group(pgid: i32, signal: i32) {
+    // SAFETY: the negative PID can only address the one group `setsid()`
+    // created for this command, and the call passes no pointers. Failure is
+    // best effort: a member that exited first is already the outcome wanted.
+    unsafe {
+        libc::kill(-pgid, signal);
+    }
+}
+
+/// The process-group id a `/proc/<pid>/stat` line reports.
+///
+/// The `comm` field is parenthesised and may itself contain spaces and `)`,
+/// so the numeric fields after it are read from the *last* `)`: what follows
+/// is `state`, `ppid`, then `pgrp`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn proc_stat_process_group(stat: &str) -> Option<i32> {
+    let after_comm = &stat[stat.rfind(')')? + 1..];
+    after_comm.split_whitespace().nth(2)?.parse().ok()
+}
+
+/// How many processes are in `pgid` right now, when the platform can say.
+///
+/// Linux and Android publish every task's group id, so the count of a sweep
+/// is exact. Other Unixes have no equivalent interface that does not shell
+/// out, and report `None` rather than a fabricated number.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn count_process_group_members(pgid: i32) -> Option<usize> {
+    let entries = std::fs::read_dir("/proc").ok()?;
+    let mut count = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        // A process that exits between the listing and the read is simply not
+        // counted; that only ever understates a best-effort count.
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        if proc_stat_process_group(&stat) == Some(pgid) {
+            count += 1;
+        }
+    }
+    Some(count)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn count_process_group_members(_pgid: i32) -> Option<usize> {
+    None
+}
+
+/// Wait for the signalled group to drain, polling until `grace` expires.
+/// Returns true when the group emptied before the deadline.
+#[cfg(unix)]
+async fn wait_for_process_group_exit(pgid: i32, grace: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + grace;
+    loop {
+        if !process_group_alive(pgid) {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        tokio::time::sleep(remaining.min(BACKGROUND_REAP_POLL)).await;
+    }
+}
+
+/// Terminate whatever the command left running in its own process group once
+/// the command has returned.
+///
+/// This is the group `ChildGroupGuard` already owns, but the guard only fires
+/// when the command itself is torn down (timeout, cancellation). A command
+/// that returns normally while a background child of its own is still alive
+/// disarmed the guard and answered the model, leaving that child running with
+/// nothing left to bound it: no timeout applies any more, and the process is
+/// reparented to init and outlives the turn, the job, and any daemon restart.
+///
+/// The sweep is `SIGTERM`, a bounded grace, then `SIGKILL`, so a cooperative
+/// child flushes and exits on its own terms. Only `-pgid` is ever signalled,
+/// after the existence check above refused a degenerate or self group, so the
+/// sweep cannot reach the daemon or an unrelated process. A descendant that
+/// called `setsid()`/`setpgid()` itself still escapes, exactly as it does on
+/// the timeout and cancellation paths. The group id stays safe to signal after
+/// the leader is reaped because a populated group keeps it reserved; see
+/// [`process_group_alive`].
+#[cfg(unix)]
+async fn reap_background_process_group(pgid: i32, grace: Duration) {
+    if !is_foreign_process_group(pgid) || !process_group_alive(pgid) {
+        return;
+    }
+
+    let signalled = count_process_group_members(pgid);
+    signal_process_group(pgid, libc::SIGTERM);
+    let escalated = !wait_for_process_group_exit(pgid, grace).await;
+    if escalated {
+        signal_process_group(pgid, libc::SIGKILL);
+    }
+
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Kill)
+            .with_outcome(if escalated {
+                ::zeroclaw_log::EventOutcome::Failure
+            } else {
+                ::zeroclaw_log::EventOutcome::Success
+            })
+            .with_attrs(::serde_json::json!({
+                "pgid": pgid,
+                "count": signalled,
+                "grace_ms": grace.as_millis(),
+                "signal": if escalated { "SIGKILL" } else { "SIGTERM" },
+            })),
+        "shell tool reaped background processes left running by a returned command"
+    );
+}
+
 /// Shell command execution tool with sandboxing
 pub struct ShellTool {
     security: Arc<SecurityPolicy>,
@@ -75,6 +295,11 @@ pub struct ShellTool {
     /// one map throughout that incarnation.
     tui_env: Option<ForwardedEnvironment>,
     persistent_writes: bool,
+    /// Grace given to the process group a returned command left behind before
+    /// the hard `SIGKILL` sweep, or `None` when that sweep is disabled.
+    /// Mirrors `[shell_tool].reap_background_on_return` and
+    /// `[shell_tool].reap_grace_secs`.
+    background_reap: Option<Duration>,
 }
 
 impl ShellTool {
@@ -87,6 +312,7 @@ impl ShellTool {
             timeout_secs,
             tui_env: None,
             persistent_writes: true,
+            background_reap: Some(DEFAULT_BACKGROUND_REAP_GRACE),
         }
     }
 
@@ -103,6 +329,7 @@ impl ShellTool {
             timeout_secs,
             tui_env: None,
             persistent_writes: true,
+            background_reap: Some(DEFAULT_BACKGROUND_REAP_GRACE),
         }
     }
 
@@ -114,6 +341,18 @@ impl ShellTool {
     /// Override the command execution timeout (in seconds).
     pub fn with_timeout_secs(mut self, secs: u64) -> Self {
         self.timeout_secs = secs;
+        self
+    }
+
+    /// Terminate whatever the command left running in its own process group
+    /// after a normal return, giving it `grace` to exit on `SIGTERM` before
+    /// the `SIGKILL` sweep. `reap = false` leaves the group alone, for an
+    /// operator who deliberately starts detached daemons through this tool.
+    ///
+    /// Unix only: without a process group of its own there is nothing to
+    /// sweep, so the setting has no effect on Windows.
+    pub fn with_background_reap(mut self, reap: bool, grace: Duration) -> Self {
+        self.background_reap = reap.then_some(grace);
         self
     }
 
@@ -384,30 +623,30 @@ impl Tool for ShellTool {
         let mut result =
             match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await {
                 Ok(Ok(status)) => {
+                    // The command answered, but it may have left a background
+                    // child of its own group still running. Sweep that group
+                    // before the drains: a background child usually holds the
+                    // pipe open, so draining first would spend the post-exit
+                    // drain budget waiting on a process this is about to kill.
+                    // The guard stays armed across the sweep so a cancellation
+                    // during the grace still ends the group.
                     #[cfg(unix)]
-                    group_guard.disarm();
+                    {
+                        if let Some(grace) = self.background_reap {
+                            reap_background_process_group(group_guard.pgid(), grace).await;
+                        }
+                        group_guard.disarm();
+                    }
+                    // Windows gives the command no process group of its own, so
+                    // the configured sweep has no target there; read the value
+                    // so the knob stays single-sourced rather than silently
+                    // diverging from the one the operator set.
+                    #[cfg(not(unix))]
+                    let _ = self.background_reap;
+
                     let (stdout_capture, stderr_capture) =
                         tokio::join!(finish_drain(stdout_drain), finish_drain(stderr_drain));
-
-                    let mut stdout = decode_capture(&stdout_capture);
-                    let mut stderr = decode_capture(&stderr_capture);
-
-                    if stdout_capture.truncated || stdout.len() > MAX_OUTPUT_BYTES {
-                        append_truncation_marker(&mut stdout, "\n... [output truncated at 1MB]");
-                    }
-                    if stderr_capture.truncated || stderr.len() > MAX_OUTPUT_BYTES {
-                        append_truncation_marker(&mut stderr, "\n... [stderr truncated at 1MB]");
-                    }
-
-                    ToolResult {
-                        success: status.success(),
-                        output: stdout.into(),
-                        error: if stderr.is_empty() {
-                            None
-                        } else {
-                            Some(stderr)
-                        },
-                    }
+                    command_result(status, stdout_capture, stderr_capture)
                 }
                 Ok(Err(e)) => {
                     tokio::join!(abort_drain(stdout_drain), abort_drain(stderr_drain));
@@ -2052,6 +2291,204 @@ mod tests {
             return true;
         }
         !state.starts_with('Z')
+    }
+
+    // ── background-process reaping on normal return ─────────────
+
+    /// A command that backgrounds a long-lived sleeper holding the tool's pipes,
+    /// publishes that sleeper's PID, and returns as soon as the PID is readable.
+    /// The rename keeps a reader from seeing a half-written PID, and the wait
+    /// loop keeps the command from returning before the sleeper exists —
+    /// otherwise the test would race the very reap it is measuring. The loop is
+    /// bounded by the tool timeout rather than by a `sleep`, so it stays
+    /// portable.
+    #[cfg(unix)]
+    fn background_sleeper_command() -> &'static str {
+        "sh -c 'echo $$ > pid.tmp && mv pid.tmp descendant.pid && exec sleep 300' & \
+         while [ ! -f descendant.pid ]; do :; done; echo returned"
+    }
+
+    /// Same as [`background_sleeper_command`], but the sleeper ignores
+    /// `SIGTERM`, so only the `SIGKILL` escalation can end it. `SIG_IGN`
+    /// dispositions survive `exec`, so the published PID is the sleeper's.
+    #[cfg(unix)]
+    fn sigterm_ignoring_background_sleeper_command() -> &'static str {
+        "sh -c 'trap \"\" TERM; echo $$ > pid.tmp && mv pid.tmp descendant.pid && exec sleep 300' & \
+         while [ ! -f descendant.pid ]; do :; done; echo returned"
+    }
+
+    #[cfg(unix)]
+    async fn read_descendant_pid(pid_file: &std::path::Path) -> libc::pid_t {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(text) = std::fs::read_to_string(pid_file) {
+                    break text.trim().parse().expect("descendant PID");
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the backgrounded descendant should publish its PID")
+    }
+
+    /// Poll until the descendant is gone, killing only that exact PID if it
+    /// outlives the wait so a regression leaves nothing running.
+    #[cfg(unix)]
+    async fn await_descendant_exit(pid: libc::pid_t, within: Duration) -> bool {
+        let exited = tokio::time::timeout(within, async {
+            while descendant_running(pid) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+        if !exited {
+            // SAFETY: kill only signals the PID the descendant itself reported.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        exited
+    }
+
+    #[cfg(unix)]
+    fn background_sleeper_tool(reap: bool, grace: Duration) -> (ShellTool, tempfile::TempDir) {
+        let workspace = tempfile::tempdir().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: workspace.path().to_path_buf(),
+            ..(*unrestricted_shell_test_security()).clone()
+        });
+        let tool = ShellTool::new(security, test_runtime())
+            .with_background_reap(reap, grace)
+            .with_timeout_secs(10);
+        (tool, workspace)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_reaps_background_processes_after_a_normal_return() {
+        let (tool, workspace) = background_sleeper_tool(true, Duration::from_secs(2));
+
+        let result = tool
+            .execute(json!({ "command": background_sleeper_command() }))
+            .await
+            .expect("a returning command should produce a result");
+        assert!(result.success, "{:?}", result.error);
+        assert!(
+            result.output.contains("returned"),
+            "the command's own output must survive the reap: {:?}",
+            result.output
+        );
+
+        let pid = read_descendant_pid(&workspace.path().join("descendant.pid")).await;
+        assert!(
+            await_descendant_exit(pid, Duration::from_secs(5)).await,
+            "descendant {pid} outlived the command that returned"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_escalates_to_sigkill_when_the_grace_expires() {
+        let (tool, workspace) = background_sleeper_tool(true, Duration::from_millis(200));
+
+        let result = tool
+            .execute(json!({
+                "command": sigterm_ignoring_background_sleeper_command()
+            }))
+            .await
+            .expect("a returning command should produce a result");
+        assert!(result.success, "{:?}", result.error);
+
+        let pid = read_descendant_pid(&workspace.path().join("descendant.pid")).await;
+        assert!(
+            await_descendant_exit(pid, Duration::from_secs(5)).await,
+            "a descendant that ignores SIGTERM must still be swept"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_keeps_background_processes_when_reaping_is_disabled() {
+        let (tool, workspace) = background_sleeper_tool(false, Duration::from_secs(2));
+
+        let result = tool
+            .execute(json!({ "command": background_sleeper_command() }))
+            .await
+            .expect("a returning command should produce a result");
+        assert!(result.success, "{:?}", result.error);
+
+        let pid = read_descendant_pid(&workspace.path().join("descendant.pid")).await;
+        // An operator who opted out is running detached daemons on purpose, so
+        // the sleeper must still be there after the call returned.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let survived = descendant_running(pid);
+        if survived {
+            // SAFETY: kill only signals the PID the descendant itself reported.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(survived, "descendant {pid} was reaped despite the opt-out");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn background_reap_refuses_degenerate_and_self_process_groups() {
+        // SAFETY: `getpgrp()` reads this process's own group id and takes no
+        // arguments or pointers.
+        let own = unsafe { libc::getpgrp() };
+        assert!(!is_foreign_process_group(0));
+        assert!(!is_foreign_process_group(-own));
+        assert!(!is_foreign_process_group(own));
+        assert!(is_foreign_process_group(own + 1));
+    }
+
+    /// Nothing to sweep must cost nothing. The grace exists to bound a
+    /// background child, not to be paid by every command, so a command that
+    /// leaves no one behind has to come back long before the grace would end.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_returns_without_waiting_out_the_grace_when_nothing_survives() {
+        let (tool, _workspace) = background_sleeper_tool(true, Duration::from_secs(8));
+        let started = tokio::time::Instant::now();
+
+        let result = tool
+            .execute(json!({ "command": "echo quick" }))
+            .await
+            .expect("a plain command should produce a result");
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.output.contains("quick"));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a command with no background work waited {:?} of its 8s grace",
+            started.elapsed()
+        );
+    }
+
+    /// The sweep has to run before the drains, not after. A background child
+    /// inherits the tool's pipes, so draining first would spend the post-exit
+    /// drain budget waiting on a process the sweep is about to kill — and the
+    /// returned command would be held up by both.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_sweeps_the_group_before_draining_a_descendant_held_pipe() {
+        let (tool, workspace) = background_sleeper_tool(true, Duration::from_secs(30));
+        let started = tokio::time::Instant::now();
+
+        let result = tool
+            .execute(json!({ "command": background_sleeper_command() }))
+            .await
+            .expect("a returning command should produce a result");
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(
+            started.elapsed() < POST_EXIT_DRAIN,
+            "the call waited {:?} for a pipe the sweep should have ended first",
+            started.elapsed()
+        );
+        let pid = read_descendant_pid(&workspace.path().join("descendant.pid")).await;
+        assert!(
+            await_descendant_exit(pid, Duration::from_secs(5)).await,
+            "descendant {pid} outlived the command that returned"
+        );
     }
 
     #[cfg(unix)]
