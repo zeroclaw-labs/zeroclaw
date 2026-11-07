@@ -8,21 +8,48 @@ import type { OidcSession } from "../lib/auth.ts";
 // agents list comes from /api/agents/available, and the chat route refuses an
 // agent the account may not use before any socket opens.
 
+// The chat a successful retry opens connects through this; no real socket.
+class FakeWebSocket {
+  static readonly OPEN = 1;
+  static instances: FakeWebSocket[] = [];
+  readyState = 0;
+  onopen: (() => void) | null = null;
+  onclose: ((ev: { code: number }) => void) | null = null;
+  onmessage: ((ev: { data: string }) => void) | null = null;
+  onerror: (() => void) | null = null;
+
+  constructor(readonly url: string) {
+    FakeWebSocket.instances.push(this);
+  }
+
+  send(): void {}
+
+  close(): void {
+    if (this.readyState === 3) return;
+    this.readyState = 3;
+    this.onclose?.({ code: 1000 });
+  }
+}
+
 const fakeWindow = Object.assign(new EventTarget(), {
   location: { protocol: "https:", host: "zc.example", hostname: "zc.example", port: "", pathname: "/", search: "" },
+  setTimeout: (fn: () => void, ms: number) => setTimeout(fn, ms),
+  clearTimeout: (id: ReturnType<typeof setTimeout>) => clearTimeout(id),
 });
-Object.assign(globalThis, { window: fakeWindow, React });
+// The chat's outside-click and Escape handlers listen on the document.
+Object.assign(globalThis, { window: fakeWindow, document: new EventTarget(), WebSocket: FakeWebSocket, React });
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT =
   true;
 
 const requested: string[] = [];
 let agentsBody: unknown = { agents: [] };
+let agentsStatus = 200;
 globalThis.fetch = async (input) => {
   const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
   requested.push(url);
   if (url.endsWith("/api/agents/available")) {
     return new Response(JSON.stringify(agentsBody), {
-      status: 200,
+      status: agentsStatus,
       headers: { "Content-Type": "application/json" },
     });
   }
@@ -32,6 +59,7 @@ globalThis.fetch = async (input) => {
 const { setOidcSession } = await import("../lib/auth.ts");
 const { default: AgentsList } = await import("./AgentsList.tsx");
 const { default: AgentChat } = await import("./AgentChat.tsx");
+const { default: ChatWorkspace } = await import("./ChatWorkspace.tsx");
 const { MemoryRouter, Route, Routes } = await import("react-router-dom");
 
 const scoped: OidcSession = {
@@ -53,6 +81,10 @@ const settle = () =>
 function text(node: ReactTestInstance): string {
   return node.children.map((c) => (typeof c === "string" ? c : text(c))).join("");
 }
+
+const marked = (r: ReactTestRenderer, attr: string) =>
+  r.root.findAll((n) => typeof n.type === "string" && n.props[attr] !== undefined);
+const availableRequests = () => requested.filter((u) => u.endsWith("/api/agents/available"));
 
 let renderer: ReactTestRenderer | null = null;
 async function render(path: string, element: React.ReactElement, routePath: string) {
@@ -77,6 +109,8 @@ afterEach(async () => {
   renderer = null;
   setOidcSession(null);
   requested.length = 0;
+  agentsStatus = 200;
+  FakeWebSocket.instances.length = 0;
 });
 
 test("the agents page lists only the agents this account may use", async () => {
@@ -124,6 +158,8 @@ test("the chat route refuses an agent the account may not use, without opening a
     (n) => typeof n.type === "string" && n.props["data-not-available"] === "not-available",
   );
   assert.equal(notice.length, 1);
+  // A list that loaded is an answer: no load error or Retry.
+  assert.equal(marked(r, "data-agents-load-error").length, 0);
   assert.deepEqual(requested.map((u) => u.replace(/^.*\/api\//, "/api/")), [
     "/api/agents/available",
   ]);
@@ -138,4 +174,41 @@ test("a disabled agent is refused the same way", async () => {
       .length,
     1,
   );
+});
+
+test("a failed agent list shows a load error with Retry, not the refusal", async () => {
+  setOidcSession(scoped);
+  agentsStatus = 503;
+  agentsBody = { error: "temporarily unavailable" };
+  const r = await render("/agent/support", createElement(AgentChat), "/agent/:alias");
+  assert.equal(marked(r, "data-not-available").length, 0);
+  const notices = marked(r, "data-agents-load-error");
+  assert.equal(notices.length, 1);
+  const [notice] = notices;
+  assert.ok(notice);
+  assert.equal(marked(r, "data-agents-retry").length, 1);
+  assert.ok(text(notice).includes("Retry"));
+});
+
+test("Retry asks again and opens the chat once the list loads", async () => {
+  setOidcSession(scoped);
+  agentsStatus = 503;
+  agentsBody = { error: "temporarily unavailable" };
+  const r = await render("/agent/support", createElement(AgentChat), "/agent/:alias");
+  assert.equal(marked(r, "data-agents-load-error").length, 1);
+  assert.equal(r.root.findAllByType(ChatWorkspace).length, 0);
+
+  agentsStatus = 200;
+  agentsBody = { agents: [{ alias: "support", enabled: true }] };
+  const [retry] = marked(r, "data-agents-retry");
+  assert.ok(retry);
+  await act(async () => {
+    retry.props.onClick();
+  });
+  await settle();
+
+  assert.equal(availableRequests().length, 2);
+  assert.equal(marked(r, "data-agents-load-error").length, 0);
+  assert.equal(marked(r, "data-not-available").length, 0);
+  assert.equal(r.root.findAllByType(ChatWorkspace).length, 1);
 });

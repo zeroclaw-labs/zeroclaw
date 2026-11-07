@@ -16,7 +16,7 @@ import {
   parseCommand,
   type CommandSpec,
 } from '@/lib/slashCommands';
-import { Button } from '@/components/ui';
+import { Button, Card } from '@/components/ui';
 import { NotAvailable } from '@/components/auth/NotAvailable';
 import ChatWorkspace from '@/pages/ChatWorkspace';
 
@@ -91,10 +91,11 @@ export default function AgentChat() {
  * agents `/api/agents/available` lists. The gateway refuses any other agent
  * before the socket opens, which the browser would otherwise retry forever,
  * so an unlisted alias shows "not available" and stale tabs for other agents
- * are dropped.
+ * are dropped. A list that failed to load says nothing about the account's
+ * access, so it offers another try instead.
  */
 function ScopedChatWorkspace({ alias }: { alias: string }) {
-  const { loading, agents } = useAvailableAgents(true);
+  const { loading, agents, error, retry } = useAvailableAgents(true);
   const allowed = useMemo(
     () => new Set(agents.filter((a) => a.enabled).map((a) => a.alias)),
     [agents],
@@ -106,10 +107,37 @@ function ScopedChatWorkspace({ alias }: { alias: string }) {
       </div>
     );
   }
+  if (error !== null) {
+    return <AvailabilityLoadError error={error} onRetry={retry} />;
+  }
   if (!allowed.has(alias)) {
     return <NotAvailable access="not-available" />;
   }
   return <ChatWorkspace initialAlias={alias} allowedAliases={allowed} />;
+}
+
+/** The agents list failed to load: the error and a Retry, not a refusal. */
+function AvailabilityLoadError({ error, onRetry }: { error: string; onRetry: () => void }) {
+  return (
+    <div className="p-6">
+      <Card padded={false} className="p-6 w-full max-w-lg" data-agents-load-error="">
+        <div className="flex items-center gap-2 mb-2">
+          <AlertCircle className="h-5 w-5 shrink-0 text-status-error" />
+          <h2 className="text-lg font-semibold" style={{ color: 'var(--pc-text-primary)' }}>
+            {t('agent.availability_load_failed')}
+          </h2>
+        </div>
+        {error && (
+          <p className="text-sm mb-4 break-words" style={{ color: 'var(--pc-text-muted)' }}>
+            {error}
+          </p>
+        )}
+        <Button size="sm" onClick={onRetry} data-agents-retry="">
+          {t('common.retry')}
+        </Button>
+      </Card>
+    </div>
+  );
 }
 
 /** Status snapshot a chat pane pushes up to the workspace tab bar. */

@@ -1,4 +1,4 @@
-import { useEffect, useState, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useState, useSyncExternalStore } from 'react';
 import { getAvailableAgents, type AvailableAgent } from '@/lib/api';
 import { getOidcSession, subscribeOidcSession, type OidcSession } from '@/lib/auth';
 import { navAccessFor, type NavAccess } from '@/lib/navAccess';
@@ -23,8 +23,18 @@ export interface AvailableAgentsState {
   error: string | null;
 }
 
-/** `GET /api/agents/available`, loaded once per mount while `enabled`. */
-export function useAvailableAgents(enabled: boolean): AvailableAgentsState {
+export interface AvailableAgents extends AvailableAgentsState {
+  /** Requests the list again, for a load that failed. */
+  retry: () => void;
+}
+
+/**
+ * `GET /api/agents/available`, loaded on mount while `enabled` and again on
+ * each `retry`. A failed load leaves `agents` empty and sets `error`, so an
+ * empty list only means "none" when `error` is null.
+ */
+export function useAvailableAgents(enabled: boolean): AvailableAgents {
+  const [attempt, setAttempt] = useState(0);
   const [state, setState] = useState<AvailableAgentsState>({
     loading: enabled,
     agents: [],
@@ -50,6 +60,7 @@ export function useAvailableAgents(enabled: boolean): AvailableAgentsState {
     return () => {
       cancelled = true;
     };
-  }, [enabled]);
-  return state;
+  }, [enabled, attempt]);
+  const retry = useCallback(() => setAttempt((n) => n + 1), []);
+  return { ...state, retry };
 }
