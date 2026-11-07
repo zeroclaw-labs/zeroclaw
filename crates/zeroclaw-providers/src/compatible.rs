@@ -9959,6 +9959,7 @@ mod tests {
             let mut builder = OpenAiCompatibleModelProvider::builder("test")
                 .display_name("test")
                 .base_url(&url)
+                .auth_style(AuthStyle::Bearer)
                 .credential(Some("fixture-key"))
                 .timeout_secs(1)
                 .read_timeout_secs(3);
