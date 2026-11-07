@@ -169,6 +169,9 @@ pub enum RpcDenialReason {
     /// A principal that is not an administrator asked to trigger an agent
     /// cron job, which rebuilds its tools without the caller's restrictions.
     CronAgentPrincipalRequired,
+    /// A remote caller's steering message reached the running turn after the
+    /// session's transport ownership had moved to another connection.
+    SessionTransportOwnershipChanged,
 }
 
 impl RpcDenialReason {
@@ -204,6 +207,7 @@ impl RpcDenialReason {
             Self::SessionNotOwned => "session_not_owned",
             Self::SessionLocalCapabilities => "session_local_capabilities",
             Self::CronAgentPrincipalRequired => "cron_agent_principal_required",
+            Self::SessionTransportOwnershipChanged => "session_transport_ownership_changed",
         }
     }
 
@@ -236,7 +240,8 @@ impl RpcDenialReason {
             | Self::SopPrincipalCeilingRequired
             | Self::SopDefinitionUnreadable
             | Self::SessionNotOwned
-            | Self::CronAgentPrincipalRequired => FORBIDDEN,
+            | Self::CronAgentPrincipalRequired
+            | Self::SessionTransportOwnershipChanged => FORBIDDEN,
             // The client is told the job was not found, the answer a missing
             // job gets, so the refusal does not confirm that the job exists.
             Self::CronJobAgentNotEntitled => INVALID_PARAMS,
@@ -281,6 +286,9 @@ impl RpcDenialReason {
             Self::SessionNotOwned => "rpc-auth-session-not-owned",
             Self::SessionLocalCapabilities => "rpc-auth-session-local-capabilities",
             Self::CronAgentPrincipalRequired => "rpc-cron-agent-principal-required",
+            Self::SessionTransportOwnershipChanged => {
+                "rpc-auth-session-transport-ownership-changed"
+            }
         }
     }
 }
@@ -484,6 +492,10 @@ impl AuthDenied {
 
     pub(crate) fn cron_agent_principal_required() -> Self {
         Self::with_message(RpcDenialReason::CronAgentPrincipalRequired)
+    }
+
+    pub(crate) fn session_transport_ownership_changed() -> Self {
+        Self::with_message(RpcDenialReason::SessionTransportOwnershipChanged)
     }
 
     pub(crate) fn sop_definition_unreadable(name: &str) -> Self {
@@ -2535,6 +2547,7 @@ mod tests {
                 "session_not_owned",
                 "session_local_capabilities",
                 "cron_agent_principal_required",
+                "session_transport_ownership_changed",
             ]
         );
         let unique: std::collections::HashSet<&str> = identifiers.iter().copied().collect();
@@ -2668,6 +2681,11 @@ mod tests {
             RpcDenialReason::SopPrincipalCeilingRequired => {
                 (AuthDenied::sop_principal_ceiling_required(), FORBIDDEN, &[])
             }
+            RpcDenialReason::SessionTransportOwnershipChanged => (
+                AuthDenied::session_transport_ownership_changed(),
+                FORBIDDEN,
+                &[],
+            ),
             RpcDenialReason::CronAgentPrincipalRequired => {
                 (AuthDenied::cron_agent_principal_required(), FORBIDDEN, &[])
             }
@@ -2738,7 +2756,7 @@ mod tests {
         /// text the replaced literal produced for them.
         type WordingCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a str);
 
-        let cases: [WordingCase<'_>; 13] = [
+        let cases: [WordingCase<'_>; 14] = [
             (
                 "rpc-auth-grant-missing",
                 &[
@@ -2817,6 +2835,11 @@ mod tests {
                 "rpc-auth-session-local-capabilities",
                 &[],
                 "Remote caller cannot use this session's local capabilities",
+            ),
+            (
+                "rpc-auth-session-transport-ownership-changed",
+                &[],
+                "Session transport ownership changed",
             ),
         ];
         for (key, values, expected) in cases {

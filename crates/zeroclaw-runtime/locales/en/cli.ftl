@@ -181,6 +181,7 @@ cli-oidc-token-expiry = The token expires in { $seconds } seconds.
 cli-oidc-browser-open = Opening your browser to sign in. If nothing opens, visit:
     { $uri }
 cli-oidc-browser-waiting = Waiting for the browser sign-in to complete...
+cli-oidc-browser-start-failed = could not start sign-in
 cli-auth-list-about = List auth profiles
 cli-auth-status-about = Show auth status with active profile and token expiry info
 
@@ -709,7 +710,7 @@ cli-quickstart-terminal-too-narrow = Quickstart needs a terminal at least {$min_
 cli-quickstart-terminal-too-short = Quickstart needs a terminal at least {$min_height} rows tall; the current terminal is {$height} rows. Make the terminal taller and try again.
 cli-quickstart-terminal-resized = The terminal changed from {$initial_width}x{$initial_height} to {$current_width}x{$current_height} while the Quickstart checklist was open. Reopen the checklist to continue.
 cli-quickstart-empty-checklist = Quickstart cannot open an empty checklist.
-cli-quickstart-cancelled = Quickstart cancelled. No config written.
+cli-quickstart-cancelled = Quickstart cancelled. Nothing was configured.
 cli-quickstart-incomplete = {"  "}Not all selectors are filled yet.
 cli-quickstart-create-agent = ── Create agent
 cli-quickstart-create-agent-locked = ── Create agent (locked — fill every selector first)
@@ -1748,6 +1749,7 @@ rpc-auth-global-stream-scoped = Scoped principals cannot read the daemon-wide lo
 rpc-auth-sop-definition-unreadable = Principal may not replace or delete procedure { $name }: its definition cannot be loaded to check which agents it runs as
 rpc-auth-session-not-owned = Session not found or not owned by this principal
 rpc-auth-session-local-capabilities = Remote caller cannot use this session's local capabilities
+rpc-auth-session-transport-ownership-changed = Session transport ownership changed
 
 cron-agent-job-failed = The scheduled task could not be completed. Please try again or ask an administrator to check the logs.
 
