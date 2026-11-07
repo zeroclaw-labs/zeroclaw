@@ -7638,7 +7638,7 @@ fn relay_dashboard_bridge(
         &format!("{label}.{}", dashboard.domain),
         dashboard.port,
     )
-    .context("[relay.dashboard] domain and port must form the dashboard's HTTPS origin")?;
+    .with_context(|| qta("cli-relay-dashboard-bad-origin", &[]))?;
     ::zeroclaw_log::record!(
         WARN,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
@@ -18797,6 +18797,29 @@ mod tests {
             qta("cli-relay-dashboard-no-gateway", &[]),
             "[relay.dashboard] is enabled, but this build has no gateway to serve the dashboard. \
              Use a build with the `gateway` feature, or disable [relay.dashboard]."
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "agent-runtime", feature = "gateway"))]
+    fn relay_dashboard_bad_origin_error_resolves_to_its_catalogue_text() {
+        let key = ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+            .expect("generate an Ed25519 key");
+        let dashboard = zeroclaw_config::schema::RelayDashboardConfig {
+            enabled: true,
+            domain: "not a domain".into(),
+            port: 443,
+        };
+        let Err(error) = relay_dashboard_bridge(
+            &dashboard,
+            key.as_ref(),
+            zeroclaw_runtime::relay_dashboard::DashboardIngress::new(),
+        ) else {
+            panic!("a domain that is not a DNS name must not form a dashboard origin");
+        };
+        assert_eq!(
+            error.to_string(),
+            "[relay.dashboard] domain and port must form the dashboard's HTTPS origin"
         );
     }
 
