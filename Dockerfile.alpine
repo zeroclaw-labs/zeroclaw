@@ -4,7 +4,7 @@
 ARG ZEROCLAW_BASE_NODE_ALPINE=node:24-alpine3.23@sha256:e44c87c7dd212720eb00469aeac89504ca2be77b8f0d6dbffb30665d5fcc59e1
 # >>> end generated:base-arg-node-alpine <<<
 # >>> generated:base-arg-rust-alpine from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
-ARG ZEROCLAW_BASE_RUST_ALPINE=rust:1.98-alpine3.23@sha256:94a43bda4fd9b71fa3a74621c0982a646f83c7d1a3ba52bb4b7ddfd76d4dca93
+ARG ZEROCLAW_BASE_RUST_ALPINE=rust:1.99.1-alpine3.23@sha256:2a941e16ec6e357ff7112e92336087772584122b6ae4b30eb36cb9adff5b5458
 # >>> end generated:base-arg-rust-alpine <<<
 # >>> generated:base-arg-alpine from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
 ARG ZEROCLAW_BASE_ALPINE=alpine:3.23@sha256:85fe1e81d6758c208f3e1eed4338a1997e19d4be002d4dd32d3100c9a8c010a0

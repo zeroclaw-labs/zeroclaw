@@ -355,7 +355,10 @@ mod tests {
         let candidate =
             manifest("capabilities = [\"tool\"]\npermissions = []\npublisher_key = \"aa\"\n");
 
-        assert!(authority_increase(&installed, &candidate).is_empty());
+        assert_eq!(
+            authority_increase(&installed, &candidate),
+            Vec::<AuthorityItem>::new()
+        );
     }
 
     #[test]
@@ -375,7 +378,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["publisher:unsigned"]
         );
-        assert!(authority_increase(&installed, &installed).is_empty());
+        assert_eq!(
+            authority_increase(&installed, &installed),
+            Vec::<AuthorityItem>::new()
+        );
     }
 
     #[test]

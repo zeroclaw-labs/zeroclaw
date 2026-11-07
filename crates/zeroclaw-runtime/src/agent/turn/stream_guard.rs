@@ -146,7 +146,7 @@ fn has_call_shaped_top_level_key(value: &serde_json::Value) -> bool {
         serde_json::Value::Object(object) => object_has_key(object),
         serde_json::Value::Array(items) => items
             .iter()
-            .any(|item| item.as_object().is_some_and(&object_has_key)),
+            .any(|item| item.as_object().is_some_and(object_has_key)),
         _ => false,
     }
 }

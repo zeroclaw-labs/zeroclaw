@@ -23,8 +23,8 @@ arg = "ZEROCLAW_BASE_RUST_SLIM"
 registry = "dockerhub"
 repo = "library/rust"
 image_ref = "rust"
-tag = "1.98-slim"
-digest = "sha256:4cd829461bd5c4d511c32e269da9cb8929223b666519d8004e35fc8d1d771ab7"
+tag = "1.99.1-slim"
+digest = "sha256:1a939748a7cbab172de91a014e3804a97af1394a8c844faa67fce9401c4e40fb"
 
 [[image]]
 zone = "base-arg-rust-bookworm"
@@ -32,8 +32,8 @@ arg = "ZEROCLAW_BASE_RUST_BOOKWORM"
 registry = "dockerhub"
 repo = "library/rust"
 image_ref = "rust"
-tag = "1.98-bookworm"
-digest = "sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e"
+tag = "1.99.1-bookworm"
+digest = "sha256:48b7f435b8fc6378ce43b44f15e3a47fd8919b2825f835c39bd4bd3da50af5b8"
 
 [[image]]
 zone = "base-arg-debian"
@@ -68,8 +68,8 @@ arg = "ZEROCLAW_BASE_RUST_ALPINE"
 registry = "dockerhub"
 repo = "library/rust"
 image_ref = "rust"
-tag = "1.98-alpine3.23"
-digest = "sha256:94a43bda4fd9b71fa3a74621c0982a646f83c7d1a3ba52bb4b7ddfd76d4dca93"
+tag = "1.99.1-alpine3.23"
+digest = "sha256:2a941e16ec6e357ff7112e92336087772584122b6ae4b30eb36cb9adff5b5458"
 
 [[image]]
 zone = "base-arg-alpine"
