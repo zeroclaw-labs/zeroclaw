@@ -159,7 +159,8 @@ struct TuiIdentity {
 
 /// One of a dashboard session's [`MAX_LIVE_CONVERSATIONS`] places, and one
 /// of its account's [`ACCOUNT_CONVERSATIONS`], held from the moment a chat
-/// starts opening until its conversation is closed. The open and its
+/// starts opening until its conversation is closed and the core is done with
+/// every handshake the chat stopped waiting for. The open and its
 /// creation share it, so an open that goes away (a request timeout, say)
 /// leaves the place taken while the creation is still under way. A creation
 /// the chat stopped waiting for lets go of the session's place but keeps the
@@ -675,7 +676,9 @@ struct Closing {
     core_id: String,
     /// Held until the close is done, then dropped: the place stays taken
     /// while the conversation may still be live, and its account stays
-    /// charged if the close fails.
+    /// charged if the close fails. A renewal's handshake the core is still
+    /// verifying holds it too ([`CoreChat::renew`]). The close's own
+    /// handshakes need nothing more: it waits for each one.
     place: Place,
     stopping: Option<tokio::sync::watch::Receiver<bool>>,
     /// Ends the chat's expiry watch.
@@ -745,14 +748,22 @@ impl CoreChat {
     /// running on it ends normally. A second refusal ends the session.
     ///
     /// Signing out ends the session, not the token kept here, which may
-    /// still verify: the wait stops when the session ends. Closing the
-    /// conversation reconnects on its own ([`Redial`]), not through this.
+    /// still verify: the wait stops when the session ends. The handshake
+    /// holds the chat's place, as an open's does ([`Kept::Place`]), so a
+    /// renewal the wait gave up on keeps the place, and its account's
+    /// charge, until the core is done verifying, even once the conversation
+    /// is closed. Closing the conversation reconnects on its own
+    /// ([`Redial`]), not through this.
     pub(crate) async fn renew(&mut self) -> Result<(), CoreFailure> {
         let ended = self.ended();
+        let kept = self
+            .closing
+            .as_ref()
+            .map(|closing| Kept::Place(Arc::clone(&closing.place)));
         let fresh = tokio::select! {
             biased;
             () = ended.cancelled() => return Err(CoreFailure::SessionEnded),
-            fresh = self.caller.connect(&self.credential, Some(&self.identity), None) => {
+            fresh = self.caller.connect(&self.credential, Some(&self.identity), kept.as_ref()) => {
                 Arc::new(fresh?)
             }
         };
@@ -5977,5 +5988,86 @@ mod tests {
         fixture
             .assert_nothing_live("a chat closed after sign-out still closes its conversation")
             .await;
+    }
+
+    #[tokio::test]
+    async fn a_renewal_cut_short_by_sign_out_stays_charged_until_the_core_is_done_with_it() {
+        let fixture = Fixture::new().await;
+        let (_, session) = fixture.sign_in("alice").await;
+        let principal = session.principal().id.clone();
+        let caller = core_caller_for(&fixture, &session);
+        // What a chat holds: one of its session's places and one of its
+        // account's conversations.
+        let charged = || {
+            let account = fixture
+                .core
+                .accounts
+                .held
+                .lock()
+                .get(principal.as_str())
+                .map_or(0, |account| account.conversations);
+            (caller.binding.places_taken(), account)
+        };
+        let mut chat = caller.open_chat("support", None).await.expect("opens");
+        assert_eq!(charged(), (1, 1), "an open chat is charged");
+
+        // The chat's connection drops, so its rebind renews it. That
+        // handshake is held at the identity provider while the user signs
+        // out, and the renewal stops waiting for it.
+        chat.client.shutdown();
+        tokio::time::timeout(Duration::from_secs(5), chat.client.closed())
+            .await
+            .expect("the connection closes");
+        slow_introspections(&fixture, "alice", "chatters", HELD_HANDSHAKE, (1, 1)).await;
+        let before = introspections_of(&fixture._idp, "tok-alice").await;
+        let signing_out = async {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while introspections_of(&fixture._idp, "tok-alice").await <= before {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the renewal reaches the identity provider");
+            let held_from = std::time::Instant::now();
+            assert!(fixture.auth.end(&session), "sign-out");
+            held_from
+        };
+        let (renewed, held_from) = tokio::join!(chat.rebind(), signing_out);
+        assert!(
+            matches!(renewed, Err(CoreFailure::SessionEnded)),
+            "{renewed:?}"
+        );
+
+        // The close reconnects on its own and finishes while the core is
+        // still verifying the token the renewal presented.
+        chat.close().await;
+        fixture
+            .assert_nothing_live_within("the close finished", Duration::from_secs(1))
+            .await;
+        let after_close = charged();
+        let checked = held_from.elapsed();
+        assert!(
+            checked < HELD_HANDSHAKE / 2,
+            "checked only after the held handshake: {checked:?}"
+        );
+        assert_eq!(
+            after_close,
+            (1, 1),
+            "the charge was given back while the core still verified the renewal"
+        );
+
+        // Once the core is done with the renewal's connection, the charge
+        // comes back.
+        let returned = tokio::time::timeout(HELD_HANDSHAKE + Duration::from_secs(10), async {
+            while charged() != (0, 0) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            returned.is_ok(),
+            "still charged after the core finished: {:?}",
+            charged()
+        );
     }
 }
