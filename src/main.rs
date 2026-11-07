@@ -7615,6 +7615,57 @@ fn ca_key_protection_from_env() -> zeroclaw_tls::CaKeyProtection {
     zeroclaw_tls::CaKeyProtection::from_env()
 }
 
+/// The relay bridge's half of `[relay.dashboard]`: the origin the relay
+/// serves this daemon's dashboard at, from the registration key's label, and
+/// the ingress its connections are handed to. `None` when it is off.
+///
+/// Logs the address and the redirect URI to register with the identity
+/// provider, and warns that this one relay route is not end-to-end.
+#[cfg(feature = "agent-runtime")]
+fn relay_dashboard_bridge(
+    dashboard: &zeroclaw_config::schema::RelayDashboardConfig,
+    signing_key_pkcs8: &[u8],
+    ingress: zeroclaw_runtime::relay_dashboard::DashboardIngress,
+) -> Result<Option<zeroclaw_runtime::relay::DashboardBridge>> {
+    if !dashboard.enabled {
+        return Ok(None);
+    }
+    if cfg!(not(feature = "gateway")) {
+        bail!(
+            "[relay.dashboard] is enabled, but this build has no gateway to serve the dashboard. \
+             Use a build with the `gateway` feature, or disable [relay.dashboard]."
+        );
+    }
+    let label = zeroclaw_runtime::relay::dashboard_label(signing_key_pkcs8)?;
+    let origin = zeroclaw_runtime::relay_dashboard::DashboardOrigin::new(
+        &format!("{label}.{}", dashboard.domain),
+        dashboard.port,
+    )
+    .context("[relay.dashboard] domain and port must form the dashboard's HTTPS origin")?;
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            ::serde_json::json!({
+                "dashboard": format!("{}/", origin.origin()),
+                "redirect_uri": format!("{}/oidc/callback", origin.origin()),
+            })
+        ),
+        "relay dashboard: serving the dashboard through the relay. This route is NOT \
+         end-to-end: the relay ends the browser's TLS, so its operator can read and change \
+         this dashboard's traffic, including session cookies and any token a page shows, and \
+         act as a signed-in user. Native clients through the relay stay end-to-end. Register \
+         redirect_uri exactly with the identity provider, and list this daemon in the relay's \
+         [dashboard] allow."
+    );
+    Ok(Some(zeroclaw_runtime::relay::DashboardBridge {
+        ingress,
+        origin,
+        // Inside the bridge's 256: enough for a few browsers (about six
+        // connections each), and never all of the native clients' slots.
+        max_conns: 64,
+    }))
+}
+
 /// Resolve the WSS mTLS policy without conflating the auto-CA and BYO-CA modes.
 ///
 /// The WSS plane is always mTLS. `enabled` controls only whether the configured
@@ -10833,8 +10884,13 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     _ => None,
                 };
 
+                // Where the relay bridge hands a relay-served dashboard's browser
+                // connections to the gateway (`[relay.dashboard]`): in process,
+                // so they never arrive as loopback peers.
+                let dashboard_ingress = zeroclaw_runtime::relay_dashboard::DashboardIngress::new();
                 #[cfg(feature = "gateway")]
                 registry.register_gateway(Box::new({
+                    let dashboard_ingress = dashboard_ingress.clone();
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
                     let sop_dh = sop_driver_supervisor
@@ -10855,7 +10911,24 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                         let sop_audit = sop_a.clone();
                         let sop_driver_handles = sop_dh.clone();
                         let plugin_webhooks = Arc::clone(&plugin_webhooks);
+                        // Only a generation whose config serves the dashboard
+                        // through the relay takes its connections.
+                        let dashboard_ingress = config
+                            .relay
+                            .dashboard
+                            .enabled
+                            .then(|| dashboard_ingress.clone());
                         Box::pin(async move {
+                            let supervision = zeroclaw_gateway::GatewaySupervision::new(
+                                ready_tx,
+                                plugin_webhooks,
+                                authority,
+                                sop_driver_handles,
+                            );
+                            let supervision = match dashboard_ingress {
+                                Some(ingress) => supervision.with_dashboard_ingress(ingress),
+                                None => supervision,
+                            };
                             Box::pin(zeroclaw_gateway::run_gateway_with_plugin_webhooks(
                                 &host,
                                 port,
@@ -10867,12 +10940,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                                 sop_engine,
                                 sop_audit,
                                 daemon_authority,
-                                zeroclaw_gateway::GatewaySupervision::new(
-                                    ready_tx,
-                                    plugin_webhooks,
-                                    authority,
-                                    sop_driver_handles,
-                                ),
+                                supervision,
                             ))
                             .await
                         })
@@ -11127,6 +11195,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 // inner mTLS terminates; it never decrypts anything.
                 registry.register_relay(Box::new(move |ctx, cancel, _client_count| {
                     let enroll_bridge_ports_for_bridge = enroll_bridge_ports_for_bridge.clone();
+                    let dashboard_ingress = dashboard_ingress.clone();
                     Box::pin(async move {
                         let (relay_cfg, wss_cfg, enroll_cfg, data_dir) = {
                             let cfg = ctx.config.read();
@@ -11184,6 +11253,11 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                         } else {
                             relay_cfg.relay_host.clone()
                         };
+                        let dashboard = relay_dashboard_bridge(
+                            &relay_cfg.dashboard,
+                            &signing_key_pkcs8,
+                            dashboard_ingress,
+                        )?;
                         // Rotation is permitted only for an auto-minted id (a
                         // pinned [relay].node_id is fixed).
                         let rotation_allowed = relay_cfg.node_id.trim().is_empty();
@@ -11216,6 +11290,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                             data_dir: data_dir.clone(),
                             node_id_rotation_days,
                             rotation_allowed,
+                            dashboard,
                         };
                         zeroclaw_runtime::relay::run_relay_bridge(bridge_cfg, cancel).await
                     })

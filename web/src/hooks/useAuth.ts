@@ -75,6 +75,8 @@ export interface AuthState {
   session: OidcSession | null;
   /** Sign-in providers to offer. Empty when sign-in is off and in the desktop app. */
   providers: OidcMethod[];
+  /** The dashboard is reached through a relay that can read this session. */
+  viaRelay: boolean;
   /** The session expires within two minutes. */
   expiryWarning: boolean;
   /** The session expired; the page stays until the user signs in again. */
@@ -116,6 +118,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
   const [session, setSession] = useState<OidcSession | null>(getOidcSession);
   const [providers, setProviders] = useState<OidcMethod[]>([]);
   const [providersKnown, setProvidersKnown] = useState(false);
+  const [viaRelay, setViaRelay] = useState(false);
   const [expiryWarning, setExpiryWarning] = useState(false);
   const [reauthRequired, setReauthRequired] = useState(false);
   const [reauthPending, setReauthPending] = useState(false);
@@ -158,13 +161,32 @@ export function AuthProvider({ children }: AuthProviderProps) {
   // On mount: decide between a stored pairing token, an open gateway, a
   // signed-in session and the sign-in screen.
   useEffect(() => {
-    if (checkAuth()) return; // already have a token, no need to check
     let cancelled = false;
+    if (checkAuth()) {
+      // A stored token needs no sign-in check, but the page still has to say
+      // when a relay carries this connection, so ask only that.
+      if (!isTauri()) {
+        fetchAuthMethods()
+          .then((methods) => {
+            if (!cancelled && methods?.via_relay) setViaRelay(true);
+          })
+          .catch(() => {
+            // The notice stays off; nothing else depends on this answer.
+          });
+      }
+      return () => {
+        cancelled = true;
+      };
+    }
     resolveInitialAuth({
       hasToken: false,
       desktop: isTauri(),
       getHealth: getPublicHealth,
-      getMethods: () => fetchAuthMethods(),
+      getMethods: () =>
+        fetchAuthMethods().then((methods) => {
+          if (methods?.via_relay) setViaRelay(true);
+          return methods;
+        }),
       getSession: () => fetchAuthSession(),
     })
       .then((initial) => {
@@ -206,6 +228,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
       .then((methods) => {
         if (cancelled) return;
         if (methods) setProviders(methods.oidc);
+        if (methods?.via_relay) setViaRelay(true);
         setProvidersKnown(true);
       })
       .catch(() => {
@@ -445,6 +468,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     mode: session ? 'oidc' : 'pairing',
     session,
     providers,
+    viaRelay,
     expiryWarning,
     reauthRequired,
     reauthPending,

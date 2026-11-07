@@ -1599,7 +1599,12 @@ pub async fn layer(
     if request.headers().contains_key(header::AUTHORIZATION) {
         return next.run(request).await;
     }
-    let https = crate::api_oidc::request_is_https(&layer.state, request.headers());
+    let via_relay = request
+        .extensions()
+        .get::<crate::relay_ingress::ViaRelay>()
+        .cloned();
+    let https =
+        crate::api_oidc::request_is_https(&layer.state, request.headers(), via_relay.as_ref());
     let scope = CookieScope {
         https,
         path_prefix: &layer.state.path_prefix,
@@ -1613,10 +1618,18 @@ pub async fn layer(
     if layer.auth.is_retired() {
         return crate::gateway_restarting(request.version());
     }
-    // A Host that isn't a plain authority leaves no own origin to check
-    // against, so the request is refused as coming from another origin.
-    let checked = match crate::api_oidc::request_authority(request.headers()) {
-        Some(host) => check_origin(request.method(), request.headers(), &origin_of(https, host)),
+    // Through a relay-served dashboard the own origin is that dashboard's,
+    // fixed. Otherwise it is built from the Host, and a Host that isn't a
+    // plain authority leaves no own origin to check against, so the
+    // request is refused as coming from another origin.
+    let own_origin = match &via_relay {
+        Some(via_relay) => Some(via_relay.origin().to_string()),
+        None => {
+            crate::api_oidc::request_authority(request.headers()).map(|host| origin_of(https, host))
+        }
+    };
+    let checked = match own_origin {
+        Some(own_origin) => check_origin(request.method(), request.headers(), &own_origin),
         None => Err(SessionRejection::Origin),
     };
     let caller = match checked {
@@ -2790,6 +2803,169 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    // ── Through a relay-served dashboard ─────────────────────────────
+
+    const RELAY_HOST: &str = "abc.relay.example";
+    const RELAY_ORIGIN: &str = "https://abc.relay.example";
+
+    /// A request on a connection a relay forwarded for the dashboard at
+    /// [`RELAY_HOST`]: the browser's address, admitted as the accept loop
+    /// admits it.
+    fn relay_request(method: &str, path: &str, headers: &[(&str, &str)]) -> HttpRequest<Body> {
+        let mut builder = HttpRequest::builder()
+            .method(method)
+            .uri(path)
+            .header("host", RELAY_HOST);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let mut request = builder.body(Body::empty()).unwrap();
+        request.extensions_mut().insert(ConnectInfo(remote()));
+        crate::relay_ingress::RelayConnection::new(
+            zeroclaw_runtime::relay_dashboard::DashboardOrigin::new(RELAY_HOST, 443).unwrap(),
+        )
+        .admit(&mut request)
+        .expect("a request for the relay dashboard is admitted");
+        request
+    }
+
+    #[tokio::test]
+    async fn a_relay_served_dashboard_signs_in_at_its_own_https_origin() {
+        let server = idp(&["admins"], "gw").await;
+        // The gateway's own listener is plain HTTP; the browser's TLS ended
+        // at the relay.
+        let fixture = fixture(sign_in_config(&server.uri()));
+
+        let response = send(
+            &fixture.router,
+            relay_request("GET", "/auth/sign-in/corp?return=/chat", &[]),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        let location = response.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            query_param(&location, "redirect_uri"),
+            "https%3A%2F%2Fabc.relay.example%2Foidc%2Fcallback",
+            "the callback is the dashboard's origin"
+        );
+        let binding_cookie = set_cookies(&response)
+            .into_iter()
+            .find(|c| c.starts_with(&format!("__Host-{BINDING_COOKIE_STEM}")))
+            .expect("a __Host- binding cookie at the HTTPS root");
+        assert!(binding_cookie.contains("; Secure"), "{binding_cookie}");
+        assert!(binding_cookie.contains("Path=/;"), "{binding_cookie}");
+        let (binding_name, rest) = binding_cookie.split_once('=').unwrap();
+        let binding = rest.split(';').next().unwrap().to_string();
+
+        mount_token(&server, &query_param(&location, "nonce"), true).await;
+        let cookie = format!("{binding_name}={binding}");
+        let response = send(
+            &fixture.router,
+            relay_request(
+                "GET",
+                &format!(
+                    "/oidc/callback?state={}&code=c1",
+                    query_param(&location, "state")
+                ),
+                &[("cookie", &cookie)],
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let session_cookie = set_cookies(&response)
+            .into_iter()
+            .find(|c| c.starts_with(HOST_SESSION_COOKIE))
+            .expect("a __Host- session cookie");
+        assert!(session_cookie.contains("; Secure"), "{session_cookie}");
+        let session = cookie_from(&response, HOST_SESSION_COOKIE).unwrap();
+        let cookie = format!("{HOST_SESSION_COOKIE}={session}");
+
+        let response = send(
+            &fixture.router,
+            relay_request(
+                "GET",
+                "/api/auth/session",
+                &[("cookie", &cookie), ("sec-fetch-site", "same-origin")],
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let csrf = json(response).await["csrf_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Another relay-served dashboard is same-site, so only the exact
+        // origin tells them apart.
+        for foreign in [
+            "https://xyz.relay.example",
+            "http://abc.relay.example",
+            "https://abc.relay.example:8443",
+        ] {
+            let response = send(
+                &fixture.router,
+                relay_request(
+                    "POST",
+                    "/auth/sign-out",
+                    &[
+                        ("cookie", &cookie),
+                        ("origin", foreign),
+                        (CSRF_HEADER, &csrf),
+                    ],
+                ),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{foreign}");
+            assert_eq!(json(response).await["reason"], "origin", "{foreign}");
+        }
+        let response = send(
+            &fixture.router,
+            relay_request(
+                "POST",
+                "/auth/sign-out",
+                &[
+                    ("cookie", &cookie),
+                    ("origin", RELAY_ORIGIN),
+                    (CSRF_HEADER, &csrf),
+                ],
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn a_relay_forwarded_request_does_not_count_as_this_machine() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        // Even naming a loopback host and a forwarded loopback address, a
+        // request a relay forwarded is the browser's, and the relay
+        // admission refuses it before routing.
+        let mut request = HttpRequest::builder()
+            .uri("/auth/sign-in/corp")
+            .header("host", "localhost")
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(remote()));
+        let refusal = crate::relay_ingress::RelayConnection::new(
+            zeroclaw_runtime::relay_dashboard::DashboardOrigin::new(RELAY_HOST, 443).unwrap(),
+        )
+        .admit(&mut request)
+        .unwrap_err();
+        assert_eq!(refusal.status(), StatusCode::MISDIRECTED_REQUEST);
+        // Admitted for its own host, it still has the browser's address,
+        // so the sign-in it starts is billed to that browser.
+        let response = send(
+            &fixture.router,
+            relay_request("GET", "/auth/sign-in/corp", &[]),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
     }
 
     // ── The store ────────────────────────────────────────────────────
