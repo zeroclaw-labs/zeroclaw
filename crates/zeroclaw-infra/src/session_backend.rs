@@ -439,6 +439,44 @@ pub trait SessionBackend: Send + Sync {
     fn list_stuck_sessions(&self, _threshold_secs: u64) -> Vec<SessionMetadata> {
         Vec::new()
     }
+
+    /// Store a peer-to-peer session message event.
+    /// Returns `Ok(())` if the message was persisted, or an error if storage failed.
+    fn store_session_message(
+        &self,
+        _message: &zeroclaw_api::session_message::SessionMessage,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Load all messages sent from a session.
+    fn load_sent_messages(
+        &self,
+        _session_key: &str,
+    ) -> Vec<zeroclaw_api::session_message::SessionMessage> {
+        Vec::new()
+    }
+
+    /// Load all messages received by a session.
+    fn load_received_messages(
+        &self,
+        _session_key: &str,
+    ) -> Vec<zeroclaw_api::session_message::SessionMessage> {
+        Vec::new()
+    }
+
+    /// Load pending (not yet admitted) messages for a session.
+    fn load_pending_messages(
+        &self,
+        _session_key: &str,
+    ) -> Vec<zeroclaw_api::session_message::SessionMessage> {
+        Vec::new()
+    }
+
+    /// Mark a message as admitted by the receiver.
+    fn mark_message_admitted(&self, _delivery_id: &str) -> std::io::Result<bool> {
+        Ok(false)
+    }
 }
 
 /// Session state information.
