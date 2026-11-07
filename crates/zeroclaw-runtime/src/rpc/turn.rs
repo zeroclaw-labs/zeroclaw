@@ -146,6 +146,9 @@ where
     let cancel_clone = cancel.clone();
     let session_key = attribution.session_key.clone();
 
+    // Capture injected_from_session before spawn: task-locals don't cross boundaries.
+    let injected_from = crate::tools::sessions_prompt::current_injected_from_session();
+
     let turn_handle = zeroclaw_spawn::spawn!(async move {
         // Held inside the task body so the connection stays counted until this
         // task's future is actually dropped. An abort requested by the caller
@@ -167,7 +170,9 @@ where
             });
         }
         let sk = attribution.session_key.clone();
-        crate::agent::loop_::scope_session_key(attribution.session_key, async move {
+        // Re-scope the injected-from origin around the turn body.
+        crate::tools::sessions_prompt::scope_injected_from_session(injected_from, async move {
+            crate::agent::loop_::scope_session_key(attribution.session_key, async move {
             use ::zeroclaw_log::Instrument as _;
             let span = ::zeroclaw_log::info_span!(
                 target: "zeroclaw_log_internal_scope",
@@ -191,6 +196,8 @@ where
                         .instrument(span),
                 )
                 .await
+            })
+            .await
         })
         .await
     });
