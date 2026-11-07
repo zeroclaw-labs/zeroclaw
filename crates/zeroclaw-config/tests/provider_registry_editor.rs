@@ -3,8 +3,7 @@ use zeroclaw_config::provider_registry::editor::{RegistryEdit, snapshot, stage};
 use zeroclaw_config::schema::Config;
 
 fn config() -> Config {
-    let mut config = Config::default();
-    config.providers = toml::from_str(
+    let providers = toml::from_str(
         r#"
 [connections."gateway.prod"]
 kind = "custom"
@@ -26,6 +25,10 @@ model = "model-two"
 "#,
     )
     .unwrap();
+    let mut config = Config {
+        providers,
+        ..Config::default()
+    };
     config
         .providers
         .models
