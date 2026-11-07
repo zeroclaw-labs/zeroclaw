@@ -1032,6 +1032,51 @@ impl PairingGuard {
         count
     }
 
+    /// Run a credential revocation once the config writer gate is held, and
+    /// return its result with the held gate so the caller persists the token
+    /// set under it.
+    ///
+    /// `config_writer` admits the caller to the process-wide config writer
+    /// mutex: the daemon passes its live-config authority's
+    /// `begin_config_commit()`. Nothing changes until it resolves, and if it
+    /// refuses (the daemon generation is closing) nothing changes at all.
+    ///
+    /// A connection authenticated by a paired token is checked for liveness
+    /// under that mutex before a guarded write, and the write holds it until
+    /// it commits. A revocation that takes the mutex first is ordered against
+    /// every such write: one that checked first commits before the token
+    /// goes, and one that checks after sees it gone.
+    ///
+    /// `revoke` is synchronous and runs as soon as the gate is held. It does
+    /// the whole revocation: it removes any durable record that names the
+    /// credential, such as a device row, and removes the token from the live
+    /// set through the guard it is handed. Nothing can be awaited between
+    /// the two, so a caller dropped at any point, a timed-out request for
+    /// one, has either changed nothing (it was still waiting for the gate)
+    /// or changed both. Only the persist that follows can be cut short, and
+    /// that leaves the token revoked in memory.
+    pub async fn revoke_under_config_write_lock<G, E, T>(
+        &self,
+        config_writer: impl std::future::Future<Output = Result<G, E>>,
+        revoke: impl FnOnce(&Self) -> T,
+    ) -> Result<(T, G), E> {
+        let gate = config_writer.await?;
+        Ok((revoke(self), gate))
+    }
+
+    /// [`Self::revoke_under_config_write_lock`] for a bare token hash, with no
+    /// durable record to remove alongside it.
+    pub async fn revoke_token_hash_ordered<G, E>(
+        &self,
+        config_writer: impl std::future::Future<Output = Result<G, E>>,
+        token_hash: &str,
+    ) -> Result<(bool, G), E> {
+        self.revoke_under_config_write_lock(config_writer, |pairing| {
+            pairing.revoke_token_hash(token_hash)
+        })
+        .await
+    }
+
     /// Generate a new pairing code that pairs an additional client.
     /// Does not revoke existing tokens. To rotate a compromised token,
     /// pair with `revoke_token`/`revoke_token_hash` + a config persist pass.
