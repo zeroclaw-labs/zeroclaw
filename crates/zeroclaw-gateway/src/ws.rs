@@ -358,10 +358,27 @@ where
     S: SinkExt<Message> + Unpin,
 {
     let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
-    // Pin the alias incarnation the claim below decides under. A committed
-    // delete or rename advances the generation, so a socket that waited for its
-    // first frame across such a change can be refused before it restores or
-    // runs a transcript it loaded under the previous incarnation.
+    // Hold lifecycle admission for the short window in which this handshake
+    // reads the incarnation, claims the session, and loads its transcript.
+    // A committed delete advances the alias generation before its cleanup
+    // clears the stored ownership; without this reservation a handshake that
+    // started inside that window would capture the *new* generation, still
+    // claim the old owner, and load the previous incarnation's transcript.
+    // The later first-frame comparison would pass because recreating the alias
+    // does not advance the generation again. The reservation is released
+    // before the socket waits for its first frame.
+    let admission = match state.agent_lifecycle.reserve_admission(agent_alias) {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            return Err(serde_json::json!({
+                "type": "error",
+                "message": error.to_string(),
+                "code": "AGENT_LIFECYCLE_UNAVAILABLE"
+            }));
+        }
+    };
+    // With the reservation held, delete cannot begin and the generation
+    // cannot advance, so this is the incarnation the claim below runs under.
     let handshake_generation = state.agent_lifecycle.alias_generation(agent_alias);
     let mut resumed = false;
     let mut message_count = 0usize;
@@ -406,6 +423,9 @@ where
             effective_name = backend.get_session_name(&session_key).unwrap_or(None);
         }
     }
+    // The claim and history load are complete; do not hold the deletion fence
+    // across the greeting write or the first-frame wait.
+    drop(admission);
     let mut session_start = serde_json::json!({
         "type": "session_start",
         "session_id": session_id,
@@ -821,7 +841,16 @@ async fn handle_socket(
     {
         Ok(hs) => hs,
         Err(frame) => {
+            // The setup reservation can refuse before the greeting when the
+            // alias is already being deleted or its generation is closing.
+            // Send the error, then close like the post-frame admission refusal
+            // so a client sees the same reconnect signal on either path.
+            let lifecycle_refusal = frame.get("code").and_then(|code| code.as_str())
+                == Some("AGENT_LIFECYCLE_UNAVAILABLE");
             let _ = sender.send(Message::Text(frame.to_string().into())).await;
+            if lifecycle_refusal {
+                close_for_reconnect(&mut sender, &mut receiver, "agent lifecycle changed").await;
+            }
             return;
         }
     };
@@ -3967,6 +3996,20 @@ data: {\"type\":\"message_stop\"}\n\n",
             (client, session_start)
         }
 
+        /// Open a chat socket without assuming the first frame is a greeting.
+        /// The setup reservation refuses before `session_start` when the alias
+        /// is already being deleted.
+        async fn connect_unchecked(&self, session_id: &str) -> WsClient {
+            let (client, _) = connect_async(format!(
+                // This URL connects only to the test's loopback listener.
+                "ws://{}/ws/chat?agent=web&session_id={session_id}", // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
+                self.gateway_addr
+            ))
+            .await
+            .expect("WebSocket upgrade");
+            client
+        }
+
         /// Send a chat message and block until the provider fixture holds the
         /// turn's streaming request, i.e. the turn is provably in flight.
         /// Returns that request body.
@@ -4994,12 +5037,13 @@ data: {\"type\":\"message_stop\"}\n\n",
             .begin_delete("web")
             .expect("nothing blocks the delete");
 
-        // The agent is built on the first frame; with a delete in progress it
-        // cannot be, so there is no socket to keep for a retry.
-        let (mut client, _) = fixture.connect("setup-refused").await;
-        send_chat(&mut client, "hello").await;
+        // The setup reservation sees the in-progress delete, so the handshake
+        // is refused before the greeting; there is no socket to keep for a
+        // retry.
+        let mut client = fixture.connect_unchecked("setup-refused").await;
 
         let refusal = next_text_frame(&mut client).await;
+        assert_eq!(refusal["type"], "error");
         assert_eq!(refusal["code"], "AGENT_LIFECYCLE_UNAVAILABLE");
         let (code, reason) = next_close_frame(&mut client).await;
         assert_eq!(code, WS_CLOSE_GOING_AWAY);
@@ -7728,6 +7772,86 @@ data: {\"type\":\"message_stop\"}\n\n",
             "the pre-greeting snapshot must not create the old workspace"
         );
 
+        server.abort();
+    }
+
+    /// A committed delete advances the alias generation before its cleanup
+    /// clears the stored ownership. A handshake that started inside that
+    /// window must not claim and load the previous incarnation's transcript:
+    /// it holds an admission reservation, so the in-flight delete is visible
+    /// and the socket is refused before any greeting.
+    #[tokio::test]
+    async fn handshake_refuses_while_the_alias_deletion_is_pending() {
+        use zeroclaw_config::multi_agent::MemoryBackendKind;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+
+        let tmp = tempfile::TempDir::new().expect("temporary config root");
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).expect("test data directory");
+        let mut agent = AliasedAgentConfig::default();
+        agent.memory.backend = MemoryBackendKind::None;
+        config.agents.insert("web".to_string(), agent);
+
+        let backend = zeroclaw_infra::make_session_backend(tmp.path(), "sqlite")
+            .expect("sqlite session backend");
+        let key = format!("{GW_SESSION_PREFIX}pending-delete");
+        backend
+            .set_session_agent_alias(&key, "web")
+            .expect("seed owner");
+        backend
+            .append(
+                &key,
+                &zeroclaw_api::model_provider::ChatMessage::user("old transcript"),
+            )
+            .expect("seed transcript");
+
+        let mut state = crate::api::tests::test_state(config);
+        state.session_backend = Some(backend);
+
+        // The config mutation has committed (the generation advanced), but the
+        // cleanup that clears stored ownership has not run yet. Keep the lease
+        // alive so `deleting` stays set for the window under test.
+        let mut deletion = state
+            .agent_lifecycle
+            .begin_delete("web")
+            .expect("delete reservation");
+        deletion.commit_destructive_mutation();
+
+        let app = Router::new()
+            .route("/ws/chat", get(handle_ws_chat))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test listener");
+        let address = listener.local_addr().expect("test listener address");
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test gateway server");
+        });
+
+        let scheme = "ws";
+        let (mut socket, _) = connect_async(format!(
+            "{scheme}://{address}/ws/chat?agent=web&session_id=pending-delete"
+        ))
+        .await
+        .expect("chat WebSocket upgrade");
+
+        let first = tokio::time::timeout(Duration::from_secs(1), socket.next())
+            .await
+            .expect("first frame timeout")
+            .expect("first frame")
+            .expect("first frame transport");
+        let json: serde_json::Value =
+            serde_json::from_str(&first.into_text().expect("text frame")).expect("JSON frame");
+        assert_eq!(json["type"], "error");
+        assert_eq!(json["code"], "AGENT_LIFECYCLE_UNAVAILABLE");
+
+        drop(deletion);
         server.abort();
     }
 }
