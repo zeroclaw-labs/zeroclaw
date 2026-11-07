@@ -7631,10 +7631,7 @@ fn relay_dashboard_bridge(
         return Ok(None);
     }
     if cfg!(not(feature = "gateway")) {
-        bail!(
-            "[relay.dashboard] is enabled, but this build has no gateway to serve the dashboard. \
-             Use a build with the `gateway` feature, or disable [relay.dashboard]."
-        );
+        bail!(qta("cli-relay-dashboard-no-gateway", &[]));
     }
     let label = zeroclaw_runtime::relay::dashboard_label(signing_key_pkcs8)?;
     let origin = zeroclaw_runtime::relay_dashboard::DashboardOrigin::new(
@@ -18791,6 +18788,16 @@ mod tests {
             }
             other => panic!("expected ACP command, got {other:?}"),
         }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn relay_dashboard_no_gateway_error_resolves_to_its_catalogue_text() {
+        assert_eq!(
+            qta("cli-relay-dashboard-no-gateway", &[]),
+            "[relay.dashboard] is enabled, but this build has no gateway to serve the dashboard. \
+             Use a build with the `gateway` feature, or disable [relay.dashboard]."
+        );
     }
 
     #[test]
