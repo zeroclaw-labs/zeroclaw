@@ -2,7 +2,6 @@
     test,
     feature = "channel-discord",
     feature = "channel-lark",
-    feature = "channel-matrix",
     feature = "channel-signal",
     feature = "channel-slack",
     feature = "channel-telegram"
@@ -18,7 +17,6 @@ use std::{collections::HashMap, sync::Arc};
     test,
     feature = "channel-discord",
     feature = "channel-lark",
-    feature = "channel-matrix",
     feature = "channel-signal",
     feature = "channel-slack",
     feature = "channel-telegram"
@@ -32,7 +30,6 @@ pub(crate) struct PendingApprovalGuard<V: Send + 'static> {
     test,
     feature = "channel-discord",
     feature = "channel-lark",
-    feature = "channel-matrix",
     feature = "channel-signal",
     feature = "channel-slack",
     feature = "channel-telegram"
@@ -64,7 +61,6 @@ impl<V: Send + 'static> PendingApprovalGuard<V> {
     test,
     feature = "channel-discord",
     feature = "channel-lark",
-    feature = "channel-matrix",
     feature = "channel-signal",
     feature = "channel-slack",
     feature = "channel-telegram"
@@ -710,10 +706,7 @@ pub(crate) fn build_approve_deny_approval_prompt(
     arguments_summary: &str,
     position: Option<(u32, u32)>,
 ) -> String {
-    let position_line = approval_position_line(position);
-    let heading = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-heading-shout");
-    let tool_label = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-tool-label");
-    let args_label = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-args-label");
+    let header = build_approval_prompt_header(token, tool_name, arguments_summary, position);
     let approve_command = format!("{token} {APPROVAL_REPLY_APPROVE}");
     let deny_command = format!("{token} {APPROVAL_REPLY_DENY}");
     let always_command = format!("{token} {APPROVAL_REPLY_ALWAYS}");
@@ -725,14 +718,29 @@ pub(crate) fn build_approve_deny_approval_prompt(
             ("always_command", always_command.as_str()),
         ],
     );
+    format!("{header}\n\n{reply}")
+}
+
+/// Heading, position, tool and arguments lines of a Matrix approval prompt,
+/// without the reply instruction.
+#[cfg(any(feature = "channel-matrix", test))]
+pub(crate) fn build_approval_prompt_header(
+    token: &str,
+    tool_name: &str,
+    arguments_summary: &str,
+    position: Option<(u32, u32)>,
+) -> String {
+    let position_line = approval_position_line(position);
+    let heading = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-heading-shout");
+    let tool_label = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-tool-label");
+    let args_label = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-args-label");
     format!(
-        "{heading} [{token}]\n{position_line}{tool_label}: {tool_name}\n{args_label}: {arguments_summary}\n\n{reply}"
+        "{heading} [{token}]\n{position_line}{tool_label}: {tool_name}\n{args_label}: {arguments_summary}"
     )
 }
 
 #[cfg(any(
     feature = "channel-discord",
-    feature = "channel-matrix",
     feature = "channel-signal",
     feature = "channel-slack",
     feature = "channel-telegram",
@@ -777,7 +785,6 @@ impl PendingApprovalResolution {
 
 #[cfg(any(
     feature = "channel-discord",
-    feature = "channel-matrix",
     feature = "channel-signal",
     feature = "channel-slack",
     test
@@ -802,7 +809,6 @@ pub(crate) async fn resolve_pending_approval(
 
 #[cfg(any(
     feature = "channel-discord",
-    feature = "channel-matrix",
     feature = "channel-signal",
     feature = "channel-slack",
     feature = "channel-telegram",
