@@ -71,16 +71,53 @@ test("after sign-out the screen says the provider session may remain", () => {
   assert.ok(ended.includes("Your session has ended."));
 });
 
-test("through a relay the screen says the relay can read the session", () => {
-  const relayed = (providers: OidcMethod[]) =>
-    renderToStaticMarkup(
-      createElement(SignInScreen, { onPair, providers, onSignIn: () => {}, notice: null, viaRelay: true }),
-    );
-  for (const providers of [[corp], []]) {
-    const html = relayed(providers);
+test("through a relay the screen offers sign-in alone, never pairing", async () => {
+  const relayed = (providers: OidcMethod[], notice: SignOutNotice | null = null) =>
+    createElement(SignInScreen, { onPair, providers, onSignIn: () => {}, notice, viaRelay: true });
+  for (const providers of [[corp, okta], [corp], []]) {
+    const html = renderToStaticMarkup(relayed(providers));
     assert.equal(count(html, "data-relay-notice"), 1);
     assert.ok(html.includes("its operator can read and change this session"));
+    // No pairing form, code or divider leading to one.
+    assert.equal(count(html, "<form"), 0);
+    assert.equal(count(html, "<input"), 0);
+    assert.equal(count(html, "pairing code"), 0);
+    assert.equal(count(html, "pairing status"), 0);
+    assert.equal(count(html, "or pair this browser"), 0);
+    assert.equal(count(html, "data-signin-provider="), providers.length);
+    // With no provider, the screen says sign-in is missing instead.
+    assert.equal(count(html, "data-relay-no-sign-in"), providers.length === 0 ? 1 : 0);
   }
+  assert.ok(
+    renderToStaticMarkup(relayed([])).includes("configured for this relay"),
+  );
+  const ended = renderToStaticMarkup(relayed([corp], { kind: "session-ended" }));
+  assert.ok(ended.includes("Your session has ended."));
+  assert.equal(count(ended, "<input"), 0);
+
+  // Mounted, it asks the gateway for no pairing code either.
+  const asked: string[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (input: RequestInfo | URL) => {
+    asked.push(String(input));
+    return new Response("", { status: 404 });
+  };
+  try {
+    for (const providers of [[corp], []]) {
+      let renderer: ReactTestRenderer | undefined;
+      await act(async () => {
+        renderer = create(relayed(providers));
+      });
+      await act(async () => {
+        renderer!.unmount();
+      });
+    }
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  assert.deepEqual(asked, []);
+
+  // A direct connection is unchanged: no relay notice.
   assert.equal(count(render([corp]), "data-relay-notice"), 0);
   assert.equal(count(render([]), "data-relay-notice"), 0);
 });
