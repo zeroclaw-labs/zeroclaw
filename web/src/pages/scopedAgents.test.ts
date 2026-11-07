@@ -212,3 +212,28 @@ test("Retry asks again and opens the chat once the list loads", async () => {
   assert.equal(marked(r, "data-not-available").length, 0);
   assert.equal(r.root.findAllByType(ChatWorkspace).length, 1);
 });
+
+test("a failed agents page load shows the error with Retry, not an empty list", async () => {
+  setOidcSession(scoped);
+  agentsStatus = 503;
+  agentsBody = { error: "temporarily unavailable" };
+  const r = await render("/agents", createElement(AgentsList), "/agents");
+  assert.equal(text(r.root).includes("No agents are available to your account."), false);
+  assert.equal(marked(r, "data-agents-load-error").length, 1);
+
+  agentsStatus = 200;
+  agentsBody = { agents: [{ alias: "support", enabled: true }] };
+  const [retry] = marked(r, "data-agents-retry");
+  assert.ok(retry);
+  await act(async () => {
+    retry.props.onClick();
+  });
+  await settle();
+
+  assert.equal(availableRequests().length, 2);
+  assert.equal(marked(r, "data-agents-load-error").length, 0);
+  assert.deepEqual(
+    marked(r, "data-available-agent").map((n) => n.props["data-available-agent"]),
+    ["support"],
+  );
+});

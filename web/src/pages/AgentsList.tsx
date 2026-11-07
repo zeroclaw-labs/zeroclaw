@@ -21,10 +21,11 @@ export default function AgentsList() {
 /**
  * The agents a signed-in account without the operator dashboard may chat with
  * (`/api/agents/available`). Configuration, cost and memory belong to the
- * operator pages, so a row here only opens the chat.
+ * operator pages, so a row here only opens the chat. A failed load shows its
+ * error and Retry, not the empty list it leaves behind.
  */
 function AvailableAgentsList() {
-  const { loading, agents, error } = useAvailableAgents(true);
+  const { loading, agents, error, retry } = useAvailableAgents(true);
   return (
     <div className="p-6 max-w-6xl mx-auto">
       <PageHeader
@@ -33,10 +34,16 @@ function AvailableAgentsList() {
         description={t('agents_list.available_description')}
       />
 
-      {error && (
-        <div className="mb-4 px-4 py-3 rounded-[var(--radius-md)] border border-status-error/20 bg-status-error/10 text-status-error flex items-start gap-2 text-sm">
+      {error !== null && (
+        <div
+          data-agents-load-error=""
+          className="mb-4 px-4 py-3 rounded-[var(--radius-md)] border border-status-error/20 bg-status-error/10 text-status-error flex items-start gap-2 text-sm"
+        >
           <AlertCircle className="h-4 w-4 flex-shrink-0 mt-0.5" />
-          <span>{error}</span>
+          <span className="flex-1">{error || t('agents_list.load_failed')}</span>
+          <Button size="sm" variant="ghost" onClick={retry} data-agents-retry="">
+            {t('common.retry')}
+          </Button>
         </div>
       )}
 
@@ -44,7 +51,7 @@ function AvailableAgentsList() {
         <div className="rounded-[var(--radius-lg)] border border-pc-border bg-pc-surface p-8 text-center text-sm text-pc-text-muted">
           {t('common.loading')}
         </div>
-      ) : agents.length === 0 ? (
+      ) : error !== null ? null : agents.length === 0 ? (
         <div className="rounded-[var(--radius-lg)] border border-dashed border-pc-border bg-pc-surface p-12 text-center">
           <div className="h-12 w-12 rounded-[var(--radius-lg)] mx-auto mb-4 flex items-center justify-center bg-pc-accent/10">
             <Bot className="h-6 w-6 text-pc-accent" />
