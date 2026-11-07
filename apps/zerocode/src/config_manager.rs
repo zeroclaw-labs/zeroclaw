@@ -4697,7 +4697,7 @@ impl App {
                 let result = async {
                     let candidate: serde_json::Value = serde_json::from_str(&self.edit_buf)?;
                     let expected = self.registry_editor_snapshot.as_ref().ok_or_else(|| {
-                        anyhow::anyhow!("provider registry editor has no loaded baseline")
+                        anyhow::Error::msg("provider registry editor has no loaded baseline")
                     })?;
                     self.rpc.set_provider_registry(expected, &candidate).await
                 }
