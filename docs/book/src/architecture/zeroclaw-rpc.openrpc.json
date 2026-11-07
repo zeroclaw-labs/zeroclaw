@@ -3774,7 +3774,7 @@
         "type": "object"
       },
       "SessionRunOnceParams": {
-        "description": "`session/run-once` params: create a session, run one prompt, and\nclose the session, in one call. The turn streams `session/update`\nnotifications like `session/prompt`; the response carries the final\nresult.",
+        "description": "`session/run-once` params: create a session, run one prompt, and\nclose the session, in one call. The turn streams `session/update`\nnotifications like `session/prompt`; the response carries the final\nresult. Requires `sessions:create`, `sessions:execute`, and\n`sessions:update` (for close). If cleanup is refused after a completed\nturn, the response reports that failure; the turn is not replayed.",
         "properties": {
           "agent_alias": {
             "type": "string"
