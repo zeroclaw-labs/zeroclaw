@@ -440,10 +440,12 @@ fn collect_unowned(
         }
         // Trust a positive metadata count (sqlite tracks it in the column);
         // a zero/absent count is not reliable (JSONL hard-codes 0), so fall
-        // back to a real load to keep the empty/non-empty decision exact.
+        // back to a verified load to keep the empty/non-empty decision exact.
+        // `try_load` (not `load`) so a transcript that cannot be read is an
+        // error instead of an empty history that silently omits the session.
         let msgs = match counts.remove(&key) {
             Some(n) if n > 0 => n,
-            _ => backend.load(&key).len(),
+            _ => backend.try_load(&key)?.len(),
         };
         if msgs == 0 {
             continue;
@@ -467,12 +469,23 @@ mod tests {
     /// but supports `get_session_agent_alias` and `set_session_agent_alias`.
     struct UnsupportedBackend {
         sessions: Mutex<HashMap<String, SessionData>>,
+        unreadable: Mutex<bool>,
     }
 
     impl UnsupportedBackend {
         fn new() -> Self {
             Self {
                 sessions: Mutex::new(HashMap::new()),
+                unreadable: Mutex::new(false),
+            }
+        }
+
+        /// A backend whose transcripts cannot be read, used to prove the
+        /// listing path propagates the failure instead of treating it as empty.
+        fn new_unreadable() -> Self {
+            Self {
+                sessions: Mutex::new(HashMap::new()),
+                unreadable: Mutex::new(true),
             }
         }
 
@@ -484,6 +497,16 @@ mod tests {
                 .0
                 .push(ChatMessage::user("hello"));
         }
+
+        /// Register a session key with no readable messages, so the listing
+        /// path has to consult `try_load` to decide whether it is empty.
+        fn seed_key_only(&self, key: &str) {
+            self.sessions
+                .lock()
+                .unwrap()
+                .entry(key.to_string())
+                .or_insert_with(|| (vec![], None));
+        }
     }
 
     impl SessionBackend for UnsupportedBackend {
@@ -494,6 +517,13 @@ mod tests {
                 .get(session_key)
                 .map(|(msgs, _)| msgs.clone())
                 .unwrap_or_default()
+        }
+
+        fn try_load(&self, session_key: &str) -> std::io::Result<Vec<ChatMessage>> {
+            if *self.unreadable.lock().unwrap() {
+                return Err(std::io::Error::other("mock: transcript cannot be read"));
+            }
+            Ok(self.load(session_key))
         }
 
         fn append(&self, _session_key: &str, _message: &ChatMessage) -> std::io::Result<()> {
@@ -587,6 +617,26 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("alice")
+        );
+    }
+
+    /// Test 4: an unreadable transcript must fail the listing instead of being
+    /// silently treated as an empty session (which would omit it from the
+    /// migration set and under-report the count).
+    #[test]
+    fn list_propagates_an_unreadable_transcript() {
+        let backend = UnsupportedBackend::new_unreadable();
+        backend.seed_key_only("gw_unreadable");
+
+        let err = collect_unowned(&backend).expect_err("unreadable transcript must error");
+        let propagated = err.chain().any(|cause| {
+            cause
+                .to_string()
+                .contains("mock: transcript cannot be read")
+        });
+        assert!(
+            propagated,
+            "the read error must propagate to the listing caller, got: {err:#}"
         );
     }
 }

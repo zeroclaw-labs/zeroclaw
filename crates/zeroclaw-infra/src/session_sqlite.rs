@@ -16,6 +16,75 @@ use zeroclaw_api::model_provider::ChatMessage;
 /// the database.
 const OPEN_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Test-only rendezvous used to hold a claim between its history probe and its
+/// owner write, while its write transaction is open. Production builds compile
+/// this module out and the call site is `#[cfg(test)]`.
+#[cfg(test)]
+mod claim_gate {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
+
+    pub(super) struct Gate {
+        reached: Mutex<bool>,
+        resume: Condvar,
+    }
+
+    fn gates() -> &'static Mutex<HashMap<String, Arc<Gate>>> {
+        static GATES: OnceLock<Mutex<HashMap<String, Arc<Gate>>>> = OnceLock::new();
+        GATES.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(super) fn install(key: &str) -> Arc<Gate> {
+        let gate = Arc::new(Gate {
+            reached: Mutex::new(false),
+            resume: Condvar::new(),
+        });
+        gates()
+            .lock()
+            .expect("claim gate registry poisoned")
+            .insert(key.to_string(), Arc::clone(&gate));
+        gate
+    }
+
+    pub(super) fn remove(key: &str) {
+        gates()
+            .lock()
+            .expect("claim gate registry poisoned")
+            .remove(key);
+    }
+
+    pub(super) fn wait_reached(gate: &Gate) {
+        let mut reached = gate.reached.lock().expect("claim gate poisoned");
+        while !*reached {
+            reached = gate.resume.wait(reached).expect("claim gate poisoned");
+        }
+    }
+
+    pub(super) fn release(gate: &Gate) {
+        let mut reached = gate.reached.lock().expect("claim gate poisoned");
+        *reached = false;
+        gate.resume.notify_all();
+    }
+
+    /// Block the claiming thread until the test releases the gate.
+    pub(super) fn pause(key: &str) {
+        let gate = gates()
+            .lock()
+            .expect("claim gate registry poisoned")
+            .get(key)
+            .cloned();
+        let Some(gate) = gate else {
+            return;
+        };
+        let mut reached = gate.reached.lock().expect("claim gate poisoned");
+        *reached = true;
+        gate.resume.notify_all();
+        while *reached {
+            reached = gate.resume.wait(reached).expect("claim gate poisoned");
+        }
+    }
+}
+
 /// SQLite-backed session store with FTS5 and WAL mode.
 pub struct SqliteSessionBackend {
     conn: Mutex<Connection>,
@@ -1836,66 +1905,131 @@ impl SessionBackend for SqliteSessionBackend {
             Some(ref owner) if owner != agent_alias => Ok(ClaimOutcome::Conflict(owner.clone())),
             Some(_) => Ok(ClaimOutcome::Claimed),
             None => {
-                // No owner recorded yet. If the session already carries
-                // transcript history, ordinary claim MUST NOT adopt it — the
-                // first claimant would silently read another agent's history.
-                // Return `NeedsMigration` so the handler refuses to load and
-                // the trusted migration CLI can adopt via
-                // `adopt_session_agent_alias` after operator preflight.
-                let has_history: bool = conn
-                    .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_key = ?1)",
-                        params![session_key],
-                        |row| row.get::<_, i64>(0).map(|n| n != 0),
-                    )
+                // The session has no recorded owner, so claiming it needs a
+                // write. Take the database write lock so the history probe and
+                // the conditional owner write share one atomic unit with any
+                // concurrent append / delete on an independent connection.
+                // Without it, an append that lands between the probe and the
+                // fresh `INSERT` leaves the transcript in place while the
+                // `INSERT` still succeeds, so the claimant would read another
+                // party's history as its own. (`busy_timeout` set at open makes
+                // this wait through a competing writer.)
+                conn.execute_batch("BEGIN IMMEDIATE")
                     .map_err(std::io::Error::other)?;
-                if has_history {
-                    return Ok(ClaimOutcome::NeedsMigration);
-                }
-                // Empty new session. Insert the row if missing, and set the
-                // owner only when the row is still ownerless. The `WHERE`
-                // clause applies to the `ON CONFLICT DO UPDATE` branch alone,
-                // so it re-checks the ownerless-and-no-transcript preconditions
-                // for an existing metadata row in the same statement the owner
-                // is written. A fresh `INSERT` conflicts with nothing and
-                // carries no history predicate of its own: an append that
-                // creates the row concurrently is caught by the re-read below,
-                // which reports the conflict instead of silently claiming it.
-                let now = Utc::now().to_rfc3339();
-                let affected = conn
-                    .execute(
-                        "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count, agent_alias)
-                         VALUES (?1, ?2, ?3, 0, ?4)
-                         ON CONFLICT(session_key) DO UPDATE SET agent_alias = excluded.agent_alias
-                         WHERE session_metadata.agent_alias IS NULL
-                           AND NOT EXISTS (SELECT 1 FROM sessions WHERE session_key = excluded.session_key)",
-                        params![session_key, now, now, agent_alias],
-                    )
-                    .map_err(std::io::Error::other)?;
-                if affected == 0 {
-                    // The guarded write was skipped: a conflicting owner or a
-                    // transcript appeared after the probe. Re-read to tell
-                    // exactly which precondition broke.
-                    let state: Option<(String, bool)> = conn
+                // Decide everything inside one closure so any error rolls back
+                // the transaction instead of leaving it dangling on the
+                // connection (a later BEGIN would then fail as nested).
+                let outcome: std::io::Result<ClaimOutcome> = (|| {
+                    // Re-probe the owner under the write lock; a concurrent
+                    // claimant may have won between the outer read and the
+                    // lock. COALESCE normalizes the NULL ownerless cell so
+                    // reading it never surfaces an InvalidColumnType error.
+                    let owner_now: Option<String> = conn
                         .query_row(
-                            "SELECT COALESCE(agent_alias, ''),
-                                    EXISTS(SELECT 1 FROM sessions WHERE session_key = ?1)
+                            "SELECT COALESCE(agent_alias, '')
                              FROM session_metadata WHERE session_key = ?1",
                             params![session_key],
-                            |row| Ok((row.get(0)?, row.get(1)?)),
+                            |row| row.get(0),
                         )
                         .optional()
                         .map_err(std::io::Error::other)?;
-                    match state {
-                        Some((owner, _)) if !owner.is_empty() => Ok(ClaimOutcome::Conflict(owner)),
-                        Some((_, true)) => Ok(ClaimOutcome::NeedsMigration),
-                        // Ownerless and empty (or the metadata row was deleted
-                        // concurrently): nothing to attach, treat as claimed.
-                        Some((_, false)) | None => Ok(ClaimOutcome::Claimed),
+                    match owner_now {
+                        Some(owner) if !owner.is_empty() && owner != agent_alias => {
+                            Ok(ClaimOutcome::Conflict(owner))
+                        }
+                        Some(owner) if owner == agent_alias => Ok(ClaimOutcome::Claimed),
+                        _ => {
+                            // Still unowned. If the session already carries
+                            // transcript history, ordinary claim MUST NOT adopt
+                            // it — the first claimant would silently read
+                            // another agent's history. Return `NeedsMigration`
+                            // so the handler refuses to load and the trusted
+                            // migration CLI can adopt via
+                            // `adopt_session_agent_alias` after operator
+                            // preflight.
+                            let has_history: bool = conn
+                                .query_row(
+                                    "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_key = ?1)",
+                                    params![session_key],
+                                    |row| row.get::<_, i64>(0).map(|n| n != 0),
+                                )
+                                .map_err(std::io::Error::other)?;
+                            if has_history {
+                                return Ok(ClaimOutcome::NeedsMigration);
+                            }
+                            // Test-only: hold the claim here, after the probe
+                            // and before the owner write, so a regression test
+                            // can prove a concurrent writer is fenced out by
+                            // the open `BEGIN IMMEDIATE` transaction.
+                            #[cfg(test)]
+                            claim_gate::pause(session_key);
+                            // Empty new session. Insert the row if missing, and
+                            // set the owner only when the row is still
+                            // ownerless. The `WHERE` clause applies to the
+                            // `ON CONFLICT DO UPDATE` branch alone, so it
+                            // re-checks the ownerless-and-no-transcript
+                            // preconditions for an existing metadata row in the
+                            // same statement the owner is written.
+                            let now = Utc::now().to_rfc3339();
+                            let affected = conn
+                                .execute(
+                                    "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count, agent_alias)
+                                     VALUES (?1, ?2, ?3, 0, ?4)
+                                     ON CONFLICT(session_key) DO UPDATE SET agent_alias = excluded.agent_alias
+                                     WHERE session_metadata.agent_alias IS NULL
+                                       AND NOT EXISTS (SELECT 1 FROM sessions WHERE session_key = excluded.session_key)",
+                                    params![session_key, now, now, agent_alias],
+                                )
+                                .map_err(std::io::Error::other)?;
+                            if affected == 0 {
+                                // Defensive: the guarded write was skipped even
+                                // under the write lock. Re-read to report the
+                                // precondition that broke rather than claiming a
+                                // session whose state we did not write.
+                                let state: Option<(String, bool)> = conn
+                                    .query_row(
+                                        "SELECT COALESCE(agent_alias, ''),
+                                                EXISTS(SELECT 1 FROM sessions WHERE session_key = ?1)
+                                         FROM session_metadata WHERE session_key = ?1",
+                                        params![session_key],
+                                        |row| Ok((row.get(0)?, row.get(1)?)),
+                                    )
+                                    .optional()
+                                    .map_err(std::io::Error::other)?;
+                                match state {
+                                    Some((owner, _)) if !owner.is_empty() => {
+                                        Ok(ClaimOutcome::Conflict(owner))
+                                    }
+                                    Some((_, true)) => Ok(ClaimOutcome::NeedsMigration),
+                                    // Ownerless and empty (or the metadata row
+                                    // was deleted): nothing to attach, treat as
+                                    // claimed.
+                                    Some((_, false)) | None => Ok(ClaimOutcome::Claimed),
+                                }
+                            } else {
+                                Ok(ClaimOutcome::Claimed)
+                            }
+                        }
                     }
-                } else {
-                    Ok(ClaimOutcome::Claimed)
+                })();
+                // Close the transaction on every path without `?`: returning
+                // early here would leave it open on this shared connection, and
+                // the next writer would fail with "cannot start a transaction
+                // within a transaction".
+                let closing = match &outcome {
+                    Ok(ClaimOutcome::Claimed) => conn.execute_batch("COMMIT"),
+                    Ok(ClaimOutcome::Conflict(_)) | Ok(ClaimOutcome::NeedsMigration) | Err(_) => {
+                        conn.execute_batch("ROLLBACK")
+                    }
+                };
+                if let Err(e) = closing {
+                    // A failed COMMIT leaves the claim unapplied. Unwind so the
+                    // connection is not left inside a transaction, then report
+                    // the failure rather than a half-applied claim.
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return Err(std::io::Error::other(e));
                 }
+                outcome
             }
         }
     }
@@ -4425,6 +4559,50 @@ mod tests {
         assert_eq!(
             backend.get_session_agent_alias(foreign).unwrap(),
             Some("mallory".to_string())
+        );
+    }
+
+    /// A claim must make its empty-history decision and its owner write one
+    /// atomic unit. While the claim holds `BEGIN IMMEDIATE`, a second
+    /// connection must not be able to insert the first transcript row between
+    /// the probe and the owner write.
+    #[test]
+    fn claim_holds_the_write_lock_across_its_history_probe() {
+        use crate::session_backend::ClaimOutcome;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let key = "claim_write_lock";
+        let gate = claim_gate::install(key);
+
+        std::thread::scope(|scope| {
+            let claim = scope.spawn(|| backend.claim_session_agent_alias(key, "alice").unwrap());
+            claim_gate::wait_reached(&gate);
+
+            // The claim is parked after its history probe and still inside its
+            // transaction. A writer on another connection with no busy wait
+            // must be refused rather than land between the probe and the write.
+            let db = rusqlite::Connection::open(tmp.path().join("sessions/sessions.db")).unwrap();
+            db.busy_timeout(std::time::Duration::ZERO).unwrap();
+            let now = Utc::now().to_rfc3339();
+            let denied = db.execute(
+                "INSERT INTO sessions (session_key, role, content, created_at)
+                 VALUES (?1, 'user', 'foreign', ?2)",
+                rusqlite::params![key, now],
+            );
+
+            claim_gate::release(&gate);
+            let outcome = claim.join().unwrap();
+            assert_eq!(outcome, ClaimOutcome::Claimed);
+            assert!(
+                denied.is_err(),
+                "a concurrent writer must be fenced out while the claim transaction is open"
+            );
+        });
+
+        claim_gate::remove(key);
+        assert_eq!(
+            backend.get_session_agent_alias(key).unwrap(),
+            Some("alice".to_string())
         );
     }
 }

@@ -982,6 +982,13 @@ async fn handle_socket(
         return;
     }
 
+    // Re-read the live config after the first-frame wait. The snapshot taken
+    // before the greeting can be stale by now: a reload during the wait may
+    // have moved the agent's workspace, and the cwd resolved below is installed
+    // as `policy.workspace_dir` on the agent built from current config. Resolve
+    // it from the same generation of config the agent is about to read.
+    let config = state.config.read().clone();
+
     let session_cwd = match resolve_ws_session_cwd(requested_cwd.as_deref(), &config, &agent_alias)
     {
         Ok(cwd) => cwd,
@@ -7619,5 +7626,108 @@ data: {\"type\":\"message_stop\"}\n\n",
         let err = gate_ws_session_claim("new", "default", &backend)
             .expect_err("even empty session on an unsupported backend must be rejected");
         assert_eq!(err_code(&err), "BACKEND_UNSUPPORTED_OWNERSHIP");
+    }
+
+    /// A socket that waited for its first frame must resolve the working
+    /// directory from the config published while it waited, not from the
+    /// pre-greeting snapshot. Otherwise a reload that moves the agent's
+    /// workspace leaves the turn running in the old directory.
+    #[tokio::test]
+    async fn socket_resolves_workspace_from_config_published_while_waiting() {
+        use zeroclaw_config::multi_agent::MemoryBackendKind;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+
+        let tmp = tempfile::TempDir::new().expect("temporary config root");
+        let mut config = Config {
+            data_dir: tmp.path().join("before-reload"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).expect("test data directory");
+        let stale_workspace = tmp.path().join("before-reload-workspace");
+        let reloaded_workspace = tmp.path().join("after-reload-workspace");
+        let mut agent = AliasedAgentConfig::default();
+        agent.memory.backend = MemoryBackendKind::None;
+        agent.workspace.path = Some(stale_workspace.clone());
+        config.agents.insert("web".to_string(), agent);
+
+        let backend = zeroclaw_infra::make_session_backend(tmp.path(), "sqlite")
+            .expect("sqlite session backend");
+        let mut state = crate::api::tests::test_state(config);
+        state.session_backend = Some(backend);
+
+        let app = Router::new()
+            .route("/ws/chat", get(handle_ws_chat))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test listener");
+        let address = listener.local_addr().expect("test listener address");
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test gateway server");
+        });
+
+        let scheme = "ws";
+        let (mut socket, _) = connect_async(format!(
+            "{scheme}://{address}/ws/chat?agent=web&session_id=workspace-reload"
+        ))
+        .await
+        .expect("chat WebSocket upgrade");
+
+        // Greeting first: the socket now holds its claimed identity and is
+        // waiting for the first client frame.
+        let greeting = tokio::time::timeout(Duration::from_secs(1), socket.next())
+            .await
+            .expect("session_start timeout")
+            .expect("session_start frame")
+            .expect("session_start transport");
+        let json: serde_json::Value =
+            serde_json::from_str(&greeting.into_text().expect("text frame")).expect("JSON frame");
+        assert_eq!(json["type"], "session_start");
+
+        // Publish a config that moves the agent's workspace while the socket
+        // waits. Nothing has resolved the workspace yet.
+        state.publish_test_config(|config| {
+            config
+                .agents
+                .get_mut("web")
+                .expect("web agent")
+                .workspace
+                .path = Some(reloaded_workspace.clone());
+        });
+        let live_workspace = state.config.read().agent_workspace_dir("web");
+        assert_ne!(live_workspace, stale_workspace);
+        assert!(!live_workspace.exists());
+        assert!(!stale_workspace.exists());
+
+        // The first frame ends the wait; the cwd must come from the live
+        // config the agent is about to use.
+        socket
+            .send(ClientMessage::Text(
+                serde_json::json!({"type": "connect"}).to_string().into(),
+            ))
+            .await
+            .expect("send connect frame");
+
+        let mut created = false;
+        for _ in 0..100 {
+            if live_workspace.exists() {
+                created = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            created,
+            "the socket must resolve the workspace from the config published while it waited"
+        );
+        assert!(
+            !stale_workspace.exists(),
+            "the pre-greeting snapshot must not create the old workspace"
+        );
+
+        server.abort();
     }
 }
