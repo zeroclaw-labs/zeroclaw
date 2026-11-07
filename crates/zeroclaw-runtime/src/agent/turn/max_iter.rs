@@ -95,6 +95,7 @@ pub(crate) async fn finish_after_max_iterations(
     crumb_present: &mut bool,
     reported_usage: Option<super::ReportedRequestUsage>,
     observer: &dyn crate::observability::Observer,
+    vision_source: Option<super::VisionProviderSource<'_>>,
 ) -> Result<String> {
     let exhaustion = limit.explanation();
     ::zeroclaw_log::record!(
@@ -154,6 +155,7 @@ pub(crate) async fn finish_after_max_iterations(
             model,
             dispatch_model,
             security,
+            vision_source,
             knobs.provider_attempt_allowlist.as_deref(),
         )
         .await?;
@@ -342,11 +344,17 @@ pub(crate) async fn finish_after_max_iterations(
                     );
                 }
                 if floor {
+                    // The summary call is tools-free, so the schemas cost nothing here.
                     return Err(super::context_window_exceeded_error(
                         (provider_name, &selected_model),
                         context_limits,
                         tokens,
                         token_counter.source(),
+                        (
+                            crate::agent::history::estimate_history_tokens(&messages),
+                            crate::agent::history::estimate_system_floor_tokens(&messages),
+                            0,
+                        ),
                     ));
                 }
                 break;
@@ -689,6 +697,7 @@ mod graceful_summary_metering_tests {
             &mut false,
             None,
             &crate::observability::NoopObserver,
+            None,
         )
         .await
     }
@@ -1056,6 +1065,7 @@ mod graceful_summary_metering_tests {
                 &mut crumb_present,
                 None,
                 &crate::observability::NoopObserver,
+                None,
             )
             .await;
             assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -1205,6 +1215,7 @@ mod graceful_summary_metering_tests {
                 &mut crumb_present,
                 None,
                 &crate::observability::NoopObserver,
+                None,
             )
             .await
             .expect("graceful summary succeeds");
@@ -1279,6 +1290,7 @@ mod graceful_summary_metering_tests {
                 &mut crumb_present,
                 None,
                 &crate::observability::NoopObserver,
+                None,
             )
             .await
             .expect_err("summary prompt must be included in the floor decision");
@@ -1367,6 +1379,7 @@ mod graceful_summary_metering_tests {
             &mut false,
             None,
             &crate::observability::NoopObserver,
+            None,
         )
         .await
         .expect("graceful summary should succeed");
@@ -1450,6 +1463,7 @@ mod graceful_summary_metering_tests {
             &mut false,
             None,
             &crate::observability::NoopObserver,
+            None,
         )
         .await
         .expect("graceful summary should succeed");
@@ -1548,6 +1562,7 @@ mod graceful_summary_metering_tests {
             &mut false,
             None,
             &crate::observability::NoopObserver,
+            None,
         )
         .await
         .expect("graceful summary should succeed");
@@ -1629,6 +1644,7 @@ mod graceful_summary_metering_tests {
             &mut false,
             None,
             &crate::observability::NoopObserver,
+            None,
         )
         .await
         .expect("graceful summary should succeed");
@@ -1720,6 +1736,7 @@ mod graceful_summary_metering_tests {
             &mut false,
             None,
             &crate::observability::NoopObserver,
+            None,
         )
         .await
         .expect("graceful summary should succeed");
@@ -1774,6 +1791,7 @@ mod graceful_summary_metering_tests {
             &mut false,
             None,
             &crate::observability::NoopObserver,
+            None,
         )
         .await
         .expect("graceful summary should succeed");
@@ -1860,6 +1878,7 @@ mod graceful_summary_metering_tests {
             &mut false,
             None,
             &crate::observability::NoopObserver,
+            None,
         )
         .await
         .expect("graceful summary should succeed");
@@ -1949,6 +1968,7 @@ mod graceful_summary_metering_tests {
             &mut false,
             None,
             &crate::observability::NoopObserver,
+            None,
         )
         .await
         .expect("graceful summary should succeed");

@@ -786,11 +786,19 @@ pub async fn run_with_authority(
     // gateway serves /pair, rotation, and revocation from THIS instance
     // and the RPC native auth provider verifies against it, so a pairing
     // change reaches both surfaces immediately (no boot-time snapshot).
-    let pairing_guard = std::sync::Arc::new(zeroclaw_config::pairing::PairingGuard::new(
-        config.gateway.require_pairing,
-        &config.gateway.paired_tokens,
-        config.gateway.pairing_code,
-    ));
+    // Code lifetime and brute-force limits are read from this generation's
+    // live `[gateway.pairing_dashboard]` on every use, for /pair and
+    // certificate enrollment alike.
+    let pairing_guard = std::sync::Arc::new(
+        zeroclaw_config::pairing::PairingGuard::new(
+            config.gateway.require_pairing,
+            &config.gateway.paired_tokens,
+            config.gateway.pairing_code,
+        )
+        .with_live_limits(zeroclaw_config::pairing::PairingLimits::live(
+            live_config_authority.live_handle(),
+        )),
+    );
 
     // One inbound-auth state for this daemon generation. The RPC context
     // and the supervised gateway authenticate against the same accepted
@@ -999,11 +1007,16 @@ pub async fn run_with_authority(
                 }
             });
         }
-        let session_backend = zeroclaw_infra::make_session_backend(
-            &config.data_dir,
-            &config.channels.session_backend,
+        let session_backend = open_rpc_session_backend(
+            || {
+                zeroclaw_infra::make_session_backend(
+                    &config.data_dir,
+                    &config.channels.session_backend,
+                )
+            },
+            RPC_SESSION_STORE_RETRY_DELAY,
         )
-        .ok();
+        .await;
 
         // Wire the memory subsystem so `memory/list` and `memory/search`
         // work over RPC transports (same pattern as the gateway).
@@ -1129,6 +1142,16 @@ pub async fn run_with_authority(
     } else {
         None
     };
+
+    // Close remote sessions whose client has been gone for
+    // `wss.orphaned_session_timeout_secs`, so they do not hold the live
+    // session map until a restart.
+    if let Some(ctx) = rpc_ctx.as_ref() {
+        handles.push(crate::rpc::orphans::spawn_orphan_retirement(
+            ctx,
+            channels_cancel.clone(),
+        ));
+    }
 
     // Local IPC RPC listener (Unix socket on Unix, Named Pipe on Windows).
     if let Some(socket_start) = registry.take_socket_start() {
@@ -1748,6 +1771,53 @@ fn settle_exit_against_channel_retirement(
          down instead so a replacement generation cannot overlap it"
     );
     Ok(DaemonExit::Shutdown)
+}
+
+/// Pause before the RPC plane's one retry of a failed session-store open.
+const RPC_SESSION_STORE_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+/// Open the RPC plane's session store, retrying once.
+///
+/// Every `session/*` RPC method refuses without the store, so a failed open
+/// is reported at ERROR instead of being dropped, and retried once in case
+/// another component was creating the same fresh database at that moment.
+async fn open_rpc_session_backend<T>(
+    mut open: impl FnMut() -> std::io::Result<T>,
+    retry_delay: Duration,
+) -> Option<T> {
+    let first = match open() {
+        Ok(backend) => return Some(backend),
+        Err(error) => error,
+    };
+    ::zeroclaw_log::record!(
+        ERROR,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({ "error": format!("{first:#}") })),
+        "RPC session store failed to open; retrying once"
+    );
+    tokio::time::sleep(retry_delay).await;
+    match open() {
+        Ok(backend) => {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success),
+                "RPC session store opened on retry"
+            );
+            Some(backend)
+        }
+        Err(error) => {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({ "error": format!("{error:#}") })),
+                "RPC session store unavailable after a retry; session RPC methods will refuse until the daemon restarts"
+            );
+            None
+        }
+    }
 }
 
 fn spawn_component_supervisor<F, Fut>(
@@ -3111,6 +3181,39 @@ mod tests {
     const DAEMON_DEADLOCK_GUARD: Duration = Duration::from_secs(30);
 
     #[tokio::test]
+    async fn rpc_session_store_open_is_retried_once_after_a_failure() {
+        let mut calls = 0;
+        let opened = open_rpc_session_backend(
+            || {
+                calls += 1;
+                if calls == 1 {
+                    Err(std::io::Error::other("database is locked"))
+                } else {
+                    Ok(calls)
+                }
+            },
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(opened, Some(2));
+    }
+
+    #[tokio::test]
+    async fn rpc_session_store_open_gives_up_after_one_retry() {
+        let mut calls = 0;
+        let opened: Option<()> = open_rpc_session_backend(
+            || {
+                calls += 1;
+                Err(std::io::Error::other("unable to open database file"))
+            },
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(opened, None);
+        assert_eq!(calls, 2);
+    }
+
+    #[tokio::test]
     async fn retiring_channel_generation_clears_admission_and_joins_active_attempt() {
         let cleared = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let clearer_state = std::sync::Arc::clone(&cleared);
@@ -4016,6 +4119,7 @@ mod tests {
                 multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                unauthorized_message: None,
                 per_user_session: true,
                 passive_group_context: false,
                 ack_reactions: None,
@@ -4322,6 +4426,7 @@ mod tests {
                 multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                unauthorized_message: None,
                 per_user_session: true,
                 passive_group_context: false,
                 ack_reactions: None,
@@ -4354,6 +4459,7 @@ mod tests {
                 multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                unauthorized_message: None,
                 per_user_session: true,
                 passive_group_context: false,
                 ack_reactions: None,
@@ -4409,6 +4515,7 @@ mod tests {
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                unauthorized_message: None,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: 120,
@@ -5254,15 +5361,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detect_gateway_bind_mode_starts_fresh_on_free_port() {
-        // Reserve an ephemeral port, then release it so the address is free.
+    async fn classify_gateway_bind_outcome_starts_fresh_on_successful_bind() {
+        // Keep the successful bind owned until classification instead of
+        // releasing the port and racing other listeners to bind it again.
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
-            .expect("reserve port");
+            .expect("bind ephemeral port");
         let port = listener.local_addr().unwrap().port();
-        drop(listener);
         assert_eq!(
-            detect_gateway_bind_mode(&Config::default(), "127.0.0.1", port).await,
+            classify_gateway_bind_outcome(Ok(listener), &Config::default(), "127.0.0.1", port)
+                .await,
             GatewayBindMode::StartFresh
         );
     }

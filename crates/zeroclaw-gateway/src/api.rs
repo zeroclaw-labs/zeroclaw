@@ -52,6 +52,12 @@ pub(crate) fn require_auth(
     // Defense-in-depth: reject empty tokens explicitly so a future
     // refactor of is_authenticated cannot accidentally treat "" as valid.
     if token.is_empty() {
+        // No bearer: a signed-in dashboard session may stand in for one,
+        // as classified by the session layer for this request. Only an
+        // administrator session is operator-equivalent.
+        if let Some(caller) = crate::dashboard_session::current_caller() {
+            return caller.admit_operator();
+        }
         return Err((
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({
@@ -1302,6 +1308,7 @@ pub async fn handle_api_cost(
                 "monthly_cost_usd": 0.0,
                 "total_tokens": 0,
                 "request_count": 0,
+                "rejected_records": 0,
                 "by_model": {},
                 "by_agent": {},
             }
@@ -2258,6 +2265,7 @@ pub async fn handle_api_session_abort(
 
 // ── Claude Code hook endpoint ────────────────────────────────────
 
+#[cfg(feature = "tool-claude-code-runner")]
 pub async fn handle_claude_code_hook(
     State(state): State<AppState>,
     Json(payload): Json<zeroclaw_tools::claude_code_runner::ClaudeCodeHookEvent>,
@@ -2509,7 +2517,6 @@ pub(crate) mod tests {
             session_backend: None,
             session_queue: Arc::new(crate::session_queue::SessionActorQueue::new(8, 30, 600)),
             device_registry: None,
-            pending_pairings: None,
             path_prefix: String::new(),
             web_dist_dir: None,
             canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),

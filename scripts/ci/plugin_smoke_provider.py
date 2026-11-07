@@ -40,11 +40,20 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from socketserver import TCPServer
 from typing import Any, Optional
 
 TURN_COMPLETE = "SMOKE_TURN_COMPLETE"
 TOOL_NOT_OFFERED = "SMOKE_TOOL_NOT_OFFERED"
 CALL_ID = "call_plugin_smoke"
+
+
+class _LiteralHTTPServer(ThreadingHTTPServer):
+    """Use the bound identity; this fixture never consumes a reverse name."""
+
+    def server_bind(self) -> None:
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
 
 def offered_tool_names(body: dict[str, Any]) -> list[str]:
@@ -149,12 +158,66 @@ def make_handler(log: Path, script: Path) -> type[BaseHTTPRequestHandler]:
     return Handler
 
 
+def startup_milestone(stage: str, started: Optional[float]) -> Optional[float]:
+    try:
+        now = time.monotonic()
+        if started is None:
+            started = now
+        print(
+            f"PROVIDER_STARTUP monotonic={now:.6f} elapsed={now - started:.6f} stage={stage}",
+            file=sys.stderr,
+            flush=True,
+        )
+    except Exception:
+        # Diagnostic computation/emission must not abort normal startup.
+        pass
+    return started
+
+
+def startup_exception(phase: str, started: Optional[float], error: Exception) -> None:
+    try:
+        if started is None:
+            return
+        now = time.monotonic()
+        name = type(error).__name__[:80]
+        if not (name.isascii() and name.replace("_", "").isalnum()):
+            name = "Exception"
+        value = error.errno if isinstance(error, OSError) else None
+        # A non-OS exception has no errno; -1 records that uncertainty numerically.
+        errno = value if type(value) is int else -1
+        print(
+            f"PROVIDER_STARTUP_ERROR monotonic={now:.6f} elapsed={now - started:.6f} "
+            f"phase={phase} type={name} errno={errno}",
+            file=sys.stderr,
+            flush=True,
+        )
+    except Exception:
+        # Diagnostic failure must not replace the original startup exception.
+        pass
+
+
 def serve(args: argparse.Namespace) -> int:
-    server = ThreadingHTTPServer((args.host, 0), make_handler(args.log, args.script))
-    args.log.touch()
-    args.port_file.write_text(str(server.server_address[1]), encoding="utf-8")
-    worker = threading.Thread(target=server.serve_forever, daemon=True)
-    worker.start()
+    started = None
+    phase = "serve-entry"
+    try:
+        started = startup_milestone("serve-entry", started)
+        phase = "server-construction"
+        started = startup_milestone("server-construction-start", started)
+        server = _LiteralHTTPServer((args.host, 0), make_handler(args.log, args.script))
+        started = startup_milestone("server-construction-done", started)
+        phase = "log-touch"
+        args.log.touch()
+        started = startup_milestone("log-touched", started)
+        phase = "port-publication"
+        args.port_file.write_text(str(server.server_address[1]), encoding="utf-8")
+        started = startup_milestone("port-published", started)
+        phase = "worker-start"
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        started = startup_milestone("worker-started", started)
+    except Exception as error:
+        startup_exception(phase, started, error)
+        raise
     try:
         while not args.stop_file.exists():
             time.sleep(0.1)

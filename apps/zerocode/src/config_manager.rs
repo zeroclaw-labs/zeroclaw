@@ -18,7 +18,7 @@ use ratatui::{
     Frame, Terminal,
     layout::{Constraint, Direction, Layout, Rect},
     style::Modifier,
-    text::{Line, Span},
+    text::{Line, Span, Text},
     widgets::{List, ListItem, ListState, Paragraph, Wrap},
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -190,6 +190,13 @@ enum FilterEditAction {
     CursorDown,
 }
 
+enum PendingConfirmation {
+    DiscardKey(KeyEvent),
+    DiscardMouse(MouseEvent),
+    ExternalPersonality,
+    ExternalSkill,
+}
+
 // ── Config section sub-tabs ──────────────────────────────────────
 
 /// Which pane of the zeroclaw split holds keyboard focus. The section list
@@ -252,6 +259,11 @@ fn editor_key(action: crate::keymap::ConfigEditorAction) -> String {
         .first()
         .map(crate::keymap::Chord::display)
         .unwrap_or_default()
+}
+
+fn editor_save_keys() -> String {
+    use crate::keymap::ConfigEditorAction as E;
+    [editor_key(E::Save), editor_key(E::Confirm)].join("/")
 }
 
 fn scalar_validation_status_key(kind: PropKind, value: &str) -> Option<&'static str> {
@@ -482,6 +494,10 @@ pub(crate) struct App {
     /// Two-step add on a `PropKind::SecretMap` row: `None` while the user
     /// types the entry key, `Some(key)` while they type its (masked) value.
     secret_map_entry_key: Option<String>,
+    /// Original draft identity for this edit attempt, not a second dirty flag.
+    field_draft_loaded: String,
+    pending_confirmation: Option<PendingConfirmation>,
+    confirmation_buttons: Option<(Rect, Rect)>,
     // Enum/bool select state
     select_cursor: usize,
     select_items: Vec<String>,
@@ -560,6 +576,9 @@ impl App {
             edit_buf: String::new(),
             edit_cursor: 0,
             secret_map_entry_key: None,
+            field_draft_loaded: String::new(),
+            pending_confirmation: None,
+            confirmation_buttons: None,
             select_cursor: 0,
             select_items: Vec::new(),
             status_msg: None,
@@ -756,6 +775,177 @@ impl App {
                 self.draw_field_edit(frame, right, &bc, fi);
             }
         }
+        self.draw_confirmation(frame, body);
+    }
+
+    fn field_draft(&self) -> &str {
+        if self.is_select_edit() {
+            let idx = if self.filter.is_some() {
+                self.filtered_indices(&self.select_items)
+                    .get(self.filter_cursor)
+                    .copied()
+            } else {
+                Some(self.select_cursor)
+            };
+            idx.and_then(|idx| self.select_items.get(idx))
+                .map(String::as_str)
+                .unwrap_or_default()
+        } else {
+            &self.edit_buf
+        }
+    }
+
+    fn has_pending_edits(&self) -> bool {
+        (matches!(self.screen, Screen::FieldEdit { .. })
+            && (self.field_draft() != self.field_draft_loaded
+                || self.secret_map_entry_key.is_some()))
+            || (self.personality_active_file.is_some()
+                && self.personality_content != self.personality_loaded)
+            || (self.skills_active.is_some() && self.skills_body != self.skills_body_loaded)
+    }
+
+    fn editor_owns_key(&self, key: &KeyEvent) -> bool {
+        use crate::keymap::ConfigEditorAction as E;
+        let editing = match self.section {
+            ConfigSection::Zeroclaw => {
+                matches!(self.screen, Screen::FieldEdit { .. })
+                    || self.personality_active_file.is_some()
+                    || self.skills_active.is_some()
+            }
+            ConfigSection::Zerocode => self.zerocode.wants_text_input(),
+        };
+        editing && matches!(E::from_chord(key), Some(E::Save | E::Confirm | E::Cancel))
+    }
+
+    fn discard_drafts(&mut self) {
+        if matches!(self.screen, Screen::FieldEdit { .. }) {
+            if self.is_select_edit() {
+                self.select_cursor = self
+                    .select_items
+                    .iter()
+                    .position(|item| item == &self.field_draft_loaded)
+                    .unwrap_or(0);
+            } else {
+                self.edit_buf = self.field_draft_loaded.clone();
+                self.edit_cursor = self.edit_buf.len();
+            }
+            self.secret_map_entry_key = None;
+        }
+        self.deactivate_filter();
+        self.personality_content = self.personality_loaded.clone();
+        self.personality_active_file = None;
+        self.skills_body = self.skills_body_loaded.clone();
+        self.skills_frontmatter = self.skills_frontmatter_loaded.clone();
+        self.skills_active = None;
+    }
+
+    fn draw_confirmation(&mut self, frame: &mut Frame, area: Rect) {
+        self.confirmation_buttons = None;
+        let Some(pending) = &self.pending_confirmation else {
+            return;
+        };
+        let external = matches!(
+            pending,
+            PendingConfirmation::ExternalPersonality | PendingConfirmation::ExternalSkill
+        );
+        let width = area.width.min(76);
+        let height = area.height.min(7);
+        let dialog = Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + (area.height - height) / 2,
+            width,
+            height,
+        );
+        frame.render_widget(ratatui::widgets::Clear, dialog);
+        let block = theme::panel_block(&crate::i18n::t(if external {
+            "zc-config-external-editor-title"
+        } else {
+            "zc-config-discard-title"
+        }));
+        let inner = block.inner(dialog);
+        frame.render_widget(block, dialog);
+        frame.render_widget(
+            Paragraph::new(crate::i18n::t(if external {
+                "zc-config-external-editor-explanation"
+            } else {
+                "zc-config-discard-explanation"
+            }))
+            .wrap(Wrap { trim: false }),
+            inner,
+        );
+        let buttons = Rect::new(
+            inner.x,
+            inner.y + inner.height.saturating_sub(1),
+            inner.width,
+            inner.height.min(1),
+        );
+        let stay = Rect::new(buttons.x, buttons.y, buttons.width / 2, buttons.height);
+        let proceed = Rect::new(
+            stay.right(),
+            buttons.y,
+            buttons.width - stay.width,
+            buttons.height,
+        );
+        use crate::keymap::ConfigEditorAction as E;
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{}={}",
+                editor_key(E::Cancel),
+                crate::i18n::t(if external {
+                    "zc-config-footer-action-cancel"
+                } else {
+                    "zc-config-action-stay"
+                })
+            )),
+            stay,
+        );
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{}={}",
+                editor_key(E::Confirm),
+                crate::i18n::t(if external {
+                    "zc-config-action-launch-editor"
+                } else {
+                    "zc-config-action-discard"
+                })
+            )),
+            proceed,
+        );
+        self.confirmation_buttons = Some((stay, proceed));
+    }
+
+    async fn handle_confirmation(&mut self, key: KeyEvent, term: &mut Term) -> Result<()> {
+        use crate::keymap::ConfigEditorAction as E;
+        match E::from_chord(&key) {
+            Some(E::Cancel) => {
+                self.pending_confirmation = None;
+            }
+            Some(E::Confirm) if key.kind == KeyEventKind::Press => {
+                self.confirm_pending(term).await?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn confirm_pending(&mut self, term: &mut Term) -> Result<()> {
+        if let Some(pending) = self.pending_confirmation.take() {
+            match pending {
+                PendingConfirmation::DiscardKey(key) => {
+                    self.discard_drafts();
+                    Box::pin(self.handle_key(key, term)).await?;
+                }
+                PendingConfirmation::DiscardMouse(mouse) => {
+                    self.discard_drafts();
+                    Box::pin(self.handle_mouse(mouse, Rect::default(), term)).await?;
+                }
+                PendingConfirmation::ExternalPersonality => {
+                    self.launch_personality_editor(term).await?
+                }
+                PendingConfirmation::ExternalSkill => self.launch_skill_editor(term).await?,
+            }
+        }
+        Ok(())
     }
 
     fn can_view_application_status(&self) -> bool {
@@ -782,7 +972,7 @@ impl App {
         }
         let default = || format!(" ?={}", crate::i18n::t("zc-config-footer-action-help"));
 
-        match &self.screen {
+        let hint = match &self.screen {
             Screen::AliasList { .. }
                 if self.zeroclaw_pane == ZeroclawPane::Detail && self.alias_add_selected() =>
             {
@@ -890,18 +1080,18 @@ impl App {
                         format!(
                             " {}  {}={}  {}={}  ?={}",
                             nav_keys(),
-                            tab_key(T::Enter),
+                            editor_save_keys(),
                             crate::i18n::t("zc-config-footer-action-save"),
-                            tab_key(T::Back),
+                            editor_key(E::Cancel),
                             crate::i18n::t("zc-config-footer-action-clear-filter"),
                             help,
                         )
                     } else {
                         format!(
                             " {}={}  {}={}",
-                            tab_key(T::Enter),
+                            editor_save_keys(),
                             crate::i18n::t("zc-config-footer-action-save"),
-                            tab_key(T::Back),
+                            editor_key(E::Cancel),
                             crate::i18n::t("zc-config-footer-action-cancel"),
                         )
                     }
@@ -918,7 +1108,7 @@ impl App {
                 } else {
                     format!(
                         " {}={}  {}={}",
-                        editor_key(E::Confirm),
+                        editor_save_keys(),
                         crate::i18n::t("zc-config-footer-action-save"),
                         editor_key(E::Cancel),
                         crate::i18n::t("zc-config-footer-action-cancel"),
@@ -926,6 +1116,21 @@ impl App {
                 }
             }
             _ => default(),
+        };
+        if matches!(self.screen, Screen::FieldEdit { .. })
+            || self.personality_active_file.is_some()
+            || self.skills_active.is_some()
+        {
+            format!(
+                "{hint}  {}",
+                crate::i18n::t(if self.has_pending_edits() {
+                    "zc-config-draft-pending"
+                } else {
+                    "zc-config-draft-unchanged"
+                })
+            )
+        } else {
+            hint
         }
     }
 
@@ -1009,6 +1214,10 @@ impl App {
     }
 
     async fn handle_key_inner(&mut self, key: KeyEvent, term: &mut Term) -> Result<bool> {
+        if self.pending_confirmation.is_some() {
+            self.handle_confirmation(key, term).await?;
+            return Ok(false);
+        }
         if self.section == ConfigSection::Zeroclaw {
             if self.application_feedback.handle_key(key) {
                 return Ok(false);
@@ -1026,7 +1235,14 @@ impl App {
         // Tab / Shift+Tab cycle the outer Config section (zeroclaw ↔
         // zerocode) from anywhere — neither is bound inside the daemon
         // editor or the zerocode pane, so there is no shadowing.
-        if let Some(action) = crate::keymap::ConfigTabAction::from_chord(&key) {
+        if !self.editor_owns_key(&key)
+            && !(self.wants_text_input()
+                && matches!(key.code, KeyCode::Char(_)) // keyguard: literal text must not trigger a list navigation binding.
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::ALT))
+            && let Some(action) = crate::keymap::ConfigTabAction::from_chord(&key)
+        {
             use crate::keymap::ConfigTabAction;
             if action == ConfigTabAction::SectionNext {
                 self.cycle_section(1);
@@ -1059,6 +1275,29 @@ impl App {
             return Ok(false);
         }
 
+        // Composite tab departures replace the active editor. Character keys
+        // remain literal input, even when the list keymap binds h/l navigation.
+        if self.filter.is_none()
+            && !self.editor_owns_key(&key)
+            && self.is_composite_tab()
+            && (self.personality_active_file.is_some() || self.skills_active.is_some())
+            && !matches!(key.code, KeyCode::Char(_)) // keyguard: printable characters belong to the multiline draft, not tab navigation.
+            && match crate::keymap::ConfigTabAction::from_chord(&key) {
+                Some(crate::keymap::ConfigTabAction::TabLeft) => true,
+                Some(crate::keymap::ConfigTabAction::TabRight) => {
+                    self.active_tab + 1 < self.tab_names.len()
+                }
+                _ => false,
+            }
+        {
+            if self.has_pending_edits() {
+                self.pending_confirmation = Some(PendingConfirmation::DiscardKey(key));
+                return Ok(false);
+            }
+            self.personality_active_file = None;
+            self.skills_active = None;
+        }
+
         // Focus on the section list: keys drive the list (which eagerly loads
         // the highlighted section into the right pane for preview). Focus on the
         // detail: keys drive whatever drill screen is loaded.
@@ -1076,6 +1315,7 @@ impl App {
                 Some(ConfigTabAction::Back | ConfigTabAction::TabLeft)
             ) && self.at_section_top_level()
                 && self.filter.is_none()
+                && !self.wants_text_input()
             {
                 self.zeroclaw_pane = ZeroclawPane::Sections;
                 return Ok(false);
@@ -1136,6 +1376,19 @@ impl App {
             return Ok(());
         }
 
+        if self.pending_confirmation.is_some() {
+            if mouse.kind == MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                && let Some((stay, proceed)) = self.confirmation_buttons
+            {
+                if mouse::in_rect(mouse.column, mouse.row, stay) {
+                    self.pending_confirmation = None;
+                } else if mouse::in_rect(mouse.column, mouse.row, proceed) {
+                    self.confirm_pending(term).await?;
+                }
+            }
+            return Ok(());
+        }
+
         // Section tab-bar click switches sub-tab in either section.
         if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
             && let Some(bar) = self.section_tab_area
@@ -1162,6 +1415,11 @@ impl App {
             || (self.loaded_section != Some(self.section_cursor)
                 && !mouse::in_rect(mouse.column, mouse.row, self.last_section_pane_area))
         {
+            return Ok(());
+        }
+
+        if self.has_pending_edits() && self.mouse_replaces_draft(mouse) {
+            self.pending_confirmation = Some(PendingConfirmation::DiscardMouse(mouse));
             return Ok(());
         }
 
@@ -1387,6 +1645,72 @@ impl App {
             self.preview_section(orig).await?;
         }
         Ok(())
+    }
+
+    fn mouse_replaces_draft(&self, mouse: MouseEvent) -> bool {
+        use crate::mouse::in_rect;
+        match mouse.kind {
+            MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                if let Some(idx) = self
+                    .last_breadcrumb_areas
+                    .iter()
+                    .position(|&area| in_rect(mouse.column, mouse.row, area))
+                {
+                    let current = match &self.screen {
+                        Screen::FieldEdit { breadcrumb, .. } => breadcrumb.len(),
+                        Screen::FieldList { breadcrumb, .. } => breadcrumb.len().saturating_sub(1),
+                        _ => return false,
+                    };
+                    return idx < current;
+                }
+                if in_rect(mouse.column, mouse.row, self.last_section_pane_area) {
+                    return crate::mouse::list_click_index(
+                        mouse.row,
+                        self.last_section_list_area,
+                        self.last_section_list_offset,
+                        self.last_section_rows.len(),
+                    )
+                    .and_then(|pos| self.last_section_rows.get(pos))
+                    .is_some_and(Option::is_some);
+                }
+                if matches!(self.screen, Screen::FieldList { .. })
+                    && let Some(area) = self.last_tab_area
+                    && in_rect(mouse.column, mouse.row, area)
+                {
+                    let display: Vec<String> = self
+                        .tab_names
+                        .iter()
+                        .enumerate()
+                        .map(|(i, tab)| {
+                            if i == self.active_tab {
+                                format!("▸ {}", tab.label())
+                            } else {
+                                tab.label().to_string()
+                            }
+                        })
+                        .collect();
+                    let labels: Vec<&str> = display.iter().map(String::as_str).collect();
+                    return crate::mouse::tab_click_index(
+                        mouse.column,
+                        mouse.row,
+                        area,
+                        &labels,
+                        3,
+                    )
+                    .is_some_and(|idx| idx != self.active_tab);
+                }
+                false
+            }
+            MouseEventKind::ScrollUp => {
+                self.section_cursor > 0
+                    && in_rect(mouse.column, mouse.row, self.last_section_pane_area)
+            }
+            MouseEventKind::ScrollDown => {
+                self.section_cursor + 1 < self.sections.len()
+                    && in_rect(mouse.column, mouse.row, self.last_section_pane_area)
+            }
+            _ => false,
+        }
     }
 
     /// Number of visible items for the current screen (respecting filters).
@@ -2097,9 +2421,11 @@ impl App {
         self.personality_files = result.files;
         self.personality_max_chars = result.max_chars;
         self.personality_cursor = 0;
-        self.personality_active_file = None;
-        self.personality_content.clear();
-        self.personality_loaded.clear();
+        // Refreshing list metadata must not reset an open editor or its baseline.
+        if self.personality_active_file.is_none() {
+            self.personality_content.clear();
+            self.personality_loaded.clear();
+        }
         Ok(())
     }
 
@@ -2119,11 +2445,12 @@ impl App {
         let result = self.rpc.skills_list(Some(&self.skills_bundle)).await?;
         self.skills_list = result.skills;
         self.skills_cursor = 0;
-        self.skills_active = None;
-        self.skills_body.clear();
-        self.skills_body_loaded.clear();
-        self.skills_frontmatter = Default::default();
-        self.skills_frontmatter_loaded = Default::default();
+        if self.skills_active.is_none() {
+            self.skills_body.clear();
+            self.skills_body_loaded.clear();
+            self.skills_frontmatter = Default::default();
+            self.skills_frontmatter_loaded = Default::default();
+        }
         Ok(())
     }
 
@@ -2858,6 +3185,25 @@ impl App {
         Ok(())
     }
 
+    /// Focus setup only after creation; ordinary opens and refreshes preserve navigation.
+    fn focus_missing_setup_field(&mut self) {
+        let Some(index) = self
+            .fields
+            .iter()
+            .position(|field| field.setup.as_ref().is_some_and(|setup| setup.missing))
+        else {
+            return;
+        };
+        self.field_cursor = index;
+        if let Some(tab) = self
+            .tab_names
+            .iter()
+            .position(|tab| *tab == self.fields[index].tab)
+        {
+            self.active_tab = tab;
+        }
+    }
+
     // ── Alias creation ───────────────────────────────────────────
 
     async fn handle_alias_create(&mut self, key: KeyEvent) -> Result<()> {
@@ -2900,6 +3246,7 @@ impl App {
                             let mut bc = breadcrumb;
                             bc.push(name);
                             self.load_fields(&prefix).await?;
+                            self.focus_missing_setup_field();
                             self.screen = Screen::FieldList {
                                 section_idx,
                                 prefix,
@@ -3334,6 +3681,52 @@ impl App {
 
     // ── Personality tab handler ──────────────────────────────────
 
+    fn offer_external_editor(&mut self, pending: PendingConfirmation) {
+        self.status_msg = None;
+        if crate::editor::editor_from_env_or_path().is_some() {
+            self.pending_confirmation = Some(pending);
+        }
+    }
+
+    async fn launch_personality_editor(&mut self, term: &mut Term) -> Result<()> {
+        let Some(filename) = self.personality_active_file.clone() else {
+            return Ok(());
+        };
+        if let Ok(edited) = edit_in_external_editor(term, &self.personality_content, &filename) {
+            self.import_personality_edit(edited, term).await?;
+        }
+        Ok(())
+    }
+
+    async fn import_personality_edit(&mut self, edited: String, term: &mut Term) -> Result<()> {
+        self.personality_content = edited;
+        if self.personality_content != self.personality_loaded {
+            self.save_personality(term).await?;
+        }
+        if self.personality_content == self.personality_loaded {
+            self.personality_active_file = None;
+        }
+        Ok(())
+    }
+
+    async fn launch_skill_editor(&mut self, term: &mut Term) -> Result<()> {
+        let Some(name) = self.skills_active.clone() else {
+            return Ok(());
+        };
+        if let Ok(edited) =
+            edit_in_external_editor(term, &self.skills_body, &format!("{name}.SKILL.md"))
+        {
+            self.skills_body = edited;
+            if self.skills_body != self.skills_body_loaded {
+                self.save_skill(term).await?;
+            }
+            if self.skills_body == self.skills_body_loaded {
+                self.skills_active = None;
+            }
+        }
+        Ok(())
+    }
+
     async fn handle_personality_tab(&mut self, key: KeyEvent, term: &mut Term) -> Result<()> {
         // Two modes: file picker (no active file) or editor (active file).
         if self.personality_active_file.is_some() {
@@ -3402,48 +3795,7 @@ impl App {
                     let _ = self.draw(term);
                     match self.load_personality_file(&filename).await {
                         Ok(()) => {
-                            // Try $EDITOR first; fall back to inline editor.
-                            match edit_in_external_editor(
-                                term,
-                                &self.personality_content,
-                                &filename,
-                            ) {
-                                Ok(edited) => {
-                                    self.personality_content = edited;
-                                    if self.personality_content != self.personality_loaded {
-                                        // Auto-save after $EDITOR.
-                                        let agent = self.personality_agent.clone();
-                                        let content = self.personality_content.clone();
-                                        match self
-                                            .rpc
-                                            .personality_put(&agent, &filename, &content)
-                                            .await
-                                        {
-                                            Ok(_) => {
-                                                self.personality_loaded =
-                                                    self.personality_content.clone();
-                                                self.status_msg = Some(crate::i18n::t_args(
-                                                    "zc-config-status-personality-saved-file",
-                                                    &[("filename", &filename)],
-                                                ));
-                                                let _ = self.load_personality_files().await;
-                                            }
-                                            Err(e) => {
-                                                self.status_msg = Some(crate::i18n::t_args(
-                                                    "zc-config-status-save-failed",
-                                                    &[("err", &e.to_string())],
-                                                ));
-                                            }
-                                        }
-                                    } else {
-                                        self.status_msg = None;
-                                    }
-                                    self.personality_active_file = None;
-                                }
-                                Err(_) => {
-                                    self.status_msg = None;
-                                }
-                            }
+                            self.offer_external_editor(PendingConfirmation::ExternalPersonality);
                         }
                         Err(e) => {
                             self.status_msg = Some(crate::i18n::t_args(
@@ -3465,49 +3817,18 @@ impl App {
                         Ok(result) => {
                             if let Some(tmpl) = result.files.iter().find(|f| f.filename == filename)
                             {
-                                self.personality_content = tmpl.content.clone();
-                                self.personality_loaded.clear();
-                                self.personality_active_file = Some(filename.clone());
-
-                                // Try $EDITOR, fall back to inline.
-                                match edit_in_external_editor(
-                                    term,
-                                    &self.personality_content,
-                                    &filename,
-                                ) {
-                                    Ok(edited) => {
-                                        self.personality_content = edited;
-                                        if !self.personality_content.is_empty() {
-                                            let content = self.personality_content.clone();
-                                            match self
-                                                .rpc
-                                                .personality_put(&agent, &filename, &content)
-                                                .await
-                                            {
-                                                Ok(_) => {
-                                                    self.personality_loaded =
-                                                        self.personality_content.clone();
-                                                    self.status_msg =
-                                                        Some(format!("Saved {filename}"));
-                                                    let _ = self.load_personality_files().await;
-                                                }
-                                                Err(e) => {
-                                                    self.status_msg =
-                                                        Some(format!("Save failed: {e}"));
-                                                }
-                                            }
-                                        } else {
-                                            self.status_msg = None;
-                                        }
-                                        self.personality_active_file = None;
-                                    }
-                                    Err(_) => {
-                                        self.status_msg = Some(crate::i18n::t_args(
-                                            "zc-config-status-template-loaded",
-                                            &[("filename", &filename)],
-                                        ));
-                                    }
+                                // Load the real baseline before replacing the draft with a template.
+                                if let Err(e) = self.load_personality_file(&filename).await {
+                                    self.status_msg = Some(crate::i18n::t_args(
+                                        "zc-config-status-load-failed",
+                                        &[("err", &e.to_string())],
+                                    ));
+                                    return Ok(());
                                 }
+                                self.personality_content = tmpl.content.clone();
+                                self.offer_external_editor(
+                                    PendingConfirmation::ExternalPersonality,
+                                );
                             } else {
                                 self.status_msg = Some(crate::i18n::t_args(
                                     "zc-config-status-template-missing",
@@ -3541,40 +3862,7 @@ impl App {
                 self.personality_active_file = None;
             }
             Some(ConfigEditorAction::Save) => {
-                if let Some(filename) = &self.personality_active_file {
-                    let filename = filename.clone();
-                    let agent = self.personality_agent.clone();
-                    let content = self.personality_content.clone();
-                    if content.chars().count() > self.personality_max_chars {
-                        self.status_msg = Some(crate::i18n::t_args(
-                            "zc-config-personality-over-limit",
-                            &[("limit", &self.personality_max_chars.to_string())],
-                        ));
-                        return Ok(());
-                    }
-                    self.status_msg = Some(crate::i18n::t_args(
-                        "zc-config-status-personality-saving-file",
-                        &[("filename", &filename)],
-                    ));
-                    let _ = self.draw(term);
-                    match self.rpc.personality_put(&agent, &filename, &content).await {
-                        Ok(_) => {
-                            self.personality_loaded = self.personality_content.clone();
-                            self.status_msg = Some(crate::i18n::t_args(
-                                "zc-config-status-personality-saved-file",
-                                &[("filename", &filename)],
-                            ));
-                            let _ = self.load_personality_files().await;
-                            self.personality_active_file = Some(filename);
-                        }
-                        Err(e) => {
-                            self.status_msg = Some(crate::i18n::t_args(
-                                "zc-config-status-save-failed",
-                                &[("err", &e.to_string())],
-                            ));
-                        }
-                    }
-                }
+                self.save_personality(term).await?;
             }
             Some(ConfigEditorAction::Confirm) => {
                 self.personality_content.push('\n');
@@ -3590,6 +3878,46 @@ impl App {
                 }
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    async fn save_personality(&mut self, term: &mut Term) -> Result<()> {
+        let Some(filename) = self.personality_active_file.clone() else {
+            return Ok(());
+        };
+        let content = self.personality_content.clone();
+        if content.chars().count() > self.personality_max_chars {
+            self.status_msg = Some(crate::i18n::t_args(
+                "zc-config-personality-over-limit",
+                &[("limit", &self.personality_max_chars.to_string())],
+            ));
+            return Ok(());
+        }
+        self.status_msg = Some(crate::i18n::t_args(
+            "zc-config-status-personality-saving-file",
+            &[("filename", &filename)],
+        ));
+        let _ = self.draw(term);
+        match self
+            .rpc
+            .personality_put(&self.personality_agent, &filename, &content)
+            .await
+        {
+            Ok(_) => {
+                self.personality_loaded = content;
+                self.status_msg = Some(crate::i18n::t_args(
+                    "zc-config-status-personality-saved-file",
+                    &[("filename", &filename)],
+                ));
+                let _ = self.load_personality_files().await;
+            }
+            Err(e) => {
+                self.status_msg = Some(crate::i18n::t_args(
+                    "zc-config-status-save-failed",
+                    &[("err", &e.to_string())],
+                ));
+            }
         }
         Ok(())
     }
@@ -3662,43 +3990,7 @@ impl App {
                     let _ = self.draw(term);
                     match self.load_skill(&name).await {
                         Ok(()) => {
-                            let hint = format!("{name}.SKILL.md");
-                            match edit_in_external_editor(term, &self.skills_body, &hint) {
-                                Ok(edited) => {
-                                    self.skills_body = edited;
-                                    if self.skills_body != self.skills_body_loaded {
-                                        let bundle = self.skills_bundle.clone();
-                                        let fm = self.skills_frontmatter.clone();
-                                        let body = self.skills_body.clone();
-                                        match self
-                                            .rpc
-                                            .skills_write(&bundle, &name, &fm, &body)
-                                            .await
-                                        {
-                                            Ok(_) => {
-                                                self.skills_body_loaded = self.skills_body.clone();
-                                                self.status_msg = Some(crate::i18n::t_args(
-                                                    "zc-config-status-skill-saved",
-                                                    &[("name", &name)],
-                                                ));
-                                            }
-                                            Err(e) => {
-                                                self.status_msg = Some(crate::i18n::t_args(
-                                                    "zc-config-status-save-failed",
-                                                    &[("err", &e.to_string())],
-                                                ));
-                                            }
-                                        }
-                                    } else {
-                                        self.status_msg = None;
-                                    }
-                                    self.skills_active = None;
-                                }
-                                Err(_) => {
-                                    self.status_msg = None;
-                                    // $EDITOR unavailable — falls into inline editor.
-                                }
-                            }
+                            self.offer_external_editor(PendingConfirmation::ExternalSkill);
                         }
                         Err(e) => {
                             self.status_msg = Some(crate::i18n::t_args(
@@ -3751,37 +4043,7 @@ impl App {
                 self.skills_active = None;
             }
             Some(ConfigEditorAction::Save) => {
-                if let Some(name) = &self.skills_active {
-                    let name = name.clone();
-                    let bundle = self.skills_bundle.clone();
-                    let frontmatter = self.skills_frontmatter.clone();
-                    let body = self.skills_body.clone();
-                    self.status_msg = Some(crate::i18n::t_args(
-                        "zc-config-status-skill-saving",
-                        &[("name", &name)],
-                    ));
-                    let _ = self.draw(term);
-                    match self
-                        .rpc
-                        .skills_write(&bundle, &name, &frontmatter, &body)
-                        .await
-                    {
-                        Ok(_) => {
-                            self.skills_body_loaded = self.skills_body.clone();
-                            self.skills_frontmatter_loaded = self.skills_frontmatter.clone();
-                            self.status_msg = Some(crate::i18n::t_args(
-                                "zc-config-status-skill-saved",
-                                &[("name", &name)],
-                            ));
-                        }
-                        Err(e) => {
-                            self.status_msg = Some(crate::i18n::t_args(
-                                "zc-config-status-save-failed",
-                                &[("err", &e.to_string())],
-                            ));
-                        }
-                    }
-                }
+                self.save_skill(term).await?;
             }
             Some(ConfigEditorAction::Confirm) => {
                 self.skills_body.push('\n');
@@ -3797,6 +4059,43 @@ impl App {
                 }
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    async fn save_skill(&mut self, term: &mut Term) -> Result<()> {
+        let Some(name) = self.skills_active.clone() else {
+            return Ok(());
+        };
+        self.status_msg = Some(crate::i18n::t_args(
+            "zc-config-status-skill-saving",
+            &[("name", &name)],
+        ));
+        let _ = self.draw(term);
+        match self
+            .rpc
+            .skills_write(
+                &self.skills_bundle,
+                &name,
+                &self.skills_frontmatter,
+                &self.skills_body,
+            )
+            .await
+        {
+            Ok(_) => {
+                self.skills_body_loaded = self.skills_body.clone();
+                self.skills_frontmatter_loaded = self.skills_frontmatter.clone();
+                self.status_msg = Some(crate::i18n::t_args(
+                    "zc-config-status-skill-saved",
+                    &[("name", &name)],
+                ));
+            }
+            Err(e) => {
+                self.status_msg = Some(crate::i18n::t_args(
+                    "zc-config-status-save-failed",
+                    &[("err", &e.to_string())],
+                ));
+            }
         }
         Ok(())
     }
@@ -3879,6 +4178,7 @@ impl App {
                 field_idx: idx,
             };
         }
+        self.field_draft_loaded = self.field_draft().to_string();
     }
 
     fn prepare_edit_at(&mut self, idx: usize) {
@@ -3927,6 +4227,7 @@ impl App {
             }
         }
         self.edit_cursor = self.edit_buf.len();
+        self.field_draft_loaded = self.field_draft().to_string();
     }
 
     fn is_select_edit(&self) -> bool {
@@ -4294,7 +4595,7 @@ impl App {
             Some(ConfigEditorAction::Cancel) => {
                 self.pop_to_field_list().await?;
             }
-            Some(ConfigEditorAction::Confirm) => {
+            Some(ConfigEditorAction::Confirm | ConfigEditorAction::Save) => {
                 if let Screen::FieldEdit { field_idx, .. } = &self.screen
                     && self.fields[*field_idx].kind == PropKind::SecretMap
                 {
@@ -4357,6 +4658,30 @@ impl App {
     async fn handle_select_edit(&mut self, key: KeyEvent) -> Result<()> {
         let visible = self.filtered_indices(&self.select_items);
 
+        use crate::keymap::ConfigEditorAction as E;
+        match E::from_chord(&key) {
+            Some(E::Cancel) => {
+                if self.filter.is_some() {
+                    self.cancel_filter().await?;
+                } else {
+                    self.pop_to_field_list().await?;
+                }
+                return Ok(());
+            }
+            Some(E::Save | E::Confirm) => {
+                let cursor = if self.filter.is_some() {
+                    self.filter_cursor
+                } else {
+                    self.select_cursor
+                };
+                if let Some(&orig) = visible.get(cursor) {
+                    return self.commit_select(orig).await;
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+
         match self.handle_filter_key(key, visible.len()) {
             FilterAction::Consumed => return Ok(()),
             FilterAction::Cancel => return self.cancel_filter().await,
@@ -4374,6 +4699,12 @@ impl App {
         let action = ConfigTabAction::from_chord(&key);
         match action {
             Some(ConfigTabAction::Back | ConfigTabAction::TabLeft) => {
+                // Navigation, unlike the resolved Cancel action, must not
+                // silently drop a changed selection.
+                if self.has_pending_edits() {
+                    self.pending_confirmation = Some(PendingConfirmation::DiscardKey(key));
+                    return Ok(());
+                }
                 self.deactivate_filter();
                 self.pop_to_field_list().await?;
             }
@@ -4405,6 +4736,7 @@ impl App {
                         .record_saved(prop.clone(), revision);
                     // The application summary below names the saved field.
                     self.status_msg = None;
+                    self.deactivate_filter();
                     self.pop_to_field_list_keep_cursor().await?;
                 }
                 Err(e) => {
@@ -4691,8 +5023,36 @@ impl App {
         section_idx: usize,
         breadcrumb: &[String],
     ) {
-        let mut r = regions(area);
         let section = &self.sections[section_idx];
+        let guidance =
+            if self.aliases.is_empty() && self.detail_filter().is_none() && self.alias_tab == 0 {
+                setup_section_key(&section.key).map(|key| {
+                    format!(
+                        "{}\n{}\n{}",
+                        crate::i18n::t("zc-config-setup-empty"),
+                        crate::i18n::t(key),
+                        crate::i18n::t_args(
+                            "zc-config-setup-add",
+                            &[("keys", &tab_key(crate::keymap::ConfigTabAction::Enter))],
+                        ),
+                    )
+                })
+            } else {
+                None
+            };
+        let mut r = guidance.as_ref().map_or_else(
+            || {
+                if self.detail_filter().is_some()
+                    && self.filtered_indices(&self.aliases).is_empty()
+                    && self.alias_list_has_tabs()
+                {
+                    regions_with_help(area, 3)
+                } else {
+                    regions(area)
+                }
+            },
+            |text| guidance_regions(area, text, self.alias_list_has_tabs()),
+        );
 
         let mut bc: Vec<String> = Vec::new();
         bc.extend(breadcrumb.iter().cloned());
@@ -4705,7 +5065,7 @@ impl App {
             use ratatui::layout::{Constraint, Direction, Layout};
             let split = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Length(1), Constraint::Length(1)])
+                .constraints([Constraint::Length(1), Constraint::Min(1)])
                 .split(r.help);
             r.help = split[1];
             Some(split[0])
@@ -4740,13 +5100,23 @@ impl App {
             render_filter_bar(frame, r.help, buf, &crate::i18n::t("zc-config-filter-list"));
         } else {
             frame.render_widget(
-                Paragraph::new(Span::styled(&section.help, theme::dim_style()))
-                    .wrap(Wrap { trim: false }),
+                Paragraph::new(Text::styled(
+                    guidance.as_deref().unwrap_or(&section.help),
+                    theme::dim_style(),
+                ))
+                .wrap(Wrap { trim: false }),
                 r.help,
             );
         }
 
         let visible = self.filtered_indices(&self.aliases);
+        if self.detail_filter().is_some() && visible.is_empty() && r.help.height > 1 {
+            frame.render_widget(
+                Paragraph::new(crate::i18n::t("zc-config-setup-no-filter-matches"))
+                    .style(theme::dim_style()),
+                Rect::new(r.help.x, r.help.y + 1, r.help.width, r.help.height - 1),
+            );
+        }
 
         let mut items: Vec<ListItem> = visible
             .iter()
@@ -4846,7 +5216,41 @@ impl App {
     }
 
     fn draw_alias_create(&mut self, frame: &mut Frame, area: Rect, breadcrumb: &[String]) {
-        let r = regions(area);
+        let setup_section = match &self.screen {
+            // Rate sheets created from the Costs tab are not aliases.
+            Screen::AliasCreate {
+                section_idx,
+                map_path,
+                ..
+            } if !map_path.starts_with("cost.") => self
+                .sections
+                .get(*section_idx)
+                .and_then(|section| setup_section_key(&section.key)),
+            _ => None,
+        };
+        // One paragraph: the narrow create pane has no row to spare for a break.
+        let hint = if let Some(key) = setup_section {
+            format!(
+                "{} {}",
+                crate::i18n::t(key),
+                crate::i18n::t_args(
+                    "zc-config-setup-create",
+                    &[
+                        (
+                            "confirm",
+                            &editor_key(crate::keymap::ConfigEditorAction::Confirm)
+                        ),
+                        (
+                            "cancel",
+                            &editor_key(crate::keymap::ConfigEditorAction::Cancel)
+                        ),
+                    ],
+                ),
+            )
+        } else {
+            crate::i18n::t("zc-config-alias-create-hint")
+        };
+        let r = guidance_regions(area, &hint, false);
 
         let mut bc: Vec<String> = Vec::new();
         bc.extend(breadcrumb.iter().cloned());
@@ -4854,10 +5258,7 @@ impl App {
         self.last_breadcrumb_areas = render_breadcrumb(frame, r.breadcrumb, &bc);
 
         frame.render_widget(
-            Paragraph::new(Span::styled(
-                crate::i18n::t("zc-config-alias-create-hint"),
-                theme::dim_style(),
-            )),
+            Paragraph::new(Span::styled(hint, theme::dim_style())).wrap(Wrap { trim: false }),
             r.help,
         );
 
@@ -5037,6 +5438,18 @@ impl App {
                         .unwrap_or_else(|| "<unset>".to_string())
                 };
 
+                let setup_marker = f
+                    .setup
+                    .as_ref()
+                    .map(|setup| {
+                        let key = if setup.missing {
+                            "zc-config-setup-required-missing"
+                        } else {
+                            "zc-config-setup-required"
+                        };
+                        format!(" [{}]", crate::i18n::t(key))
+                    })
+                    .unwrap_or_default();
                 let env_marker = if f.is_env_overridden { " [env]" } else { "" };
                 let press_hint = if Some(i) == selected_field {
                     let enter_key = tab_key(crate::keymap::ConfigTabAction::Enter);
@@ -5047,7 +5460,8 @@ impl App {
                 } else {
                     String::new()
                 };
-                let line = format!("{short_name} = {val_display}{env_marker}{press_hint}");
+                let line =
+                    format!("{short_name}{setup_marker} = {val_display}{env_marker}{press_hint}");
 
                 let style = if f.populated {
                     theme::body_style()
@@ -5358,7 +5772,16 @@ impl App {
             } else if field.kind == PropKind::StringArray {
                 let suffix = crate::i18n::t_args(
                     "zc-config-field-type-string-array-suffix",
-                    &[("newline_chord", "Enter"), ("save_chord", "Ctrl+S")],
+                    &[
+                        (
+                            "newline_chord",
+                            &editor_key(crate::keymap::ConfigEditorAction::Confirm),
+                        ),
+                        (
+                            "save_chord",
+                            &editor_key(crate::keymap::ConfigEditorAction::Save),
+                        ),
+                    ],
                 );
                 format!("{type_prefix} {} {suffix}", field.kind.wire_name())
             } else {
@@ -5453,9 +5876,16 @@ impl App {
         if self.application_feedback.details_open() {
             return;
         }
+        if self.pending_confirmation.is_some() {
+            return;
+        }
         // Normalise line endings — bracketed paste can deliver \r, \r\n,
         // or \n depending on terminal.
         let cleaned: String = text.replace("\r\n", "\n").replace('\r', "\n");
+        if self.section == ConfigSection::Zerocode {
+            self.zerocode.handle_paste(&cleaned);
+            return;
+        }
 
         // Filter active: paste goes into the filter buffer.
         if let Some(buf) = self.filter.as_mut() {
@@ -5525,6 +5955,9 @@ impl App {
 
     /// Whether the pane owns text-input keys (filter, edit buf, alias create/rename, editors).
     pub(crate) fn wants_text_input(&self) -> bool {
+        if self.pending_confirmation.is_some() {
+            return true;
+        }
         if self.section == ConfigSection::Zerocode {
             return self.zerocode.wants_text_input();
         }
@@ -5839,19 +6272,37 @@ impl App {
                     .map(|f| f.kind == PropKind::StringArray)
                     .unwrap_or(false);
                 if self.is_select_edit() {
+                    let save_selection = || {
+                        E::new(
+                            vec![
+                                editor_key(crate::keymap::ConfigEditorAction::Save),
+                                editor_key(crate::keymap::ConfigEditorAction::Confirm),
+                            ],
+                            crate::i18n::t("zc-config-help-save-selection"),
+                        )
+                    };
+                    let cancel = || {
+                        E::new(
+                            vec![editor_key(crate::keymap::ConfigEditorAction::Cancel)],
+                            crate::i18n::t("zc-config-help-cancel"),
+                        )
+                    };
                     if self.detail_filter().is_some() {
                         HelpNode::entries(vec![
                             nav(),
-                            k(A::Enter, "zc-config-help-save-selection"),
-                            clear_filter(),
+                            save_selection(),
+                            E::new(
+                                vec![editor_key(crate::keymap::ConfigEditorAction::Cancel)],
+                                crate::i18n::t("zc-config-help-clear-filter"),
+                            ),
                             help(),
                         ])
                     } else {
                         HelpNode::entries(vec![
                             nav(),
-                            k(A::Enter, "zc-config-help-save-selection"),
+                            save_selection(),
                             filter(),
-                            k(A::Back, "zc-config-help-cancel"),
+                            cancel(),
                             help(),
                             E::spacer(),
                             E::key("Mouse", crate::i18n::t("zc-config-help-mouse-save")),
@@ -5876,7 +6327,10 @@ impl App {
                 } else {
                     HelpNode::entries(vec![
                         E::new(
-                            vec![editor_key(crate::keymap::ConfigEditorAction::Confirm)],
+                            vec![
+                                editor_key(crate::keymap::ConfigEditorAction::Save),
+                                editor_key(crate::keymap::ConfigEditorAction::Confirm),
+                            ],
                             crate::i18n::t("zc-config-help-save-value"),
                         ),
                         E::new(
@@ -5957,14 +6411,40 @@ struct Regions {
     status: Rect,
 }
 
+fn setup_section_key(section: &str) -> Option<&'static str> {
+    match section {
+        "providers.models" => Some("zc-config-setup-model-providers"),
+        "providers.tts" => Some("zc-config-setup-tts-providers"),
+        "model_routes" | "embedding_routes" => Some("zc-config-setup-routes"),
+        _ => None,
+    }
+}
+
+fn guidance_regions(area: Rect, text: &str, has_tabs: bool) -> Regions {
+    let height = Paragraph::new(text)
+        .wrap(Wrap { trim: false })
+        .line_count(area.width.max(1))
+        .saturating_add(usize::from(has_tabs));
+    regions_with_help(
+        area,
+        height
+            .min(usize::from(area.height.saturating_sub(6)))
+            .max(2) as u16,
+    )
+}
+
 fn regions(area: Rect) -> Regions {
+    regions_with_help(area, 2)
+}
+
+fn regions_with_help(area: Rect, help_height: u16) -> Regions {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // breadcrumb
-            Constraint::Length(2), // help
-            Constraint::Min(4),    // main
-            Constraint::Length(1), // status
+            Constraint::Length(1),           // breadcrumb
+            Constraint::Length(help_height), // help
+            Constraint::Min(4),              // main
+            Constraint::Length(1),           // status
         ])
         .split(area);
 
@@ -6936,6 +7416,281 @@ mod tests {
         assert_eq!(manager.section_cursor, 1);
     }
 
+    fn set_detail_filter(manager: &mut App, query: String) {
+        manager.filter_origin = Some(FilterOrigin {
+            pane: ZeroclawPane::Detail,
+            section_cursor: manager.section_cursor,
+            active_tab: manager.active_tab,
+            detail: None,
+        });
+        manager.filter = Some(query);
+    }
+
+    fn draw_setup_test_frame(frame: &mut Frame, manager: &mut App) {
+        manager.loaded_section = Some(manager.section_cursor);
+        let mut chat = crate::chat::Chat::new(manager.rpc.clone(), crate::chat::PaneKind::Chat);
+        let mut acp = crate::acp::Acp::new(manager.rpc.clone());
+        crate::app::draw_app_frame(
+            frame,
+            crate::app::Mode::Config,
+            &mut chat,
+            &mut acp,
+            |frame, chunks, _, _| manager.draw_into(frame, chunks[1]),
+        );
+    }
+
+    #[test]
+    fn older_daemon_setup_metadata_stays_unknown() {
+        let value = serde_json::to_value(field("model_routes.fast.model")).unwrap();
+        let mut value = value.as_object().unwrap().clone();
+        value.remove("setup");
+        let decoded: ConfigFieldEntry = serde_json::from_value(value.into()).unwrap();
+        assert!(decoded.setup.is_none());
+    }
+
+    #[tokio::test]
+    async fn alias_creation_uses_typed_missing_metadata_and_selects_its_tab() {
+        use crate::jsonrpc::RpcOutbound;
+        use crate::wire::ConfigFieldSetup;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+        let outbound = Arc::new(RpcOutbound::new(tx));
+        let rpc = Arc::new(RpcClient::with_rpc(outbound.clone()));
+        let mut manager = App::new(rpc, Path::new("/tmp"));
+        manager.sections = vec![typed_section("providers.tts")];
+        manager.screen = Screen::AliasCreate {
+            section_idx: 0,
+            map_path: "providers.tts.openai".to_string(),
+            breadcrumb: vec!["TTS".to_string(), "openai".to_string()],
+        };
+        manager.edit_buf = "sample".to_string();
+        let mut optional = field("providers.tts.openai.sample.voice");
+        optional.tab = ConfigTab::Model;
+        let mut required = field("providers.tts.openai.sample.api_key");
+        required.tab = ConfigTab::Connection;
+        required.is_secret = true;
+        required.populated = true; // Masked display population must not control setup.
+        required.setup = Some(ConfigFieldSetup { missing: true });
+        let responder = tokio::spawn(async move {
+            let create: serde_json::Value =
+                serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+            assert_eq!(
+                create["method"],
+                crate::client::method::CONFIG_MAP_KEY_CREATE
+            );
+            assert_eq!(create["params"]["key"], "sample");
+            outbound.dispatch_response(
+                create["id"].as_str().unwrap(),
+                Some(serde_json::json!({})),
+                None,
+            );
+            let list: serde_json::Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+            assert_eq!(list["method"], crate::client::method::CONFIG_LIST);
+            outbound.dispatch_response(
+                list["id"].as_str().unwrap(),
+                Some(serde_json::json!({"entries": [optional, required]})),
+                None,
+            );
+        });
+        manager
+            .handle_alias_create(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        responder.await.unwrap();
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        assert_eq!(manager.field_cursor, 1);
+        assert_eq!(manager.tab_names[manager.active_tab], ConfigTab::Connection);
+    }
+
+    #[tokio::test]
+    async fn cancelling_alias_name_only_reads_the_alias_list() {
+        use crate::jsonrpc::RpcOutbound;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+        let outbound = Arc::new(RpcOutbound::new(tx));
+        let mut manager = App::new(
+            Arc::new(RpcClient::with_rpc(outbound.clone())),
+            Path::new("/tmp"),
+        );
+        manager.sections = vec![typed_section("model_routes")];
+        manager.screen = Screen::AliasCreate {
+            section_idx: 0,
+            map_path: "model_routes".to_string(),
+            breadcrumb: vec!["Routes".to_string()],
+        };
+        manager.edit_buf = "discarded".to_string();
+        let responder = tokio::spawn(async move {
+            let request: serde_json::Value =
+                serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+            assert_eq!(request["method"], crate::client::method::CONFIG_MAP_KEYS);
+            outbound.dispatch_response(
+                request["id"].as_str().unwrap(),
+                Some(serde_json::json!({"keys": []})),
+                None,
+            );
+            rx
+        });
+        manager
+            .handle_alias_create(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let mut rx = responder.await.unwrap();
+        assert!(rx.try_recv().is_err());
+        assert!(matches!(manager.screen, Screen::AliasList { .. }));
+    }
+
+    fn render_setup_text(manager: &mut App) -> String {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| draw_setup_test_frame(frame, manager))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn section_search_keeps_setup_guidance_in_the_detail_preview() {
+        let mut manager = test_manager();
+        manager.sections = vec![typed_section("providers.tts")];
+        manager.screen = Screen::AliasList {
+            section_idx: 0,
+            map_path: "providers.tts.edge".to_string(),
+            breadcrumb: vec![],
+        };
+        manager.filter_origin = Some(FilterOrigin {
+            pane: ZeroclawPane::Sections,
+            section_cursor: 0,
+            active_tab: manager.active_tab,
+            detail: None,
+        });
+        manager.filter = Some("tts".to_string());
+        let text = render_setup_text(&mut manager);
+        assert!(text.contains("No aliases are configured"), "{text}");
+        assert!(!text.contains("No matches. Clear filter."));
+    }
+
+    #[tokio::test]
+    async fn cost_rate_creation_keeps_the_generic_name_hint() {
+        let mut manager = test_manager();
+        manager.sections = vec![typed_section("providers.tts")];
+        manager.screen = Screen::AliasCreate {
+            section_idx: 0,
+            map_path: "cost.rates.providers.tts.openai".to_string(),
+            breadcrumb: vec![],
+        };
+        let text = render_setup_text(&mut manager);
+        assert!(!text.contains("Text-to-speech is optional"), "{text}");
+        assert!(!text.contains("[missing]"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn setup_explanation_is_visible_without_adding_selectable_rows() {
+        use ratatui::backend::TestBackend;
+        for (width, height) in [(120, 40), (60, 24)] {
+            let mut manager = test_manager();
+            manager.sections = vec![typed_section("providers.tts")];
+            manager.screen = Screen::AliasList {
+                section_idx: 0,
+                map_path: "providers.tts.edge".to_string(),
+                breadcrumb: vec!["TTS".to_string(), "edge".to_string()],
+            };
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| draw_setup_test_frame(frame, &mut manager))
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(text.contains("optional"));
+            assert!(text.contains("[+ Add]"));
+            assert!(!text.contains("list.Text"), "guidance lines ran together");
+            assert_eq!(manager.alias_cursor, 0);
+            assert!(manager.last_main_area.height >= 4);
+            manager.aliases = vec!["present".to_string()];
+            set_detail_filter(&mut manager, "nomatch".to_string());
+            terminal
+                .draw(|frame| draw_setup_test_frame(frame, &mut manager))
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(text.contains("No matches."));
+            assert!(!text.contains("No aliases are configured"));
+            assert!(!text.contains("[+ Add]"));
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_field_and_creation_guidance_survive_narrow_detail_pane() {
+        use crate::wire::ConfigFieldSetup;
+        use ratatui::backend::TestBackend;
+        for (width, height) in [(120, 40), (60, 24)] {
+            for path in [
+                "providers.tts.openai.sample.api_key",
+                "model_routes.fast.model_provider",
+            ] {
+                let mut manager = test_manager();
+                manager.sections = vec![typed_section("providers.tts")];
+                manager.zeroclaw_pane = ZeroclawPane::Detail;
+                let prefix = path.rsplit_once('.').unwrap().0.to_string();
+                manager.screen = Screen::FieldList {
+                    section_idx: 0,
+                    prefix,
+                    breadcrumb: vec![],
+                };
+                let mut required = field(path);
+                required.setup = Some(ConfigFieldSetup { missing: true });
+                manager.fields = vec![required];
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|frame| draw_setup_test_frame(frame, &mut manager))
+                    .unwrap();
+                let text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                let name = path.rsplit_once('.').unwrap().1;
+                assert!(
+                    text.contains(&format!("{name} [missing]")),
+                    "{width} columns: {name}"
+                );
+                manager.screen = Screen::AliasCreate {
+                    section_idx: 0,
+                    map_path: "providers.tts.openai".into(),
+                    breadcrumb: vec![],
+                };
+                terminal
+                    .draw(|frame| draw_setup_test_frame(frame, &mut manager))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let mut detail = String::new();
+                for y in 0..height {
+                    for x in 30..width {
+                        detail.push_str(buffer[(x, y)].symbol());
+                    }
+                    detail.push(' ');
+                }
+                let detail = detail.split_whitespace().collect::<Vec<_>>().join(" ");
+                assert!(detail.contains("cancels without saving"), "{detail}");
+                assert!(detail.contains("keeps the saved entry"), "{detail}");
+            }
+        }
+    }
+
     fn entry_with_cost(key: &str, cost_category: &str) -> ConfigSectionEntry {
         ConfigSectionEntry {
             key: key.to_string(),
@@ -7105,6 +7860,504 @@ mod tests {
                 }),
             ),
         }
+    }
+
+    fn field_draft_manager(
+        kind: PropKind,
+    ) -> (
+        App,
+        Arc<crate::jsonrpc::RpcOutbound>,
+        tokio::sync::mpsc::Receiver<String>,
+        Term,
+    ) {
+        let (mut manager, outbound, rx, term) = alias_rename_manager("example", "unused");
+        manager.sections[0].shape = Some(SectionShape::DirectForm);
+        let mut entry = field("example.value");
+        entry.kind = kind;
+        entry.value = Some(serde_json::json!(match kind {
+            PropKind::Bool => "true",
+            PropKind::StringArray => "[\"original\"]",
+            _ => "original",
+        }));
+        entry.populated = true;
+        manager.fields = vec![entry];
+        manager.screen = Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "example".into(),
+            breadcrumb: vec!["example".into()],
+            field_idx: 0,
+        };
+        manager.prepare_edit_at(0);
+        (manager, outbound, rx, term)
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn config_save_dispatches_scalar_choice_and_array_values_with_resolved_shortcut() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        crate::keymap::overrides::set_row(
+            "config_editor",
+            "save",
+            vec![crate::keymap::Chord::key(KeyCode::F(6))],
+        );
+        for (kind, value) in [
+            (PropKind::String, serde_json::json!("literal hjkl/ text")),
+            (PropKind::Bool, serde_json::json!("false")),
+            (PropKind::StringArray, serde_json::json!(["alpha", "beta"])),
+        ] {
+            let (mut manager, outbound, mut rx, mut term) = field_draft_manager(kind);
+            if kind == PropKind::Bool {
+                manager.select_cursor = 1;
+            } else {
+                manager.edit_buf = if kind == PropKind::StringArray {
+                    "alpha\nbeta".into()
+                } else {
+                    "literal hjkl/ text".into()
+                };
+            }
+            assert!(manager.has_pending_edits());
+            assert!(
+                manager
+                    .bottom_hint()
+                    .contains(&editor_key(crate::keymap::ConfigEditorAction::Save))
+            );
+            let answers = async {
+                answer_config_request(
+                    &outbound,
+                    &mut rx,
+                    "config/set",
+                    serde_json::json!({"prop":"example.value", "value":value}),
+                    Ok(serde_json::json!({})),
+                )
+                .await;
+                answer_config_request(
+                    &outbound,
+                    &mut rx,
+                    "config/list",
+                    serde_json::json!({"prefix":"example"}),
+                    Ok(serde_json::json!({"entries":[]})),
+                )
+                .await;
+            };
+            let ((), ()) =
+                tokio::join!(config_key(&mut manager, &mut term, KeyCode::F(6)), answers);
+            assert!(matches!(manager.screen, Screen::FieldList { .. }));
+            assert!(!manager.has_pending_edits());
+            assert!(rx.try_recv().is_err());
+        }
+        crate::keymap::overrides::reset();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn config_cancel_and_mouse_discard_never_write_the_field_draft() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let (mut manager, outbound, mut rx, mut term) = field_draft_manager(PropKind::String);
+        manager.handle_paste(" pending").await;
+        manager.last_breadcrumb_areas = vec![Rect::new(0, 0, 7, 1), Rect::new(12, 0, 5, 1)];
+        let click = |column| MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        // Clicking the current crumb is inert, including for a dirty draft.
+        manager
+            .handle_mouse(click(12), Rect::default(), &mut term)
+            .await
+            .unwrap();
+        assert!(manager.pending_confirmation.is_none());
+        manager
+            .handle_mouse(click(0), Rect::default(), &mut term)
+            .await
+            .unwrap();
+        assert!(manager.pending_confirmation.is_some());
+        assert!(rx.try_recv().is_err());
+        config_key(&mut manager, &mut term, KeyCode::Esc).await;
+        assert_eq!(manager.edit_buf, "original pending");
+        assert!(matches!(manager.screen, Screen::FieldEdit { .. }));
+        manager
+            .handle_mouse(click(0), Rect::default(), &mut term)
+            .await
+            .unwrap();
+        let answers = answer_config_request(
+            &outbound,
+            &mut rx,
+            "config/list",
+            serde_json::json!({"prefix":"example"}),
+            Ok(serde_json::json!({"entries":[]})),
+        );
+        let ((), ()) = tokio::join!(config_key(&mut manager, &mut term, KeyCode::Enter), answers);
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        assert!(rx.try_recv().is_err());
+
+        let (mut manager, outbound, mut rx, mut term) = field_draft_manager(PropKind::String);
+        manager.handle_paste(" canceled").await;
+        let answers = answer_config_request(
+            &outbound,
+            &mut rx,
+            "config/list",
+            serde_json::json!({"prefix":"example"}),
+            Ok(serde_json::json!({"entries":[]})),
+        );
+        let ((), ()) = tokio::join!(config_key(&mut manager, &mut term, KeyCode::Esc), answers);
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn config_left_out_of_changed_choice_asks_before_discarding() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let (mut manager, outbound, mut rx, mut term) = field_draft_manager(PropKind::Bool);
+        config_key(&mut manager, &mut term, KeyCode::Down).await;
+        assert!(manager.has_pending_edits(), "Down changes the choice");
+        config_key(&mut manager, &mut term, KeyCode::Left).await;
+        assert!(manager.pending_confirmation.is_some());
+        assert!(matches!(manager.screen, Screen::FieldEdit { .. }));
+        config_key(&mut manager, &mut term, KeyCode::Esc).await;
+        assert!(manager.pending_confirmation.is_none());
+        assert!(manager.has_pending_edits(), "Stay keeps the changed choice");
+        config_key(&mut manager, &mut term, KeyCode::Left).await;
+        let answers = answer_config_request(
+            &outbound,
+            &mut rx,
+            "config/list",
+            serde_json::json!({"prefix":"example"}),
+            Ok(serde_json::json!({"entries":[]})),
+        );
+        let ((), ()) = tokio::join!(config_key(&mut manager, &mut term, KeyCode::Enter), answers);
+        assert!(manager.pending_confirmation.is_none());
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        assert!(rx.try_recv().is_err(), "discard never writes");
+        crate::keymap::overrides::reset();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn config_staged_secret_map_key_counts_as_pending() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let (mut manager, _outbound, mut rx, mut term) = field_draft_manager(PropKind::SecretMap);
+        manager.edit_buf.clear();
+        manager.edit_cursor = 0;
+        manager.field_draft_loaded.clear();
+        for c in "API_TOKEN".chars() {
+            config_key(&mut manager, &mut term, KeyCode::Char(c)).await;
+        }
+        config_key(&mut manager, &mut term, KeyCode::Enter).await;
+        assert_eq!(manager.secret_map_entry_key.as_deref(), Some("API_TOKEN"));
+        assert!(manager.edit_buf.is_empty());
+        assert!(manager.has_pending_edits(), "the staged key is a draft");
+        manager.discard_drafts();
+        assert!(manager.secret_map_entry_key.is_none());
+        assert!(!manager.has_pending_edits());
+        assert!(rx.try_recv().is_err());
+        crate::keymap::overrides::reset();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn config_filtered_choice_cancel_clears_filter_before_canceling() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let (mut manager, outbound, mut rx, mut term) = field_draft_manager(PropKind::Bool);
+        config_key(&mut manager, &mut term, KeyCode::Char('/')).await;
+        for c in "false".chars() {
+            config_key(&mut manager, &mut term, KeyCode::Char(c)).await;
+        }
+        assert_eq!(manager.field_draft(), "false");
+        config_key(&mut manager, &mut term, KeyCode::Esc).await;
+        assert!(manager.filter.is_none());
+        assert!(matches!(manager.screen, Screen::FieldEdit { .. }));
+        assert!(rx.try_recv().is_err());
+        config_key(&mut manager, &mut term, KeyCode::Char('/')).await;
+        manager.handle_paste("false").await;
+        let answers = async {
+            answer_config_request(
+                &outbound,
+                &mut rx,
+                "config/set",
+                serde_json::json!({"prop":"example.value", "value":"false"}),
+                Ok(serde_json::json!({})),
+            )
+            .await;
+            answer_config_request(
+                &outbound,
+                &mut rx,
+                "config/list",
+                serde_json::json!({"prefix":"example"}),
+                Ok(serde_json::json!({"entries":[]})),
+            )
+            .await;
+        };
+        let save = async {
+            manager
+                .handle_key(
+                    KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                    &mut term,
+                )
+                .await
+                .unwrap();
+        };
+        let ((), ()) = tokio::join!(save, answers);
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn config_connection_paste_and_resolved_actions_leave_parked_draft_untouched() {
+        let _env = crate::test_support::env_test_lock();
+        let _keys = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        for cancel in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut manager, _outbound, mut rx, mut term) = field_draft_manager(PropKind::String);
+            manager.handle_paste(" parked").await;
+            manager.zerocode = crate::zerocode_pane::ZerocodePane::new(dir.path());
+            for _ in 0..5 {
+                manager
+                    .zerocode
+                    .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            }
+            for _ in 0..2 {
+                manager
+                    .zerocode
+                    .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            }
+            manager.section = ConfigSection::Zerocode;
+            assert!(manager.wants_text_input());
+            let before = std::fs::read(crate::config::config_path(dir.path())).unwrap();
+            manager.handle_paste("ws://127.0.0.1:\r\n42617").await;
+            assert_eq!(manager.edit_buf, "original parked");
+            assert!(rx.try_recv().is_err());
+            let action = if cancel { "cancel" } else { "save" };
+            crate::keymap::overrides::set_row(
+                "config_editor",
+                action,
+                vec![crate::keymap::Chord::key(KeyCode::Tab)],
+            );
+            config_key(&mut manager, &mut term, KeyCode::Tab).await;
+            assert!(manager.section == ConfigSection::Zerocode);
+            assert!(!manager.wants_text_input());
+            assert_eq!(manager.edit_buf, "original parked");
+            if cancel {
+                assert_eq!(
+                    std::fs::read(crate::config::config_path(dir.path())).unwrap(),
+                    before
+                );
+            } else {
+                assert_eq!(
+                    crate::config::ensure_and_load(dir.path())
+                        .unwrap()
+                        .connection
+                        .wss
+                        .uri
+                        .as_deref(),
+                    Some("ws://127.0.0.1:42617")
+                );
+            }
+            assert!(rx.try_recv().is_err());
+            crate::keymap::overrides::reset();
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn config_alt_section_binding_parks_scalar_draft_without_inserting_text() {
+        let _keys = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        crate::keymap::overrides::set_row(
+            "config_tab",
+            "section_next",
+            vec![crate::keymap::Chord::with(
+                KeyCode::Char('n'),
+                KeyModifiers::ALT,
+            )],
+        );
+        let (mut manager, _outbound, mut rx, mut term) = field_draft_manager(PropKind::String);
+        manager.handle_paste(" pending").await;
+        manager
+            .handle_key(
+                KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT),
+                &mut term,
+            )
+            .await
+            .unwrap();
+        assert!(manager.section == ConfigSection::Zerocode);
+        assert_eq!(manager.edit_buf, "original pending");
+        assert!(matches!(manager.screen, Screen::FieldEdit { .. }));
+        assert!(rx.try_recv().is_err());
+        crate::keymap::overrides::reset();
+    }
+
+    fn personality_draft_manager() -> (
+        App,
+        Arc<crate::jsonrpc::RpcOutbound>,
+        tokio::sync::mpsc::Receiver<String>,
+        Term,
+    ) {
+        let (mut manager, outbound, rx, term) = alias_rename_manager("agents", "demo");
+        manager.screen = Screen::FieldList {
+            section_idx: 0,
+            prefix: "agents.demo".into(),
+            breadcrumb: vec!["agents".into(), "demo".into()],
+        };
+        manager.tab_names = vec![ConfigTab::Settings, ConfigTab::Personality];
+        manager.active_tab = 1;
+        manager.personality_agent = "demo".into();
+        manager.personality_active_file = Some("SOUL.md".into());
+        manager.personality_loaded = "original".into();
+        manager.personality_content = "draft".into();
+        (manager, outbound, rx, term)
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn config_personality_save_preserves_content_baseline_and_second_save() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let (mut manager, outbound, mut rx, mut term) = personality_draft_manager();
+        for _ in 0..2 {
+            let answers = async {
+                answer_config_request(
+                    &outbound,
+                    &mut rx,
+                    "personality/put",
+                    serde_json::json!({"agent":"demo", "filename":"SOUL.md", "content":"draft"}),
+                    Ok(serde_json::json!({})),
+                )
+                .await;
+                answer_config_request(
+                    &outbound,
+                    &mut rx,
+                    "personality/list",
+                    serde_json::json!({"agent":"demo"}),
+                    Ok(serde_json::json!({"files":[], "max_chars":20000})),
+                )
+                .await;
+            };
+            let save = async {
+                manager
+                    .handle_key(
+                        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                        &mut term,
+                    )
+                    .await
+                    .unwrap();
+            };
+            let ((), ()) = tokio::join!(save, answers);
+            assert_eq!(manager.personality_content, "draft");
+            assert_eq!(manager.personality_loaded, "draft");
+            assert_eq!(manager.personality_active_file.as_deref(), Some("SOUL.md"));
+            assert!(!manager.has_pending_edits());
+        }
+        manager.handle_paste("hjkl/").await;
+        config_key(&mut manager, &mut term, KeyCode::Enter).await;
+        assert_eq!(manager.personality_content, "drafthjkl/\n");
+        config_key(&mut manager, &mut term, KeyCode::Esc).await;
+        assert!(manager.personality_active_file.is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn config_personality_failed_external_import_keeps_draft_for_inline_retry() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let (mut manager, outbound, mut rx, mut term) = personality_draft_manager();
+        manager.pending_confirmation = Some(PendingConfirmation::ExternalPersonality);
+        config_key(&mut manager, &mut term, KeyCode::Esc).await;
+        assert!(rx.try_recv().is_err());
+        let answers = answer_config_request(
+            &outbound,
+            &mut rx,
+            "personality/put",
+            serde_json::json!({"agent":"demo", "filename":"SOUL.md", "content":"external draft"}),
+            Err("write unavailable"),
+        );
+        let (result, ()) = tokio::join!(
+            manager.import_personality_edit("external draft".into(), &mut term),
+            answers
+        );
+        result.unwrap();
+        assert_eq!(manager.personality_content, "external draft");
+        assert_eq!(manager.personality_loaded, "original");
+        assert!(manager.has_pending_edits());
+        assert_eq!(manager.personality_active_file.as_deref(), Some("SOUL.md"));
+        let answers = async {
+            answer_config_request(&outbound, &mut rx, "personality/put", serde_json::json!({"agent":"demo", "filename":"SOUL.md", "content":"external draft"}), Ok(serde_json::json!({}))).await;
+            answer_config_request(
+                &outbound,
+                &mut rx,
+                "personality/list",
+                serde_json::json!({"agent":"demo"}),
+                Ok(serde_json::json!({"files":[], "max_chars":20000})),
+            )
+            .await;
+        };
+        let save = async {
+            manager
+                .handle_key(
+                    KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                    &mut term,
+                )
+                .await
+                .unwrap();
+        };
+        let ((), ()) = tokio::join!(save, answers);
+        assert!(!manager.has_pending_edits());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn config_personality_keyboard_departure_stays_or_discards_without_writes() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let (mut manager, outbound, mut rx, mut term) = personality_draft_manager();
+        config_key(&mut manager, &mut term, KeyCode::Char('h')).await;
+        assert_eq!(manager.personality_content, "drafth");
+        config_key(&mut manager, &mut term, KeyCode::Left).await;
+        assert!(manager.pending_confirmation.is_some());
+        assert!(rx.try_recv().is_err());
+        config_key(&mut manager, &mut term, KeyCode::Esc).await;
+        assert_eq!(manager.active_tab, 1);
+        assert_eq!(manager.personality_content, "drafth");
+        config_key(&mut manager, &mut term, KeyCode::Left).await;
+        let answers = answer_config_request(
+            &outbound,
+            &mut rx,
+            "config/list",
+            serde_json::json!({"prefix":"agents.demo"}),
+            Ok(serde_json::json!({"entries":[]})),
+        );
+        let ((), ()) = tokio::join!(config_key(&mut manager, &mut term, KeyCode::Enter), answers);
+        assert_eq!(manager.active_tab, 0);
+        assert!(manager.personality_active_file.is_none());
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -7985,7 +9238,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_alias_rename_breadcrumbs_navigate_without_saving() {
+    async fn field_breadcrumbs_discard_confirmed_drafts_without_saving() {
         for target in 0..3 {
             let (mut manager, outbound, mut rx, mut term) =
                 alias_rename_manager("providers.models", "openai");
@@ -8042,10 +9295,16 @@ mod tests {
                 }
             };
             let (result, ()) = tokio::join!(
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    manager.handle_mouse(click(areas[target].x), Rect::default(), &mut term),
-                ),
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    manager
+                        .handle_mouse(click(areas[target].x), Rect::default(), &mut term)
+                        .await?;
+                    assert!(manager.pending_confirmation.is_some());
+                    manager
+                        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut term)
+                        .await?;
+                    Ok::<(), anyhow::Error>(())
+                },),
                 replies
             );
             result.unwrap().unwrap();
@@ -8151,6 +9410,7 @@ mod tests {
             section: None,
             tab: ConfigTab::None,
             alias_source: None,
+            setup: None,
         }
     }
 
@@ -8409,6 +9669,7 @@ mod tests {
             section: None,
             tab: ConfigTab::None,
             alias_source: None,
+            setup: None,
         }
     }
 
@@ -8680,7 +9941,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn multiline_save_refreshes_once_and_keeps_tab_and_cursor() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
         let (mut manager, calls) = responding_manager();
         let mut first = field("a.first");
         first.tab = ConfigTab::Connection;

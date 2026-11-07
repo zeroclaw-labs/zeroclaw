@@ -30,6 +30,14 @@ Do not hand-edit the generated config reference. If a field, enum, alias
 section, secret marker, or description is wrong there, fix the schema or the
 generator and regenerate the reference.
 
+## Setup guidance
+
+The `config/list` RPC exposes optional per-field setup metadata from the current typed `Config`. A present `setup` entry identifies a required field under a covered contract; `missing` reports whether that contract considers its value empty. An absent entry means unknown requiredness, not optionality or readiness. The metadata is derived during introspection and is never persisted.
+
+Route guidance shares the required-value checks used by `Config::validate`. Cloud TTS key guidance shares the trimmed-key accessor used by its constructors. Missing secret values are checked against typed values before display masking. Model-provider authentication remains conditional on the provider and authentication mode; setup metadata does not check external logins, executables, connectivity, or provider readiness.
+
+In ZeroCode Config, confirming an alias name saves the entry before opening its fields. Cancelling the name form does not create an entry. Leaving the field editor afterward keeps the saved entry, and field edits retain their existing persistence behavior.
+
 ## Load order
 
 Config load has a few distinct phases:
@@ -167,6 +175,23 @@ When replacing an existing file, the writer creates a same-directory
 `config.toml.bak` during the replace and removes it after a successful write.
 Gateway writes also snapshot the pre-write file and best-effort restore it if
 persistence fails before publishing the new pair.
+
+The CLI's `zeroclaw config migrate` keeps the pre-migration file as
+`config.toml.backup`, which the next CLI migration replaces. Dashboard migration
+instead writes `config.toml.bak`; the next save can replace that copy, so it is
+not a lasting downgrade backup. The first rewrite of a file at an older schema
+version, whether a migration or a save from any surface, also copies it to
+`config.toml.v<version>.backup` (for example `config.toml.v3.backup`). That
+copy is owner-only, is written once and never replaced, and is the downgrade
+path: an older binary reads it as is. A file already at that name counts only
+when it holds exactly the bytes about to be rewritten; anything else there is
+left alone and the copy goes to the first free numbered name
+(`config.toml.v3-1.backup`, and so on). A copy an older build left readable
+by others is made owner-only before it counts. On a filesystem without hard
+links the copy is kept under a name of its own instead
+(`config.toml.v3-<random>.backup`). It still holds every key the upgrade
+retired, including plaintext secrets, so delete it once a downgrade is no
+longer needed.
 
 There is no general transactional rollback for a valid but undesired config
 change after it has been saved and applied. Restore the previous `config.toml`
