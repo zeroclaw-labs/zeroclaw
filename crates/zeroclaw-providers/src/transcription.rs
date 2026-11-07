@@ -172,6 +172,7 @@ impl GroqProvider {
             alias: alias.to_owned(),
             client: crate::protocols::openai::audio::TranscriptionClient {
                 transport: config.transport.clone(),
+                service_key: "transcription.groq",
                 endpoint: config.endpoint()?,
                 model: config
                     .model
@@ -200,6 +201,7 @@ impl GroqProvider {
             alias: alias.to_string(),
             client: crate::protocols::openai::audio::TranscriptionClient {
                 endpoint: config.api_url.clone(),
+                service_key: "transcription.groq",
                 model: config.model.clone(),
                 transport: HttpTransportConfig::with_base_url("", Some(api_key)),
                 language: config.language.clone(),
@@ -229,6 +231,7 @@ impl GroqProvider {
             alias: alias.to_string(),
             client: crate::protocols::openai::audio::TranscriptionClient {
                 endpoint: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
+                service_key: "transcription.groq",
                 model: cfg
                     .model
                     .clone()
@@ -267,6 +270,7 @@ impl OpenAiWhisperProvider {
             alias: alias.to_owned(),
             client: crate::protocols::openai::audio::TranscriptionClient {
                 transport: config.transport.clone(),
+                service_key: "transcription.openai",
                 endpoint: config.endpoint()?,
                 model: config
                     .model
@@ -295,6 +299,7 @@ impl OpenAiWhisperProvider {
             alias: alias.to_string(),
             client: crate::protocols::openai::audio::TranscriptionClient {
                 endpoint: "https://api.openai.com/v1/audio/transcriptions".to_string(),
+                service_key: "transcription.openai",
                 transport: HttpTransportConfig::with_base_url("", Some(api_key)),
                 model: config.model.clone(),
                 language: None,
@@ -324,6 +329,7 @@ impl OpenAiWhisperProvider {
             alias: alias.to_string(),
             client: crate::protocols::openai::audio::TranscriptionClient {
                 endpoint: "https://api.openai.com/v1/audio/transcriptions".to_string(),
+                service_key: "transcription.openai",
                 transport: HttpTransportConfig::with_base_url("", Some(api_key)),
                 model: cfg
                     .model

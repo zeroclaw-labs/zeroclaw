@@ -1936,9 +1936,8 @@ async fn run_tool_call_loop_impl<'a>(
         // Preserve the legacy embedded-agent contract when no Config is
         // supplied. Config-backed turns resolve the model-owned policy below
         // once the accepted route is known.
-        extract_text_reasoning: config.map_or(true, |config| {
-            config.model_text_extraction(provider_name).reasoning
-        }),
+        extract_text_reasoning: config
+            .is_none_or(|config| config.model_text_extraction(provider_name).reasoning),
         channel,
         draft_reasoning: knobs.draft_reasoning,
         turn_id,

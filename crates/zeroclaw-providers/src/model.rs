@@ -723,11 +723,17 @@ pub fn build_model(
     let model_name = &identity.model_id;
 
     let mut runtime_options = if bare_family {
-        // Bare family: inherit the agent's own profile options with the
-        // provider-specific bits cleared — the legacy `--provider <family>`
-        // semantics preserved by `options_for_provider_ref`'s bare arm.
-        let agent_options = crate::provider_runtime_options_for_agent(config, agent_alias);
-        crate::options_for_provider_ref(config, model_provider_ref, &agent_options)
+        // A bare family with an agent selection is only a selector shorthand:
+        // construct the selected profile's full connection/options, rather
+        // than rebuilding the family default and accidentally dropping its
+        // URI, kind, headers, or wire policy. A truly unconfigured bare
+        // family keeps the historical provider-default path.
+        if selection.is_some() {
+            crate::provider_runtime_options_for_agent(config, agent_alias)
+        } else {
+            let agent_options = crate::provider_runtime_options_for_agent(config, agent_alias);
+            crate::options_for_provider_ref(config, model_provider_ref, &agent_options)
+        }
     } else {
         crate::provider_runtime_options_for_alias(
             config,
@@ -737,11 +743,25 @@ pub fn build_model(
     };
     crate::apply_model_entry_options(&mut runtime_options, model_entry);
 
+    let construction_ref = if bare_family {
+        selection.as_ref().map_or_else(
+            || model_provider_ref.to_owned(),
+            |selected| {
+                let profile = format!("{}.{}", selected.family, selected.alias);
+                selected
+                    .model_alias
+                    .as_ref()
+                    .map_or(profile.clone(), |model| format!("{profile}.{model}"))
+            },
+        )
+    } else {
+        model_provider_ref.to_owned()
+    };
+
     let (provider, model_route_resolver) =
         crate::create_routed_model_provider_with_options_and_resolver(
             config,
-            // The raw ref, deliberately: see the function-level comment.
-            model_provider_ref,
+            &construction_ref,
             entry.and_then(|e| e.api_key.as_deref()),
             explicit_url.or_else(|| entry.and_then(|e| e.uri.as_deref())),
             &config.reliability,
@@ -845,7 +865,7 @@ mod tests {
                 "explicit-model"
             );
         }
-        assert!(routed_selection_depends_on_model_ref(
+        assert!(!routed_selection_depends_on_model_ref(
             &config,
             "worker",
             "custom.primary.fast",

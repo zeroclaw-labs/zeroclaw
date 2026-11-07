@@ -52,6 +52,31 @@ fn invalid_semantic_completion_error(agent_name: &str) -> String {
     crate::agent::turn::outcome::semantic_empty_terminal_completion_message(Some(agent_name))
 }
 
+/// A delegated turn must prepare for every model that can actually serve its
+/// first request. A native primary can fail before the loop gets a chance to
+/// observe the fallback route; when a reachable fallback uses prompt-guided
+/// tools, the initial prompt still needs to carry that protocol so the retry
+/// can execute its text tool calls.
+fn text_tool_calls_available(config: &Config, model_ref: &str) -> bool {
+    if config.model_text_extraction(model_ref).tool_calls {
+        return true;
+    }
+    let Ok(registry) = config.provider_registry() else {
+        return false;
+    };
+    let root = zeroclaw_config::provider_registry::ModelRef::from(model_ref);
+    registry
+        .fallback_chain(&root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .any(|candidate| config.model_text_extraction(candidate.as_str()).tool_calls)
+}
+
+fn text_tool_calls_available_from(config: Option<&Config>, model_ref: &str) -> bool {
+    config.is_none_or(|config| text_tool_calls_available(config, model_ref))
+}
+
 fn delegate_failure_error(agent_name: &str, error: &anyhow::Error) -> String {
     if error
         .chain()
@@ -5179,12 +5204,8 @@ impl DelegateTool {
         };
 
         let empty_tools: &[Box<dyn Tool>] = &[];
-        let expose_text_tools = sends_native_tool_specs
-            || config.map_or(true, |config| {
-                config
-                    .model_text_extraction(&agent_config.model_provider)
-                    .tool_calls
-            });
+        let text_tool_calls = text_tool_calls_available_from(config, &agent_config.model_provider);
+        let expose_text_tools = sends_native_tool_specs || text_tool_calls;
         let prompt_tools = if expose_text_tools {
             sub_tools
         } else {
@@ -5194,11 +5215,12 @@ impl DelegateTool {
         let shell_profile = self.runtime.as_ref().and_then(|r| r.shell_profile());
 
         // Build structured operational context using SystemPromptBuilder sections.
-        let dispatcher_instructions = if sends_native_tool_specs || prompt_tools.is_empty() {
-            String::new()
-        } else {
-            XmlToolDispatcher.prompt_instructions(prompt_tools)
-        };
+        let dispatcher_instructions =
+            if prompt_tools.is_empty() || (sends_native_tool_specs && !text_tool_calls) {
+                String::new()
+            } else {
+                XmlToolDispatcher.prompt_instructions(prompt_tools)
+            };
         // Independent delegates run under the target's own ApprovalManager, so
         // the prompt must state that exact policy — Full contracts and named
         // `always_ask` exceptions come from the same manager the nested loop's
@@ -5807,13 +5829,10 @@ impl DelegateTool {
             enriched_system_prompt,
             sub_deferred_section,
             native_tools,
-            !target_config
-                .or(self.root_config.as_deref())
-                .map_or(true, |config| {
-                    config
-                        .model_text_extraction(&agent_config.model_provider)
-                        .tool_calls
-                }),
+            !text_tool_calls_available_from(
+                target_config.or(self.root_config.as_deref()),
+                &agent_config.model_provider,
+            ),
         );
         let enriched_system_prompt = match (
             enriched_system_prompt,
@@ -5926,13 +5945,10 @@ impl DelegateTool {
                         excluded_tools: &[],
                         dedup_exempt_tools: tool_policy.excluded_tools.as_deref().unwrap_or(&[]),
                         pacing: &pacing,
-                        text_tool_calls_disabled: !target_config
-                            .or(self.root_config.as_deref())
-                            .map_or(true, |config| {
-                                config
-                                    .model_text_extraction(&agent_config.model_provider)
-                                    .tool_calls
-                            }),
+                        text_tool_calls_disabled: !text_tool_calls_available_from(
+                            target_config.or(self.root_config.as_deref()),
+                            &agent_config.model_provider,
+                        ),
                         parallel_tools: loop_runtime.parallel_tools,
                         max_tool_result_chars: loop_runtime.max_tool_result_chars,
                         keep_tool_context_turns: loop_runtime.keep_tool_context_turns,
@@ -13523,8 +13539,18 @@ options = { extract_text_tool_calls = false }
         root.runtime_profiles = agentic_runtime_profiles(10);
         root.risk_profiles = agentic_risk_profiles(vec!["echo_tool".into()]);
         root.agents.insert("agentic".into(), target.clone());
-        let tool = DelegateTool::new(root.agents.clone(), None, test_security())
+        root.agents.insert(
+            "caller".into(),
+            AliasedAgentConfig {
+                model_provider: target.model_provider.clone(),
+                risk_profile: target.risk_profile.clone(),
+                runtime_profile: target.runtime_profile.clone(),
+                ..Default::default()
+            },
+        );
+        let tool = DelegateTool::new(root.agents.clone(), None, security_allowing())
             .with_root_config(Arc::new(root))
+            .with_caller_alias("caller")
             .with_workspace_dir(workspace.path().to_path_buf())
             .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
 
@@ -21962,7 +21988,16 @@ command = "rm independent-delegate-marker"
             .map(|value| format!("native_tools = {value}"))
             .unwrap_or_default();
         let backup_options = backup_native_tools
-            .map(|value| format!("native_tools = {value}"))
+            .map(|value| {
+                if value {
+                    "native_tools = true".to_string()
+                } else {
+                    // Text-only canonical models opt into the shared parser
+                    // explicitly; custom providers no longer enable it by
+                    // default.
+                    "native_tools = false, extract_text_tool_calls = true".to_string()
+                }
+            })
             .unwrap_or_default();
         config.providers = toml::from_str(&format!(
             r#"

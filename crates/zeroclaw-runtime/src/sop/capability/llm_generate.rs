@@ -50,10 +50,15 @@ pub trait LlmGenerateAdapter: Send + Sync {
     /// Run one bounded generation while retaining an internal typed failure.
     ///
     /// The default preserves compatibility with pre-existing adapters. The
-    /// provider-backed implementation overrides it so the runtime can classify
-    /// terminal-completion failures before SOP serializes them for the user.
+    /// config-free adapter route also retains its historical reasoning parser:
+    /// legacy injected adapters return raw text, so a reasoning-only
+    /// `<think>...</think>` completion must be classified as empty before SOP
+    /// serializes it. The provider-backed implementation overrides this method
+    /// because it already applies its model-owned policy while dispatching.
     fn generate_typed(&self, system: Option<&str>, prompt: &str) -> Result<String> {
-        self.generate(system, prompt).map_err(anyhow::Error::msg)
+        self.generate(system, prompt)
+            .map(|text| zeroclaw_api::model_provider::strip_think_tags(&text))
+            .map_err(anyhow::Error::msg)
     }
 }
 

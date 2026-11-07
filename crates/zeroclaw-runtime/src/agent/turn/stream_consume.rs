@@ -1421,13 +1421,14 @@ mod tests {
                     "nk>reasoning</think>Answer\n",
                     "<tool_call>{\"name\":\"shell\",\"arguments\":{}}</tool_call>",
                 ]);
+                let (delta_tx, _delta_rx) = tokio::sync::mpsc::channel(16);
                 let outcome = consume_provider_streaming_response_with_policy(
                     &provider,
                     ChatRequest::new(&messages).with_tools(&tools),
                     "mock-model",
                     Some(0.0),
                     None,
-                    None,
+                    Some(&delta_tx),
                     None,
                     !tool_calls,
                     reasoning,

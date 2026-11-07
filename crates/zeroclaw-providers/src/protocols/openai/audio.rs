@@ -59,6 +59,10 @@ pub(crate) async fn speech_audio(response: reqwest::Response) -> Result<Vec<u8>>
 /// supply defaults; the protocol never selects a provider or reads config.
 pub(crate) struct TranscriptionClient {
     pub(crate) transport: crate::transport::HttpTransportConfig,
+    /// Proxy/telemetry service identity. The multipart wire format is shared
+    /// by OpenAI-compatible vendors, but their configured proxy routes are
+    /// intentionally distinct.
+    pub(crate) service_key: &'static str,
     pub(crate) endpoint: String,
     pub(crate) model: String,
     pub(crate) language: Option<String>,
@@ -68,17 +72,9 @@ pub(crate) struct TranscriptionClient {
 impl TranscriptionClient {
     pub(crate) async fn transcribe(&self, audio: &[u8], file_name: &str) -> Result<String> {
         let (file_name, mime) = crate::transcription::validate_audio(audio, file_name)?;
-        // The multipart wire format is shared with OpenAI, but transport
-        // attribution still follows the selected vendor so request metrics
-        // and rate-limit accounting do not classify Groq traffic as OpenAI.
-        let service = if self.endpoint.contains("groq.com") {
-            "transcription.groq"
-        } else {
-            "transcription.openai"
-        };
         let client = self
             .transport
-            .client(std::time::Duration::from_secs(120), service)?;
+            .client(std::time::Duration::from_secs(120), self.service_key)?;
         let form = TranscriptionRequest {
             model: &self.model,
             language: self.language.as_deref(),

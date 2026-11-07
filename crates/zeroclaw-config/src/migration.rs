@@ -7759,6 +7759,14 @@ model = "fast-model"
             "[runtime_profiles.x]\nstrict_tool_parsing = true\n",
         ),
         (
+            "providers.models.x.x.fallback",
+            "[providers.models.x.x]\nfallback = [\"custom.backup\"]\n",
+        ),
+        (
+            "providers.models.x.x.fallback_models",
+            "[providers.models.x.x]\nfallback_models = [\"backup\"]\n",
+        ),
+        (
             "runtime_profiles.x.context_compression.summary_model",
             "[runtime_profiles.x.context_compression]\nsummary_model = \"haiku\"\n",
         ),

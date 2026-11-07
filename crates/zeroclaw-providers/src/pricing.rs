@@ -261,6 +261,9 @@ struct WantedModel {
     /// cannot inherit prices from an opted-in same-family alias via the
     /// bare-family fallback.
     provider_key: String,
+    /// Legacy family aliases can safely project a bare-family snapshot entry;
+    /// canonical exact model refs intentionally have no such projection.
+    alias_family: Option<String>,
     /// Same as `provider_key`; kept for clarity at use sites that build handles.
     composite: String,
     model_id: String,
@@ -323,6 +326,7 @@ fn enabled_pricing_groups(
             // snapshot uses this directly so a non-opted-in alias can never
             // inherit rates from an opted-in same-family alias.
             provider_key: composite.clone(),
+            alias_family: Some(ty.to_string()),
             composite,
             model_id: model_id.to_string(),
             // models.dev provider key for this family, for the fallback path.
@@ -361,6 +365,92 @@ fn enabled_pricing_groups(
                         })),
                     "live pricing: could not build provider; skipping gateway"
                 );
+            }
+        }
+    }
+
+    // Canonical models own `live_pricing` on their chat API. Keep these exact
+    // model refs separate from legacy family aliases so a canonical key such
+    // as `chat.fast` never creates or inherits a bare `chat` price slot.
+    if let Ok(registry) = config.provider_registry() {
+        for (model_ref, model) in &registry.models {
+            if model.capability() != zeroclaw_api::capability::Capability::Chat {
+                continue;
+            }
+            let Ok(resolved) = registry.resolve_chat(model_ref) else {
+                continue;
+            };
+            if resolved.live_pricing != Some(true) {
+                continue;
+            }
+            let Some(model_id) = resolved
+                .upstream_model()
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+            else {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "provider": model_ref.as_str(),
+                        })),
+                    "live pricing: canonical model opted in but has no effective model selection"
+                );
+                continue;
+            };
+            let composite = model_ref.to_string();
+            let wanted = WantedModel {
+                provider_key: composite.clone(),
+                alias_family: None,
+                composite,
+                model_id: model_id.to_owned(),
+                models_dev_key: crate::catalog::catalog_source_for(
+                    resolved.selection.connection.kind(),
+                )
+                .and_then(|(key, _)| key)
+                .map(str::to_owned),
+            };
+            let gateway_key = resolved
+                .selection
+                .connection
+                .uri()
+                .map(str::trim)
+                .filter(|uri| !uri.is_empty())
+                .map_or_else(
+                    || format!("type:{}", resolved.selection.connection.kind()),
+                    str::to_owned,
+                );
+            if let Some(group) = groups.get_mut(&gateway_key) {
+                group.wanted.push(wanted);
+                continue;
+            }
+            match crate::model::build_raw_provider(
+                config,
+                model_ref.as_str(),
+                crate::model::ProviderOverrides::default(),
+            ) {
+                Ok(binding) => {
+                    groups.insert(
+                        gateway_key,
+                        GatewayGroup {
+                            handle: Arc::from(binding.provider),
+                            wanted: vec![wanted],
+                        },
+                    );
+                }
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "provider": model_ref.as_str(),
+                                "error": format!("{error}"),
+                            })),
+                        "live pricing: could not build canonical provider; skipping gateway"
+                    );
+                }
             }
         }
     }
@@ -405,12 +495,9 @@ fn assemble_snapshot(
 
     for (wanted, catalog) in gateway_results {
         for want in *wanted {
-            let family = want
-                .provider_key
-                .split_once('.')
-                .map(|(f, _)| f)
-                .unwrap_or(&want.provider_key);
-            *opted_in_per_family.entry(family.to_string()).or_default() += 1;
+            if let Some(family) = want.alias_family.as_deref() {
+                *opted_in_per_family.entry(family.to_owned()).or_default() += 1;
+            }
 
             let gw = match_pricing(catalog, &want.model_id).copied();
             let md = want
@@ -756,6 +843,9 @@ mod tests {
             // provider_key is the composite alias, matching what
             // enabled_pricing_groups now stores (not the bare family).
             provider_key: composite.to_string(),
+            alias_family: composite
+                .split_once('.')
+                .map(|(family, _)| family.to_owned()),
             composite: composite.to_string(),
             model_id: model.to_string(),
             models_dev_key: md_key.map(str::to_string),

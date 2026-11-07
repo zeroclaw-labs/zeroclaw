@@ -6836,6 +6836,33 @@ mod tests {
         cfg
     }
 
+    /// The carrier regression exercises prompt-guided tool extraction through
+    /// a supplied provider. Keep that parser choice explicit in the canonical
+    /// V4 fixture instead of relying on a provider-family default.
+    fn make_prompt_tool_config(cwd: &std::path::Path) -> Config {
+        let mut cfg = make_test_config(cwd);
+        cfg.providers = toml::from_str(
+            r#"
+[connections."carrier"]
+kind = "custom"
+uri = "http://127.0.0.1:9"
+capabilities = ["chat"]
+
+[models."custom.carrier"]
+capability = "chat"
+provider = "carrier"
+model = "carrier-model"
+options = { extract_text_tool_calls = true }
+"#,
+        )
+        .expect("prompt-tool carrier fixture parses");
+        cfg.agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .model_provider = "custom.carrier".into();
+        cfg
+    }
+
     #[test]
     fn gateway_backed_server_initialize_uses_reloaded_config() {
         let cwd = tempfile::tempdir().unwrap();
@@ -8912,7 +8939,7 @@ mod tests {
 
         let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
         let server = Arc::new(AcpServer::new_with_writer_and_store(
-            make_test_config(cwd.path()),
+            make_prompt_tool_config(cwd.path()),
             AcpServerConfig::default(),
             writer_tx,
             Arc::clone(&store),
@@ -9066,7 +9093,7 @@ mod tests {
             zeroclaw_infra::acp_session_store::AcpSessionStore::new(live_cwd.path()).unwrap(),
         );
         let live_server = Arc::new(AcpServer::new_with_store(
-            make_test_config(live_cwd.path()),
+            make_prompt_tool_config(live_cwd.path()),
             AcpServerConfig::default(),
             Arc::clone(&live_store),
         ));

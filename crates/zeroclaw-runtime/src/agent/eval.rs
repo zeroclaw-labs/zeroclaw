@@ -410,21 +410,31 @@ mod tests {
 
     #[test]
     fn effort_routing_authorizes_nested_selections_by_canonical_profile() {
-        use zeroclaw_config::schema::{Config, ModelEntryConfig};
-        let mut config = Config::default();
-        let profile = config
-            .providers
-            .models
-            .ensure("custom", "local.edge")
-            .unwrap();
-        profile.models.insert(
-            "small".into(),
-            ModelEntryConfig {
-                id: Some("local-model".into()),
-                ..Default::default()
-            },
-        );
-        config.providers.models.ensure("custom", "cloud").unwrap();
+        use zeroclaw_config::schema::Config;
+        let mut config: Config = toml::from_str(
+            r#"
+[providers.connections."local.edge"]
+kind = "custom"
+uri = "http://127.0.0.1:9"
+capabilities = ["chat"]
+
+[providers.connections."cloud"]
+kind = "custom"
+uri = "http://127.0.0.1:9"
+capabilities = ["chat"]
+
+[providers.models."custom.local.edge.small"]
+capability = "chat"
+provider = "local.edge"
+model = "local-model"
+
+[providers.models."custom.cloud"]
+capability = "chat"
+provider = "cloud"
+model = "cloud-model"
+"#,
+        )
+        .expect("canonical effort-route fixture parses");
         config.model_routes = vec![
             ModelRouteConfig {
                 hint: "local".into(),
@@ -446,14 +456,14 @@ mod tests {
         let local = resolve_effort_route(&policy, &config.model_routes, "hello").unwrap();
         assert_eq!(
             local.allowed_profile_refs(&config),
-            HashSet::from(["custom.local.edge".into()])
+            HashSet::from(["custom.local.edge.small".into()])
         );
         assert_eq!(local.route.effective_model(&config), "local-model");
         policy.cloud_escalation = CloudEscalationPolicy::Auto;
         let cloud = resolve_effort_route(&policy, &config.model_routes, &"a".repeat(201)).unwrap();
         assert_eq!(
             cloud.allowed_profile_refs(&config),
-            HashSet::from(["custom.local.edge".into(), "custom.cloud".into()])
+            HashSet::from(["custom.local.edge.small".into(), "custom.cloud".into()])
         );
     }
 

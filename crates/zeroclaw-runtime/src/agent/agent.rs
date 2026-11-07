@@ -3974,7 +3974,7 @@ impl Agent {
         dispatcher: &dyn ToolDispatcher,
         max_chars: usize,
     ) -> Result<String> {
-        let expose_text_tool_protocol = self.full_config().map_or(true, |config| {
+        let expose_text_tool_protocol = self.full_config().is_none_or(|config| {
             config
                 .model_text_extraction(&self.selected_model_provider_ref())
                 .tool_calls
@@ -6131,7 +6131,7 @@ mod tests {
             Mock, MockServer, ResponseTemplate,
             matchers::{header, method},
         };
-        use zeroclaw_config::schema::{AliasedAgentConfig, ModelEntryConfig};
+        use zeroclaw_config::schema::{AliasedAgentConfig, ModelEntryConfig, WireApi};
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(header("authorization", "Bearer fixture-key"))
@@ -6146,6 +6146,7 @@ mod tests {
         profile.api_key = Some("fixture-key".into());
         profile.uri = Some(server.uri());
         profile.model = Some("legacy-id".into());
+        profile.wire_api = Some(WireApi::ChatCompletions);
         profile.models.insert(
             "default".into(),
             ModelEntryConfig {
@@ -6294,7 +6295,7 @@ mod tests {
             Mock, MockServer, ResponseTemplate,
             matchers::{body_partial_json, method},
         };
-        use zeroclaw_config::schema::{AliasedAgentConfig, ModelEntryConfig, ModelRouteConfig};
+        use zeroclaw_config::schema::{AliasedAgentConfig, ModelRouteConfig};
         let primary = MockServer::start().await;
         let target = MockServer::start().await;
         Mock::given(method("POST"))
@@ -6323,43 +6324,57 @@ mod tests {
             .await;
         let mut config = Config::default();
         config.reliability.provider_retries = 0;
-        let profile = config.providers.models.ensure("custom", "primary").unwrap();
-        profile.uri = Some(primary.uri());
-        profile.api_key = Some("primary-fixture-key".into());
-        profile.model = Some("primary-id".into());
-        profile.temperature = Some(0.2);
-        let profile = config.providers.models.ensure("custom", "target").unwrap();
-        profile.uri = Some(target.uri());
-        profile.api_key = Some("target-fixture-key".into());
-        profile.temperature = Some(0.9);
-        profile.max_tokens = Some(999);
-        profile.provider_extra = Some(serde_json::json!({"profile_only": true}));
-        profile.chat_template_kwargs = Some(serde_json::json!({"profile_only": true}));
-        profile.models = HashMap::from([
-            (
-                "default".into(),
-                ModelEntryConfig {
-                    id: Some("shared-id".into()),
-                    temperature: Some(0.4),
-                    context_window: Some(128_000),
-                    ..Default::default()
-                },
-            ),
-            (
-                "selected".into(),
-                ModelEntryConfig {
-                    id: Some("shared-id".into()),
-                    temperature: Some(0.8),
-                    context_window: Some(8_000),
-                    max_tokens: Some(77),
-                    provider_extra: Some(serde_json::json!({"selected_only": true})),
-                    chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
-                    vision: Some(false),
-                    native_tools: Some(false),
-                    ..Default::default()
-                },
-            ),
-        ]);
+        config.providers = toml::from_str(&format!(
+            r#"
+[connections."primary"]
+kind = "custom"
+uri = "{primary_uri}"
+capabilities = ["chat"]
+auth = {{ mode = "api_key", api_key = "primary-fixture-key" }}
+
+[connections."primary".api.chat.options]
+temperature = 0.2
+provider_extra = {{ profile_only = true }}
+chat_template_kwargs = {{ profile_only = true }}
+
+[connections."target"]
+kind = "custom"
+uri = "{target_uri}"
+capabilities = ["chat"]
+auth = {{ mode = "api_key", api_key = "target-fixture-key" }}
+
+[connections."target".api.chat.options]
+temperature = 0.9
+max_tokens = 999
+provider_extra = {{ profile_only = true }}
+chat_template_kwargs = {{ profile_only = true }}
+
+[models."custom.primary"]
+capability = "chat"
+provider = "primary"
+model = "primary-id"
+
+[models."custom.target.default"]
+capability = "chat"
+provider = "target"
+model = "shared-id"
+metadata = {{ context_window = 128000 }}
+options = {{ temperature = 0.4 }}
+
+[models."custom.target.selected"]
+capability = "chat"
+provider = "target"
+model = "shared-id"
+metadata = {{ context_window = 8000, vision = false }}
+options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_only = true }}, chat_template_kwargs = {{ enable_thinking = false }}, native_tools = false }}
+
+[fallback]
+"custom.primary" = ["custom.target.selected"]
+"#,
+            primary_uri = primary.uri(),
+            target_uri = target.uri(),
+        ))
+        .unwrap();
         config.agents.insert(
             "worker".into(),
             AliasedAgentConfig {

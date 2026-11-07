@@ -565,8 +565,23 @@ pub fn plan_export(config: &Config, alias: &str) -> Result<ExportPlan, ExportErr
             agent.transcription_provider.trim(),
         ),
     ];
+    let canonical_speech_refs: Vec<&str> = provider_refs
+        .iter()
+        .map(|(_, reference)| *reference)
+        .filter(|reference| config.is_canonical_model_ref(reference))
+        .collect();
+    carry_model_provider_closure(
+        &mut out,
+        &masked_root,
+        config,
+        &canonical_speech_refs,
+        &mut dropped,
+    );
     let mut carried_providers: BTreeSet<String> = BTreeSet::new();
     for (section, reference) in provider_refs {
+        if config.is_canonical_model_ref(reference) {
+            continue;
+        }
         let Some((family, entry)) = split_provider_ref(reference) else {
             continue;
         };
@@ -1252,10 +1267,10 @@ fn carry(out: &mut toml::Table, masked_root: &toml::Table, path: &[&str], defaul
 
 /// Carry the exact-key model graph that runtime fallback can actually reach.
 ///
-/// Runtime starts fallback links at depth one, caps the walk at
-/// [`crate::providers::MAX_FALLBACK_DEPTH`], skips unresolved keys, and prunes
-/// cycles on the current path. Mirroring those rules keeps the bundle's
-/// connection and model surface no broader than the source runtime's.
+/// Runtime starts fallback links at depth one and follows the validated
+/// canonical graph, skips unresolved legacy keys, and prunes cycles on the
+/// current path. Mirroring those rules keeps the bundle's connection and
+/// model surface no broader than the source runtime's.
 fn carry_model_provider_closure(
     out: &mut toml::Table,
     masked_root: &toml::Table,
@@ -1271,7 +1286,6 @@ fn carry_model_provider_closure(
             masked_root,
             config,
             root,
-            0,
             &mut visited,
             &mut carried,
             dropped,
@@ -1284,14 +1298,10 @@ fn carry_model_provider(
     masked_root: &toml::Table,
     config: &Config,
     reference: &str,
-    depth: usize,
     visited: &mut Vec<String>,
     carried: &mut BTreeSet<String>,
     _dropped: &mut Vec<DroppedRef>,
 ) {
-    if depth > crate::providers::MAX_FALLBACK_DEPTH {
-        return;
-    }
     let trimmed = reference.trim();
     if trimmed.is_empty() || visited.iter().any(|seen| seen == trimmed) {
         return;
@@ -1313,14 +1323,29 @@ fn carry_model_provider(
                 &["providers", "connections", model.provider().as_str()],
                 &toml::Table::new(),
             );
-            let preset = match model {
+            let model_preset = match model {
                 crate::provider_registry::ModelDefinition::Chat(model) => model.preset.as_ref(),
                 crate::provider_registry::ModelDefinition::Tts(model) => model.preset.as_ref(),
                 crate::provider_registry::ModelDefinition::Asr(model) => model.preset.as_ref(),
                 crate::provider_registry::ModelDefinition::Embedding(_)
                 | crate::provider_registry::ModelDefinition::Decision(_) => None,
             };
-            if let Some(preset) = preset {
+            let connection_preset = config.providers.connections.get(model.provider()).and_then(
+                |connection| match model {
+                    crate::provider_registry::ModelDefinition::Chat(_) => {
+                        connection.chat_defaults().and_then(|(preset, _)| preset)
+                    }
+                    crate::provider_registry::ModelDefinition::Tts(_) => {
+                        connection.tts_defaults().and_then(|(preset, _)| preset)
+                    }
+                    crate::provider_registry::ModelDefinition::Asr(_) => {
+                        connection.asr_defaults().and_then(|(preset, _)| preset)
+                    }
+                    crate::provider_registry::ModelDefinition::Embedding(_)
+                    | crate::provider_registry::ModelDefinition::Decision(_) => None,
+                },
+            );
+            for preset in [model_preset, connection_preset].into_iter().flatten() {
                 carry(
                     out,
                     masked_root,
@@ -1353,7 +1378,6 @@ fn carry_model_provider(
                     masked_root,
                     config,
                     target.as_str(),
-                    depth + 1,
                     visited,
                     carried,
                     _dropped,

@@ -4858,9 +4858,11 @@ impl Config {
                     )
                 })
             })
-            .unwrap_or_else(|| {
-                crate::provider_registry::TextExtraction::for_provider(model_ref, None, None)
-            })
+            // A direct/injected provider may intentionally have no matching
+            // config entry. Its legacy reasoning behavior is admitted at the
+            // runtime injection boundary; an unknown config reference remains
+            // fail-closed for both text parsers.
+            .unwrap_or_default()
     }
 
     /// Resolve a model's configured temperature from the canonical registry,

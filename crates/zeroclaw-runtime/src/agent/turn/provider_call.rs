@@ -36,6 +36,23 @@ pub(crate) struct ProviderCallOutcome {
     pub(crate) image_recovery_succeeded: bool,
 }
 
+/// Route/request data selected for one provider attempt. Keeping this as one
+/// value prevents the streaming and non-streaming branches from growing a
+/// parallel list of loosely related arguments whenever a route policy gains a
+/// new field.
+struct ProviderCallInput<'a> {
+    active_model_provider: &'a dyn ModelProvider,
+    active_model_provider_name: &'a str,
+    active_model: &'a str,
+    active_dispatch_model: &'a str,
+    original_request: ChatRequest<'a>,
+    image_recovery_messages: Option<&'a [ChatMessage]>,
+    should_consume_provider_stream: bool,
+    policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    iteration: usize,
+    guard_tools: Option<&'a [ToolSpec]>,
+}
+
 fn is_image_recovery_candidate_error(error: &anyhow::Error) -> bool {
     !zeroclaw_providers::reliable::is_context_window_exceeded(error)
         && error.chain().any(|cause| {
@@ -330,16 +347,18 @@ pub(crate) async fn call_provider(
         call_provider_inner(
             ctx,
             config,
-            active_model_provider,
-            active_model_provider_name,
-            active_model,
-            active_dispatch_model,
-            original_request,
-            image_recovery_messages,
-            should_consume_provider_stream,
-            policy,
-            iteration,
-            guard_tools,
+            ProviderCallInput {
+                active_model_provider,
+                active_model_provider_name,
+                active_model,
+                active_dispatch_model,
+                original_request,
+                image_recovery_messages,
+                should_consume_provider_stream,
+                policy,
+                iteration,
+                guard_tools,
+            },
         ),
     )
     .await
@@ -348,17 +367,20 @@ pub(crate) async fn call_provider(
 async fn call_provider_inner(
     ctx: &TurnCtx<'_>,
     config: Option<&zeroclaw_config::schema::Config>,
-    active_model_provider: &dyn ModelProvider,
-    active_model_provider_name: &str,
-    active_model: &str,
-    active_dispatch_model: &str,
-    original_request: ChatRequest<'_>,
-    image_recovery_messages: Option<&[ChatMessage]>,
-    should_consume_provider_stream: bool,
-    policy: zeroclaw_api::model_provider::ToolRoundPolicy,
-    iteration: usize,
-    guard_tools: Option<&[ToolSpec]>,
+    input: ProviderCallInput<'_>,
 ) -> Result<ProviderCallOutcome> {
+    let ProviderCallInput {
+        active_model_provider,
+        active_model_provider_name,
+        active_model,
+        active_dispatch_model,
+        original_request,
+        image_recovery_messages,
+        should_consume_provider_stream,
+        policy,
+        iteration,
+        guard_tools,
+    } = input;
     let mut streamed_live_deltas = false;
     let mut streamed_protocol_suppressed = false;
     let mut streamed_visible_text = String::new();

@@ -154,7 +154,9 @@ impl ResolvedModelAccess<'_> {
                 // but cannot be accepted. Keep it out of context-window fill
                 // and successful response telemetry before returning its typed
                 // cause to every one-shot caller.
-                if response.is_semantically_empty_terminal_with(false) {
+                if response.is_semantically_empty_terminal_with(
+                    zeroclaw_api::text_extraction_reasoning_for(self.provider_name),
+                ) {
                     crate::agent::cost::settle_provider_attempts(attempts, None);
                     extend_rejected_summaries(settled_out, attempts);
                     return Err(anyhow::Error::new(SemanticEmptyTerminalCompletion));
@@ -794,17 +796,22 @@ mod run_model_query_tests {
             let turn_usage = Arc::clone(&ctx.turn_usage);
             let error = TOOL_LOOP_COST_TRACKING_CONTEXT
                 .scope(Some(ctx), async {
-                    direct_access(&provider)
-                        .run_model_query(
+                    // This is the config-free injected-provider seam. It keeps
+                    // the legacy reasoning extraction policy, while configured
+                    // turns install their model-owned policy around the call.
+                    zeroclaw_api::scope_text_extraction(
+                        Some(std::sync::Arc::new(|_: &str| true)),
+                        direct_access(&provider).run_model_query(
                             ChatRequest {
                                 messages: &messages,
                                 tools: None,
                                 thinking: None,
                             },
                             &mut Vec::new(),
-                        )
-                        .await
-                        .expect_err("direct semantic-empty response must fail")
+                        ),
+                    )
+                    .await
+                    .expect_err("direct semantic-empty response must fail")
                 })
                 .await;
 

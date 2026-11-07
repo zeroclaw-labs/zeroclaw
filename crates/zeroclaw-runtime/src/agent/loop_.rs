@@ -26293,21 +26293,25 @@ mod capability_entry_point_tests {
                 ..Default::default()
             },
         );
-        config.providers.models.openai.insert(
-            "fast".to_string(),
-            OpenAIModelProviderConfig {
-                base: ModelProviderConfig {
-                    model: Some("gpt-4o-mini".to_string()),
-                    // Unroutable: only the supplied provider can answer.
-                    uri: Some("http://127.0.0.1:9".to_string()),
-                    ..Default::default()
-                },
-            },
-        );
+        config.providers = toml::from_str(
+            r#"
+[connections."skill"]
+kind = "custom"
+uri = "http://127.0.0.1:9"
+capabilities = ["chat"]
+
+[models."custom.skill"]
+capability = "chat"
+provider = "skill"
+model = "gpt-4o-mini"
+options = { extract_text_tool_calls = true }
+"#,
+        )
+        .unwrap();
         config.agents.insert(
             "skill-agent".to_string(),
             AliasedAgentConfig {
-                model_provider: "openai.fast".into(),
+                model_provider: "custom.skill".into(),
                 risk_profile: "skill-hooks".into(),
                 ..Default::default()
             },
