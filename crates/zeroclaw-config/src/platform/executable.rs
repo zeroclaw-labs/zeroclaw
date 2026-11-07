@@ -96,23 +96,90 @@ fn is_bare_name(path: &Path) -> bool {
 }
 
 #[cfg(unix)]
-fn validate_and_canonicalize(program: &OsStr, candidate: PathBuf) -> io::Result<PathBuf> {
-    let canonical = candidate.canonicalize().map_err(|error| {
+fn canonicalize_failure_message(program: &OsStr, candidate: &Path, error: &io::Error) -> String {
+    if error.kind() == io::ErrorKind::NotFound {
+        format!(
+            "executable {program:?} at {} does not exist",
+            candidate.display()
+        )
+    } else {
+        format!(
+            "executable {program:?} could not be canonicalized at {}: {error}",
+            candidate.display()
+        )
+    }
+}
+
+/// When `canonicalize` fails with `PermissionDenied` on an absolute path (seen
+/// on Android for `/system/bin/sh`, where SELinux denies `open(O_PATH)` while
+/// `execve` still works), canonicalize the parent directory and join the final
+/// component. Reject symlinks: we cannot safely resolve them without opening
+/// the file.
+#[cfg(unix)]
+fn canonicalize_absolute_via_parent(candidate: &Path) -> io::Result<PathBuf> {
+    let file_name = candidate.file_name().ok_or_else(|| {
         io::Error::new(
-            error.kind(),
-            if error.kind() == io::ErrorKind::NotFound {
-                format!(
-                    "executable {program:?} at {} does not exist",
-                    candidate.display()
-                )
-            } else {
-                format!(
-                    "executable {program:?} could not be canonicalized at {}: {error}",
-                    candidate.display()
-                )
-            },
+            io::ErrorKind::InvalidInput,
+            format!(
+                "absolute executable path {} has no file name",
+                candidate.display()
+            ),
         )
     })?;
+    let parent = candidate.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "absolute executable path {} has no parent directory",
+                candidate.display()
+            ),
+        )
+    })?;
+
+    let symlink_meta = std::fs::symlink_metadata(candidate)?;
+    if symlink_meta.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "executable at {} is a symlink that could not be canonicalized",
+                candidate.display()
+            ),
+        ));
+    }
+
+    Ok(parent.canonicalize()?.join(file_name))
+}
+
+#[cfg(unix)]
+fn validate_and_canonicalize(program: &OsStr, candidate: PathBuf) -> io::Result<PathBuf> {
+    let canonical = match candidate.canonicalize() {
+        Ok(path) => path,
+        Err(error)
+            if error.kind() == io::ErrorKind::PermissionDenied && candidate.is_absolute() =>
+        {
+            canonicalize_absolute_via_parent(&candidate).map_err(|fallback_error| {
+                // Prefer the original canonicalize failure when the parent
+                // fallback also fails; keep the fallback kind when it is more
+                // specific (e.g. symlink rejection).
+                if fallback_error.kind() == io::ErrorKind::PermissionDenied
+                    && fallback_error.to_string().contains("symlink")
+                {
+                    fallback_error
+                } else {
+                    io::Error::new(
+                        error.kind(),
+                        canonicalize_failure_message(program, &candidate, &error),
+                    )
+                }
+            })?
+        }
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                canonicalize_failure_message(program, &candidate, &error),
+            ));
+        }
+    };
 
     let metadata = std::fs::metadata(&canonical).map_err(|error| {
         io::Error::new(
@@ -261,5 +328,25 @@ mod tests {
                 .kind(),
             std::io::ErrorKind::NotFound
         );
+    }
+
+    #[test]
+    fn parent_fallback_joins_file_name_under_canonical_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = executable(dir.path(), "tool", 0o755);
+        let via_parent = canonicalize_absolute_via_parent(&tool).unwrap();
+        assert_eq!(via_parent, tool.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn parent_fallback_rejects_unresolved_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = executable(dir.path(), "target", 0o755);
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = canonicalize_absolute_via_parent(&link).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("symlink"));
     }
 }
