@@ -597,34 +597,29 @@ impl OpenRouterModelProvider {
         builder.build().unwrap_or_else(|_| Client::new())
     }
 
-    /// HTTP client for streaming SSE connections. Streaming responses can
-    /// outlive the default request timeout while still making progress. An
-    /// explicitly configured total deadline also applies to streaming.
-    fn streaming_http_client(&self) -> Client {
-        if self.read_timeout_disabled {
-            let mut builder = Client::builder()
-                .connect_timeout(Duration::from_secs(OPENROUTER_CONNECT_TIMEOUT_SECS));
-            if self.timeout_configured && !self.timeout_disabled {
-                builder = builder.timeout(Duration::from_secs(self.timeout_secs));
-            }
-            let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
-                builder,
-                "model_provider.openrouter",
-            );
-            return builder.build().unwrap_or_else(|_| Client::new());
+    fn streaming_timeouts(&self) -> super::StreamTimeouts {
+        super::StreamTimeouts {
+            request: (self.timeout_configured && !self.timeout_disabled)
+                .then(|| Duration::from_secs(self.timeout_secs)),
+            read: (!self.read_timeout_disabled).then(|| {
+                self.read_timeout_secs
+                    .map_or(super::StreamIdleBound::Fixed(STREAM_IDLE_TIMEOUT), |secs| {
+                        super::StreamIdleBound::Read(Duration::from_secs(secs))
+                    })
+            }),
         }
-        self.streaming_http_client_with_idle_timeout(
-            self.read_timeout_secs
-                .map_or(STREAM_IDLE_TIMEOUT, Duration::from_secs),
-        )
     }
 
-    fn streaming_http_client_with_idle_timeout(&self, idle_timeout: Duration) -> Client {
-        let mut builder = Client::builder()
-            .connect_timeout(Duration::from_secs(OPENROUTER_CONNECT_TIMEOUT_SECS))
-            .read_timeout(idle_timeout);
-        if self.timeout_configured && !self.timeout_disabled {
-            builder = builder.timeout(Duration::from_secs(self.timeout_secs));
+    /// Use the same resolved deadlines for transport and diagnostics.
+    fn streaming_http_client(&self) -> Client {
+        let timeouts = self.streaming_timeouts();
+        let mut builder =
+            Client::builder().connect_timeout(Duration::from_secs(OPENROUTER_CONNECT_TIMEOUT_SECS));
+        if let Some(timeout) = timeouts.request {
+            builder = builder.timeout(timeout);
+        }
+        if let Some(timeout) = timeouts.read {
+            builder = builder.read_timeout(timeout.duration());
         }
         zeroclaw_config::schema::apply_runtime_proxy_to_builder(
             builder,
@@ -987,12 +982,14 @@ impl ModelProvider for OpenRouterModelProvider {
         };
 
         let client = self.streaming_http_client();
+        let timeouts = self.streaming_timeouts();
         let endpoint_url = self.streaming_endpoint_url("chat/completions");
         let count_tokens = options.count_tokens;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
         let handle = ::zeroclaw_spawn::spawn!(async move {
+            let timeouts = timeouts.start();
             let response = match client
                 .post(endpoint_url)
                 .header("Authorization", format!("Bearer {credential}"))
@@ -1008,9 +1005,9 @@ impl ModelProvider for OpenRouterModelProvider {
                 Err(e) => {
                     let _ = tx
                         .send(Err(if e.is_connect() {
-                            StreamError::ConnectFailed(super::format_error_chain(&e))
+                            StreamError::ConnectFailed(timeouts.error_message(&e))
                         } else {
-                            StreamError::Http(super::format_error_chain(&e))
+                            StreamError::Http(timeouts.error_message(&e))
                         }))
                         .await;
                     return;
@@ -1031,7 +1028,7 @@ impl ModelProvider for OpenRouterModelProvider {
                 return;
             }
 
-            let mut event_stream = sse_bytes_to_events(response, count_tokens);
+            let mut event_stream = sse_bytes_to_events(response, count_tokens, timeouts);
             while let Some(event) = event_stream.next().await {
                 if tx.send(event).await.is_err() {
                     break;
@@ -1384,9 +1381,10 @@ data: [DONE]
                 .expect("request must settle")
                 .expect("stream should yield an event");
             if deadline == "finite" {
+                let error = second.expect_err("the total deadline must stop an active stream");
                 assert!(
-                    second.is_err(),
-                    "the total deadline must stop an active stream"
+                    error.to_string().contains("request_timeout_secs"),
+                    "{error}"
                 );
                 continue;
             }
@@ -1436,9 +1434,10 @@ data: [DONE]
 
         let provider = OpenRouterModelProvider::builder("test")
             .credential(Some("test-key"))
+            .read_timeout_secs(1)
             .build();
         let response = provider
-            .streaming_http_client_with_idle_timeout(Duration::from_secs(1))
+            .streaming_http_client()
             .get(format!("http://{addr}/stream"))
             .send()
             .await

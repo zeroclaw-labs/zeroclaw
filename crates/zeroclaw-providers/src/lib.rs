@@ -1302,6 +1302,8 @@ pub(crate) enum StreamIdleBound {
     /// `max(STREAM_IDLE_TIMEOUT, timeout_secs)`: `timeout_secs` governs the
     /// bound, so idle-timeout errors also name the knob that raises it.
     Configurable(std::time::Duration),
+    /// The independent canonical `read_timeout_secs` setting.
+    Read(std::time::Duration),
     /// A fixed client constant: no configuration knob moves it, so
     /// idle-timeout errors name the bound without knob advice.
     Fixed(std::time::Duration),
@@ -1311,8 +1313,71 @@ impl StreamIdleBound {
     /// The bound's duration, regardless of whether it is configurable.
     pub(crate) fn duration(self) -> std::time::Duration {
         match self {
-            StreamIdleBound::Configurable(duration) | StreamIdleBound::Fixed(duration) => duration,
+            StreamIdleBound::Configurable(duration)
+            | StreamIdleBound::Read(duration)
+            | StreamIdleBound::Fixed(duration) => duration,
         }
+    }
+}
+
+/// Resolved request deadlines, shared by client construction and diagnostics.
+#[derive(Clone, Copy)]
+pub(crate) struct StreamTimeouts {
+    pub(crate) request: Option<std::time::Duration>,
+    pub(crate) read: Option<StreamIdleBound>,
+}
+
+impl From<StreamIdleBound> for StreamTimeouts {
+    fn from(read: StreamIdleBound) -> Self {
+        Self {
+            request: None,
+            read: Some(read),
+        }
+    }
+}
+
+impl StreamTimeouts {
+    pub(crate) fn start(self) -> StreamDeadline {
+        StreamDeadline {
+            timeouts: self,
+            started: tokio::time::Instant::now(),
+        }
+    }
+
+    pub(crate) fn error_message(
+        self,
+        error: &reqwest::Error,
+        elapsed: std::time::Duration,
+    ) -> String {
+        // Reqwest uses the same error type for both deadlines. Its total-body
+        // guard runs first once the request budget expires, even after reads.
+        if error.is_timeout()
+            && !error.is_connect()
+            && let Some(limit) = self.request.filter(|limit| elapsed >= *limit)
+        {
+            return format!(
+                "request exceeded {}s (request_timeout_secs); increase request_timeout_secs to wait longer: {}",
+                limit.as_secs_f64(),
+                format_error_chain(error)
+            );
+        }
+        self.read.map_or_else(
+            || format_error_chain(error),
+            |read| stream_idle_error_message(error, read),
+        )
+    }
+}
+
+/// A request's actual start time, retained when headers hand off to an SSE parser.
+#[derive(Clone, Copy)]
+pub(crate) struct StreamDeadline {
+    timeouts: StreamTimeouts,
+    started: tokio::time::Instant,
+}
+
+impl StreamDeadline {
+    pub(crate) fn error_message(self, error: &reqwest::Error) -> String {
+        self.timeouts.error_message(error, self.started.elapsed())
     }
 }
 
@@ -1328,20 +1393,20 @@ pub(crate) fn stream_idle_timeout(timeout_secs: u64) -> StreamIdleBound {
 }
 
 /// Error text for a failed streaming read. A read/idle timeout names the bound
-/// that fired instead of reqwest's bare "operation timed out"; when
-/// `timeout_secs` governs the bound the message also says that raising it
-/// waits longer. Every other error, including connect failures, keeps the
-/// sanitized reqwest chain unchanged.
+/// that fired instead of reqwest's bare "operation timed out", together with
+/// the applicable configuration setting. Every other error, including connect
+/// failures, keeps the sanitized reqwest chain unchanged.
 pub(crate) fn stream_idle_error_message(
     error: &reqwest::Error,
     idle_timeout: StreamIdleBound,
 ) -> String {
     if error.is_timeout() && !error.is_connect() {
-        let secs = idle_timeout.duration().as_secs();
+        let secs = idle_timeout.duration().as_secs_f64();
         let advice = match idle_timeout {
             StreamIdleBound::Configurable(_) => {
                 format!("; raise timeout_secs above {secs}s to wait longer")
             }
+            StreamIdleBound::Read(_) => "; increase read_timeout_secs to wait longer".to_owned(),
             StreamIdleBound::Fixed(_) => String::new(),
         };
         format!(
