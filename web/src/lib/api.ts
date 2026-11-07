@@ -704,6 +704,25 @@ export function listProps(prefix?: string): Promise<ListResponse> {
   return apiFetch<ListResponse>(`/api/config/list${q}`);
 }
 
+// The editor snapshot always includes the four maps, including empty maps.
+// Their contents stay generated from the backend's capability-tagged schema.
+export type ProviderRegistryDocument = Required<components['schemas']['ProviderRegistry']>;
+
+export function getProviderRegistry(): Promise<ProviderRegistryDocument> {
+  return apiFetch('/api/config/provider-registry');
+}
+
+export async function saveProviderRegistry(
+  expected: ProviderRegistryDocument,
+  registry: ProviderRegistryDocument,
+): Promise<void> {
+  await apiFetch('/api/config/provider-registry', {
+    method: 'PUT',
+    body: JSON.stringify({ expected, registry }),
+  });
+  window.dispatchEvent(new Event('zeroclaw-config-mutated'));
+}
+
 export async function patchConfig(
   ops: PatchOp[],
   opts?: {

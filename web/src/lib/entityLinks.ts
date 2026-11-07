@@ -55,7 +55,7 @@ export function entityConfigPath(kind: EntityKind, id: string, modelAliases: rea
   if (shape === 'typed') {
     if (kind === 'model-provider') {
       const profile = modelProfileRef(id, modelAliases);
-      if (!profile) return `/config/${section}`;
+      if (!profile) return `/config/providers.registry?model=${encodeURIComponent(id)}`;
       const dot = profile.indexOf('.');
       return `/config/${section}/${encodeURIComponent(profile.slice(0, dot))}/${encodeURIComponent(profile.slice(dot + 1))}`;
     }

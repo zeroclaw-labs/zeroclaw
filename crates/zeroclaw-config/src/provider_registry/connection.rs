@@ -167,14 +167,14 @@ strict_struct!(KiloExtra {
 });
 
 macro_rules! connection_struct {
-    ($name:ident { $($field:ident: $type:ty),* $(,)? }) => {
+    ($name:ident { $($(#[$attr:meta])* $field:ident: $type:ty),* $(,)? }) => {
         #[derive(Clone, Serialize, Deserialize)]
         #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
         #[serde(deny_unknown_fields)]
         pub struct $name {
             #[serde(default)]
             pub capabilities: CapabilitySet,
-            $(#[serde(default)] pub $field: $type,)*
+            $($(#[$attr])* #[serde(default)] pub $field: $type,)*
         }
         impl $name { pub const FIELDS: &'static [&'static str] = &["kind", "capabilities", $(stringify!($field)),*]; }
         impl std::fmt::Debug for $name {
@@ -186,6 +186,7 @@ macro_rules! connection_struct {
 }
 connection_struct!(CompatibleConnection {
     uri: Option<String>,
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     extra_headers: BTreeMap<String, String>,
     tls_ca_cert_path: Option<String>,
     auth: Option<ApiKeyAuth>,
@@ -193,6 +194,7 @@ connection_struct!(CompatibleConnection {
 });
 connection_struct!(OpenAiConnection {
     uri: Option<String>,
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     extra_headers: BTreeMap<String, String>,
     tls_ca_cert_path: Option<String>,
     auth: Option<OpenAiAuth>,
@@ -200,6 +202,7 @@ connection_struct!(OpenAiConnection {
 });
 connection_struct!(HttpChatConnection {
     uri: Option<String>,
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     extra_headers: BTreeMap<String, String>,
     tls_ca_cert_path: Option<String>,
     auth: Option<ApiKeyAuth>,
@@ -216,6 +219,7 @@ connection_struct!(FixedChatConnection {
 });
 connection_struct!(QwenConnection {
     uri: Option<String>,
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     extra_headers: BTreeMap<String, String>,
     tls_ca_cert_path: Option<String>,
     auth: Option<QwenAuth>,
@@ -224,6 +228,7 @@ connection_struct!(QwenConnection {
 });
 connection_struct!(MinimaxConnection {
     uri: Option<String>,
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     extra_headers: BTreeMap<String, String>,
     tls_ca_cert_path: Option<String>,
     auth: Option<MinimaxAuth>,
@@ -249,6 +254,7 @@ connection_struct!(BedrockConnection {
 });
 connection_struct!(MoonshotConnection {
     uri: Option<String>,
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     extra_headers: BTreeMap<String, String>,
     tls_ca_cert_path: Option<String>,
     auth: Option<ApiKeyAuth>,
@@ -257,6 +263,7 @@ connection_struct!(MoonshotConnection {
 });
 connection_struct!(StepfunConnection {
     uri: Option<String>,
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     extra_headers: BTreeMap<String, String>,
     tls_ca_cert_path: Option<String>,
     auth: Option<ApiKeyAuth>,
@@ -265,6 +272,7 @@ connection_struct!(StepfunConnection {
 });
 connection_struct!(GlmConnection {
     uri: Option<String>,
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     extra_headers: BTreeMap<String, String>,
     tls_ca_cert_path: Option<String>,
     auth: Option<ApiKeyAuth>,
@@ -273,6 +281,7 @@ connection_struct!(GlmConnection {
 });
 connection_struct!(ZaiConnection {
     uri: Option<String>,
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     extra_headers: BTreeMap<String, String>,
     tls_ca_cert_path: Option<String>,
     auth: Option<ApiKeyAuth>,
@@ -281,6 +290,7 @@ connection_struct!(ZaiConnection {
 });
 connection_struct!(KiloConnection {
     uri: Option<String>,
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     extra_headers: BTreeMap<String, String>,
     tls_ca_cert_path: Option<String>,
     auth: Option<ApiKeyAuth>,
@@ -289,6 +299,7 @@ connection_struct!(KiloConnection {
 });
 connection_struct!(GroqConnection {
     uri: Option<String>,
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     extra_headers: BTreeMap<String, String>,
     tls_ca_cert_path: Option<String>,
     auth: Option<ApiKeyAuth>,
@@ -320,6 +331,7 @@ connection_struct!(CliConnection { api: CliApi });
 connection_struct!(GrokConnection { api: GrokApi });
 connection_struct!(HailoConnection {
     uri: Option<String>,
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     extra_headers: BTreeMap<String, String>,
     auth: Option<ApiKeyAuth>,
     api: HailoApi,
@@ -450,27 +462,39 @@ fn is_connection_secret_key(key: &str) -> bool {
     CONNECTION_SECRET_KEYS.contains(&key)
 }
 
+fn is_connection_secret_map(key: &str) -> bool {
+    // Match legacy ModelProviderConfig: every custom header is a secret,
+    // including application-specific auth headers whose names we cannot know.
+    key == "extra_headers"
+}
+
 fn visit_connection_secrets(
     value: &mut Value,
     path: &str,
+    secret_map: bool,
     visit: &mut impl FnMut(&mut String, &str) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     match value {
         Value::Object(object) => {
             for (key, child) in object {
                 let child_path = format!("{path}.{key}");
-                if is_connection_secret_key(key) {
+                if secret_map || is_connection_secret_key(key) {
                     if let Value::String(secret) = child {
                         visit(secret, &child_path)?;
                     }
                 } else {
-                    visit_connection_secrets(child, &child_path, visit)?;
+                    visit_connection_secrets(
+                        child,
+                        &child_path,
+                        is_connection_secret_map(key),
+                        visit,
+                    )?;
                 }
             }
         }
         Value::Array(items) => {
             for (index, child) in items.iter_mut().enumerate() {
-                visit_connection_secrets(child, &format!("{path}[{index}]"), visit)?;
+                visit_connection_secrets(child, &format!("{path}[{index}]"), false, visit)?;
             }
         }
         _ => {}
@@ -478,38 +502,38 @@ fn visit_connection_secrets(
     Ok(())
 }
 
-fn mask_connection_secrets(value: &mut Value) {
+fn mask_connection_secrets(value: &mut Value, secret_map: bool) {
     match value {
         Value::Object(object) => {
             for (key, child) in object {
-                if is_connection_secret_key(key) {
+                if secret_map || is_connection_secret_key(key) {
                     if let Value::String(secret) = child
                         && !secret.is_empty()
                     {
                         *secret = MASKED_SECRET.to_owned();
                     }
                 } else {
-                    mask_connection_secrets(child);
+                    mask_connection_secrets(child, is_connection_secret_map(key));
                 }
             }
         }
         Value::Array(items) => {
             for child in items {
-                mask_connection_secrets(child);
+                mask_connection_secrets(child, false);
             }
         }
         _ => {}
     }
 }
 
-fn restore_connection_secrets(value: &mut Value, current: &Value) {
+fn restore_connection_secrets(value: &mut Value, current: &Value, secret_map: bool) {
     match (value, current) {
         (Value::Object(object), Value::Object(current_object)) => {
             for (key, child) in object {
                 let Some(current_child) = current_object.get(key) else {
                     continue;
                 };
-                if is_connection_secret_key(key) {
+                if secret_map || is_connection_secret_key(key) {
                     if let (Value::String(secret), Value::String(current_secret)) =
                         (child, current_child)
                         && secret == MASKED_SECRET
@@ -517,13 +541,13 @@ fn restore_connection_secrets(value: &mut Value, current: &Value) {
                         *secret = current_secret.clone();
                     }
                 } else {
-                    restore_connection_secrets(child, current_child);
+                    restore_connection_secrets(child, current_child, is_connection_secret_map(key));
                 }
             }
         }
         (Value::Array(items), Value::Array(current_items)) => {
             for (child, current_child) in items.iter_mut().zip(current_items) {
-                restore_connection_secrets(child, current_child);
+                restore_connection_secrets(child, current_child, false);
             }
         }
         _ => {}
@@ -531,13 +555,20 @@ fn restore_connection_secrets(value: &mut Value, current: &Value) {
 }
 
 impl ProviderConnection {
+    pub(super) fn with_secret_json_for_editor(
+        &mut self,
+        mut visit: impl FnMut(&str) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        self.with_secret_json(|secret, _| visit(secret), "providers.connections")
+    }
+
     fn with_secret_json(
         &mut self,
         mut visit: impl FnMut(&mut String, &str) -> anyhow::Result<()>,
         field: &str,
     ) -> anyhow::Result<()> {
         let mut value = serde_json::to_value(&*self).context("serialize provider connection")?;
-        visit_connection_secrets(&mut value, field, &mut visit)?;
+        visit_connection_secrets(&mut value, field, false, &mut visit)?;
         *self = serde_json::from_value(value).context("deserialize provider connection")?;
         Ok(())
     }
@@ -554,7 +585,7 @@ impl ProviderConnection {
         let Ok(mut value) = serde_json::to_value(&*self) else {
             return;
         };
-        mask_connection_secrets(&mut value);
+        mask_connection_secrets(&mut value, false);
         if let Ok(updated) = serde_json::from_value(value) {
             *self = updated;
         }
@@ -566,25 +597,27 @@ impl ProviderConnection {
         else {
             return;
         };
-        restore_connection_secrets(&mut value, &current_value);
+        restore_connection_secrets(&mut value, &current_value, false);
         if let Ok(updated) = serde_json::from_value(value) {
             *self = updated;
         }
     }
 
     pub fn has_secrets(&self) -> bool {
-        fn contains(value: &Value) -> bool {
+        fn contains(value: &Value, secret_map: bool) -> bool {
             match value {
                 Value::Object(object) => object.iter().any(|(key, child)| {
-                    (is_connection_secret_key(key)
+                    ((secret_map || is_connection_secret_key(key))
                         && child.as_str().is_some_and(|secret| !secret.is_empty()))
-                        || (!is_connection_secret_key(key) && contains(child))
+                        || (!secret_map
+                            && !is_connection_secret_key(key)
+                            && contains(child, is_connection_secret_map(key)))
                 }),
-                Value::Array(items) => items.iter().any(contains),
+                Value::Array(items) => items.iter().any(|item| contains(item, false)),
                 _ => false,
             }
         }
-        serde_json::to_value(self).is_ok_and(|value| contains(&value))
+        serde_json::to_value(self).is_ok_and(|value| contains(&value, false))
     }
 }
 provider_connections! {

@@ -1,0 +1,221 @@
+use serde_json::json;
+use zeroclaw_config::provider_registry::editor::{RegistryEdit, snapshot, stage};
+use zeroclaw_config::schema::Config;
+
+fn config() -> Config {
+    let mut config = Config::default();
+    config.providers = toml::from_str(
+        r#"
+[connections."gateway.prod"]
+kind = "custom"
+uri = "https://example.test/v1"
+auth = { mode = "api_key", api_key = "test-secret" }
+[connections."gateway.prod".extra_headers]
+Authorization = "test-header"
+X-Custom-Auth = "custom-header-secret"
+[models."chat.fast.us"]
+capability = "chat"
+provider = "gateway.prod"
+model = "model-one"
+[models."chat.backup"]
+capability = "chat"
+provider = "gateway.prod"
+model = "model-two"
+[fallback]
+"chat.fast.us" = ["chat.backup"]
+"#,
+    )
+    .unwrap();
+    config
+        .providers
+        .models
+        .ensure("openai", "legacy.prod")
+        .unwrap()
+        .model = Some("legacy-model".into());
+    config
+}
+
+#[test]
+fn registry_editor_preserves_exact_keys_secrets_and_legacy_maps() {
+    let mut config = config();
+    let expected = snapshot(&config).unwrap();
+    assert!(!expected.to_string().contains("test-secret"));
+    assert!(!expected.to_string().contains("test-header"));
+    assert!(!expected.to_string().contains("custom-header-secret"));
+    let mut registry = expected.clone();
+    registry["models"]["chat.fast.us"]["model"] = json!("model-updated");
+    registry["models"]["chat.fast.us"]["options"] = json!({"temperature": "null"});
+    stage(&mut config, RegistryEdit { expected, registry }).unwrap();
+    assert_eq!(
+        config.resolve_model_id("chat.fast.us").as_deref(),
+        Some("model-updated")
+    );
+    assert_eq!(
+        config.resolve_model_id("openai.legacy.prod").as_deref(),
+        Some("legacy-model")
+    );
+    let value = serde_json::to_value(&config.providers).unwrap();
+    assert_eq!(
+        value["connections"]["gateway.prod"]["auth"]["api_key"],
+        "test-secret"
+    );
+    assert_eq!(
+        value["connections"]["gateway.prod"]["extra_headers"]["Authorization"],
+        "test-header"
+    );
+    assert_eq!(
+        snapshot(&config).unwrap()["models"]["chat.fast.us"]["options"]["temperature"],
+        "null"
+    );
+}
+
+#[test]
+fn registry_voice_pickers_use_complete_model_refs_and_correct_capabilities() {
+    let mut config = config();
+    let expected = snapshot(&config).unwrap();
+    let mut registry = expected.clone();
+    for (name, capability) in [
+        ("voice.en.us", "tts"),
+        ("asr.en.us", "asr"),
+        ("embed.docs.v1", "embedding"),
+        ("decision.fast.v1", "decision"),
+    ] {
+        registry["models"][name] =
+            json!({"capability": capability, "provider": "gateway.prod", "model": "upstream"});
+    }
+    stage(&mut config, RegistryEdit { expected, registry }).unwrap();
+    assert_eq!(
+        config.resolve_alias_source(zeroclaw_config::traits::AliasSource::TtsProviders),
+        vec!["voice.en.us"]
+    );
+    assert_eq!(
+        config.resolve_alias_source(zeroclaw_config::traits::AliasSource::TranscriptionProviders),
+        vec!["asr.en.us"]
+    );
+    let chat = config.resolve_alias_source(zeroclaw_config::traits::AliasSource::ModelProviders);
+    assert!(chat.contains(&"chat.fast.us".to_owned()));
+    assert!(!chat.contains(&"voice.en.us".to_owned()));
+    assert!(!chat.contains(&"embed.docs.v1".to_owned()));
+}
+
+#[test]
+fn registry_editor_rejects_stale_or_invalid_replacements_atomically() {
+    let mut config = config();
+    let expected = snapshot(&config).unwrap();
+    let before = serde_json::to_value(&config.providers).unwrap();
+    let mut invalid = expected.clone();
+    invalid["fallback"]["chat.fast.us"] = json!(["missing.model"]);
+    assert!(
+        stage(
+            &mut config,
+            RegistryEdit {
+                expected: expected.clone(),
+                registry: invalid
+            }
+        )
+        .is_err()
+    );
+    assert_eq!(serde_json::to_value(&config.providers).unwrap(), before);
+    let mut stale = expected.clone();
+    stale["models"]["chat.fast.us"]["model"] = json!("different");
+    assert!(
+        stage(
+            &mut config,
+            RegistryEdit {
+                expected: stale,
+                registry: expected
+            }
+        )
+        .is_err()
+    );
+    assert_eq!(serde_json::to_value(&config.providers).unwrap(), before);
+}
+
+#[test]
+fn registry_editor_rejects_orphan_mask_but_accepts_explicit_secret_replacement() {
+    let mut config = config();
+    let expected = snapshot(&config).unwrap();
+    let mut registry = expected.clone();
+    registry["connections"]["new.connection"] = registry["connections"]["gateway.prod"].clone();
+    assert!(
+        stage(
+            &mut config,
+            RegistryEdit {
+                expected: expected.clone(),
+                registry
+            }
+        )
+        .is_err()
+    );
+    let mut registry = expected.clone();
+    registry["connections"]["gateway.prod"]["auth"]["api_key"] = json!("replacement-secret");
+    stage(&mut config, RegistryEdit { expected, registry }).unwrap();
+    assert_eq!(
+        serde_json::to_value(&config.providers).unwrap()["connections"]["gateway.prod"]["auth"]["api_key"],
+        "replacement-secret"
+    );
+}
+
+#[test]
+fn registry_editor_retains_models_referenced_by_memory() {
+    let mut config = config();
+    let expected = snapshot(&config).unwrap();
+    let mut registry = expected.clone();
+    registry["models"]["embed.active"] =
+        json!({"capability": "embedding", "provider": "gateway.prod", "model": "embedding-v1"});
+    stage(&mut config, RegistryEdit { expected, registry }).unwrap();
+    config.memory.embedding_model_ref = Some("embed.active".into());
+    let expected = snapshot(&config).unwrap();
+    for replacement in [
+        None,
+        Some(json!({"capability": "chat", "provider": "gateway.prod", "model": "chat-v1"})),
+    ] {
+        let mut registry = expected.clone();
+        if let Some(replacement) = replacement {
+            registry["models"]["embed.active"] = replacement;
+        } else {
+            registry["models"]
+                .as_object_mut()
+                .unwrap()
+                .remove("embed.active");
+        }
+        let error = stage(
+            &mut config,
+            RegistryEdit {
+                expected: expected.clone(),
+                registry,
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("memory.embedding_model_ref"));
+        assert_eq!(snapshot(&config).unwrap(), expected);
+    }
+}
+
+#[test]
+fn registry_connection_header_secrets_follow_encryption_and_decryption() {
+    use zeroclaw_config::secrets::SecretStore;
+    let tmp = tempfile::tempdir().unwrap();
+    let store = SecretStore::new(tmp.path(), true);
+    let mut config = config();
+    let connection = config
+        .providers
+        .connections
+        .get_mut("gateway.prod")
+        .unwrap();
+    let original = serde_json::to_value(&*connection).unwrap();
+    connection
+        .encrypt_secrets(&store, "providers.connections.gateway.prod")
+        .unwrap();
+    let encrypted = serde_json::to_value(&*connection).unwrap();
+    for value in encrypted["extra_headers"].as_object().unwrap().values() {
+        assert!(SecretStore::is_encrypted(value.as_str().unwrap()));
+    }
+    assert!(SecretStore::is_encrypted(
+        encrypted["auth"]["api_key"].as_str().unwrap()
+    ));
+    connection
+        .decrypt_secrets(&store, "providers.connections.gateway.prod")
+        .unwrap();
+    assert_eq!(serde_json::to_value(connection).unwrap(), original);
+}

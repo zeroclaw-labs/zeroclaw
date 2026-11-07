@@ -99,6 +99,54 @@ pub async fn handle_config_get(State(state): State<AppState>) -> Response {
     Json(cfg).into_response()
 }
 
+/// Canonical provider editor, with exact map keys and the normal secret mask.
+pub async fn handle_registry_get(State(state): State<AppState>) -> Response {
+    match zeroclaw_config::provider_registry::editor::snapshot(&state.config.read()) {
+        Ok(document) => Json(document).into_response(),
+        Err(error) => error_response(ConfigApiError::new(
+            ConfigApiCode::ValidationFailed,
+            error.to_string(),
+        )),
+    }
+}
+
+pub async fn handle_registry_put(
+    State(state): State<AppState>,
+    principal: RequestPrincipal,
+    Json(edit): Json<zeroclaw_config::provider_registry::editor::RegistryEdit>,
+) -> Response {
+    let commit = match state.begin_config_commit().await {
+        Ok(commit) => commit,
+        Err(error) => return error_response(config_commit_admission_error(error)),
+    };
+    // A whole-registry replacement requires the union of map CRUD grants.
+    for verb in [Verb::Create, Verb::Delete] {
+        if let Err(denied) = authorize_config_write(
+            &principal,
+            ConfigWriteSet::default().with("providers", verb),
+            &commit,
+        ) {
+            return denied.into_response();
+        }
+    }
+    let writes = ConfigWriteSet::default().with("providers", Verb::Update);
+    let authorization = match authorize_config_write(&principal, writes, &commit) {
+        Ok(authorization) => authorization,
+        Err(denied) => return denied.into_response(),
+    };
+    let mut candidate = commit.current_config();
+    if let Err(error) = zeroclaw_config::provider_registry::editor::stage(&mut candidate, edit) {
+        return error_response(ConfigApiError::new(
+            ConfigApiCode::ValidationFailed,
+            format!("{error:#}"),
+        ));
+    }
+    match persist_and_swap(&state, authorization, candidate, commit).await {
+        Ok(_guard) => Json(serde_json::json!({ "saved": true })).into_response(),
+        Err(response) => response,
+    }
+}
+
 fn parse_patch_ops(value: serde_json::Value) -> Result<Vec<PatchOp>, ConfigApiError> {
     let ops = value.as_array().ok_or_else(|| {
         ConfigApiError::new(
@@ -3443,6 +3491,88 @@ mod tests {
             data_dir,
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn provider_registry_editor_masks_and_persists_through_config_lifecycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config.providers = toml::from_str(
+            r#"
+[connections."gateway.prod"]
+kind = "custom"
+uri = "https://example.test/v1"
+auth = { mode = "api_key", api_key = "test-registry-secret" }
+[models."chat.fast.us"]
+capability = "chat"
+provider = "gateway.prod"
+model = "before"
+"#,
+        )
+        .unwrap();
+        config.save().await.unwrap();
+        let state = test_state(config);
+        let response = handle_registry_get(State(state.clone())).await;
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let expected: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("test-registry-secret"));
+        let mut registry = expected.clone();
+        registry["models"]["chat.fast.us"]["model"] = serde_json::json!("after");
+        let response = handle_registry_put(
+            State(state.clone()),
+            None,
+            Json(zeroclaw_config::provider_registry::editor::RegistryEdit {
+                expected: expected.clone(),
+                registry: registry.clone(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            state
+                .config
+                .read()
+                .resolve_model_id("chat.fast.us")
+                .as_deref(),
+            Some("after")
+        );
+        let persisted = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        assert!(
+            !persisted.contains("test-registry-secret"),
+            "registry save must use normal encryption"
+        );
+        assert!(
+            state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        let response = handle_registry_put(
+            State(state.clone()),
+            None,
+            Json(zeroclaw_config::provider_registry::editor::RegistryEdit { expected, registry }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("config.toml")).unwrap(),
+            persisted
+        );
+        let expected =
+            zeroclaw_config::provider_registry::editor::snapshot(&state.config.read()).unwrap();
+        let response = handle_registry_put(
+            State(state.clone()),
+            None,
+            Json(zeroclaw_config::provider_registry::editor::RegistryEdit {
+                expected,
+                registry: serde_json::json!({}),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!state.config.read().providers.models.has_canonical_models());
+        let persisted = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        assert!(!persisted.contains("gateway.prod"));
+        assert!(!persisted.contains("chat.fast.us"));
     }
 
     fn test_state(config: zeroclaw_config::schema::Config) -> AppState {

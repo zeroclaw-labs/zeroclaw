@@ -4703,6 +4703,45 @@ impl Config {
     /// `PropKind::AliasRef` pickers and validation.
     #[must_use]
     pub fn resolve_alias_source(&self, source: crate::traits::AliasSource) -> Vec<String> {
+        if matches!(
+            source,
+            crate::traits::AliasSource::TtsProviders
+                | crate::traits::AliasSource::TranscriptionProviders
+        ) {
+            let capability = if source == crate::traits::AliasSource::TtsProviders {
+                zeroclaw_api::capability::Capability::Tts
+            } else {
+                zeroclaw_api::capability::Capability::Asr
+            };
+            let mut refs = Vec::new();
+            if let Ok(registry) = self.provider_registry() {
+                refs.extend(
+                    registry
+                        .models
+                        .iter()
+                        .filter(|(_, model)| model.capability() == capability)
+                        .map(|(name, _)| name.to_string()),
+                );
+            }
+            if capability == zeroclaw_api::capability::Capability::Tts {
+                refs.extend(
+                    self.providers
+                        .tts
+                        .iter_entries()
+                        .map(|(family, alias, _)| format!("{family}.{alias}")),
+                );
+            } else {
+                refs.extend(
+                    self.providers
+                        .transcription
+                        .iter_aliases()
+                        .map(|(family, alias)| format!("{family}.{alias}")),
+                );
+            }
+            refs.sort();
+            refs.dedup();
+            return refs;
+        }
         // Model references have dynamic keys containing literal dots. Build
         // them from the typed maps, never from flattened property paths.
         if source == crate::traits::AliasSource::ModelProviders {

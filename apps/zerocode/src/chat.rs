@@ -5090,10 +5090,21 @@ impl Chat {
         })
     }
 
-    /// Read the model configured for a dotted model_provider ref
-    /// (`providers.models.<family>.<alias>.model`), used to pre-select the
-    /// current model in the picker.
+    /// Read the model for an exact registry reference or legacy profile,
+    /// used to pre-select the current model in the picker.
     async fn configured_model(rpc: &RpcClient, model_provider_ref: &str) -> Option<String> {
+        // Exact canonical keys may contain dots or have no dot at all. Only
+        // enter the legacy family/alias resolver after an exact lookup misses.
+        let registry = rpc.provider_registry().await.ok()?;
+        if let Some(model) = registry
+            .get("models")
+            .and_then(|models| models.get(model_provider_ref))
+        {
+            return model
+                .get("model")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned);
+        }
         let (family, tail) = model_provider_ref.trim().split_once('.')?;
         let aliases = rpc
             .config_map_keys(&format!("providers.models.{family}"))
@@ -13194,6 +13205,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configured_model_resolves_canonical_exact_key_before_legacy_paths() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = RpcClient::with_rpc(Arc::clone(&rpc));
+        let task = tokio::spawn(async move {
+            Chat::configured_model(&client, "custom.gateway.prod.fast.v1").await
+        });
+        let request = next_rpc_request(&mut rx, "canonical registry").await;
+        assert_eq!(request["method"], "config/provider-registry");
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({"models": {
+                "custom.gateway.prod.fast.v1": {"capability": "chat", "provider": "gateway.prod", "model": "upstream-id"}
+            }}),
+        );
+        assert_eq!(task.await.unwrap().as_deref(), Some("upstream-id"));
+        assert!(
+            rx.try_recv().is_err(),
+            "canonical names must never use flattened profile paths"
+        );
+    }
+
+    #[tokio::test]
     async fn configured_model_uses_complete_profile_keys_and_nested_inheritance() {
         for (reference, models, nested, expected) in [
             ("custom.gw.v2", vec![], None, "legacy-id"),
@@ -13222,6 +13257,9 @@ mod tests {
             let client = RpcClient::with_rpc(Arc::clone(&rpc));
             let task =
                 tokio::spawn(async move { Chat::configured_model(&client, reference).await });
+            let request = next_rpc_request(&mut rx, "canonical registry").await;
+            assert_eq!(request["method"], "config/provider-registry");
+            respond_ok(&rpc, &request, serde_json::json!({"models": {}}));
             let request = next_rpc_request(&mut rx, "profile keys").await;
             assert_eq!(request["method"], crate::client::method::CONFIG_MAP_KEYS);
             assert_eq!(request["params"]["path"], "providers.models.custom");

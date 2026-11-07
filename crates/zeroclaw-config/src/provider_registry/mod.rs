@@ -22,3 +22,4 @@ pub use options::{
 pub use override_value::Override;
 pub use registry::{ModelSelection, ProviderRegistry, RegistryError};
 pub use resolve::{ResolvedAsr, ResolvedChat, ResolvedDecision, ResolvedEmbedding, ResolvedTts};
+pub mod editor;

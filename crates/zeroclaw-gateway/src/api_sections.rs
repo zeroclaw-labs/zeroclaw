@@ -112,6 +112,9 @@ pub fn derive_section_status(cfg: &zeroclaw_config::schema::Config) -> ConfigSta
     let ready = missing.is_empty();
     let has_partial_state = !cfg.onboard_state.completed_sections.is_empty()
         || cfg.providers.models.iter_entries().next().is_some()
+        || cfg.providers.models.has_canonical_models()
+        || !cfg.providers.connections.is_empty()
+        || !cfg.providers.model_presets.is_empty()
         || !cfg.risk_profiles.is_empty()
         || !cfg.runtime_profiles.is_empty()
         || !cfg.agents.is_empty();
@@ -133,7 +136,12 @@ pub fn derive_section_status(cfg: &zeroclaw_config::schema::Config) -> ConfigSta
 
 fn quickstart_missing_requirements(cfg: &zeroclaw_config::schema::Config) -> Vec<String> {
     let mut missing = Vec::new();
-    if cfg.providers.models.iter_entries().next().is_none() {
+    if cfg.providers.models.iter_entries().next().is_none()
+        && !cfg
+            .providers
+            .models
+            .has_canonical_capability(zeroclaw_api::capability::Capability::Chat)
+    {
         missing.push("Add a model provider.".to_string());
     }
     if cfg.agents.is_empty() {
@@ -330,6 +338,7 @@ pub async fn handle_sections(State(state): State<AppState>) -> Response {
     for s in zeroclaw_config::sections::QUICKSTART_SECTIONS {
         roots.insert(s.as_str().to_string());
     }
+    roots.insert("providers.registry".to_string());
 
     // Drop bare parent-segment entries when a dotted child is present
     // — `providers` is phantom once `providers.models` etc. are listed.
@@ -357,6 +366,9 @@ pub async fn handle_sections(State(state): State<AppState>) -> Response {
     let sections: Vec<ConfigSectionEntry> = ordered
         .into_iter()
         .map(|key| {
+            if key == "providers.registry" {
+                return zeroclaw_runtime::rpc::types::provider_registry_section(&cfg);
+            }
             let wizard = zeroclaw_config::sections::Section::from_key(&key);
             let has_picker = match wizard {
                 Some(w) => !matches!(
@@ -545,7 +557,8 @@ fn providers_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
 }
 
 fn any_usable_model_provider(cfg: &zeroclaw_config::schema::Config) -> bool {
-    cfg.providers
+    let legacy = cfg
+        .providers
         .models
         .iter_entries()
         .any(|(family, alias, base)| {
@@ -554,7 +567,37 @@ fn any_usable_model_provider(cfg: &zeroclaw_config::schema::Config) -> bool {
                 alias_effective_model(cfg, family, alias).as_deref(),
                 zeroclaw_runtime::quickstart::model_provider_is_local(family),
             )
-        })
+        });
+    if legacy {
+        return true;
+    }
+
+    cfg.provider_registry().is_ok_and(|registry| {
+        registry
+            .models
+            .values()
+            .any(|model| canonical_chat_model_usable(model, &registry))
+    })
+}
+
+fn canonical_chat_model_usable(
+    model: &zeroclaw_config::provider_registry::ModelDefinition,
+    registry: &zeroclaw_config::provider_registry::ProviderRegistry,
+) -> bool {
+    use zeroclaw_api::capability::Capability;
+    model.capability() == Capability::Chat
+        && model
+            .upstream_model()
+            .is_some_and(|value| !value.trim().is_empty())
+        && registry
+            .connections
+            .get(model.provider())
+            .is_some_and(|connection| {
+                connection.supports(Capability::Chat)
+                    && (connection.has_secrets()
+                        || connection.uses_openai_codex_auth()
+                        || zeroclaw_runtime::quickstart::model_provider_is_local(connection.kind()))
+            })
 }
 
 fn provider_type_badge(
@@ -1655,6 +1698,41 @@ mod tests {
             sop_audit: None,
             sop_driver_handles: None,
         }
+    }
+
+    #[test]
+    fn provider_registry_chat_readiness_does_not_require_legacy_profiles() {
+        let mut cfg = empty_cfg();
+        cfg.providers = toml::from_str(
+            r#"
+[connections."gateway.prod"]
+kind = "custom"
+auth = { mode = "api_key", api_key = "test-key" }
+[models."chat.fast.us"]
+capability = "chat"
+provider = "gateway.prod"
+model = "upstream-model"
+"#,
+        )
+        .unwrap();
+        assert!(any_usable_model_provider(&cfg));
+        // The typed-family picker only links to legacy aliases. Its badge
+        // must not imply that a canonical model is editable through that path.
+        assert!(provider_type_badge(&cfg, "custom", false).is_none());
+        assert!(
+            !quickstart_missing_requirements(&cfg)
+                .iter()
+                .any(|message| message == "Add a model provider.")
+        );
+        assert!(zeroclaw_config::sections::section_has_signal(
+            &cfg,
+            zeroclaw_config::sections::Section::ModelProviders
+        ));
+        cfg.providers.models = Default::default();
+        assert!(
+            derive_section_status(&cfg).has_partial_state,
+            "a saved connection is still partial setup state"
+        );
     }
 
     #[test]

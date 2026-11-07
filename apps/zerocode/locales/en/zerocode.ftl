@@ -791,6 +791,9 @@ zc-config-group-operations = Operations
 zc-config-group-other = Other
 
 zc-config-section-providers-models-label = Model providers
+zc-config-section-providers-registry-label = Provider registry
+zc-config-section-providers-registry-help = Connections, capability models, presets and fallback references. Names are exact keys and may contain dots.
+zc-config-registry-help = Edit connections, models, model_presets and fallback together as JSON. Enter inserts a line; Ctrl+S saves. For inherited options, omit a field to inherit and use the string "null" to clear it. References are validated and unchanged masked credentials are preserved. Reload after another editor changes the registry.
 zc-config-section-model-routes-label = Model routes
 zc-config-section-embedding-routes-label = Embedding routes
 zc-config-section-risk-profiles-label = Risk profiles

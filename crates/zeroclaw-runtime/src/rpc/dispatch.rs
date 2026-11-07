@@ -145,6 +145,8 @@ pub enum Method {
 
     // Config
     ConfigGet,
+    ConfigRegistryGet,
+    ConfigRegistrySet,
     ConfigSet,
     ConfigSetMany,
     ConfigValidate,
@@ -281,6 +283,8 @@ impl Method {
         (Method::CronSettings, "cron/settings"),
         // Config
         (Method::ConfigGet, "config/get"),
+        (Method::ConfigRegistryGet, "config/provider-registry"),
+        (Method::ConfigRegistrySet, "config/provider-registry-set"),
         (Method::ConfigSet, "config/set"),
         (Method::ConfigSetMany, "config/set-many"),
         (Method::ConfigValidate, "config/validate"),
@@ -441,6 +445,7 @@ impl Method {
             M::CronTrigger => (Resource::Cron, Verb::Execute),
 
             M::ConfigGet
+            | M::ConfigRegistryGet
             | M::ConfigValidate
             | M::ConfigList
             | M::ConfigMapKeys
@@ -450,9 +455,11 @@ impl Method {
             | M::ConfigStatus
             | M::ConfigCatalog
             | M::ConfigCatalogModels => (Resource::Config, Verb::Read),
-            M::ConfigSet | M::ConfigSetMany | M::ConfigReload | M::ConfigMapKeyRename => {
-                (Resource::Config, Verb::Update)
-            }
+            M::ConfigSet
+            | M::ConfigSetMany
+            | M::ConfigReload
+            | M::ConfigMapKeyRename
+            | M::ConfigRegistrySet => (Resource::Config, Verb::Update),
             M::ConfigMapKeyCreate => (Resource::Config, Verb::Create),
             M::ConfigDelete | M::ConfigMapKeyDelete => (Resource::Config, Verb::Delete),
 
@@ -3876,6 +3883,11 @@ impl RpcDispatcher {
 
             // Config
             Method::ConfigGet => self.handle_config_get(params),
+            Method::ConfigRegistryGet => {
+                zeroclaw_config::provider_registry::editor::snapshot(&self.ctx.config.read())
+                    .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))
+            }
+            Method::ConfigRegistrySet => Box::pin(self.handle_config_registry_set(params)).await,
             Method::ConfigSet => Box::pin(self.handle_config_set(params)).await,
             Method::ConfigSetMany => Box::pin(self.handle_config_set_many(params)).await,
             Method::ConfigValidate => self.handle_config_validate(),
@@ -10047,6 +10059,61 @@ impl RpcDispatcher {
 
     // ── Config handlers ──────────────────────────────────────────
 
+    async fn handle_config_registry_set(&self, params: &Value) -> RpcResult {
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_config::provider_registry::editor;
+
+        let edit: editor::RegistryEdit = parse_params(params)?;
+        let method = Method::ConfigRegistrySet;
+        self.selector_config_write(method, "providers")?;
+        let commit = self
+            .ctx
+            .begin_config_commit()
+            .await
+            .map_err(config_commit_admission_error)?;
+        self.recheck_config_write_authority(method, Some("providers"), &commit)?;
+        // This whole-registry editor can create and remove entries as well as
+        // update them. Keep the same coarse verbs as the map CRUD surfaces.
+        for verb in [Verb::Create, Verb::Delete] {
+            self.require_additional_grant(method, Resource::Config, verb)?;
+        }
+        let mut candidate = Box::new(self.ctx.config.read().clone());
+        editor::stage(&mut candidate, edit)
+            .map_err(|error| rpc_err(INVALID_PARAMS, format!("{error:#}")))?;
+        // A model can change without its connection changing. Match the real
+        // embedding consumer (including routes), then rebuild its entire view
+        // once rather than refreshing once per model on a shared connection.
+        let memory_provider_refs = candidate
+            .providers
+            .models
+            .canonical_model_refs()
+            .map(|reference| reference.as_str())
+            .chain(
+                candidate
+                    .providers
+                    .connections
+                    .keys()
+                    .map(|provider| provider.as_str()),
+            )
+            .find(|reference| memory_embeddings_use_provider(&candidate, reference))
+            .map(str::to_owned)
+            .into_iter()
+            .collect();
+        let revision = Box::pin(self.commit_config_with_live_session_refresh(
+            *candidate,
+            commit,
+            &LiveSessionRefreshScope::SharedConstruction,
+            RpcConfigCommitEffects {
+                memory_provider_refs,
+                ..RpcConfigCommitEffects::default()
+            },
+        ))
+        .await?;
+        Ok(
+            serde_json::json!({ "revision": crate::config_application::PublishedConfigRevision::from(revision) }),
+        )
+    }
+
     fn handle_config_get(&self, params: &Value) -> RpcResult {
         use zeroclaw_config::traits::MaskSecrets;
         let req: ConfigGetParams = parse_params(params)?;
@@ -12021,6 +12088,7 @@ impl RpcDispatcher {
         for s in QUICKSTART_SECTIONS {
             roots.insert(s.as_str().to_string());
         }
+        roots.insert("providers.registry".to_string());
 
         let direct_scalar_parents: std::collections::HashSet<String> = config
             .prop_fields()
@@ -12074,6 +12142,9 @@ impl RpcDispatcher {
         let sections: Vec<ConfigSectionEntry> = ordered
             .into_iter()
             .map(|key| {
+                if key == "providers.registry" {
+                    return super::types::provider_registry_section(&config);
+                }
                 let wizard = Section::from_key(&key);
                 let has_picker = match wizard {
                     Some(w) => matches!(
@@ -42167,6 +42238,56 @@ mod tests {
             model_name_for_session(&dispatcher, &session_id).await,
             "other-model",
             "config/set must publish the new provider before acknowledging the write"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_registry_set_rebuilds_active_model_and_rejects_stale_documents() {
+        use zeroclaw_config::provider_registry::editor;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        config.providers = toml::from_str(
+            r#"
+[connections."gateway.prod"]
+kind = "custom"
+uri = "http://127.0.0.1:1/v1"
+auth = { mode = "api_key", api_key = "test-key" }
+[models."chat.fast.us"]
+capability = "chat"
+provider = "gateway.prod"
+model = "before"
+"#,
+        )
+        .unwrap();
+        config.agents.get_mut("test-agent").unwrap().model_provider = "chat.fast.us".into();
+        let expected = editor::snapshot(&config).unwrap();
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "before"
+        );
+        let mut registry = expected.clone();
+        registry["models"]["chat.fast.us"]["model"] = json!("after");
+        let params = json!({"expected": expected, "registry": registry});
+        let result = dispatcher
+            .handle_config_registry_set(&params)
+            .await
+            .unwrap();
+        assert!(result["revision"].is_object());
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "after"
+        );
+        assert!(
+            dispatcher
+                .handle_config_registry_set(&params)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "after"
         );
     }
 

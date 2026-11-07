@@ -22,6 +22,7 @@ use ratatui::{
     widgets::{List, ListItem, ListState, Paragraph, Wrap},
 };
 use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::client::{ConfigSectionEntry, ConfigTemplateEntry, RpcClient};
 use crate::terminal_backend::WideCellCleanupBackend;
@@ -486,6 +487,8 @@ pub(crate) struct App {
     cost_cursor: usize,
     // Field list
     fields: Vec<ConfigFieldEntry>,
+    /// Optimistic editing baseline, discarded whenever the editor reloads.
+    registry_editor_snapshot: Option<serde_json::Value>,
     field_cursor: usize,
     // Edit state
     edit_buf: String,
@@ -571,6 +574,7 @@ impl App {
             cost_resources: Vec::new(),
             cost_cursor: 0,
             fields: Vec::new(),
+            registry_editor_snapshot: None,
             field_cursor: 0,
             edit_buf: String::new(),
             edit_cursor: 0,
@@ -2285,7 +2289,29 @@ impl App {
     }
 
     async fn load_fields(&mut self, prefix: &str) -> Result<()> {
-        self.fields = self.rpc.config_list(Some(prefix)).await?;
+        self.fields = if prefix == "providers.registry" {
+            let registry = self.rpc.provider_registry().await?;
+            let value = serde_json::to_string_pretty(&registry)?;
+            self.registry_editor_snapshot = Some(registry);
+            vec![ConfigFieldEntry {
+                path: prefix.to_owned(),
+                category: "providers".into(),
+                kind: PropKind::Object,
+                type_hint: "ProviderRegistry".into(),
+                value: Some(serde_json::Value::String(value)),
+                populated: true,
+                is_secret: false,
+                is_env_overridden: false,
+                enum_variants: Vec::new(),
+                description: crate::i18n::t("zc-config-registry-help"),
+                section: Some(prefix.to_owned()),
+                tab: ConfigTab::None,
+                alias_source: None,
+                setup: None,
+            }]
+        } else {
+            self.rpc.config_list(Some(prefix)).await?
+        };
         if prefix == "channels" {
             retain_direct_children(&mut self.fields, prefix);
         }
@@ -2352,6 +2378,10 @@ impl App {
     /// so values stay current after out-of-band edits. Silent on failure —
     /// retains the previously loaded data so the user sees no flicker.
     async fn reload_fields_silent(&mut self, prefix: &str) {
+        if prefix == "providers.registry" {
+            let _ = self.load_fields(prefix).await;
+            return;
+        }
         let Ok(new_fields) = self.rpc.config_list(Some(prefix)).await else {
             return;
         };
@@ -4527,6 +4557,10 @@ impl App {
     }
 
     async fn handle_field_edit(&mut self, key: KeyEvent) -> Result<()> {
+        if matches!(&self.screen, Screen::FieldEdit { prefix, .. } if prefix == "providers.registry")
+        {
+            return self.handle_registry_edit(key).await;
+        }
         if self.is_select_edit() {
             return self.handle_select_edit(key).await;
         }
@@ -4650,6 +4684,68 @@ impl App {
                 }
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    async fn handle_registry_edit(&mut self, key: KeyEvent) -> Result<()> {
+        use crate::keymap::ConfigEditorAction as E;
+        match E::from_chord(&key) {
+            Some(E::Cancel) => self.pop_to_field_list().await?,
+            Some(E::Confirm) => self.insert_scalar_edit_text("\n"),
+            Some(E::Save) => {
+                let result = async {
+                    let candidate: serde_json::Value = serde_json::from_str(&self.edit_buf)?;
+                    let expected = self.registry_editor_snapshot.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("provider registry editor has no loaded baseline")
+                    })?;
+                    self.rpc.set_provider_registry(expected, &candidate).await
+                }
+                .await;
+                match result {
+                    Ok(revision) => {
+                        self.application_feedback
+                            .record_saved("providers".to_owned(), revision);
+                        self.status_msg = None;
+                        self.pop_to_field_list_keep_cursor().await?;
+                    }
+                    Err(error) => {
+                        self.status_msg = Some(crate::i18n::t_args(
+                            "zc-config-status-set-failed",
+                            &[("err", &error.to_string())],
+                        ));
+                    }
+                }
+            }
+            Some(E::Backspace) => self.backspace_scalar_edit(),
+            Some(E::Up | E::Down) => {
+                self.edit_cursor = crate::text_navigation::adjacent_line_cursor(
+                    &self.edit_buf,
+                    self.edit_cursor,
+                    matches!(E::from_chord(&key), Some(E::Down)),
+                );
+            }
+            Some(E::CursorStart) => {
+                self.edit_cursor = self.edit_buf[..self.edit_cursor]
+                    .rfind('\n')
+                    .map_or(0, |index| index + 1);
+            }
+            Some(E::CursorEnd) => {
+                self.edit_cursor += self.edit_buf[self.edit_cursor..]
+                    .find('\n')
+                    .unwrap_or(self.edit_buf.len() - self.edit_cursor);
+            }
+            Some(
+                action @ (E::CursorLeft | E::CursorRight | E::CursorWordLeft | E::CursorWordRight),
+            ) => self.move_scalar_edit_cursor(action),
+            None => {
+                if let KeyCode::Char(c) = key.code
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    let mut encoded = [0; 4];
+                    self.insert_scalar_edit_text(c.encode_utf8(&mut encoded));
+                }
+            }
         }
         Ok(())
     }
@@ -5844,6 +5940,29 @@ impl App {
             let input_display =
                 scalar_edit_display(&self.edit_buf, self.edit_cursor, field.is_secret);
 
+            if field.path == "providers.registry" {
+                let prefix = &self.edit_buf[..self.edit_cursor.min(self.edit_buf.len())];
+                let cursor_line = prefix.bytes().filter(|byte| *byte == b'\n').count();
+                let cursor_column = prefix.rsplit('\n').next().unwrap_or_default().width();
+                let vertical = cursor_line.saturating_sub(r.main.height.saturating_sub(3) as usize);
+                let horizontal =
+                    cursor_column.saturating_sub(r.main.width.saturating_sub(3) as usize);
+                frame.render_widget(
+                    Paragraph::new(input_display)
+                        .scroll((
+                            u16::try_from(vertical).unwrap_or(u16::MAX),
+                            u16::try_from(horizontal).unwrap_or(u16::MAX),
+                        ))
+                        .block(theme::panel_block(&format!(
+                            " {} (JSON) ",
+                            crate::i18n::t("zc-config-section-providers-registry-label")
+                        ))),
+                    r.main,
+                );
+                self.draw_status(frame, r);
+                return;
+            }
+
             let input = Paragraph::new(vec![
                 Line::from(Span::styled(&kind_hint, theme::dim_style())),
                 Line::from(Span::styled(input_display, theme::input_style())),
@@ -5932,7 +6051,13 @@ impl App {
                     .get(*field_idx)
                     .map(|f| f.kind == PropKind::StringArray)
                     .unwrap_or(false);
-                if is_string_array {
+                if self
+                    .fields
+                    .get(*field_idx)
+                    .is_some_and(|field| field.path == "providers.registry")
+                {
+                    self.insert_scalar_edit_text(&cleaned);
+                } else if is_string_array {
                     // Preserve newlines so each pasted line becomes a new entry.
                     self.edit_buf.push_str(&cleaned);
                 } else {
@@ -7900,6 +8025,63 @@ mod tests {
         };
         manager.prepare_edit_at(0);
         (manager, outbound, rx, term)
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn provider_registry_paste_preserves_json_lines_and_saves_the_loaded_baseline() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::keymap::overrides::reset();
+        let (mut manager, outbound, mut rx, mut term) = field_draft_manager(PropKind::Object);
+        let expected = serde_json::json!({"connections": {}, "models": {}, "model_presets": {}, "fallback": {}});
+        manager.registry_editor_snapshot = Some(expected.clone());
+        manager.fields[0].path = "providers.registry".into();
+        manager.edit_buf.clear();
+        manager.edit_cursor = 0;
+        manager.screen = Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "providers.registry".into(),
+            breadcrumb: vec!["providers.registry".into()],
+            field_idx: 0,
+        };
+        manager
+            .handle_paste("{\r\n  \"connections\": {},\r\n  \"models\": {}\r\n}")
+            .await;
+        assert!(manager.edit_buf.contains('\n'));
+        let candidate: serde_json::Value = serde_json::from_str(&manager.edit_buf).unwrap();
+        let answers = async {
+            answer_config_request(
+                &outbound,
+                &mut rx,
+                "config/provider-registry-set",
+                serde_json::json!({"expected": expected, "registry": candidate}),
+                Ok(serde_json::json!({})),
+            )
+            .await;
+            answer_config_request(
+                &outbound,
+                &mut rx,
+                "config/provider-registry",
+                serde_json::json!({}),
+                Ok(expected.clone()),
+            )
+            .await;
+        };
+        let save = async {
+            manager
+                .handle_key(
+                    KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                    &mut term,
+                )
+                .await
+                .unwrap();
+        };
+        tokio::join!(answers, save);
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        assert!(manager.status_msg.is_none());
+        crate::keymap::overrides::reset();
     }
 
     #[tokio::test]

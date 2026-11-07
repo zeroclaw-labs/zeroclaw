@@ -1,4 +1,4 @@
-import { getMapKeys, getProp, getTemplates } from './api';
+import { getMapKeys, getProp, getTemplates, getProviderRegistry } from './api';
 import type { PropResponse } from './api';
 
 export type ConfiguredModelCategory = 'models' | 'tts' | 'transcription';
@@ -14,6 +14,14 @@ export async function walkConfiguredModelBindings(
 ): Promise<ConfiguredModelBinding[]> {
   const root = `providers.${category}`;
   const out: ConfiguredModelBinding[] = [];
+  const registry = await getProviderRegistry();
+  const capability = { models: 'chat', tts: 'tts', transcription: 'asr' }[category];
+  for (const [alias, model] of Object.entries(registry.models)) {
+    const connection = registry.connections[model.provider];
+    if (model.capability === capability && model.model && connection) {
+      out.push({ type: connection.kind, alias, resource: model.model });
+    }
+  }
   // providers.<category> isn't a map-keyed section; the typed wrapper
   // exposes one HashMap per provider type. Read the slot list from
   // map_key_sections via the templates endpoint.

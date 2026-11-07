@@ -5,6 +5,22 @@ model reference is an exact TOML key, so a name such as `chat.gateway.prod`
 keeps both dots as part of the reference. The older family/alias layout below
 remains the migration reference for existing V4 files.
 
+The dashboard and Zerocode expose a **Provider registry** configuration section
+for connections, capability models, presets, and fallback routes. The dashboard
+edits each registry in a separate JSON tab; Zerocode edits the complete JSON
+document (Enter inserts a newline; Ctrl+S saves). All registries are validated
+and saved together, preserving exact names such as `chat.gateway.prod`.
+For inherited options, omit a field to inherit its value; use the JSON string
+`"null"` to explicitly clear it, matching the TOML override syntax below.
+Unchanged masked credentials retain their existing values and follow the normal
+secret encryption lifecycle. A stale editor must reload before saving.
+
+The editor retains existing typed provider maps. Because a registry replacement
+can add, update, and remove entries, a scoped principal needs Config create,
+update, and delete grants with write access to `providers`. Dashboard saves use
+the normal configuration application/reload flow; RPC saves also prepare and
+publish updated providers for active sessions before committing the generation.
+
 ## Canonical connections and models
 
 Put shared endpoint and authentication settings in a connection, then bind

@@ -983,6 +983,10 @@ fn config_admin_router(inbound_auth: &Arc<principal_gate::GatewayInboundAuth>) -
                 .options(api_config::handle_options_prop),
         )
         .route("/api/config/list", get(api_config::handle_list))
+        .route(
+            "/api/config/provider-registry",
+            get(api_config::handle_registry_get).put(api_config::handle_registry_put),
+        )
         .route("/api/config/drift", get(api_config::handle_drift))
         .route(
             "/api/config/reload-status",
