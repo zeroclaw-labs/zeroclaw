@@ -635,6 +635,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'config.registry_fallback': "Fallback",
     'config.registry_save': "Save registry",
     'config.registry_reload': "Reload registry",
+    'config.registry_refresh_required': "The registry was saved, but its refreshed server snapshot was unavailable. Reload it successfully before saving again.",
     'config.registry_help': 'Edit the canonical provider registry as JSON. Names, including dots, are exact keys. All four tabs save together and references are validated. For inherited options, omit a field to inherit and use the string "null" to clear it. Masked credentials are preserved when unchanged. Saved changes use the normal configuration application/reload flow.',
     'config.tab_peer_groups': "Peer Groups",
     'config.tab_personality': "Personality",

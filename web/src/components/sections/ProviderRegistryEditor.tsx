@@ -25,6 +25,11 @@ export default function ProviderRegistryEditor({ onSaved }: { onSaved: () => voi
   const [section, setSection] = useState<Section>(selectedModel ? 'models' : 'connections');
   const [error, setError] = useState('');
   const [saving, setSaving] = useState(false);
+  const [loading, setLoading] = useState(false);
+  // A successful PUT followed by a failed GET leaves the old CAS baseline in
+  // the draft store. Require a successful refresh before another write.
+  const [refreshRequired, setRefreshRequired] = useState(false);
+  const editVersion = useRef(0);
   const loadedThisMount = useRef(false);
   const {
     providerRegistryDraft,
@@ -32,16 +37,27 @@ export default function ProviderRegistryEditor({ onSaved }: { onSaved: () => voi
   } = useConfigDraft();
 
   const load = useCallback(async () => {
+    const versionAtStart = editVersion.current;
+    setLoading(true);
     try {
       const document = await getProviderRegistry();
+      // A reload is allowed to replace the current draft only when the user
+      // did not type while the request was in flight.
+      if (editVersion.current !== versionAtStart) return false;
       setProviderRegistryDraft({
         expected: document,
         sections: sectionDraft(document),
         dirty: false,
       });
+      setRefreshRequired(false);
       setError('');
+      return true;
     } catch (cause) {
       setError(String(cause));
+      setRefreshRequired(true);
+      throw cause;
+    } finally {
+      setLoading(false);
     }
   }, [setProviderRegistryDraft]);
 
@@ -49,12 +65,12 @@ export default function ProviderRegistryEditor({ onSaved }: { onSaved: () => voi
     if (!loadedThisMount.current) {
       loadedThisMount.current = true;
       // A dirty draft belongs to the shared store and must survive remounts.
-      if (!providerRegistryDraft?.dirty) void load();
+      if (!providerRegistryDraft?.dirty) void load().catch(() => undefined);
       return;
     }
     // Save all and discard all clear the shared draft while this editor stays
     // mounted. Re-read the masked server document so the editor remains usable.
-    if (!providerRegistryDraft) void load();
+    if (!providerRegistryDraft) void load().catch(() => undefined);
   }, [load, providerRegistryDraft]);
   useEffect(() => { if (selectedModel) setSection('models'); }, [selectedModel]);
 
@@ -70,7 +86,9 @@ export default function ProviderRegistryEditor({ onSaved }: { onSaved: () => voi
       // The PUT accepts masked credentials and the server restores/re-masks
       // them. Refresh the canonical snapshot instead of using the submitted
       // candidate as the next CAS baseline.
-      await load();
+      setRefreshRequired(true);
+      const refreshed = await load();
+      if (!refreshed) throw new Error(t('config.registry_refresh_required'));
       setError('');
       onSaved();
     } catch (cause) { setError(String(cause)); }
@@ -79,7 +97,7 @@ export default function ProviderRegistryEditor({ onSaved }: { onSaved: () => voi
 
   const reload = () => {
     setError('');
-    void load();
+    void load().catch(() => undefined);
   };
 
   const registry = providerRegistryDraft;
@@ -96,17 +114,20 @@ export default function ProviderRegistryEditor({ onSaved }: { onSaved: () => voi
       aria-label={t(`config.registry_${section}`)}
       className="w-full min-h-96 resize-y rounded border border-pc-border bg-pc-base text-pc-text p-3 font-mono text-sm"
       value={drafts[section]}
-      disabled={saving}
+      disabled={saving || loading || refreshRequired}
       spellCheck={false}
-      onChange={(event) => setProviderRegistryDraft({
-        expected: registry.expected,
-        sections: { ...drafts, [section]: event.target.value },
-        dirty: true,
-      })}
+      onChange={(event) => {
+        editVersion.current += 1;
+        setProviderRegistryDraft({
+          expected: registry.expected,
+          sections: { ...drafts, [section]: event.target.value },
+          dirty: true,
+        });
+      }}
     />}
     <div className="flex gap-2">
-      <Button disabled={!drafts || saving} onClick={() => void save()}>{t('config.registry_save')}</Button>
-      <Button variant="ghost" disabled={saving} onClick={reload}>{t('config.registry_reload')}</Button>
+      <Button disabled={!drafts || saving || loading || refreshRequired} onClick={() => void save()}>{t('config.registry_save')}</Button>
+      <Button variant="ghost" disabled={saving || loading} onClick={reload}>{t('config.registry_reload')}</Button>
     </div>
   </div>;
 }
