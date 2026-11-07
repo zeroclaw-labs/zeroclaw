@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test, { afterEach, beforeEach } from "node:test";
-import { createElement } from "react";
+import React, { createElement } from "react";
 import { act, create, type ReactTestRenderer } from "react-test-renderer";
 import type { OidcSession } from "../lib/auth.ts";
 import type { AuthState } from "./useAuth.ts";
@@ -87,6 +87,8 @@ let requests: Recorded[] = [];
 let health = { require_pairing: true, paired: true };
 let providers: string[] = [];
 let viaRelay = false;
+// How `/api/auth/methods` fails, when a test makes it fail.
+let methodsFailure: null | "network" | number = null;
 let sessionResponse: () => Response = () => new Response("", { status: 401 });
 // Paths whose next request meets a gateway generation that is stopping for a reload.
 let restartingOnce = new Set<string>();
@@ -111,6 +113,8 @@ globalThis.fetch = async (input, init) => {
   }
   if (url.endsWith("/health")) return json(200, health);
   if (url.endsWith("/api/auth/methods")) {
+    if (methodsFailure === "network") throw new TypeError("Failed to fetch");
+    if (methodsFailure !== null) return json(methodsFailure, { error: "unavailable" });
     return json(200, {
       pairing_required: true,
       oidc: providers.map((alias) => ({ alias, provider: `oidc.${alias}` })),
@@ -125,8 +129,12 @@ globalThis.fetch = async (input, init) => {
   return json(404, {});
 };
 
+// The jiti CLI compiles JSX with the classic runtime, which needs React in scope.
+Object.assign(globalThis, { React });
+
 const auth = await import("../lib/auth.ts");
 const { AuthProvider, useAuth } = await import("./useAuth.ts");
+const { SignInScreen } = await import("../components/auth/SignInScreen.tsx");
 const { WebSocketClient } = await import("../lib/ws.ts");
 const api = await import("../lib/api.ts");
 
@@ -164,6 +172,52 @@ async function mount(): Promise<void> {
   await act(settle);
 }
 
+/** The provider with what App shows a browser that isn't signed in. */
+function Screen() {
+  const s = useAuth();
+  latest = s;
+  if (s.loading || s.isAuthenticated || !s.requiresPairing) return null;
+  return createElement(SignInScreen, {
+    onPair: s.pair,
+    providers: s.providers,
+    onSignIn: s.signIn,
+    notice: s.signOutNotice,
+    viaRelay: s.viaRelay,
+    methods: s.signInMethods,
+    onRetryMethods: s.retrySignInMethods,
+  });
+}
+
+async function mountScreen(): Promise<void> {
+  await act(async () => {
+    renderer = create(createElement(AuthProvider, null, createElement(Screen)));
+  });
+  await act(settle);
+}
+
+const rendered = (attr: string) =>
+  renderer?.root.findAll((node) => typeof node.type === "string" && node.props[attr] !== undefined)
+    .length ?? 0;
+const inputs = () => renderer?.root.findAll((node) => node.type === "input").length ?? 0;
+
+async function retryMethods(): Promise<void> {
+  const button = renderer?.root.find(
+    (node) => typeof node.type === "string" && node.props["data-methods-retry"] !== undefined,
+  );
+  assert.ok(button, "a retry button");
+  await act(async () => {
+    button.props.onClick();
+  });
+  await act(settle);
+}
+
+async function unmount(): Promise<void> {
+  await act(async () => {
+    renderer?.unmount();
+  });
+  renderer = null;
+}
+
 async function fire(name: keyof typeof auth.AUTH_EVENTS): Promise<void> {
   await act(async () => {
     fakeWindow.dispatchEvent(new Event(auth.AUTH_EVENTS[name]));
@@ -191,6 +245,7 @@ beforeEach(() => {
   health = { require_pairing: true, paired: true };
   providers = [];
   viaRelay = false;
+  methodsFailure = null;
   sessionResponse = () => new Response("", { status: 401 });
   restartingOnce = new Set();
   routes = new Map();
@@ -207,6 +262,58 @@ afterEach(async () => {
 // ---------------------------------------------------------------------------
 // Unchanged paths
 // ---------------------------------------------------------------------------
+
+test("a failed sign-in methods request shows no pairing form, and a retry shows the right screen", async () => {
+  // Whether pairing is allowed is in that answer: a relay-served page must
+  // not offer it, and without the answer the page can't tell.
+  for (const failure of ["network", 429, 500, 503] as const) {
+    methodsFailure = failure;
+    await mountScreen();
+    assert.equal(state().isAuthenticated, false, `${failure}`);
+    assert.equal(inputs(), 0, `${failure}: no pairing input`);
+    assert.equal(rendered("data-methods-retry"), 1, `${failure}: a retry`);
+    // The retry is answered: through a relay, with a provider.
+    methodsFailure = null;
+    viaRelay = true;
+    providers = ["corp"];
+    await retryMethods();
+    assert.equal(inputs(), 0, `${failure}: still no pairing input`);
+    assert.equal(rendered("data-signin-provider"), 1, `${failure}: the provider`);
+    assert.equal(rendered("data-relay-notice"), 1, `${failure}: the relay notice`);
+    await unmount();
+    viaRelay = false;
+    providers = [];
+  }
+  // A retry answered directly, with sign-in off: the pairing form.
+  methodsFailure = 503;
+  await mountScreen();
+  assert.equal(inputs(), 0);
+  methodsFailure = null;
+  await retryMethods();
+  assert.equal(inputs(), 1, "the pairing form once the gateway says pairing is how to sign in");
+  await unmount();
+  // Answered first time: the pairing form, exactly as before.
+  await mountScreen();
+  assert.equal(inputs(), 1);
+  assert.equal(rendered("data-methods-retry"), 0);
+});
+
+test("a paired browser whose token is refused while the methods request fails shows no pairing form", async () => {
+  storage.setItem("zeroclaw_token", "tok");
+  await mountScreen();
+  assert.equal(state().isAuthenticated, true);
+  methodsFailure = 429;
+  await fire("unauthorized");
+  assert.equal(state().isAuthenticated, false);
+  assert.equal(inputs(), 0);
+  assert.equal(rendered("data-methods-retry"), 1);
+  methodsFailure = null;
+  viaRelay = true;
+  providers = ["corp"];
+  await retryMethods();
+  assert.equal(inputs(), 0);
+  assert.equal(rendered("data-signin-provider"), 1);
+});
 
 test("sign-in off: the pairing screen, no provider, no session lookup", async () => {
   await mount();

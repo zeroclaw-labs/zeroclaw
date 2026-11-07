@@ -137,6 +137,8 @@ function AppContent() {
     pair,
     providers,
     viaRelay,
+    signInMethods,
+    retrySignInMethods,
     signIn,
     signOutNotice,
   } = useAuth();
@@ -182,6 +184,8 @@ function AppContent() {
         onSignIn={signIn}
         notice={signOutNotice}
         viaRelay={viaRelay}
+        methods={signInMethods}
+        onRetryMethods={retrySignInMethods}
       />
     );
   }

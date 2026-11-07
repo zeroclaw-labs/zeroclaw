@@ -71,6 +71,36 @@ test("after sign-out the screen says the provider session may remain", () => {
   assert.ok(ended.includes("Your session has ended."));
 });
 
+test("until the gateway says how to sign in, the screen offers no pairing form", async () => {
+  const screen = (methods: "checking" | "failed", viaRelay: boolean, providers: OidcMethod[]) =>
+    renderToStaticMarkup(
+      createElement(SignInScreen, {
+        onPair,
+        providers,
+        onSignIn: () => {},
+        notice: null,
+        viaRelay,
+        methods,
+        onRetryMethods: () => {},
+      }),
+    );
+  for (const methods of ["checking", "failed"] as const) {
+    for (const viaRelay of [false, true]) {
+      for (const providers of [[], [corp]]) {
+        const html = screen(methods, viaRelay, providers);
+        assert.equal(count(html, "<form"), 0, `${methods} ${viaRelay}`);
+        assert.equal(count(html, "<input"), 0, `${methods} ${viaRelay}`);
+        assert.equal(count(html, "pairing code"), 0, `${methods} ${viaRelay}`);
+        assert.equal(count(html, "data-signin-provider="), 0, `${methods} ${viaRelay}`);
+        assert.equal(count(html, "data-methods-retry"), methods === "failed" ? 1 : 0);
+        assert.equal(count(html, "data-relay-notice"), viaRelay ? 1 : 0);
+      }
+    }
+  }
+  assert.ok(screen("failed", false, []).includes("check how to sign in"));
+  assert.ok(screen("checking", false, []).includes("Checking how to sign in"));
+});
+
 test("through a relay the screen offers sign-in alone, never pairing", async () => {
   const relayed = (providers: OidcMethod[], notice: SignOutNotice | null = null) =>
     createElement(SignInScreen, { onPair, providers, onSignIn: () => {}, notice, viaRelay: true });

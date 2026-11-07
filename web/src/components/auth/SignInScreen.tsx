@@ -3,7 +3,7 @@ import { getAdminPairCode, generatePairCode, PairCodeForbiddenError } from "../.
 import type { OidcMethod } from "../../lib/authSession";
 import { basePath } from "../../lib/basePath";
 import { t } from "../../lib/i18n";
-import type { SignOutNotice } from "../../hooks/useAuth";
+import type { SignInMethods, SignOutNotice } from "../../hooks/useAuth";
 import { RelayNotice } from "./RelayNotice";
 
 // Pairing dialog: the sign-in screen when no sign-in providers are configured,
@@ -277,6 +277,10 @@ export interface SignInScreenProps {
   notice: SignOutNotice | null;
   /** The dashboard is reached through a relay that can read the session. */
   viaRelay?: boolean;
+  /** Whether the gateway has said how to sign in. Until it has, no pairing form. */
+  methods?: SignInMethods;
+  /** Ask the gateway again, after it didn't answer. */
+  onRetryMethods?: () => void;
 }
 
 /**
@@ -284,7 +288,8 @@ export interface SignInScreenProps {
  * then the pairing form. With no providers and no notice it is exactly the
  * pairing dialog, so installs without sign-in see no change. Through a relay
  * it offers sign-in alone: the gateway refuses pairing there, because the
- * relay would see the code.
+ * relay would see the code. Until the gateway has said how to sign in, it
+ * offers neither: only that answer says whether a relay carries the page.
  */
 export function SignInScreen({
   onPair,
@@ -292,7 +297,29 @@ export function SignInScreen({
   onSignIn,
   notice,
   viaRelay = false,
+  methods = "known",
+  onRetryMethods,
 }: SignInScreenProps) {
+  if (methods !== "known") {
+    return (
+      <SignInFrame
+        status={t(methods === "failed" ? "auth.methods.failed" : "auth.methods.checking")}
+      >
+        {viaRelay && <RelayNotice />}
+        {notice && <SignOutNoticeMessage notice={notice} />}
+        {methods === "failed" && (
+          <button
+            type="button"
+            data-methods-retry=""
+            onClick={onRetryMethods}
+            className="btn-electric w-full py-3.5 text-sm font-semibold tracking-wide"
+          >
+            {t("auth.methods.retry")}
+          </button>
+        )}
+      </SignInFrame>
+    );
+  }
   if (viaRelay) {
     return (
       <SignInFrame status={t("auth.relay.sign_in")}>
