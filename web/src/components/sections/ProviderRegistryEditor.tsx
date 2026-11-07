@@ -1,11 +1,20 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { getProviderRegistry, saveProviderRegistry, type ProviderRegistryDocument } from '@/lib/api';
 import { t } from '@/lib/i18n';
+import { useConfigDraft } from '@/lib/draftStore';
 import { Button } from '@/components/ui';
 
 const sections = ['connections', 'models', 'model_presets', 'fallback'] as const;
 type Section = typeof sections[number];
+
+type RegistrySections = Record<Section, string>;
+
+function sectionDraft(document: ProviderRegistryDocument): RegistrySections {
+  return Object.fromEntries(
+    sections.map((key) => [key, JSON.stringify(document[key], null, 2)]),
+  ) as RegistrySections;
+}
 
 /** Edit one atomic registry document so model/preset/connection references can
  * change together. The server validates the typed candidate and preserves
@@ -14,33 +23,64 @@ export default function ProviderRegistryEditor({ onSaved }: { onSaved: () => voi
   const [params] = useSearchParams();
   const selectedModel = params.get('model');
   const [section, setSection] = useState<Section>(selectedModel ? 'models' : 'connections');
-  const [loaded, setLoaded] = useState<ProviderRegistryDocument>();
-  const [drafts, setDrafts] = useState<Record<Section, string>>();
   const [error, setError] = useState('');
   const [saving, setSaving] = useState(false);
+  const loadedThisMount = useRef(false);
+  const {
+    providerRegistryDraft,
+    setProviderRegistryDraft,
+    clearProviderRegistryDraft,
+  } = useConfigDraft();
 
-  const load = async () => {
+  const load = useCallback(async () => {
     try {
       const document = await getProviderRegistry();
-      setLoaded(document);
-      setDrafts(Object.fromEntries(sections.map((key) => [key, JSON.stringify(document[key], null, 2)])) as Record<Section, string>);
+      setProviderRegistryDraft({
+        expected: document,
+        sections: sectionDraft(document),
+        dirty: false,
+      });
       setError('');
-    } catch (cause) { setError(String(cause)); }
-  };
-  useEffect(() => { void load(); }, []);
+    } catch (cause) {
+      setError(String(cause));
+    }
+  }, [setProviderRegistryDraft]);
+
+  useEffect(() => {
+    if (loadedThisMount.current) return;
+    loadedThisMount.current = true;
+    if (!providerRegistryDraft?.dirty) void load();
+  }, [load, providerRegistryDraft?.dirty]);
   useEffect(() => { if (selectedModel) setSection('models'); }, [selectedModel]);
 
   const save = async () => {
-    if (!loaded || !drafts) return;
+    if (!providerRegistryDraft) return;
     setSaving(true);
     try {
-      const candidate = Object.fromEntries(sections.map((key) => [key, JSON.parse(drafts[key])])) as unknown as ProviderRegistryDocument;
-      await saveProviderRegistry(loaded, candidate);
-      await load();
+      const registrySections = providerRegistryDraft.sections as RegistrySections;
+      const candidate = Object.fromEntries(
+        sections.map((key) => [key, JSON.parse(registrySections[key])]),
+      ) as ProviderRegistryDocument;
+      await saveProviderRegistry(providerRegistryDraft.expected, candidate);
+      setProviderRegistryDraft({
+        expected: candidate,
+        sections: sectionDraft(candidate),
+        dirty: false,
+      });
+      setError('');
       onSaved();
     } catch (cause) { setError(String(cause)); }
     finally { setSaving(false); }
   };
+
+  const reload = () => {
+    clearProviderRegistryDraft();
+    setError('');
+    void load();
+  };
+
+  const registry = providerRegistryDraft;
+  const drafts = registry?.sections as RegistrySections | undefined;
 
   return <div className="flex flex-col gap-4 min-h-0">
     <p className="text-sm text-pc-text-muted">{t('config.registry_help')}</p>
@@ -49,17 +89,21 @@ export default function ProviderRegistryEditor({ onSaved }: { onSaved: () => voi
       {sections.map((key) => <Button key={key} role="tab" aria-selected={section === key} variant={section === key ? 'primary' : 'ghost'} onClick={() => setSection(key)}>{t(`config.registry_${key}`)}</Button>)}
     </div>
     {error && <p role="alert" className="text-status-error whitespace-pre-wrap">{error}</p>}
-    {drafts && <textarea
+    {registry && drafts && <textarea
       aria-label={t(`config.registry_${section}`)}
       className="w-full min-h-96 resize-y rounded border border-pc-border bg-pc-base text-pc-text p-3 font-mono text-sm"
       value={drafts[section]}
       disabled={saving}
       spellCheck={false}
-      onChange={(event) => setDrafts({ ...drafts, [section]: event.target.value })}
+      onChange={(event) => setProviderRegistryDraft({
+        expected: registry.expected,
+        sections: { ...drafts, [section]: event.target.value },
+        dirty: true,
+      })}
     />}
     <div className="flex gap-2">
       <Button disabled={!drafts || saving} onClick={() => void save()}>{t('config.registry_save')}</Button>
-      <Button variant="ghost" disabled={saving} onClick={() => void load()}>{t('config.registry_reload')}</Button>
+      <Button variant="ghost" disabled={saving} onClick={reload}>{t('config.registry_reload')}</Button>
     </div>
   </div>;
 }

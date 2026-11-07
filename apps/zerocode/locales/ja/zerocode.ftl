@@ -647,6 +647,7 @@ zc-config-group-operations = 運用
 zc-config-group-other = その他
 
 zc-config-section-providers-models-label = モデルプロバイダー
+zc-config-section-providers-registry-label = プロバイダーレジストリ
 zc-config-section-model-routes-label = モデルルート
 zc-config-section-embedding-routes-label = 埋め込みルート
 zc-config-section-risk-profiles-label = リスクプロファイル
@@ -689,6 +690,7 @@ zc-config-section-media-pipeline-label = メディアパイプライン
 zc-config-section-multimodal-label = マルチモーダル
 
 zc-config-section-providers-models-help = 設定するモデルプロバイダー（Anthropic、OpenAI、OpenRouter、Ollama、OpenAI互換ゲートウェイなど）を選択します。プロバイダーごとに複数のエイリアスを作成できます。
+zc-config-section-providers-registry-help = 接続、モデル、モデルプリセット、フォールバックを JSON としてまとめて編集します。Enter で改行、Ctrl+S で保存します。継承するオプションは項目を省略し、消去する場合は文字列 "null" を使用します。参照は検証され、変更していないマスク済み認証情報は保持されます。別のエディターでレジストリを変更した後は再読み込みしてください。
 zc-config-section-model-routes-help = reasoning、fast、code などのモデルルーティングヒントを設定します。各ルートはヒントをプロバイダーとモデルに対応付けます。
 zc-config-section-embedding-routes-help = 埋め込みルーティングヒントを設定します。各ルートはヒントを埋め込み対応のプロバイダーとモデルに対応付けます。
 zc-config-section-risk-profiles-help = 許可リスト、拒否リスト、承認しきい値をまとめたリスクプロファイルを設定します。

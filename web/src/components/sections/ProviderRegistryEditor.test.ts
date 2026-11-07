@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import React, { createElement } from 'react';
+import React, { createElement, useState } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { MemoryRouter } from 'react-router-dom';
 
@@ -11,6 +11,7 @@ Object.assign(globalThis, {
   IS_REACT_ACT_ENVIRONMENT: true,
 });
 const { default: Editor } = await import('./ProviderRegistryEditor.tsx');
+const { ConfigDraftProvider } = await import('../../lib/draftStore.tsx');
 const { useModelProfileAliases } = await import('../../lib/useModelProfileAliases.ts');
 const { configuredResourceIds } = await import('../../lib/configuredModels.ts');
 const original = {
@@ -18,6 +19,16 @@ const original = {
   models: { 'chat.fast.us': { capability: 'chat', provider: 'gateway.prod', model: 'before' } },
   model_presets: {}, fallback: {},
 };
+
+function renderEditor(children: React.ReactElement) {
+  return create(
+    createElement(
+      ConfigDraftProvider,
+      null,
+      createElement(MemoryRouter, null, children),
+    ),
+  );
+}
 
 test('registry editor saves exact keys and the original masked baseline atomically', async () => {
   let current = structuredClone(original);
@@ -33,7 +44,17 @@ test('registry editor saves exact keys and the original masked baseline atomical
   let renderer: ReactTestRenderer | undefined;
   try {
     await act(async () => {
-      renderer = create(createElement(MemoryRouter, { initialEntries: ['/config/providers.registry?model=chat.fast.us'] }, createElement(Editor, { onSaved: () => { saves++; } })));
+      renderer = create(
+        createElement(
+          ConfigDraftProvider,
+          null,
+          createElement(
+            MemoryRouter,
+            { initialEntries: ['/config/providers.registry?model=chat.fast.us'] },
+            createElement(Editor, { onSaved: () => { saves++; } }),
+          ),
+        ),
+      );
     });
     const textarea = renderer!.root.findByType('textarea');
     assert.match(textarea.props.value, /chat\.fast\.us/);
@@ -55,13 +76,52 @@ test('invalid registry JSON stays in the editor and never sends a write', async 
   };
   let renderer: ReactTestRenderer | undefined;
   try {
-    await act(async () => { renderer = create(createElement(MemoryRouter, null, createElement(Editor, { onSaved: () => assert.fail('invalid JSON must not save') }))); });
+    await act(async () => {
+      renderer = renderEditor(
+        createElement(Editor, { onSaved: () => assert.fail('invalid JSON must not save') }),
+      );
+    });
     const textarea = renderer!.root.findByType('textarea');
     await act(async () => textarea.props.onChange({ target: { value: '{invalid' } }));
     const save = renderer!.root.findAllByType('button').find((button) => String(button.props.children).includes('Save'))!;
     await act(async () => { save.props.onClick(); });
     assert.equal(writes, 0);
     assert.equal(renderer!.root.findByProps({ role: 'alert' }).children.length > 0, true);
+  } finally { await act(async () => renderer?.unmount()); }
+});
+
+test('registry drafts survive leaving and returning to the config section', async () => {
+  let reads = 0;
+  globalThis.fetch = async () => {
+    reads++;
+    return new Response(JSON.stringify(original), { headers: { 'Content-Type': 'application/json' } });
+  };
+  let showEditor!: React.Dispatch<React.SetStateAction<boolean>>;
+  function Harness() {
+    const [visible, setVisible] = useState(true);
+    showEditor = setVisible;
+    return visible ? createElement(Editor, { onSaved: () => undefined }) : null;
+  }
+  let renderer: ReactTestRenderer | undefined;
+  try {
+    await act(async () => {
+      renderer = create(
+        createElement(
+          ConfigDraftProvider,
+          null,
+          createElement(MemoryRouter, null, createElement(Harness)),
+        ),
+      );
+    });
+    const textarea = renderer!.root.findByType('textarea');
+    const edited = JSON.stringify({
+      'chat.fast.us': { ...original.models['chat.fast.us'], model: 'after-navigation' },
+    });
+    await act(async () => textarea.props.onChange({ target: { value: edited } }));
+    await act(async () => showEditor(false));
+    await act(async () => showEditor(true));
+    assert.equal(renderer!.root.findByType('textarea').props.value, edited);
+    assert.equal(reads, 1);
   } finally { await act(async () => renderer?.unmount()); }
 });
 
