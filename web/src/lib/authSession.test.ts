@@ -23,7 +23,7 @@ function session(overrides: Partial<OidcSession> = {}): OidcSession {
     admin: false,
     expires_at: 2_000_000_000,
     csrf_token: "csrf-1",
-    features: { chat: true, operator_pages: false },
+    features: { chat: true, operator_pages: false, config: true },
     ...overrides,
   };
 }
@@ -183,8 +183,17 @@ test("parseOidcSession requires the credential fields and denies missing feature
   };
   assert.deepEqual(authSession.parseOidcSession(raw), {
     ...raw,
-    features: { chat: false, operator_pages: false },
+    features: { chat: false, operator_pages: false, config: false },
   });
+  assert.deepEqual(
+    authSession.parseOidcSession({ ...raw, features: { chat: true, config: true } })?.features,
+    { chat: true, operator_pages: false, config: true },
+  );
+  assert.equal(
+    authSession.parseOidcSession({ ...raw, features: { config: "yes" } })?.features.config,
+    false,
+    "only a literal true grants the config pages",
+  );
   assert.equal(authSession.parseOidcSession({ ...raw, csrf_token: "" }), null);
   assert.equal(authSession.parseOidcSession({ ...raw, principal_id: undefined }), null);
   assert.equal(authSession.parseOidcSession({ ...raw, kind: "pairing" }), null);

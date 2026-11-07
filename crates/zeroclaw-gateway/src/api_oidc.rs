@@ -16,7 +16,8 @@
 //! - `GET  /oidc/login/{alias}` starts Authorization Code + PKCE (302).
 //! - `GET  /oidc/callback` finishes it: the one-time page hands the token
 //!   to `window.opener` via `postMessage` (gateway origin only) with a
-//!   manual copy fallback. No cookies, no session: clients keep
+//!   manual copy fallback. A short-lived cookie binds this flow to its
+//!   initiating browser; it grants no session. Clients keep
 //!   authenticating per request with the route-layer headers.
 //!
 //! Opt-in dashboard sign-in (`[gateway.dashboard_sign_in]`) reuses the same
@@ -60,9 +61,11 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
+use rand::TryRng as _;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Semaphore, SemaphorePermit};
+use zeroclaw_runtime::i18n::get_required_cli_string;
 use zeroclaw_runtime::security::auth_provider::{DevicePollOutcome, Enrollment, PkceFlow};
 
 use crate::dashboard_session::{
@@ -136,7 +139,12 @@ struct PendingPkce {
 
 enum FlowMode {
     /// `GET /oidc/login/{alias}`: the one-time token page.
-    Enrollment,
+    Enrollment {
+        /// A fresh browser secret, hashed before storage; never sent to the IdP.
+        binding_hash: String,
+        /// Transport scope chosen at flow start, unchanged by a capacity retry.
+        secure_cookie: bool,
+    },
     /// `GET /auth/sign-in/{alias}`: a dashboard session.
     Dashboard {
         /// SHA-256 of the binding cookie set on the browser that started
@@ -154,6 +162,59 @@ enum FlowMode {
         /// A sign-in that succeeds ends that session.
         replaces: Option<[u8; 32]>,
     },
+}
+
+fn binding_hash(value: &str) -> String {
+    hex::encode(Sha256::digest(value.as_bytes()))
+}
+
+fn binding_cookie_name(state_key: &str, secure: bool) -> String {
+    let prefix = if secure { "__Host-" } else { "" };
+    format!("{prefix}zc_oidc_{}", binding_hash(state_key))
+}
+
+fn binding_cookie(
+    state_key: &str,
+    value: &str,
+    secure: bool,
+    max_age: u64,
+) -> Result<HeaderValue, axum::http::header::InvalidHeaderValue> {
+    // Root scope permits __Host- even for a gateway mounted under a prefix.
+    // The per-flow name keeps parallel tabs independent. Lax admits the IdP's
+    // top-level GET redirect; this cookie is never an API credential.
+    let secure_attribute = if secure { "; Secure" } else { "" };
+    HeaderValue::from_str(&format!(
+        "{}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure_attribute}",
+        binding_cookie_name(state_key, secure)
+    ))
+}
+
+fn browser_matches(headers: &HeaderMap, pending: &PendingPkce) -> bool {
+    let FlowMode::Enrollment {
+        binding_hash: expected_hash,
+        secure_cookie,
+    } = &pending.mode
+    else {
+        // Dashboard flows retain their own CookieScope check before exchange.
+        return false;
+    };
+    let name = binding_cookie_name(&pending.flow.state, *secure_cookie);
+    let mut found = None;
+    for header in headers.get_all(header::COOKIE) {
+        let Ok(cookies) = header.to_str() else {
+            return false;
+        };
+        for cookie in cookies.split(';') {
+            let Some((key, value)) = cookie.trim().split_once('=') else {
+                continue;
+            };
+            // Ambiguous cookies fail closed, including across Cookie headers.
+            if key == name && found.replace(value).is_some() {
+                return false;
+            }
+        }
+    }
+    found.is_some_and(|value| crate::constant_time_eq(&binding_hash(value), expected_hash))
 }
 
 /// In-flight PKCE flows keyed by `state`, following the pairing-store
@@ -751,17 +812,42 @@ async fn handle_pkce_login(
             Err(e) => return error_json(StatusCode::BAD_GATEWAY, &format!("{e}")),
         }
     };
+    let mut secret = [0_u8; 32];
+    if rand::rngs::SysRng.try_fill_bytes(&mut secret).is_err() {
+        return error_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &get_required_cli_string("cli-oidc-browser-start-failed"),
+        );
+    }
+    let secret = hex::encode(secret);
+    let secure_cookie = redirect_uri
+        .get(..8)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"));
+    let cookie = match binding_cookie(&flow.state, &secret, secure_cookie, FLOW_TTL.as_secs()) {
+        Ok(cookie) => cookie,
+        Err(_) => {
+            return error_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &get_required_cli_string("cli-oidc-browser-start-failed"),
+            );
+        }
+    };
     let authorize_url = flow.authorize_url.clone();
     if let Err(full) = relay.flows.insert(PendingPkce {
         alias,
         flow,
         created: Instant::now(),
         client: key,
-        mode: FlowMode::Enrollment,
+        mode: FlowMode::Enrollment {
+            binding_hash: binding_hash(&secret),
+            secure_cookie,
+        },
     }) {
         return too_many_requests(full, CAPACITY_RETRY_AFTER_SECS);
     }
-    Redirect::temporary(&authorize_url).into_response()
+    let mut response = Redirect::temporary(&authorize_url).into_response();
+    response.headers_mut().insert(header::SET_COOKIE, cookie);
+    response
 }
 
 /// Longest `return` path a dashboard sign-in accepts.
@@ -1035,6 +1121,9 @@ async fn handle_auth_session(
                     // Chat for other accounts needs the core session path.
                     "chat": admin,
                     "operator_pages": admin,
+                    // The config routes' own read rule; an administrator's
+                    // grants permit everything, so it covers them too.
+                    "config": crate::principal_gate::may_read_config(&session.grants),
                 },
             }))
             .into_response()
@@ -1221,6 +1310,54 @@ async fn handle_pkce_callback(
     let Some(pending) = query.state.as_deref().and_then(|s| relay.flows.consume(s)) else {
         return unproductive_callback(&relay, &key, StatusCode::BAD_REQUEST);
     };
+    // Each mode owns its binding evidence and cookie scope. Enrollment uses
+    // the root-scoped per-flow cookie; dashboard sign-in keeps CookieScope's
+    // existing binding, session and browser-marker lifecycle.
+    let clear_cookie = match &pending.mode {
+        FlowMode::Enrollment { secure_cookie, .. } => {
+            let cookie = match binding_cookie(&pending.flow.state, "", *secure_cookie, 0) {
+                Ok(cookie) => cookie,
+                Err(_) => {
+                    return unproductive_callback(&relay, &key, StatusCode::INTERNAL_SERVER_ERROR);
+                }
+            };
+            if !browser_matches(&headers, &pending) {
+                let mut response = unproductive_callback(&relay, &key, StatusCode::BAD_REQUEST);
+                response.headers_mut().append(header::SET_COOKIE, cookie);
+                return response;
+            }
+            Some(cookie)
+        }
+        FlowMode::Dashboard { .. } => None,
+    };
+    let mut response = finish_pkce_callback(
+        &state,
+        &relay,
+        &key,
+        pending,
+        query,
+        dashboard_ext,
+        &headers,
+    )
+    .await;
+    if response.status() != StatusCode::SERVICE_UNAVAILABLE
+        && let Some(cookie) = clear_cookie
+    {
+        // A capacity retry retains the same flow and cookie until the original TTL.
+        response.headers_mut().append(header::SET_COOKIE, cookie);
+    }
+    response
+}
+
+async fn finish_pkce_callback(
+    state: &AppState,
+    relay: &OidcEnrollmentState,
+    key: &str,
+    pending: PendingPkce,
+    query: CallbackQuery,
+    dashboard_ext: Option<Extension<Arc<DashboardAuth>>>,
+    headers: &HeaderMap,
+) -> Response {
     // RFC 9207: a response that names another issuer is a mix-up, and is
     // not acted on either way — neither its code nor its error verdict.
     if let Err(e) = pending.flow.check_callback_issuer(query.iss.as_deref()) {
@@ -1234,7 +1371,7 @@ async fn handle_pkce_callback(
                 })),
             "oidc browser sign-in response names a different issuer"
         );
-        return unproductive_callback(&relay, &key, StatusCode::BAD_REQUEST);
+        return unproductive_callback(relay, key, StatusCode::BAD_REQUEST);
     }
     if let Some(error) = query.error {
         ::zeroclaw_log::record!(
@@ -1248,28 +1385,28 @@ async fn handle_pkce_callback(
                 })),
             "oidc browser sign-in denied by the identity provider"
         );
-        return unproductive_callback(&relay, &key, StatusCode::BAD_REQUEST);
+        return unproductive_callback(relay, key, StatusCode::BAD_REQUEST);
     }
     let Some(code) = query.code else {
-        return unproductive_callback(&relay, &key, StatusCode::BAD_REQUEST);
+        return unproductive_callback(relay, key, StatusCode::BAD_REQUEST);
     };
     // A dashboard sign-in must finish in the browser that started it.
     // Without this check a sign-in someone else started, as themselves,
     // could be completed here, leaving this browser signed in to their
     // account. Checked before any outbound work.
     let binding_hash = match &pending.mode {
-        FlowMode::Enrollment => None,
+        FlowMode::Enrollment { .. } => None,
         FlowMode::Dashboard { binding_hash, .. } => Some(*binding_hash),
     };
     let dashboard = match binding_hash {
         None => None,
         Some(binding_hash) => {
             let scope = CookieScope {
-                https: request_is_https(&state, &headers),
+                https: request_is_https(state, headers),
                 path_prefix: &state.path_prefix,
             };
             let bound = scope
-                .binding_value(&headers, &pending.flow.state)
+                .binding_value(headers, &pending.flow.state)
                 .is_some_and(|value| dashboard_session::session_key(&value) == binding_hash);
             if !bound {
                 ::zeroclaw_log::record!(
@@ -1279,10 +1416,10 @@ async fn handle_pkce_callback(
                         .with_attrs(::serde_json::json!({"alias": pending.alias})),
                     "dashboard sign-in callback did not come from the browser that started it"
                 );
-                return unproductive_callback(&relay, &key, StatusCode::BAD_REQUEST);
+                return unproductive_callback(relay, key, StatusCode::BAD_REQUEST);
             }
             let Some(Extension(dashboard)) = dashboard_ext else {
-                return unproductive_callback(&relay, &key, StatusCode::BAD_REQUEST);
+                return unproductive_callback(relay, key, StatusCode::BAD_REQUEST);
             };
             // The provider as configured now, and whether it is still
             // offered: a sign-in whose provider was taken off the screen
@@ -1315,17 +1452,17 @@ async fn handle_pkce_callback(
     // flow, so a successful exchange vouches for the pin as well.
     let built = match &dashboard {
         Some((_, entry, _)) => enrollment_from(&pending.alias, entry.clone()),
-        None => enrollment_for(&state, &pending.alias),
+        None => enrollment_for(state, &pending.alias),
     };
     let enrollment = match built {
         Ok(enrollment) => enrollment,
         // The alias was removed while the flow was in flight: fail closed.
-        Err(_) => return unproductive_callback(&relay, &key, StatusCode::BAD_REQUEST),
+        Err(_) => return unproductive_callback(relay, key, StatusCode::BAD_REQUEST),
     };
     let dashboard = dashboard.map(|(dashboard, entry, lifetime_secs)| {
         (dashboard, ProviderPin::of(&entry), lifetime_secs)
     });
-    let Some(_permit) = outbound_permit(&relay) else {
+    let Some(_permit) = outbound_permit(relay) else {
         // The busy page carries a short `Retry-After`. That invitation is
         // only honest if the retry can still finish the sign-in: the state
         // is single-use and this attempt used none of it, so hand the flow
@@ -1339,7 +1476,7 @@ async fn handle_pkce_callback(
         alias, flow, mode, ..
     } = pending;
     let exchanged = match mode {
-        FlowMode::Enrollment => enrollment.pkce_exchange(&flow, &code).await,
+        FlowMode::Enrollment { .. } => enrollment.pkce_exchange(&flow, &code).await,
         FlowMode::Dashboard { .. } => {
             enrollment
                 .pkce_exchange_requiring_id_token(&flow, &code)
@@ -1359,11 +1496,11 @@ async fn handle_pkce_callback(
                     })),
                 "oidc browser sign-in code exchange failed"
             );
-            return unproductive_callback(&relay, &key, StatusCode::BAD_GATEWAY);
+            return unproductive_callback(relay, key, StatusCode::BAD_GATEWAY);
         }
     };
     match (mode, dashboard) {
-        (FlowMode::Enrollment, _) => success_page(
+        (FlowMode::Enrollment { .. }, _) => success_page(
             &format!("oidc.{alias}"),
             &token.access_token,
             token.expires_in,
@@ -1385,13 +1522,12 @@ async fn handle_pkce_callback(
                 provider,
                 lifetime_secs,
                 flow_state: flow.state.clone(),
-                client: key,
+                client: key.to_owned(),
                 return_to,
                 popup,
                 replaces,
             };
-            finish_dashboard_sign_in(&state, &dashboard, &headers, landing, token.access_token)
-                .await
+            finish_dashboard_sign_in(state, &dashboard, headers, landing, token.access_token).await
         }
         // A dashboard flow always has its session state by now (it returned
         // above otherwise); never fall through to the token page.
@@ -2006,14 +2142,43 @@ mod tests {
             .to_string()
     }
 
-    /// Start a browser flow and return the `state` the gateway issued.
-    async fn start_login(router: &Router) -> String {
+    struct BrowserFlow {
+        state: String,
+        cookie: String,
+    }
+
+    impl std::ops::Deref for BrowserFlow {
+        type Target = str;
+        fn deref(&self) -> &str {
+            &self.state
+        }
+    }
+
+    impl std::fmt::Display for BrowserFlow {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.state)
+        }
+    }
+
+    fn browser_flow(response: &Response) -> BrowserFlow {
+        BrowserFlow {
+            state: state_from_location(&header_value(response, "location")),
+            cookie: header_value(response, "set-cookie")
+                .split(';')
+                .next()
+                .unwrap()
+                .into(),
+        }
+    }
+
+    /// Start a browser flow and preserve its emitted state and cookie.
+    async fn start_login(router: &Router) -> BrowserFlow {
         start_login_as(router, loopback()).await
     }
 
     /// The same, from a chosen peer, for the tests that care which client
     /// the flow is billed to.
-    async fn start_login_as(router: &Router, peer: SocketAddr) -> String {
+    async fn start_login_as(router: &Router, peer: SocketAddr) -> BrowserFlow {
         let response = send_as(
             router,
             peer,
@@ -2025,7 +2190,7 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
-        state_from_location(&header_value(&response, "location"))
+        browser_flow(&response)
     }
 
     #[tokio::test]
@@ -2054,12 +2219,14 @@ mod tests {
 
         let flow_state = start_login(&router).await;
 
-        let response = send(
+        let response = send_as(
             &router,
+            loopback(),
             "GET",
             &format!("/oidc/callback?code=auth-1&state={flow_state}"),
             "gw.local",
             None,
+            &[("cookie", &flow_state.cookie)],
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -2069,12 +2236,14 @@ mod tests {
         assert!(page.contains("oidc.corp"));
 
         // Single use: the same state cannot be redeemed twice.
-        let response = send(
+        let response = send_as(
             &router,
+            loopback(),
             "GET",
             &format!("/oidc/callback?code=auth-1&state={flow_state}"),
             "gw.local",
             None,
+            &[("cookie", &flow_state.cookie)],
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -2085,14 +2254,16 @@ mod tests {
         let server = idp().await;
         let router = router_for(config_with_alias(&server.uri(), "corp"));
         let flow_state = start_login(&router).await;
-        let response = send(
+        let response = send_as(
             &router,
+            loopback(),
             "GET",
             &format!(
                 "/oidc/callback?error=access_denied&error_description=nope&state={flow_state}"
             ),
             "gw.local",
             None,
+            &[("cookie", &flow_state.cookie)],
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -2298,7 +2469,7 @@ mod tests {
                 &format!("/oidc/callback?code=auth-{round}&state={flow_state}"),
                 "gw.local",
                 None,
-                &[],
+                &[("cookie", &flow_state.cookie)],
             )
             .await;
             assert_eq!(response.status(), StatusCode::OK, "sign-in {round}");
@@ -2505,12 +2676,14 @@ mod tests {
         assert_eq!(header_value(&response, "retry-after"), "5");
         assert_eq!(requests_to(&server, "/token").await, 0);
 
-        let response = send(
+        let response = send_as(
             &router,
+            loopback(),
             "GET",
             &format!("/oidc/callback?code=auth-1&state={flow_state}"),
             "gw.local",
             None,
+            &[("cookie", &flow_state.cookie)],
         )
         .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -2559,7 +2732,7 @@ mod tests {
                 &format!("/oidc/callback?code=auth-{round}&state={flow_state}"),
                 "gw.local",
                 None,
-                &[],
+                &[("cookie", &flow_state.cookie)],
             )
             .await;
             assert_eq!(
@@ -2659,12 +2832,14 @@ mod tests {
         );
         assert_no_store(
             "callback success page",
-            &send(
+            &send_as(
                 &router,
+                loopback(),
                 "GET",
                 &format!("/oidc/callback?code=auth-1&state={flow_state}"),
                 "gw.local",
                 None,
+                &[("cookie", &flow_state.cookie)],
             )
             .await,
             StatusCode::OK,
@@ -2701,12 +2876,14 @@ mod tests {
         // A matching state carrying a foreign `iss` is a mix-up: refused
         // before the code is exchanged.
         let flow_state = start_login(&router).await;
-        let response = send(
+        let response = send_as(
             &router,
+            loopback(),
             "GET",
             &format!("/oidc/callback?code=auth-1&state={flow_state}&iss={foreign}"),
             "gw.local",
             None,
+            &[("cookie", &flow_state.cookie)],
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -2716,21 +2893,25 @@ mod tests {
         // An IdP error from a foreign issuer is not a verdict on this flow
         // either, and the state is spent regardless.
         let flow_state = start_login(&router).await;
-        let response = send(
+        let response = send_as(
             &router,
+            loopback(),
             "GET",
             &format!("/oidc/callback?error=access_denied&state={flow_state}&iss={foreign}"),
             "gw.local",
             None,
+            &[("cookie", &flow_state.cookie)],
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let response = send(
+        let response = send_as(
             &router,
+            loopback(),
             "GET",
             &format!("/oidc/callback?code=auth-1&state={flow_state}"),
             "gw.local",
             None,
+            &[("cookie", &flow_state.cookie)],
         )
         .await;
         assert_eq!(
@@ -2743,12 +2924,14 @@ mod tests {
         // The issuer this flow was started for is accepted.
         let flow_state = start_login(&router).await;
         let matching = query_escape(&server.uri());
-        let response = send(
+        let response = send_as(
             &router,
+            loopback(),
             "GET",
             &format!("/oidc/callback?code=auth-1&state={flow_state}&iss={matching}"),
             "gw.local",
             None,
+            &[("cookie", &flow_state.cookie)],
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -2795,7 +2978,9 @@ mod tests {
             .nest(
                 "/gw",
                 Router::new()
-                    .merge(crate::config_admin_router(&inbound_auth))
+                    .merge(crate::config_admin_router(
+                        crate::principal_gate::ConfigRouteAuth::new(&inbound_auth, &state.config),
+                    ))
                     .merge(routes())
                     .with_state(state)
                     .layer(tower_http::limit::RequestBodyLimitLayer::new(
@@ -2826,16 +3011,31 @@ mod tests {
             location.contains("%2Fgw%2Foidc%2Fcallback"),
             "redirect_uri keeps the path prefix: {location}"
         );
-        let flow_state = state_from_location(&location);
+        let flow_state = browser_flow(&response);
+
+        // The binding cookie is not a credential for authenticated API routes.
+        let denied = send_as(
+            &app,
+            loopback(),
+            "GET",
+            "/gw/api/config",
+            "gw.local",
+            None,
+            &[("cookie", &flow_state.cookie)],
+        )
+        .await;
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
 
         // The token-bearing page carries both the gateway security headers
         // and this surface's cache policy.
-        let response = send(
+        let response = send_as(
             &app,
+            loopback(),
             "GET",
             &format!("/gw/oidc/callback?code=auth-1&state={flow_state}"),
             "gw.local",
             None,
+            &[("cookie", &flow_state.cookie)],
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -2912,12 +3112,14 @@ mod tests {
         ));
 
         let flow_state = start_login(&router).await;
-        let response = send(
+        let response = send_as(
             &router,
+            loopback(),
             "GET",
             &format!("/oidc/callback?code=auth-1&state={flow_state}"),
             "gw.local",
             None,
+            &[("cookie", &flow_state.cookie)],
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -2981,12 +3183,14 @@ mod tests {
             .unwrap();
         drop(commit);
 
-        let response = send(
+        let response = send_as(
             &router,
+            loopback(),
             "GET",
             &format!("/oidc/callback?code=auth-1&state={flow_state}"),
             "gw.local",
             None,
+            &[("cookie", &flow_state.cookie)],
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -3018,27 +3222,35 @@ mod tests {
             .outbound
             .try_acquire_many(OUTBOUND_RELAY_CAP as u32)
             .unwrap();
-        let response = send(
+        let response = send_as(
             &router,
+            loopback(),
             "GET",
             &format!("/oidc/callback?code=auth-1&state={flow_state}"),
             "gw.local",
             None,
+            &[("cookie", &flow_state.cookie)],
         )
         .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(header_value(&response, "retry-after"), "5");
+        assert!(
+            !response.headers().contains_key(header::SET_COOKIE),
+            "a valid retry keeps its cookie"
+        );
         assert_eq!(requests_to(&server, "/token").await, 0);
         drop(permits);
 
         // The retry that `Retry-After` invited finishes the sign-in: the
         // refusal spent nothing, so it must not have spent the flow.
-        let response = send(
+        let response = send_as(
             &router,
+            loopback(),
             "GET",
             &format!("/oidc/callback?code=auth-1&state={flow_state}"),
             "gw.local",
             None,
+            &[("cookie", &flow_state.cookie)],
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -3047,12 +3259,14 @@ mod tests {
         assert_eq!(requests_to(&server, "/token").await, 1);
 
         // Single use survives the round trip: the flow is spent now.
-        let response = send(
+        let response = send_as(
             &router,
+            loopback(),
             "GET",
             &format!("/oidc/callback?code=auth-1&state={flow_state}"),
             "gw.local",
             None,
+            &[("cookie", &flow_state.cookie)],
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -3192,6 +3406,231 @@ mod tests {
             ..pending
         });
         assert!(relay.flows.consume(&expired).is_none());
+    }
+
+    #[tokio::test]
+    async fn enrollment_binding_refuses_other_browsers_before_exchange_and_consumes_the_flow() {
+        let server = idp().await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "synthetic-browser-token", "token_type": "Bearer"
+            })))
+            .mount(&server)
+            .await;
+        let router = router_for(config_with_alias(&server.uri(), "corp"));
+        for case in [
+            "missing",
+            "wrong",
+            "another_flow",
+            "duplicate",
+            "duplicate_headers",
+        ] {
+            let flow = start_login(&router).await;
+            let another = start_login(&router).await;
+            let name = flow.cookie.split_once('=').unwrap().0;
+            let wrong = format!("{name}=not-this-browser");
+            let duplicate = format!("{}; {wrong}", flow.cookie);
+            let headers: Vec<(&str, &str)> = match case {
+                "missing" => vec![],
+                "wrong" => vec![("cookie", &wrong)],
+                "another_flow" => vec![("cookie", &another.cookie)],
+                "duplicate" => vec![("cookie", &duplicate)],
+                "duplicate_headers" => vec![("cookie", &flow.cookie), ("cookie", &wrong)],
+                _ => unreachable!(),
+            };
+            let uri = format!("/oidc/callback?code=auth&state={flow}");
+            let response =
+                send_as(&router, loopback(), "GET", &uri, "gw.local", None, &headers).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{case}");
+            assert!(header_value(&response, "set-cookie").contains("Max-Age=0"));
+            assert!(
+                !body_text(response)
+                    .await
+                    .contains("synthetic-browser-token")
+            );
+            assert_eq!(requests_to(&server, "/token").await, 0, "{case}");
+            let retry = send_as(
+                &router,
+                loopback(),
+                "GET",
+                &uri,
+                "gw.local",
+                None,
+                &[("cookie", &flow.cookie)],
+            )
+            .await;
+            assert_eq!(
+                retry.status(),
+                StatusCode::BAD_REQUEST,
+                "spent flow: {case}"
+            );
+            assert_eq!(requests_to(&server, "/token").await, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn enrollment_binding_keeps_two_tabs_independent_and_clears_only_the_finished_cookie() {
+        let server = idp().await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "synthetic-browser-token", "token_type": "Bearer"
+            })))
+            .mount(&server)
+            .await;
+        let relay = Arc::new(OidcEnrollmentState::default());
+        let router = routes_with(relay.clone()).with_state(crate::api::tests::test_state(
+            config_with_alias(&server.uri(), "corp"),
+        ));
+        let first = start_login(&router).await;
+        let second = start_login(&router).await;
+        assert_ne!(first.cookie, second.cookie);
+        let cookies = format!("{}; {}", first.cookie, second.cookie);
+        for flow in [&first, &second] {
+            let (name, value) = flow.cookie.split_once('=').unwrap();
+            {
+                let flows = relay.flows.flows.lock();
+                let pending = flows.get(&flow.state).unwrap();
+                let FlowMode::Enrollment {
+                    binding_hash: stored_hash,
+                    ..
+                } = &pending.mode
+                else {
+                    panic!("enrollment route stored a dashboard flow");
+                };
+                assert_eq!(*stored_hash, binding_hash(value));
+                assert_ne!(stored_hash, value);
+                assert!(!pending.flow.authorize_url.contains(value));
+            }
+            let response = send_as(
+                &router,
+                loopback(),
+                "GET",
+                &format!("/oidc/callback?code=auth&state={flow}"),
+                "gw.local",
+                None,
+                &[("cookie", &cookies)],
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let cleared = header_value(&response, "set-cookie");
+            assert!(cleared.starts_with(&format!("{name}=;")));
+            assert!(cleared.contains("Max-Age=0"));
+            assert!(
+                body_text(response)
+                    .await
+                    .contains("synthetic-browser-token")
+            );
+        }
+        assert_eq!(requests_to(&server, "/token").await, 2);
+    }
+
+    #[tokio::test]
+    async fn enrollment_binding_refuses_a_foreign_browser_even_when_relay_capacity_is_full() {
+        let server = idp().await;
+        let relay = Arc::new(OidcEnrollmentState::default());
+        let router = routes_with(relay.clone()).with_state(crate::api::tests::test_state(
+            config_with_alias(&server.uri(), "corp"),
+        ));
+        let flow = start_login(&router).await;
+        let _permits = relay
+            .outbound
+            .acquire_many(OUTBOUND_RELAY_CAP as u32)
+            .await
+            .unwrap();
+        let response = send(
+            &router,
+            "GET",
+            &format!("/oidc/callback?code=auth&state={flow}"),
+            "gw.local",
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(relay.flows.consume(&flow.state).is_none());
+        assert_eq!(requests_to(&server, "/token").await, 0);
+    }
+
+    #[tokio::test]
+    async fn enrollment_binding_cookie_scope_covers_https_prefixes_and_plain_http() {
+        let server = idp().await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "synthetic-browser-token", "token_type": "Bearer"
+            })))
+            .mount(&server)
+            .await;
+        for (tls, prefix) in [(false, ""), (true, ""), (true, "/gw")] {
+            let mut config = config_with_alias(&server.uri(), "corp");
+            config.gateway.tls = Some(GatewayTlsConfig {
+                enabled: tls,
+                ..Default::default()
+            });
+            let mut state = crate::api::tests::test_state(config);
+            state.path_prefix = prefix.into();
+            let inner = routes().with_state(state);
+            let router = if prefix.is_empty() {
+                inner
+            } else {
+                Router::new().nest(prefix, inner)
+            };
+            let response = send(
+                &router,
+                "GET",
+                &format!("{prefix}/oidc/login/corp"),
+                "gw.local",
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+            let cookie = header_value(&response, "set-cookie");
+            assert_eq!(cookie.starts_with("__Host-"), tls);
+            assert_eq!(cookie.contains("; Secure"), tls);
+            assert!(cookie.contains("; Path=/; HttpOnly; SameSite=Lax; Max-Age=600"));
+            assert!(!cookie.contains("Domain="));
+            assert_no_store("bound login", &response, StatusCode::TEMPORARY_REDIRECT);
+            let flow = browser_flow(&response);
+            let response = send_as(
+                &router,
+                loopback(),
+                "GET",
+                &format!("{prefix}/oidc/callback?error=access_denied&state={flow}"),
+                "gw.local",
+                None,
+                &[("cookie", &flow.cookie)],
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let cleared = header_value(&response, "set-cookie");
+            assert_eq!(cleared.starts_with("__Host-"), tls);
+            assert!(cleared.contains("Max-Age=0"));
+            if tls {
+                let response = send(
+                    &router,
+                    "GET",
+                    &format!("{prefix}/oidc/login/corp"),
+                    "gw.local",
+                    None,
+                )
+                .await;
+                let flow = browser_flow(&response);
+                let unprefixed = flow.cookie.strip_prefix("__Host-").unwrap();
+                let response = send_as(
+                    &router,
+                    loopback(),
+                    "GET",
+                    &format!("{prefix}/oidc/callback?code=auth&state={flow}"),
+                    "gw.local",
+                    None,
+                    &[("cookie", unprefixed)],
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                assert_eq!(requests_to(&server, "/token").await, 0);
+            }
+        }
     }
 
     #[test]

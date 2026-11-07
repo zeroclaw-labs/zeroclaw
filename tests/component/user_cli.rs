@@ -15,8 +15,13 @@ use zeroclaw_config::secrets::SecretStore;
 
 const PASSWORD: &str = "zeroclaw-test-passphrase";
 const ROTATED: &str = "zeroclaw-rotated-passphrase";
-const PROFILES: &str =
-    "schema_version = 3\n\n[permission_profiles.operator]\ngrants = { sessions = [\"read\"] }\n";
+/// A config at the current schema version holding one permission profile.
+fn profiles() -> String {
+    format!(
+        "schema_version = {}\n\n[permission_profiles.operator]\ngrants = {{ sessions = [\"read\"] }}\n",
+        zeroclaw_config::migration::CURRENT_SCHEMA_VERSION
+    )
+}
 
 fn write_config(dir: &Path, contents: &str) {
     std::fs::write(dir.join("config.toml"), contents).expect("write config");
@@ -110,7 +115,7 @@ fn add_password_user(dir: &Path, extra: &[&str]) {
 #[test]
 fn add_list_rotate_and_remove_a_password_user() {
     let dir = tempfile::tempdir().expect("temporary config directory");
-    write_config(dir.path(), PROFILES);
+    write_config(dir.path(), &profiles());
 
     add_password_user(dir.path(), &[]);
     let config = read_config(dir.path());
@@ -157,7 +162,7 @@ fn add_list_rotate_and_remove_a_password_user() {
 #[test]
 fn a_crlf_line_is_one_password() {
     let dir = tempfile::tempdir().expect("temporary config directory");
-    write_config(dir.path(), PROFILES);
+    write_config(dir.path(), &profiles());
     let added = zeroclaw(
         dir.path(),
         &[
@@ -201,7 +206,7 @@ fn a_password_cut_at_the_read_limit_is_refused_not_shortened() {
 #[test]
 fn disable_password_keeps_the_uid() {
     let dir = tempfile::tempdir().expect("temporary config directory");
-    write_config(dir.path(), PROFILES);
+    write_config(dir.path(), &profiles());
     add_password_user(dir.path(), &["--uid", "4101"]);
 
     let disabled = zeroclaw(
@@ -225,7 +230,7 @@ fn disable_password_keeps_the_uid() {
 #[test]
 fn an_entry_without_a_credential_is_refused_by_flag() {
     let dir = tempfile::tempdir().expect("temporary config directory");
-    write_config(dir.path(), PROFILES);
+    write_config(dir.path(), &profiles());
     let output = zeroclaw(
         dir.path(),
         &["user", "add", "zeroclaw_user", "--profile", "operator"],
@@ -239,7 +244,7 @@ fn an_entry_without_a_credential_is_refused_by_flag() {
     );
     assert_eq!(
         read_config(dir.path()),
-        PROFILES,
+        profiles(),
         "a refused edit writes nothing"
     );
 }
@@ -247,7 +252,7 @@ fn an_entry_without_a_credential_is_refused_by_flag() {
 #[test]
 fn a_short_password_is_refused() {
     let dir = tempfile::tempdir().expect("temporary config directory");
-    write_config(dir.path(), PROFILES);
+    write_config(dir.path(), &profiles());
     let output = zeroclaw(
         dir.path(),
         &[
@@ -262,13 +267,13 @@ fn a_short_password_is_refused() {
     );
     assert!(!output.status.success(), "a short password must be refused");
     assert!(stderr(&output).contains("15"), "{}", stderr(&output));
-    assert_eq!(read_config(dir.path()), PROFILES);
+    assert_eq!(read_config(dir.path()), profiles());
 }
 
 #[test]
 fn the_entry_is_checked_before_the_password_is_read() {
     let dir = tempfile::tempdir().expect("temporary config directory");
-    write_config(dir.path(), PROFILES);
+    write_config(dir.path(), &profiles());
     // The profile does not exist. Reading the too-short password would
     // report its length; the refusal must be about the profile instead.
     let output = zeroclaw(
@@ -290,13 +295,13 @@ fn the_entry_is_checked_before_the_password_is_read() {
         !reason.contains("15"),
         "the password was read first: {reason}"
     );
-    assert_eq!(read_config(dir.path()), PROFILES);
+    assert_eq!(read_config(dir.path()), profiles());
 }
 
 #[test]
 fn the_only_credential_cannot_be_disabled() {
     let dir = tempfile::tempdir().expect("temporary config directory");
-    write_config(dir.path(), PROFILES);
+    write_config(dir.path(), &profiles());
     add_password_user(dir.path(), &[]);
     let before = read_config(dir.path());
 
@@ -317,8 +322,11 @@ fn the_only_credential_cannot_be_disabled() {
 #[test]
 fn a_roster_that_failed_to_load_is_not_edited() {
     let dir = tempfile::tempdir().expect("temporary config directory");
-    let broken = "schema_version = 3\nusers = \"not a table\"\n";
-    write_config(dir.path(), broken);
+    let broken = format!(
+        "schema_version = {}\nusers = \"not a table\"\n",
+        zeroclaw_config::migration::CURRENT_SCHEMA_VERSION
+    );
+    write_config(dir.path(), &broken);
     for args in [
         &["user", "list"][..],
         &["user", "remove", "zeroclaw_user"][..],
@@ -348,7 +356,8 @@ fn passwd_repairs_an_entry_the_policy_refuses() {
         write_config(
             dir.path(),
             &format!(
-                "{PROFILES}\n[users.zeroclaw_user]\npermission_profiles = [\"operator\"]\n{broken_entry}"
+                "{}\n[users.zeroclaw_user]\npermission_profiles = [\"operator\"]\n{broken_entry}",
+                profiles()
             ),
         );
         let repaired = zeroclaw(
@@ -368,15 +377,13 @@ fn passwd_repairs_an_entry_the_policy_refuses() {
 #[test]
 fn overrides_the_check_does_not_read_do_not_block_an_edit() {
     let oidc = format!(
-        "{PROFILES}\n[oidc.corp]\nissuer = \"https://sso.example.com/realms/main\"\n\
+        "{}\n[oidc.corp]\nissuer = \"https://sso.example.com/realms/main\"\n\
          audience = \"zeroclaw\"\nvalidation = \"introspection\"\nclaim_path = \"roles\"\n\
-         profile_map = {{ \"zeroclaw-operators\" = \"operator\" }}\n"
+         profile_map = {{ \"zeroclaw-operators\" = \"operator\" }}\n",
+        profiles()
     );
     let cases = [
-        (
-            PROFILES.to_owned(),
-            ("ZEROCLAW_security__otp__enabled", "false"),
-        ),
+        (profiles(), ("ZEROCLAW_security__otp__enabled", "false")),
         // Introspection needs a client secret, supplied here only through the
         // environment, the documented way to keep it out of the file.
         (
@@ -417,7 +424,7 @@ fn overrides_the_check_does_not_read_do_not_block_an_edit() {
 #[test]
 fn an_environment_override_on_an_auth_section_is_refused() {
     let dir = tempfile::tempdir().expect("temporary config directory");
-    write_config(dir.path(), PROFILES);
+    write_config(dir.path(), &profiles());
     let output = zeroclaw_with(
         dir.path(),
         &[
@@ -444,7 +451,7 @@ fn an_environment_override_on_an_auth_section_is_refused() {
         "the refusal names the overridden path: {}",
         stderr(&output)
     );
-    assert_eq!(read_config(dir.path()), PROFILES);
+    assert_eq!(read_config(dir.path()), profiles());
 }
 
 #[test]
@@ -455,7 +462,10 @@ fn hash_password_prints_only_the_hash_and_loads_no_config() {
     // print an enrollment URI on stdout.
     write_config(
         otp.path(),
-        "schema_version = 3\n\n[security.otp]\nenabled = true\n",
+        &format!(
+            "schema_version = {}\n\n[security.otp]\nenabled = true\n",
+            zeroclaw_config::migration::CURRENT_SCHEMA_VERSION
+        ),
     );
 
     for dir in [empty.path(), otp.path()] {
