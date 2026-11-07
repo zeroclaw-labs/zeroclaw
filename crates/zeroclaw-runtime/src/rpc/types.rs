@@ -366,7 +366,9 @@ rpc_type! {
     /// `session/run-once` params: create a session, run one prompt, and
     /// close the session, in one call. The turn streams `session/update`
     /// notifications like `session/prompt`; the response carries the final
-    /// result.
+    /// result. Requires `sessions:create`, `sessions:execute`, and
+    /// `sessions:update` (for close). If cleanup is refused after a completed
+    /// turn, the response reports that failure; the turn is not replayed.
     pub struct SessionRunOnceParams {
         pub agent_alias: String,
         pub prompt: String,
@@ -1091,7 +1093,8 @@ rpc_type! {
     pub struct AgentSkillEntry {
         pub name: String,
         pub description: String,
-        /// `"workspace"` | `"open-skills"` | `"plugin"` | `"bundle"`.
+        /// `"built-in"` | `"workspace"` | `"open-skills"` | `"plugin"` |
+        /// `"bundle"`.
         pub origin: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub plugin: Option<String>,
