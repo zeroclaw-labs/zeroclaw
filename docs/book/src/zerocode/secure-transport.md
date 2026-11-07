@@ -582,6 +582,15 @@ through the same relay stay end-to-end**, and a direct HTTPS connection to the
 gateway (or a VPN such as Tailscale) keeps the relay out entirely. Use those
 when the relay must not be trusted.
 
+**An administrator's session gives the relay administrator power.** Acting
+for someone signed in as an administrator, the relay can make any change an
+administrator can, including changes that outlast the session: adding
+scheduled jobs, writing credentials into the config, or adding a sign-in
+provider or identity mapping that it controls and then signing in with it
+later. Sign in as an administrator through the relay only if you trust the
+relay that far. Otherwise administer the daemon over a direct connection or
+with `zerocode`.
+
 What the relay does not get, even so:
 
 - **Identity-provider passwords.** The browser talks to the identity
@@ -609,6 +618,10 @@ What the relay does not get, even so:
   WebSocket subprotocol, or in a `token` query parameter. OIDC enrollment (`/oidc/login/{alias}` and the
   device grant) is refused too, because it hands the browser an access token.
   Pair or enroll on a direct connection to the gateway instead.
+  A token sent through the relay anyway is refused, but the relay has still
+  seen it, so revoke or rotate it on a direct connection. This covers what
+  the gateway hands out or accepts. An administrator's session can still
+  write a credential into the config, as described above.
 - **More than the signed-in user may do.** Authorization stays at the
   gateway.
 - **Another daemon's dashboard.** Each dashboard is its own origin. The
