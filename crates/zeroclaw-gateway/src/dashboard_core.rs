@@ -481,7 +481,15 @@ enum Kept {
     /// chat holds its place itself, or, when it fails or its caller goes
     /// away first, until the core is done with the connection.
     Place(Place),
+    /// The account's share of a creation no chat took, held as a chat's
+    /// place is while that creation's conversation is closed.
+    Share(Share),
 }
+
+/// An account's share of a creation no chat took, apart from the session's
+/// place, while the creation is settled: taken out to be kept for the
+/// generation, or given back once the last holder lets go.
+type Share = Arc<parking_lot::Mutex<Option<AccountPlace>>>;
 
 /// One handshake through `connector`, presenting `credential` and, when there
 /// is one, the TUI identity, on a connection bound to the credential's
@@ -508,11 +516,12 @@ async fn handshake(
                     drop(slot);
                 }
                 Kept::Place(place) => {
-                    tokio::select! {
-                        () = served.wait() => {}
-                        () = succeeded.cancelled() => {}
-                    }
+                    served_or_succeeded(&served, &succeeded).await;
                     drop(place);
+                }
+                Kept::Share(share) => {
+                    served_or_succeeded(&served, &succeeded).await;
+                    drop(share);
                 }
             }
         });
@@ -529,6 +538,14 @@ async fn handshake(
         succeeded.cancel();
     }
     Ok((outcome, served))
+}
+
+/// Until the core is done with a connection, or its handshake succeeded.
+async fn served_or_succeeded(served: &Served, succeeded: &CancellationToken) {
+    tokio::select! {
+        () = served.wait() => {}
+        () = succeeded.cancelled() => {}
+    }
 }
 
 /// A refusal at the handshake: the core no longer takes this token.
@@ -568,14 +585,17 @@ struct Redial {
 }
 
 impl Redial {
-    async fn connect(&self) -> Option<Arc<RpcClient>> {
+    /// A connection of the close's own. Its handshake holds `kept`, as
+    /// [`Kept`] says: one the client gives up on (past its handshake
+    /// deadline) leaves the charge held until the core is done verifying.
+    async fn connect(&self, kept: &Kept) -> Option<Arc<RpcClient>> {
         let connector = self.core.connector()?;
         match handshake(
             connector,
             &self.provider,
             &self.credential,
             Some(&self.identity),
-            None,
+            Some(kept),
         )
         .await
         {
@@ -585,16 +605,17 @@ impl Redial {
     }
 
     /// Close `core_id`, on `client` first. A lost connection, a timeout or a
-    /// demand for a new handshake is tried again on a new connection.
-    /// Whether the conversation is gone from the core.
-    async fn close(&self, core_id: &str, mut client: Option<Arc<RpcClient>>) -> bool {
+    /// demand for a new handshake is tried again on a new connection, whose
+    /// handshake holds `kept`. Whether the conversation is gone from the
+    /// core.
+    async fn close(&self, core_id: &str, mut client: Option<Arc<RpcClient>>, kept: &Kept) -> bool {
         for attempt in 0..CLOSE_ATTEMPTS {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_millis(200) * attempt).await;
             }
             let current = match client.take() {
                 Some(current) if current.state() == ConnectionState::Connected => current,
-                _ => match self.connect().await {
+                _ => match self.connect(kept).await {
                     Some(fresh) => fresh,
                     None => continue,
                 },
@@ -676,9 +697,10 @@ struct Closing {
     core_id: String,
     /// Held until the close is done, then dropped: the place stays taken
     /// while the conversation may still be live, and its account stays
-    /// charged if the close fails. A renewal's handshake the core is still
-    /// verifying holds it too ([`CoreChat::renew`]). The close's own
-    /// handshakes need nothing more: it waits for each one.
+    /// charged if the close fails. A handshake the client stopped waiting
+    /// for holds it too, until the core is done with that connection: a
+    /// renewal's ([`CoreChat::renew`]), and any of the close's own
+    /// ([`Redial::connect`]).
     place: Place,
     stopping: Option<tokio::sync::watch::Receiver<bool>>,
     /// Ends the chat's expiry watch.
@@ -695,10 +717,11 @@ impl Closing {
             .stopping
             .as_ref()
             .is_some_and(|stopping| *stopping.borrow() || stopping.has_changed().is_err());
+        let kept = Kept::Place(Arc::clone(&self.place));
         if !stopped
             && !self
                 .redial
-                .close(&self.core_id, clients.first().cloned())
+                .close(&self.core_id, clients.first().cloned(), &kept)
                 .await
         {
             self.place.keep_charged();
@@ -896,21 +919,24 @@ impl Answer {
 
     /// Settle `account`'s charge for a creation no chat will take: given back
     /// once the core is known to hold no conversation for it, closing the one
-    /// it created first; kept for the rest of the generation when that cannot
-    /// be known.
+    /// it created first, and once the core is done with each handshake that
+    /// close stopped waiting for; kept for the rest of the generation when
+    /// that cannot be known.
     async fn settle(self, client: Arc<RpcClient>, redial: &Redial, account: Option<AccountPlace>) {
+        let share: Share = Arc::new(parking_lot::Mutex::new(account));
         let let_go = match self {
             Self::Refused(_) => true,
             Self::Opened(SessionNewResult { session_id, .. })
             | Self::Unknown(_, Some(session_id)) => {
-                redial.close(&session_id, Some(Arc::clone(&client))).await
+                let kept = Kept::Share(Arc::clone(&share));
+                redial
+                    .close(&session_id, Some(Arc::clone(&client)), &kept)
+                    .await
             }
             Self::Unknown(_, None) => false,
         };
         client.shutdown();
-        if let Some(account) = account
-            && !let_go
-        {
+        if !let_go && let Some(account) = share.lock().take() {
             account.keep();
         }
     }
@@ -5668,8 +5694,9 @@ mod tests {
             CloseAttempt::Retry,
             "a send the writer refused locally never reached the core"
         );
+        let kept = Kept::Place(Arc::clone(&closing.place));
         assert!(
-            closing.redial.close(&core_id, Some(client)).await,
+            closing.redial.close(&core_id, Some(client), &kept).await,
             "the next attempt, on a new connection, closes it"
         );
         assert!(!fixture.store.list_ids().await.contains(&core_id));
@@ -5990,24 +6017,25 @@ mod tests {
             .await;
     }
 
+    /// What `caller`'s session holds: its places among the session's chats,
+    /// and the conversations charged to its account.
+    fn charge_of(fixture: &Fixture, caller: &CoreCaller) -> (usize, usize) {
+        let account = fixture
+            .core
+            .accounts
+            .held
+            .lock()
+            .get(caller.session.principal().id.as_str())
+            .map_or(0, |account| account.conversations);
+        (caller.binding.places_taken(), account)
+    }
+
     #[tokio::test]
     async fn a_renewal_cut_short_by_sign_out_stays_charged_until_the_core_is_done_with_it() {
         let fixture = Fixture::new().await;
         let (_, session) = fixture.sign_in("alice").await;
-        let principal = session.principal().id.clone();
         let caller = core_caller_for(&fixture, &session);
-        // What a chat holds: one of its session's places and one of its
-        // account's conversations.
-        let charged = || {
-            let account = fixture
-                .core
-                .accounts
-                .held
-                .lock()
-                .get(principal.as_str())
-                .map_or(0, |account| account.conversations);
-            (caller.binding.places_taken(), account)
-        };
+        let charged = || charge_of(&fixture, &caller);
         let mut chat = caller.open_chat("support", None).await.expect("opens");
         assert_eq!(charged(), (1, 1), "an open chat is charged");
 
@@ -6069,5 +6097,160 @@ mod tests {
             "still charged after the core finished: {:?}",
             charged()
         );
+    }
+
+    // ── A cleanup handshake past the client's deadline ──
+
+    /// Longer than the client waits for a handshake, shorter than the core
+    /// waits for the identity provider (15 s): the core is still verifying
+    /// a token when the client gives up on the handshake that presented it.
+    const PAST_THE_CLIENT_DEADLINE: Duration =
+        Duration::from_secs(zeroclaw_rpc_client::DEFAULT_HANDSHAKE_TIMEOUT.as_secs() + 4);
+
+    /// Wait until the identity provider has seen more of alice's
+    /// introspections than `before`, and say when.
+    async fn introspected_after(fixture: &Fixture, before: usize) -> std::time::Instant {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while introspections_of(&fixture._idp, "tok-alice").await <= before {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the cleanup's handshake reaches the identity provider");
+        std::time::Instant::now()
+    }
+
+    /// The charge read once the close has finished, while the first cleanup
+    /// handshake's verification is still held: the client has given up on
+    /// it and a retry closed the conversation.
+    async fn assert_still_charged(
+        fixture: &Fixture,
+        caller: &CoreCaller,
+        before: usize,
+        held_from: std::time::Instant,
+        want: (usize, usize),
+    ) {
+        let after_close = charge_of(fixture, caller);
+        let checked = held_from.elapsed();
+        assert!(
+            introspections_of(&fixture._idp, "tok-alice").await >= before + 2,
+            "the close gave up on its first handshake and tried again"
+        );
+        assert!(
+            checked > zeroclaw_rpc_client::DEFAULT_HANDSHAKE_TIMEOUT
+                && checked < PAST_THE_CLIENT_DEADLINE - Duration::from_secs(1),
+            "checked outside the window the test means: {checked:?}"
+        );
+        assert_eq!(
+            after_close, want,
+            "the charge was given back while the core still verified a cleanup handshake"
+        );
+    }
+
+    /// Wait until `caller`'s session holds nothing.
+    async fn assert_charge_returned(fixture: &Fixture, caller: &CoreCaller) {
+        let returned = tokio::time::timeout(PAST_THE_CLIENT_DEADLINE, async {
+            while charge_of(fixture, caller) != (0, 0) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            returned.is_ok(),
+            "still charged after the core finished: {:?}",
+            charge_of(fixture, caller)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chat_cleanup_handshake_past_the_client_deadline_stays_charged_until_the_core_is_done_with_it()
+     {
+        let fixture = Fixture::new().await;
+        let (_, session) = fixture.sign_in("alice").await;
+        let caller = core_caller_for(&fixture, &session);
+        let chat = caller.open_chat("support", None).await.expect("opens");
+        assert_eq!(
+            charge_of(&fixture, &caller),
+            (1, 1),
+            "an open chat is charged"
+        );
+
+        // The chat's connection is lost, so its close reconnects. That
+        // handshake's verification outlasts the client's deadline; the
+        // close tries again, and the next one is quick.
+        chat.client.shutdown();
+        tokio::time::timeout(Duration::from_secs(5), chat.client.closed())
+            .await
+            .expect("the connection closes");
+        slow_introspections(
+            &fixture,
+            "alice",
+            "chatters",
+            PAST_THE_CLIENT_DEADLINE,
+            (1, 1),
+        )
+        .await;
+        let before = introspections_of(&fixture._idp, "tok-alice").await;
+        let ((), held_from) = tokio::join!(chat.close(), introspected_after(&fixture, before));
+        fixture
+            .assert_nothing_live_within("the close finished", Duration::from_secs(1))
+            .await;
+        assert_still_charged(&fixture, &caller, before, held_from, (1, 1)).await;
+        assert_charge_returned(&fixture, &caller).await;
+    }
+
+    #[tokio::test]
+    async fn a_late_creations_cleanup_handshake_past_the_client_deadline_stays_charged_until_the_core_is_done_with_it()
+     {
+        let fixture = revalidating_fixture(|config| {
+            config.wss.orphaned_session_timeout_secs = 0;
+        })
+        .await;
+        fixture
+            .core
+            .accounts
+            .set_create_ceiling(Duration::from_millis(300));
+        // The core holds its answer to the creation past the chat's ceiling.
+        fixture.start_gate.arm();
+        let (_, session) = fixture.sign_in("alice").await;
+        let caller = core_caller_for(&fixture, &session);
+        let opened = caller.open_chat("support", None).await;
+        assert!(
+            matches!(opened, Err(CoreFailure::Lost(_))),
+            "the creation outlived its ceiling: {:?}",
+            opened.map(|chat| chat.core_id.clone())
+        );
+        assert_eq!(
+            charge_of(&fixture, &caller),
+            (0, 1),
+            "the creation keeps its account's share"
+        );
+
+        // By the time the core answers, the creation's connection is past
+        // its deadline, so the core refuses the close on it and the close
+        // reconnects. That handshake's verification outlasts the client's
+        // deadline; the close tries again, and the next one is quick.
+        tokio::time::sleep(PAST_THE_REVALIDATION).await;
+        slow_introspections(
+            &fixture,
+            "alice",
+            "chatters",
+            PAST_THE_CLIENT_DEADLINE,
+            (1, 1),
+        )
+        .await;
+        let before = introspections_of(&fixture._idp, "tok-alice").await;
+        fixture.start_gate.release();
+        let held_from = introspected_after(&fixture, before).await;
+        fixture
+            .assert_nothing_live_within(
+                "the late creation is closed",
+                zeroclaw_rpc_client::DEFAULT_HANDSHAKE_TIMEOUT + Duration::from_secs(2),
+            )
+            .await;
+        // The settling gives the share back right after the close, if at all.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_still_charged(&fixture, &caller, before, held_from, (0, 1)).await;
+        assert_charge_returned(&fixture, &caller).await;
     }
 }
