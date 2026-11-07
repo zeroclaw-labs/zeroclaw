@@ -1,5 +1,7 @@
 //! Trait abstraction for session persistence backends.
 
+use std::collections::BTreeSet;
+
 use chrono::{DateTime, Utc};
 use zeroclaw_api::model_provider::ChatMessage;
 
@@ -69,6 +71,199 @@ pub struct TimestampedMessage {
     pub created_at: Option<DateTime<Utc>>,
 }
 
+/// Why an agent-scoped session operation was denied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionOwnershipDenial {
+    /// The session is attributed to a different agent.
+    ForeignAgent(String),
+    /// The session is attributed to a channel not owned by the calling agent.
+    ForeignChannel(String),
+    /// The session exists but carries no trusted agent or channel attribution.
+    Unattributed,
+    /// The backend cannot make ownership and access one atomic operation.
+    AtomicCheckUnavailable,
+}
+
+/// Result of an ownership-conditional session operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopedSessionAccess<T> {
+    /// Ownership matched and the operation completed.
+    Granted(T),
+    /// The session did not exist at the operation's linearization point.
+    Missing,
+    /// The session existed but the caller was not authorized to access it.
+    Denied(SessionOwnershipDenial),
+}
+
+/// Evaluate trusted persisted ownership metadata against one agent's live
+/// execution scope.
+///
+/// Agent attribution takes precedence over channel attribution, matching the
+/// session-tool contract: a row explicitly owned by another agent is never
+/// widened by a channel grant.
+pub fn check_session_ownership(
+    owner_agent: Option<&str>,
+    owner_channel: Option<&str>,
+    agent_alias: &str,
+    channel_ids: &BTreeSet<String>,
+) -> Result<(), SessionOwnershipDenial> {
+    if let Some(owner) = owner_agent {
+        return if owner == agent_alias {
+            Ok(())
+        } else {
+            Err(SessionOwnershipDenial::ForeignAgent(owner.to_string()))
+        };
+    }
+
+    if let Some(channel_id) = owner_channel {
+        return if channel_ids.contains(channel_id) {
+            Ok(())
+        } else {
+            Err(SessionOwnershipDenial::ForeignChannel(
+                channel_id.to_string(),
+            ))
+        };
+    }
+
+    Err(SessionOwnershipDenial::Unattributed)
+}
+
+/// Synchronous live channel authority. The resolver retains its policy read
+/// guard while invoking the effect. Backends call this only after acquiring
+/// storage admission; callbacks must not acquire storage or cross an await.
+pub type ChannelAuthority = dyn Fn(&mut dyn FnMut(&BTreeSet<String>)) + Send + Sync;
+
+/// What one inbound turn may claim, resolved by a live policy reader after
+/// storage admission so the decision and the write share one critical
+/// section.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionClaimGrant {
+    /// Channel refs the calling agent currently owns. A transcript stamped
+    /// with one of them and no agent may be claimed.
+    pub channels: BTreeSet<String>,
+    /// Whether an existing transcript that carries neither agent nor channel
+    /// attribution may be adopted. Such transcripts predate ownership
+    /// stamping on the channel path. A sole enabled agent is their only
+    /// possible author, so it adopts them, exactly as it owns the legacy
+    /// Discord archive. With several enabled agents nobody adopts
+    /// implicitly; the operator attributes the transcript explicitly.
+    pub adopt_unattributed: bool,
+}
+
+/// Synchronous live claim authority. The resolver retains its policy read
+/// guard while invoking the effect with the caller's current grant, under
+/// the same storage rules as [`ChannelAuthority`].
+pub type SessionClaimAuthority = dyn Fn(&mut dyn FnMut(&SessionClaimGrant)) + Send + Sync;
+
+/// Decide one inbound ownership claim.
+///
+/// `ownership` is `None` when no session exists (a new conversation may
+/// always be created); otherwise it is the persisted `(agent, channel)`
+/// attribution. Agent and channel ownership are judged exactly as
+/// [`check_session_ownership`] does for reads. Only the unattributed case
+/// can be widened, and only by the grant's `adopt_unattributed` bit.
+pub fn decide_session_claim(
+    ownership: Option<(Option<&str>, Option<&str>)>,
+    agent_alias: &str,
+    grant: &SessionClaimGrant,
+) -> Result<(), SessionOwnershipDenial> {
+    let Some((owner_agent, owner_channel)) = ownership else {
+        return Ok(());
+    };
+    match check_session_ownership(owner_agent, owner_channel, agent_alias, &grant.channels) {
+        Err(SessionOwnershipDenial::Unattributed) if grant.adopt_unattributed => Ok(()),
+        decision => decision,
+    }
+}
+
+/// Outcome of an ownership claim on a session key.
+///
+/// `Foreign` carries the persisted ownership refusal so callers can tell an
+/// explicit other owner or foreign channel from a transcript that predates
+/// attribution, and surface the matching remedy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionOwnerClaim {
+    /// The session was absent or its trusted persisted ownership allowed the claim.
+    Claimed,
+    /// Persisted ownership refused the claim; nothing was written.
+    Foreign(SessionOwnershipDenial),
+}
+
+/// One transcript write that a turn makes after claiming its session; see
+/// [`SessionBackend::write_as_owner`].
+#[derive(Debug, Clone)]
+pub enum OwnedSessionWrite<'a> {
+    /// Append one message.
+    Append(&'a ChatMessage),
+    /// Remove the last message.
+    RemoveLast,
+    /// Replace the transcript and its trim breadcrumb flag together, as
+    /// [`SessionBackend::replace_conversation_state`] does.
+    ReplaceConversationState {
+        messages: &'a [ChatMessage],
+        breadcrumb_present: bool,
+    },
+    /// Record the trim breadcrumb flag.
+    SetTrimBreadcrumb(bool),
+    /// Record routing context, as [`SessionBackend::set_session_context`] does.
+    SetContext(SessionContext<'a>),
+}
+
+/// Admit a claimed turn's later write or read: `Granted` while `agent_alias`
+/// is the persisted agent owner, `Missing` when the session is absent
+/// (`ownership` is `None`), otherwise `Denied`. Unlike a claim, no channel
+/// grant or adoption applies: the turn's claim recorded the agent.
+pub(crate) fn check_claimed_owner(
+    ownership: Option<(Option<&str>, Option<&str>)>,
+    agent_alias: &str,
+) -> std::io::Result<ScopedSessionAccess<()>> {
+    if agent_alias.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "empty session owner",
+        ));
+    }
+    let Some((owner_agent, owner_channel)) = ownership else {
+        return Ok(ScopedSessionAccess::Missing);
+    };
+    let owner_agent = owner_agent.filter(|owner| !owner.is_empty());
+    let owner_channel = owner_channel.filter(|channel| !channel.is_empty());
+    if owner_agent == Some(agent_alias) {
+        return Ok(ScopedSessionAccess::Granted(()));
+    }
+    Ok(ScopedSessionAccess::Denied(
+        check_session_ownership(owner_agent, owner_channel, agent_alias, &BTreeSet::new())
+            .err()
+            .unwrap_or(SessionOwnershipDenial::Unattributed),
+    ))
+}
+
+/// Make `write` with no ownership condition, through the backend's ordinary
+/// operations. Returns whether it changed anything: for `RemoveLast`, whether
+/// a message was removed; otherwise `true`.
+pub fn apply_session_write<B: SessionBackend + ?Sized>(
+    backend: &B,
+    session_key: &str,
+    write: OwnedSessionWrite<'_>,
+) -> std::io::Result<bool> {
+    match write {
+        OwnedSessionWrite::Append(message) => backend.append(session_key, message).map(|()| true),
+        OwnedSessionWrite::RemoveLast => backend.remove_last(session_key),
+        OwnedSessionWrite::ReplaceConversationState {
+            messages,
+            breadcrumb_present,
+        } => backend
+            .replace_conversation_state(session_key, messages, breadcrumb_present)
+            .map(|()| true),
+        OwnedSessionWrite::SetTrimBreadcrumb(present) => backend
+            .set_session_trim_breadcrumb(session_key, present)
+            .map(|()| true),
+        OwnedSessionWrite::SetContext(context) => backend
+            .set_session_context(session_key, context)
+            .map(|()| true),
+    }
+}
+
 /// A caller-owned, synchronous authority hold. Storage knows no runtime policy.
 pub trait SessionEffectGuard {}
 impl<T> SessionEffectGuard for T {}
@@ -107,6 +302,110 @@ pub trait SessionBackend: Send + Sync {
 
     /// Append a single message to a session.
     fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()>;
+
+    /// Load a session only when its persisted ownership matches the supplied
+    /// agent scope. Implementations must make the ownership predicate and load
+    /// one backend-stable operation; a separate best-effort check is unsafe.
+    fn load_if_owned(
+        &self,
+        _session_key: &str,
+        _agent_alias: &str,
+        _channel_ids: &BTreeSet<String>,
+    ) -> std::io::Result<ScopedSessionAccess<Vec<ChatMessage>>> {
+        Ok(ScopedSessionAccess::Denied(
+            SessionOwnershipDenial::AtomicCheckUnavailable,
+        ))
+    }
+
+    /// Append only when persisted ownership matches the supplied agent scope.
+    /// Implementations must make the predicate and mutation one transaction or
+    /// critical section so ownership cannot change between them.
+    fn append_if_owned(
+        &self,
+        _session_key: &str,
+        _message: &ChatMessage,
+        _agent_alias: &str,
+        _channel_ids: &BTreeSet<String>,
+    ) -> std::io::Result<ScopedSessionAccess<()>> {
+        Ok(ScopedSessionAccess::Denied(
+            SessionOwnershipDenial::AtomicCheckUnavailable,
+        ))
+    }
+
+    /// Resolve live policy under storage admission and retain it through access.
+    fn load_with_authority(
+        &self,
+        _session_key: &str,
+        _agent_alias: &str,
+        _authority: &ChannelAuthority,
+    ) -> std::io::Result<ScopedSessionAccess<Vec<ChatMessage>>> {
+        Ok(ScopedSessionAccess::Denied(
+            SessionOwnershipDenial::AtomicCheckUnavailable,
+        ))
+    }
+
+    /// Resolve live policy under storage admission and retain it through access.
+    fn append_with_authority(
+        &self,
+        _session_key: &str,
+        _message: &ChatMessage,
+        _agent_alias: &str,
+        _authority: &ChannelAuthority,
+    ) -> std::io::Result<ScopedSessionAccess<()>> {
+        Ok(ScopedSessionAccess::Denied(
+            SessionOwnershipDenial::AtomicCheckUnavailable,
+        ))
+    }
+
+    /// Make one write of the conversation `agent_alias` claimed, in the same
+    /// critical section as a check that `agent_alias` is still its persisted
+    /// agent owner.
+    ///
+    /// A turn claims its session before it writes, but the session can be
+    /// archived or deleted in between. An unconditional write would then
+    /// recreate it with no owner, and a sole enabled agent adopts a session
+    /// with no owner. So an absent session is first recorded as
+    /// `agent_alias`'s again; `RemoveLast` on one is `Missing`. Any other
+    /// persisted ownership refuses the write with `Denied`, and nothing is
+    /// written. `Granted` carries what [`apply_session_write`] returns.
+    ///
+    /// The default makes the write unconditionally, which suits a backend
+    /// that persists no ownership. Both persistent backends override it.
+    fn write_as_owner(
+        &self,
+        session_key: &str,
+        _agent_alias: &str,
+        write: OwnedSessionWrite<'_>,
+    ) -> std::io::Result<ScopedSessionAccess<bool>> {
+        apply_session_write(self, session_key, write).map(ScopedSessionAccess::Granted)
+    }
+
+    /// Read the conversation `agent_alias` claimed, as strictly as
+    /// [`try_load`](Self::try_load), in the same critical section as a check
+    /// that `agent_alias` is still its persisted agent owner. An absent
+    /// session is `Missing`; any other persisted ownership is `Denied`.
+    ///
+    /// The default reads unconditionally, which suits a backend that persists
+    /// no ownership. Both persistent backends override it.
+    fn try_load_as_owner(
+        &self,
+        session_key: &str,
+        _agent_alias: &str,
+    ) -> std::io::Result<ScopedSessionAccess<Vec<ChatMessage>>> {
+        self.try_load(session_key).map(ScopedSessionAccess::Granted)
+    }
+
+    /// List metadata with the same persisted/live policy boundary as history.
+    fn list_with_authority(
+        &self,
+        _agent_alias: &str,
+        _authority: &ChannelAuthority,
+    ) -> std::io::Result<Vec<SessionMetadata>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "session backend cannot atomically list scoped ownership",
+        ))
+    }
 
     /// Remove the last message from a session. Returns `true` if a message was removed.
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool>;
@@ -229,6 +528,51 @@ pub trait SessionBackend: Send + Sync {
         Ok(())
     }
 
+    /// Claim an absent session or one explicitly owned by `agent_alias`.
+    /// Channel-only ownership requires `claim_session_with_authority`.
+    ///
+    /// This exists because routing an inbound message to an agent is not
+    /// permission to seize a transcript another agent already owns. Two
+    /// distinct conversations can normalize onto one storage key (the key
+    /// builder concatenates channel, thread and sender without an
+    /// unambiguous encoding), and an operator reassigning a channel from A
+    /// to B makes the very next inbound message collide with A's history.
+    /// An unconditional write turns either case into a silent ownership
+    /// transfer, after which the reader checks pass against the wrong owner.
+    ///
+    /// Backends MUST decide the claim and mutation in one storage critical
+    /// section, so concurrent inbound turns cannot both observe an absent
+    /// session and claim it independently.
+    ///
+    /// Without a channel authority, only absent or explicitly same-agent
+    /// sessions can be claimed. Unsupported backends fail closed.
+    fn claim_session_agent_alias(
+        &self,
+        session_key: &str,
+        agent_alias: &str,
+    ) -> std::io::Result<SessionOwnerClaim> {
+        self.claim_session_with_authority(session_key, agent_alias, &|effect| {
+            effect(&SessionClaimGrant::default())
+        })
+    }
+
+    /// Claim an inbound session without overwriting channel-only legacy
+    /// ownership. Unsupported backends fail closed. An existing transcript
+    /// with no attribution is not a new session: it is adopted only when the
+    /// grant says so (see [`SessionClaimGrant::adopt_unattributed`]), and the
+    /// backend decides that inside the same critical section as the write.
+    fn claim_session_with_authority(
+        &self,
+        _session_key: &str,
+        _agent_alias: &str,
+        _authority: &SessionClaimAuthority,
+    ) -> std::io::Result<SessionOwnerClaim> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "session backend cannot atomically claim scoped ownership",
+        ))
+    }
+
     /// Get the agent alias associated with a session, if recorded.
     fn get_session_agent_alias(&self, _session_key: &str) -> std::io::Result<Option<String>> {
         Ok(None)
@@ -316,6 +660,45 @@ pub trait SessionBackend: Send + Sync {
             return Ok(false);
         }
         self.replace_conversation_state(session_key, messages, breadcrumb_present)?;
+        Ok(true)
+    }
+
+    /// Append one message only if the session still exists, with the same
+    /// contract as
+    /// [`replace_conversation_state_if_exists`](Self::replace_conversation_state_if_exists):
+    /// `Ok(false)` means the session was already gone and nothing was
+    /// written, so no transcript, row or sidecar is recreated for the key.
+    /// For a writer that holds no claim on the session, such as startup
+    /// restoration closing a turn it read earlier, where cleanup removing
+    /// the session in between must win.
+    ///
+    /// The default implementation is check-then-act and only best-effort.
+    /// Both built-in backends override it with the same atomic probe and
+    /// write that their `replace_conversation_state_if_exists` uses.
+    fn append_if_exists(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<bool> {
+        if !self.session_exists(session_key) {
+            return Ok(false);
+        }
+        self.append(session_key, message)?;
+        Ok(true)
+    }
+
+    /// Record the trim breadcrumb flag only if the session still exists, with
+    /// the same contract as [`append_if_exists`](Self::append_if_exists).
+    /// Unlike a replacement, it leaves the transcript as it stands, so a
+    /// message appended after the caller read the transcript survives.
+    ///
+    /// The default implementation is check-then-act and only best-effort.
+    /// Both built-in backends override it atomically.
+    fn set_session_trim_breadcrumb_if_exists(
+        &self,
+        session_key: &str,
+        present: bool,
+    ) -> std::io::Result<bool> {
+        if !self.session_exists(session_key) {
+            return Ok(false);
+        }
+        self.set_session_trim_breadcrumb(session_key, present)?;
         Ok(true)
     }
 
@@ -479,5 +862,46 @@ mod tests {
         let q = SessionQuery::default();
         assert!(q.keyword.is_none());
         assert!(q.limit.is_none());
+    }
+
+    #[test]
+    fn claim_decision_adopts_unattributed_only_with_the_grant() {
+        let mut grant = SessionClaimGrant::default();
+        // An absent session is always creatable.
+        assert_eq!(decide_session_claim(None, "solo", &grant), Ok(()));
+
+        // An existing transcript with no attribution predates ownership
+        // stamping: refused by default, adopted only with the grant.
+        let legacy = Some((None, None));
+        assert_eq!(
+            decide_session_claim(legacy, "solo", &grant),
+            Err(SessionOwnershipDenial::Unattributed)
+        );
+        grant.adopt_unattributed = true;
+        assert_eq!(decide_session_claim(legacy, "solo", &grant), Ok(()));
+
+        // The adoption bit never widens an explicit agent or a channel the
+        // caller does not own.
+        assert_eq!(
+            decide_session_claim(Some((Some("other"), None)), "solo", &grant),
+            Err(SessionOwnershipDenial::ForeignAgent("other".into()))
+        );
+        assert_eq!(
+            decide_session_claim(Some((None, Some("discord.ops"))), "solo", &grant),
+            Err(SessionOwnershipDenial::ForeignChannel("discord.ops".into()))
+        );
+        grant.channels.insert("discord.ops".into());
+        assert_eq!(
+            decide_session_claim(Some((None, Some("discord.ops"))), "solo", &grant),
+            Ok(())
+        );
+        assert_eq!(
+            decide_session_claim(
+                Some((Some("solo"), Some("discord.ops"))),
+                "solo",
+                &SessionClaimGrant::default()
+            ),
+            Ok(())
+        );
     }
 }

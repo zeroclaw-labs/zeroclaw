@@ -1,14 +1,19 @@
 use crate::budget;
 use crate::policy::PolicyEnforcer;
 use crate::sqlite_permissions::{check_sqlite_storage, prepare_existing_sqlite_storage};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Local, NaiveDate, Utc};
 use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration as StdDuration, SystemTime};
+use zeroclaw_api::session_keys::{
+    JSONL_SESSION_FILE_SUFFIX, JSONL_SESSION_METADATA_FILE_SUFFIX,
+    JSONL_SESSION_MIGRATED_FILE_SUFFIX, JSONL_SESSION_MIGRATED_METADATA_FILE_SUFFIX,
+};
 use zeroclaw_config::schema::MemoryConfig;
+use zeroclaw_infra::session_store::with_session_directory_lock;
 
 const HYGIENE_INTERVAL_HOURS: i64 = 12;
 const STATE_FILE: &str = "memory_hygiene_state.json";
@@ -234,7 +239,7 @@ fn archive_session_files(workspace_dir: &Path, archive_after_days: u32) -> Resul
         let entry = entry?;
         let path = entry.path();
 
-        if path.is_dir() {
+        if path.is_dir() || !path.exists() {
             continue;
         }
 
@@ -242,17 +247,70 @@ fn archive_session_files(workspace_dir: &Path, archive_after_days: u32) -> Resul
             continue;
         };
 
-        if !is_legacy_session_artifact(filename) {
+        if let Some((stem, transcript_suffix, metadata_suffix)) = jsonl_transcript_parts(filename) {
+            // Claims, appends and ownership writes hold the session store's
+            // directory lock. Holding it from the retention check through both
+            // renames means none of them sees the transcript without its
+            // sidecar, which would read as an unattributed transcript that a
+            // sole enabled agent may adopt.
+            moved += with_session_directory_lock(&sessions_dir, || -> Result<u64> {
+                // The listing is stale by now: check the pair again.
+                if !path.exists() {
+                    return Ok(0);
+                }
+                let metadata_path = sessions_dir.join(format!("{stem}{metadata_suffix}"));
+                // An empty transcript paired with ownership metadata is a live
+                // pre-message claim. Retain it until the first message arrives so
+                // delayed sessions cannot lose attribution at the age boundary.
+                if metadata_path.exists() && fs::metadata(&path)?.len() == 0 {
+                    return Ok(0);
+                }
+                let is_old = if let Some(date) = date_prefix(filename) {
+                    date < cutoff_date
+                } else {
+                    is_older_than(&path, cutoff_time)
+                };
+                if !is_old {
+                    return Ok(0);
+                }
+                if metadata_path.exists() {
+                    move_jsonl_pair_to_archive(
+                        &path,
+                        &metadata_path,
+                        &archive_dir,
+                        stem,
+                        transcript_suffix,
+                        metadata_suffix,
+                    )?;
+                    Ok(2)
+                } else {
+                    move_to_archive(&path, &archive_dir)?;
+                    Ok(1)
+                }
+            })??;
             continue;
         }
 
-        let is_old = if let Some(date) = date_prefix(filename) {
-            date < cutoff_date
-        } else {
-            is_older_than(&path, cutoff_time)
-        };
+        if let Some((stem, transcript_suffix)) = jsonl_metadata_parts(filename) {
+            // A sidecar with a live transcript is handled as a pair when the
+            // transcript reaches its retention boundary. A metadata-only file
+            // can be a trusted ownership claim made before the first message;
+            // retain it so a delayed append cannot lose attribution. Current
+            // writers materialize an empty transcript with every claim, while
+            // this compatibility path protects claims written by older builds.
+            if sessions_dir
+                .join(format!("{stem}{transcript_suffix}"))
+                .exists()
+            {
+                continue;
+            }
+            continue;
+        }
 
-        if is_old {
+        if is_legacy_session_artifact(filename)
+            && (date_prefix(filename).is_some_and(|date| date < cutoff_date)
+                || (date_prefix(filename).is_none() && is_older_than(&path, cutoff_time)))
+        {
             move_to_archive(&path, &archive_dir)?;
             moved += 1;
         }
@@ -262,9 +320,7 @@ fn archive_session_files(workspace_dir: &Path, archive_after_days: u32) -> Resul
 }
 
 fn is_legacy_session_artifact(filename: &str) -> bool {
-    date_prefix(filename).is_some()
-        || filename.ends_with(".jsonl")
-        || filename.ends_with(".jsonl.migrated")
+    date_prefix(filename).is_some() || jsonl_transcript_parts(filename).is_some()
 }
 
 fn purge_memory_archives(workspace_dir: &Path, purge_after_days: u32) -> Result<u64> {
@@ -327,7 +383,7 @@ fn purge_session_archives(workspace_dir: &Path, purge_after_days: u32) -> Result
         let entry = entry?;
         let path = entry.path();
 
-        if path.is_dir() {
+        if path.is_dir() || !path.exists() {
             continue;
         }
 
@@ -335,17 +391,47 @@ fn purge_session_archives(workspace_dir: &Path, purge_after_days: u32) -> Result
             continue;
         };
 
-        if !is_legacy_session_artifact(filename) {
+        if let Some((stem, _, metadata_suffix)) = jsonl_transcript_parts(filename) {
+            let is_old = if let Some(date) = date_prefix(filename) {
+                date < cutoff_date
+            } else {
+                is_older_than(&path, cutoff_time)
+            };
+            if is_old {
+                let metadata_path = archive_dir.join(format!("{stem}{metadata_suffix}"));
+                if metadata_path.exists() {
+                    fs::remove_file(metadata_path)?;
+                    removed += 1;
+                }
+                fs::remove_file(&path)?;
+                removed += 1;
+            }
             continue;
         }
 
-        let is_old = if let Some(date) = date_prefix(filename) {
-            date < cutoff_date
-        } else {
-            is_older_than(&path, cutoff_time)
-        };
+        if let Some((stem, transcript_suffix)) = jsonl_metadata_parts(filename) {
+            if archive_dir
+                .join(format!("{stem}{transcript_suffix}"))
+                .exists()
+            {
+                continue;
+            }
+            let is_old = if let Some(date) = date_prefix(filename) {
+                date < cutoff_date
+            } else {
+                is_older_than(&path, cutoff_time)
+            };
+            if is_old {
+                fs::remove_file(&path)?;
+                removed += 1;
+            }
+            continue;
+        }
 
-        if is_old {
+        if is_legacy_session_artifact(filename)
+            && (date_prefix(filename).is_some_and(|date| date < cutoff_date)
+                || (date_prefix(filename).is_none() && is_older_than(&path, cutoff_time)))
+        {
             fs::remove_file(&path)?;
             removed += 1;
         }
@@ -493,6 +579,113 @@ fn move_to_archive(src: &Path, archive_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn jsonl_transcript_parts(filename: &str) -> Option<(&str, &'static str, &'static str)> {
+    filename
+        .strip_suffix(JSONL_SESSION_MIGRATED_FILE_SUFFIX)
+        .map(|stem| {
+            (
+                stem,
+                JSONL_SESSION_MIGRATED_FILE_SUFFIX,
+                JSONL_SESSION_MIGRATED_METADATA_FILE_SUFFIX,
+            )
+        })
+        .or_else(|| {
+            filename
+                .strip_suffix(JSONL_SESSION_FILE_SUFFIX)
+                .map(|stem| {
+                    (
+                        stem,
+                        JSONL_SESSION_FILE_SUFFIX,
+                        JSONL_SESSION_METADATA_FILE_SUFFIX,
+                    )
+                })
+        })
+}
+
+fn jsonl_metadata_parts(filename: &str) -> Option<(&str, &'static str)> {
+    filename
+        .strip_suffix(JSONL_SESSION_MIGRATED_METADATA_FILE_SUFFIX)
+        .map(|stem| (stem, JSONL_SESSION_MIGRATED_FILE_SUFFIX))
+        .or_else(|| {
+            filename
+                .strip_suffix(JSONL_SESSION_METADATA_FILE_SUFFIX)
+                .map(|stem| (stem, JSONL_SESSION_FILE_SUFFIX))
+        })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Runs on this thread between the sidecar and transcript renames.
+    static BETWEEN_PAIR_RENAMES: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn move_jsonl_pair_to_archive(
+    transcript: &Path,
+    metadata: &Path,
+    archive_dir: &Path,
+    stem: &str,
+    transcript_suffix: &str,
+    metadata_suffix: &str,
+) -> Result<()> {
+    let (transcript_target, metadata_target) =
+        unique_jsonl_archive_targets(archive_dir, stem, transcript_suffix, metadata_suffix)?;
+
+    // Move the transcript first. Until the sidecar follows, the key reads as
+    // its owner's claim on a session with no messages, so another agent's
+    // claim is refused even from a path that doesn't hold the store's lock.
+    // If the sidecar rename fails and so does the rollback, that
+    // metadata-only claim stays live, and hygiene retains it as a
+    // pre-message claim.
+    fs::rename(transcript, &transcript_target).with_context(|| {
+        format!(
+            "failed to archive JSONL transcript {}",
+            transcript.display()
+        )
+    })?;
+    #[cfg(test)]
+    BETWEEN_PAIR_RENAMES.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook();
+        }
+    });
+    if let Err(error) = fs::rename(metadata, &metadata_target) {
+        let rollback = fs::rename(&transcript_target, transcript);
+        let rollback_note = rollback
+            .err()
+            .map(|rollback_error| format!("; transcript rollback also failed: {rollback_error}"))
+            .unwrap_or_default();
+        return Err(error).with_context(|| {
+            format!(
+                "failed to archive JSONL ownership sidecar {}{rollback_note}",
+                metadata.display()
+            )
+        });
+    }
+    Ok(())
+}
+
+fn unique_jsonl_archive_targets(
+    archive_dir: &Path,
+    stem: &str,
+    transcript_suffix: &str,
+    metadata_suffix: &str,
+) -> Result<(PathBuf, PathBuf)> {
+    for index in 0..10_000 {
+        let candidate_stem = if index == 0 {
+            stem.to_string()
+        } else {
+            format!("{stem}_{index}")
+        };
+        let transcript = archive_dir.join(format!("{candidate_stem}{transcript_suffix}"));
+        let metadata = archive_dir.join(format!("{candidate_stem}{metadata_suffix}"));
+        if !transcript.exists() && !metadata.exists() {
+            return Ok((transcript, metadata));
+        }
+    }
+    anyhow::bail!("could not allocate a unique JSONL session archive name for {stem}")
+}
+
 fn unique_archive_target(archive_dir: &Path, filename: &str) -> PathBuf {
     let direct = archive_dir.join(filename);
     if !direct.exists() {
@@ -626,15 +819,19 @@ mod tests {
     }
 
     #[test]
-    fn archives_old_legacy_jsonl_session_files() {
+    fn archives_jsonl_ownership_sidecar_with_transcript() {
         let tmp = TempDir::new().unwrap();
         let workspace = tmp.path();
         let sessions_dir = workspace.join("sessions");
         fs::create_dir_all(&sessions_dir).unwrap();
 
         let legacy_file = sessions_dir.join("legacy_session.jsonl");
+        let metadata_file = sessions_dir.join("legacy_session.metadata.json");
         fs::write(&legacy_file, "legacy session").unwrap();
+        fs::write(&metadata_file, r#"{"agent_alias":"agent_a"}"#).unwrap();
         set_old_mtime(&legacy_file, 10);
+        // Fresh metadata must still follow an old transcript through hygiene.
+        set_old_mtime(&metadata_file, 1);
 
         run_if_due(&default_cfg(), workspace).unwrap();
 
@@ -643,12 +840,359 @@ mod tests {
             "old legacy JSONL session file should be archived"
         );
         assert!(
+            !metadata_file.exists(),
+            "ownership sidecar must leave the active session directory"
+        );
+        assert!(
             sessions_dir
                 .join("archive")
                 .join("legacy_session.jsonl")
                 .exists(),
             "archived legacy JSONL session file should exist"
         );
+        assert!(
+            sessions_dir
+                .join("archive")
+                .join("legacy_session.metadata.json")
+                .exists(),
+            "ownership sidecar must be archived with its transcript"
+        );
+    }
+
+    mod pair_move_races {
+        //! Archive cleanup can run while the same process handles an inbound
+        //! turn. Each test pauses a pair move between its two renames and
+        //! runs a claim in that gap.
+
+        use super::*;
+        use std::collections::BTreeSet;
+        use std::sync::{Arc, mpsc};
+        use std::thread::JoinHandle;
+        use zeroclaw_api::model_provider::ChatMessage;
+        use zeroclaw_infra::session_backend::{
+            SessionBackend, SessionClaimGrant, SessionOwnerClaim, SessionOwnershipDenial,
+        };
+        use zeroclaw_infra::session_store::SessionStore;
+
+        const KEY: &str = "webhook_alice";
+
+        type Turn = (
+            std::io::Result<SessionOwnerClaim>,
+            std::io::Result<Vec<ChatMessage>>,
+        );
+
+        fn grant(
+            adopt_unattributed: bool,
+        ) -> impl Fn(&mut dyn FnMut(&SessionClaimGrant)) + Send + Sync {
+            move |effect: &mut dyn FnMut(&SessionClaimGrant)| {
+                effect(&SessionClaimGrant {
+                    channels: BTreeSet::new(),
+                    adopt_unattributed,
+                });
+            }
+        }
+
+        /// A store holding agent A's explicitly owned transcript, past retention.
+        fn old_pair_owned_by_a() -> (TempDir, Arc<SessionStore>) {
+            let tmp = TempDir::new().unwrap();
+            let store = Arc::new(SessionStore::new(tmp.path()).unwrap());
+            store
+                .append(KEY, &ChatMessage::user("agent A's private history"))
+                .unwrap();
+            store.set_session_agent_alias(KEY, "agent-a").unwrap();
+            set_old_mtime(&transcript(tmp.path()), 10);
+            (tmp, store)
+        }
+
+        fn transcript(workspace: &Path) -> PathBuf {
+            workspace
+                .join("sessions")
+                .join(format!("{KEY}{JSONL_SESSION_FILE_SUFFIX}"))
+        }
+
+        fn sidecar(workspace: &Path) -> PathBuf {
+            workspace
+                .join("sessions")
+                .join(format!("{KEY}{JSONL_SESSION_METADATA_FILE_SUFFIX}"))
+        }
+
+        /// Runs `mover` on its own thread and returns once it is paused
+        /// between its two renames. Sending on the returned channel resumes it.
+        fn pause_between_renames<T: Send + 'static>(
+            mover: impl FnOnce() -> T + Send + 'static,
+        ) -> (JoinHandle<T>, mpsc::Sender<()>) {
+            let (paused_tx, paused_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel::<()>();
+            let handle = std::thread::spawn(move || {
+                BETWEEN_PAIR_RENAMES.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        paused_tx.send(()).unwrap();
+                        resume_rx.recv().unwrap();
+                    }));
+                });
+                mover()
+            });
+            paused_rx
+                .recv_timeout(StdDuration::from_secs(10))
+                .expect("the pair move should pause between its two renames");
+            (handle, resume_tx)
+        }
+
+        /// An inbound turn: claim the key, then hydrate it, as the channel
+        /// orchestrator does. It reports when it is done, so a caller can tell
+        /// whether it ran inside the gap or waited for the move to finish.
+        fn spawn_turn(
+            store: &Arc<SessionStore>,
+            agent: &'static str,
+            adopt_unattributed: bool,
+            message: Option<&'static str>,
+        ) -> (JoinHandle<Turn>, mpsc::Receiver<()>) {
+            let (done_tx, done_rx) = mpsc::channel();
+            let store = Arc::clone(store);
+            let handle = std::thread::spawn(move || {
+                let claim =
+                    store.claim_session_with_authority(KEY, agent, &grant(adopt_unattributed));
+                let history = store.try_load(KEY);
+                if let (Ok(SessionOwnerClaim::Claimed), Some(message)) = (&claim, message) {
+                    store.append(KEY, &ChatMessage::user(message)).unwrap();
+                }
+                done_tx.send(()).unwrap();
+                (claim, history)
+            });
+            (handle, done_rx)
+        }
+
+        fn archived_owner(workspace: &Path) -> serde_json::Value {
+            let archive = workspace.join("sessions").join("archive");
+            let sidecar = archive.join(format!("{KEY}{JSONL_SESSION_METADATA_FILE_SUFFIX}"));
+            let owner: serde_json::Value =
+                serde_json::from_slice(&fs::read(sidecar).unwrap()).unwrap();
+            owner["agent_alias"].clone()
+        }
+
+        fn archived_history(workspace: &Path) -> String {
+            let archive = workspace.join("sessions").join("archive");
+            fs::read_to_string(archive.join(format!("{KEY}{JSONL_SESSION_FILE_SUFFIX}"))).unwrap()
+        }
+
+        /// The regression for the reported race: a sole enabled agent's turn
+        /// overlapping cleanup of a transcript another agent owns explicitly.
+        #[test]
+        fn archive_cleanup_never_lets_a_sole_agent_adopt_a_foreign_transcript_mid_move() {
+            let (tmp, store) = old_pair_owned_by_a();
+            let workspace = tmp.path().to_path_buf();
+            // B is the sole enabled agent, so it may adopt unattributed
+            // transcripts. A's ownership is explicit, so B is refused.
+            assert_eq!(
+                store
+                    .claim_session_with_authority(KEY, "agent-b", &grant(true))
+                    .unwrap(),
+                SessionOwnerClaim::Foreign(SessionOwnershipDenial::ForeignAgent("agent-a".into()))
+            );
+
+            let (cleanup, resume) = pause_between_renames({
+                let workspace = workspace.clone();
+                move || archive_session_files(&workspace, 7)
+            });
+            let (turn, turn_done) = spawn_turn(&store, "agent-b", true, None);
+            // Give the turn time to land inside the gap if nothing holds it.
+            let ran_in_gap = turn_done.recv_timeout(StdDuration::from_secs(1)).is_ok();
+            resume.send(()).unwrap();
+            assert_eq!(cleanup.join().unwrap().unwrap(), 2);
+            let (claim, history) = turn.join().unwrap();
+
+            // Transcript-first ordering alone would refuse a claim in the gap,
+            // so this is what pins the lock: B's turn waits out the move.
+            assert!(!ran_in_gap, "agent B's turn ran inside the pair move");
+            let history = history.unwrap();
+            assert!(
+                history
+                    .iter()
+                    .all(|message| !message.content.contains("agent A")),
+                "agent B hydrated agent A's history: {history:?}"
+            );
+            // Having waited, B starts a new conversation on the freed key.
+            assert_eq!(claim.unwrap(), SessionOwnerClaim::Claimed);
+            assert_eq!(archived_owner(&workspace), "agent-a");
+            assert!(archived_history(&workspace).contains("agent A's private history"));
+        }
+
+        /// The owner's own turn during cleanup. If it ran in the gap, the
+        /// second rename would carry its sidecar into the archive and leave
+        /// its live conversation with no owner. The store's lock keeps it out
+        /// of the gap.
+        #[test]
+        fn archive_cleanup_never_strips_the_owner_from_a_turn_that_overlaps_it() {
+            let (tmp, store) = old_pair_owned_by_a();
+            let workspace = tmp.path().to_path_buf();
+
+            let (cleanup, resume) = pause_between_renames({
+                let workspace = workspace.clone();
+                move || archive_session_files(&workspace, 7)
+            });
+            let (turn, turn_done) = spawn_turn(&store, "agent-a", false, Some("agent A, later"));
+            let _ = turn_done.recv_timeout(StdDuration::from_secs(1));
+            resume.send(()).unwrap();
+            assert_eq!(cleanup.join().unwrap().unwrap(), 2);
+            let (claim, _history) = turn.join().unwrap();
+
+            assert_eq!(claim.unwrap(), SessionOwnerClaim::Claimed);
+            let live: Vec<String> = store
+                .try_load(KEY)
+                .unwrap()
+                .into_iter()
+                .map(|message| message.content)
+                .collect();
+            assert_eq!(live, ["agent A, later"]);
+            assert_eq!(
+                store.get_session_agent_alias(KEY).unwrap().as_deref(),
+                Some("agent-a"),
+                "the live conversation lost its owner"
+            );
+            assert_eq!(archived_owner(&workspace), "agent-a");
+            assert!(archived_history(&workspace).contains("agent A's private history"));
+        }
+
+        /// A pair move that doesn't hold this process's lock, such as one
+        /// made by another process. Moving the transcript first leaves the
+        /// sidecar as the owner's claim during the gap, so the claim fails
+        /// closed even then.
+        #[test]
+        fn an_unlocked_pair_move_still_refuses_a_sole_agent_claim_in_its_gap() {
+            let (tmp, store) = old_pair_owned_by_a();
+            let workspace = tmp.path().to_path_buf();
+            let archive_dir = workspace.join("sessions").join("archive");
+            fs::create_dir_all(&archive_dir).unwrap();
+
+            let (mover, resume) = pause_between_renames({
+                let workspace = workspace.clone();
+                move || {
+                    move_jsonl_pair_to_archive(
+                        &transcript(&workspace),
+                        &sidecar(&workspace),
+                        &workspace.join("sessions").join("archive"),
+                        KEY,
+                        JSONL_SESSION_FILE_SUFFIX,
+                        JSONL_SESSION_METADATA_FILE_SUFFIX,
+                    )
+                }
+            });
+            let claim = store.claim_session_with_authority(KEY, "agent-b", &grant(true));
+            let history = store.try_load(KEY).unwrap();
+            resume.send(()).unwrap();
+            mover.join().unwrap().unwrap();
+
+            assert_eq!(
+                claim.unwrap(),
+                SessionOwnerClaim::Foreign(SessionOwnershipDenial::ForeignAgent("agent-a".into()))
+            );
+            assert!(
+                history.is_empty(),
+                "agent B could read the transcript in the gap: {history:?}"
+            );
+            assert_eq!(archived_owner(&workspace), "agent-a");
+            assert!(archived_history(&workspace).contains("agent A's private history"));
+        }
+    }
+
+    #[test]
+    fn keeps_a_recent_jsonl_pair_in_place() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+        let sessions_dir = workspace.join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+
+        let transcript_file = sessions_dir.join("recent.jsonl");
+        let metadata_file = sessions_dir.join("recent.metadata.json");
+        fs::write(
+            &transcript_file,
+            serde_json::to_string(&zeroclaw_api::model_provider::ChatMessage::user("hi")).unwrap(),
+        )
+        .unwrap();
+        fs::write(&metadata_file, r#"{"agent_alias":"agent_a"}"#).unwrap();
+        set_old_mtime(&transcript_file, 1);
+
+        assert_eq!(archive_session_files(workspace, 7).unwrap(), 0);
+        assert!(transcript_file.exists() && metadata_file.exists());
+        assert!(!sessions_dir.join("archive").join("recent.jsonl").exists());
+    }
+
+    #[test]
+    fn retains_legacy_metadata_only_claim_until_first_message() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+        let sessions_dir = workspace.join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+
+        let metadata_file = sessions_dir.join("delayed.metadata.json");
+        fs::write(&metadata_file, r#"{"agent_alias":"agent_a"}"#).unwrap();
+        set_old_mtime(&metadata_file, 10);
+
+        run_if_due(&default_cfg(), workspace).unwrap();
+
+        assert!(
+            metadata_file.exists(),
+            "a pre-message ownership claim must remain active"
+        );
+        assert!(
+            !sessions_dir
+                .join("archive")
+                .join("delayed.metadata.json")
+                .exists()
+        );
+
+        fs::write(
+            sessions_dir.join("delayed.jsonl"),
+            serde_json::to_string(&zeroclaw_api::model_provider::ChatMessage::user("first"))
+                .unwrap(),
+        )
+        .unwrap();
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(metadata_file).unwrap()).unwrap();
+        assert_eq!(metadata["agent_alias"], "agent_a");
+    }
+
+    #[test]
+    fn retains_materialized_empty_claim_until_first_message() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+        let sessions_dir = workspace.join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+
+        let transcript_file = sessions_dir.join("delayed.jsonl");
+        let metadata_file = sessions_dir.join("delayed.metadata.json");
+        fs::write(&transcript_file, "").unwrap();
+        fs::write(&metadata_file, r#"{"agent_alias":"agent_a"}"#).unwrap();
+        set_old_mtime(&transcript_file, 10);
+        set_old_mtime(&metadata_file, 10);
+
+        run_if_due(&default_cfg(), workspace).unwrap();
+
+        assert!(
+            transcript_file.exists(),
+            "an empty claimed transcript must remain active"
+        );
+        assert!(
+            metadata_file.exists(),
+            "ownership metadata must remain until the first message"
+        );
+        assert!(!sessions_dir.join("archive").join("delayed.jsonl").exists());
+        assert!(
+            !sessions_dir
+                .join("archive")
+                .join("delayed.metadata.json")
+                .exists()
+        );
+
+        fs::write(
+            transcript_file,
+            serde_json::to_string(&zeroclaw_api::model_provider::ChatMessage::user("first"))
+                .unwrap(),
+        )
+        .unwrap();
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(metadata_file).unwrap()).unwrap();
+        assert_eq!(metadata["agent_alias"], "agent_a");
     }
 
     #[test]
@@ -666,14 +1210,22 @@ mod tests {
         }
 
         let legacy_file = archive_dir.join("legacy_session.jsonl");
+        let metadata_file = archive_dir.join("legacy_session.metadata.json");
         fs::write(&legacy_file, "legacy session").unwrap();
+        fs::write(&metadata_file, r#"{"agent_alias":"agent_a"}"#).unwrap();
         set_old_mtime(&legacy_file, 40);
+        // Retention follows the transcript even if ownership changed later.
+        set_old_mtime(&metadata_file, 1);
 
         run_if_due(&default_cfg(), workspace).unwrap();
 
         assert!(
             !legacy_file.exists(),
             "old archived legacy session file should be purged"
+        );
+        assert!(
+            !metadata_file.exists(),
+            "archived ownership sidecar should be purged with its transcript"
         );
         for filename in protected {
             assert!(
