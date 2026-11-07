@@ -574,19 +574,19 @@ use zeroclaw_config::schema::{
     HuggingfaceModelProviderConfig, HunyuanModelProviderConfig, HyperbolicModelProviderConfig,
     InceptionModelProviderConfig, KiloCliModelProviderConfig, KiloModelProviderConfig,
     LambdaAiModelProviderConfig, LeptonModelProviderConfig, LitellmModelProviderConfig,
-    LlamacppModelProviderConfig, LmstudioModelProviderConfig, ManifestModelProviderConfig,
-    MinimaxModelProviderConfig, MistralModelProviderConfig, MoonshotEndpoint,
-    MoonshotModelProviderConfig, MorphModelProviderConfig, NearaiModelProviderConfig,
-    NebiusModelProviderConfig, NovitaModelProviderConfig, NscaleModelProviderConfig,
-    NvidiaModelProviderConfig, OllamaModelProviderConfig, OpenAIModelProviderConfig,
-    OpenRouterModelProviderConfig, OpencodeModelProviderConfig, OsaurusModelProviderConfig,
-    OvhModelProviderConfig, PerplexityModelProviderConfig, QianfanModelProviderConfig,
-    QwenModelProviderConfig, RekaModelProviderConfig, SambanovaModelProviderConfig,
-    SglangModelProviderConfig, SiliconflowModelProviderConfig, StepfunModelProviderConfig,
-    SyntheticModelProviderConfig, TelnyxModelProviderConfig, TogetherModelProviderConfig,
-    UpstageModelProviderConfig, VeniceModelProviderConfig, VercelModelProviderConfig,
-    VllmModelProviderConfig, XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
-    ZerorouterModelProviderConfig,
+    LlamacppModelProviderConfig, LlmtrModelProviderConfig, LmstudioModelProviderConfig,
+    ManifestModelProviderConfig, MinimaxModelProviderConfig, MistralModelProviderConfig,
+    MoonshotEndpoint, MoonshotModelProviderConfig, MorphModelProviderConfig,
+    NearaiModelProviderConfig, NebiusModelProviderConfig, NovitaModelProviderConfig,
+    NscaleModelProviderConfig, NvidiaModelProviderConfig, OllamaModelProviderConfig,
+    OpenAIModelProviderConfig, OpenRouterModelProviderConfig, OpencodeModelProviderConfig,
+    OsaurusModelProviderConfig, OvhModelProviderConfig, PerplexityModelProviderConfig,
+    QianfanModelProviderConfig, QwenModelProviderConfig, RekaModelProviderConfig,
+    SambanovaModelProviderConfig, SglangModelProviderConfig, SiliconflowModelProviderConfig,
+    StepfunModelProviderConfig, SyntheticModelProviderConfig, TelnyxModelProviderConfig,
+    TogetherModelProviderConfig, UpstageModelProviderConfig, VeniceModelProviderConfig,
+    VercelModelProviderConfig, VllmModelProviderConfig, XaiModelProviderConfig,
+    YiModelProviderConfig, ZaiModelProviderConfig, ZerorouterModelProviderConfig,
 };
 
 #[must_use]
@@ -667,6 +667,19 @@ impl CompatFamilySpec for ZerorouterModelProviderConfig {
     const DEFAULT_URL: &'static str = zeroclaw_config::schema::ZEROROUTER_DEFAULT_URL;
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const PUBLIC_MODEL_LISTING: bool = true;
+}
+impl CompatFamilySpec for LlmtrModelProviderConfig {
+    const DISPLAY: &'static str = "LLMTR";
+    const DEFAULT_URL: &'static str = zeroclaw_config::schema::LLMTR_DEFAULT_URL;
+    const AUTH: AuthStyle = AuthStyle::Bearer;
+    /// Public `GET /v1/models` returns `data[].id` plus `context_length`.
+    /// A successful listing is not an API-key check.
+    const PUBLIC_MODEL_LISTING: bool = true;
+    const SERVES_MODEL_CONTEXT_CATALOG: bool = true;
+    // Chat completions only. `wire_api` stays the trait default (`None`), so a
+    // stored `responses` value cannot select `POST /v1/responses`. Reasoning
+    // stays omitted: the gateway enables it server-side, and this profile does
+    // not send a `reasoning` object or force `reasoning_effort`.
 }
 impl CompatFamilySpec for SyntheticModelProviderConfig {
     const DISPLAY: &'static str = "Synthetic";
@@ -2659,6 +2672,265 @@ mod tests {
     }
 
     #[test]
+    fn llmtr_default_url_matches_schema_endpoint() {
+        use zeroclaw_config::schema::{
+            LLMTR_DEFAULT_URL, LLMTR_EXAMPLE_MODEL, LlmtrEndpoint, ModelEndpoint,
+        };
+        assert_eq!(
+            <LlmtrModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+            LlmtrEndpoint::default().uri(),
+            "schema LlmtrEndpoint and factory DEFAULT_URL disagree"
+        );
+        assert_eq!(LlmtrEndpoint::default().uri(), LLMTR_DEFAULT_URL);
+        assert_eq!(LLMTR_DEFAULT_URL, "https://llmtr.com/v1");
+        assert_eq!(LLMTR_EXAMPLE_MODEL, "minimax/minimax-m3.1-flash");
+        assert!(
+            !LlmtrModelProviderConfig::default()
+                .fallback_auth_ready(None, &ModelProviderRuntimeOptions::default()),
+            "a public model list must not count as a configured API key"
+        );
+        assert!(LlmtrModelProviderConfig::default().fallback_auth_ready(
+            Some("llmtr-test-key"),
+            &ModelProviderRuntimeOptions::default(),
+        ));
+    }
+
+    #[tokio::test]
+    async fn llmtr_chat_route_keeps_model_ids_and_omits_reasoning() {
+        use axum::body::Bytes;
+        use axum::extract::State;
+        use axum::http::{HeaderMap, Method, StatusCode, Uri};
+        use axum::{Json, Router};
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::LLMTR_EXAMPLE_MODEL;
+
+        #[derive(Clone)]
+        struct AppState {
+            hits: Arc<Mutex<Vec<Hit>>>,
+        }
+
+        #[derive(Clone, Debug)]
+        struct Hit {
+            method: String,
+            path: String,
+            auth: Option<String>,
+            body: Option<serde_json::Value>,
+        }
+
+        async fn llmtr_fixture(
+            State(state): State<AppState>,
+            method: Method,
+            uri: Uri,
+            headers: HeaderMap,
+            body: Bytes,
+        ) -> (StatusCode, Json<serde_json::Value>) {
+            let auth = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let parsed = serde_json::from_slice::<serde_json::Value>(&body).ok();
+            state.hits.lock().expect("hit lock").push(Hit {
+                method: method.to_string(),
+                path: uri.path().to_string(),
+                auth,
+                body: parsed,
+            });
+            let catalog = serde_json::json!({
+                "object": "list",
+                "data": [
+                    {
+                        "id": "minimax/minimax-m3.1-flash",
+                        "object": "model",
+                        "context_length": 1_000_000,
+                        "pricing": {
+                            "prompt": "0.00000015",
+                            "completion": "0.0000006",
+                            "input_cache_read": "0.000000015"
+                        },
+                        "top_provider": {
+                            "context_length": 1_000_000,
+                            "max_completion_tokens": 524288
+                        },
+                        "supported_endpoints": ["/v1/chat/completions"],
+                        "supported_operations": ["CHAT_COMPLETIONS"]
+                    },
+                    {
+                        "id": "llmtr/namespace/kept-intact",
+                        "object": "model"
+                    }
+                ]
+            });
+            match (method.as_str(), uri.path()) {
+                ("GET", "/v1/models") => (StatusCode::OK, Json(catalog)),
+                ("POST", "/v1/chat/completions") => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "ok"}
+                        }]
+                    })),
+                ),
+                _ => (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": "unexpected llmtr route"})),
+                ),
+            }
+        }
+
+        let hits = Arc::new(Mutex::new(Vec::<Hit>::new()));
+        let app = Router::new().fallback(llmtr_fixture).with_state(AppState {
+            hits: Arc::clone(&hits),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind llmtr fixture");
+        let addr = listener.local_addr().expect("llmtr fixture address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve llmtr fixture");
+        });
+        let base = format!("http://{addr}/v1");
+
+        let catalog_provider = LlmtrModelProviderConfig::default()
+            .create_provider(
+                "home",
+                None,
+                Some(&base),
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .expect("keyless llmtr catalog client");
+        assert_eq!(
+            catalog_provider.default_base_url(),
+            Some(zeroclaw_config::schema::LLMTR_DEFAULT_URL)
+        );
+        assert_eq!(catalog_provider.default_wire_api(), "chat_completions");
+        assert_eq!(
+            catalog_provider
+                .list_models()
+                .await
+                .expect("public model ids"),
+            vec![
+                "llmtr/namespace/kept-intact".to_string(),
+                "minimax/minimax-m3.1-flash".to_string(),
+            ]
+        );
+        let priced = catalog_provider
+            .list_models_with_pricing()
+            .await
+            .expect("public model pricing");
+        let minimax = priced
+            .iter()
+            .find(|model| model.id == "minimax/minimax-m3.1-flash")
+            .expect("example model id preserved");
+        let pricing = minimax
+            .pricing
+            .as_ref()
+            .expect("catalog pricing is parsed, not invented");
+        assert_eq!(pricing.prompt.as_deref(), Some("0.00000015"));
+        assert_eq!(pricing.completion.as_deref(), Some("0.0000006"));
+        assert_eq!(pricing.input_cache_read.as_deref(), Some("0.000000015"));
+
+        let window = crate::fetch_context_window(
+            "llmtr",
+            &ModelProviderConfig {
+                model: Some(LLMTR_EXAMPLE_MODEL.to_string()),
+                uri: Some(base.clone()),
+                ..ModelProviderConfig::default()
+            },
+        )
+        .await;
+        assert_eq!(window, Some(1_000_000));
+
+        let chat = LlmtrModelProviderConfig {
+            base: ModelProviderConfig {
+                wire_api: Some(WireApi::Responses),
+                ..ModelProviderConfig::default()
+            },
+        }
+        .create_provider(
+            "home",
+            Some("llmtr-test-key"),
+            Some(&base),
+            &ModelProviderRuntimeOptions {
+                provider_max_tokens: Some(64),
+                wire_api: Some("responses".into()),
+                reasoning_effort: Some("high".into()),
+                ..ModelProviderRuntimeOptions::default()
+            },
+        )
+        .expect("llmtr chat provider");
+        assert_eq!(
+            chat.default_wire_api(),
+            "chat_completions",
+            "llmtr must not follow an automatic Responses route"
+        );
+        for model in [LLMTR_EXAMPLE_MODEL, "llmtr/namespace/kept-intact"] {
+            let text = chat
+                .simple_chat("ping", model, None)
+                .await
+                .expect("one chat completion");
+            assert_eq!(text, "ok");
+        }
+
+        let seen = hits.lock().expect("hit lock").clone();
+        assert!(
+            seen.iter().all(|hit| !hit.path.contains("responses")),
+            "llmtr fixture saw a Responses route: {seen:?}"
+        );
+        let listings: Vec<_> = seen
+            .iter()
+            .filter(|hit| hit.method == "GET" && hit.path == "/v1/models")
+            .collect();
+        assert!(
+            listings.len() >= 3,
+            "expected public catalog and context-window reads, saw {seen:?}"
+        );
+        assert!(
+            listings.iter().all(|hit| hit.auth.is_none()),
+            "keyless GET /models must not send Authorization: {listings:?}"
+        );
+        let chats: Vec<_> = seen
+            .iter()
+            .filter(|hit| hit.method == "POST" && hit.path == "/v1/chat/completions")
+            .collect();
+        assert_eq!(chats.len(), 2, "expected two chat posts, saw {seen:?}");
+        let mut models = Vec::new();
+        for hit in chats {
+            assert_eq!(hit.auth.as_deref(), Some("Bearer llmtr-test-key"));
+            let body = hit.body.as_ref().expect("chat body");
+            let model = body
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .expect("model field")
+                .to_string();
+            models.push(model);
+            assert_eq!(
+                body.get("max_tokens").and_then(serde_json::Value::as_u64),
+                Some(64)
+            );
+            assert_ne!(
+                body.get("max_tokens").and_then(serde_json::Value::as_u64),
+                Some(524288)
+            );
+            assert!(body.get("reasoning").is_none(), "{body}");
+            assert!(body.get("reasoning_effort").is_none(), "{body}");
+            assert!(body.get("thinking").is_none(), "{body}");
+            assert!(body.get("tools").is_none(), "{body}");
+        }
+        models.sort();
+        assert_eq!(
+            models,
+            vec![
+                "llmtr/namespace/kept-intact".to_string(),
+                "minimax/minimax-m3.1-flash".to_string(),
+            ]
+        );
+
+        server.abort();
+    }
+
+    #[test]
     fn openai_factory_routes_to_codex_when_requires_openai_auth_true() {
         let cfg = OpenAIModelProviderConfig {
             base: ModelProviderConfig {
@@ -3532,7 +3804,7 @@ mod tests {
     /// the bar is evidence that `GET {base}/models` really returns
     /// `data[].id` with a per-model `context_length`, not that the family
     /// speaks the OpenAI-compatible chat wire.
-    const PROBEABLE_FAMILIES: [&str; 9] = [
+    const PROBEABLE_FAMILIES: [&str; 10] = [
         "together",
         "groq",
         "fireworks",
@@ -3542,6 +3814,7 @@ mod tests {
         "novita",
         "nebius",
         "crusoe",
+        "llmtr",
     ];
 
     /// The families the hand-written probe list in `fetch_context_window` used
