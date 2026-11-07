@@ -580,9 +580,10 @@ async fn main() -> Result<()> {
              of {} allowlisted daemon(s) at https://<label>.{}/ and ENDS THOSE BROWSERS' TLS: \
              it forwards their dashboard traffic to the daemon in plaintext over the daemon's \
              relay link. Anyone who can modify this relay can read and change that traffic, \
-             including session cookies and any token a page shows, and act as a signed-in \
-             user. The blind-forwarder guarantee still holds for the RPC plane and for \
-             zerocode/native clients. Disable [dashboard] to withdraw that trust.",
+             including session cookies, and act as a signed-in user, with an \
+             administrator's session as an administrator. The blind-forwarder guarantee \
+             still holds for the RPC plane and for zerocode/native clients. Disable \
+             [dashboard] to withdraw that trust.",
             dashboard.allow.len(),
             dashboard.domain
         );

@@ -7649,10 +7649,11 @@ fn relay_dashboard_bridge(
         ),
         "relay dashboard: serving the dashboard through the relay. This route is NOT \
          end-to-end: the relay ends the browser's TLS, so its operator can read and change \
-         this dashboard's traffic, including session cookies and any token a page shows, and \
-         act as a signed-in user. Native clients through the relay stay end-to-end. Register \
-         redirect_uri exactly with the identity provider, and list this daemon in the relay's \
-         [dashboard] allow."
+         this dashboard's traffic, including session cookies, and act as a signed-in user, \
+         with an administrator's session as an administrator. Administer this daemon over a \
+         direct connection or zerocode. Native clients through the relay stay end-to-end. \
+         Register redirect_uri exactly with the identity provider, and list this daemon in \
+         the relay's [dashboard] allow."
     );
     Ok(Some(zeroclaw_runtime::relay::DashboardBridge {
         ingress,

@@ -8511,10 +8511,11 @@ pub struct RelayConfig {
 /// TRUST: unlike every other relay route, this one is NOT end-to-end. The
 /// relay ends the browser's TLS, so its operator can read and change the
 /// dashboard traffic of everyone who uses this address - pages, session
-/// cookies, CSRF tokens and any token a page shows - and act as a signed-in
-/// user for that session. Native clients through the same relay stay
-/// end-to-end encrypted. Use zerocode, or a direct HTTPS connection, when the
-/// relay must not be trusted.
+/// cookies and CSRF tokens - and act as a signed-in user for that session,
+/// with an administrator's session as an administrator. Native clients
+/// through the same relay stay end-to-end encrypted. Use zerocode, or a
+/// direct HTTPS connection, when the relay must not be trusted, and to
+/// administer the daemon.
 ///
 /// The gateway serves these connections as the browser's, never as a local
 /// peer, and builds every URL it hands them from this origin. It refuses

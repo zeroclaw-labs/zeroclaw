@@ -117,7 +117,8 @@ connect_rate_per_node = 20.0
 # the relay ends those browsers' TLS and forwards their dashboard traffic to
 # the daemon in plaintext over the daemon's relay link. Anyone who can modify
 # this relay can read and change that traffic - pages, session cookies, CSRF
-# tokens, any token a page shows - and act as a signed-in user. Browsers still
+# tokens - and act as a signed-in user, with an administrator's session as an
+# administrator, including changes that outlast the session. Browsers still
 # sign in to the identity provider directly; the daemon serves these
 # connections as the remote browser they are, routes them only to its own
 # dashboard, and never to a local port.
