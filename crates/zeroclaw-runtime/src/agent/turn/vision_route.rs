@@ -2010,6 +2010,7 @@ model = "vision-model"
             "primary-model",
             "primary-model",
             None,
+            None,
         )
         .await
         .expect("a text-only follow-up must not fail the turn");
@@ -2091,6 +2092,7 @@ model = "vision-model"
             "primary",
             "primary-model",
             "primary-model",
+            None,
             None,
         )
         .await
