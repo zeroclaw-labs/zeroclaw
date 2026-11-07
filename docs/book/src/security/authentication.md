@@ -476,10 +476,22 @@ the shared resolver's grants at prompt admission.
 
 That composition does not cover every route to an agent's tools. Cron jobs
 and SOP authoring check only the agent selector. A constrained principal
-holding cron grants can create a shell job for its agent, though agent jobs
-are refused to it as described above, and one holding SOP create or update
+holding cron grants can create or edit a shell job for its agent with RPC
+`cron/add` and `cron/patch`. The command meets the agent's approval policy
+there, as it does from the CLI and the dashboard, so under supervised
+autonomy a command that needs approval is refused rather than stored. Agent
+jobs are refused to it as described above. One holding SOP create or update
 grants can save a procedure whose trigger runs it later. Treat cron and SOP
 authoring grants as grants of the agent's tools.
+
+These checks run again when the job is written, not only when the request
+arrives. A grant withdrawn, or a paired device revoked, while a cron write
+waits for the database either stops that write or waits for it to finish.
+
+A tool called from a `pipeline` step or through a skill alias never inherits
+an approval. The runtime approves only the call it dispatched, so under
+supervised autonomy a command that needs approval is refused there; call the
+tool directly to be asked.
 
 Principal-owned sessions may use synchronous and parallel delegation when
 their grants allow it. Background delegation and its `check_result`,
