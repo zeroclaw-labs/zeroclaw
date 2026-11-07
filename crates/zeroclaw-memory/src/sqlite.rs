@@ -25,6 +25,12 @@ use zeroclaw_config::schema::SearchMode;
 const SQLITE_OPEN_TIMEOUT_CAP_SECS: u64 = 300;
 static SQLITE_MEMORY_STARTUP_LOCK: StdMutex<()> = StdMutex::new(());
 
+#[derive(Default)]
+struct RecallOptions {
+    allowed_agent_ids: Vec<String>,
+    cosine_only: bool,
+}
+
 fn acquire_sqlite_startup_lock() -> MutexGuard<'static, ()> {
     SQLITE_MEMORY_STARTUP_LOCK
         .lock()
@@ -1054,9 +1060,15 @@ impl SqliteMemory {
         session_id: Option<&str>,
         since: Option<&str>,
         until: Option<&str>,
-        allowed_agent_ids: Option<Vec<String>>,
+        options: RecallOptions,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
-        let allowed_agent_ids = allowed_agent_ids.unwrap_or_default();
+        let RecallOptions {
+            allowed_agent_ids,
+            cosine_only,
+        } = options;
+        if cosine_only && (limit == 0 || is_recent_recall_query(query)) {
+            return Ok(Vec::new());
+        }
         // Time-only query: list by time range when no keywords.
         // Treat only a bare "*" as the same recent-entry request; keep
         // real wildcard searches such as "wild*" on the keyword path.
@@ -1118,7 +1130,7 @@ impl SqliteMemory {
             let vector_live = query_embedding.is_some();
 
             // FTS5 BM25 keyword search (skip for embedding-only mode)
-            let keyword_results = if search_mode == SearchMode::Embedding {
+            let keyword_results = if cosine_only || search_mode == SearchMode::Embedding {
                 Vec::new()
             } else if let Some(agent_filter) = agent_filter {
                 if vector_live {
@@ -1156,7 +1168,19 @@ impl SqliteMemory {
             };
 
             // Merge results based on search mode
-            let merged = if vector_results.is_empty() {
+            let merged = if cosine_only || keyword_results.is_empty() {
+                // Only raw vector evidence can authorize supersession. In
+                // particular, an empty vector result must not fall back to FTS.
+                vector_results
+                    .iter()
+                    .map(|(id, score)| vector::ScoredResult {
+                        id: id.clone(),
+                        vector_score: Some(*score),
+                        keyword_score: None,
+                        final_score: *score,
+                    })
+                    .collect::<Vec<_>>()
+            } else if vector_results.is_empty() {
                 // FTS-only survivors: map raw BM25 onto the [0, 1] axis
                 // (matching hybrid_merge's internal keyword normalization) so
                 // downstream relevance thresholding and the injection rerank
@@ -1170,16 +1194,6 @@ impl SqliteMemory {
                         vector_score: None,
                         keyword_score: Some(score),
                         final_score: score,
-                    })
-                    .collect::<Vec<_>>()
-            } else if keyword_results.is_empty() {
-                vector_results
-                    .iter()
-                    .map(|(id, score)| vector::ScoredResult {
-                        id: id.clone(),
-                        vector_score: Some(*score),
-                        keyword_score: None,
-                        final_score: *score,
                     })
                     .collect::<Vec<_>>()
             } else {
@@ -1322,7 +1336,7 @@ impl SqliteMemory {
             }
 
             // If hybrid returned nothing, fall back to LIKE search.
-            if results.is_empty() {
+            if results.is_empty() && !cosine_only {
                 const MAX_LIKE_KEYWORDS: usize = 8;
                 let raw_keywords: Vec<String> = query
                     .split_whitespace()
@@ -1664,8 +1678,34 @@ impl Memory for SqliteMemory {
         since: Option<&str>,
         until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
-        self.recall_scoped(query, limit, session_id, since, until, None)
-            .await
+        self.recall_scoped(
+            query,
+            limit,
+            session_id,
+            since,
+            until,
+            RecallOptions::default(),
+        )
+        .await
+    }
+
+    async fn recall_for_supersession(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.recall_scoped(
+            query,
+            limit,
+            None,
+            None,
+            None,
+            RecallOptions {
+                cosine_only: true,
+                ..RecallOptions::default()
+            },
+        )
+        .await
     }
 
     async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
@@ -2776,8 +2816,18 @@ impl Memory for SqliteMemory {
         }
 
         let allowed: Vec<String> = allowed_agent_ids.iter().map(|s| (*s).to_string()).collect();
-        self.recall_scoped(query, limit, session_id, since, until, Some(allowed))
-            .await
+        self.recall_scoped(
+            query,
+            limit,
+            session_id,
+            since,
+            until,
+            RecallOptions {
+                allowed_agent_ids: allowed,
+                ..RecallOptions::default()
+            },
+        )
+        .await
     }
 
     async fn ensure_agent_uuid(&self, alias: &str) -> anyhow::Result<String> {

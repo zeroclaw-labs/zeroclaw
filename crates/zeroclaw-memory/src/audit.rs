@@ -470,6 +470,21 @@ impl<M: Memory> Memory for AuditedMemory<M> {
         self.inner.health_check().await
     }
 
+    async fn recall_for_supersession(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.log_audit(
+            AuditOp::Recall,
+            None,
+            None,
+            None,
+            Some(&format!("supersession query={query}")),
+        );
+        self.inner.recall_for_supersession(query, limit).await
+    }
+
     async fn supersede(&self, superseded_ids: &[String], new_id: &str) -> anyhow::Result<()> {
         self.inner.supersede(superseded_ids, new_id).await
     }
