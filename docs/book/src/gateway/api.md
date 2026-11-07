@@ -23,6 +23,41 @@ Local-bound by default. Over-the-network access requires TLS termination at
 the gateway or in front of it; the per-property and PATCH endpoints are not
 safe to expose unauthenticated regardless of TLS posture.
 
+## Generic webhook request timeout
+
+`POST /webhook` without SSE streaming waits for the agent's final JSON answer.
+It uses `gateway.long_running_request_timeout_secs` (default 600 seconds), the
+same request budget as manual cron runs and A2A tasks. Ordinary gateway routes
+use `gateway.request_timeout_secs` (default 30 seconds).
+
+The longer deadline covers the entire `/webhook` request until response creation,
+including body extraction and the SOP-first and SSE branches. It does not set a
+total lifetime for the SSE response body or change cancellation on disconnect.
+Separate channel, plugin and `/sop/*` webhook admission routes retain their own
+timeout behavior. Authentication, rate limits, body limits and idempotency are
+unchanged.
+
+Previously, `/webhook` used the ordinary request timeout. Existing deployments
+that relied on that deadline must set the long-running timeout accordingly;
+that setting also affects manual cron and A2A task routes. Timeout middleware is
+configured when the gateway starts, so apply timeout changes through daemon
+reload or standalone gateway restart.
+
+Longer deadlines allow connections, including incomplete request bodies, to
+remain open longer. Client and reverse-proxy timeouts are independent and may
+expire first. A timeout does not prove that external tool effects were rolled
+back, and an idempotency reservation does not retrieve a completed answer.
+
+The duplicate-marker lifetime is independently controlled by
+`gateway.idempotency_ttl_secs` (default 300 seconds). It is not extended while
+an agent turn is active. Consequently, the default 600-second request budget
+can outlast its duplicate marker: retrying the same key after expiry can start
+another turn while the original is still running. Choose a marker lifetime
+covering the expected request and retry window, and avoid automatic retries
+of actions with uncertain outcomes. Markers are also bounded and held in
+memory, so this configuration does not guarantee exactly-once processing or
+survival across restarts. Rate limits do not cap concurrent turns.
+
 ## Channel-plugin webhook ingress
 
 Builds with WASM plugin support expose `GET` and `POST /plugin/{path}` when a running,
