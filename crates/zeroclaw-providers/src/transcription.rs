@@ -1469,7 +1469,7 @@ fn bind_provider(manager: TranscriptionManager, agent_provider: &str) -> Transcr
 ///
 /// Registers every configured provider — legacy `[transcription]` and typed
 /// `[providers.transcription.<type>.<alias>]` alike — and binds the provider
-/// per [`bind_provider`]. Built from `Config` rather than a
+/// per `bind_provider`. Built from `Config` rather than a
 /// `TranscriptionConfig` snapshot so typed providers are visible and
 /// reloadable provider policy is never copied into a channel handle.
 ///

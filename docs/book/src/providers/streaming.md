@@ -81,14 +81,20 @@ OpenAI-compatible streams finish on `[DONE]`, OpenAI Responses streams finish
 on their terminal response event, and Anthropic streams finish on
 `message_stop`. Servers may keep the HTTP connection open after those events.
 
-Streaming clients use byte-idle timeouts: 300 seconds for OpenAI Responses and
-OpenAI-compatible providers, and 90 seconds for Anthropic. On OpenAI Responses
-and OpenAI-compatible providers, setting `timeout_secs` above 300 on the
-provider raises the idle bound to match; the bound is never lowered below the
-default. Each received body read resets the relevant timeout, so active
-generations are not constrained by the whole-request timeout used for
-non-streaming calls. Connection setup, response headers, and buffered error
-bodies remain bounded.
+Canonical chat models configure two independent deadlines in `api.chat` or
+their model's `api` override. A finite `request_timeout_secs` covers the whole
+HTTP request, including an active stream; `"null"` removes that total deadline.
+Without a total deadline in either API defaults or model overrides, streaming
+has no total deadline and non-streaming keeps its driver's default request
+deadline.
+
+`read_timeout_secs` bounds silence between HTTP body reads, including heartbeat
+traffic. Its streaming baseline is 300 seconds for OpenAI Responses,
+OpenAI-compatible providers and OpenRouter, and 90 seconds for Anthropic.
+`"null"` disables read-idle protection independently of the total deadline.
+Canonical models do not derive one deadline from the other. Legacy profiles
+retained during migration may still derive the idle bound from `timeout_secs`.
+Connection setup retains its separate transport guard.
 
 ## Non-streaming providers
 

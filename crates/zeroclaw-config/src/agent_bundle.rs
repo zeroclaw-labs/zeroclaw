@@ -1310,28 +1310,34 @@ fn carry_model_provider(
     // Canonical model keys are opaque TOML keys; do not split dotted names.
     let canonical = crate::provider_registry::ModelRef::from(trimmed);
     if let Some(model) = config.providers.models.canonical_model(&canonical) {
-        if carried.insert(trimmed.to_string()) {
-            carry(
-                out,
-                masked_root,
-                &["providers", "models", trimmed],
-                &toml::Table::new(),
-            );
-            carry(
-                out,
-                masked_root,
-                &["providers", "connections", model.provider().as_str()],
-                &toml::Table::new(),
-            );
-            let model_preset = match model {
-                crate::provider_registry::ModelDefinition::Chat(model) => model.preset.as_ref(),
-                crate::provider_registry::ModelDefinition::Tts(model) => model.preset.as_ref(),
-                crate::provider_registry::ModelDefinition::Asr(model) => model.preset.as_ref(),
-                crate::provider_registry::ModelDefinition::Embedding(_)
-                | crate::provider_registry::ModelDefinition::Decision(_) => None,
-            };
-            let connection_preset = config.providers.connections.get(model.provider()).and_then(
-                |connection| match model {
+        if !carried.insert(trimmed.to_string()) {
+            return;
+        }
+        carry(
+            out,
+            masked_root,
+            &["providers", "models", trimmed],
+            &toml::Table::new(),
+        );
+        carry(
+            out,
+            masked_root,
+            &["providers", "connections", model.provider().as_str()],
+            &toml::Table::new(),
+        );
+        let model_preset = match model {
+            crate::provider_registry::ModelDefinition::Chat(model) => model.preset.as_ref(),
+            crate::provider_registry::ModelDefinition::Tts(model) => model.preset.as_ref(),
+            crate::provider_registry::ModelDefinition::Asr(model) => model.preset.as_ref(),
+            crate::provider_registry::ModelDefinition::Embedding(_)
+            | crate::provider_registry::ModelDefinition::Decision(_) => None,
+        };
+        let connection_preset =
+            config
+                .providers
+                .connections
+                .get(model.provider())
+                .and_then(|connection| match model {
                     crate::provider_registry::ModelDefinition::Chat(_) => {
                         connection.chat_defaults().and_then(|(preset, _)| preset)
                     }
@@ -1343,16 +1349,14 @@ fn carry_model_provider(
                     }
                     crate::provider_registry::ModelDefinition::Embedding(_)
                     | crate::provider_registry::ModelDefinition::Decision(_) => None,
-                },
+                });
+        for preset in [model_preset, connection_preset].into_iter().flatten() {
+            carry(
+                out,
+                masked_root,
+                &["providers", "model_presets", preset.as_str()],
+                &toml::Table::new(),
             );
-            for preset in [model_preset, connection_preset].into_iter().flatten() {
-                carry(
-                    out,
-                    masked_root,
-                    &["providers", "model_presets", preset.as_str()],
-                    &toml::Table::new(),
-                );
-            }
         }
         // Fallback edges are part of the model's admitted closure. Carry the
         // exact TOML key as one table entry; dotted model names are opaque and
@@ -1815,6 +1819,66 @@ mod tests {
     use crate::autonomy::{AutonomyLevel, DelegationMode};
     use crate::multi_agent::AgentWorkspaceConfig;
     use std::collections::HashMap;
+
+    #[test]
+    fn canonical_export_visits_shared_fallbacks_once_and_carries_api_presets() {
+        let mut source = String::from(
+            r#"
+[connections."shared.prod"]
+kind = "custom"
+capabilities = ["chat", "tts", "asr"]
+api.chat = { preset = "chat.defaults" }
+api.tts = { preset = "tts.defaults" }
+api.asr = { preset = "asr.defaults" }
+[model_presets."chat.defaults"]
+capability = "chat"
+[model_presets."tts.defaults"]
+capability = "tts"
+[model_presets."asr.defaults"]
+capability = "asr"
+[models."speech.tts"]
+capability = "tts"
+provider = "shared.prod"
+model = "speech-model"
+[models."speech.asr"]
+capability = "asr"
+provider = "shared.prod"
+model = "asr-model"
+"#,
+        );
+        for index in 0..30 {
+            source.push_str(&format!(
+                "\n[models.\"chat.{index}\"]\ncapability = \"chat\"\nprovider = \"shared.prod\"\nmodel = \"model-{index}\"\n"
+            ));
+        }
+        source.push_str("\n[fallback]\n");
+        for index in 0..28 {
+            source.push_str(&format!(
+                "\"chat.{index}\" = [\"chat.{}\", \"chat.{}\"]\n",
+                index + 1,
+                index + 2
+            ));
+        }
+        let config = Config {
+            providers: toml::from_str(&source).unwrap(),
+            ..Config::default()
+        };
+        let masked = toml::Value::try_from(&config).unwrap();
+        let mut output = toml::Table::new();
+        carry_model_provider_closure(
+            &mut output,
+            masked.as_table().unwrap(),
+            &config,
+            &["chat.0", "speech.tts", "speech.asr"],
+            &mut Vec::new(),
+        );
+        let providers = output["providers"].as_table().unwrap();
+        assert_eq!(providers["models"].as_table().unwrap().len(), 32);
+        assert_eq!(providers["fallback"].as_table().unwrap().len(), 28);
+        assert_eq!(providers["connections"].as_table().unwrap().len(), 1);
+        assert_eq!(providers["model_presets"].as_table().unwrap().len(), 3);
+        assert!(providers["models"].get("chat.29").is_some());
+    }
 
     /// Config with one agent wired to a risk profile, an MCP bundle granting
     /// two of three servers, and an Anthropic model provider carrying a key.

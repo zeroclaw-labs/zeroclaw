@@ -9218,7 +9218,22 @@ mod tests {
                     .collect(),
             );
             let workspace = tempdir().unwrap();
-            let mut config = zeroclaw_config::schema::Config::default();
+            let mut config = zeroclaw_config::schema::Config {
+                providers: toml::from_str(
+                    r#"
+[connections.fixture]
+kind = "custom"
+capabilities = ["chat"]
+[models.mock-provider]
+capability = "chat"
+provider = "fixture"
+model = "mock-model"
+options = { extract_text_tool_calls = true }
+"#,
+                )
+                .unwrap(),
+                ..Default::default()
+            };
             config.runtime_profiles.insert(
                 "scoped".to_string(),
                 zeroclaw_config::schema::RuntimeProfileConfig {
@@ -13925,6 +13940,23 @@ This is an example, not an invocation."#;
         let observer = NoopObserver;
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
 
+        let config = zeroclaw_config::schema::Config {
+            providers: toml::from_str(
+                r#"
+[connections.fixture]
+kind = "custom"
+capabilities = ["chat"]
+[models.mock-provider]
+capability = "chat"
+provider = "fixture"
+model = "mock-model"
+options = { extract_text_reasoning = true }
+"#,
+            )
+            .unwrap(),
+            ..Default::default()
+        };
+
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
             served_route_sink: None,
@@ -13943,7 +13975,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
-                config: None,
+                config: Some(&config),
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -15954,16 +15986,16 @@ This is an example, not an invocation."#;
                 None, // turn_id: self-minted
             )
             .await
-            .expect("strict wrapper path should preserve fallback-looking text");
+            .expect("disabled extraction should preserve tool-like text");
 
             assert_eq!(invocations.load(Ordering::SeqCst), 0);
             assert!(
                 result.contains("<tool_call>"),
-                "strict parser should return fallback-looking text, got: {result}"
+                "disabled extraction should return tool-like text, got: {result}"
             );
             assert!(
-                !result.contains("private reasoning"),
-                "strict parser should still strip think tags from final text, got: {result}"
+                result.contains("<think>private reasoning</think>"),
+                "an unconfigured wrapper must preserve reasoning syntax, got: {result}"
             );
         });
     }

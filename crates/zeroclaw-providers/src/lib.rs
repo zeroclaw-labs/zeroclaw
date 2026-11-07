@@ -707,7 +707,7 @@ pub struct ModelProviderRuntimeOptions {
     /// HTTP request timeout in seconds for LLM model_provider API calls.
     /// `None` uses the model_provider's built-in default (120s for compatible model_providers).
     pub provider_timeout_secs: Option<u64>,
-    /// Explicitly disable the compatible adapter's total request timeout.
+    /// Explicitly disable the adapter's total request timeout.
     pub provider_timeout_disabled: bool,
     /// Optional per-read idle timeout for streaming and HTTP response bodies.
     /// `None` keeps the adapter's existing idle policy unless disabled below.
@@ -850,7 +850,9 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         reasoning_enabled: config.runtime.reasoning_enabled,
         reasoning_effort: config.runtime.reasoning_effort.clone(),
         reasoning_effort_passthrough: entry.is_some_and(|e| e.reasoning_effort_passthrough),
-        provider_timeout_secs: Some(entry.and_then(|e| e.timeout_secs).unwrap_or(120)),
+        // Preserve absence: each driver owns its baseline, and streaming
+        // distinguishes an inherited default from an explicit total deadline.
+        provider_timeout_secs: entry.and_then(|e| e.timeout_secs),
         provider_timeout_disabled: false,
         provider_read_timeout_secs: None,
         provider_read_timeout_disabled: false,

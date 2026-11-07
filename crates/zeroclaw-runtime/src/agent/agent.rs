@@ -7636,6 +7636,31 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
     }
 
     #[tokio::test]
+    async fn injected_agent_preserves_reasoning_syntax_without_a_model_policy() {
+        for streamed in [false, true] {
+            let text = "<think>literal content</think>";
+            let mut agent = blank_input_agent(Box::new(MockModelProvider {
+                responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                    text: Some(text.into()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                }]),
+            }));
+            let result = if streamed {
+                let (tx, _rx) = tokio::sync::mpsc::channel(16);
+                agent
+                    .turn_streamed("return literal syntax", tx, None)
+                    .await
+                    .map(|(text, _)| text)
+            } else {
+                agent.turn("return literal syntax").await
+            };
+            assert_eq!(result.unwrap(), text, "streamed={streamed}");
+        }
+    }
+
+    #[tokio::test]
     async fn turn_rejects_blank_input() {
         let model_provider = Box::new(MockModelProvider {
             responses: Mutex::new(Vec::new()),
@@ -11863,7 +11888,22 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
             agent.model_name.clone(),
         ));
         agent.config.resolved.max_tool_iterations = 3;
-        let mut config = Config::default();
+        let mut config = Config {
+            providers: toml::from_str(
+                r#"
+[connections.rounds]
+kind = "custom"
+capabilities = ["chat"]
+[models."custom.rounds"]
+capability = "chat"
+provider = "rounds"
+model = "round-model"
+options = { extract_text_tool_calls = true }
+"#,
+            )
+            .unwrap(),
+            ..Default::default()
+        };
         config.agents.insert(
             "round-agent".into(),
             zeroclaw_config::schema::AliasedAgentConfig {

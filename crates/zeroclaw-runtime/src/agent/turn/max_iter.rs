@@ -393,9 +393,7 @@ pub(crate) async fn finish_after_max_iterations(
                         config.model_text_extraction(model).reasoning
                     })
                 }
-                // Keep the legacy config-free injected-agent behavior for
-                // graceful summaries as well as ordinary turn calls.
-                None => std::sync::Arc::new(|_: &str| true),
+                None => std::sync::Arc::new(|_: &str| false),
             };
             zeroclaw_api::scope_text_extraction(
                 Some(resolver),
@@ -514,13 +512,10 @@ pub(crate) async fn finish_after_max_iterations(
         .rev()
         .find(|attempt| attempt.accepted)
         .map_or(provider_name, |attempt| attempt.provider_ref.as_str());
-    let extraction: zeroclaw_config::provider_registry::TextExtraction = config.map_or_else(
-        || zeroclaw_config::provider_registry::TextExtraction {
-            reasoning: true,
-            ..Default::default()
-        },
-        |config| config.model_text_extraction(served_ref),
-    );
+    let extraction: zeroclaw_config::provider_registry::TextExtraction = config
+        .map_or_else(Default::default, |config| {
+            config.model_text_extraction(served_ref)
+        });
     let display_text = if extraction.reasoning {
         strip_think_tags(&raw_text)
     } else {
@@ -843,6 +838,22 @@ mod graceful_summary_metering_tests {
         let pacing = PacingConfig::default();
         let knobs = LoopKnobs::default(); // GracefulSummary
         let multimodal_config = MultimodalConfig::default();
+        let config = zeroclaw_config::schema::Config {
+            providers: toml::from_str(
+                r#"
+[connections.fixture]
+kind = "custom"
+capabilities = ["chat"]
+[models.custom]
+capability = "chat"
+provider = "fixture"
+model = "test-model"
+options = { extract_text_reasoning = true, extract_text_tool_calls = true }
+"#,
+            )
+            .unwrap(),
+            ..Default::default()
+        };
         finish_after_max_iterations(
             &mut None,
             provider,
@@ -861,7 +872,7 @@ mod graceful_summary_metering_tests {
             event_tx,
             on_delta,
             None,
-            None,
+            Some(&config),
             &multimodal_config,
             None,
             None,

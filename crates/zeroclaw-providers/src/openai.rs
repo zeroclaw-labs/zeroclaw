@@ -76,15 +76,10 @@ impl ResponseMessage {
     }
 }
 
-/// String-only completions have no native tool-call escape hatch. An empty or
-/// reasoning-only result is therefore a typed terminal failure, not a valid
-/// string result for direct callers that do not use the structured chat API.
-fn require_terminal_text(content: String, model: &str) -> anyhow::Result<String> {
-    let content = if zeroclaw_api::text_extraction_reasoning_for(model) {
-        zeroclaw_api::model_provider::strip_think_tags(&content)
-    } else {
-        content
-    };
+/// Check the wire result without interpreting model-specific text syntax.
+/// Reliable normalizes it using the configured candidate reference; the
+/// upstream model ID is not a configuration key.
+fn require_terminal_text(content: String) -> anyhow::Result<String> {
     if content.trim().is_empty() {
         return Err(anyhow::Error::new(
             zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
@@ -588,7 +583,7 @@ impl ModelProvider for OpenAiModelProvider {
             .choices
             .into_iter()
             .next()
-            .map(|c| require_terminal_text(c.message.effective_content(), model))
+            .map(|c| require_terminal_text(c.message.effective_content()))
             .transpose()?
             .ok_or_else(|| {
                 ::zeroclaw_log::record!(
@@ -1063,14 +1058,12 @@ pub struct OpenAiResponsesModelProvider {
     credential: Option<String>,
     max_tokens: Option<u32>,
     reasoning_effort: Option<String>,
-    /// HTTP request timeout in seconds for non-streaming LLM API calls.
-    /// Streaming SSE calls use `streaming_client`, which sets no overall
-    /// timeout (long-running responses aren't killed mid-stream) and derives
-    /// its read-idle bound as `max(300 s, timeout_secs)` via
-    /// `stream_idle_timeout`: the 300 s floor applies when this field is
-    /// unset or lower, and a higher value raises the idle bound to match.
+    /// HTTP total deadline. The default applies to non-streaming calls;
+    /// streaming applies it only when explicitly configured. Read-idle
+    /// protection is configured separately by canonical API options.
     /// Default: 120 (matches `OpenAiCompatibleModelProvider`).
     timeout_secs: u64,
+    timeout_configured: bool,
     timeout_disabled: bool,
     read_timeout_secs: Option<u64>,
     read_timeout_disabled: bool,
@@ -1134,7 +1127,7 @@ impl OpenAiResponsesBuilder {
         self
     }
 
-    /// Override the non-streaming HTTP request timeout. Values of 0 are
+    /// Override the total HTTP request timeout, including streaming. Values of 0 are
     /// ignored (the default 120 s is kept) so a stray `Some(0)` from
     /// config cannot silently disable the safety timeout — same guard
     /// applied by [`OpenAiBuilder::timeout_secs`],
@@ -1193,6 +1186,7 @@ impl OpenAiResponsesBuilder {
             max_tokens: self.max_tokens,
             reasoning_effort: self.reasoning_effort,
             timeout_secs: self.timeout_secs.unwrap_or(120),
+            timeout_configured: self.timeout_secs.is_some(),
             timeout_disabled: self.timeout_disabled,
             read_timeout_secs: self.read_timeout_secs,
             read_timeout_disabled: self.read_timeout_disabled,
@@ -1354,6 +1348,9 @@ impl OpenAiResponsesModelProvider {
     fn streaming_client(&self) -> Client {
         let default_headers = self.build_default_headers();
         let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+        if self.timeout_configured && !self.timeout_disabled {
+            builder = builder.timeout(std::time::Duration::from_secs(self.timeout_secs));
+        }
         if !self.read_timeout_disabled {
             builder = builder.read_timeout(self.read_timeout_secs.map_or_else(
                 || super::stream_idle_timeout(self.timeout_secs).duration(),
@@ -3078,27 +3075,73 @@ mod tests {
     #[test]
     fn string_completion_rejects_only_unconditionally_empty_text() {
         for text in ["", "  \n"] {
-            let error = require_terminal_text(text.to_string(), "test-model")
+            let error = require_terminal_text(text.to_string())
                 .expect_err("a string-only semantic-empty completion must fail");
             assert!(error.chain().any(|cause| {
                 cause.is::<zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion>()
             }));
         }
-        assert!(
-            require_terminal_text(
-                "<think>internal reasoning</think>".to_string(),
-                "test-model"
-            )
-            .is_ok()
-        );
+        assert!(require_terminal_text("<think>internal reasoning</think>".to_string()).is_ok());
     }
 
     #[test]
     fn string_completion_keeps_visible_text() {
         assert_eq!(
-            require_terminal_text("final answer".to_string(), "test-model").unwrap(),
+            require_terminal_text("final answer".to_string()).unwrap(),
             "final answer"
         );
+    }
+
+    #[tokio::test]
+    async fn responses_streaming_client_keeps_total_and_idle_deadlines_independent() {
+        use axum::{Router, body::Body, routing::get};
+        use futures_util::StreamExt as _;
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new().route(
+            "/",
+            get(|| async {
+                let first = futures_util::stream::once(async {
+                    Ok::<_, std::convert::Infallible>("first")
+                });
+                let second = futures_util::stream::once(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+                    Ok::<_, std::convert::Infallible>("second")
+                });
+                Body::from_stream(first.chain(second))
+            }),
+        );
+        let server =
+            zeroclaw_spawn::spawn!(async move { axum::serve(listener, app).await.unwrap() });
+        for deadline in ["inherit", "finite", "clear", "idle"] {
+            let mut builder = OpenAiResponsesModelProvider::builder("test");
+            if deadline != "inherit" {
+                builder = builder.timeout_secs(1);
+            }
+            if matches!(deadline, "clear" | "idle") {
+                builder = builder.without_timeout();
+            }
+            builder = if deadline == "idle" {
+                builder.read_timeout_secs(1)
+            } else {
+                builder.without_read_timeout()
+            };
+            let response = builder
+                .build()
+                .streaming_client()
+                .get(&url)
+                .send()
+                .await
+                .unwrap();
+            let result = response.bytes().await;
+            if matches!(deadline, "finite" | "idle") {
+                assert!(result.is_err_and(|error| error.is_timeout()), "{deadline}");
+            } else {
+                assert_eq!(result.unwrap().as_ref(), b"firstsecond", "{deadline}");
+            }
+        }
+        server.abort();
     }
 
     #[test]

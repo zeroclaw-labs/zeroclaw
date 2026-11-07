@@ -26894,6 +26894,26 @@ api_key = "second-key"
         )
     }
 
+    /// XML-emitting test providers must opt in just like configured models.
+    fn text_tool_test_config() -> zeroclaw_config::schema::Config {
+        zeroclaw_config::schema::Config {
+            providers: toml::from_str(
+                r#"
+[connections.fixture]
+kind = "custom"
+capabilities = ["chat"]
+[models.test-provider]
+capability = "chat"
+provider = "fixture"
+model = "test-model"
+options = { extract_text_tool_calls = true }
+"#,
+            )
+            .unwrap(),
+            ..Default::default()
+        }
+    }
+
     /// Test context with executable tools. The explicit Full profile keeps the
     /// lifecycle test focused on the real post-tool transition rather than an
     /// approval-path short circuit.
@@ -27233,7 +27253,7 @@ api_key = "second-key"
         let runtime_ctx = test_runtime_ctx_with_observer_and_tools(
             channel,
             Arc::new(ToolCallingModelProvider),
-            zeroclaw_config::schema::Config::default(),
+            text_tool_test_config(),
             zeroclaw_config::schema::AliasedAgentConfig::default(),
             "test-provider",
             None,
@@ -30472,6 +30492,61 @@ BTC is currently around $65,000 based on latest tool output."#
         use wiremock::matchers::{body_partial_json, header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
+        struct NativeModelToolsProvider;
+        impl zeroclaw_api::attribution::Attributable for NativeModelToolsProvider {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Attributable::role(&ToolCallingModelProvider)
+            }
+            fn alias(&self) -> &str {
+                "native-model-tools-fixture"
+            }
+        }
+        #[async_trait::async_trait]
+        impl ModelProvider for NativeModelToolsProvider {
+            fn supports_native_tools(&self) -> bool {
+                true
+            }
+            async fn chat_with_system(
+                &self,
+                _system: Option<&str>,
+                _prompt: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok("done".into())
+            }
+            async fn chat(
+                &self,
+                request: zeroclaw_providers::traits::ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+                if request
+                    .messages
+                    .iter()
+                    .any(|message| message.role == "tool")
+                {
+                    return Ok(zeroclaw_providers::ChatResponse {
+                        text: Some("done".into()),
+                        tool_calls: Vec::new(),
+                        usage: None,
+                        reasoning_content: None,
+                    });
+                }
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: None,
+                    tool_calls: vec![zeroclaw_providers::traits::ToolCall {
+                        id: "model-tools".into(),
+                        name: "mock_price".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+
         struct ModelToolsProbe {
             llm_task: Arc<dyn Tool>,
             model_switch: Arc<dyn Tool>,
@@ -30526,6 +30601,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ..Config::default()
         };
         let profile = startup.providers.models.ensure("custom", "local").unwrap();
+        profile.native_tools = Some(true);
         profile.uri = Some(format!("{}/v1/chat/completions", server.uri()));
         profile.api_key = Some("startup-test-key".into());
         profile.model = Some("startup-model".into());
@@ -30657,7 +30733,7 @@ BTC is currently around $65,000 based on latest tool output."#
             }));
         context.provider_cache.lock().unwrap().insert(
             provider_cache_key("custom.local", None, 1),
-            Arc::new(ToolCallingModelProvider),
+            Arc::new(NativeModelToolsProvider),
         );
         process_channel_message(
             context,
@@ -30735,11 +30811,8 @@ BTC is currently around $65,000 based on latest tool output."#
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: zeroclaw_config::live::LiveConfig::new(
-                zeroclaw_config::schema::Config::default(),
-            )
-            .handle(),
+            prompt_config: Arc::new(text_tool_test_config()),
+            live_config: zeroclaw_config::live::LiveConfig::new(text_tool_test_config()).handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -32229,11 +32302,8 @@ BTC is currently around $65,000 based on latest tool output."#
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: zeroclaw_config::live::LiveConfig::new(
-                zeroclaw_config::schema::Config::default(),
-            )
-            .handle(),
+            prompt_config: Arc::new(text_tool_test_config()),
+            live_config: zeroclaw_config::live::LiveConfig::new(text_tool_test_config()).handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -32355,11 +32425,8 @@ BTC is currently around $65,000 based on latest tool output."#
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: zeroclaw_config::live::LiveConfig::new(
-                zeroclaw_config::schema::Config::default(),
-            )
-            .handle(),
+            prompt_config: Arc::new(text_tool_test_config()),
+            live_config: zeroclaw_config::live::LiveConfig::new(text_tool_test_config()).handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -32478,7 +32545,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let base_ctx = test_runtime_ctx_with_observer_and_tools(
             channel,
             Arc::new(ToolCallingModelProvider),
-            zeroclaw_config::schema::Config::default(),
+            text_tool_test_config(),
             zeroclaw_config::schema::AliasedAgentConfig::default(),
             "test-provider",
             None,
@@ -32953,11 +33020,8 @@ BTC is currently around $65,000 based on latest tool output."#
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: zeroclaw_config::live::LiveConfig::new(
-                zeroclaw_config::schema::Config::default(),
-            )
-            .handle(),
+            prompt_config: Arc::new(text_tool_test_config()),
+            live_config: zeroclaw_config::live::LiveConfig::new(text_tool_test_config()).handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -33218,11 +33282,8 @@ BTC is currently around $65,000 based on latest tool output."#
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: zeroclaw_config::live::LiveConfig::new(
-                zeroclaw_config::schema::Config::default(),
-            )
-            .handle(),
+            prompt_config: Arc::new(text_tool_test_config()),
+            live_config: zeroclaw_config::live::LiveConfig::new(text_tool_test_config()).handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -34370,11 +34431,8 @@ BTC is currently around $65,000 based on latest tool output."#
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: zeroclaw_config::live::LiveConfig::new(
-                zeroclaw_config::schema::Config::default(),
-            )
-            .handle(),
+            prompt_config: Arc::new(text_tool_test_config()),
+            live_config: zeroclaw_config::live::LiveConfig::new(text_tool_test_config()).handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -37881,7 +37939,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let mut ctx = test_runtime_ctx_with_observer_and_tools(
             channel.clone(),
             Arc::new(ShellProvider(channel.clone())),
-            Default::default(),
+            text_tool_test_config(),
             agent_cfg,
             "test-provider",
             None,
@@ -44043,7 +44101,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_provider,
             zeroclaw_config::schema::Config {
                 peer_groups,
-                ..Default::default()
+                ..text_tool_test_config()
             },
             zeroclaw_config::schema::AliasedAgentConfig::default(),
             "test-provider",
@@ -44285,7 +44343,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_provider,
             zeroclaw_config::schema::Config {
                 peer_groups,
-                ..Default::default()
+                ..text_tool_test_config()
             },
             zeroclaw_config::schema::AliasedAgentConfig::default(),
             "test-provider",

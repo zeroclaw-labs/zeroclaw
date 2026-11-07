@@ -59,15 +59,10 @@ impl ResponseMessage {
     }
 }
 
-/// String-only completions have no native tool-call escape hatch. An empty or
-/// reasoning-only result is therefore a typed terminal failure, not a valid
-/// string result for direct callers that do not use the structured chat API.
-fn require_terminal_text(content: String, model: &str) -> anyhow::Result<String> {
-    let content = if zeroclaw_api::text_extraction_reasoning_for(model) {
-        zeroclaw_api::model_provider::strip_think_tags(&content)
-    } else {
-        content
-    };
+/// Validate blank wire content. Candidate-specific interpretation belongs to
+/// Reliable, which knows the exact configured reference rather than only the
+/// upstream deployment ID.
+fn require_terminal_text(content: String) -> anyhow::Result<String> {
     if content.trim().is_empty() {
         return Err(anyhow::Error::new(
             zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
@@ -597,7 +592,7 @@ impl ModelProvider for AzureOpenAiModelProvider {
             .choices
             .into_iter()
             .next()
-            .map(|c| require_terminal_text(c.message.effective_content(), model))
+            .map(|c| require_terminal_text(c.message.effective_content()))
             .transpose()?
             .ok_or_else(|| {
                 ::zeroclaw_log::record!(
@@ -1332,25 +1327,19 @@ mod tests {
     #[test]
     fn string_completion_rejects_only_unconditionally_empty_text() {
         for text in ["", "  \n"] {
-            let error = require_terminal_text(text.to_string(), "test-model")
+            let error = require_terminal_text(text.to_string())
                 .expect_err("a string-only semantic-empty completion must fail");
             assert!(error.chain().any(|cause| {
                 cause.is::<zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion>()
             }));
         }
-        assert!(
-            require_terminal_text(
-                "<think>internal reasoning</think>".to_string(),
-                "test-model"
-            )
-            .is_ok()
-        );
+        assert!(require_terminal_text("<think>internal reasoning</think>".to_string()).is_ok());
     }
 
     #[test]
     fn string_completion_keeps_visible_text() {
         assert_eq!(
-            require_terminal_text("final answer".to_string(), "test-model").unwrap(),
+            require_terminal_text("final answer".to_string()).unwrap(),
             "final answer"
         );
     }

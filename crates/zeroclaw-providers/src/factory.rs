@@ -2206,7 +2206,7 @@ pub(crate) fn dispatch_model_ref_with_registry(
         Some(Override::Clear)
     );
     // Canonical chat configuration has an independent read-idle baseline.
-    // Materialize the compatible driver's 300-second default here instead of
+    // Materialize the driver's baseline here instead of
     // deriving it from request_timeout_secs; legacy family construction keeps
     // its historical max(300, timeout) behavior in the adapter.
     runtime.provider_read_timeout_secs = resolved
@@ -2217,8 +2217,14 @@ pub(crate) fn dispatch_model_ref_with_registry(
             Override::Clear => None,
         })
         .or_else(|| {
-            (!matches!(resolved.read_timeout_secs.as_ref(), Some(Override::Clear)))
-                .then_some(crate::STREAM_IDLE_TIMEOUT.as_secs())
+            (!matches!(resolved.read_timeout_secs.as_ref(), Some(Override::Clear))).then_some(
+                match resolved.selection.connection {
+                    ProviderConnection::Anthropic(_) => {
+                        crate::anthropic::STREAM_IDLE_TIMEOUT.as_secs()
+                    }
+                    _ => crate::STREAM_IDLE_TIMEOUT.as_secs(),
+                },
+            )
         });
     runtime.provider_read_timeout_disabled =
         matches!(resolved.read_timeout_secs.as_ref(), Some(Override::Clear));

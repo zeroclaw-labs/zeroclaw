@@ -140,6 +140,22 @@ fn any_live_pricing(config: &Config) -> bool {
         .models
         .iter_entries()
         .any(|(_, _, base)| base.live_pricing)
+        || config
+            .providers
+            .models
+            .canonical_model_refs()
+            .any(|model_ref| {
+                config
+                    .providers
+                    .models
+                    .canonical_model(model_ref)
+                    .filter(|model| {
+                        model.capability() == zeroclaw_api::capability::Capability::Chat
+                    })
+                    .and_then(|model| config.providers.connections.get(model.provider()))
+                    .and_then(|connection| connection.chat_api())
+                    .is_some_and(|api| api.live_pricing == Some(true))
+            })
 }
 
 /// Whether the background price refresher has been started in this process.
@@ -668,6 +684,33 @@ mod tests {
             },
         );
         config
+    }
+
+    #[test]
+    fn canonical_models_enable_live_pricing_without_legacy_profiles() {
+        let config = Config {
+            providers: toml::from_str(
+                r#"
+[connections."gateway.prod"]
+kind = "custom"
+uri = "http://127.0.0.1:9/v1"
+capabilities = ["chat"]
+api.chat = { live_pricing = true }
+[models."chat.fast"]
+capability = "chat"
+provider = "gateway.prod"
+model = "fast-id"
+"#,
+            )
+            .unwrap(),
+            ..Default::default()
+        };
+        assert!(any_live_pricing(&config));
+        let (groups, _) = enabled_pricing_groups(&config);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].wanted[0].provider_key, "chat.fast");
+        assert_eq!(groups[0].wanted[0].model_id, "fast-id");
+        assert!(!any_live_pricing(&Config::default()));
     }
 
     fn opt_out(config: &mut Config) {

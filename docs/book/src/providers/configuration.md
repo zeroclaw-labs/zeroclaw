@@ -82,6 +82,8 @@ their paths and do not define a second URI. API defaults are applied first,
 then the API preset/options, model preset/options, and finally invocation
 overrides. `request_timeout_secs` is the total request bound and
 `read_timeout_secs` is the response-read idle bound; they are independent.
+An explicit finite request deadline also covers streaming. `"null"` disables
+only the specified deadline; omitted fields inherit the API or driver baseline.
 An `openai` connection may omit `uri` and uses `https://api.openai.com/v1` for
 decision requests. Fireworks uses its documented
 `https://api.fireworks.ai/inference/v1` prefix, and OpenRouter uses

@@ -41567,7 +41567,7 @@ mod tests {
 
     #[tokio::test]
     async fn config_set_refreshes_bare_and_url_bindings_with_inherited_models() {
-        for reference in ["custom", "custom:http://127.0.0.1:2/v1"] {
+        for reference in ["openai", "custom:http://127.0.0.1:2/v1"] {
             for explicit_model in [None, Some("explicit-model")] {
                 let tmp = tempfile::TempDir::new().unwrap();
                 let mut config = make_model_refresh_test_config(&tmp);

@@ -329,10 +329,7 @@ options = { extract_text_tool_calls = true }
         );
         assert_eq!(
             config.model_text_extraction("not-configured"),
-            TextExtraction {
-                reasoning: true,
-                tool_calls: true,
-            }
+            TextExtraction::default()
         );
     }
 

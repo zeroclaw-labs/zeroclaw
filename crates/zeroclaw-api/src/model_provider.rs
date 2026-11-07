@@ -1103,8 +1103,6 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
                 usage: None,
                 reasoning_content: None,
             };
-            let mut response = response;
-            response.normalize_text_for_policy(crate::text_extraction_reasoning_for(model));
             return (!response.is_semantically_empty_terminal())
                 .then_some(response)
                 .ok_or_else(|| anyhow::Error::new(SemanticEmptyTerminalCompletion));
@@ -1119,8 +1117,6 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
             usage: None,
             reasoning_content: None,
         };
-        let mut response = response;
-        response.normalize_text_for_policy(crate::text_extraction_reasoning_for(model));
         (!response.is_semantically_empty_terminal())
             .then_some(response)
             .ok_or_else(|| anyhow::Error::new(SemanticEmptyTerminalCompletion))
@@ -1157,8 +1153,6 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
             usage: None,
             reasoning_content: None,
         };
-        let mut response = response;
-        response.normalize_text_for_policy(crate::text_extraction_reasoning_for(model));
         (!response.is_semantically_empty_terminal())
             .then_some(response)
             .ok_or_else(|| anyhow::Error::new(SemanticEmptyTerminalCompletion))
@@ -1575,12 +1569,31 @@ mod capability_tests {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
-            _message: &str,
+            message: &str,
             _model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
-            Ok(String::new())
+            Ok(message.to_owned())
         }
+    }
+
+    #[tokio::test]
+    async fn default_chat_adapters_preserve_wire_text_for_candidate_normalization() {
+        let text = "<think>literal content</think>";
+        let messages = [super::ChatMessage::user(text)];
+        crate::scope_text_extraction(Some(std::sync::Arc::new(|_| true)), async {
+            let response = NativeAccessorOnlyProvider
+                .chat(super::ChatRequest::new(&messages), "upstream-id", None)
+                .await
+                .unwrap();
+            assert_eq!(response.text.as_deref(), Some(text));
+            let response = NativeAccessorOnlyProvider
+                .chat_with_tools(&messages, &[], "upstream-id", None)
+                .await
+                .unwrap();
+            assert_eq!(response.text.as_deref(), Some(text));
+        })
+        .await;
     }
 
     #[tokio::test]

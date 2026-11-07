@@ -10104,6 +10104,7 @@ mod tests {
         let model_provider_config = ModelProviderConfig {
             uri: model_uri,
             model: Some("delegate-test-model".to_string()),
+            native_tools: Some(true),
             api_key: Some("delegate-test-key".to_string()),
             timeout_secs: Some(2),
             ..ModelProviderConfig::default()
@@ -21166,6 +21167,7 @@ target = "sessions_history"
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        config.providers.models.ensure("ollama", "target").unwrap();
         config.risk_profiles.insert(
             "caller".to_string(),
             RiskProfileConfig {
@@ -21243,7 +21245,7 @@ target = "sessions_history"
                 .execute_agentic(
                     "target",
                     target,
-                    "test",
+                    "ollama.target",
                     "test-model",
                     &provider,
                     "echo the marker phrase",

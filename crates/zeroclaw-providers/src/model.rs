@@ -707,10 +707,19 @@ pub fn build_model(
             _ => (model_provider_ref.to_string(), String::new(), true),
         };
 
-    // Named refs select their own profile; a bare family inherits the
-    // configured agent selection, including default/sole nested entries.
+    // Named refs select their own profile. Bare selectors inherit model
+    // defaults, but only the same bare family may reuse the agent connection;
+    // a different family or an explicit URL keeps its requested transport.
     let selection = configured_selection_for_construction(config, agent_alias, model_provider_ref);
-    let entry = selection.as_ref().map(|selection| selection.entry);
+    let inherit_connection = bare_family
+        && explicit_url.is_none()
+        && selection
+            .as_ref()
+            .is_some_and(|selected| selected.family == model_provider_name);
+    let entry = selection
+        .as_ref()
+        .filter(|_| !bare_family || inherit_connection)
+        .map(|selection| selection.entry);
     let model_entry = selection.as_ref().and_then(|s| s.model_entry);
 
     let identity = resolve_model_identity(config, agent_alias, model_provider_ref, model_override)
@@ -723,12 +732,10 @@ pub fn build_model(
     let model_name = &identity.model_id;
 
     let mut runtime_options = if bare_family {
-        // A bare family with an agent selection is only a selector shorthand:
-        // construct the selected profile's full connection/options, rather
-        // than rebuilding the family default and accidentally dropping its
-        // URI, kind, headers, or wire policy. A truly unconfigured bare
-        // family keeps the historical provider-default path.
-        if selection.is_some() {
+        // Reuse full connection options only for a same-family shorthand.
+        // Other selectors inherit applicable model defaults after removing
+        // the configured profile's transport-specific options.
+        if inherit_connection {
             crate::provider_runtime_options_for_agent(config, agent_alias)
         } else {
             let agent_options = crate::provider_runtime_options_for_agent(config, agent_alias);
@@ -743,7 +750,7 @@ pub fn build_model(
     };
     crate::apply_model_entry_options(&mut runtime_options, model_entry);
 
-    let construction_ref = if bare_family {
+    let construction_ref = if inherit_connection {
         selection.as_ref().map_or_else(
             || model_provider_ref.to_owned(),
             |selected| {
@@ -781,6 +788,62 @@ pub fn build_model(
 mod tests {
     use super::*;
     use zeroclaw_config::schema::{ModelEntryConfig, ModelRouteConfig};
+
+    #[test]
+    fn bare_provider_override_keeps_the_requested_family() {
+        use zeroclaw_api::attribution::{ModelProviderKind, ProviderKind, Role};
+        let mut config = Config::default();
+        let profile = config.providers.models.ensure("anthropic", "work").unwrap();
+        profile.model = Some("claude-work".into());
+        profile.api_key = Some("fixture-anthropic-key".into());
+        profile.uri = Some("http://127.0.0.1:9/anthropic".into());
+        config.agents.insert(
+            "worker".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: "anthropic.work".into(),
+                ..Default::default()
+            },
+        );
+        let built = build_model(&config, "worker", "openai", Some("gpt-test")).unwrap();
+        assert_eq!(
+            built.provider().role(),
+            Role::Provider(ProviderKind::Model(ModelProviderKind::OpenAi))
+        );
+        assert_eq!(built.identity().provider_ref(), "openai");
+        let built = build_model(
+            &config,
+            "worker",
+            "custom:http://127.0.0.1:9/v1",
+            Some("proxy-model"),
+        )
+        .unwrap();
+        assert_eq!(
+            built.provider().role(),
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Plugin))
+        );
+    }
+
+    #[test]
+    fn configured_options_preserve_an_absent_total_deadline() {
+        let mut config = Config::default();
+        config.providers.models.ensure("openai", "primary").unwrap();
+        assert_eq!(
+            crate::provider_runtime_options_for_alias(&config, "openai", "primary")
+                .provider_timeout_secs,
+            None
+        );
+        config
+            .providers
+            .models
+            .ensure("openai", "primary")
+            .unwrap()
+            .timeout_secs = Some(37);
+        assert_eq!(
+            crate::provider_runtime_options_for_alias(&config, "openai", "primary")
+                .provider_timeout_secs,
+            Some(37)
+        );
+    }
 
     #[test]
     fn shared_construction_dependencies_exclude_unrelated_global_policy() {

@@ -155,7 +155,12 @@ impl ResolvedModelAccess<'_> {
                 // and successful response telemetry before returning its typed
                 // cause to every one-shot caller.
                 if response.is_semantically_empty_terminal_with(
-                    zeroclaw_api::text_extraction_reasoning_for(self.provider_name),
+                    zeroclaw_api::text_extraction_reasoning_for(
+                        accepted_route
+                            .as_ref()
+                            .and_then(|route| route.selection_ref())
+                            .unwrap_or(&served_provider),
+                    ),
                 ) {
                     crate::agent::cost::settle_provider_attempts(attempts, None);
                     extend_rejected_summaries(settled_out, attempts);
@@ -776,6 +781,72 @@ mod run_model_query_tests {
     }
 
     #[tokio::test]
+    async fn run_model_query_uses_the_successful_fallbacks_text_policy() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        for (model, text) in [
+            ("primary", "<think>private</think>"),
+            ("backup", "<think>literal</think>"),
+        ] {
+            Mock::given(method("POST"))
+                .and(body_partial_json(serde_json::json!({"model":model})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices":[{"message":{"role":"assistant", "content":text},"finish_reason":"stop"}]
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let mut config = zeroclaw_config::schema::Config {
+            providers: toml::from_str(&format!(
+                r#"
+[connections.gateway]
+kind = "custom"
+uri = "{}/v1"
+capabilities = ["chat"]
+[models."chat.primary"]
+capability = "chat"
+provider = "gateway"
+model = "primary"
+options = {{ extract_text_reasoning = true }}
+[models."chat.backup"]
+capability = "chat"
+provider = "gateway"
+model = "backup"
+options = {{ extract_text_reasoning = false }}
+[fallback]
+"chat.primary" = ["chat.backup"]
+"#,
+                server.uri()
+            ))
+            .unwrap(),
+            ..Default::default()
+        };
+        config.reliability.provider_retries = 0;
+        let built =
+            zeroclaw_providers::model::build_model(&config, "default", "chat.primary", None)
+                .unwrap();
+        let messages = [ChatMessage::user("hi")];
+        let access = ResolvedModelAccess {
+            model_provider: built.provider(),
+            provider_name: "chat.primary",
+            model: "primary",
+            dispatch_model: "primary",
+            temperature: None.into(),
+        };
+        let response = zeroclaw_api::scope_text_extraction(
+            Some(Arc::new(move |reference| {
+                config.model_text_extraction(reference).reasoning
+            })),
+            access.run_model_query(ChatRequest::new(&messages), &mut Vec::new()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.text.as_deref(), Some("<think>literal</think>"));
+    }
+
+    #[tokio::test]
     async fn run_model_query_rejects_direct_semantic_empty_text_before_accepted_accounting() {
         let messages = [ChatMessage::user("hi")];
         for text in ["", " \n\t", "<think>internal reasoning</think>"] {
@@ -796,9 +867,8 @@ mod run_model_query_tests {
             let turn_usage = Arc::clone(&ctx.turn_usage);
             let error = TOOL_LOOP_COST_TRACKING_CONTEXT
                 .scope(Some(ctx), async {
-                    // This is the config-free injected-provider seam. It keeps
-                    // the legacy reasoning extraction policy, while configured
-                    // turns install their model-owned policy around the call.
+                    // Opt this injected fixture into reasoning extraction;
+                    // unconfigured calls preserve text syntax by default.
                     zeroclaw_api::scope_text_extraction(
                         Some(std::sync::Arc::new(|_: &str| true)),
                         direct_access(&provider).run_model_query(

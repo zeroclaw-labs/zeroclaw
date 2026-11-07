@@ -49,16 +49,11 @@ pub trait LlmGenerateAdapter: Send + Sync {
 
     /// Run one bounded generation while retaining an internal typed failure.
     ///
-    /// The default preserves compatibility with pre-existing adapters. The
-    /// config-free adapter route also retains its historical reasoning parser:
-    /// legacy injected adapters return raw text, so a reasoning-only
-    /// `<think>...</think>` completion must be classified as empty before SOP
-    /// serializes it. The provider-backed implementation overrides this method
-    /// because it already applies its model-owned policy while dispatching.
+    /// An injected adapter owns its response formatting. Without a selected
+    /// model policy, textual syntax is preserved. Provider-backed adapters
+    /// apply the accepted model's extraction policy while dispatching.
     fn generate_typed(&self, system: Option<&str>, prompt: &str) -> Result<String> {
-        self.generate(system, prompt)
-            .map(|text| zeroclaw_api::model_provider::strip_think_tags(&text))
-            .map_err(anyhow::Error::msg)
+        self.generate(system, prompt).map_err(anyhow::Error::msg)
     }
 }
 
@@ -256,28 +251,34 @@ impl ProviderLlmAdapter {
                 let resolver = Arc::new(move |model: &str| {
                     policy_config.model_text_extraction(model).reasoning
                 }) as Arc<dyn Fn(&str) -> bool + Send + Sync>;
-                let text = zeroclaw_api::scope_text_extraction(
-                    Some(resolver),
-                    ProviderDispatch::new(Arc::from(provider)).chat_with_system_with_sampling(
-                        system.as_deref(),
-                        &prompt,
-                        &identity.model_id,
-                        sampling,
-                    ),
-                )
-                .await?;
+                let scope = zeroclaw_providers::dispatch::AccountedChatScope::new();
+                let text = scope
+                    .scope(zeroclaw_api::scope_text_extraction(
+                        Some(resolver),
+                        ProviderDispatch::new(Arc::from(provider)).chat_with_system_with_sampling(
+                            system.as_deref(),
+                            &prompt,
+                            &identity.model_id,
+                            sampling,
+                        ),
+                    ))
+                    .await?;
+                scope.mark_logical_success();
+                let accounting = scope.take();
+                let served_ref = accounting
+                    .accepted_route()
+                    .and_then(|route| route.selection_ref())
+                    .unwrap_or(&provider_ref);
                 // The provider API applies the same policy while building its
                 // response. Repeat the final normalization at this typed
                 // capability boundary so an adapter implementation that
                 // returns raw text cannot turn a reasoning-only completion
                 // into visible SOP output or bypass the empty check.
-                Ok(
-                    if config.model_text_extraction(&identity.model_id).reasoning {
-                        zeroclaw_api::model_provider::strip_think_tags(&text)
-                    } else {
-                        text
-                    },
-                )
+                Ok(if config.model_text_extraction(served_ref).reasoning {
+                    zeroclaw_api::model_provider::strip_think_tags(&text)
+                } else {
+                    text
+                })
             },
             GENERATE_TIMEOUT,
             "model call",
@@ -657,7 +658,7 @@ mod tests {
     fn blank_model_success_maps_to_terminal_failure() {
         let adapter = Arc::new(RecordingLlm {
             calls: Mutex::new(Vec::new()),
-            result: Ok("<think>internal</think>".into()),
+            result: Ok("  \n".into()),
         });
         let cap = LlmGenerateCapability::new(Some(adapter));
         let out = cap.execute(ctx(), json!({"instruction": "x"})).unwrap();
@@ -667,6 +668,18 @@ mod tests {
             crate::agent::semantic_empty_terminal_completion_message(None)
         );
         assert_eq!(out.error.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn injected_adapter_preserves_literal_reasoning_syntax_without_a_model_policy() {
+        let adapter = RecordingLlm {
+            calls: Mutex::new(Vec::new()),
+            result: Ok("<think>literal</think>".into()),
+        };
+        assert_eq!(
+            adapter.generate_typed(None, "prompt").unwrap(),
+            "<think>literal</think>"
+        );
     }
 
     #[test]
@@ -754,6 +767,69 @@ mod tests {
         )
         .unwrap();
         assert_eq!(response, "ok");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn provider_adapter_preserves_the_accepted_models_literal_reasoning_text() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        for (temperature, text) in [
+            (0.1, "<think>private</think>"),
+            (0.9, "<think>literal</think>"),
+        ] {
+            Mock::given(method("POST"))
+                .and(body_partial_json(json!({"model":"shared-wire-id", "temperature":temperature})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "choices":[{"message":{"role":"assistant", "content":text},"finish_reason":"stop"}]
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let mut config = Config {
+            providers: toml::from_str(&format!(
+                r#"
+[connections.gateway]
+kind = "openai"
+uri = "{}/v1"
+auth = {{ mode = "api_key", api_key = "fixture-key" }}
+capabilities = ["chat"]
+api.chat = {{ wire_api = "chat_completions" }}
+[models."chat.primary"]
+capability = "chat"
+provider = "gateway"
+model = "shared-wire-id"
+options = {{ temperature = 0.1, extract_text_reasoning = true }}
+[models."chat.backup"]
+capability = "chat"
+provider = "gateway"
+model = "shared-wire-id"
+options = {{ temperature = 0.9, extract_text_reasoning = false }}
+[fallback]
+"chat.primary" = ["chat.backup"]
+"#,
+                server.uri()
+            ))
+            .unwrap(),
+            ..Default::default()
+        };
+        config.reliability.provider_retries = 0;
+        let text = ProviderLlmAdapter::generate_resolved(
+            move || {
+                let built = zeroclaw_providers::model::build_model(
+                    &config,
+                    "default",
+                    "chat.primary",
+                    None,
+                )?;
+                Ok((config, built))
+            },
+            None,
+            "prompt",
+        )
+        .unwrap();
+        assert_eq!(text, "<think>literal</think>");
     }
 
     #[tokio::test(flavor = "current_thread")]
