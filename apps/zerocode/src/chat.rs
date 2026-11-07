@@ -4894,10 +4894,9 @@ impl Chat {
 
     /// The persisted sessions this pane may load, from the pane's own store.
     ///
-    /// ACP and Chat live in separate stores and must not cross-pick:
-    ///  • Chat → unified session_backend (filter out channel-backed
-    ///    sessions; those are owned by the channels pane).
-    ///  • ACP  → dedicated acp-sessions.db, listed by a separate RPC.
+    /// Both panes read the canonical session catalog. Chat filters out
+    /// channel-owned sessions, while ACP keeps its compatibility list method
+    /// but uses the same backend and session identities.
     async fn list_pane_sessions(
         rpc: &RpcClient,
         pane_kind: PaneKind,
