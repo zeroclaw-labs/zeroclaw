@@ -37,6 +37,18 @@ use zeroclaw_relay_proto::{PEER_HINT_GATEWAY, is_dashboard_label};
 /// connection is forwarded unread.
 const REFUSAL_READ_BUDGET: Duration = Duration::from_secs(5);
 
+/// Refusals the dashboard tier answers at once (see [`DashboardTier::refuse`]).
+///
+/// A dashboard connection gives back its pre-admission handshake permit as
+/// soon as it is classified, so browser traffic can never shed the daemons
+/// and native clients that pool protects. A refusal then holds a TLS stream,
+/// a read buffer and a task for up to its read and write budgets, and the
+/// browser it answers holds at most an address slot: one over its address's
+/// cap holds none. This pool is what bounds them across addresses. Past it, a
+/// refusal is dropped unanswered. Routed connections never take from it:
+/// their per-address and per-daemon caps bound them.
+pub(crate) const MAX_DASHBOARD_REFUSALS: usize = 64;
+
 /// The operator's `[dashboard]` settings.
 #[derive(Debug, Clone)]
 pub struct DashboardConfig {
@@ -115,6 +127,7 @@ pub(crate) enum DashboardHost {
 pub(crate) struct DashboardTier {
     cfg: DashboardConfig,
     per_ip: std::sync::Mutex<HashMap<IpAddr, usize>>,
+    refusals: tokio::sync::Semaphore,
 }
 
 impl DashboardTier {
@@ -122,6 +135,7 @@ impl DashboardTier {
         Self {
             cfg,
             per_ip: std::sync::Mutex::new(HashMap::new()),
+            refusals: tokio::sync::Semaphore::new(MAX_DASHBOARD_REFUSALS),
         }
     }
 
@@ -144,6 +158,19 @@ impl DashboardTier {
         } else {
             DashboardHost::Unknown
         })
+    }
+
+    /// Answer a connection the relay will not route, under the refusal pool.
+    /// With the pool spent the browser gets no answer: dropping the stream
+    /// closes it.
+    async fn refuse<S>(&self, browser: &mut S, status: u16, message: &str)
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let Ok(_refusal) = self.refusals.try_acquire() else {
+            return;
+        };
+        refuse(browser, status, message).await;
     }
 
     /// Take one of `ip`'s connection slots, or `None` when it has none left.
@@ -219,7 +246,7 @@ pub(crate) async fn serve<S>(
         return;
     };
     let Some(_ip_slot) = tier.take_ip_slot(peer.ip()) else {
-        refuse(
+        tier.refuse(
             &mut browser,
             429,
             "Too many connections from this address. Try again shortly.",
@@ -228,7 +255,8 @@ pub(crate) async fn serve<S>(
         return;
     };
     let DashboardHost::Label(label) = host else {
-        refuse(&mut browser, 404, "There is no dashboard at this address.").await;
+        tier.refuse(&mut browser, 404, "There is no dashboard at this address.")
+            .await;
         return;
     };
     // The newest registration under this label: during a node-id rotation's
@@ -245,7 +273,7 @@ pub(crate) async fn serve<S>(
             .map(|handle| (DaemonLink::of(handle), Arc::clone(&handle.dashboard_live)))
     };
     let Some((link, node_live)) = target else {
-        refuse(
+        tier.refuse(
             &mut browser,
             404,
             "There is no dashboard at this address, or its daemon is not connected.",
@@ -254,7 +282,7 @@ pub(crate) async fn serve<S>(
         return;
     };
     let Some(_node_slot) = NodeSlot::take(node_live, tier.max_conns_per_node()) else {
-        refuse(
+        tier.refuse(
             &mut browser,
             503,
             "This dashboard is busy. Try again shortly.",
@@ -272,7 +300,7 @@ pub(crate) async fn serve<S>(
                     (503, "This dashboard is unavailable. Try again shortly.")
                 }
             };
-            refuse(&mut browser, status, message).await;
+            tier.refuse(&mut browser, status, message).await;
             return;
         }
     };
@@ -562,6 +590,88 @@ mod tests {
         .expect("closing a browser that never reads must not hold its slots");
         drop(browser);
         answering.abort();
+    }
+
+    /// Serve one browser that sends a request, and return what it was sent.
+    async fn served(inner: &Arc<crate::Inner>, host: DashboardHost, peer: SocketAddr) -> String {
+        let (mut browser, relay_side) = tokio::io::duplex(64 * 1024);
+        browser
+            .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            serve(Arc::clone(inner), relay_side, host, peer),
+        )
+        .await
+        .expect("a refusal with nothing left to wait for returns at once");
+        let mut answer = String::new();
+        browser.read_to_string(&mut answer).await.unwrap();
+        answer
+    }
+
+    #[tokio::test]
+    async fn refusals_past_their_pool_are_shed_without_touching_the_handshake_pool() {
+        let server = crate::RelayServer::new(crate::RelayConfig {
+            dashboard: Some(cfg()),
+            ..crate::RelayConfig::default()
+        });
+        let inner = Arc::clone(&server.inner);
+        let tier = inner.dashboard.clone().expect("the dashboard tier");
+        // Browsers from as many addresses, each sending nothing: every
+        // refusal waits out its read budget holding a refusal permit.
+        let mut silent = Vec::new();
+        for n in 0..MAX_DASHBOARD_REFUSALS {
+            let (browser, relay_side) = tokio::io::duplex(1024);
+            let peer = SocketAddr::from(([10, 0, (n / 250) as u8, (n % 250) as u8 + 1], 40000));
+            tokio::spawn(serve(
+                Arc::clone(&inner),
+                relay_side,
+                DashboardHost::Unknown,
+                peer,
+            ));
+            silent.push(browser);
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while tier.refusals.available_permits() > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the silent refusals take the whole pool");
+
+        // Past the pool, both kinds of refusal are shed unanswered: an unknown
+        // host, and an address already at its connection cap.
+        let crowded: SocketAddr = "203.0.113.7:51000".parse().unwrap();
+        let _slots = [
+            tier.take_ip_slot(crowded.ip()).unwrap(),
+            tier.take_ip_slot(crowded.ip()).unwrap(),
+        ];
+        let other: SocketAddr = "203.0.113.8:51000".parse().unwrap();
+        let label = DashboardHost::Label("a".repeat(26));
+        assert_eq!(served(&inner, DashboardHost::Unknown, other).await, "");
+        assert_eq!(served(&inner, label.clone(), crowded).await, "");
+        // None of it holds a pre-admission permit: daemons and native clients
+        // are admitted as before.
+        assert_eq!(
+            inner.handshake_permits.available_permits(),
+            crate::RelayConfig::default().max_pending_handshakes
+        );
+
+        // Once the silent browsers go, refusals are answered again.
+        drop(silent);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while tier.refusals.available_permits() < MAX_DASHBOARD_REFUSALS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the refusals give their permits back");
+        let unknown = served(&inner, DashboardHost::Unknown, other).await;
+        assert!(unknown.starts_with("HTTP/1.1 404 "), "{unknown}");
+        let over_cap = served(&inner, label, crowded).await;
+        assert!(over_cap.starts_with("HTTP/1.1 429 "), "{over_cap}");
+        assert_eq!(tier.refusals.available_permits(), MAX_DASHBOARD_REFUSALS);
     }
 
     #[tokio::test(start_paused = true)]
