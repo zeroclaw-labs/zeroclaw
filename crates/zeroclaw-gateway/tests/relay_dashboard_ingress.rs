@@ -494,6 +494,56 @@ fn a_relay_browser_cannot_present_a_paired_token() {
 }
 
 #[test]
+fn a_relay_browser_cannot_present_the_webhook_secret() {
+    on_runtime(|| async {
+        const SECRET: &str = "relay-test-webhook-secret";
+        let gateway =
+            Gateway::start_with(|config| config.gateway.webhook_secret = Some(SECRET.into())).await;
+        let code = gateway.mint_pairing_code().await;
+        let paired = gateway.direct(&legacy_pair("127.0.0.1", &code, "")).await;
+        assert_eq!(paired.status, 200, "{}", paired.text);
+        let token = paired.json()["token"].as_str().unwrap().to_string();
+        let webhook = |host: &str, extra: &str| {
+            format!(
+                "POST /webhook HTTP/1.1\r\nHost: {host}\r\n{extra}Content-Length: 0\r\n\
+                 Connection: close\r\n\r\n"
+            )
+        };
+
+        // Through the relay the secret is refused at admission, whatever
+        // else the request carries.
+        let relayed = gateway
+            .via_relay(
+                BROWSER,
+                &webhook(DASHBOARD_HOST, &format!("X-Webhook-Secret: {SECRET}\r\n")),
+            )
+            .await;
+        assert_eq!(relayed.status, 401, "{}", relayed.text);
+        assert!(relayed.is_relay_refusal(), "{}", relayed.text);
+
+        // Directly, with the paired token, the same secret passes both
+        // checks (the empty body is what's refused), and a wrong one doesn't.
+        let direct = gateway
+            .direct(&webhook(
+                "127.0.0.1",
+                &format!("Authorization: Bearer {token}\r\nX-Webhook-Secret: {SECRET}\r\n"),
+            ))
+            .await;
+        assert_eq!(direct.status, 400, "{}", direct.text);
+        assert!(direct.text.contains("Invalid JSON body"), "{}", direct.text);
+        let wrong = gateway
+            .direct(&webhook(
+                "127.0.0.1",
+                &format!("Authorization: Bearer {token}\r\nX-Webhook-Secret: not-the-secret\r\n"),
+            ))
+            .await;
+        assert_eq!(wrong.status, 401, "{}", wrong.text);
+        assert!(wrong.text.contains("X-Webhook-Secret"), "{}", wrong.text);
+        gateway.stop().await;
+    });
+}
+
+#[test]
 fn a_relay_connection_serves_only_its_dashboard_host() {
     on_runtime(|| async {
         let gateway = Gateway::start().await;

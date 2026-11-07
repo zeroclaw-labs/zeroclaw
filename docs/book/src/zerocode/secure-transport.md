@@ -605,8 +605,8 @@ What the relay does not get, even so:
   after the browser leaves. So on these connections the gateway refuses
   pairing (`POST /pair`, `POST /api/pair`, and minting a code) before it reads
   the code or counts the attempt, and refuses any request that presents a
-  token: in `Authorization`, in a `bearer.` WebSocket subprotocol, or in a
-  `token` query parameter. OIDC enrollment (`/oidc/login/{alias}` and the
+  token or secret: in `Authorization`, in `X-Webhook-Secret`, in a `bearer.`
+  WebSocket subprotocol, or in a `token` query parameter. OIDC enrollment (`/oidc/login/{alias}` and the
   device grant) is refused too, because it hands the browser an access token.
   Pair or enroll on a direct connection to the gateway instead.
 - **More than the signed-in user may do.** Authorization stays at the

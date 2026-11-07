@@ -118,11 +118,13 @@ impl RelayConnection {
 
 /// Whether `request` presents a credential other than a dashboard session
 /// cookie: an `Authorization` header, a `bearer.` WebSocket subprotocol or a
-/// `token` query parameter, every place the gateway reads a bearer from.
+/// `token` query parameter, every place the gateway reads a bearer from, or
+/// the `X-Webhook-Secret` header `/webhook` reads its shared secret from.
 /// A signed-in dashboard sends none of them.
 fn presents_a_credential<B>(request: &Request<B>) -> bool {
     let headers = request.headers();
     headers.contains_key(header::AUTHORIZATION)
+        || headers.contains_key(WEBHOOK_SECRET)
         || headers
             .get_all(header::SEC_WEBSOCKET_PROTOCOL)
             .iter()
@@ -142,6 +144,9 @@ fn presents_a_credential<B>(request: &Request<B>) -> bool {
 
 /// The WebSocket subprotocol prefix that carries a bearer.
 const BEARER_PROTOCOL: &str = "bearer.";
+
+/// The header `/webhook` reads the gateway's webhook secret from.
+const WEBHOOK_SECRET: &str = "x-webhook-secret";
 
 /// Route layer for the routes that issue or redeem a pairing code. A request
 /// a relay forwarded is refused before the handler runs, so its code is
@@ -299,6 +304,7 @@ mod tests {
         for (uri, extra) in [
             ("/api/status", vec![("authorization", "Bearer zc_paired")]),
             ("/api/status", vec![("authorization", "Basic dXNlcjpwYXNz")]),
+            ("/webhook", vec![("X-Webhook-Secret", "hook-secret")]),
             (
                 "/ws/chat",
                 vec![("sec-websocket-protocol", "zeroclaw.v1, bearer.zc_paired")],
