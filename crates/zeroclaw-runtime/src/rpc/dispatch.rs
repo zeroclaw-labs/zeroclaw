@@ -53746,6 +53746,12 @@ mod tests {
             delete_after_next_read: std::sync::atomic::AtomicBool,
             deleted: std::sync::atomic::AtomicBool,
             writes: std::sync::atomic::AtomicUsize,
+            /// Ownership claims held by this fixture. The retirement scenarios
+            /// create sessions through RPC Chat, whose admission requires a
+            /// backend with the atomic agent-ownership contract; the inner
+            /// JSONL store does not implement it, so the fixture records the
+            /// claim here instead of weakening the production gate.
+            claims: std::sync::Mutex<std::collections::HashMap<String, String>>,
         }
 
         impl DeletedAfterReadBackend {
@@ -53810,6 +53816,25 @@ mod tests {
                 self.wrote();
                 self.inner.set_session_agent_alias(session_key, agent_alias)
             }
+
+            fn claim_session_agent_alias(
+                &self,
+                session_key: &str,
+                agent_alias: &str,
+            ) -> std::io::Result<zeroclaw_infra::session_backend::ClaimOutcome> {
+                use zeroclaw_infra::session_backend::ClaimOutcome;
+                let mut claims = self.claims.lock().expect("claim map poisoned");
+                match claims.get(session_key) {
+                    Some(owner) if owner != agent_alias => {
+                        Ok(ClaimOutcome::Conflict(owner.clone()))
+                    }
+                    Some(_) => Ok(ClaimOutcome::Claimed),
+                    None => {
+                        claims.insert(session_key.to_string(), agent_alias.to_string());
+                        Ok(ClaimOutcome::Claimed)
+                    }
+                }
+            }
             fn rewrite_messages(
                 &self,
                 session_key: &str,
@@ -53849,6 +53874,7 @@ mod tests {
                         delete_after_next_read: std::sync::atomic::AtomicBool::new(false),
                         deleted: std::sync::atomic::AtomicBool::new(false),
                         writes: std::sync::atomic::AtomicUsize::new(0),
+                        claims: std::sync::Mutex::new(std::collections::HashMap::new()),
                     });
                     let queue = Arc::new(SessionActorQueue::new(32, 30, 600));
                     let sessions = Arc::new(SessionStore::new(64, queue));
