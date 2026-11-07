@@ -273,11 +273,24 @@ pub fn routes() -> Router<AppState> {
 /// Same routes over a caller-supplied state, so a test can hold the budget
 /// and semaphore handles the routes are enforcing.
 pub(crate) fn routes_with(enrollment_state: Arc<OidcEnrollmentState>) -> Router<AppState> {
+    // Enrollment hands its token to the page or the poller, which a relay
+    // serving the dashboard would read: refused there, before any flow.
+    let no_relayed_enrollment =
+        axum::middleware::from_fn(crate::relay_ingress::no_enrollment_through_a_relay);
     Router::new()
         .route("/api/oidc/providers", get(handle_providers))
-        .route("/api/oidc/{alias}/device/start", post(handle_device_start))
-        .route("/api/oidc/{alias}/device/poll", post(handle_device_poll))
-        .route("/oidc/login/{alias}", get(handle_pkce_login))
+        .route(
+            "/api/oidc/{alias}/device/start",
+            post(handle_device_start).layer(no_relayed_enrollment.clone()),
+        )
+        .route(
+            "/api/oidc/{alias}/device/poll",
+            post(handle_device_poll).layer(no_relayed_enrollment.clone()),
+        )
+        .route(
+            "/oidc/login/{alias}",
+            get(handle_pkce_login).layer(no_relayed_enrollment),
+        )
         .route("/oidc/callback", get(handle_pkce_callback))
         .route("/auth/sign-in/{alias}", get(handle_dashboard_sign_in))
         .route("/api/auth/methods", get(handle_auth_methods))
@@ -1207,12 +1220,7 @@ fn failure_page(status: StatusCode) -> Response {
 /// token to `window.opener` via `postMessage` with this page's own
 /// origin as the target, plus a manual copy fallback. The token reaches
 /// the page only as a JSON string literal inside the inline script.
-fn success_page(
-    provider: &str,
-    access_token: &str,
-    expires_in: Option<u64>,
-    via_relay: bool,
-) -> Response {
+fn success_page(provider: &str, access_token: &str, expires_in: Option<u64>) -> Response {
     // `</` cannot appear inside the script element, whatever the IdP
     // returned; JSON string escaping handles the rest.
     let token_json = serde_json::to_string(access_token)
@@ -1224,19 +1232,12 @@ fn success_page(
     let expires_note = expires_in
         .map(|secs| format!("<p>The token expires in {secs} seconds.</p>"))
         .unwrap_or_default();
-    let relay_note = if via_relay {
-        "<p><strong>This page reached you through a relay.</strong> The relay's \
-         operator can read this token. Use it only if you trust that relay; \
-         zerocode connects end-to-end.</p>"
-    } else {
-        ""
-    };
     Html(format!(
         "<!doctype html><meta charset=\"utf-8\"><title>Signed in</title>\
          <body style=\"font-family:system-ui;margin:3rem\">\
          <h1>Signed in</h1>\
          <p>Enrollment is complete. If the application does not pick the token up \
-         automatically, copy it below and close this tab.</p>{relay_note}{expires_note}\
+         automatically, copy it below and close this tab.</p>{expires_note}\
          <p><code id=\"token\" style=\"word-break:break-all\"></code></p>\
          <script>(function () {{\
            var token = {token_json};\
@@ -1280,6 +1281,12 @@ async fn handle_pkce_callback(
     let Some(pending) = query.state.as_deref().and_then(|s| relay.flows.consume(s)) else {
         return unproductive_callback(&relay, &key, StatusCode::BAD_REQUEST);
     };
+    // An enrollment flow can't start through a relay, but its callback could
+    // still arrive through one. Its token page would then reach the relay, so
+    // the flow ends here, spent, with its code never exchanged.
+    if via_relay.is_some() && matches!(pending.mode, FlowMode::Enrollment) {
+        return crate::relay_ingress::enrollment_refused();
+    }
     // RFC 9207: a response that names another issuer is a mix-up, and is
     // not acted on either way — neither its code nor its error verdict.
     if let Err(e) = pending.flow.check_callback_issuer(query.iss.as_deref()) {
@@ -1426,7 +1433,6 @@ async fn handle_pkce_callback(
             &format!("oidc.{alias}"),
             &token.access_token,
             token.expires_in,
-            via_relay.is_some(),
         ),
         (
             FlowMode::Dashboard {
@@ -2050,44 +2056,101 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_relay_forwarded_login_calls_back_to_the_dashboard_origin_never_the_host() {
-        let server = idp().await;
-        let mut state = crate::api::tests::test_state(config_with_alias(&server.uri(), "corp"));
+    /// `request`, admitted as the accept loop admits a connection a relay
+    /// forwarded for the dashboard at `abc.relay.example`.
+    fn relayed(mut request: HttpRequest<Body>) -> HttpRequest<Body> {
+        crate::relay_ingress::RelayConnection::new(
+            zeroclaw_runtime::relay_dashboard::DashboardOrigin::new("abc.relay.example", 443)
+                .unwrap(),
+        )
+        .admit(&mut request)
+        .unwrap();
+        request
+    }
+
+    #[test]
+    fn a_relay_forwarded_sign_in_calls_back_to_the_dashboard_origin_never_the_host() {
+        let mut state = crate::api::tests::test_state(Config::default());
         // A proxy in front of the listener is trusted; the relay path must
         // not be steered by what that trust would otherwise accept.
         state.trust_forwarded_headers = true;
-        let router = routes().with_state(state);
-        let relay = crate::relay_ingress::RelayConnection::new(
-            zeroclaw_runtime::relay_dashboard::DashboardOrigin::new("abc.relay.example", 443)
-                .unwrap(),
-        );
-        let mut request = build_request(
+        let request = relayed(build_request(
             "GET",
-            "/oidc/login/corp",
+            "/auth/sign-in/corp",
             "abc.relay.example",
             None,
             remote(),
             &[],
-        );
-        relay.admit(&mut request).unwrap();
+        ));
+        let via_relay = request.extensions().get::<ViaRelay>().cloned();
         // Whatever Host and scheme the request then claims, the callback is
         // the dashboard's origin: the relay routes by the TLS server name,
         // so the Host is not what decided where this request went.
-        let headers = request.headers_mut();
+        let mut headers = request.headers().clone();
         headers.insert(header::HOST, HeaderValue::from_static("evil.example"));
         headers.insert("x-forwarded-proto", HeaderValue::from_static("http"));
-        let response = router.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
-        let redirect_uri = header_value(&response, "location")
-            .split('&')
-            .find_map(|pair| pair.strip_prefix("redirect_uri="))
-            .unwrap_or_default()
-            .to_string();
         assert_eq!(
-            redirect_uri,
-            query_escape("https://abc.relay.example/oidc/callback")
+            callback_uri(&state, &headers, via_relay.as_ref()).unwrap(),
+            "https://abc.relay.example/oidc/callback"
         );
+    }
+
+    #[tokio::test]
+    async fn enrollment_is_refused_through_a_relay_before_any_flow_starts() {
+        let server = idp().await;
+        let router = router_for(config_with_alias(&server.uri(), "corp"));
+        for (method, path) in [
+            ("GET", "/oidc/login/corp"),
+            ("POST", "/api/oidc/corp/device/start"),
+            ("POST", "/api/oidc/corp/device/poll"),
+        ] {
+            let request = relayed(build_request(
+                method,
+                path,
+                "abc.relay.example",
+                None,
+                remote(),
+                &[],
+            ));
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+            let body = body_text(response).await;
+            assert!(
+                body.contains("Enrollment isn't available through a relay"),
+                "{path}: {body}"
+            );
+        }
+        assert_eq!(total_requests(&server).await, 0, "no discovery, no flow");
+    }
+
+    #[tokio::test]
+    async fn an_enrollment_callback_through_a_relay_never_exchanges_its_code() {
+        let server = idp().await;
+        let router = router_for(config_with_alias(&server.uri(), "corp"));
+        // Started directly; its callback then arrives through the relay.
+        let flow_state = start_login(&router).await;
+        let request = relayed(build_request(
+            "GET",
+            &format!("/oidc/callback?code=auth-1&state={flow_state}"),
+            "abc.relay.example",
+            None,
+            remote(),
+            &[],
+        ));
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(!body_text(response).await.contains("zeroclaw-oidc-token"));
+        assert_eq!(requests_to(&server, "/token").await, 0, "no code exchange");
+        // And the flow is spent.
+        let response = send(
+            &router,
+            "GET",
+            &format!("/oidc/callback?code=auth-1&state={flow_state}"),
+            "gw.local",
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -2117,14 +2180,6 @@ mod tests {
         let relayed = router.oneshot(request).await.unwrap();
         assert_eq!(relayed.status(), StatusCode::OK);
         assert_eq!(body_json(relayed).await["via_relay"], true);
-    }
-
-    #[tokio::test]
-    async fn the_token_page_says_when_a_relay_could_read_the_token() {
-        let direct = body_text(success_page("oidc.corp", "tok", None, false)).await;
-        assert!(!direct.contains("through a relay"), "{direct}");
-        let relayed = body_text(success_page("oidc.corp", "tok", None, true)).await;
-        assert!(relayed.contains("reached you through a relay"), "{relayed}");
     }
 
     #[tokio::test]

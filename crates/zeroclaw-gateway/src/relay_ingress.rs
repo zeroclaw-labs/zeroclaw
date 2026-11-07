@@ -22,7 +22,9 @@
 //!   elsewhere is worth nothing here. The routes that issue or redeem a
 //!   pairing code refuse a relayed request too ([`no_pairing_through_a_relay`]),
 //!   before the code or any limiter is consulted: a code typed or shown here
-//!   would be the relay's to redeem.
+//!   would be the relay's to redeem. So do the OIDC enrollment routes
+//!   ([`no_enrollment_through_a_relay`]), which hand an access token to the
+//!   page or the poller.
 
 use std::sync::Arc;
 
@@ -37,6 +39,11 @@ use zeroclaw_runtime::relay_dashboard::DashboardOrigin;
 const CREDENTIAL_REFUSED: &str = "This dashboard is served through a relay, which can read \
      everything sent through it, so it accepts only dashboard sign-in. Sign in with a \
      provider instead of a paired token, or connect to the gateway directly.";
+
+/// Why a relayed request for an OIDC enrollment route was refused.
+const ENROLLMENT_REFUSED: &str = "Enrollment isn't available through a relay: the relay would \
+     see the issued token. Sign in with a provider to use this dashboard, or enroll on a \
+     direct connection to the gateway.";
 
 /// Why a relayed request for a pairing route was refused.
 const PAIRING_REFUSED: &str = "Pairing isn't available through a relay: the relay would see \
@@ -147,6 +154,24 @@ pub(crate) async fn no_pairing_through_a_relay(
         return refused(StatusCode::FORBIDDEN, PAIRING_REFUSED);
     }
     next.run(request).await
+}
+
+/// Route layer for the OIDC enrollment routes, which hand the issued access
+/// token to the page or the poller. A request a relay forwarded is refused
+/// before the handler runs, so no flow starts and nothing is billed.
+pub(crate) async fn no_enrollment_through_a_relay(
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    if request.extensions().get::<ViaRelay>().is_some() {
+        return enrollment_refused();
+    }
+    next.run(request).await
+}
+
+/// The refusal for an enrollment reached through a relay.
+pub(crate) fn enrollment_refused() -> Response {
+    refused(StatusCode::FORBIDDEN, ENROLLMENT_REFUSED)
 }
 
 fn refused(status: StatusCode, error: &str) -> Response {
