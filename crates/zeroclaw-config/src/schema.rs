@@ -8517,10 +8517,12 @@ pub struct RelayConfig {
 /// relay must not be trusted.
 ///
 /// The gateway serves these connections as the browser's, never as a local
-/// peer, and builds every URL it hands them from this origin. Requires
-/// `[relay]` enabled with a verified relay certificate,
-/// `gateway.require_pairing = true` and no `gateway.path_prefix`. The relay
-/// must list this daemon in its own `[dashboard] allow`.
+/// peer, and builds every URL it hands them from this origin. It refuses
+/// pairing and paired tokens on them, which the relay would see, so people
+/// sign in through `[gateway.dashboard_sign_in]`. Requires `[relay]` enabled
+/// with a verified relay certificate, `gateway.require_pairing = true`,
+/// dashboard sign-in with at least one provider, and no `gateway.path_prefix`.
+/// The relay must list this daemon in its own `[dashboard] allow`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "relay.dashboard"]
@@ -14634,6 +14636,15 @@ impl Config {
                 ValidationFailed,
                 "gateway.require_pairing",
                 "[relay.dashboard] needs gateway.require_pairing = true: with pairing off the dashboard would be open to anyone who reaches the relay address",
+            );
+        }
+        // Pairing and paired tokens are refused through the relay, which
+        // would see the code or token, so sign-in is the only way in.
+        if !self.gateway.dashboard_sign_in.enabled() {
+            validation_bail!(
+                ValidationFailed,
+                "gateway.dashboard_sign_in.oidc",
+                "[relay.dashboard] needs [gateway.dashboard_sign_in] with at least one provider: pairing and paired tokens are refused through the relay, which would see them, so dashboard sign-in is the only way in",
             );
         }
         // `__Host-` cookies need the root path.
@@ -30878,6 +30889,7 @@ zeroclaw-operators = "operator"
             config.relay.url = "relay.example.com:443".into();
             config.relay.dashboard.enabled = true;
             config.relay.dashboard.domain = "relay.example.com".into();
+            config.gateway.dashboard_sign_in.oidc = vec!["corp".into()];
             config
         };
         ready()
@@ -30911,6 +30923,12 @@ zeroclaw-operators = "operator"
         refused(
             |c| c.gateway.require_pairing = false,
             "require_pairing = true",
+        );
+        // Without a sign-in provider nobody could use it: pairing is
+        // refused through the relay.
+        refused(
+            |c| c.gateway.dashboard_sign_in.oidc.clear(),
+            "needs [gateway.dashboard_sign_in] with at least one provider",
         );
         refused(
             |c| c.gateway.path_prefix = Some("/zc".into()),
