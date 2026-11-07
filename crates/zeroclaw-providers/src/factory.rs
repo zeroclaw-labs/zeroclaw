@@ -3398,6 +3398,55 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn minimax_default_flash_chat_serializes_model_without_injecting_reasoning_effort() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use serde_json::Value;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured_route = Arc::clone(&captured);
+        let app = Router::new()
+            .route(
+                "/chat/completions",
+                post(
+                    move |State(captured): State<Arc<Mutex<Vec<Value>>>>,
+                          Json(body): Json<Value>| async move {
+                        captured.lock().unwrap().push(body);
+                        Json(serde_json::json!({"choices":[{"message":{"content":"ok"}}]}))
+                    },
+                ),
+            )
+            .with_state(captured_route);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let provider = MinimaxModelProviderConfig::default()
+            .create_provider(
+                "intl",
+                Some("test-key"),
+                Some(&format!("http://{address}")),
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            provider
+                .chat_with_system(None, "hello", "MiniMax-M3.1-Flash", None)
+                .await
+                .unwrap(),
+            "ok"
+        );
+        server.abort();
+        let body = captured.lock().unwrap().pop().unwrap();
+        assert_eq!(body["model"], "MiniMax-M3.1-Flash");
+        assert!(body.get("reasoning_effort").is_none());
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][0]["content"], "hello");
+    }
+
     #[test]
     fn compat_family_factory_defaults_to_chat_completions_without_wire_api() {
         let cfg = OpencodeModelProviderConfig::default();
