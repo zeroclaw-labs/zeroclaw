@@ -2,7 +2,7 @@
 //!
 //! The relay bridge hands such a connection over in process
 //! ([`zeroclaw_runtime::relay_dashboard`]); the accept loop serves it like a
-//! TCP connection, with three differences decided here, before routing:
+//! TCP connection, with these differences decided here, before routing:
 //!
 //! - **The peer is the browser.** `ConnectInfo` is the browser's address as
 //!   the relay reported it, which is never loopback, so every loopback check
@@ -16,13 +16,32 @@
 //!   is refused with 421, and the request carries a [`ViaRelay`] marker that
 //!   the scheme, callback URI and own-origin decisions read instead of the
 //!   request's `Host`.
+//! - **Only a dashboard sign-in authenticates.** The relay ends the
+//!   browser's TLS, so it reads every byte of these requests. A request that
+//!   presents any other credential is refused with 401, so a token paired
+//!   elsewhere is worth nothing here. The routes that issue or redeem a
+//!   pairing code refuse a relayed request too ([`no_pairing_through_a_relay`]),
+//!   before the code or any limiter is consulted: a code typed or shown here
+//!   would be the relay's to redeem.
 
 use std::sync::Arc;
 
 use axum::Json;
+use axum::extract::Query;
 use axum::http::{HeaderMap, HeaderName, Request, StatusCode, header};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use zeroclaw_runtime::relay_dashboard::DashboardOrigin;
+
+/// Why a relayed request that presented a credential was refused.
+const CREDENTIAL_REFUSED: &str = "This dashboard is served through a relay, which can read \
+     everything sent through it, so it accepts only dashboard sign-in. Sign in with a \
+     provider instead of a paired token, or connect to the gateway directly.";
+
+/// Why a relayed request for a pairing route was refused.
+const PAIRING_REFUSED: &str = "Pairing isn't available through a relay: the relay would see \
+     the pairing code. Sign in with a provider instead, or pair on a direct connection to \
+     the gateway.";
 
 /// Marks a request that reached the gateway through a relay-served
 /// dashboard, with the origin that dashboard is served at.
@@ -62,6 +81,12 @@ impl RelayConnection {
         if !self.names_this_dashboard(request) {
             return Err(Box::new(misdirected(&self.origin)));
         }
+        if presents_a_credential(request) {
+            return Err(Box::new(refused(
+                StatusCode::UNAUTHORIZED,
+                CREDENTIAL_REFUSED,
+            )));
+        }
         request.extensions_mut().insert(self.marker.clone());
         Ok(())
     }
@@ -82,6 +107,50 @@ impl RelayConnection {
                 .authority()
                 .is_none_or(|authority| self.origin.is_named_by(authority.as_str()))
     }
+}
+
+/// Whether `request` presents a credential other than a dashboard session
+/// cookie: an `Authorization` header, a `bearer.` WebSocket subprotocol or a
+/// `token` query parameter, every place the gateway reads a bearer from.
+/// A signed-in dashboard sends none of them.
+fn presents_a_credential<B>(request: &Request<B>) -> bool {
+    let headers = request.headers();
+    headers.contains_key(header::AUTHORIZATION)
+        || headers
+            .get_all(header::SEC_WEBSOCKET_PROTOCOL)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|protocols| protocols.split(','))
+            .any(|protocol| {
+                protocol
+                    .trim()
+                    .get(..BEARER_PROTOCOL.len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(BEARER_PROTOCOL))
+            })
+        // Decoded as the handlers decode it, so an escaped name is caught
+        // too. A query that doesn't decode can't deliver a token to them.
+        || Query::<Vec<(String, String)>>::try_from_uri(request.uri())
+            .is_ok_and(|Query(pairs)| pairs.iter().any(|(name, _)| name == "token"))
+}
+
+/// The WebSocket subprotocol prefix that carries a bearer.
+const BEARER_PROTOCOL: &str = "bearer.";
+
+/// Route layer for the routes that issue or redeem a pairing code. A request
+/// a relay forwarded is refused before the handler runs, so its code is
+/// never read and no rate-limit or failed-attempt entry is written for it.
+pub(crate) async fn no_pairing_through_a_relay(
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    if request.extensions().get::<ViaRelay>().is_some() {
+        return refused(StatusCode::FORBIDDEN, PAIRING_REFUSED);
+    }
+    next.run(request).await
+}
+
+fn refused(status: StatusCode, error: &str) -> Response {
+    (status, Json(serde_json::json!({ "error": error }))).into_response()
 }
 
 /// Remove every header a proxy would use to report the client's address,
@@ -198,5 +267,58 @@ mod tests {
             assert!(!headers.contains_key(gone), "{gone}");
         }
         assert_eq!(headers["x-request-id"], "kept");
+    }
+
+    #[test]
+    fn a_request_presenting_any_other_credential_is_refused() {
+        for (uri, extra) in [
+            ("/api/status", vec![("authorization", "Bearer zc_paired")]),
+            ("/api/status", vec![("authorization", "Basic dXNlcjpwYXNz")]),
+            (
+                "/ws/chat",
+                vec![("sec-websocket-protocol", "zeroclaw.v1, bearer.zc_paired")],
+            ),
+            (
+                "/ws/chat",
+                vec![("sec-websocket-protocol", "Bearer.zc_paired")],
+            ),
+            (
+                "/ws/chat",
+                vec![
+                    ("sec-websocket-protocol", "zeroclaw.v1"),
+                    ("sec-websocket-protocol", "bearer.zc_paired"),
+                ],
+            ),
+            ("/ws/chat?token=zc_paired", vec![]),
+            ("/ws/chat?session_id=1&%74oken=zc_paired", vec![]),
+        ] {
+            let mut headers = vec![("host", "abc.relay.example")];
+            headers.extend(extra);
+            let mut refused = request(uri, &headers);
+            let response = connection().admit(&mut refused).unwrap_err();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{uri} {headers:?}"
+            );
+            assert!(refused.extensions().get::<ViaRelay>().is_none());
+        }
+        // What a signed-in dashboard sends is admitted: its own subprotocol,
+        // its session cookie, query names that merely contain "token".
+        for (uri, extra) in [
+            (
+                "/ws/chat?session_id=1",
+                vec![("sec-websocket-protocol", "zeroclaw.v1")],
+            ),
+            (
+                "/api/cost?max_tokens=10",
+                vec![("cookie", "__Host-zeroclaw_session=abc")],
+            ),
+        ] {
+            let mut headers = vec![("host", "abc.relay.example")];
+            headers.extend(extra);
+            let mut admitted = request(uri, &headers);
+            connection().admit(&mut admitted).unwrap();
+        }
     }
 }

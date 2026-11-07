@@ -2482,6 +2482,9 @@ pub async fn run_gateway_with_plugin_webhooks(
     };
 
     let dashboard_layer_state = state.clone();
+    // On every route that issues or redeems a pairing code: refused through a
+    // relay-served dashboard, where the relay would see the code.
+    let no_relayed_pairing = axum::middleware::from_fn(relay_ingress::no_pairing_through_a_relay);
 
     // Build router with middleware
     let inner = Router::new()
@@ -2499,7 +2502,10 @@ pub async fn run_gateway_with_plugin_webhooks(
         // ── Existing routes ──
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
-        .route("/pair", post(handle_pair))
+        .route(
+            "/pair",
+            post(handle_pair).layer(no_relayed_pairing.clone()),
+        )
         .route("/pair/code", get(handle_pair_code))
         .route("/webhook", post(handle_webhook))
         .merge(sop_webhook_routes())
@@ -2674,8 +2680,14 @@ pub async fn run_gateway_with_plugin_webhooks(
         .route("/api/sessions/{id}/state", get(api::handle_api_session_state))
         .route("/api/sessions/{id}/abort", post(api::handle_api_session_abort))
         // ── Pairing + Device management API ──
-        .route("/api/pairing/initiate", post(api_pairing::initiate_pairing))
-        .route("/api/pair", post(api_pairing::submit_pairing_enhanced))
+        .route(
+            "/api/pairing/initiate",
+            post(api_pairing::initiate_pairing).layer(no_relayed_pairing.clone()),
+        )
+        .route(
+            "/api/pair",
+            post(api_pairing::submit_pairing_enhanced).layer(no_relayed_pairing.clone()),
+        )
         .route("/api/devices", get(api_pairing::list_devices))
         .route(
             "/api/devices/me/capabilities",
@@ -2684,7 +2696,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         .route("/api/devices/{id}", delete(api_pairing::revoke_device))
         .route(
             "/api/devices/{id}/token/rotate",
-            post(api_pairing::rotate_token),
+            post(api_pairing::rotate_token).layer(no_relayed_pairing),
         )
         // ── Live Canvas (A2UI) routes ──
         .route("/api/canvas", get(canvas::handle_canvas_list))
