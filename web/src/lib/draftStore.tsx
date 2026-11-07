@@ -26,6 +26,7 @@ import {
   type PatchResponse,
   type ProviderRegistryDocument,
 } from './api';
+import { t } from './i18n';
 
 type DraftEntry = {
   /** Raw input text the user has typed, as it appears in the input box. */
@@ -246,6 +247,12 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
     for (const path of tombstones) {
       if (draftedPaths.has(path)) continue;
       ops.push({ op: 'remove', path });
+    }
+    // Registry replacement and dotted-property PATCH use separate server
+    // transactions. Refuse to partially commit a mixed Save All request;
+    // save the registry from its editor first, then save the remaining draft.
+    if (providerRegistryDraft?.dirty && ops.length > 0) {
+      throw new Error(t('unsaved_banner.registry_save_separately'));
     }
     if (providerRegistryDraft?.dirty) {
       const registry: Record<string, unknown> = {};

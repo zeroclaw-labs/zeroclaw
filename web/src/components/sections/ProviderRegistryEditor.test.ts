@@ -11,7 +11,7 @@ Object.assign(globalThis, {
   IS_REACT_ACT_ENVIRONMENT: true,
 });
 const { default: Editor } = await import('./ProviderRegistryEditor.tsx');
-const { ConfigDraftProvider } = await import('../../lib/draftStore.tsx');
+const { ConfigDraftProvider, useConfigDraft } = await import('../../lib/draftStore.tsx');
 const { useModelProfileAliases } = await import('../../lib/useModelProfileAliases.ts');
 const { configuredResourceIds } = await import('../../lib/configuredModels.ts');
 const original = {
@@ -33,11 +33,16 @@ function renderEditor(children: React.ReactElement) {
 test('registry editor saves exact keys and the original masked baseline atomically', async () => {
   let current = structuredClone(original);
   let saved: { expected: typeof original; registry: typeof original } | undefined;
+  const requests: Array<{ expected: typeof original; registry: typeof original }> = [];
   let saves = 0;
   globalThis.fetch = async (_input, init) => {
     if (init?.method === 'PUT') {
       saved = JSON.parse(init.body as string);
-      current = saved!.registry;
+      requests.push(saved!);
+      current = structuredClone(saved!.registry);
+      // The real endpoint always returns a masked snapshot after preserving a
+      // newly submitted credential. A later CAS must use this projection.
+      current.connections['gateway.prod'].auth.api_key = '********';
     }
     return new Response(JSON.stringify(init?.method === 'PUT' ? { saved: true } : current), { headers: { 'Content-Type': 'application/json' } });
   };
@@ -65,6 +70,17 @@ test('registry editor saves exact keys and the original masked baseline atomical
     assert.equal(saved?.registry.models['chat.fast.us'].model, 'after');
     assert.deepEqual(saved?.registry.connections, original.connections);
     assert.equal(saves, 1);
+
+    // A second save must compare against the server's masked document, not the
+    // plaintext candidate submitted by the first save.
+    const modelTab = renderer!.root.findAllByType('button').find((button) => String(button.props.children).includes('Models'))!;
+    await act(async () => modelTab.props.onClick());
+    const modelTextarea = renderer!.root.findByType('textarea');
+    await act(async () => modelTextarea.props.onChange({ target: { value: JSON.stringify({ 'chat.fast.us': { ...original.models['chat.fast.us'], model: 'after-again' } }) } }));
+    await act(async () => { renderer!.root.findAllByType('button').find((button) => String(button.props.children).includes('Save'))!.props.onClick(); });
+    assert.equal(requests.length, 2);
+    const second = requests[1]!;
+    assert.equal(second.expected.connections['gateway.prod'].auth.api_key, '********');
   } finally { await act(async () => renderer?.unmount()); }
 });
 
@@ -122,6 +138,26 @@ test('registry drafts survive leaving and returning to the config section', asyn
     await act(async () => showEditor(true));
     assert.equal(renderer!.root.findByType('textarea').props.value, edited);
     assert.equal(reads, 1);
+  } finally { await act(async () => renderer?.unmount()); }
+});
+
+test('banner discard reloads the mounted editor from the server', async () => {
+  globalThis.fetch = async () => new Response(JSON.stringify(original), { headers: { 'Content-Type': 'application/json' } });
+  let discard!: () => void;
+  function Harness() {
+    discard = useConfigDraft().discardAll;
+    return createElement(Editor, { onSaved: () => undefined });
+  }
+  let renderer: ReactTestRenderer | undefined;
+  try {
+    await act(async () => {
+      renderer = create(createElement(ConfigDraftProvider, null, createElement(MemoryRouter, null, createElement(Harness))));
+    });
+    const textarea = renderer!.root.findByType('textarea');
+    await act(async () => textarea.props.onChange({ target: { value: JSON.stringify({}) } }));
+    assert.deepEqual(JSON.parse(renderer!.root.findByType('textarea').props.value), {});
+    await act(async () => discard());
+    assert.match(renderer!.root.findByType('textarea').props.value, /gateway\.prod/);
   } finally { await act(async () => renderer?.unmount()); }
 });
 

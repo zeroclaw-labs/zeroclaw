@@ -29,7 +29,6 @@ export default function ProviderRegistryEditor({ onSaved }: { onSaved: () => voi
   const {
     providerRegistryDraft,
     setProviderRegistryDraft,
-    clearProviderRegistryDraft,
   } = useConfigDraft();
 
   const load = useCallback(async () => {
@@ -47,10 +46,16 @@ export default function ProviderRegistryEditor({ onSaved }: { onSaved: () => voi
   }, [setProviderRegistryDraft]);
 
   useEffect(() => {
-    if (loadedThisMount.current) return;
-    loadedThisMount.current = true;
-    if (!providerRegistryDraft?.dirty) void load();
-  }, [load, providerRegistryDraft?.dirty]);
+    if (!loadedThisMount.current) {
+      loadedThisMount.current = true;
+      // A dirty draft belongs to the shared store and must survive remounts.
+      if (!providerRegistryDraft?.dirty) void load();
+      return;
+    }
+    // Save all and discard all clear the shared draft while this editor stays
+    // mounted. Re-read the masked server document so the editor remains usable.
+    if (!providerRegistryDraft) void load();
+  }, [load, providerRegistryDraft]);
   useEffect(() => { if (selectedModel) setSection('models'); }, [selectedModel]);
 
   const save = async () => {
@@ -62,11 +67,10 @@ export default function ProviderRegistryEditor({ onSaved }: { onSaved: () => voi
         sections.map((key) => [key, JSON.parse(registrySections[key])]),
       ) as ProviderRegistryDocument;
       await saveProviderRegistry(providerRegistryDraft.expected, candidate);
-      setProviderRegistryDraft({
-        expected: candidate,
-        sections: sectionDraft(candidate),
-        dirty: false,
-      });
+      // The PUT accepts masked credentials and the server restores/re-masks
+      // them. Refresh the canonical snapshot instead of using the submitted
+      // candidate as the next CAS baseline.
+      await load();
       setError('');
       onSaved();
     } catch (cause) { setError(String(cause)); }
@@ -74,7 +78,6 @@ export default function ProviderRegistryEditor({ onSaved }: { onSaved: () => voi
   };
 
   const reload = () => {
-    clearProviderRegistryDraft();
     setError('');
     void load();
   };

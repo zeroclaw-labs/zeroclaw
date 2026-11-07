@@ -1156,6 +1156,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'unsaved_banner.saving': "Saving…",
     'unsaved_banner.unsaved_change': "unsaved change",
     'unsaved_banner.unsaved_changes': "unsaved changes",
+    'unsaved_banner.registry_save_separately': "Save the provider registry with its editor first, then save the other configuration changes. These two updates cannot be committed atomically.",
     'validation_warning.security_audit_disabled_drops_certificate_record': 'Audit logging is off, so certificate issuance and renewal have no audit-log record. Command execution is not audited under either setting: use an external supervisor, a process-observing logging wrapper, or OS-level process accounting if you need a record of what ran.',
     'workspace.back_to_chat_prefix': "Back to chat",
     'workspace.binary_file_prefix': "Binary file",
