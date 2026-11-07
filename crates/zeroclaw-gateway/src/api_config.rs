@@ -3692,7 +3692,11 @@ mod tests {
             )
             .unwrap(),
         );
-        let router = crate::config_admin_router(&auth).with_state(state.clone());
+        let router = crate::config_admin_router(crate::principal_gate::ConfigRouteAuth::new(
+            &auth,
+            &state.config,
+        ))
+        .with_state(state.clone());
         let read = || {
             axum::http::Request::builder()
                 .uri("/api/config/reload-status")
@@ -6334,7 +6338,11 @@ mod tests {
             )
             .unwrap(),
         );
-        let router = crate::config_admin_router(&auth).with_state(state.clone());
+        let router = crate::config_admin_router(crate::principal_gate::ConfigRouteAuth::new(
+            &auth,
+            &state.config,
+        ))
+        .with_state(state.clone());
         let response = router
             .oneshot(
                 axum::http::Request::builder()
