@@ -4859,10 +4859,13 @@ impl Config {
                 })
             })
             // A direct/injected provider may intentionally have no matching
-            // config entry. Its legacy reasoning behavior is admitted at the
-            // runtime injection boundary; an unknown config reference remains
-            // fail-closed for both text parsers.
-            .unwrap_or_default()
+            // config entry. Preserve the pre-registry injected-provider
+            // contract here; concrete canonical/legacy selections above use
+            // their model-owned or provider-specific defaults.
+            .unwrap_or(crate::provider_registry::TextExtraction {
+                reasoning: true,
+                tool_calls: true,
+            })
     }
 
     /// Resolve a model's configured temperature from the canonical registry,
