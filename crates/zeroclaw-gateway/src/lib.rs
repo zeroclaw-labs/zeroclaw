@@ -9513,11 +9513,7 @@ path = "{trigger_path}"
 
         assert!(request_is_local(Some(loopback), &HeaderMap::new(), true));
         assert!(request_is_local(Some(loopback), &HeaderMap::new(), false));
-        assert!(!request_is_local(
-            Some(loopback),
-            &forwarded_loopback,
-            true
-        ));
+        assert!(!request_is_local(Some(loopback), &forwarded_loopback, true));
         assert!(!request_is_local(Some(remote), &forwarded_loopback, true));
         assert!(!request_is_local(Some(remote), &HeaderMap::new(), true));
     }
