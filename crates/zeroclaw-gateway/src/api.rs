@@ -335,12 +335,13 @@ pub async fn handle_api_status(
                     Some(agent.model_provider.as_str().to_string())
                 };
                 let resolved = config.resolved_model_provider_for_agent(alias);
-                let model = resolved
-                    .as_ref()
-                    .and_then(|(_, _, cfg)| cfg.model.clone())
+                let model = config
+                    .resolve_model_id(agent.model_provider.as_str())
+                    .or_else(|| resolved.as_ref().and_then(|(_, _, cfg)| cfg.model.clone()))
                     .unwrap_or_default();
-                let temperature: Option<f64> =
-                    resolved.as_ref().and_then(|(_, _, cfg)| cfg.temperature);
+                let temperature: Option<f64> = config
+                    .resolve_model_temperature(agent.model_provider.as_str())
+                    .or_else(|| resolved.as_ref().and_then(|(_, _, cfg)| cfg.temperature));
                 let backend_kind = agent.memory.backend;
                 let backend = serde_json::to_value(backend_kind)
                     .ok()
@@ -1040,7 +1041,16 @@ pub async fn handle_api_doctor(
     }
 
     let config = state.config.read().clone();
-    let results = zeroclaw_runtime::doctor::diagnose(&config);
+    let results = match zeroclaw_runtime::doctor::diagnose_nonblocking(&config).await {
+        Ok(results) => results,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": error.to_string()})),
+            )
+                .into_response();
+        }
+    };
 
     let ok_count = results
         .iter()

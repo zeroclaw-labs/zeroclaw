@@ -313,7 +313,7 @@ pub struct QQChannel {
     proxy_url: Option<String>,
     /// Optional voice transcription manager for QQ audio attachments that do
     /// not already carry QQ platform ASR text.
-    transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
+    transcription_manager: Option<Arc<zeroclaw_providers::transcription::TranscriptionManager>>,
     /// Session ID from the last READY event, used for gateway resume (opcode 6).
     session_id: Arc<RwLock<Option<String>>>,
     /// Last sequence number received, used for gateway resume (opcode 6).
@@ -368,9 +368,12 @@ impl QQChannel {
     /// config and the owning agent's resolved provider; this path can only see
     /// the legacy section, so it binds a lone registered provider and
     /// otherwise leaves the choice unbound (see
-    /// `transcription::manager_from_snapshot`).
+    /// `transcription::build_transcription_manager_from_legacy_config`).
     pub fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
-        let manager = super::transcription::manager_from_snapshot(&config);
+        let manager =
+            zeroclaw_providers::transcription::build_transcription_manager_from_legacy_config(
+                &config,
+            );
         self.with_transcription_manager(config, manager)
     }
 
@@ -380,7 +383,7 @@ impl QQChannel {
     pub(crate) fn with_transcription_manager(
         mut self,
         _config: zeroclaw_config::schema::TranscriptionConfig,
-        manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
+        manager: Option<std::sync::Arc<zeroclaw_providers::transcription::TranscriptionManager>>,
     ) -> Self {
         if let Some(manager) = manager {
             self.transcription_manager = Some(manager);

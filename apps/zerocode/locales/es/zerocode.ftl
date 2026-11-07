@@ -648,6 +648,7 @@ zc-config-group-operations = Operaciones
 zc-config-group-other = Otros
 
 zc-config-section-providers-models-label = Proveedores de modelos
+zc-config-section-providers-registry-label = Registro de proveedores
 zc-config-section-model-routes-label = Rutas de modelos
 zc-config-section-embedding-routes-label = Rutas de embeddings
 zc-config-section-risk-profiles-label = Perfiles de riesgo
@@ -690,6 +691,7 @@ zc-config-section-media-pipeline-label = Canalización multimedia
 zc-config-section-multimodal-label = Multimodal
 
 zc-config-section-providers-models-help = Elige un proveedor de modelos para configurar (Anthropic, OpenAI, OpenRouter, Ollama, puertas de enlace personalizadas compatibles con OpenAI, etc.). Se admiten varios alias por proveedor.
+zc-config-section-providers-registry-help = Edita conjuntamente las conexiones, los modelos, los preajustes de modelos y las reservas como JSON. Intro inserta una línea; Ctrl+S guarda. Para opciones heredadas, omite un campo para heredarlo y usa la cadena "null" para borrarlo. Las referencias se validan y las credenciales enmascaradas sin cambios se conservan. Recarga después de que otro editor modifique el registro.
 zc-config-section-model-routes-help = Indicaciones de enrutamiento de modelos con nombre (por ejemplo, reasoning, fast o code). Cada ruta asigna una indicación a un proveedor y un modelo.
 zc-config-section-embedding-routes-help = Indicaciones de enrutamiento de embeddings con nombre. Cada ruta asigna una indicación a un proveedor y un modelo compatible con embeddings.
 zc-config-section-risk-profiles-help = Perfiles de riesgo con nombre que vinculan listas de permitidos, listas de bloqueados y umbrales de aprobación.

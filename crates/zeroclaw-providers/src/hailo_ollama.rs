@@ -1174,36 +1174,20 @@ impl HailoOllamaModelProvider {
         result.map_err(|error| self.redact_transport_error(error))
     }
 
-    fn strip_think_tags(content: &str) -> String {
-        let mut result = String::new();
-        let mut remaining = content;
-        while let Some(start) = remaining.find("<think>") {
-            result.push_str(&remaining[..start]);
-            let after_start = &remaining[start + "<think>".len()..];
-            let Some(end) = after_start.find("</think>") else {
-                return result;
-            };
-            remaining = &after_start[end + "</think>".len()..];
-        }
-        result.push_str(remaining);
-        result
-    }
-
     fn response_text(response: &ApiChatResponse) -> anyhow::Result<String> {
         // Hailo advertises no extended-thinking capability. The native
         // service can nevertheless place its only non-empty output in the
         // optional `thinking` field, so this compatibility fallback is
         // deliberately returned as ordinary text and not reported as
         // `reasoning_content`.
-        let content = Self::strip_think_tags(&response.message.content);
-        if !content.trim().is_empty() {
-            return Ok(content);
+        // Preserve textual markup for the runtime's model-owned extractors.
+        if !response.message.content.trim().is_empty() {
+            return Ok(response.message.content.clone());
         }
-        if let Some(thinking) = response.message.thinking.as_deref() {
-            let thinking = Self::strip_think_tags(thinking);
-            if !thinking.trim().is_empty() {
-                return Ok(thinking);
-            }
+        if let Some(thinking) = response.message.thinking.as_deref()
+            && !thinking.trim().is_empty()
+        {
+            return Ok(thinking.to_owned());
         }
         anyhow::bail!("Hailo-Ollama returned an empty completed response")
     }

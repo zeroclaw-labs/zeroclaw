@@ -112,6 +112,9 @@ pub fn derive_section_status(cfg: &zeroclaw_config::schema::Config) -> ConfigSta
     let ready = missing.is_empty();
     let has_partial_state = !cfg.onboard_state.completed_sections.is_empty()
         || cfg.providers.models.iter_entries().next().is_some()
+        || cfg.providers.models.has_canonical_models()
+        || !cfg.providers.connections.is_empty()
+        || !cfg.providers.model_presets.is_empty()
         || !cfg.risk_profiles.is_empty()
         || !cfg.runtime_profiles.is_empty()
         || !cfg.agents.is_empty();
@@ -133,7 +136,12 @@ pub fn derive_section_status(cfg: &zeroclaw_config::schema::Config) -> ConfigSta
 
 fn quickstart_missing_requirements(cfg: &zeroclaw_config::schema::Config) -> Vec<String> {
     let mut missing = Vec::new();
-    if cfg.providers.models.iter_entries().next().is_none() {
+    if cfg.providers.models.iter_entries().next().is_none()
+        && !cfg
+            .providers
+            .models
+            .has_canonical_capability(zeroclaw_api::capability::Capability::Chat)
+    {
         missing.push("Add a model provider.".to_string());
     }
     if cfg.agents.is_empty() {
@@ -171,16 +179,21 @@ fn quickstart_agent_missing_requirements(
     let model_ref = agent.model_provider.trim();
     if model_ref.is_empty() {
         missing.push(format!("Set a model provider for agent `{alias}`."));
+    } else if cfg.is_canonical_model_ref(model_ref) {
+        if cfg.resolve_model_id(model_ref).is_none() {
+            missing.push(format!("Choose a model for model provider `{model_ref}`."));
+        }
     } else if let Some((family, _, provider)) = cfg.resolved_model_provider_for_agent(alias) {
-        let has_model = provider
-            .model
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|m| !m.is_empty());
-        if !has_model {
+        // Resolve through the selection so a nested-only profile (model ids
+        // under `[providers.models.<family>.<alias>.models.*]`) still counts.
+        let effective_model = cfg
+            .resolve_model_selection(model_ref)
+            .and_then(|selection| selection.model_id);
+        if effective_model.is_none() {
             missing.push(format!("Choose a model for model provider `{model_ref}`."));
         } else if !model_provider_alias_usable(
             provider,
+            effective_model.as_deref(),
             zeroclaw_runtime::quickstart::model_provider_is_local(family),
         ) {
             missing.push(format!(
@@ -325,6 +338,7 @@ pub async fn handle_sections(State(state): State<AppState>) -> Response {
     for s in zeroclaw_config::sections::QUICKSTART_SECTIONS {
         roots.insert(s.as_str().to_string());
     }
+    roots.insert("providers.registry".to_string());
 
     // Drop bare parent-segment entries when a dotted child is present
     // — `providers` is phantom once `providers.models` etc. are listed.
@@ -352,6 +366,9 @@ pub async fn handle_sections(State(state): State<AppState>) -> Response {
     let sections: Vec<ConfigSectionEntry> = ordered
         .into_iter()
         .map(|key| {
+            if key == "providers.registry" {
+                return zeroclaw_runtime::rpc::types::provider_registry_section(&cfg);
+            }
             let wizard = zeroclaw_config::sections::Section::from_key(&key);
             let has_picker = match wizard {
                 Some(w) => !matches!(
@@ -540,15 +557,47 @@ fn providers_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
 }
 
 fn any_usable_model_provider(cfg: &zeroclaw_config::schema::Config) -> bool {
-    cfg.providers
+    let legacy = cfg
+        .providers
         .models
         .iter_entries()
-        .any(|(family, _, base)| {
+        .any(|(family, alias, base)| {
             model_provider_alias_usable(
                 base,
+                alias_effective_model(cfg, family, alias).as_deref(),
                 zeroclaw_runtime::quickstart::model_provider_is_local(family),
             )
-        })
+        });
+    if legacy {
+        return true;
+    }
+
+    cfg.provider_registry().is_ok_and(|registry| {
+        registry
+            .models
+            .values()
+            .any(|model| canonical_chat_model_usable(model, &registry))
+    })
+}
+
+fn canonical_chat_model_usable(
+    model: &zeroclaw_config::provider_registry::ModelDefinition,
+    registry: &zeroclaw_config::provider_registry::ProviderRegistry,
+) -> bool {
+    use zeroclaw_api::capability::Capability;
+    model.capability() == Capability::Chat
+        && model
+            .upstream_model()
+            .is_some_and(|value| !value.trim().is_empty())
+        && registry
+            .connections
+            .get(model.provider())
+            .is_some_and(|connection| {
+                connection.supports(Capability::Chat)
+                    && (connection.has_secrets()
+                        || connection.uses_openai_codex_auth()
+                        || zeroclaw_runtime::quickstart::model_provider_is_local(connection.kind()))
+            })
 }
 
 fn provider_type_badge(
@@ -558,12 +607,16 @@ fn provider_type_badge(
 ) -> Option<String> {
     let mut has_alias = false;
     let mut has_usable_alias = false;
-    for (ty, _, base) in cfg.providers.models.iter_entries() {
+    for (ty, alias, base) in cfg.providers.models.iter_entries() {
         if ty != family {
             continue;
         }
         has_alias = true;
-        if model_provider_alias_usable(base, local) {
+        if model_provider_alias_usable(
+            base,
+            alias_effective_model(cfg, ty, alias).as_deref(),
+            local,
+        ) {
             has_usable_alias = true;
         }
     }
@@ -578,11 +631,10 @@ fn provider_type_badge(
 
 fn model_provider_alias_usable(
     base: &zeroclaw_config::schema::ModelProviderConfig,
+    effective_model: Option<&str>,
     local: bool,
 ) -> bool {
-    let has_model = base
-        .model
-        .as_deref()
+    let has_model = effective_model
         .map(str::trim)
         .is_some_and(|model| !model.is_empty());
     if !has_model {
@@ -594,6 +646,17 @@ fn model_provider_alias_usable(
         .is_some_and(|key| !key.is_empty())
         || base.requires_openai_auth
         || local
+}
+
+/// The model id an alias effectively serves: the nested-model selection for a
+/// `<family>.<alias>` ref (falling back to the legacy profile-level `model`),
+/// so a nested-only profile still counts as having a model.
+fn alias_effective_model(
+    cfg: &zeroclaw_config::schema::Config,
+    family: &str,
+    alias: &str,
+) -> Option<String> {
+    cfg.resolve_model_id(&format!("{family}.{alias}"))
 }
 
 fn storage_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
@@ -1635,6 +1698,41 @@ mod tests {
             sop_audit: None,
             sop_driver_handles: None,
         }
+    }
+
+    #[test]
+    fn provider_registry_chat_readiness_does_not_require_legacy_profiles() {
+        let mut cfg = empty_cfg();
+        cfg.providers = toml::from_str(
+            r#"
+[connections."gateway.prod"]
+kind = "custom"
+auth = { mode = "api_key", api_key = "test-key" }
+[models."chat.fast.us"]
+capability = "chat"
+provider = "gateway.prod"
+model = "upstream-model"
+"#,
+        )
+        .unwrap();
+        assert!(any_usable_model_provider(&cfg));
+        // The typed-family picker only links to legacy aliases. Its badge
+        // must not imply that a canonical model is editable through that path.
+        assert!(provider_type_badge(&cfg, "custom", false).is_none());
+        assert!(
+            !quickstart_missing_requirements(&cfg)
+                .iter()
+                .any(|message| message == "Add a model provider.")
+        );
+        assert!(zeroclaw_config::sections::section_has_signal(
+            &cfg,
+            zeroclaw_config::sections::Section::ModelProviders
+        ));
+        cfg.providers.models = Default::default();
+        assert!(
+            derive_section_status(&cfg).has_partial_state,
+            "a saved connection is still partial setup state"
+        );
     }
 
     #[test]

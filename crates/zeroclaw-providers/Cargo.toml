@@ -3,7 +3,7 @@ name = "zeroclaw-providers"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "LLM provider implementations, auth services, and multimodal processing."
+description = "Provider implementations, capability adapters, auth services, and multimodal processing."
 repository.workspace = true
 homepage.workspace = true
 publish = true
@@ -51,6 +51,8 @@ hyper = { version = "1", features = ["http1", "server"] }
 tempfile = "3.26"
 scopeguard = "1.2"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+toml = "1.0"
+wiremock = "0.6"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

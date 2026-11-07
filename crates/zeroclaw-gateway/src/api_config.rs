@@ -99,6 +99,54 @@ pub async fn handle_config_get(State(state): State<AppState>) -> Response {
     Json(cfg).into_response()
 }
 
+/// Canonical provider editor, with exact map keys and the normal secret mask.
+pub async fn handle_registry_get(State(state): State<AppState>) -> Response {
+    match zeroclaw_config::provider_registry::editor::snapshot(&state.config.read()) {
+        Ok(document) => Json(document).into_response(),
+        Err(error) => error_response(ConfigApiError::new(
+            ConfigApiCode::ValidationFailed,
+            error.to_string(),
+        )),
+    }
+}
+
+pub async fn handle_registry_put(
+    State(state): State<AppState>,
+    principal: RequestPrincipal,
+    Json(edit): Json<zeroclaw_config::provider_registry::editor::RegistryEdit>,
+) -> Response {
+    let commit = match state.begin_config_commit().await {
+        Ok(commit) => commit,
+        Err(error) => return error_response(config_commit_admission_error(error)),
+    };
+    // A whole-registry replacement requires the union of map CRUD grants.
+    for verb in [Verb::Create, Verb::Delete] {
+        if let Err(denied) = authorize_config_write(
+            &principal,
+            ConfigWriteSet::default().with("providers", verb),
+            &commit,
+        ) {
+            return denied.into_response();
+        }
+    }
+    let writes = ConfigWriteSet::default().with("providers", Verb::Update);
+    let authorization = match authorize_config_write(&principal, writes, &commit) {
+        Ok(authorization) => authorization,
+        Err(denied) => return denied.into_response(),
+    };
+    let mut candidate = commit.current_config();
+    if let Err(error) = zeroclaw_config::provider_registry::editor::stage(&mut candidate, edit) {
+        return error_response(ConfigApiError::new(
+            ConfigApiCode::ValidationFailed,
+            format!("{error:#}"),
+        ));
+    }
+    match persist_and_swap(&state, authorization, candidate, commit).await {
+        Ok(_guard) => Json(serde_json::json!({ "saved": true })).into_response(),
+        Err(response) => response,
+    }
+}
+
 fn parse_patch_ops(value: serde_json::Value) -> Result<Vec<PatchOp>, ConfigApiError> {
     let ops = value.as_array().ok_or_else(|| {
         ConfigApiError::new(
@@ -1250,6 +1298,10 @@ pub async fn handle_list(State(state): State<AppState>, Query(q): Query<ListQuer
             None => true,
         })
         .filter(|info| !field_visibility::is_excluded(&info.name, &excluded))
+        // A migrated profile keeps its legacy `model` for compatibility, but
+        // the runtime resolver selects the nested entry. Do not offer the
+        // shadowed field as a second editable model in the Web form.
+        .filter(|info| config.effective_model_edit_path(&info.name) == info.name)
         .map(|info| {
             let populated = info.display_value != zeroclaw_config::traits::UNSET_DISPLAY;
             let is_sensitive = info.is_secret || info.derived_from_secret;
@@ -2605,10 +2657,14 @@ pub async fn handle_patch(
     if !override_drift {
         let drifted = compute_drift(&working).await;
         if !drifted.is_empty() {
-            let touched: std::collections::HashSet<String> = ops
-                .iter()
-                .map(|op| json_pointer_to_dotted(&op.path))
-                .collect();
+            let mut touched = std::collections::HashSet::new();
+            for op in &ops {
+                let requested = json_pointer_to_dotted(&op.path);
+                touched.insert(requested.clone());
+                if matches!(op.op.as_str(), "add" | "replace" | "test") {
+                    touched.insert(working.effective_model_edit_path(&requested));
+                }
+            }
             let conflicts: Vec<&DriftEntry> = drifted
                 .iter()
                 .filter(|d| touched.contains(&d.path))
@@ -2634,7 +2690,12 @@ pub async fn handle_patch(
     let mut results = Vec::with_capacity(ops.len());
 
     for (idx, op) in ops.iter().enumerate() {
-        let path = json_pointer_to_dotted(&op.path);
+        let requested_path = json_pointer_to_dotted(&op.path);
+        let path = if matches!(op.op.as_str(), "add" | "replace" | "test") {
+            working.effective_model_edit_path(&requested_path)
+        } else {
+            requested_path
+        };
         if matches!(op.op.as_str(), "add" | "replace") && working.ensure_map_key_for_path(&path) {
             // Refused to vivify the reserved `default` agent: surface the same
             // reserved error the explicit create surfaces do, not a generic 404.
@@ -3430,6 +3491,88 @@ mod tests {
             data_dir,
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn provider_registry_editor_masks_and_persists_through_config_lifecycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config.providers = toml::from_str(
+            r#"
+[connections."gateway.prod"]
+kind = "custom"
+uri = "https://example.test/v1"
+auth = { mode = "api_key", api_key = "test-registry-secret" }
+[models."chat.fast.us"]
+capability = "chat"
+provider = "gateway.prod"
+model = "before"
+"#,
+        )
+        .unwrap();
+        config.save().await.unwrap();
+        let state = test_state(config);
+        let response = handle_registry_get(State(state.clone())).await;
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let expected: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("test-registry-secret"));
+        let mut registry = expected.clone();
+        registry["models"]["chat.fast.us"]["model"] = serde_json::json!("after");
+        let response = handle_registry_put(
+            State(state.clone()),
+            None,
+            Json(zeroclaw_config::provider_registry::editor::RegistryEdit {
+                expected: expected.clone(),
+                registry: registry.clone(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            state
+                .config
+                .read()
+                .resolve_model_id("chat.fast.us")
+                .as_deref(),
+            Some("after")
+        );
+        let persisted = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        assert!(
+            !persisted.contains("test-registry-secret"),
+            "registry save must use normal encryption"
+        );
+        assert!(
+            state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        let response = handle_registry_put(
+            State(state.clone()),
+            None,
+            Json(zeroclaw_config::provider_registry::editor::RegistryEdit { expected, registry }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("config.toml")).unwrap(),
+            persisted
+        );
+        let expected =
+            zeroclaw_config::provider_registry::editor::snapshot(&state.config.read()).unwrap();
+        let response = handle_registry_put(
+            State(state.clone()),
+            None,
+            Json(zeroclaw_config::provider_registry::editor::RegistryEdit {
+                expected,
+                registry: serde_json::json!({}),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!state.config.read().providers.models.has_canonical_models());
+        let persisted = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        assert!(!persisted.contains("gateway.prod"));
+        assert!(!persisted.contains("chat.fast.us"));
     }
 
     fn test_state(config: zeroclaw_config::schema::Config) -> AppState {
@@ -4860,60 +5003,101 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_map_key_handler_cascades_model_provider_and_persists() {
+    async fn patch_legacy_model_updates_the_runtime_selected_nested_entry() {
         let tmp = tempfile::tempdir().unwrap();
         let mut config = temp_config(&tmp);
-        config
+        let profile = config
             .providers
             .models
-            .ensure("anthropic", "default")
-            .unwrap();
-        config
-            .providers
-            .models
-            .ensure("openai", "main")
-            .unwrap()
-            .fallback = vec!["anthropic.default".into()];
-        config.agents.insert(
-            "triage".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                classifier_provider: "anthropic.default".into(),
+            .ensure("openai", "migrated")
+            .expect("openai provider slot exists");
+        profile.model = Some("legacy-model".into());
+        profile.models.insert(
+            "default".into(),
+            zeroclaw_config::schema::ModelEntryConfig {
+                id: Some("effective-before".into()),
                 ..Default::default()
             },
         );
         config.save().await.unwrap();
-
         let state = test_state(config);
+
         let (status, json) = response_json(
-            handle_delete_map_key(
-                axum::extract::State(state.clone()),
+            handle_patch(
+                State(state.clone()),
                 None,
-                axum::extract::Query(MapKeyQuery {
-                    path: "providers.models.anthropic".to_string(),
-                    key: "default".to_string(),
-                }),
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "replace",
+                    "path": "/providers/models/openai/migrated/model",
+                    "value": "effective-after"
+                }])),
             )
             .await,
         )
         .await;
 
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["path"], "providers.models.anthropic");
-        assert_eq!(json["key"], "default");
-        let cfg = state.config.read();
-        assert!(cfg.providers.models.find("anthropic", "default").is_none());
-        assert!(cfg.agents["triage"].classifier_provider.is_empty());
-        assert!(
-            cfg.providers
-                .models
-                .find("openai", "main")
-                .unwrap()
-                .fallback
-                .is_empty()
+        assert_eq!(status, StatusCode::OK, "PATCH failed: {json}");
+        assert_eq!(
+            json["results"][0]["path"],
+            "providers.models.openai.migrated.models.default.id"
         );
-        drop(cfg);
-        let written = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
-        assert!(!written.contains("anthropic.default"));
+        {
+            let live = state.config.read();
+            assert_eq!(
+                live.resolve_model_selection("openai.migrated")
+                    .and_then(|selection| selection.model_id)
+                    .as_deref(),
+                Some("effective-after")
+            );
+            assert_eq!(
+                live.providers
+                    .models
+                    .find("openai", "migrated")
+                    .and_then(|profile| profile.model.as_deref()),
+                Some("legacy-model"),
+                "the compatibility field must not become a second synchronized source"
+            );
+        }
+
+        let written = tokio::fs::read_to_string(tmp.path().join("config.toml"))
+            .await
+            .expect("patched config must be saved");
+        let reloaded: zeroclaw_config::schema::Config =
+            toml::from_str(&written).expect("patched config must reload");
+        assert_eq!(
+            reloaded
+                .resolve_model_selection("openai.migrated")
+                .and_then(|selection| selection.model_id)
+                .as_deref(),
+            Some("effective-after")
+        );
+
+        let (list_status, list_json) = response_json(
+            handle_list(
+                State(state),
+                Query(ListQuery {
+                    prefix: Some("providers.models.openai.migrated".into()),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(list_status, StatusCode::OK);
+        let listed_paths: Vec<&str> = list_json["entries"]
+            .as_array()
+            .expect("config list returns entries")
+            .iter()
+            .filter_map(|entry| entry["path"].as_str())
+            .collect();
+        assert!(
+            !listed_paths.contains(&"providers.models.openai.migrated.model"),
+            "the Web config list must hide the shadowed legacy field"
+        );
+        assert!(
+            listed_paths.contains(&"providers.models.openai.migrated.models.default.id"),
+            "the Web config list must expose the runtime-selected nested field"
+        );
     }
 
     #[tokio::test]

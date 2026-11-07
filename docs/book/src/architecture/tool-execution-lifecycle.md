@@ -16,7 +16,7 @@ ingress and agent-side action.
 | Tool definition | `zeroclaw-api::tool::Tool` | A tool has a stable name, description, JSON schema, async `execute`, and attribution. |
 | Tool assembly | Runtime tool factory and scoped registry | The agent receives only the tools admitted by bundles, MCP config, risk profile, and per-run narrowing. |
 | Turn context resolution | `ResolvedAgentExecution` | The turn starts with one resolved bundle: model access, registry, approval manager, observer, runtime knobs, MCP activation handle, and receipt generator. |
-| Provider request | `agent::turn::tool_specs` and provider call | Native-tool providers receive structured specs; text-protocol providers receive prompt instructions unless strict parsing hides them. |
+| Provider request | `agent::turn::tool_specs` and provider call | Native-tool providers receive structured specs; text-protocol providers receive prompt instructions when the selected model enables text tool extraction. |
 | Tool-call parsing | `agent::turn::parse_response` and parser helpers | Native and text tool calls are normalized into parsed calls with provider ids when available. |
 | Preparation | `agent::turn::call_prep` | Hooks, delivery defaults, approval, prompt-required duplicate guards, and ordinary duplicate-call guards run before dispatch. |
 | Execution | `agent::tool_execution` | Prepared calls run sequentially or in parallel according to policy, cancellation, and activation constraints. |
@@ -76,7 +76,7 @@ The model can only call tools that are effective for the current turn:
 - native-tool providers receive structured specs for effective tools;
 - text-protocol providers receive tool instructions only when text tool calling
   is allowed;
-- strict parsing can hide the text tool protocol entirely;
+- `options.extract_text_tool_calls = false` hides the text tool protocol entirely;
 - `tool_filter_groups` decide which MCP tool schemas are visible for the
   current turn. `mode = "always"` groups can pre-activate eligible deferred MCP
   wrappers, while `dynamic` groups expose tools only when the current user

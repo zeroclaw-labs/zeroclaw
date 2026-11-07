@@ -180,15 +180,11 @@ impl<M: Memory> Memory for AuditedMemory<M> {
 
     fn refresh_embedder(
         &self,
-        model_provider: &str,
-        api_key: Option<&str>,
-        model: &str,
-        dimensions: usize,
+        embedder: std::sync::Arc<dyn zeroclaw_api::embedding::EmbeddingProvider>,
     ) {
         // Transparent decorator: forward the embedder refresh to the wrapped
         // backend like every other method
-        self.inner
-            .refresh_embedder(model_provider, api_key, model, dimensions);
+        self.inner.refresh_embedder(embedder);
     }
 
     async fn store(
@@ -645,10 +641,12 @@ mod tests {
 
         Memory::refresh_embedder(
             &audited,
-            "openai",
-            Some("sk-test"),
-            "text-embedding-3-small",
-            1536,
+            std::sync::Arc::from(zeroclaw_providers::embedding::create_embedding_provider(
+                "openai",
+                Some("sk-test"),
+                "text-embedding-3-small",
+                1536,
+            )),
         );
 
         assert_eq!(

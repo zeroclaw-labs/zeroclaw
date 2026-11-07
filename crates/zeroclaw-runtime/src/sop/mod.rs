@@ -32,7 +32,7 @@ pub use binding::{
 pub use capability::{
     CapabilityContext, CapabilityInfo, CapabilityResult, SopCapability, SopCapabilityRegistry,
 };
-pub use decision::{DecisionModel, SopDecision, SopDecisionSpec, SystemOneClient};
+pub use decision::{Answer, Answers, DecisionModel, Question, SopDecision, SopDecisionSpec};
 pub use engine::{
     CancelOutcome, MaintenanceSummary, OrphanedRunSettlement, SopEngine,
     err_is_cancellation_persistence_retained, err_is_resume_at_capacity,
@@ -116,7 +116,7 @@ pub struct SopEngineAdapters {
     pub llm: Option<Arc<dyn capability::LlmGenerateAdapter>>,
     /// Extra decision models by alias, added to (and overriding) the ones built
     /// from `[decision_models]`. Used by tests and embedders.
-    pub decision: std::collections::HashMap<String, Arc<dyn decision::DecisionModel>>,
+    pub decision: std::collections::HashMap<String, Arc<dyn zeroclaw_api::decision::DecisionModel>>,
 }
 
 /// Build a single shared SopEngine + SopAuditLogger pair.
@@ -173,7 +173,65 @@ pub fn build_sop_engine_with_capability(
     adapters: SopEngineAdapters,
     execution_capability: Option<crate::live_config_authority::AgentExecutionCapability>,
 ) -> (Arc<Mutex<SopEngine>>, Arc<SopAuditLogger>) {
+    build_sop_engine_with_capability_and_registry(
+        config,
+        decision_models,
+        data_dir,
+        install_root,
+        audit_memory,
+        adapters,
+        execution_capability,
+        None,
+    )
+}
+
+/// Managed construction variant that also admits canonical `Decision` models
+/// from `[providers.models]`. The legacy public constructor remains available
+/// for standalone callers that only provide `[decision_models]`.
+pub fn build_sop_engine_with_provider_registry(
+    config: SopConfig,
+    provider_config: &zeroclaw_config::schema::Config,
+    decision_models: &std::collections::HashMap<
+        String,
+        zeroclaw_config::schema::SopDecisionModelConfig,
+    >,
+    data_dir: &Path,
+    install_root: &Path,
+    audit_memory: Arc<dyn Memory>,
+    adapters: SopEngineAdapters,
+    execution_capability: Option<crate::live_config_authority::AgentExecutionCapability>,
+) -> (Arc<Mutex<SopEngine>>, Arc<SopAuditLogger>) {
+    build_sop_engine_with_capability_and_registry(
+        config,
+        decision_models,
+        data_dir,
+        install_root,
+        audit_memory,
+        adapters,
+        execution_capability,
+        Some(provider_config),
+    )
+}
+
+fn build_sop_engine_with_capability_and_registry(
+    config: SopConfig,
+    decision_models: &std::collections::HashMap<
+        String,
+        zeroclaw_config::schema::SopDecisionModelConfig,
+    >,
+    data_dir: &Path,
+    install_root: &Path,
+    audit_memory: Arc<dyn Memory>,
+    adapters: SopEngineAdapters,
+    execution_capability: Option<crate::live_config_authority::AgentExecutionCapability>,
+    provider_config: Option<&zeroclaw_config::schema::Config>,
+) -> (Arc<Mutex<SopEngine>>, Arc<SopAuditLogger>) {
     let mut decision_models = decision::models_from_config(decision_models);
+    if let Some(provider_config) = provider_config {
+        // An exact canonical model key wins if it intentionally shares a
+        // legacy decision alias; this mirrors every other canonical consumer.
+        decision_models.extend(decision::models_from_provider_registry(provider_config));
+    }
     let SopEngineAdapters {
         route: route_adapter,
         forge: forge_adapter,

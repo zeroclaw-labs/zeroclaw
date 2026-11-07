@@ -1,4 +1,5 @@
-import { getMapKeys, getProp, getTemplates } from './api';
+import { getMapKeys, getProp, getTemplates, getProviderRegistry } from './api';
+import type { PropResponse } from './api';
 
 export type ConfiguredModelCategory = 'models' | 'tts' | 'transcription';
 
@@ -13,6 +14,14 @@ export async function walkConfiguredModelBindings(
 ): Promise<ConfiguredModelBinding[]> {
   const root = `providers.${category}`;
   const out: ConfiguredModelBinding[] = [];
+  const registry = await getProviderRegistry();
+  const capability = { models: 'chat', tts: 'tts', transcription: 'asr' }[category];
+  for (const [alias, model] of Object.entries(registry.models)) {
+    const connection = registry.connections[model.provider];
+    if (model.capability === capability && model.model && connection) {
+      out.push({ type: connection.kind, alias, resource: model.model });
+    }
+  }
   // providers.<category> isn't a map-keyed section; the typed wrapper
   // exposes one HashMap per provider type. Read the slot list from
   // map_key_sections via the templates endpoint.
@@ -46,6 +55,36 @@ export async function walkConfiguredModelBindings(
         out.push({ type, alias, resource: v });
       }
     });
+    // Multi-model subtable entries live at
+    // `providers.models.<type>.<alias>.models.<sub>.id`. Only the `models`
+    // category has this subtable (tts/transcription do not), so guard on it.
+    if (category === 'models') {
+      const subResults = await Promise.all(
+        aliases.map(async (alias) => {
+          try {
+            const { keys } = await getMapKeys(`${root}.${type}.${alias}.models`);
+            const ids = await Promise.all(
+              keys.map((sub) =>
+                getProp(`${root}.${type}.${alias}.models.${sub}.id`).catch(
+                  () => null,
+                ),
+              ),
+            );
+            return { alias, ids };
+          } catch {
+            return { alias, ids: [] as (PropResponse | null)[] };
+          }
+        }),
+      );
+      for (const { alias, ids } of subResults) {
+        for (const r of ids) {
+          const v = r && typeof r.value === 'string' ? r.value : '';
+          if (v && v !== '<unset>') {
+            out.push({ type, alias, resource: v });
+          }
+        }
+      }
+    }
   }
   return out;
 }

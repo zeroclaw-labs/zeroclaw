@@ -1370,6 +1370,28 @@ rpc_type! {
     }
 }
 
+/// Synthetic editor section shared by HTTP and RPC consumers. The registry
+/// stays outside legacy flattened prop paths; this is a navigation entry.
+pub fn provider_registry_section(config: &zeroclaw_config::schema::Config) -> ConfigSectionEntry {
+    ConfigSectionEntry {
+        key: "providers.registry".into(),
+        label: crate::i18n::get_required_cli_string("cli-config-provider-registry-label"),
+        help: crate::i18n::get_required_cli_string("cli-config-provider-registry-help"),
+        has_picker: false,
+        completed: config.providers.models.has_canonical_models(),
+        ready: config.providers.models.has_canonical_models(),
+        group: zeroclaw_config::sections::SectionGroup::Foundation
+            .label()
+            .into(),
+        group_key: zeroclaw_config::sections::SectionGroup::Foundation
+            .key()
+            .into(),
+        is_quickstart: false,
+        shape: Some(zeroclaw_config::sections::SectionShape::DirectForm),
+        cost_category: String::new(),
+    }
+}
+
 rpc_type! {
     /// Config readiness status for the dashboard/TUI.
     pub struct ConfigStatusResult {

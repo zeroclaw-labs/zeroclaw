@@ -145,6 +145,8 @@ pub enum Method {
 
     // Config
     ConfigGet,
+    ConfigRegistryGet,
+    ConfigRegistrySet,
     ConfigSet,
     ConfigSetMany,
     ConfigValidate,
@@ -281,6 +283,8 @@ impl Method {
         (Method::CronSettings, "cron/settings"),
         // Config
         (Method::ConfigGet, "config/get"),
+        (Method::ConfigRegistryGet, "config/provider-registry"),
+        (Method::ConfigRegistrySet, "config/provider-registry-set"),
         (Method::ConfigSet, "config/set"),
         (Method::ConfigSetMany, "config/set-many"),
         (Method::ConfigValidate, "config/validate"),
@@ -441,6 +445,7 @@ impl Method {
             M::CronTrigger => (Resource::Cron, Verb::Execute),
 
             M::ConfigGet
+            | M::ConfigRegistryGet
             | M::ConfigValidate
             | M::ConfigList
             | M::ConfigMapKeys
@@ -450,9 +455,11 @@ impl Method {
             | M::ConfigStatus
             | M::ConfigCatalog
             | M::ConfigCatalogModels => (Resource::Config, Verb::Read),
-            M::ConfigSet | M::ConfigSetMany | M::ConfigReload | M::ConfigMapKeyRename => {
-                (Resource::Config, Verb::Update)
-            }
+            M::ConfigSet
+            | M::ConfigSetMany
+            | M::ConfigReload
+            | M::ConfigMapKeyRename
+            | M::ConfigRegistrySet => (Resource::Config, Verb::Update),
             M::ConfigMapKeyCreate => (Resource::Config, Verb::Create),
             M::ConfigDelete | M::ConfigMapKeyDelete => (Resource::Config, Verb::Delete),
 
@@ -683,15 +690,12 @@ fn personality_template_context(
     }
 }
 
-fn model_provider_ref_from_provider_profile_prop(prop: &str) -> Option<String> {
+fn model_provider_ref_from_provider_profile_prop(config: &Config, prop: &str) -> Option<String> {
     let rest = prop.strip_prefix("providers.models.")?;
-    let (provider_type, rest) = rest.split_once('.')?;
-    let (provider_alias, field) = rest.split_once('.')?;
-    if provider_type.is_empty() || provider_alias.is_empty() || field.is_empty() {
-        None
-    } else {
-        Some(format!("{provider_type}.{provider_alias}"))
-    }
+    let (family, alias) = config.providers.models.profile_ref(rest)?;
+    let prefix = format!("{family}.{alias}");
+    rest.strip_prefix(&prefix)?.strip_prefix('.')?;
+    Some(prefix)
 }
 
 /// Whether a config prop path touches `model_routes` (a field edit like
@@ -723,31 +727,32 @@ fn agent_alias_from_model_provider_prop(prop: &str) -> Option<String> {
 
 /// Session-selection predicate for an agent-scoped `model_provider` refresh
 /// (`config/set agents.<alias>.model_provider`). Only sessions bound to the
-/// edited agent are eligible, and a session that carries its own
-/// `model_provider` override is excluded so unrelated agents and overridden
-/// sessions are never rebuilt.
+/// edited agent are eligible. Named provider overrides resolve independently;
+/// bare families and URL overrides still inherit the agent's configured model
+/// and connection defaults.
 fn agent_scoped_refresh_selects(
+    config: &Config,
     edited_agent: &str,
     session_agent: &str,
     overrides: &SessionOverrides,
 ) -> bool {
-    session_agent == edited_agent && overrides.model_provider.is_none()
+    session_agent == edited_agent
+        && overrides.model_provider.as_deref().is_none_or(|reference| {
+            zeroclaw_providers::model::inherits_agent_selection(config, reference)
+        })
 }
 
-/// Session-selection predicate for a provider-scoped refresh
-/// (`providers.models.*` edit). A session is eligible when its own
-/// `model_provider` override matches the edited provider, or when it has no
-/// override and thus inherits the agent's provider (final provider match is
-/// resolved separately against config). A complete `model_routes` entry that
-/// targets the edited profile expands the scope to every session in
-/// `LiveSessionRefreshScope::resolve_provider_ref`, because every routed
-/// provider materialization contains that target.
-fn provider_scoped_refresh_selects(target_ref: &str, overrides: &SessionOverrides) -> bool {
-    overrides
-        .model_provider
-        .as_deref()
-        .map(|r| r == target_ref)
-        .unwrap_or(true)
+/// Reduce a possibly three-segment `<type>.<alias>.<model>` model_provider
+/// reference to its two-segment `<type>.<alias>` provider-profile form, so it
+/// can be matched against a profile-scoped edit target. Falls back to the
+/// trimmed input when the ref has no dot separator.
+fn profile_ref_of(config: &Config, model_provider_ref: &str) -> String {
+    config
+        .providers
+        .models
+        .profile_ref(model_provider_ref)
+        .map(|(family, alias)| format!("{family}.{alias}"))
+        .unwrap_or_else(|| model_provider_ref.trim().to_string())
 }
 
 /// The live-session materialization affected by one config mutation.
@@ -760,6 +765,7 @@ enum LiveSessionRefreshScope {
     ModelProvider(String),
     Agent(String),
     ModelRoutes,
+    SharedConstruction,
     /// Transient union derived from one atomic config/set-many request.
     Batch(Vec<Self>),
     /// A provider alias rename (`providers.models.<family>.<from>` ->
@@ -774,14 +780,85 @@ enum LiveSessionRefreshScope {
         old_ref: String,
         new_ref: String,
     },
+    /// A nested model alias rename within one provider profile. Persistent
+    /// referrers are rewritten by the config cascade, while transient session
+    /// overrides must be migrated here before their provider view is rebuilt.
+    ModelAliasRename {
+        old_ref: String,
+        new_ref: String,
+    },
 }
 
 impl LiveSessionRefreshScope {
-    fn for_prop(prop: &str) -> Option<Self> {
-        model_provider_ref_from_provider_profile_prop(prop)
+    fn may_affect_agent(&self, agent_alias: &str) -> bool {
+        match self {
+            Self::Agent(edited) => edited == agent_alias,
+            Self::Batch(scopes) => scopes
+                .iter()
+                .any(|scope| scope.may_affect_agent(agent_alias)),
+            // A running tool may switch profiles. Its installed selection is
+            // authoritative only after entering the per-session boundary.
+            _ => true,
+        }
+    }
+
+    fn for_prop(config: &Config, prop: &str) -> Option<Self> {
+        model_provider_ref_from_provider_profile_prop(config, prop)
             .map(Self::ModelProvider)
             .or_else(|| agent_alias_from_model_provider_prop(prop).map(Self::Agent))
             .or_else(|| touches_model_routes(prop).then_some(Self::ModelRoutes))
+            .or_else(|| {
+                zeroclaw_providers::model::shared_construction_depends_on_prop(prop)
+                    .then_some(Self::SharedConstruction)
+            })
+    }
+
+    fn resolve_provider_ref_for_update(
+        &self,
+        previous: &Config,
+        next: &Config,
+        session_agent: &str,
+        overrides: &SessionOverrides,
+    ) -> Result<Option<String>, String> {
+        if let Self::Batch(scopes) = self {
+            for scope in scopes {
+                if let Some(provider) = scope.resolve_provider_ref_for_update(
+                    previous,
+                    next,
+                    session_agent,
+                    overrides,
+                )? {
+                    return Ok(Some(provider));
+                }
+            }
+            return Ok(None);
+        }
+        if let Some(provider) = self.resolve_provider_ref(next, session_agent, overrides)? {
+            return Ok(Some(provider));
+        }
+        // Removed fallback edges and routes still belong to the installed
+        // provider graph. Select with either generation, then build from next.
+        let previous_scope = match self {
+            Self::ProviderAliasRename { old_ref, .. } | Self::ModelAliasRename { old_ref, .. } => {
+                Self::ModelProvider(profile_ref_of(previous, old_ref))
+            }
+            _ => self.clone(),
+        };
+        if previous_scope
+            .resolve_provider_ref(previous, session_agent, overrides)?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        overrides
+            .model_provider
+            .clone()
+            .or_else(|| {
+                next.agent(session_agent)
+                    .map(|agent| agent.model_provider.to_string())
+            })
+            .map(Some)
+            .ok_or_else(|| format!("agent `{session_agent}` is not configured"))
     }
 
     fn resolve_provider_ref(
@@ -808,32 +885,36 @@ impl LiveSessionRefreshScope {
                         .agent(session_agent)
                         .map(|agent| agent.model_provider.as_str())
                 });
-                let materialized_route_uses_target = config.model_routes.iter().any(|route| {
-                    !route.hint.trim().is_empty()
-                        && !route.model.trim().is_empty()
-                        && route.model_provider.trim() == target_ref
-                });
-                if materialized_route_uses_target {
-                    return effective_ref
-                        .map(str::to_string)
-                        .map(Some)
-                        .ok_or_else(|| format!("agent `{session_agent}` is not configured"));
-                }
-                if !provider_scoped_refresh_selects(target_ref, overrides) {
+                let depends = zeroclaw_providers::model::routed_selection_depends_on_model_ref(
+                    config,
+                    session_agent,
+                    effective_ref.unwrap_or_default(),
+                    target_ref,
+                );
+                if !depends {
                     return Ok(None);
                 }
-                Ok((effective_ref == Some(target_ref.as_str())).then(|| target_ref.clone()))
+                effective_ref
+                    .map(str::to_string)
+                    .map(Some)
+                    .ok_or_else(|| format!("agent `{session_agent}` is not configured"))
             }
             Self::Agent(edited_agent) => {
-                if !agent_scoped_refresh_selects(edited_agent, session_agent, overrides) {
+                if !agent_scoped_refresh_selects(config, edited_agent, session_agent, overrides) {
                     return Ok(None);
                 }
-                config
-                    .agent(edited_agent)
-                    .map(|agent| Some(agent.model_provider.to_string()))
+                overrides
+                    .model_provider
+                    .clone()
+                    .or_else(|| {
+                        config
+                            .agent(edited_agent)
+                            .map(|agent| agent.model_provider.to_string())
+                    })
+                    .map(Some)
                     .ok_or_else(|| format!("agent `{edited_agent}` is not configured"))
             }
-            Self::ModelRoutes => overrides
+            Self::ModelRoutes | Self::SharedConstruction => overrides
                 .model_provider
                 .clone()
                 .or_else(|| {
@@ -857,18 +938,60 @@ impl LiveSessionRefreshScope {
                 // from config; a session carrying an explicit override still
                 // reads `old_ref`. Both name the same profile across the
                 // rename, so both rebuild against the new reference.
+                let matches_old = effective_ref == old_ref
+                    || effective_ref
+                        .strip_prefix(old_ref)
+                        .is_some_and(|suffix| suffix.starts_with('.'))
+                        && !config
+                            .providers
+                            .models
+                            .iter_entries()
+                            .any(|(family, alias, _)| {
+                                let profile = format!("{family}.{alias}");
+                                profile.len() >= old_ref.len()
+                                    && (effective_ref == profile
+                                        || effective_ref
+                                            .strip_prefix(&profile)
+                                            .is_some_and(|suffix| suffix.starts_with('.')))
+                            });
+                if matches_old {
+                    let suffix = effective_ref
+                        .trim()
+                        .strip_prefix(old_ref)
+                        .unwrap_or_default();
+                    return Ok(Some(format!("{new_ref}{suffix}")));
+                }
+                Ok(
+                    zeroclaw_providers::model::routed_selection_depends_on_model_ref(
+                        config,
+                        session_agent,
+                        effective_ref,
+                        new_ref,
+                    )
+                    .then(|| effective_ref.to_string()),
+                )
+            }
+            Self::ModelAliasRename { old_ref, new_ref } => {
+                let effective_ref = overrides
+                    .model_provider
+                    .as_deref()
+                    .or_else(|| {
+                        config
+                            .agent(session_agent)
+                            .map(|agent| agent.model_provider.as_str())
+                    })
+                    .ok_or_else(|| format!("agent `{session_agent}` is not configured"))?;
                 if effective_ref == old_ref || effective_ref == new_ref {
                     return Ok(Some(new_ref.clone()));
                 }
-                // Otherwise the session keeps its own provider, but a route
-                // table that materializes the renamed alias still binds it
-                // into this session's resolver.
-                let materialized_route_uses_target = config.model_routes.iter().any(|route| {
-                    !route.hint.trim().is_empty()
-                        && !route.model.trim().is_empty()
-                        && route.model_provider.trim() == new_ref
-                });
-                Ok(materialized_route_uses_target.then(|| effective_ref.to_string()))
+                let profile_ref = new_ref
+                    .rsplit_once('.')
+                    .map_or(new_ref.as_str(), |(profile, _)| profile);
+                Self::ModelProvider(profile_ref.to_string()).resolve_provider_ref(
+                    config,
+                    session_agent,
+                    overrides,
+                )
             }
         }
     }
@@ -886,12 +1009,7 @@ struct PreparedLiveSessionRefresh {
     /// stale work cannot mutate a successor session.
     session_generation: u64,
     _model_provider_update: tokio::sync::OwnedMutexGuard<()>,
-    model_provider: Box<dyn zeroclaw_providers::ModelProvider>,
-    model_provider_name: String,
-    model_name: String,
-    model_route_resolver: Arc<zeroclaw_providers::router::ModelRouteResolver>,
-    tool_dispatcher: Box<dyn crate::agent::dispatcher::ToolDispatcher>,
-    temperature: Option<f64>,
+    model_update: crate::agent::agent::PreparedModelUpdate,
     /// New `model_provider` override value for a session whose stored override
     /// names an alias this transaction renames away. Applied in the same
     /// publication step as the provider box, so the override never survives as
@@ -907,11 +1025,31 @@ fn memory_embeddings_use_provider(
     config: &zeroclaw_config::schema::Config,
     model_provider_ref: &str,
 ) -> bool {
-    config.memory.embedding_provider.trim() == model_provider_ref
+    if let Some(reference) = config
+        .memory
+        .embedding_model_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return reference == model_provider_ref
+            || config.provider_registry().ok().is_some_and(|registry| {
+                registry
+                    .resolve_embedding(&zeroclaw_config::provider_registry::ModelRef::from(
+                        reference,
+                    ))
+                    .is_ok_and(|resolved| {
+                        resolved.selection.provider_id.as_str() == model_provider_ref
+                    })
+            });
+    }
+    // Compare on the provider-profile portion so a three-segment
+    // `<type>.<alias>.<model>` embedding ref still matches the edited profile.
+    profile_ref_of(config, &config.memory.embedding_provider) == model_provider_ref
         || config
             .embedding_routes
             .iter()
-            .any(|route| route.model_provider.trim() == model_provider_ref)
+            .any(|route| profile_ref_of(config, &route.model_provider) == model_provider_ref)
 }
 
 fn rename_error_to_rpc(
@@ -3353,7 +3491,6 @@ impl RpcDispatcher {
                 Self::apply_prepared_live_sessions_refresh(
                     Arc::clone(&ctx),
                     effects.prepared_sessions,
-                    Arc::clone(&accepted),
                     Some(revision),
                 )
                 .await;
@@ -3746,6 +3883,11 @@ impl RpcDispatcher {
 
             // Config
             Method::ConfigGet => self.handle_config_get(params),
+            Method::ConfigRegistryGet => {
+                zeroclaw_config::provider_registry::editor::snapshot(&self.ctx.config.read())
+                    .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))
+            }
+            Method::ConfigRegistrySet => Box::pin(self.handle_config_registry_set(params)).await,
             Method::ConfigSet => Box::pin(self.handle_config_set(params)).await,
             Method::ConfigSetMany => Box::pin(self.handle_config_set_many(params)).await,
             Method::ConfigValidate => self.handle_config_validate(),
@@ -4251,7 +4393,9 @@ impl RpcDispatcher {
     ) -> RpcResult {
         let config = self.ctx.config.read().clone();
         let (results, timed_out_phase) =
-            crate::doctor::run_structured_with_probe(&config, PROBE_MODEL_TIMEOUT, probe).await;
+            crate::doctor::run_structured_with_probe(&config, PROBE_MODEL_TIMEOUT, probe)
+                .await
+                .map_err(|error| rpc_err(INTERNAL_ERROR, format!("Doctor run failed: {error}")))?;
         let summary = doctor_summary(&results);
         // Read enabled + path from the one canonical active-writer accessor.
         // The runtime `ctx.config.observability.log_persistence` snapshot is
@@ -5244,22 +5388,25 @@ impl RpcDispatcher {
                 self.ctx.config.clone(),
                 self.ctx.agent_lifecycle.clone(),
             );
-        let mut agent = Box::pin(
-            crate::agent::agent::Agent::from_snapshot_with_tui_env_with_capability(
-                &config,
-                self.ctx.config.clone(),
-                &req.agent_alias,
-                cwd_path,
+        let mut agent = Box::pin(crate::agent::agent::Agent::from_snapshot_with_context(
+            &config,
+            &req.agent_alias,
+            crate::agent::AgentBuildContext {
+                session_cwd: cwd_path,
                 initialize_mcp,
                 exclude_memory,
                 tui_env,
-                self.ctx.sop_engine.clone(),
-                self.ctx.sop_audit.clone(),
-                self.principal_tool_narrowing(),
-                Some(execution_capability),
+                approval_backchannel: true,
+                sop_engine: self.ctx.sop_engine.clone(),
+                sop_audit: self.ctx.sop_audit.clone(),
+                principal_allowed_tools: self.principal_tool_narrowing(),
+                execution_capability: Some(execution_capability),
                 acp_session_store,
-            ),
-        )
+                live_config: Some(self.ctx.config.clone()),
+                live_model_config: Some(self.ctx.config.clone()),
+                ..Default::default()
+            },
+        ))
         .await
         .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Failed to create agent: {e}")))?;
         // The constructor already intersected the tool surface with the
@@ -6405,22 +6552,25 @@ impl RpcDispatcher {
                 self.ctx.config.clone(),
                 self.ctx.agent_lifecycle.clone(),
             );
-        let Ok(mut agent) = Box::pin(
-            crate::agent::agent::Agent::from_snapshot_with_tui_env_with_capability(
-                &config,
-                self.ctx.config.clone(),
-                &data.agent_alias,
-                cwd_path,
-                false,
+        let Ok(mut agent) = Box::pin(crate::agent::agent::Agent::from_snapshot_with_context(
+            &config,
+            &data.agent_alias,
+            crate::agent::AgentBuildContext {
+                session_cwd: cwd_path,
+                initialize_mcp: false,
                 exclude_memory,
                 tui_env,
-                self.ctx.sop_engine.clone(),
-                self.ctx.sop_audit.clone(),
-                self.principal_tool_narrowing(),
-                Some(execution_capability),
-                Some(Arc::clone(&store)),
-            ),
-        )
+                approval_backchannel: true,
+                sop_engine: self.ctx.sop_engine.clone(),
+                sop_audit: self.ctx.sop_audit.clone(),
+                principal_allowed_tools: self.principal_tool_narrowing(),
+                execution_capability: Some(execution_capability),
+                acp_session_store: Some(Arc::clone(&store)),
+                live_config: Some(self.ctx.config.clone()),
+                live_model_config: Some(self.ctx.config.clone()),
+                ..Default::default()
+            },
+        ))
         .await
         else {
             return Ok(None);
@@ -6696,17 +6846,25 @@ impl RpcDispatcher {
         let agent_cfg = config_generation
             .resolved_agent_config(agent_alias)
             .or_else(|| config_generation.agent(agent_alias).cloned());
-        let resolved = agent_cfg.as_ref().and_then(|cfg| {
-            crate::agent::agent::build_session_model_provider(
-                &config_generation,
+        let temperature_override = ctx
+            .sessions
+            .get_overrides(session_id)
+            .await
+            .and_then(|overrides| overrides.temperature);
+        let resolved = if let Some(cfg) = agent_cfg.as_ref() {
+            crate::agent::agent::PreparedModelUpdate::build(
+                Arc::clone(&config_generation),
+                agent_alias,
                 cfg.model_provider.as_str(),
                 None,
+                temperature_override,
             )
+            .await
             .ok()
-            .map(|tuple| (cfg.model_provider.clone(), cfg.clone(), tuple))
-        });
-        let Some((model_provider_ref, cfg, (provider, provider_name, model, resolver))) = resolved
-        else {
+        } else {
+            None
+        };
+        let Some(model_update) = resolved else {
             // The alias is unresolvable against the committed config. Leave the
             // construction-time box in place but keep the session unavailable:
             // a later refresh can publish one coherent binding and clear its
@@ -6726,47 +6884,8 @@ impl RpcDispatcher {
             );
             return false;
         };
-        let dispatcher =
-            crate::agent::agent::tool_dispatcher_for_provider(&cfg, provider.as_ref(), &model);
-        // Temperature belongs to the same state transition as the provider box.
-        // Resolve it exactly as the ordinary refresh path does
-        // (`overrides.temperature.or(provider_temperature)`) and publish it
-        // here: nothing re-derives temperature at turn entry — neither
-        // `sync_config_generation` nor `try_apply_model_switch` touches
-        // `Agent::temperature` — so passing `None` would leave a repaired
-        // session on the pre-commit profile temperature while its provider,
-        // resolver, and limits are all on the committed generation.
-        let provider_temperature =
-            model_provider_ref
-                .split_once('.')
-                .and_then(|(provider_type, provider_alias)| {
-                    config_generation
-                        .providers
-                        .models
-                        .find(provider_type, provider_alias)
-                        .and_then(|entry| entry.temperature)
-                });
-        let temperature = ctx
-            .sessions
-            .get_overrides(session_id)
-            .await
-            .and_then(|overrides| overrides.temperature)
-            .or(provider_temperature);
         ctx.sessions
-            .apply_model_provider(
-                session_id,
-                session_generation,
-                crate::rpc::session::ModelProviderUpdate {
-                    model_provider: provider,
-                    model_provider_name: provider_name,
-                    model_name: model,
-                    model_route_resolver: resolver,
-                    tool_dispatcher: dispatcher,
-                    config_generation: Arc::clone(&config_generation),
-                    temperature: Some(temperature),
-                    multimodal_config: config_generation.multimodal.clone(),
-                },
-            )
+            .apply_model_provider(session_id, session_generation, model_update)
             .await
     }
 
@@ -8016,97 +8135,69 @@ impl RpcDispatcher {
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
 
         // Model/model_provider overrides need a live provider-box rebuild,
-        // which requires Config — held here, not in the session store. Resolve
-        // the provider from the prospective merged override or configured
-        // agent, build the box, and only then commit the override.
-        let built_model_provider = if merged.model_provider.is_some() || merged.model.is_some() {
-            let agent_alias = self
-                .ctx
-                .sessions
-                .get_agent_alias(&req.session_id)
-                .await
-                .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
-            let built = {
-                let config = self.ctx.config.read();
-                let agent_cfg = config
-                    .resolved_agent_config(&agent_alias)
-                    .or_else(|| config.agent(&agent_alias).cloned())
-                    .ok_or_else(|| {
-                        rpc_err(
-                            INVALID_PARAMS,
-                            format!("Agent `{agent_alias}` is not configured"),
-                        )
-                    })?;
-                let model_provider_ref = merged
-                    .model_provider
-                    .as_deref()
-                    .unwrap_or_else(|| agent_cfg.model_provider.as_str());
-                let (model_provider, model_provider_name, model_name, model_route_resolver) =
-                    crate::agent::agent::build_session_model_provider(
-                        &config,
+        // which requires Config — held here, not in the session store. Build
+        // the complete model runtime from the prospective merged override or
+        // configured agent, and only then commit the override.
+        let built_model_runtime =
+            if req.overrides.model_provider.is_some() || req.overrides.model.is_some() {
+                let agent_alias = self
+                    .ctx
+                    .sessions
+                    .get_agent_alias(&req.session_id)
+                    .await
+                    .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+                let update = {
+                    let config = Arc::new(self.ctx.config.read().clone());
+                    let agent_cfg = config
+                        .resolved_agent_config(&agent_alias)
+                        .or_else(|| config.agent(&agent_alias).cloned())
+                        .ok_or_else(|| {
+                            rpc_err(
+                                INVALID_PARAMS,
+                                format!("Agent `{agent_alias}` is not configured"),
+                            )
+                        })?;
+                    let active_provider = if req.overrides.model_provider.is_none() {
+                        let agent = self
+                            .ctx
+                            .sessions
+                            .get_agent(&req.session_id)
+                            .await
+                            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+                        Some(agent.lock().await.selected_model_provider_ref())
+                    } else {
+                        None
+                    };
+                    let model_provider_ref = active_provider
+                        .as_deref()
+                        .or(merged.model_provider.as_deref())
+                        .unwrap_or_else(|| agent_cfg.model_provider.as_str());
+                    crate::agent::agent::PreparedModelUpdate::build(
+                        Arc::clone(&config),
+                        &agent_alias,
                         model_provider_ref,
                         merged.model.as_deref(),
+                        merged.temperature,
                     )
-                    .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
-                let tool_dispatcher = crate::agent::agent::tool_dispatcher_for_provider(
-                    &agent_cfg,
-                    model_provider.as_ref(),
-                    &model_name,
-                );
-                (
-                    model_provider,
-                    model_provider_name,
-                    model_name,
-                    model_route_resolver,
-                    tool_dispatcher,
-                    // The exact generation the box and resolver above were built
-                    // from, published onto the agent with them.
-                    std::sync::Arc::new(config.clone()),
-                )
+                    .await
+                    .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?
+                };
+                Some(update)
+            } else {
+                None
             };
-            Some(built)
-        } else {
-            None
-        };
 
         let merged = self
             .ctx
             .sessions
-            .set_overrides_gated(&req.session_id, session_generation, req.overrides)
+            .set_overrides_gated(
+                &req.session_id,
+                session_generation,
+                req.overrides,
+                built_model_runtime,
+            )
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
-
-        if let Some((
-            model_provider,
-            model_provider_name,
-            model_name,
-            model_route_resolver,
-            tool_dispatcher,
-            config_generation,
-        )) = built_model_provider
-        {
-            self.ctx
-                .sessions
-                .apply_model_provider(
-                    &req.session_id,
-                    session_generation,
-                    crate::rpc::session::ModelProviderUpdate {
-                        model_provider,
-                        model_provider_name,
-                        model_name,
-                        model_route_resolver,
-                        tool_dispatcher,
-                        config_generation: Arc::clone(&config_generation),
-                        // Temperature is already committed through
-                        // `set_overrides_gated` on this path.
-                        temperature: None,
-                        multimodal_config: config_generation.multimodal.clone(),
-                    },
-                )
-                .await
-                .then_some(())
-                .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
-        }
 
         to_result(SessionConfigureResult {
             session_id: req.session_id,
@@ -9968,6 +10059,61 @@ impl RpcDispatcher {
 
     // ── Config handlers ──────────────────────────────────────────
 
+    async fn handle_config_registry_set(&self, params: &Value) -> RpcResult {
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_config::provider_registry::editor;
+
+        let edit: editor::RegistryEdit = parse_params(params)?;
+        let method = Method::ConfigRegistrySet;
+        self.selector_config_write(method, "providers")?;
+        let commit = self
+            .ctx
+            .begin_config_commit()
+            .await
+            .map_err(config_commit_admission_error)?;
+        self.recheck_config_write_authority(method, Some("providers"), &commit)?;
+        // This whole-registry editor can create and remove entries as well as
+        // update them. Keep the same coarse verbs as the map CRUD surfaces.
+        for verb in [Verb::Create, Verb::Delete] {
+            self.require_additional_grant(method, Resource::Config, verb)?;
+        }
+        let mut candidate = Box::new(self.ctx.config.read().clone());
+        editor::stage(&mut candidate, edit)
+            .map_err(|error| rpc_err(INVALID_PARAMS, format!("{error:#}")))?;
+        // A model can change without its connection changing. Match the real
+        // embedding consumer (including routes), then rebuild its entire view
+        // once rather than refreshing once per model on a shared connection.
+        let memory_provider_refs = candidate
+            .providers
+            .models
+            .canonical_model_refs()
+            .map(|reference| reference.as_str())
+            .chain(
+                candidate
+                    .providers
+                    .connections
+                    .keys()
+                    .map(|provider| provider.as_str()),
+            )
+            .find(|reference| memory_embeddings_use_provider(&candidate, reference))
+            .map(str::to_owned)
+            .into_iter()
+            .collect();
+        let revision = Box::pin(self.commit_config_with_live_session_refresh(
+            *candidate,
+            commit,
+            &LiveSessionRefreshScope::SharedConstruction,
+            RpcConfigCommitEffects {
+                memory_provider_refs,
+                ..RpcConfigCommitEffects::default()
+            },
+        ))
+        .await?;
+        Ok(
+            serde_json::json!({ "revision": crate::config_application::PublishedConfigRevision::from(revision) }),
+        )
+    }
+
     fn handle_config_get(&self, params: &Value) -> RpcResult {
         use zeroclaw_config::traits::MaskSecrets;
         let req: ConfigGetParams = parse_params(params)?;
@@ -9993,9 +10139,10 @@ impl RpcDispatcher {
                 .map(|alias| self.ctx.agent_lifecycle.reserve_config_mutation(alias))
                 .transpose()
                 .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?;
-        let refresh_model_provider_ref = model_provider_ref_from_provider_profile_prop(&req.prop);
+        let refresh_model_provider_ref =
+            model_provider_ref_from_provider_profile_prop(&self.ctx.config.read(), &req.prop);
         let refresh_channel_agent = agent_alias_from_channel_auth_prop(&req.prop);
-        let refresh_scope = LiveSessionRefreshScope::for_prop(&req.prop);
+        let refresh_scope = LiveSessionRefreshScope::for_prop(&self.ctx.config.read(), &req.prop);
         let config_commit = self
             .ctx
             .begin_config_commit()
@@ -10023,6 +10170,12 @@ impl RpcDispatcher {
         // the heap rather than inflating this async fn's stack frame across the
         // awaits below.
         let mut config = Box::new(old_config.clone());
+        let effective_prop = config.effective_model_edit_path(&req.prop);
+        self.recheck_config_write_authority(
+            Method::ConfigSet,
+            Some(&effective_prop),
+            &config_commit,
+        )?;
         Self::stage_config_set(&mut config, &req.prop, &req.value)?;
         let effects = RpcConfigCommitEffects {
             config_reservations: _agent_config_reservation.into_iter().collect(),
@@ -10037,7 +10190,7 @@ impl RpcDispatcher {
                 .map(|comment| {
                     (
                         config.config_path.clone(),
-                        vec![(req.prop.clone(), comment.clone())],
+                        vec![(effective_prop.clone(), comment.clone())],
                     )
                 }),
             ..RpcConfigCommitEffects::default()
@@ -10174,6 +10327,12 @@ impl RpcDispatcher {
         )?;
         let mut config = old_config.clone();
         for (index, entry) in req.sets.iter().enumerate() {
+            let effective_prop = config.effective_model_edit_path(&entry.prop);
+            self.recheck_config_write_authority(
+                Method::ConfigSetMany,
+                Some(&effective_prop),
+                &config_commit,
+            )?;
             Self::stage_config_set(&mut config, &entry.prop, &entry.value).map_err(|e| {
                 rpc_err(
                     e.code,
@@ -10194,14 +10353,16 @@ impl RpcDispatcher {
         let scopes: Vec<_> = req
             .sets
             .iter()
-            .filter_map(|entry| LiveSessionRefreshScope::for_prop(&entry.prop))
+            .filter_map(|entry| LiveSessionRefreshScope::for_prop(&config, &entry.prop))
             .collect();
         let effects = RpcConfigCommitEffects {
             config_reservations: _agent_config_reservations,
             memory_provider_refs: req
                 .sets
                 .iter()
-                .filter_map(|entry| model_provider_ref_from_provider_profile_prop(&entry.prop))
+                .filter_map(|entry| {
+                    model_provider_ref_from_provider_profile_prop(&config, &entry.prop)
+                })
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter()
                 .collect(),
@@ -10235,6 +10396,8 @@ impl RpcDispatcher {
         prop: &str,
         value: &Value,
     ) -> Result<(), JsonRpcError> {
+        let effective_prop = config.effective_model_edit_path(prop);
+        let prop = effective_prop.as_str();
         if config.ensure_map_key_for_path(prop) {
             // Refused to vivify the reserved `default` agent: return a
             // reserved error rather than a downstream "Unknown property".
@@ -10287,39 +10450,35 @@ impl RpcDispatcher {
         // Match daemon-boot resolution (`create_memory_with_storage_and_routes`
         // is called with `api_key = None`): keys come from the per-route /
         // `[memory]` override or the referenced profile, never an inherited seed.
-        let resolved = zeroclaw_memory::resolve_embedding_settings(
-            &config.memory,
-            &config.embedding_routes,
-            None,
-            Some(&config.providers.models),
-        );
+        let embedder = match zeroclaw_memory::build_embedder_from_config(config, None) {
+            Ok(embedder) => embedder,
+            Err(error) => {
+                ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error_key": "memory.embedder_refresh_failed", "error": error.to_string()})), "failed to prepare memory embedder refresh");
+                return;
+            }
+        };
         // 1. Install-wide RPC memory handle.
         if let Some(memory) = ctx.memory.as_ref() {
-            memory.refresh_embedder(
-                &resolved.model_provider,
-                resolved.api_key.as_deref(),
-                &resolved.model,
-                resolved.dimensions,
-            );
+            memory.refresh_embedder(Arc::clone(&embedder));
         }
         let ctx = Arc::clone(ctx);
         zeroclaw_spawn::spawn!(async move {
-            Self::refresh_live_agent_memory(ctx, resolved).await;
+            Self::refresh_live_agent_memory(ctx, embedder).await;
         });
     }
 
     async fn refresh_live_agent_memory(
         ctx: Arc<RpcContext>,
-        resolved: zeroclaw_memory::EmbeddingSettings,
+        embedder: Arc<dyn zeroclaw_api::embedding::EmbeddingProvider>,
     ) {
         for session_id in ctx.sessions.list_ids().await {
             if let Some(agent) = ctx.sessions.get_agent(&session_id).await {
-                agent.lock().await.refresh_memory_embedder(
-                    &resolved.model_provider,
-                    resolved.api_key.as_deref(),
-                    &resolved.model,
-                    resolved.dimensions,
-                );
+                agent
+                    .lock()
+                    .await
+                    .refresh_memory_embedder(Arc::clone(&embedder));
             }
         }
     }
@@ -10363,6 +10522,8 @@ impl RpcDispatcher {
         config: &Config,
         scope: &LiveSessionRefreshScope,
     ) -> Result<Vec<PreparedLiveSessionRefresh>, JsonRpcError> {
+        let previous_config = ctx.config.read().clone();
+        let config_generation = Arc::new(config.clone());
         let session_ids = ctx.sessions.list_ids().await;
         let mut prepared = Vec::new();
         // Application paths are recorded only on prepared sessions; with none
@@ -10399,40 +10560,11 @@ impl RpcDispatcher {
                 continue;
             };
 
-            // Pre-filter on scope BEFORE taking the per-session lock. A
-            // running turn holds `model_provider_update` for its whole
-            // duration (see `handle_session_prompt`), so locking first would
-            // park this transaction — and the sequential dispatcher loop of
-            // the connection that issued the `config/set` — behind every
-            // busy session on the daemon, including ones this edit cannot
-            // touch (editing agent B's provider while agent A is mid-turn).
-            // The pre-read is authoritative for selection: overrides only
-            // change through `session/configure`, which takes
-            // `config_write_lock` first, and the caller holds that lock for
-            // the whole transaction. Agent alias is fixed for a generation.
-            // The state is re-read under the lock below anyway so the
-            // rebuild uses exactly what the ordering boundary guarantees.
-            {
-                let Some(agent_alias) = ctx.sessions.get_agent_alias(&session_id).await else {
-                    continue;
-                };
-                let Some(overrides) = ctx.sessions.get_overrides(&session_id).await else {
-                    continue;
-                };
-                let in_scope = scope
-                    .resolve_provider_ref(config, &agent_alias, &overrides)
-                    .map_err(|error| {
-                        rpc_err(
-                            INVALID_PARAMS,
-                            format!(
-                                "Config update cannot refresh live session `{session_id}`: {error}"
-                            ),
-                        )
-                    })?
-                    .is_some();
-                if !in_scope {
-                    continue;
-                }
+            let Some(agent_alias) = ctx.sessions.get_agent_alias(&session_id).await else {
+                continue;
+            };
+            if !scope.may_affect_agent(&agent_alias) {
+                continue;
             }
 
             // Acquire the per-session ordering boundary. This serialises
@@ -10466,8 +10598,42 @@ impl RpcDispatcher {
             let Some(overrides) = ctx.sessions.get_overrides(&session_id).await else {
                 continue;
             };
-            let Some(model_provider_ref) = scope
-                .resolve_provider_ref(config, &agent_alias, &overrides)
+            let Some(agent) = ctx.sessions.get_agent(&session_id).await else {
+                continue;
+            };
+            let mut binding_overrides = overrides.clone();
+            if let Some((active_ref, active_model_override)) =
+                agent.lock().await.model_selection_override(
+                    overrides.model_provider.as_deref(),
+                    overrides.model.as_deref(),
+                )
+            {
+                binding_overrides.model_provider = Some(active_ref);
+                binding_overrides.model = active_model_override;
+            }
+            let override_migration = match scope {
+                LiveSessionRefreshScope::ProviderAliasRename { old_ref, new_ref } => overrides
+                    .model_provider
+                    .as_deref()
+                    .filter(|current| profile_ref_of(&previous_config, current) == *old_ref)
+                    .map(|current| {
+                        let suffix = current.trim().strip_prefix(old_ref).unwrap_or_default();
+                        format!("{new_ref}{suffix}")
+                    }),
+                LiveSessionRefreshScope::ModelAliasRename { old_ref, new_ref } => overrides
+                    .model_provider
+                    .as_deref()
+                    .is_some_and(|current| current == old_ref)
+                    .then(|| new_ref.clone()),
+                _ => None,
+            };
+            let selected_provider = scope
+                .resolve_provider_ref_for_update(
+                    &previous_config,
+                    config,
+                    &agent_alias,
+                    &binding_overrides,
+                )
                 .map_err(|error| {
                     rpc_err(
                         INVALID_PARAMS,
@@ -10475,21 +10641,15 @@ impl RpcDispatcher {
                             "Config update cannot refresh live session `{session_id}`: {error}"
                         ),
                     )
-                })?
-            else {
+                })?;
+            let Some(model_provider_ref) = selected_provider.or_else(|| {
+                override_migration
+                    .as_ref()
+                    .and(binding_overrides.model_provider.clone())
+            }) else {
                 continue;
             };
-            let provider_temperature =
-                model_provider_ref
-                    .split_once('.')
-                    .and_then(|(provider_type, provider_alias)| {
-                        config
-                            .providers
-                            .models
-                            .find(provider_type, provider_alias)
-                            .and_then(|entry| entry.temperature)
-                    });
-            let agent_cfg = config
+            config
                 .resolved_agent_config(&agent_alias)
                 .or_else(|| config.agent(&agent_alias).cloned())
                 .ok_or_else(|| {
@@ -10501,26 +10661,23 @@ impl RpcDispatcher {
                         ),
                     )
                 })?;
-            let (model_provider, model_provider_name, model_name, model_route_resolver) =
-                crate::agent::agent::build_session_model_provider(
-                    config,
-                    &model_provider_ref,
-                    overrides.model.as_deref(),
-                )
-                .map_err(|error| {
-                    rpc_err(
-                        INVALID_PARAMS,
-                        format!(
-                            "Config update cannot refresh live session `{session_id}` from \
+            let model_update = crate::agent::agent::PreparedModelUpdate::build(
+                Arc::clone(&config_generation),
+                &agent_alias,
+                &model_provider_ref,
+                binding_overrides.model.as_deref(),
+                overrides.temperature,
+            )
+            .await
+            .map_err(|error| {
+                rpc_err(
+                    INVALID_PARAMS,
+                    format!(
+                        "Config update cannot refresh live session `{session_id}` from \
                              `{model_provider_ref}`: {error}"
-                        ),
-                    )
-                })?;
-            let tool_dispatcher = crate::agent::agent::tool_dispatcher_for_provider(
-                &agent_cfg,
-                model_provider.as_ref(),
-                &model_name,
-            );
+                    ),
+                )
+            })?;
             prepared.push(PreparedLiveSessionRefresh {
                 application_paths: application_paths
                     .iter()
@@ -10565,20 +10722,8 @@ impl RpcDispatcher {
                 session_id,
                 session_generation,
                 _model_provider_update: model_provider_update,
-                model_provider,
-                model_provider_name,
-                model_name,
-                model_route_resolver,
-                tool_dispatcher,
-                temperature: overrides.temperature.or(provider_temperature),
-                override_migration: match scope {
-                    LiveSessionRefreshScope::ProviderAliasRename { old_ref, new_ref } => overrides
-                        .model_provider
-                        .as_deref()
-                        .is_some_and(|current| current == old_ref)
-                        .then(|| new_ref.clone()),
-                    _ => None,
-                },
+                model_update,
+                override_migration,
             });
         }
         Ok(prepared)
@@ -10587,7 +10732,6 @@ impl RpcDispatcher {
     async fn apply_prepared_live_sessions_refresh(
         ctx: Arc<RpcContext>,
         prepared: Vec<PreparedLiveSessionRefresh>,
-        config_generation: Arc<Config>,
         revision: Option<zeroclaw_config::live::ConfigRevision>,
     ) {
         for refresh in prepared {
@@ -10596,12 +10740,7 @@ impl RpcDispatcher {
                 application_paths,
                 session_generation,
                 _model_provider_update,
-                model_provider,
-                model_provider_name,
-                model_name,
-                model_route_resolver,
-                tool_dispatcher,
-                temperature,
+                model_update,
                 override_migration,
             } = refresh;
             if revision
@@ -10619,22 +10758,7 @@ impl RpcDispatcher {
             }
             let applied = ctx
                 .sessions
-                .apply_model_provider(
-                    &session_id,
-                    session_generation,
-                    crate::rpc::session::ModelProviderUpdate {
-                        model_provider,
-                        model_provider_name,
-                        model_name,
-                        model_route_resolver,
-                        tool_dispatcher,
-                        config_generation: Arc::clone(&config_generation),
-                        // Temperature travels in the same state transition as
-                        // the provider box rather than a follow-up setter.
-                        temperature: Some(temperature),
-                        multimodal_config: config_generation.multimodal.clone(),
-                    },
-                )
+                .apply_model_provider(&session_id, session_generation, model_update)
                 .await;
             if let Some(revision) = revision {
                 ctx.config_authority.complete_application(
@@ -10667,7 +10791,7 @@ impl RpcDispatcher {
             &LiveSessionRefreshScope::Agent(agent_alias.to_string()),
         )
         .await?;
-        Self::apply_prepared_live_sessions_refresh(ctx, prepared, Arc::new(config), None).await;
+        Self::apply_prepared_live_sessions_refresh(ctx, prepared, None).await;
         Ok(())
     }
 
@@ -10715,6 +10839,7 @@ impl RpcDispatcher {
                 None => true,
             })
             .filter(|info| !field_visibility::is_excluded(&info.name, &excluded))
+            .filter(|info| config.effective_model_edit_path(&info.name) == info.name)
             .map(|info| {
                 let env = config.prop_is_env_overridden(&info.name);
                 ConfigFieldEntry::from_prop_field(info, env)
@@ -10731,8 +10856,9 @@ impl RpcDispatcher {
                 .map(|alias| self.ctx.agent_lifecycle.reserve_config_mutation(alias))
                 .transpose()
                 .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?;
-        let refresh_model_provider_ref = model_provider_ref_from_provider_profile_prop(&req.prop);
-        let refresh_scope = LiveSessionRefreshScope::for_prop(&req.prop);
+        let refresh_model_provider_ref =
+            model_provider_ref_from_provider_profile_prop(&self.ctx.config.read(), &req.prop);
+        let refresh_scope = LiveSessionRefreshScope::for_prop(&self.ctx.config.read(), &req.prop);
         let refresh_channel_agent = agent_alias_from_channel_auth_prop(&req.prop);
         let config_commit = self
             .ctx
@@ -10835,8 +10961,9 @@ impl RpcDispatcher {
             config_reservations: _agent_config_reservation.into_iter().collect(),
             ..RpcConfigCommitEffects::default()
         };
+        let scope = LiveSessionRefreshScope::for_prop(&self.ctx.config.read(), &key_path);
         let mut revision = None;
-        let created = if touches_model_routes(&req.path) {
+        let created = if let Some(scope) = scope {
             let mut working = self.ctx.config.read().clone();
             let created = create(&mut working)?;
             if created {
@@ -10844,7 +10971,7 @@ impl RpcDispatcher {
                     Box::pin(self.commit_config_with_live_session_refresh(
                         working,
                         config_commit,
-                        &LiveSessionRefreshScope::ModelRoutes,
+                        &scope,
                         effects,
                     ))
                     .await?,
@@ -10926,7 +11053,7 @@ impl RpcDispatcher {
                     zeroclaw_config::alias_refs::AliasKind::Provider {
                         category: zeroclaw_config::alias_refs::ProviderCategory::Models,
                         ..
-                    }
+                    } | zeroclaw_config::alias_refs::AliasKind::ModelAlias { .. }
                 )
             });
 
@@ -11161,11 +11288,21 @@ impl RpcDispatcher {
             // `from` must be rebuilt against `to` on the same generation as
             // the config commit, the same as a `providers.models.*` field
             // edit already does.
-            let model_provider_family = match &kind {
+            let model_refresh_scope = match &kind {
                 zeroclaw_config::alias_refs::AliasKind::Provider {
                     category: zeroclaw_config::alias_refs::ProviderCategory::Models,
                     family,
-                } => Some(family.clone()),
+                } => Some(LiveSessionRefreshScope::ProviderAliasRename {
+                    old_ref: format!("{family}.{}", req.from),
+                    new_ref: format!("{family}.{}", req.to),
+                }),
+                zeroclaw_config::alias_refs::AliasKind::ModelAlias {
+                    family,
+                    profile_alias,
+                } => Some(LiveSessionRefreshScope::ModelAliasRename {
+                    old_ref: format!("{family}.{profile_alias}.{}", req.from),
+                    new_ref: format!("{family}.{profile_alias}.{}", req.to),
+                }),
                 _ => None,
             };
             if is_agent {
@@ -11314,11 +11451,7 @@ impl RpcDispatcher {
                     ..RpcConfigCommitEffects::default()
                 };
                 if !resume_committed_to {
-                    if let Some(family) = model_provider_family {
-                        let scope = LiveSessionRefreshScope::ProviderAliasRename {
-                            old_ref: format!("{family}.{}", req.from),
-                            new_ref: format!("{family}.{}", req.to),
-                        };
+                    if let Some(scope) = model_refresh_scope {
                         Box::pin(self.commit_config_with_live_session_refresh(
                             working,
                             config_commit,
@@ -11955,6 +12088,7 @@ impl RpcDispatcher {
         for s in QUICKSTART_SECTIONS {
             roots.insert(s.as_str().to_string());
         }
+        roots.insert("providers.registry".to_string());
 
         let direct_scalar_parents: std::collections::HashSet<String> = config
             .prop_fields()
@@ -12008,6 +12142,9 @@ impl RpcDispatcher {
         let sections: Vec<ConfigSectionEntry> = ordered
             .into_iter()
             .map(|key| {
+                if key == "providers.registry" {
+                    return super::types::provider_registry_section(&config);
+                }
                 let wizard = Section::from_key(&key);
                 let has_picker = match wizard {
                     Some(w) => matches!(
@@ -26707,6 +26844,7 @@ mod tests {
     #[test]
     fn agent_scoped_refresh_selects_only_edited_agent_without_override() {
         use crate::rpc::session::SessionOverrides;
+        let config = Config::default();
         let no_override = SessionOverrides::default();
         let with_override = SessionOverrides {
             model_provider: Some("anthropic.other".to_string()),
@@ -26714,28 +26852,78 @@ mod tests {
         };
 
         // A session bound to the edited agent with no override is rebuilt.
-        assert!(agent_scoped_refresh_selects("fred", "fred", &no_override));
+        assert!(agent_scoped_refresh_selects(
+            &config,
+            "fred",
+            "fred",
+            &no_override
+        ));
         // A session belonging to a different agent is never rebuilt, even
         // when it resolves to the same provider.
-        assert!(!agent_scoped_refresh_selects("fred", "wilma", &no_override));
+        assert!(!agent_scoped_refresh_selects(
+            &config,
+            "fred",
+            "wilma",
+            &no_override
+        ));
         // The edited agent's own session is left untouched when it carries a
         // `model_provider` override.
         assert!(!agent_scoped_refresh_selects(
+            &config,
             "fred",
             "fred",
             &with_override
         ));
         // A different agent with an override is likewise excluded.
         assert!(!agent_scoped_refresh_selects(
+            &config,
             "fred",
             "wilma",
             &with_override
         ));
+        for reference in ["custom", "custom:http://127.0.0.1:1/v1"] {
+            assert!(agent_scoped_refresh_selects(
+                &config,
+                "fred",
+                "fred",
+                &SessionOverrides {
+                    model_provider: Some(reference.into()),
+                    ..Default::default()
+                }
+            ));
+        }
     }
 
     #[test]
-    fn provider_scoped_refresh_selects_inheritors_and_matching_overrides() {
-        use crate::rpc::session::SessionOverrides;
+    fn provider_refresh_selects_inheritors_and_matching_overrides() {
+        let mut config = Config::default();
+        config
+            .providers
+            .models
+            .ensure("anthropic", "default")
+            .unwrap()
+            .models
+            .insert(
+                "fast".into(),
+                zeroclaw_config::schema::ModelEntryConfig {
+                    id: Some("fast-model".into()),
+                    ..Default::default()
+                },
+            );
+        config.agents.insert(
+            "worker".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: "anthropic.default".into(),
+                ..Default::default()
+            },
+        );
+        let scope = LiveSessionRefreshScope::ModelProvider("anthropic.default".into());
+        let selects = |overrides: &SessionOverrides| {
+            scope
+                .resolve_provider_ref(&config, "worker", overrides)
+                .unwrap()
+                .is_some()
+        };
         let no_override = SessionOverrides::default();
         let matching_override = SessionOverrides {
             model_provider: Some("anthropic.default".to_string()),
@@ -26748,20 +26936,25 @@ mod tests {
 
         // No override: inherits the agent provider, so it is a candidate
         // (final config match is resolved by the caller).
-        assert!(provider_scoped_refresh_selects(
-            "anthropic.default",
-            &no_override
-        ));
+        assert!(selects(&no_override));
         // Override that names the edited provider is a candidate.
-        assert!(provider_scoped_refresh_selects(
-            "anthropic.default",
-            &matching_override
-        ));
+        assert!(selects(&matching_override));
         // Override that names a different provider is excluded.
-        assert!(!provider_scoped_refresh_selects(
-            "anthropic.default",
-            &other_override
-        ));
+        assert!(!selects(&other_override));
+
+        // A three-segment override refreshes when its profile (first two
+        // segments) matches the edited `<type>.<alias>` target.
+        let three_seg_match = SessionOverrides {
+            model_provider: Some("anthropic.default.fast".to_string()),
+            ..Default::default()
+        };
+        assert!(selects(&three_seg_match));
+        // ...but not when the profile portion names a different alias.
+        let three_seg_other = SessionOverrides {
+            model_provider: Some("anthropic.work.fast".to_string()),
+            ..Default::default()
+        };
+        assert!(!selects(&three_seg_other));
     }
 
     #[test]
@@ -31486,116 +31679,6 @@ mod tests {
         assert_eq!(
             v["params"]["model_context_window"], 1_000_000,
             "emitted context_usage must carry B's model_context_window (1M), not A's (128k)"
-        );
-    }
-
-    /// Blocking (note12): same-profile fallback to a different model must not
-    /// borrow the primary's capacity. Mirrors the gateway regression with the
-    /// same config: `openai.default` for model-a (200k) with
-    /// fallback_models=[model-b]. Serving model-b must omit
-    /// `model_context_window` on the RPC wire so clients use the trim budget.
-    #[test]
-    fn context_usage_omits_window_on_same_profile_model_fallback() {
-        use std::collections::HashMap;
-        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
-
-        let mut runtime_profiles = HashMap::new();
-        runtime_profiles.insert(
-            "coding".to_string(),
-            RuntimeProfileConfig {
-                max_context_tokens: Some(800_000),
-                ..RuntimeProfileConfig::default()
-            },
-        );
-
-        let mut agents = HashMap::new();
-        agents.insert(
-            "coder".to_string(),
-            AliasedAgentConfig {
-                enabled: true,
-                runtime_profile: "coding".into(),
-                model_provider: "openai.default".into(),
-                ..AliasedAgentConfig::default()
-            },
-        );
-
-        let mut providers = zeroclaw_config::providers::Providers::default();
-        let entry = providers
-            .models
-            .ensure("openai", "default")
-            .expect("ensure entry");
-        entry.model = Some("model-a".to_string());
-        entry.fallback_models = vec!["model-b".to_string()];
-        entry.context_window = Some(200_000);
-
-        let cfg = Config {
-            agents,
-            runtime_profiles,
-            providers,
-            ..Config::default()
-        };
-
-        // Shared resolution: primary matches, fallback does not.
-        assert_eq!(
-            cfg.model_provider_context_window_opt("openai.default", "model-a"),
-            Some(200_000)
-        );
-        assert_eq!(
-            cfg.model_provider_context_window_opt("openai.default", "model-b"),
-            None,
-            "fallback model must not borrow the primary's capacity"
-        );
-
-        // The serving call resolves limits for model-b, not the primary model.
-        let limits = cfg.resolved_context_limits_for_route("coder", "openai.default", "model-b");
-        let mut event = TurnEvent::Usage {
-            context_token_budget: None,
-            model_context_window: None,
-            input_tokens: Some(1000),
-            cached_input_tokens: None,
-            output_tokens: Some(500),
-            cost_usd: Some(0.01),
-            provider_ref: "openai.default".to_string(),
-            model: "model-b".to_string(),
-            accepted: true,
-            estimated_input_tokens: None,
-        };
-        let model_ctx_window = if let TurnEvent::Usage {
-            provider_ref,
-            model,
-            ..
-        } = &event
-        {
-            cfg.model_provider_context_window_opt(provider_ref, model)
-                .map(|v| v as u64)
-        } else {
-            None
-        };
-        assert!(
-            model_ctx_window.is_none(),
-            "RPC must omit window when served model differs from configured primary"
-        );
-
-        let max_ctx = limits.context_token_budget as u64;
-        if let TurnEvent::Usage {
-            context_token_budget,
-            model_context_window,
-            ..
-        } = &mut event
-        {
-            *context_token_budget = Some(max_ctx);
-            *model_context_window = model_ctx_window;
-        }
-        let json = notification_for_turn_event("s1", &event).unwrap();
-        let v = parse(&json);
-        assert_eq!(v["params"]["type"], "context_usage");
-        assert_eq!(
-            v["params"]["max_context_tokens"], 800_000,
-            "the explicit profile budget survives the same-profile fallback (#10068)"
-        );
-        assert!(
-            v["params"].get("model_context_window").is_none(),
-            "RPC wire must omit model_context_window on same-profile fallback"
         );
     }
 
@@ -41521,6 +41604,320 @@ mod tests {
         agent.lock().await.temperature_for_test()
     }
 
+    fn add_tool_switch_test_provider(config: &mut Config) {
+        let provider = config
+            .providers
+            .models
+            .ensure("openai", "tool_provider")
+            .expect("tool provider slot exists");
+        provider.api_key = Some("test-tool-key".into());
+        provider.uri = Some("http://127.0.0.1:1".into());
+        provider.model = Some("tool-model".into());
+        provider.temperature = Some(0.9);
+    }
+
+    async fn switch_model_for_session(
+        dispatcher: &RpcDispatcher,
+        session_id: &str,
+        provider_ref: &str,
+        model: &str,
+    ) {
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(session_id)
+            .await
+            .expect("session agent exists");
+        agent
+            .lock()
+            .await
+            .apply_model_switch_for_test(provider_ref, model)
+            .await
+            .expect("in-turn model switch must succeed");
+    }
+
+    #[tokio::test]
+    async fn config_set_refreshes_bare_and_url_bindings_with_inherited_models() {
+        for reference in ["openai", "custom:http://127.0.0.1:2/v1"] {
+            for explicit_model in [None, Some("explicit-model")] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let mut config = make_model_refresh_test_config(&tmp);
+                add_tool_switch_test_provider(&mut config);
+                let dispatcher = make_config_set_test_dispatcher(config);
+                let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+                let mut overrides = json!({ "model_provider": reference });
+                if let Some(model) = explicit_model {
+                    overrides["model"] = json!(model);
+                }
+                dispatcher
+                    .handle_session_configure(&json!({
+                        "session_id": session_id,
+                        "overrides": overrides
+                    }))
+                    .await
+                    .expect("bare and URL selections must inherit configured defaults");
+                assert_eq!(
+                    model_name_for_session(&dispatcher, &session_id).await,
+                    explicit_model.unwrap_or("old-model")
+                );
+
+                dispatcher
+                    .handle_config_set(&json!({
+                        "prop": "providers.models.openai.test-provider.model",
+                        "value": "updated-inherited-model"
+                    }))
+                    .await
+                    .expect("editing inherited model defaults must refresh bare/URL bindings");
+                assert_eq!(
+                    model_name_for_session(&dispatcher, &session_id).await,
+                    explicit_model.unwrap_or("updated-inherited-model")
+                );
+
+                dispatcher
+                    .handle_config_set(&json!({
+                        "prop": "agents.test-agent.model_provider",
+                        "value": "openai.tool_provider"
+                    }))
+                    .await
+                    .expect("changing the source selection must refresh its inheriting bindings");
+                assert_eq!(
+                    model_name_for_session(&dispatcher, &session_id).await,
+                    explicit_model.unwrap_or("tool-model")
+                );
+                let agent = dispatcher
+                    .ctx
+                    .sessions
+                    .get_agent(&session_id)
+                    .await
+                    .expect("session survives inherited-provider refresh");
+                assert_eq!(agent.lock().await.selected_model_provider_ref(), reference);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn config_set_refreshes_active_tool_selection_and_inherits_its_model() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        add_tool_switch_test_provider(&mut config);
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        switch_model_for_session(
+            &dispatcher,
+            &session_id,
+            "openai.tool_provider",
+            "tool-model",
+        )
+        .await;
+
+        dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.test-provider.temperature",
+                "value": 0.4
+            }))
+            .await
+            .expect("editing the original provider must succeed");
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "tool-model",
+            "editing the original provider must preserve the active tool selection"
+        );
+        assert_eq!(
+            temperature_for_session(&dispatcher, &session_id).await,
+            Some(0.9)
+        );
+
+        dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.tool_provider.model",
+                "value": "tool-model-v2"
+            }))
+            .await
+            .expect("editing the active provider must rebuild the selected binding");
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "tool-model-v2",
+            "the model resolved by the tool must keep inheriting its selected config"
+        );
+        dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.tool_provider.temperature",
+                "value": 0.7
+            }))
+            .await
+            .expect("subsequent active-provider edits must still refresh the binding");
+        assert_eq!(
+            temperature_for_session(&dispatcher, &session_id).await,
+            Some(0.7)
+        );
+        let overrides = dispatcher
+            .ctx
+            .sessions
+            .get_overrides(&session_id)
+            .await
+            .expect("session survives refresh");
+        assert!(overrides.model_provider.is_none());
+        assert!(overrides.model.is_none());
+    }
+
+    #[tokio::test]
+    async fn config_set_refresh_preserves_explicit_tool_model_override() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        add_tool_switch_test_provider(&mut config);
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        switch_model_for_session(
+            &dispatcher,
+            &session_id,
+            "openai.tool_provider",
+            "explicit-tool-model",
+        )
+        .await;
+
+        dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.tool_provider.model",
+                "value": "tool-model-v2"
+            }))
+            .await
+            .expect("editing the active provider must preserve an explicit model override");
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "explicit-tool-model"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_configure_preserves_active_tool_selection_without_provider_override() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        add_tool_switch_test_provider(&mut config);
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        switch_model_for_session(
+            &dispatcher,
+            &session_id,
+            "openai.tool_provider",
+            "tool-model",
+        )
+        .await;
+
+        dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": { "temperature": 0.6 }
+            }))
+            .await
+            .expect("temperature-only configure must preserve the active provider");
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "tool-model"
+        );
+        assert_eq!(
+            temperature_for_session(&dispatcher, &session_id).await,
+            Some(0.6)
+        );
+        dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": { "model": "configured-tool-model" }
+            }))
+            .await
+            .expect("model-only configure must rebuild against the active provider");
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(&session_id)
+            .await
+            .expect("session agent exists");
+        assert_eq!(
+            agent.lock().await.selected_model_provider_ref(),
+            "openai.tool_provider"
+        );
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "configured-tool-model"
+        );
+        assert_eq!(
+            temperature_for_session(&dispatcher, &session_id).await,
+            Some(0.6)
+        );
+
+        dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": { "model_provider": "openai.test-provider" }
+            }))
+            .await
+            .expect("an explicit provider configure must replace the tool selection");
+        assert_eq!(
+            agent.lock().await.selected_model_provider_ref(),
+            "openai.test-provider"
+        );
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_alias_rename_preserves_active_tool_selection() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        add_tool_switch_test_provider(&mut config);
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        switch_model_for_session(
+            &dispatcher,
+            &session_id,
+            "openai.tool_provider",
+            "tool-model",
+        )
+        .await;
+
+        dispatcher
+            .handle_config_map_key_rename(&json!({
+                "path": "providers.models.openai",
+                "from": "tool_provider",
+                "to": "tool_renamed"
+            }))
+            .await
+            .expect("renaming an in-turn selected provider must rebuild its binding");
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(&session_id)
+            .await
+            .expect("session agent exists");
+        assert_eq!(
+            agent.lock().await.selected_model_provider_ref(),
+            "openai.tool_renamed"
+        );
+        dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.tool_renamed.model",
+                "value": "renamed-model"
+            }))
+            .await
+            .expect("the renamed active selection must keep inheriting config edits");
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "renamed-model"
+        );
+        assert!(
+            dispatcher
+                .ctx
+                .sessions
+                .get_overrides(&session_id)
+                .await
+                .expect("session survives rename")
+                .model_provider
+                .is_none(),
+            "refresh must derive active selection without duplicating it in overrides"
+        );
+    }
+
     async fn wait_for_model_name(dispatcher: &RpcDispatcher, session_id: &str, expected: &str) {
         for _ in 0..50 {
             if model_name_for_session(dispatcher, session_id).await == expected {
@@ -41844,6 +42241,224 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn provider_registry_set_rebuilds_active_model_and_rejects_stale_documents() {
+        use zeroclaw_config::provider_registry::editor;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        config.providers = toml::from_str(
+            r#"
+[connections."gateway.prod"]
+kind = "custom"
+uri = "http://127.0.0.1:1/v1"
+auth = { mode = "api_key", api_key = "test-key" }
+[models."chat.fast.us"]
+capability = "chat"
+provider = "gateway.prod"
+model = "before"
+"#,
+        )
+        .unwrap();
+        config.agents.get_mut("test-agent").unwrap().model_provider = "chat.fast.us".into();
+        let expected = editor::snapshot(&config).unwrap();
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "before"
+        );
+        let mut registry = expected.clone();
+        registry["models"]["chat.fast.us"]["model"] = json!("after");
+        let params = json!({"expected": expected, "registry": registry});
+        let result = dispatcher
+            .handle_config_registry_set(&params)
+            .await
+            .unwrap();
+        assert!(result["revision"].is_object());
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "after"
+        );
+        assert!(
+            dispatcher
+                .handle_config_registry_set(&params)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "after"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_shared_reliability_rebuilds_the_active_session_provider() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let mut config = make_model_refresh_test_config(&tmp);
+        add_tool_switch_test_provider(&mut config);
+        config
+            .providers
+            .models
+            .ensure("openai", "tool_provider")
+            .unwrap()
+            .uri = Some(server.uri());
+        config.reliability.provider_retries = 0;
+        config.reliability.provider_backoff_ms = 0;
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        switch_model_for_session(
+            &dispatcher,
+            &session_id,
+            "openai.tool_provider",
+            "tool-model",
+        )
+        .await;
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(&session_id)
+            .await
+            .unwrap();
+
+        // Non-streaming turns expose the exact retry budget without adding
+        // the separate stream-recovery allowance.
+        assert!(agent.lock().await.turn("before update").await.is_err());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        dispatcher
+            .handle_config_set(&json!({
+                "prop": "reliability.provider_retries",
+                "value": 2
+            }))
+            .await
+            .expect("the shared retry policy must commit with rebuilt session bindings");
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "tool-model"
+        );
+        assert!(agent.lock().await.turn("after update").await.is_err());
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            4,
+            "the existing session must make three attempts under the committed retry budget"
+        );
+        for request in requests {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["model"], "tool-model");
+        }
+    }
+
+    #[tokio::test]
+    async fn config_set_shared_options_refreshes_session_requests_and_multimodal_policy() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let mut config = make_model_refresh_test_config(&tmp);
+        let provider = config
+            .providers
+            .models
+            .ensure("openai", "test-provider")
+            .unwrap();
+        provider.kind = Some("openai-compatible".into());
+        provider.wire_api = Some(zeroclaw_config::schema::WireApi::ChatCompletions);
+        provider.uri = Some(server.uri());
+        provider.reasoning_effort_passthrough = true;
+        provider.vision = Some(true);
+        config.runtime.reasoning_effort = Some("low".into());
+        config.multimodal.max_images = 1;
+        config.reliability.provider_retries = 0;
+        config.reliability.provider_backoff_ms = 0;
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+
+        dispatcher
+            .handle_config_set(&json!({
+                "prop": "runtime.reasoning_effort",
+                "value": "high"
+            }))
+            .await
+            .expect("reasoning defaults must rebuild existing session bindings");
+        assert!(
+            dispatcher
+                .handle_session_prompt(&json!({
+                    "session_id": session_id,
+                    "prompt": "use the committed reasoning setting"
+                }))
+                .await
+                .is_err()
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert!(!requests.is_empty());
+        for request in &requests {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["reasoning_effort"], "high");
+        }
+
+        dispatcher
+            .handle_config_set(&json!({
+                "prop": "multimodal.max_images",
+                "value": 2
+            }))
+            .await
+            .expect("multimodal policy must rebuild the runtime and provider together");
+        const PNG: [u8; 67] = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        let first_image = tmp.path().join("first.png");
+        let second_image = tmp.path().join("second.png");
+        std::fs::write(&first_image, PNG).unwrap();
+        std::fs::write(&second_image, PNG).unwrap();
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(&session_id)
+            .await
+            .unwrap();
+        let mut agent = agent.lock().await;
+        assert_eq!(agent.multimodal_config_for_test().max_images, 2);
+        agent.seed_history(&[ChatMessage::user(format!(
+            "first [IMAGE:{}]",
+            first_image.display()
+        ))]);
+        assert!(
+            agent
+                .turn(&format!("second [IMAGE:{}]", second_image.display()))
+                .await
+                .is_err()
+        );
+        drop(agent);
+        let refreshed_requests = server.received_requests().await.unwrap();
+        let image_requests = &refreshed_requests[requests.len()..];
+        assert!(!image_requests.is_empty());
+        for request in image_requests {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["reasoning_effort"], "high");
+            assert_eq!(
+                body.to_string().matches("data:image/png;base64,").count(),
+                2,
+                "both runtime and provider must admit the newly widened image budget"
+            );
+        }
+    }
+
     /// The Aug 13 review's specifically-requested boundary: a route-affecting
     /// `config/set` (here, `model_routes.*`) followed immediately by the next
     /// prompt on an already-running live session must dispatch AND report
@@ -41955,9 +42570,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn config_set_provider_refreshes_implicit_nested_route_model() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = make_model_refresh_test_config(&tmp);
+        let provider = cfg
+            .providers
+            .models
+            .ensure("openai", "test-provider")
+            .expect("openai provider exists");
+        provider.model = None;
+        provider.models.insert(
+            "default".into(),
+            zeroclaw_config::schema::ModelEntryConfig {
+                id: Some("default-model".into()),
+                ..Default::default()
+            },
+        );
+        provider.models.insert(
+            "fast".into(),
+            zeroclaw_config::schema::ModelEntryConfig {
+                id: Some("fast-v1".into()),
+                context_window: Some(8_000),
+                ..Default::default()
+            },
+        );
+        cfg.model_routes
+            .push(zeroclaw_config::schema::ModelRouteConfig {
+                hint: "reasoning".into(),
+                model_provider: "openai.test-provider.fast".into(),
+                model: String::new(),
+                api_key: None,
+            });
+
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        {
+            let agent = dispatcher
+                .ctx
+                .sessions
+                .get_agent(&session_id)
+                .await
+                .expect("session agent exists");
+            let agent = agent.lock().await;
+            let route = agent.resolved_route_for_test("hint:reasoning");
+            assert_eq!(route.model, "fast-v1");
+            assert_eq!(
+                agent
+                    .context_limits_for_route(&route.provider_name, &route.model)
+                    .model_context_window,
+                8_000
+            );
+        }
+
+        dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.test-provider.models.fast.id",
+                "value": "fast-v2"
+            }))
+            .await
+            .expect("editing the nested provider entry must succeed");
+        dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.test-provider.models.fast.context_window",
+                "value": 16000
+            }))
+            .await
+            .expect("editing the nested context window must succeed");
+
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(&session_id)
+            .await
+            .expect("session agent exists");
+        let agent = agent.lock().await;
+        let route = agent.resolved_route_for_test("hint:reasoning");
+        assert_eq!(
+            route.model, "fast-v2",
+            "an implicit route model must refresh when its nested provider entry changes"
+        );
+        assert_eq!(
+            agent
+                .context_limits_for_route(&route.provider_name, &route.model)
+                .model_context_window,
+            16_000,
+            "context limits must come from the same refreshed nested model generation"
+        );
+    }
+
+    #[tokio::test]
     async fn staged_model_route_becomes_live_only_when_complete() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let mut cfg = make_model_refresh_test_config(&tmp);
+        let staged = cfg
+            .providers
+            .models
+            .ensure("openai", "staged-provider")
+            .expect("openai staged-provider slot exists");
+        staged.api_key = Some("test-key-staged".into());
+        staged.uri = Some("http://127.0.0.1:1".into());
+        staged.model = None;
+        let dispatcher = make_config_set_test_dispatcher(cfg);
         let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
 
         dispatcher
@@ -41970,7 +42683,7 @@ mod tests {
         dispatcher
             .handle_config_set(&json!({
                 "prop": "model_routes.reasoning.model_provider",
-                "value": "openai.test-provider"
+                "value": "openai.staged-provider"
             }))
             .await
             .expect("setting the staged route provider must succeed");
@@ -42008,8 +42721,110 @@ mod tests {
             route.kind,
             zeroclaw_providers::router::RouteResolutionKind::MatchedHint
         ));
-        assert_eq!(route.provider_name, "openai.test-provider");
+        assert_eq!(route.provider_name, "openai.staged-provider");
         assert_eq!(route.model, "old-model");
+    }
+
+    #[tokio::test]
+    async fn config_set_provider_refresh_preserves_session_nested_model_ref() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = make_model_refresh_test_config(&tmp);
+
+        // Convert the profile to nested-only: a `default` entry plus a `fast`
+        // entry, with the agent selecting `fast` through a three-segment ref.
+        // Nothing points at the profile-level `model` anymore.
+        let provider = cfg
+            .providers
+            .models
+            .ensure("openai", "test-provider")
+            .expect("openai provider slot exists");
+        provider.model = None;
+        provider.models.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::ModelEntryConfig {
+                id: Some("old-model".to_string()),
+                ..Default::default()
+            },
+        );
+        provider.models.insert(
+            "fast".to_string(),
+            zeroclaw_config::schema::ModelEntryConfig {
+                id: Some("fast-model".to_string()),
+                ..Default::default()
+            },
+        );
+        cfg.agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .model_provider = "openai.test-provider.fast".into();
+
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "fast-model",
+            "session must start on the selected nested model entry"
+        );
+
+        // Editing the selected entry's tuning triggers the provider-scoped
+        // live refresh; the rebuild must keep the session's three-segment
+        // selection instead of collapsing to the profile default entry.
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.test-provider.models.fast.temperature",
+                "value": 0.5
+            }))
+            .await;
+        assert!(
+            res.is_ok(),
+            "config/set providers.models.<t>.<a>.models.<alias>.temperature must succeed: {res:?}"
+        );
+
+        wait_for_temperature(&dispatcher, &session_id, Some(0.5)).await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "fast-model",
+            "provider-scoped refresh must not collapse the selected nested model to models.default"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_agent_model_does_not_wait_for_unrelated_busy_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        let other = config
+            .providers
+            .models
+            .ensure("openai", "other-provider")
+            .unwrap();
+        other.api_key = Some("test-key".into());
+        other.uri = Some("http://127.0.0.1:1".into());
+        other.model = Some("other-model".into());
+        let mut other_agent = config.agents["test-agent"].clone();
+        other_agent.model_provider = "openai.test-provider".into();
+        config.agents.insert("other-agent".into(), other_agent);
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        let guard = dispatcher
+            .ctx
+            .sessions
+            .lock_model_provider_update(&session_id)
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            dispatcher.handle_config_set(&json!({
+                "prop": "agents.other-agent.model_provider", "value": "openai.other-provider"
+            })),
+        )
+        .await
+        .expect("unrelated session cannot block an agent-scoped update")
+        .expect("valid config update succeeds");
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model"
+        );
+        drop(guard);
     }
 
     #[tokio::test]
@@ -42706,6 +43521,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn config_set_removed_route_dependency_rebuilds_from_previous_generation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        let route_provider = config
+            .providers
+            .models
+            .ensure("openai", "route-only")
+            .unwrap();
+        route_provider.api_key = Some("test-key".into());
+        route_provider.uri = Some("http://127.0.0.1:1".into());
+        route_provider.model = Some("route-model".into());
+        config
+            .model_routes
+            .push(zeroclaw_config::schema::ModelRouteConfig {
+                hint: "reasoning".into(),
+                model_provider: "openai.route-only".into(),
+                ..Default::default()
+            });
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(&session_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            agent
+                .lock()
+                .await
+                .resolved_route_for_test("hint:reasoning")
+                .provider_name,
+            "openai.route-only"
+        );
+
+        dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.route-only.model",
+                "value": ""
+            }))
+            .await
+            .expect("removing an implicit route model must rebuild its old consumers");
+
+        let route = agent.lock().await.resolved_route_for_test("hint:reasoning");
+        assert_eq!(route.provider_name, "openai.test-provider");
+        assert_eq!(
+            route.kind,
+            zeroclaw_providers::router::RouteResolutionKind::UnknownHintFallback
+        );
+    }
+
+    #[tokio::test]
     async fn config_set_provider_refresh_failure_rolls_back_config_and_session() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_model_refresh_test_config(&tmp);
@@ -42965,6 +43832,408 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_alias_rename_preserves_nested_selection_in_live_and_saved_refs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        let profile = config
+            .providers
+            .models
+            .ensure("openai", "nested_provider")
+            .expect("nested provider slot exists");
+        profile.api_key = Some("nested-key".into());
+        profile.uri = Some("http://127.0.0.1:1".into());
+        profile.models.insert(
+            "fast".into(),
+            zeroclaw_config::schema::ModelEntryConfig {
+                id: Some("nested-fast-model".into()),
+                ..Default::default()
+            },
+        );
+        config
+            .agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .model_provider = "openai.nested_provider.fast".into();
+
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": { "model_provider": "openai.nested_provider.fast" }
+            }))
+            .await
+            .expect("nested session override must be accepted");
+
+        dispatcher
+            .handle_config_map_key_rename(&json!({
+                "path": "providers.models.openai",
+                "from": "nested_provider",
+                "to": "nested_renamed"
+            }))
+            .await
+            .expect("provider alias rename must preserve the nested selection");
+
+        assert_eq!(
+            dispatcher
+                .ctx
+                .sessions
+                .get_overrides(&session_id)
+                .await
+                .and_then(|o| o.model_provider)
+                .as_deref(),
+            Some("openai.nested_renamed.fast")
+        );
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "nested-fast-model"
+        );
+        assert_eq!(
+            dispatcher
+                .ctx
+                .config
+                .read()
+                .agent("test-agent")
+                .expect("agent survives rename")
+                .model_provider
+                .as_str(),
+            "openai.nested_renamed.fast"
+        );
+        let saved = tokio::fs::read_to_string(tmp.path().join("config.toml"))
+            .await
+            .expect("renamed config must be saved");
+        let reloaded: zeroclaw_config::schema::Config =
+            toml::from_str(&saved).expect("saved config must reload");
+        assert_eq!(
+            reloaded
+                .agent("test-agent")
+                .expect("saved agent survives rename")
+                .model_provider
+                .as_str(),
+            "openai.nested_renamed.fast"
+        );
+    }
+
+    #[tokio::test]
+    async fn implicit_nested_selection_mutations_refresh_live_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        let provider = config
+            .providers
+            .models
+            .ensure("openai", "test-provider")
+            .unwrap();
+        provider.models.insert(
+            "default".into(),
+            zeroclaw_config::schema::ModelEntryConfig {
+                id: Some("default-model".into()),
+                temperature: Some(0.7),
+                ..Default::default()
+            },
+        );
+        provider.models.insert(
+            "fast".into(),
+            zeroclaw_config::schema::ModelEntryConfig {
+                id: Some("fast-model".into()),
+                ..Default::default()
+            },
+        );
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "default-model"
+        );
+        dispatcher.handle_config_map_key_rename(&json!({
+            "path": "providers.models.openai.test-provider.models", "from": "default", "to": "other"
+        })).await.unwrap();
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model"
+        );
+        assert_eq!(
+            temperature_for_session(&dispatcher, &session_id).await,
+            Some(0.2)
+        );
+        dispatcher
+            .handle_config_map_key_create(&json!({
+                "path": "providers.models.openai.test-provider.models", "key": "default"
+            }))
+            .await
+            .unwrap();
+        dispatcher.handle_config_set(&json!({
+            "prop": "providers.models.openai.test-provider.models.default.id", "value": "new-default"
+        })).await.unwrap();
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "new-default"
+        );
+        let config = dispatcher.ctx.config.read().clone();
+        assert_eq!(
+            config
+                .resolve_model_selection("openai.test-provider")
+                .unwrap()
+                .model_id
+                .as_deref(),
+            Some("new-default")
+        );
+    }
+
+    #[tokio::test]
+    async fn creating_default_refreshes_a_previously_sole_nested_selection() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        config
+            .providers
+            .models
+            .ensure("openai", "test-provider")
+            .unwrap()
+            .models
+            .insert(
+                "fast".into(),
+                zeroclaw_config::schema::ModelEntryConfig {
+                    id: Some("sole-model".into()),
+                    temperature: Some(0.8),
+                    ..Default::default()
+                },
+            );
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "sole-model"
+        );
+        dispatcher
+            .handle_config_map_key_create(&json!({
+                "path": "providers.models.openai.test-provider.models", "key": "default"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model"
+        );
+        assert_eq!(
+            temperature_for_session(&dispatcher, &session_id).await,
+            Some(0.2)
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_model_edit_updates_effective_nested_id_and_keeps_inherited_model_editable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        config
+            .providers
+            .models
+            .ensure("openai", "test-provider")
+            .unwrap()
+            .models
+            .insert(
+                "default".into(),
+                zeroclaw_config::schema::ModelEntryConfig {
+                    id: Some("nested-before".into()),
+                    ..Default::default()
+                },
+            );
+        let dispatcher = make_config_set_test_dispatcher(config);
+        dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.test-provider.model", "value": "nested-after"
+            }))
+            .await
+            .unwrap();
+        let saved = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        let reloaded: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(
+            reloaded
+                .resolve_model_selection("openai.test-provider")
+                .unwrap()
+                .model_id
+                .as_deref(),
+            Some("nested-after")
+        );
+        assert_eq!(
+            reloaded
+                .providers
+                .models
+                .find("openai", "test-provider")
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("old-model")
+        );
+        let mut inherited = reloaded;
+        inherited
+            .providers
+            .models
+            .ensure("openai", "test-provider")
+            .unwrap()
+            .models
+            .get_mut("default")
+            .unwrap()
+            .id = None;
+        let path = "providers.models.openai.test-provider.model";
+        assert_eq!(inherited.effective_model_edit_path(path), path);
+        RpcDispatcher::stage_config_set(&mut inherited, path, &json!("inherited-after")).unwrap();
+        assert_eq!(
+            inherited
+                .resolve_model_selection("openai.test-provider")
+                .unwrap()
+                .model_id
+                .as_deref(),
+            Some("inherited-after")
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_model_alias_rename_migrates_live_override() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        let profile = config
+            .providers
+            .models
+            .ensure("openai", "test-provider")
+            .expect("test provider exists");
+        profile.models.insert(
+            "fast".into(),
+            zeroclaw_config::schema::ModelEntryConfig {
+                id: Some("nested-fast-model".into()),
+                ..Default::default()
+            },
+        );
+        config
+            .agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .model_provider = "openai.test-provider.fast".into();
+
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": { "model_provider": "openai.test-provider.fast" }
+            }))
+            .await
+            .expect("nested session override must be accepted");
+
+        dispatcher
+            .handle_config_map_key_rename(&json!({
+                "path": "providers.models.openai.test-provider.models",
+                "from": "fast",
+                "to": "quick"
+            }))
+            .await
+            .expect("nested model rename must refresh live sessions");
+
+        assert_eq!(
+            dispatcher
+                .ctx
+                .sessions
+                .get_overrides(&session_id)
+                .await
+                .and_then(|o| o.model_provider)
+                .as_deref(),
+            Some("openai.test-provider.quick")
+        );
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "nested-fast-model"
+        );
+        assert_eq!(
+            dispatcher
+                .ctx
+                .config
+                .read()
+                .agent("test-agent")
+                .expect("agent survives nested rename")
+                .model_provider
+                .as_str(),
+            "openai.test-provider.quick"
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_model_delete_refuses_persisted_agent_reference() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        config
+            .providers
+            .models
+            .ensure("openai", "test-provider")
+            .expect("test provider exists")
+            .models
+            .insert(
+                "fast".into(),
+                zeroclaw_config::schema::ModelEntryConfig {
+                    id: Some("nested-fast-model".into()),
+                    ..Default::default()
+                },
+            );
+        config
+            .agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .model_provider = "openai.test-provider.fast".into();
+        config.save().await.expect("save baseline config");
+
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "nested-fast-model"
+        );
+        let err = dispatcher
+            .handle_config_map_key_delete(&json!({
+                "path": "providers.models.openai.test-provider.models",
+                "key": "fast"
+            }))
+            .await
+            .expect_err("a referenced nested model must not be deleted");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(
+            dispatcher
+                .ctx
+                .config
+                .read()
+                .providers
+                .models
+                .find("openai", "test-provider")
+                .expect("profile remains live")
+                .models
+                .contains_key("fast")
+        );
+        let saved = tokio::fs::read_to_string(tmp.path().join("config.toml"))
+            .await
+            .expect("baseline config remains saved");
+        let reloaded: zeroclaw_config::schema::Config =
+            toml::from_str(&saved).expect("saved config must reload");
+        assert!(
+            reloaded
+                .providers
+                .models
+                .find("openai", "test-provider")
+                .expect("saved profile remains")
+                .models
+                .contains_key("fast")
+        );
+        assert_eq!(
+            reloaded
+                .agent("test-agent")
+                .expect("saved agent remains")
+                .model_provider
+                .as_str(),
+            "openai.test-provider.fast"
+        );
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "nested-fast-model",
+            "the refused delete must leave the live session on its original model"
+        );
+    }
+
+    #[tokio::test]
     async fn routed_provider_profile_refreshes_other_base_sessions() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = make_model_refresh_test_config(&tmp);
@@ -43060,6 +44329,57 @@ mod tests {
             model_name_for_session(&dispatcher, &session_id).await,
             "old-model",
             "failed provider switch must leave the live agent unchanged"
+        );
+    }
+
+    /// A configure that switches the model_provider override must move the
+    /// session temperature to the new profile's, not leave the previous
+    /// profile's value behind. The old call passed `None` ("leave
+    /// untouched") where the hot-refresh path passed the composed value, so
+    /// a configure-only switch kept a stale temperature until the next
+    /// config/set refresh.
+    #[tokio::test]
+    async fn session_configure_model_override_updates_temperature() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            temperature_for_session(&dispatcher, &session_id).await,
+            Some(0.2),
+            "session starts on the configured profile's temperature"
+        );
+
+        // A second profile with a different temperature, target of the switch.
+        publish_test_config(&dispatcher.ctx, |config| {
+            let other = config
+                .providers
+                .models
+                .ensure("openai", "other-provider")
+                .expect("openai provider slot exists");
+            other.api_key = Some("test-key".into());
+            other.uri = Some("http://127.0.0.1:1".into());
+            other.model = Some("other-model".into());
+            other.temperature = Some(0.9);
+        });
+
+        let res = dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": {
+                    "model_provider": "openai.other-provider"
+                }
+            }))
+            .await;
+        assert!(res.is_ok(), "configure must succeed: {res:?}");
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "other-model",
+            "the override ref must take effect immediately"
+        );
+        assert_eq!(
+            temperature_for_session(&dispatcher, &session_id).await,
+            Some(0.9),
+            "switching the override must move the temperature with the profile"
         );
     }
 
@@ -46001,6 +47321,56 @@ mod tests {
                 before,
                 "the refused write must not reach disk"
             );
+        });
+    }
+
+    #[test]
+    fn nested_model_redirect_requires_destination_write_authority() {
+        run_on_a_large_stack(|| async move {
+            for batch in [false, true] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let prop = "providers.models.anthropic.default.model";
+                let mut config = config_write_roster_config(&tmp, 4242, &[prop]);
+                config
+                    .providers
+                    .models
+                    .ensure("anthropic", "default")
+                    .unwrap()
+                    .models
+                    .insert(
+                        "default".into(),
+                        zeroclaw_config::schema::ModelEntryConfig {
+                            id: Some("nested-before".into()),
+                            ..Default::default()
+                        },
+                    );
+                let ctx = enforcement_ctx(config);
+                let (writer, _rx) = roster_peer(&ctx, 4242).await;
+                let before =
+                    std::fs::read_to_string(tmp.path().join("config.toml")).unwrap_or_default();
+                let entry = json!({"prop": prop, "value": "unauthorized-nested"});
+                let result = if batch {
+                    writer
+                        .handle_config_set_many(&json!({"sets": [entry]}))
+                        .await
+                } else {
+                    writer.handle_config_set(&entry).await
+                };
+                assert_eq!(result.unwrap_err().code, FORBIDDEN);
+                assert_eq!(
+                    ctx.config
+                        .read()
+                        .resolve_model_selection("anthropic.default")
+                        .unwrap()
+                        .model_id
+                        .as_deref(),
+                    Some("nested-before")
+                );
+                assert_eq!(
+                    std::fs::read_to_string(tmp.path().join("config.toml")).unwrap_or_default(),
+                    before
+                );
+            }
         });
     }
 

@@ -83,6 +83,50 @@ pub struct ResolvedEffortRoute<'a> {
     pub cloud_escalation: CloudEscalationPolicy,
 }
 
+impl ResolvedEffortRoute<'_> {
+    /// Materialize the physical-provider boundary from canonical profile lookup.
+    /// A selected nested model retains its raw route reference, while attempts
+    /// and side routes are authorized by the owning connection profile.
+    pub fn allowed_profile_refs(
+        &self,
+        config: &zeroclaw_config::schema::Config,
+    ) -> HashSet<String> {
+        let mut allowed = HashSet::new();
+        let registry = config.provider_registry().ok();
+        for reference in &self.allowed_provider_refs {
+            let trimmed = reference.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let canonical = zeroclaw_config::provider_registry::ModelRef::from(trimmed);
+            if config
+                .providers
+                .models
+                .canonical_model(&canonical)
+                .is_some()
+            {
+                // Canonical model names are exact TOML keys. Include their
+                // reachable fallback chain under the same exact spelling.
+                allowed.insert(trimmed.to_owned());
+                if let Some(registry) = registry.as_ref()
+                    && let Ok(fallbacks) = registry.fallback_chain(&canonical)
+                {
+                    allowed.extend(fallbacks.into_iter().map(|item| item.to_string()));
+                }
+                continue;
+            }
+
+            // Preserve the raw nested legacy reference for attempt filtering,
+            // and its owning two-segment profile for legacy map scoping.
+            allowed.insert(trimmed.to_owned());
+            if let Some((family, alias)) = config.providers.models.profile_ref(trimmed) {
+                allowed.insert(format!("{family}.{alias}"));
+            }
+        }
+        allowed
+    }
+}
+
 /// Resolve an opted-in effort route without making a model or network call.
 /// Standard (ambiguous) turns intentionally stay local.
 pub fn effort_routing_decision<'a>(
@@ -362,6 +406,65 @@ mod tests {
         assert_eq!(ac.hint_for(ComplexityTier::Simple), Some("fast"));
         assert_eq!(ac.hint_for(ComplexityTier::Standard), None);
         assert_eq!(ac.hint_for(ComplexityTier::Complex), Some("reasoning"));
+    }
+
+    #[test]
+    fn effort_routing_authorizes_nested_selections_by_canonical_profile() {
+        use zeroclaw_config::schema::Config;
+        let mut config: Config = toml::from_str(
+            r#"
+[providers.connections."local.edge"]
+kind = "custom"
+uri = "http://127.0.0.1:9"
+capabilities = ["chat"]
+
+[providers.connections."cloud"]
+kind = "custom"
+uri = "http://127.0.0.1:9"
+capabilities = ["chat"]
+
+[providers.models."custom.local.edge.small"]
+capability = "chat"
+provider = "local.edge"
+model = "local-model"
+
+[providers.models."custom.cloud"]
+capability = "chat"
+provider = "cloud"
+model = "cloud-model"
+"#,
+        )
+        .expect("canonical effort-route fixture parses");
+        config.model_routes = vec![
+            ModelRouteConfig {
+                hint: "local".into(),
+                model_provider: "custom.local.edge.small".into(),
+                ..Default::default()
+            },
+            ModelRouteConfig {
+                hint: "cloud".into(),
+                model_provider: "custom.cloud".into(),
+                model: "cloud-model".into(),
+                ..Default::default()
+            },
+        ];
+        let mut policy = EffortRoutingConfig {
+            local_hint: "local".into(),
+            cloud_hint: "cloud".into(),
+            cloud_escalation: CloudEscalationPolicy::Never,
+        };
+        let local = resolve_effort_route(&policy, &config.model_routes, "hello").unwrap();
+        assert_eq!(
+            local.allowed_profile_refs(&config),
+            HashSet::from(["custom.local.edge.small".into()])
+        );
+        assert_eq!(local.route.effective_model(&config), "local-model");
+        policy.cloud_escalation = CloudEscalationPolicy::Auto;
+        let cloud = resolve_effort_route(&policy, &config.model_routes, &"a".repeat(201)).unwrap();
+        assert_eq!(
+            cloud.allowed_profile_refs(&config),
+            HashSet::from(["custom.local.edge.small".into(), "custom.cloud".into()])
+        );
     }
 
     #[test]

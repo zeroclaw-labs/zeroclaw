@@ -51,95 +51,33 @@ impl ProviderSource for ConfigProviders {
         &self,
         request: &ProviderRequest<'_>,
     ) -> anyhow::Result<Arc<dyn ModelProvider>> {
-        let config = request.config;
-        let agent_entry = config.resolved_model_provider_for_agent(request.agent_alias);
-        let provider_ref = match request.provider_ref {
-            Some(provider_ref) => provider_ref.to_string(),
-            None => agent_entry
-                .map(|(family, alias, _)| format!("{family}.{alias}"))
-                .ok_or_else(|| {
-                    anyhow::Error::msg(format!(
-                        "agents.{}.model_provider does not resolve to a configured \
-                         [providers.models.<type>.<alias>] entry",
-                        request.agent_alias
-                    ))
-                })?,
-        };
-        let target_entry = provider_ref
-            .split_once('.')
-            .and_then(|(family, alias)| config.providers.models.find(family, alias));
-        let model = request
-            .model
-            .map(str::to_string)
+        let provider_ref = request
+            .provider_ref
             .or_else(|| {
-                target_entry
-                    .and_then(|entry| entry.model.as_deref())
-                    .map(str::trim)
-                    .filter(|model| !model.is_empty())
-                    .map(str::to_string)
+                request
+                    .config
+                    .agent(request.agent_alias)
+                    .map(|agent| agent.model_provider.as_str())
             })
             .ok_or_else(|| {
-                anyhow::Error::msg(format!(
-                    "model_provider `{provider_ref}` has no `model` configured and no model \
-                     was requested"
-                ))
+                anyhow::Error::msg(format!("agents.{} is not configured", request.agent_alias))
             })?;
-
-        // A configured target entry is the canonical source of credentials and
-        // endpoint. The agent's own entry is the fallback only when the
-        // reference names no configured entry, as a bare-family override does.
-        let credential_entry = target_entry.or(agent_entry.map(|(_, _, entry)| entry));
-        let api_key = credential_entry.and_then(|entry| entry.api_key.as_deref());
-        let uri = credential_entry.and_then(|entry| entry.uri.as_deref());
-
-        let agent_options = match agent_entry {
-            Some((family, alias, _)) => {
-                zeroclaw_providers::provider_runtime_options_for_alias(config, family, alias)
-            }
-            None => {
-                zeroclaw_providers::provider_runtime_options_for_agent(config, request.agent_alias)
-            }
-        };
-        let options =
-            zeroclaw_providers::options_for_provider_ref(config, &provider_ref, &agent_options);
-
-        let provider = zeroclaw_providers::create_routed_model_provider_with_options(
-            config,
-            &provider_ref,
-            api_key,
-            uri,
-            &config.reliability,
-            &config.model_routes,
-            &model,
-            &options,
-        )?;
-        Ok(Arc::from(provider))
+        zeroclaw_providers::model::build_model(
+            request.config,
+            request.agent_alias,
+            provider_ref,
+            request.model,
+        )
+        .map(|model| Arc::from(model.into_provider()))
     }
 
-    /// The agent's config-snapshot switch recipe, so a capability-built agent
-    /// on these sources switches exactly as an adapter-built agent does. It
-    /// differs from a session start in two places: a matching `model_routes`
-    /// credential is preferred, and a bare-family target takes only the
-    /// root multimodal policy rather than the agent's other options.
     fn switched_model_provider(
         &self,
         request: &ProviderRequest<'_>,
     ) -> anyhow::Result<Arc<dyn ModelProvider>> {
-        let (Some(provider_ref), Some(model)) = (request.provider_ref, request.model) else {
-            return self.model_provider(request);
-        };
-        let (provider, _resolver) = crate::agent::agent::config_switch_provider(
-            request.config,
-            request.agent_alias,
-            provider_ref,
-            model,
-        )?;
-        Ok(Arc::from(provider))
+        self.model_provider(request)
     }
 
-    /// The vision route is built through the alias-aware factory the turn's
-    /// vision routing has always used, so its per-alias `vision` override,
-    /// endpoint and credentials are honored exactly as before.
     fn vision_model_provider(
         &self,
         request: &ProviderRequest<'_>,
@@ -147,9 +85,13 @@ impl ProviderSource for ConfigProviders {
         let Some(provider_ref) = request.provider_ref else {
             return self.model_provider(request);
         };
-        let resolved = zeroclaw_providers::create_model_provider_from_ref_with_model(
+        let resolved = zeroclaw_providers::model::build_raw_provider(
             request.config,
             provider_ref,
+            zeroclaw_providers::model::ProviderOverrides {
+                model: request.model,
+                ..Default::default()
+            },
         )?;
         Ok(Arc::from(resolved.provider))
     }
@@ -203,6 +145,7 @@ pub fn native_compat_registry(
         live_config,
         execution_capability,
         acp_sessions,
+        model_config,
     } = inputs;
     let config = request.config.as_ref();
     let risk_profile = config
@@ -244,6 +187,7 @@ pub fn native_compat_registry(
         live_config,
         execution_capability,
         acp_sessions,
+        model_config,
     )
 }
 

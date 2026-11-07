@@ -18,7 +18,15 @@ import {
   useState,
   type ReactNode,
 } from 'react';
-import { ApiError, patchConfig, type PatchOp, type PatchResponse } from './api';
+import {
+  ApiError,
+  patchConfig,
+  saveProviderRegistry,
+  type PatchOp,
+  type PatchResponse,
+  type ProviderRegistryDocument,
+} from './api';
+import { t } from './i18n';
 
 type DraftEntry = {
   /** Raw input text the user has typed, as it appears in the input box. */
@@ -33,6 +41,18 @@ type ConfigDraftState = {
   drafts: Record<string, DraftEntry>;
   comments: Record<string, string>;
   tombstones: Set<string>;
+  providerRegistryDraft?: ProviderRegistryDraft;
+};
+
+/**
+ * The provider registry is saved as one compare-and-swap document rather than
+ * as dotted config properties. Keep its expected snapshot and the editor's
+ * raw JSON together so the draft survives the registry section unmounting.
+ */
+export type ProviderRegistryDraft = {
+  expected: ProviderRegistryDocument;
+  sections: Record<string, string>;
+  dirty: boolean;
 };
 
 type ConfigDraftCtx = ConfigDraftState & {
@@ -48,6 +68,8 @@ type ConfigDraftCtx = ConfigDraftState & {
   discardSection: (prefix: string) => void;
   /** Drop everything. */
   discardAll: () => void;
+  setProviderRegistryDraft: (draft: ProviderRegistryDraft) => void;
+  clearProviderRegistryDraft: () => void;
   /** Commit every staged draft + tombstone as a single PATCH and clear on success. */
   saveAll: () => Promise<PatchResponse>;
 };
@@ -58,6 +80,8 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
   const [drafts, setDrafts] = useState<Record<string, DraftEntry>>({});
   const [comments, setComments] = useState<Record<string, string>>({});
   const [tombstones, setTombstones] = useState<Set<string>>(() => new Set());
+  const [providerRegistryDraft, setProviderRegistryDraftState] =
+    useState<ProviderRegistryDraft>();
 
   const setDraft = useCallback((path: string, input: string, value?: unknown) => {
     setDrafts((prev) => ({ ...prev, [path]: { input, value } }));
@@ -195,6 +219,15 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
     setDrafts({});
     setComments({});
     setTombstones(new Set());
+    setProviderRegistryDraftState(undefined);
+  }, []);
+
+  const setProviderRegistryDraft = useCallback((draft: ProviderRegistryDraft) => {
+    setProviderRegistryDraftState(draft);
+  }, []);
+
+  const clearProviderRegistryDraft = useCallback(() => {
+    setProviderRegistryDraftState(undefined);
   }, []);
 
   const saveAll = useCallback(async (): Promise<PatchResponse> => {
@@ -215,6 +248,27 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
       if (draftedPaths.has(path)) continue;
       ops.push({ op: 'remove', path });
     }
+    // Registry replacement and dotted-property PATCH use separate server
+    // transactions. Refuse to partially commit a mixed Save All request;
+    // save the registry from its editor first, then save the remaining draft.
+    if (providerRegistryDraft?.dirty && ops.length > 0) {
+      throw new Error(t('unsaved_banner.registry_save_separately'));
+    }
+    if (providerRegistryDraft?.dirty) {
+      const registry: Record<string, unknown> = {};
+      for (const [section, input] of Object.entries(providerRegistryDraft.sections)) {
+        try {
+          registry[section] = JSON.parse(input);
+        } catch (error) {
+          throw error instanceof Error ? error : new Error(String(error));
+        }
+      }
+      await saveProviderRegistry(
+        providerRegistryDraft.expected,
+        registry as ProviderRegistryDocument,
+      );
+      setProviderRegistryDraftState(undefined);
+    }
     if (ops.length === 0) {
       return { saved: true, results: [], warnings: [] };
     }
@@ -230,13 +284,16 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
       if (e instanceof ApiError) throw e;
       throw e;
     }
-  }, [drafts, comments, tombstones]);
+  }, [drafts, comments, tombstones, providerRegistryDraft]);
 
   // The drafts outlive the config form, so the warning before leaving the
   // page lives here: a reload or a closed tab asks first while anything is
   // unsaved, whichever page is showing.
   const unsaved =
-    Object.keys(drafts).length > 0 || Object.keys(comments).length > 0 || tombstones.size > 0;
+    Object.keys(drafts).length > 0 ||
+    Object.keys(comments).length > 0 ||
+    tombstones.size > 0 ||
+    providerRegistryDraft?.dirty === true;
   useEffect(() => {
     if (!unsaved) return;
     const warn = (e: BeforeUnloadEvent) => {
@@ -252,6 +309,7 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
       drafts,
       comments,
       tombstones,
+      providerRegistryDraft,
       setDraft,
       clearDraft,
       setComment,
@@ -261,12 +319,15 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
       discardPaths,
       discardSection,
       discardAll,
+      setProviderRegistryDraft,
+      clearProviderRegistryDraft,
       saveAll,
     }),
     [
       drafts,
       comments,
       tombstones,
+      providerRegistryDraft,
       setDraft,
       clearDraft,
       setComment,
@@ -276,6 +337,8 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
       discardPaths,
       discardSection,
       discardAll,
+      setProviderRegistryDraft,
+      clearProviderRegistryDraft,
       saveAll,
     ],
   );
@@ -291,20 +354,21 @@ export function useConfigDraft(): ConfigDraftCtx {
   return ctx;
 }
 
-/** Count of pending changes — drafts + comments + tombstones, deduplicated by path. */
+/** Count of pending changes — field drafts plus atomic registry drafts. */
 export function useConfigDirtyCount(): number {
-  const { drafts, comments, tombstones } = useConfigDraft();
+  const { drafts, comments, tombstones, providerRegistryDraft } = useConfigDraft();
   const seen = new Set<string>();
   for (const path of Object.keys(drafts)) seen.add(path);
   for (const path of Object.keys(comments)) seen.add(path);
   for (const path of tombstones) seen.add(path);
+  if (providerRegistryDraft?.dirty) seen.add('providers.registry');
   return seen.size;
 }
 
 /** Aggregate top-level section keys (`channels`, `memory`, ...) that have
  *  any pending edits. Used by the banner to show which sections to revisit. */
 export function useConfigDirtySections(): string[] {
-  const { drafts, comments, tombstones } = useConfigDraft();
+  const { drafts, comments, tombstones, providerRegistryDraft } = useConfigDraft();
   const seen = new Set<string>();
   const collect = (path: string) => {
     const top = path.split('.', 1)[0];
@@ -313,5 +377,6 @@ export function useConfigDirtySections(): string[] {
   for (const path of Object.keys(drafts)) collect(path);
   for (const path of Object.keys(comments)) collect(path);
   for (const path of tombstones) collect(path);
+  if (providerRegistryDraft?.dirty) collect('providers.registry');
   return [...seen].sort();
 }

@@ -1004,6 +1004,7 @@ cli-status-config = Config:      {$v}
 cli-status-provider-indent = {"   "}ModelProvider:      {$family}.{$alias}
 cli-status-provider = 🤖 ModelProvider:      {$family}.{$alias}
 cli-status-model = {"   "}Model:         {$model}
+cli-status-model-entry = {"   "}Model [{$alias}]: {$model}
 cli-status-observability = 📊 Observability:  {$v}
 cli-status-trace-storage = 🧾 Trace storage:  {$mode} ({$path})
 cli-status-agents = 🛡️  Agents:        {$v}
@@ -1051,6 +1052,8 @@ cli-status-channel-not-compiled = 🚫 configured, not compiled
 cli-desktop-not-installed = ZeroClaw companion app is not installed.
 cli-desktop-blurb1 = The companion app is a lightweight menu bar app that
 cli-desktop-blurb2 = connects to the same gateway as the CLI.
+cli-config-provider-registry-label = Provider registry
+cli-config-provider-registry-help = Connections, capability models, model presets and fallback references. Names are exact keys and may contain dots.
 cli-config-all-configured = All sections already configured.
 cli-config-initialized-sections = Initialized {$count} section(s) with defaults:
 cli-config-schema-current = Config already at current schema version.
@@ -1117,6 +1120,8 @@ cli-config-capped-key-lowered = warning: lowered config key `{$key}` in {$path} 
 cli-config-capped-reason-pairing-code-ttl = a pairing code stays redeemable for at most 600 seconds (10 minutes)
 cli-config-retired-reason-nevis = the Nevis IAM integration was removed; configure `[oidc.<alias>]` with `[users]` and `[permission_profiles]` instead
 cli-config-retired-reason-agent-tunable = agent-inline runtime tunables are no longer read; runtime profiles are authoritative, so set this key on the agent's `[runtime_profiles.<profile>]` instead
+cli-config-retired-reason-text-tool-parsing = text tool parsing is configured per chat model; use `options.extract_text_tool_calls = false` instead of `strict_tool_parsing = true`
+cli-config-retired-reason-profile-fallback = profile-level fallback lists were removed in V4; use the exact-key `[providers.fallback]` graph and define each target as a complete model reference
 cli-config-retired-reason-summary-model = the deprecated bare model id had no provider identity and was never read; `summary_provider` replaced it (context compression itself is not currently implemented in the runtime)
 cli-config-retired-reason-node-transport = the legacy HMAC node transport was removed
 cli-config-retired-reason-wati = WATI support was removed; migrate to `[channels.whatsapp.<alias>]` using the Cloud API or WhatsApp Web, then revoke the unused WATI API token
@@ -1456,7 +1461,6 @@ channel-runtime-safeguard-footer-client-server =
     🛡️ Safety safeguards flagged this request — switched through a fallback chain to **{ $served }** (requested `{ $requested }`).
 
 delegate-provider-fallback-warning = Warning: The delegated agent recovered through a provider fallback. Provider failure details were logged and omitted from this result.
-turn-tool-protocol-strict-mixed-error = Strict tool parsing cannot run a fallback chain that mixes native-tool and text-only candidates. Configure every reachable candidate to use the same tool protocol, or set strict_tool_parsing to false.
 turn-context-hook-mutation-unsafe-error = A before-LLM-call hook changed existing messages in a way that cannot be safely reconciled with a required context-budget trim. Configure the hook to only append messages, or shorten the current turn.
 delegate-provider-fallback-header = [Agent '{ $agent }' (requested: { $requested_provider }/{ $requested_model }; served: { $actual_provider }/{ $actual_model })]
 delegate-provider-fallback-header-agentic = [Agent '{ $agent }' (requested: { $requested_provider }/{ $requested_model }; served: { $actual_provider }/{ $actual_model }, agentic)]
@@ -1619,7 +1623,7 @@ cli-agent-error-provider-connection-remote = Cannot reach the model provider at 
 cli-agent-error-provider-connection = Cannot reach the selected model provider. Check network access or choose another provider.
 cli-agent-error-provider-timeout = The selected model provider timed out. Try again or choose another provider.
 cli-agent-error-provider-generic = The selected model provider failed. Review provider configuration or choose another provider.
-cli-agent-error-provider-refusal = The model's safety system declined this request. Rephrase it, or configure fallback_models on the provider to auto-switch models.
+cli-agent-error-provider-refusal = The model's safety system declined this request. Rephrase it, or configure a target in [providers.fallback] to auto-switch models.
 cli-doctor-context-window-ok = {$provider_ref}: context window: {$context_window} tokens
 cli-doctor-context-window-zero = {$provider_ref}: context_window is 0 (invalid; set it to the model's real context limit)
 cli-doctor-context-window-unset = {$provider_ref}: no context_window set — will use {$fallback} token fallback when selected; likely far below this model's real limit; set context_window on this profile
@@ -1754,6 +1758,17 @@ sop-rpc-definition-unavailable = The procedure definition is no longer available
 cli-sop-run-unavailable = SOP run unavailable in this session.
 cli-sop-step-owner-principal-mismatch = SOP step refused: this run belongs to a different principal than the one this turn's capabilities act for.
 cli-sop-step-owner-memory-unavailable = SOP step failed: the memory of this run's owner is unavailable ({ $error }).
+
+# Named model selection diagnostics.
+cli-model-switch-invalid-reference = model_provider must be a dotted `<type>.<alias>` or `<type>.<alias>.<model>` provider profile reference, got `{ $provider_ref }`
+cli-model-switch-no-profiles = no configured provider profiles
+cli-model-switch-profile-missing = model_provider `{ $provider_ref }` is not a configured provider profile. Add a [providers.models.{ $family }.{ $alias }] entry or use one of: { $available }
+cli-model-switch-model-id-missing = model entry `{ $provider_ref }` has no `id` and its provider profile has no `model`
+cli-model-switch-entry-missing = model_provider `{ $provider_ref }` names model `{ $model_alias }` but [providers.models.{ $family }.{ $alias }.models.{ $model_alias }] is not configured
+cli-model-switch-model-required = Missing 'model' parameter for 'set' action (or use a `<type>.<alias>.<model>` model_provider ref)
+cli-doctor-nested-model = { $provider_ref }: model: { $model } (entry { $model_alias })
+cli-doctor-nested-model-id-missing = { $provider_ref }: entry { $model_alias } has no model id (set its `id` or the profile `model`)
+cli-doctor-temperature-out-of-range = { $provider_ref }: temperature { $temperature } is out of range (expected 0.0–2.0)
 
 # Result-aware Agent loop recovery
 turn-repeated-success-advisory = The same tool call returned the same successful result repeatedly. Reconsider whether another call will help. Polling may continue when needed.

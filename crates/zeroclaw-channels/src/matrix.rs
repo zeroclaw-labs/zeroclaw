@@ -2885,7 +2885,7 @@ mod inbound {
         if let Some(m) = mime {
             // Audio MIMEs resolve through the canonical transcription-side
             // mapping; non-audio types are display/on-disk naming only.
-            if let Some(ext) = crate::transcription::extension_for_audio_mime(m) {
+            if let Some(ext) = zeroclaw_providers::transcription::extension_for_audio_mime(m) {
                 return ext;
             }
             match m.split(';').next().unwrap_or(m).trim() {
@@ -2912,13 +2912,13 @@ mod inbound {
     /// otherwise passes the unsupported name through so the resolver rejects
     /// it locally before any request is sent.
     pub(super) fn transcription_safe_filename(file_name: &str, mime: Option<&str>) -> String {
-        let ext_accepted = file_name
-            .rsplit_once('.')
-            .is_some_and(|(_, ext)| crate::transcription::mime_for_audio(ext).is_some());
+        let ext_accepted = file_name.rsplit_once('.').is_some_and(|(_, ext)| {
+            zeroclaw_providers::transcription::mime_for_audio(ext).is_some()
+        });
         if ext_accepted {
             return file_name.to_string();
         }
-        match mime.and_then(crate::transcription::extension_for_audio_mime) {
+        match mime.and_then(zeroclaw_providers::transcription::extension_for_audio_mime) {
             Some(ext) => format!("attachment.{ext}"),
             None => file_name.to_string(),
         }
@@ -2980,8 +2980,8 @@ mod inbound {
 pub(crate) fn build_transcription_manager(
     config: &zeroclaw_config::schema::Config,
     agent_provider: &str,
-) -> anyhow::Result<crate::transcription::TranscriptionManager> {
-    crate::transcription::build_channel_transcription_manager(config, agent_provider)
+) -> anyhow::Result<zeroclaw_providers::transcription::TranscriptionManager> {
+    zeroclaw_providers::transcription::build_transcription_manager(config, agent_provider)
 }
 
 /// Resolves transcription state from live config at message time. `None` means
@@ -2999,10 +2999,12 @@ pub(crate) fn build_transcription_manager(
 /// copied into this long-lived channel handle
 /// (see AGENTS.md "Single Source Of Truth").
 pub(crate) type TtsResolver =
-    Arc<dyn Fn() -> Option<anyhow::Result<crate::tts::TtsManager>> + Send + Sync>;
+    Arc<dyn Fn() -> Option<anyhow::Result<zeroclaw_providers::tts::TtsManager>> + Send + Sync>;
 
 pub(crate) type TranscriptionResolver = Arc<
-    dyn Fn() -> Option<anyhow::Result<crate::transcription::TranscriptionManager>> + Send + Sync,
+    dyn Fn() -> Option<anyhow::Result<zeroclaw_providers::transcription::TranscriptionManager>>
+        + Send
+        + Sync,
 >;
 
 /// Resolver over a legacy `[transcription]` section alone. Typed
@@ -4389,8 +4391,9 @@ impl MatrixChannel {
     /// `transcription_provider` are honoured.
     pub(crate) fn with_transcription_manager_factory(
         mut self,
-        factory: impl Fn() -> Option<anyhow::Result<crate::transcription::TranscriptionManager>>
-        + Send
+        factory: impl Fn() -> Option<
+            anyhow::Result<zeroclaw_providers::transcription::TranscriptionManager>,
+        > + Send
         + Sync
         + 'static,
     ) -> Self {
@@ -4402,7 +4405,10 @@ impl MatrixChannel {
     /// agent's `tts_provider` and reloaded provider policy are honoured.
     pub(crate) fn with_tts_manager_factory(
         mut self,
-        factory: impl Fn() -> Option<anyhow::Result<crate::tts::TtsManager>> + Send + Sync + 'static,
+        factory: impl Fn() -> Option<anyhow::Result<zeroclaw_providers::tts::TtsManager>>
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
         self.tts = Some(Arc::new(factory));
         self
@@ -5752,7 +5758,7 @@ mod tests {
                 if !tts_config.tts.enabled {
                     return None;
                 }
-                Some(crate::tts::TtsManager::from_config_for_agent(
+                Some(zeroclaw_providers::tts::TtsManager::from_config_for_agent(
                     &tts_config,
                     Some("default"),
                 ))

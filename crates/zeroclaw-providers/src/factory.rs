@@ -301,6 +301,15 @@ pub fn apply_compat_options(
     if let Some(t) = opts.provider_timeout_secs {
         b = b.timeout_secs(t);
     }
+    if opts.provider_timeout_disabled {
+        b = b.without_timeout();
+    }
+    if let Some(t) = opts.provider_read_timeout_secs {
+        b = b.read_timeout_secs(t);
+    }
+    if opts.provider_read_timeout_disabled {
+        b = b.without_read_timeout();
+    }
     if let Some(ref effort) = opts.reasoning_effort {
         b = b.reasoning_effort(Some(effort.clone()));
     }
@@ -395,7 +404,12 @@ fn build_responses_provider_if_requested(
     opts: &ModelProviderRuntimeOptions,
     single_tool_rounds_supported: bool,
 ) -> Option<Box<dyn ModelProvider>> {
-    if wire_api != Some(zeroclaw_config::schema::WireApi::Responses) {
+    let runtime_wire_api = match opts.wire_api.as_deref() {
+        Some("responses") => Some(zeroclaw_config::schema::WireApi::Responses),
+        Some("chat_completions") => Some(zeroclaw_config::schema::WireApi::ChatCompletions),
+        _ => None,
+    };
+    if runtime_wire_api.or(wire_api) != Some(zeroclaw_config::schema::WireApi::Responses) {
         return None;
     }
     let mut builder = crate::openai::OpenAiResponsesModelProvider::builder(alias)
@@ -406,6 +420,15 @@ fn build_responses_provider_if_requested(
     }
     if let Some(t) = opts.provider_timeout_secs {
         builder = builder.timeout_secs(t);
+    }
+    if opts.provider_timeout_disabled {
+        builder = builder.without_timeout();
+    }
+    if let Some(t) = opts.provider_read_timeout_secs {
+        builder = builder.read_timeout_secs(t);
+    }
+    if opts.provider_read_timeout_disabled {
+        builder = builder.without_read_timeout();
     }
     if let Some(mt) = opts.provider_max_tokens {
         builder = builder.max_tokens(Some(mt));
@@ -450,6 +473,13 @@ pub fn dispatch_family_factory(
         let default_cfg = openai_missing_entry_fallback_config();
         let cfg = config
             .and_then(|c| c.providers.models.openai.get(alias))
+            .unwrap_or(&default_cfg);
+        return cfg.create_provider(alias, key, api_url, opts);
+    }
+    if family == "qwen" {
+        let default_cfg = qwen_missing_entry_fallback_config();
+        let cfg = config
+            .and_then(|c| c.providers.models.qwen.get(alias))
             .unwrap_or(&default_cfg);
         return cfg.create_provider(alias, key, api_url, opts);
     }
@@ -1203,6 +1233,15 @@ impl FamilyProviderFactory for OpenRouterModelProviderConfig {
         if let Some(t) = opts.provider_timeout_secs {
             b = b.timeout_secs(t);
         }
+        if opts.provider_timeout_disabled {
+            b = b.without_timeout();
+        }
+        if let Some(t) = opts.provider_read_timeout_secs {
+            b = b.read_timeout_secs(t);
+        }
+        if opts.provider_read_timeout_disabled {
+            b = b.without_read_timeout();
+        }
         if let Some(extra) = opts.provider_extra.clone() {
             b = b.extra_body(extra);
         }
@@ -1232,6 +1271,15 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
         }
         if let Some(ts) = opts.provider_timeout_secs {
             b = b.timeout_secs(ts);
+        }
+        if opts.provider_timeout_disabled {
+            b = b.without_timeout();
+        }
+        if let Some(ts) = opts.provider_read_timeout_secs {
+            b = b.read_timeout_secs(ts);
+        }
+        if opts.provider_read_timeout_disabled {
+            b = b.without_read_timeout();
         }
         if let Some(cache_ttl) = opts.cache_ttl {
             b = b.cache_ttl(cache_ttl);
@@ -1308,6 +1356,15 @@ impl FamilyProviderFactory for OpenAIModelProviderConfig {
         }
         if let Some(t) = opts.provider_timeout_secs {
             b = b.timeout_secs(t);
+        }
+        if opts.provider_timeout_disabled {
+            b = b.without_timeout();
+        }
+        if let Some(t) = opts.provider_read_timeout_secs {
+            b = b.read_timeout_secs(t);
+        }
+        if opts.provider_read_timeout_disabled {
+            b = b.without_read_timeout();
         }
         if let Some(mt) = opts.provider_max_tokens {
             b = b.max_tokens(Some(mt));
@@ -1438,9 +1495,9 @@ impl FamilyProviderFactory for HailoOllamaModelProviderConfig {
                 i32::try_from(value).unwrap_or(i32::MAX)
             });
         let tuning = crate::ollama::OllamaTuning {
-            num_ctx: self
-                .base
-                .context_window
+            num_ctx: opts
+                .provider_context_window
+                .or(self.base.context_window)
                 .map(|value| u32::try_from(value).unwrap_or(u32::MAX))
                 .unwrap_or(crate::hailo_ollama::HAILO_DEFAULT_NUM_CTX),
             num_predict: max_tokens,
@@ -1613,6 +1670,15 @@ impl FamilyProviderFactory for BedrockModelProviderConfig {
     }
 }
 
+/// Bare Qwen dispatch historically uses the CN region. Persisted profiles keep
+/// their configured endpoint, whose schema default for new entries is Intl.
+fn qwen_missing_entry_fallback_config() -> QwenModelProviderConfig {
+    QwenModelProviderConfig {
+        endpoint: zeroclaw_config::schema::QwenEndpoint::Cn,
+        ..Default::default()
+    }
+}
+
 impl FamilyProviderFactory for QwenModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Dynamic;
 
@@ -1623,6 +1689,8 @@ impl FamilyProviderFactory for QwenModelProviderConfig {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
+        use zeroclaw_config::schema::ModelEndpoint;
+
         let alias_oauth: Option<crate::QwenOauthCredentials> = self
             .oauth_refresh_token
             .as_deref()
@@ -1661,7 +1729,7 @@ impl FamilyProviderFactory for QwenModelProviderConfig {
         let base_url = api_url
             .map(ToString::to_string)
             .or_else(|| oauth_context.base_url.clone())
-            .unwrap_or_else(|| crate::QWEN_OAUTH_BASE_FALLBACK_URL.to_string());
+            .unwrap_or_else(|| self.endpoint.uri().to_string());
         let b = if oauth_context.credential.is_some() {
             OpenAiCompatibleModelProvider::builder(alias)
                 .display_name("Qwen Code")
@@ -2057,6 +2125,187 @@ impl FamilyProviderFactory for zeroclaw_config::schema::ModelProviderConfig {
         }
         Ok(apply_compat_options(b, opts))
     }
+}
+
+/// Construct a chat provider from the canonical exact-key registry. This is
+/// the migration boundary used by new consumers; the legacy family/alias
+/// dispatcher remains available only for V4 configuration adapters.
+pub fn dispatch_model_ref(
+    config: &zeroclaw_config::schema::Config,
+    model_ref: &zeroclaw_config::provider_registry::ModelRef,
+    options: &ModelProviderRuntimeOptions,
+) -> Result<Box<dyn ModelProvider>> {
+    let registry = config
+        .provider_registry()
+        .map_err(|error| anyhow::Error::msg(error.to_string()))?;
+    dispatch_model_ref_with_registry(&registry, model_ref, options)
+}
+
+/// Construct one fresh provider adapter from an already validated immutable
+/// registry. The registry/connection descriptors are reused for all candidates
+/// in one build transaction, while model options are resolved and applied anew
+/// for every exact model reference. This prevents model-switch/fallback state
+/// from leaking between candidates.
+pub(crate) fn dispatch_model_ref_with_registry(
+    registry: &zeroclaw_config::provider_registry::ProviderRegistry,
+    model_ref: &zeroclaw_config::provider_registry::ModelRef,
+    options: &ModelProviderRuntimeOptions,
+) -> Result<Box<dyn ModelProvider>> {
+    use zeroclaw_config::provider_registry::{ModelDefinition, Override, ProviderConnection};
+
+    let resolved = registry
+        .resolve_chat(model_ref)
+        .map_err(|error| anyhow::Error::msg(error.to_string()))?;
+    let mut runtime = options.clone();
+    let model_options = &resolved.options;
+    if let Some(Override::Set(value)) = &model_options.max_tokens {
+        runtime.provider_max_tokens = Some(*value);
+    }
+    if let Some(Override::Clear) = &model_options.max_tokens {
+        runtime.provider_max_tokens = None;
+    }
+    if let Some(Override::Set(value)) = &model_options.cache_ttl {
+        runtime.cache_ttl = Some(*value);
+    }
+    if let Some(Override::Clear) = &model_options.cache_ttl {
+        runtime.cache_ttl = None;
+    }
+    runtime.native_tools = model_options.native_tools;
+    runtime.think = model_options.think.as_ref().and_then(|value| match value {
+        Override::Set(value) => Some(*value),
+        Override::Clear => None,
+    });
+    runtime.merge_system_into_user = model_options.merge_system_into_user.unwrap_or(false);
+    runtime.replay_assistant_reasoning = model_options.replay_assistant_reasoning;
+    runtime.thinking_passthrough = model_options.thinking_passthrough.unwrap_or(false);
+    runtime.reasoning_effort_passthrough =
+        model_options.reasoning_effort_passthrough.unwrap_or(false);
+    runtime.cache_passthrough = model_options.cache_passthrough.unwrap_or(false);
+    runtime.provider_extra = model_options.provider_extra.clone();
+    runtime.chat_template_kwargs = model_options.chat_template_kwargs.clone();
+    runtime.tool_result_image_policy = model_options.tool_result_image_policy.unwrap_or_default();
+    runtime.wire_api = resolved.wire_api.map(|wire| wire.as_str().to_owned());
+    runtime.provider_context_window = match resolved.selection.model {
+        ModelDefinition::Chat(model) => model.metadata.context_window,
+        _ => None,
+    };
+    runtime.vision = match resolved.selection.model {
+        ModelDefinition::Chat(model) => model.metadata.vision,
+        _ => None,
+    };
+    runtime.provider_timeout_secs =
+        resolved
+            .request_timeout_secs
+            .as_ref()
+            .and_then(|value| match value {
+                Override::Set(value) => Some(value.get()),
+                Override::Clear => None,
+            });
+    runtime.provider_timeout_disabled = matches!(
+        resolved.request_timeout_secs.as_ref(),
+        Some(Override::Clear)
+    );
+    // Canonical chat configuration has an independent read-idle baseline.
+    // Materialize the driver's baseline here instead of
+    // deriving it from request_timeout_secs; legacy family construction keeps
+    // its historical max(300, timeout) behavior in the adapter.
+    runtime.provider_read_timeout_secs = resolved
+        .read_timeout_secs
+        .as_ref()
+        .and_then(|value| match value {
+            Override::Set(value) => Some(value.get()),
+            Override::Clear => None,
+        })
+        .or_else(|| {
+            (!matches!(resolved.read_timeout_secs.as_ref(), Some(Override::Clear))).then_some(
+                match resolved.selection.connection {
+                    ProviderConnection::Anthropic(_) => {
+                        crate::anthropic::STREAM_IDLE_TIMEOUT.as_secs()
+                    }
+                    _ => crate::STREAM_IDLE_TIMEOUT.as_secs(),
+                },
+            )
+        });
+    runtime.provider_read_timeout_disabled =
+        matches!(resolved.read_timeout_secs.as_ref(), Some(Override::Clear));
+    runtime.extra_headers = resolved
+        .selection
+        .connection
+        .extra_headers()
+        .map(|headers| {
+            headers
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    runtime.tls_ca_cert_path = resolved
+        .selection
+        .connection
+        .tls_ca_cert_path()
+        .map(str::to_owned);
+
+    let provider_kind = resolved.selection.connection.kind();
+    let supported = matches!(
+        resolved.selection.connection,
+        ProviderConnection::OpenAi(_)
+            | ProviderConnection::Anthropic(_)
+            | ProviderConnection::OpenRouter(_)
+            | ProviderConnection::OpenAiCompatible(_)
+            | ProviderConnection::Custom(_)
+            | ProviderConnection::Ollama(_)
+            | ProviderConnection::Groq(_)
+    );
+    if !supported {
+        anyhow::bail!(
+            "canonical model `{}` uses connection kind `{provider_kind}`; its factory adapter is not migrated yet",
+            model_ref.as_str()
+        );
+    }
+
+    // Canonical connections carry typed authentication and model extras. The
+    // legacy family dispatcher cannot recover either fact from `api_key` or a
+    // missing config slot, so materialize those provider-specific settings at
+    // this boundary before falling back to the common dispatcher.
+    if provider_kind == "openai" && resolved.selection.connection.uses_openai_codex_auth() {
+        let provider_config = zeroclaw_config::schema::OpenAIModelProviderConfig {
+            base: zeroclaw_config::schema::ModelProviderConfig {
+                requires_openai_auth: true,
+                wire_api: Some(zeroclaw_config::schema::WireApi::Responses),
+                ..Default::default()
+            },
+        };
+        return provider_config.create_provider(
+            model_ref.as_str(),
+            resolved.selection.connection.api_key(),
+            resolved.selection.connection.uri(),
+            &runtime,
+        );
+    }
+    if provider_kind == "anthropic"
+        && let ModelDefinition::Chat(model) = resolved.selection.model
+        && let Some(zeroclaw_config::provider_registry::ChatModelExtra::Anthropic(extra)) =
+            model.extra.as_ref()
+    {
+        let provider_config = zeroclaw_config::schema::AnthropicModelProviderConfig {
+            server_fallback_models: extra.server_fallback_models.clone(),
+            ..Default::default()
+        };
+        return provider_config.create_provider(
+            model_ref.as_str(),
+            resolved.selection.connection.api_key(),
+            resolved.selection.connection.uri(),
+            &runtime,
+        );
+    }
+    dispatch_family_factory(
+        None,
+        provider_kind,
+        model_ref.as_str(),
+        resolved.selection.connection.api_key(),
+        resolved.selection.connection.uri(),
+        &runtime,
+    )
 }
 
 #[cfg(test)]
@@ -2842,6 +3091,19 @@ mod tests {
         .expect("persisted openai dispatch should build");
         assert_eq!(provider.default_wire_api(), "responses");
         assert!(provider.capabilities().native_tool_calling);
+    }
+
+    #[test]
+    fn qwen_missing_entry_preserves_cn_without_overriding_dynamic_transport() {
+        use zeroclaw_config::schema::QwenEndpoint;
+
+        let missing_entry = qwen_missing_entry_fallback_config();
+        assert_eq!(missing_entry.endpoint, QwenEndpoint::Cn);
+        assert_eq!(missing_entry.base.uri, None);
+        assert_eq!(
+            QwenModelProviderConfig::default().endpoint,
+            QwenEndpoint::Intl
+        );
     }
 
     #[tokio::test]

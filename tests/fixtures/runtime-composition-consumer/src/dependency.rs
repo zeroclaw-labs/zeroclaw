@@ -16,7 +16,10 @@ fn root() -> PathBuf {
 // do not affect this check; concrete construction cannot be waved through by a
 // retained manifest edge. Known entry bodies use balanced braces in literals too.
 fn function<'a>(source: &'a str, name: &str) -> &'a str {
-    let marker = format!("fn {name}(");
+    // Some async boundary adapters are generic over their borrowed lifetime
+    // (`fn name<'a>(...)`). Match the function name first, then locate the
+    // opening brace so the check remains independent of generic parameters.
+    let marker = format!("fn {name}");
     let start = source
         .find(&marker)
         .unwrap_or_else(|| panic!("missing boundary function {name}"));
@@ -142,6 +145,7 @@ fn dependency_boundary() {
     // through one adapter statement that builds the config-backed set. That
     // statement is the only allowed construction; it appears at most once.
     const ADAPTER: &str = "letcapabilities=capabilities.unwrap_or_else(||RuntimeCapabilities::config_backed(&config));";
+    const AGENT_ADAPTER: &str = "letbound=supplied_capabilities.clone().unwrap_or_else(||{crate::composition::BoundCapabilities{capabilities:crate::composition::RuntimeCapabilities::config_backed(config),principal:None,}});";
     let boundaries = [
         ("crates/zeroclaw-runtime/src/agent/loop_.rs", "run_inner"),
         (
@@ -150,7 +154,7 @@ fn dependency_boundary() {
         ),
         (
             "crates/zeroclaw-runtime/src/agent/agent.rs",
-            "build_with_capabilities",
+            "from_config_with_context_body",
         ),
         (
             "crates/zeroclaw-runtime/src/agent/turn/mod.rs",
@@ -173,7 +177,11 @@ fn dependency_boundary() {
             compact.matches(ADAPTER).count() <= 1,
             "{path}::{name}: more than one config-backed adapter statement"
         );
-        let compact = compact.replacen(ADAPTER, "", 1);
+        let compact = if compact.contains(ADAPTER) {
+            compact.replacen(ADAPTER, "", 1)
+        } else {
+            compact.replacen(AGENT_ADAPTER, "", 1)
+        };
         for constructor in forbidden {
             if compact.contains(constructor) {
                 violations.push(format!("{path}::{name}: {constructor}"));

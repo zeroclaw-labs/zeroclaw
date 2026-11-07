@@ -78,6 +78,64 @@ pub struct BoundCapabilities {
     pub principal: Option<PrincipalId>,
 }
 
+impl BoundCapabilities {
+    /// Resolve metadata and ask this binding's provider source on a blocking-safe worker.
+    /// A supplied source refusal is final; it never falls back to concrete factories.
+    pub(crate) async fn build_model(
+        &self,
+        config: Arc<Config>,
+        agent_alias: &str,
+        provider_ref: &str,
+        model: Option<&str>,
+        switched: bool,
+        explicit_provider_ref: bool,
+    ) -> anyhow::Result<zeroclaw_providers::model::BuiltModel> {
+        let bound = self.clone();
+        let agent_alias = agent_alias.to_owned();
+        let provider_ref = provider_ref.to_owned();
+        let model = model.map(str::to_owned);
+        zeroclaw_providers::model::build_nonblocking(move || {
+            zeroclaw_providers::ensure_known_model_entry_ref(&config, &provider_ref)?;
+            let identity = zeroclaw_providers::model::resolve_model_identity(
+                &config, &agent_alias, &provider_ref, model.as_deref(),
+            ).ok_or_else(|| anyhow::Error::msg(format!(
+                "model_provider `{provider_ref}` has no model configured and no model override was supplied"
+            )))?;
+            let request = ProviderRequest {
+                config: &config,
+                agent_alias: &agent_alias,
+                // Preserve an explicit source key when the caller selected a
+                // route (including canonical keys containing dots). Ordinary
+                // agent admission keeps the historical `None` contract so a
+                // source can resolve its own configured default.
+                provider_ref: if explicit_provider_ref
+                    || switched
+                    || !config.agent(&agent_alias).is_some_and(|agent| {
+                        agent.model_provider == provider_ref
+                    })
+                {
+                    Some(&provider_ref)
+                } else {
+                    None
+                },
+                model: Some(&identity.model_id),
+                principal: bound.principal.as_ref(),
+            };
+            let provider: Box<dyn ModelProvider> = if switched {
+                Box::new(bound.capabilities.providers.switched_model_provider(&request)?)
+            } else {
+                bound.capabilities.model_provider(&request)?
+            };
+            let resolver = zeroclaw_providers::model_route_resolver(
+                &config, &provider_ref, &config.model_routes, &identity.model_id,
+            );
+            Ok(zeroclaw_providers::model::BuiltModel::from_routed_provider(
+                provider, identity, resolver,
+            ))
+        }).await
+    }
+}
+
 /// Where a tool that starts child operations reads the capabilities it
 /// inherits. Empty until the entry point that owns the tool's registry binds
 /// it; while empty the tool keeps its pre-capability behavior.
@@ -350,6 +408,8 @@ pub struct NativeRecipeInputs<'a> {
     pub execution_capability: Option<crate::live_config_authority::AgentExecutionCapability>,
     /// A read view of ACP sessions, for entry points that serve ACP.
     pub acp_sessions: Option<crate::tools::AcpSessionReadView>,
+    /// Canonical admitted model generation, when the caller follows live model updates.
+    pub model_config: Option<zeroclaw_tools::llm_task::ModelConfigResolver>,
 }
 
 /// A native compatibility recipe: builds the native registry for one eager

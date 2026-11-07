@@ -103,6 +103,12 @@ pub struct RetiredKey {
     pub reason_id: &'static str,
 }
 
+const RETIRED_TEXT_TOOL_PARSING: &str = "text tool parsing is configured per chat model; use \
+    `options.extract_text_tool_calls = false` instead of `strict_tool_parsing = true`";
+
+const RETIRED_PROFILE_FALLBACK: &str = "profile-level fallback lists were replaced by the exact-key \
+    `[providers.fallback]` graph; define each target as a complete model reference there";
+
 /// Every retired key, applied by the migration chain when it reaches
 /// `retired_in`, and again on every load of a current config so a key that
 /// reappears is dropped with a notice rather than silently ignored. Retiring
@@ -164,8 +170,26 @@ pub const RETIRED_KEYS: &[RetiredKey] = &[
     RetiredKey {
         retired_in: 4,
         path: &["agents", ANY_KEY, "strict_tool_parsing"],
-        reason: INERT_AGENT_TUNABLE,
-        reason_id: "cli-config-retired-reason-agent-tunable",
+        reason: RETIRED_TEXT_TOOL_PARSING,
+        reason_id: "cli-config-retired-reason-text-tool-parsing",
+    },
+    RetiredKey {
+        retired_in: 4,
+        path: &["runtime_profiles", ANY_KEY, "strict_tool_parsing"],
+        reason: RETIRED_TEXT_TOOL_PARSING,
+        reason_id: "cli-config-retired-reason-text-tool-parsing",
+    },
+    RetiredKey {
+        retired_in: 4,
+        path: &["providers", "models", ANY_KEY, ANY_KEY, "fallback"],
+        reason: RETIRED_PROFILE_FALLBACK,
+        reason_id: "cli-config-retired-reason-profile-fallback",
+    },
+    RetiredKey {
+        retired_in: 4,
+        path: &["providers", "models", ANY_KEY, ANY_KEY, "fallback_models"],
+        reason: RETIRED_PROFILE_FALLBACK,
+        reason_id: "cli-config-retired-reason-profile-fallback",
     },
     RetiredKey {
         retired_in: 4,
@@ -627,6 +651,38 @@ const LEGACY_LAYOUT_PATHS: &[&[&str]] = &[
 ///
 /// A V4 file has the V3 shape, so an unversioned V4 file is read as V3 too;
 /// its V3 -> V4 step changes nothing it has not already done.
+/// Return evidence that the file uses the canonical provider registry. This
+/// registry is part of schema V4; it must be recognized as V3-shaped for an
+/// omitted version so the V3→V4 step stamps the file without sending it
+/// through the destructive V1/V2 reshapers.
+fn canonical_registry_evidence(table: &toml::Table) -> Option<String> {
+    let providers = table.get("providers").and_then(toml::Value::as_table)?;
+    for section in ["connections", "model_presets", "fallback"] {
+        if providers
+            .get(section)
+            .and_then(toml::Value::as_table)
+            .is_some_and(|entries| !entries.is_empty())
+        {
+            return Some(format!(
+                "`[providers.{section}]` is in the canonical V4 layout"
+            ));
+        }
+    }
+    providers
+        .get("models")
+        .and_then(toml::Value::as_table)
+        .and_then(|models| {
+            models.iter().find_map(|(model_ref, value)| {
+                value
+                    .as_table()
+                    .and_then(|entry| entry.contains_key("capability").then_some(model_ref))
+            })
+        })
+        .map(|model_ref| {
+            format!("`[providers.models.{model_ref}]` declares a canonical V4 capability model")
+        })
+}
+
 fn unversioned_shape(table: &toml::Table) -> UnversionedShape {
     let provider_families = table
         .get("providers")
@@ -665,7 +721,7 @@ fn unversioned_shape(table: &toml::Table) -> UnversionedShape {
                 })
         });
 
-    let mut current = None;
+    let mut current = canonical_registry_evidence(table);
     let mut legacy = legacy_layout_evidence(table);
     let mut ambiguous = None;
     for (entry_kind, root, name, section) in provider_families.chain(channel_types) {
@@ -673,6 +729,12 @@ fn unversioned_shape(table: &toml::Table) -> UnversionedShape {
             continue;
         };
         if section.is_empty() {
+            continue;
+        }
+        // A canonical model row also sits directly below `providers.models`,
+        // but its `capability` discriminator makes it a model definition, not
+        // a V2 family field or V3 alias map.
+        if section.contains_key("capability") {
             continue;
         }
         let path = format!("{root}.{name}");
@@ -2511,8 +2573,10 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
             .context("failed to deserialize as V2 schema")?;
         v2.migrate().context("failed to migrate V2 → V3")
     },
-    // V3 → V4: no shape change; the chain applies the V4 entries in
-    // `RETIRED_KEYS` after this step.
+    // V3 → V4: canonical provider definitions are already TOML-keyed and
+    // therefore need no lossy family/alias reshaping. The step stamps the
+    // version and lets the V4 retirement pass remove only keys that are no
+    // longer part of the current schema.
     |value| stamp_schema_version(value, 4),
 ];
 
@@ -6007,6 +6071,65 @@ mention_only = false
     }
 
     #[test]
+    fn an_unversioned_canonical_registry_is_carried_to_v4_without_v1_reshaping() {
+        let raw = r#"
+[providers.connections."gateway.prod"]
+kind = "custom"
+uri = "https://gateway.example/v1"
+
+[providers.models."chat.fast.prod"]
+capability = "chat"
+provider = "gateway.prod"
+model = "fast-model"
+"#;
+        let value: toml::Value = toml::from_str(raw).unwrap();
+        assert_eq!(detect_version(&value).unwrap(), INFERRED_SCHEMA_VERSION);
+
+        let (migrated, notices) = migrate_file_with_notices(raw).unwrap().unwrap();
+        assert_eq!(notices, vec![MigrationNotice::InferredV3]);
+        let migrated: toml::Value = toml::from_str(&migrated).unwrap();
+        assert_eq!(migrated["schema_version"].as_integer(), Some(4));
+        assert_eq!(
+            migrated["providers"]["connections"]["gateway.prod"]["uri"].as_str(),
+            Some("https://gateway.example/v1")
+        );
+        assert_eq!(
+            migrated["providers"]["models"]["chat.fast.prod"]["model"].as_str(),
+            Some("fast-model")
+        );
+    }
+
+    #[test]
+    fn explicit_v3_canonical_registry_is_stamped_without_splitting_dotted_keys() {
+        let raw = r#"
+schema_version = 3
+
+[providers.connections."gateway.prod"]
+kind = "custom"
+uri = "https://gateway.example/v1"
+
+[providers.models."chat.fast.prod"]
+capability = "chat"
+provider = "gateway.prod"
+model = "fast-model"
+"#;
+        let (migrated, notices) = migrate_file_with_notices(raw).unwrap().unwrap();
+        assert!(notices.is_empty());
+        let migrated: toml::Value = toml::from_str(&migrated).unwrap();
+        assert_eq!(migrated["schema_version"].as_integer(), Some(4));
+        assert!(
+            migrated["providers"]["connections"]
+                .as_table()
+                .is_some_and(|connections| connections.contains_key("gateway.prod"))
+        );
+        assert!(
+            migrated["providers"]["models"]
+                .as_table()
+                .is_some_and(|models| models.contains_key("chat.fast.prod"))
+        );
+    }
+
+    #[test]
     fn an_inferred_v3_file_is_migrated_to_v4_and_keeps_every_channel_alias() {
         let config =
             migrate_to_current(HAND_WRITTEN_V3_WITHOUT_VERSION).expect("a V3-shaped file loads");
@@ -7632,6 +7755,18 @@ mention_only = false
             "[agents.x]\nstrict_tool_parsing = true\n",
         ),
         (
+            "runtime_profiles.x.strict_tool_parsing",
+            "[runtime_profiles.x]\nstrict_tool_parsing = true\n",
+        ),
+        (
+            "providers.models.x.x.fallback",
+            "[providers.models.x.x]\nfallback = [\"custom.backup\"]\n",
+        ),
+        (
+            "providers.models.x.x.fallback_models",
+            "[providers.models.x.x]\nfallback_models = [\"backup\"]\n",
+        ),
+        (
             "runtime_profiles.x.context_compression.summary_model",
             "[runtime_profiles.x.context_compression]\nsummary_model = \"haiku\"\n",
         ),
@@ -9094,6 +9229,35 @@ summary_model = "opus"
             );
             assert!(out.contains("provider_retries = 3"), "{out}");
         }
+    }
+
+    #[test]
+    fn v3_profile_fallback_fields_are_retired_into_the_canonical_graph() {
+        let raw = r#"schema_version = 3
+
+[providers.models.custom."gateway.prod"]
+model = "primary"
+fallback = ["custom.backup"]
+fallback_models = ["backup"]
+
+[providers.models.custom.backup]
+model = "backup"
+"#;
+        let (migrated, notices) = migrate_file_with_notices(raw)
+            .unwrap()
+            .expect("retired profile fallback fields must trigger a rewrite");
+        let paths = removed_paths(&notices);
+        assert!(paths.contains(&"providers.models.custom.gateway.prod.fallback"));
+        assert!(paths.contains(&"providers.models.custom.gateway.prod.fallback_models"));
+        let value: toml::Value = toml::from_str(&migrated).unwrap();
+        let profile = &value["providers"]["models"]["custom"]["gateway.prod"];
+        assert!(profile.get("fallback").is_none());
+        assert!(profile.get("fallback_models").is_none());
+        assert!(notices.iter().all(|notice| matches!(
+            notice,
+            MigrationNotice::Removed { reason, .. }
+                if reason.contains("profile-level fallback")
+        )));
     }
 
     #[test]

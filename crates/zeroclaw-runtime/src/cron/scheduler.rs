@@ -1255,54 +1255,23 @@ async fn run_agent_job_inner(
         sop_step_scope: None,
         ..crate::agent::loop_::AgentRunOverrides::default()
     };
-    let temperature = config
-        .model_provider_for_agent(agent_alias)
-        .and_then(|e| e.temperature);
     let run_result = match job.session_target {
-        SessionTarget::Main | SessionTarget::Isolated => match capabilities {
-            Some(capabilities) => {
-                Box::pin(
-                    crate::agent::run_with_capabilities(
-                        config.clone(),
-                        capabilities.clone(),
-                        None,
-                        agent_alias,
-                        Some(prefixed_prompt),
-                        None,
-                        model_override,
-                        temperature,
-                        vec![],
-                        false,
-                        Some(session_path.clone()),
-                        job.allowed_tools.clone(),
-                        zeroclaw_api::ingress::TurnOrigin::Cron,
-                        run_overrides,
-                    )
-                    .instrument(subagent_span),
-                )
+        SessionTarget::Main | SessionTarget::Isolated => {
+            let mut request = crate::agent::AgentRunRequest::new(agent_alias);
+            request.message = Some(prefixed_prompt);
+            request.model.model = model_override.as_deref();
+            request.session_state_file = Some(session_path.clone());
+            request.allowed_tools = job.allowed_tools.clone();
+            request.origin = zeroclaw_api::ingress::TurnOrigin::Cron;
+            request.capabilities =
+                capabilities.map(|capabilities| crate::composition::BoundCapabilities {
+                    capabilities: capabilities.clone(),
+                    principal: None,
+                });
+            crate::agent::run_with_request(Arc::new(config.clone()), request, run_overrides)
+                .instrument(subagent_span)
                 .await
-            }
-            None => {
-                Box::pin(
-                    crate::agent::run(
-                        config.clone(),
-                        agent_alias,
-                        Some(prefixed_prompt),
-                        None,
-                        model_override,
-                        temperature,
-                        vec![],
-                        false,
-                        Some(session_path.clone()),
-                        job.allowed_tools.clone(),
-                        zeroclaw_api::ingress::TurnOrigin::Cron,
-                        run_overrides,
-                    )
-                    .instrument(subagent_span),
-                )
-                .await
-            }
-        },
+        }
     };
 
     match run_result {

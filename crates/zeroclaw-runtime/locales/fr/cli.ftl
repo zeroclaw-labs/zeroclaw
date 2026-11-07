@@ -856,6 +856,7 @@ cli-status-config = Config :      {$v}
 cli-status-provider-indent = {"   "}ModelProvider :      {$family}.{$alias}
 cli-status-provider = 🤖 ModelProvider :      {$family}.{$alias}
 cli-status-model = {"   "}Modèle :         {$model}
+cli-status-model-entry = {"   "}Modèle [{$alias}] : {$model}
 cli-status-observability = 📊 Observabilité :  {$v}
 cli-status-trace-storage = 🧾 Stockage des traces :  {$mode} ({$path})
 cli-status-agents = 🛡️  Agents :        {$v}
@@ -954,6 +955,8 @@ cli-config-capped-key-lowered = avertissement : la clé de configuration `{$key}
 cli-config-capped-reason-pairing-code-ttl = un code d’appairage reste utilisable 600 secondes (10 minutes) au plus
 cli-config-retired-reason-nevis = l’intégration Nevis IAM a été supprimée ; configurez plutôt `[oidc.<alias>]` avec `[users]` et `[permission_profiles]`
 cli-config-retired-reason-agent-tunable = les réglages d’exécution définis dans l’agent ne sont plus lus ; les profils d’exécution font foi, définissez donc cette clé dans le `[runtime_profiles.<profile>]` de l’agent
+cli-config-retired-reason-text-tool-parsing = l’analyse des appels d’outils dans le texte se configure par modèle de chat ; utilisez `options.extract_text_tool_calls = false` à la place de `strict_tool_parsing = true`
+cli-config-retired-reason-profile-fallback = les listes de repli au niveau des profils ont été supprimées en V4 ; utilisez le graphe à clés exactes `[providers.fallback]` et définissez-y chaque cible comme une référence de modèle complète
 cli-config-retired-reason-summary-model = l’ancien identifiant de modèle seul n’avait pas de fournisseur et n’était jamais lu ; `summary_provider` l’a remplacé (la compression du contexte elle-même n’est pas encore implémentée dans le runtime)
 cli-config-retired-reason-node-transport = l’ancien transport de nœuds HMAC a été supprimé
 cli-config-retired-reason-wati = la prise en charge de WATI a été supprimée ; passez à `[channels.whatsapp.<alias>]` avec la Cloud API ou WhatsApp Web, puis révoquez le jeton d’API WATI inutilisé
@@ -1222,7 +1225,6 @@ channel-runtime-fallback-footer =
     Changer de modèle : /models
 channel-runtime-model-fallback-redacted = ⚡ Le modèle demandé était indisponible ; un modèle de secours a généré cette réponse.
 delegate-provider-fallback-warning = Avertissement : l’agent délégué a repris son exécution grâce à un basculement vers un fournisseur de secours. Les détails de la défaillance du fournisseur ont été consignés et omis de ce résultat.
-turn-tool-protocol-strict-mixed-error = L’analyse stricte des outils ne peut pas exécuter une chaîne de repli qui mélange des candidats native-tool et text-only. Configurez chaque candidat accessible pour utiliser le même protocole d’outils, ou définissez strict_tool_parsing sur false.
 delegate-provider-fallback-header = [Agent '{ $agent }' (demandé : { $requested_provider }/{ $requested_model } ; fourni : { $actual_provider }/{ $actual_model })]
 delegate-provider-fallback-header-agentic = [Agent '{ $agent }' (demandé : { $requested_provider }/{ $requested_model } ; fourni : { $actual_provider }/{ $actual_model }, agentique)]
 cli-alias-list-empty = (aucune entrée sous {$section})
@@ -1384,3 +1386,14 @@ channel-approval-opt-allow-always = Toujours autoriser
 channel-approval-opt-reject = Rejeter
 channel-approval-opt-reject-with-edit = Rejeter avec modification
 tool-git-operations-error-docker-runtime-write-unsupported = Les commandes d’écriture Git ne sont pas disponibles avec l’environnement d’exécution Docker, car elles ne peuvent pas être confinées à son conteneur.
+
+# Named model selection diagnostics.
+cli-model-switch-invalid-reference = model_provider doit être une référence `<type>.<alias>` ou `<type>.<alias>.<model>` ; valeur reçue : `{ $provider_ref }`
+cli-model-switch-no-profiles = aucun profil de fournisseur configuré
+cli-model-switch-profile-missing = model_provider `{ $provider_ref }` ne correspond à aucun profil configuré. Ajoutez [providers.models.{ $family }.{ $alias }] ou utilisez : { $available }
+cli-model-switch-model-id-missing = L’entrée `{ $provider_ref }` n’a pas d’`id` et son profil n’a pas de `model`
+cli-model-switch-entry-missing = model_provider `{ $provider_ref }` désigne le modèle `{ $model_alias }`, mais [providers.models.{ $family }.{ $alias }.models.{ $model_alias }] n’est pas configuré
+cli-model-switch-model-required = Paramètre 'model' manquant pour 'set' (ou utilisez une référence model_provider `<type>.<alias>.<model>`)
+cli-doctor-nested-model = { $provider_ref } : modèle : { $model } (entrée { $model_alias })
+cli-doctor-nested-model-id-missing = { $provider_ref } : l’entrée { $model_alias } n’a pas d’ID de modèle (définissez son `id` ou le `model` du profil)
+cli-doctor-temperature-out-of-range = { $provider_ref } : la température { $temperature } est hors plage (valeur attendue : 0.0–2.0)

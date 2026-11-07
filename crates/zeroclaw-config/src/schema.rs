@@ -216,12 +216,13 @@ pub struct Config {
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
 
-    /// All configured provider profiles, grouped by category under a
-    /// single `[providers]` root. Categories today: `models`, `tts`,
-    /// `transcription`. Shape: `[providers.<category>.<type>.<alias>]`,
-    /// e.g. `[providers.models.anthropic.default]`,
-    /// `[providers.tts.openai.default]`,
-    /// `[providers.transcription.groq.default]`.
+    /// All configured provider connections and capability model identities
+    /// under one `[providers]` root. New configuration uses exact-key tables
+    /// such as `[providers.connections."gateway.prod"]`,
+    /// `[providers.models."chat.main"]`, `[providers.model_presets."chat.fast"]`
+    /// and `[providers.fallback]`. The typed `tts`/`transcription` maps remain
+    /// only as the explicit V4 migration adapter while consumers move to the
+    /// canonical registry.
     #[serde(default)]
     #[nested]
     pub providers: crate::providers::Providers,
@@ -884,6 +885,34 @@ impl WireApi {
     }
 }
 
+/// Wire protocol used by a typed decision model.
+///
+/// `openai_decisions` is OpenAI's dedicated Decisions API (`POST
+/// /v1/decisions`). OpenAI-compatible gateways and local servers can expose
+/// the same contract. `system_one` keeps the existing Jev / Laya contract
+/// available for legacy decision entries. Chat Completions and Responses are
+/// chat wire APIs and are intentionally represented by [`WireApi`] instead.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionWireApi {
+    #[serde(rename = "openai_decisions")]
+    OpenAiDecisions,
+    SystemOne,
+}
+
+impl DecisionWireApi {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAiDecisions => "openai_decisions",
+            Self::SystemOne => "system_one",
+        }
+    }
+}
+
 /// Policy for images a native tool-result carrier declared in its
 /// `attachments` array.
 #[derive(
@@ -918,6 +947,215 @@ pub enum AuthMode {
     /// OAuth flow — credential resolution defers to the family runtime impl
     /// (typically reading a vendor-specific token cache or env var).
     OAuth,
+}
+
+/// One selectable model hosted by a single provider profile.
+///
+/// Lives under `[providers.models.<family>.<alias>.models.<model_alias>]`. A
+/// model entry carries only model-side request tuning; it inherits the
+/// enclosing provider profile's connection state (`api_key`, `uri`,
+/// `extra_headers`, `tls_ca_cert_path`, `wire_api`, `kind`). Every field left
+/// unset falls back to the enclosing `ModelProviderConfig`'s value of the same
+/// name, so a model entry only overrides what differs from the provider
+/// default. This lets one provider account (one credential + endpoint) serve
+/// several models, each addressable via a three-segment reference
+/// `<family>.<alias>.<model_alias>`.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models"]
+pub struct ModelEntryConfig {
+    /// Model identifier sent with each request (the provider catalog id, e.g.
+    /// `gpt-4o`, `claude-sonnet-4-5`). When unset, the enclosing provider
+    /// profile's `model` field is used.
+    #[tab(Model)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Sampling temperature for this model. Overrides the provider profile's
+    /// `temperature` when set.
+    #[tab(Model)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    /// Hard cap on response length in tokens for this model. Overrides the
+    /// provider profile's `max_tokens` when set.
+    #[tab(Model)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    /// Context window size (max input tokens) for this model. Overrides the
+    /// provider profile's `context_window` when set.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<usize>,
+    /// Enable or disable chain-of-thought thinking for this model. Overrides
+    /// the provider profile's `think` when set.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub think: Option<bool>,
+    /// Override vision (image input) capability for this model. Overrides the
+    /// provider profile's `vision` when set.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision: Option<bool>,
+    /// Override native tool calling for this model. Overrides the provider
+    /// profile's `native_tools` when set.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_tools: Option<bool>,
+    /// Whether stored assistant reasoning is replayed for this model. Overrides
+    /// the provider profile's `replay_assistant_reasoning` when set.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_assistant_reasoning: Option<bool>,
+    /// Extra JSON parameters merged into request bodies for this model.
+    /// Overrides the provider profile's `provider_extra` when set.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_extra: Option<serde_json::Value>,
+    /// `chat_template_kwargs` forwarded for this model. Overrides the provider
+    /// profile's value when set.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_template_kwargs: Option<serde_json::Value>,
+}
+
+/// Result of resolving a model_provider reference against the config.
+///
+/// Produced by [`Config::resolve_model_selection`]. Borrows the provider
+/// profile and (when one was selected) the model entry from the config, and
+/// carries the provider-local model id to send with requests.
+#[derive(Debug, Clone)]
+pub struct ModelSelection<'a> {
+    /// Provider family key, e.g. `"openai"`.
+    pub family: &'static str,
+    /// Provider alias within the family, e.g. `"default"`.
+    pub alias: &'a str,
+    /// The resolved provider profile (connection + legacy model fields).
+    pub entry: &'a ModelProviderConfig,
+    /// The selected model entry, when the profile has a `models` map and one
+    /// was selected. `None` for the legacy single-model path.
+    pub model_entry: Option<&'a ModelEntryConfig>,
+    /// The selected model alias, when a model entry was selected.
+    pub model_alias: Option<String>,
+    /// Provider-local model id to send. `None` when neither the model entry's
+    /// `id` nor the profile's `model` is set (caller may supply an override).
+    pub model_id: Option<String>,
+}
+
+/// Owned identity of a resolved model selection — the comparison key for
+/// "is this a different model than the current one".
+///
+/// Two refs that resolve to the same profile, the same model entry, and the
+/// same effective model id compare equal — so a two-segment ref and the
+/// three-segment ref naming that profile's selected entry are the same model
+/// (no spurious rebuild), while two entries under one profile that happen to
+/// share a model id stay distinct (a real switch).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelIdentity {
+    /// Provider family key, e.g. `"openai"`.
+    pub family: String,
+    /// Provider profile alias, e.g. `"default"`.
+    pub alias: String,
+    /// Name of the selected model entry under the profile's `models` map.
+    /// `None` when no entry was selected (legacy single-model path).
+    pub entry_alias: Option<String>,
+    /// Effective model id, after any caller-supplied override.
+    pub model_id: String,
+}
+
+impl ModelIdentity {
+    /// Profile identity used for credentials, billing, and cooldowns.
+    #[must_use]
+    pub fn profile_ref(&self) -> String {
+        if self.alias.is_empty() {
+            self.family.clone()
+        } else {
+            format!("{}.{}", self.family, self.alias)
+        }
+    }
+
+    /// Reference retaining the selected entry, including dotted profile aliases.
+    #[must_use]
+    pub fn provider_ref(&self) -> String {
+        if self.alias.is_empty() {
+            return self.family.clone();
+        }
+        let profile = self.profile_ref();
+        self.entry_alias
+            .as_ref()
+            .map_or(profile.clone(), |alias| format!("{profile}.{alias}"))
+    }
+}
+
+impl ModelSelection<'_> {
+    /// Model-side sampling takes precedence over the enclosing profile.
+    #[must_use]
+    pub fn temperature(&self) -> Option<f64> {
+        self.model_entry
+            .and_then(|entry| entry.temperature)
+            .or(self.entry.temperature)
+    }
+
+    /// Configured capacity, preserving the distinction between unset and a
+    /// compatibility fallback used for budget arithmetic.
+    #[must_use]
+    pub fn configured_context_window(&self) -> Option<usize> {
+        self.model_entry
+            .and_then(|entry| entry.context_window)
+            .or(self.entry.context_window)
+    }
+
+    /// Owned identity of this selection, for "did the model change"
+    /// comparisons. `model_override` (when set) replaces the resolved model
+    /// id, mirroring how callers layer an explicit model over
+    /// [`Self::model_id`].
+    #[must_use]
+    pub fn identity(&self, model_override: Option<&str>) -> ModelIdentity {
+        let model_id = model_override
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string)
+            .or_else(|| self.model_id.clone())
+            .unwrap_or_default();
+        ModelIdentity {
+            family: self.family.to_string(),
+            alias: self.alias.to_string(),
+            entry_alias: self.model_alias.clone(),
+            model_id,
+        }
+    }
+}
+
+/// One configured model as the CLI surfaces report it — the shared
+/// enumeration behind `models list` / `models status` / `zeroclaw status`
+/// and the doctor commands, so they can never disagree about what a
+/// profile hosts. Produced by [`Config::configured_model_entries`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfiguredModelEntry {
+    /// `family.alias` on the legacy single-model path,
+    /// `family.alias.model_alias` when the profile hosts multiple models.
+    pub provider_ref: String,
+    /// The two-segment profile ref.
+    pub profile_ref: String,
+    /// The nested model entry's alias; `None` on the legacy path.
+    pub model_alias: Option<String>,
+    /// Resolved model id (the entry's `id`, else the profile `model`);
+    /// `None` when neither is set.
+    pub model_id: Option<String>,
+}
+
+/// Extract the `(family, alias)` provider-profile pair from a model_provider
+/// reference. Accepts both the two-segment `<family>.<alias>` form and the
+/// three-segment `<family>.<alias>.<model_alias>` form (the model alias is
+/// ignored — provider lookup only needs the profile). Returns `None` when the
+/// reference has no `.` separator.
+#[must_use]
+pub fn provider_profile_ref(model_provider_ref: &str) -> Option<(&str, &str)> {
+    let mut parts = model_provider_ref.splitn(3, '.');
+    let family = parts.next()?;
+    let alias = parts.next()?;
+    if family.is_empty() || alias.is_empty() {
+        return None;
+    }
+    Some((family, alias))
 }
 
 /// Prompt-cache entry lifetime to request for this provider's Anthropic
@@ -971,25 +1209,6 @@ pub struct ModelProviderConfig {
     #[tab(Model)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Ordered list of other provider aliases to try when every model on this
-    /// alias has failed. Each entry is a dotted `<type>.<alias>` reference into
-    /// `providers.models` and resolves with its own credentials, endpoint, and
-    /// model. A fallback never inherits this alias's key. The walk is
-    /// depth-first: this alias's models are exhausted first, then each fallback
-    /// alias is descended in turn (applying its own `fallback_models` and
-    /// `fallback`). Empty means no provider-level fallback.
-    #[tab(Model)]
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub fallback: Vec<crate::providers::ModelProviderRef>,
-    /// Ordered alternate models to try on THIS provider before falling over to
-    /// the `fallback` aliases. Same endpoint, key, and headers as the primary
-    /// `model`. Only the model identifier changes. Use this when a provider
-    /// serves a backup model (e.g. a smaller or older variant) that should be
-    /// tried before leaving the provider entirely. Empty means only `model` is
-    /// tried.
-    #[tab(Model)]
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub fallback_models: Vec<String>,
     /// Sampling temperature passed to the model. Lower values (0.0–0.3) give
     /// deterministic, near-verbatim output, which fits code, routing, summarization.
     /// Higher values (0.7–1.2) give more varied output, which fits open-ended chat.
@@ -1194,6 +1413,16 @@ pub struct ModelProviderConfig {
     #[tab(Connection)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_ca_cert_path: Option<String>,
+    /// Models hosted by this provider profile, keyed by model alias. Each entry
+    /// shares this profile's credential and endpoint but carries its own model
+    /// id and model-side tuning, and is addressable as
+    /// `<family>.<alias>.<model_alias>`. When empty, the profile behaves as
+    /// before: a single model selected via the `model` field above. See
+    /// `ModelEntryConfig`.
+    #[tab(Model)]
+    #[nested]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub models: HashMap<String, ModelEntryConfig>,
 }
 
 // ── Per-family model model_provider configs ────────────────────────────
@@ -1376,8 +1605,8 @@ pub struct AnthropicModelProviderConfig {
     /// must differ from the requested model, and must be permitted fallback
     /// targets for it (e.g. `claude-fable-5` → `["claude-opus-4-8"]`; a
     /// non-permitted entry is rejected by the API). Applies to non-streaming
-    /// requests only. Distinct from the generic `fallback_models`, which
-    /// ZeroClaw itself retries client-side after an error. Empty (the default)
+    /// requests only. Distinct from the client-side `[providers.fallback]`
+    /// graph, which ZeroClaw retries after an error. Empty (the default)
     /// sends no fallback parameter and no beta value.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub server_fallback_models: Vec<String>,
@@ -3874,7 +4103,6 @@ pub struct ResolvedRuntime {
     pub context_compact_ratio: Option<f64>,
     pub parallel_tools: bool,
     pub tool_dispatcher: String,
-    pub strict_tool_parsing: bool,
     pub tool_call_dedup_exempt: Vec<String>,
     pub tool_filter_groups: Vec<ToolFilterGroup>,
     pub max_system_prompt_chars: usize,
@@ -4068,7 +4296,6 @@ impl Default for ResolvedRuntime {
             context_compact_ratio: None,
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
-            strict_tool_parsing: false,
             tool_call_dedup_exempt: Vec::new(),
             tool_filter_groups: Vec::new(),
             max_system_prompt_chars: default_max_system_prompt_chars(),
@@ -4476,6 +4703,75 @@ impl Config {
     /// `PropKind::AliasRef` pickers and validation.
     #[must_use]
     pub fn resolve_alias_source(&self, source: crate::traits::AliasSource) -> Vec<String> {
+        if matches!(
+            source,
+            crate::traits::AliasSource::TtsProviders
+                | crate::traits::AliasSource::TranscriptionProviders
+        ) {
+            let capability = if source == crate::traits::AliasSource::TtsProviders {
+                zeroclaw_api::capability::Capability::Tts
+            } else {
+                zeroclaw_api::capability::Capability::Asr
+            };
+            let mut refs = Vec::new();
+            if let Ok(registry) = self.provider_registry() {
+                refs.extend(
+                    registry
+                        .models
+                        .iter()
+                        .filter(|(_, model)| model.capability() == capability)
+                        .map(|(name, _)| name.to_string()),
+                );
+            }
+            if capability == zeroclaw_api::capability::Capability::Tts {
+                refs.extend(
+                    self.providers
+                        .tts
+                        .iter_entries()
+                        .map(|(family, alias, _)| format!("{family}.{alias}")),
+                );
+            } else {
+                refs.extend(
+                    self.providers
+                        .transcription
+                        .iter_aliases()
+                        .map(|(family, alias)| format!("{family}.{alias}")),
+                );
+            }
+            refs.sort();
+            refs.dedup();
+            return refs;
+        }
+        // Model references have dynamic keys containing literal dots. Build
+        // them from the typed maps, never from flattened property paths.
+        if source == crate::traits::AliasSource::ModelProviders {
+            let mut refs = Vec::new();
+            if self.providers.models.has_canonical_models()
+                && let Ok(registry) = self.provider_registry()
+            {
+                refs.extend(
+                    registry
+                        .models
+                        .iter()
+                        .filter(|(_, model)| {
+                            model.capability() == zeroclaw_api::capability::Capability::Chat
+                        })
+                        .map(|(model_ref, _)| model_ref.to_string()),
+                );
+            }
+            for (family, alias, profile) in self.providers.models.iter_entries() {
+                refs.push(format!("{family}.{alias}"));
+                refs.extend(
+                    profile
+                        .models
+                        .keys()
+                        .map(|model| format!("{family}.{alias}.{model}")),
+                );
+            }
+            refs.sort();
+            refs.dedup();
+            return refs;
+        }
         let section = source.section_path();
         if source.is_two_tier() {
             let prefix = format!("{section}.");
@@ -4502,22 +4798,153 @@ impl Config {
         }
     }
 
-    /// Return the first concrete `model` string available for use as a
-    /// default: the model declared by the first entry that has one. Entries
-    /// are visited in macro slot order, then sorted alias order within each
-    /// slot, as implemented by
-    /// [`ModelProviders::first_entry_with_model`](crate::providers::ModelProviders::first_entry_with_model).
-    /// Returns `None` only when no model-provider entry has any model
-    /// configured at all.
+    /// Resolve the first provider profile that has an effective model. Entries
+    /// are visited in deterministic provider-slot and alias order. The result
+    /// keeps the profile, selected nested entry, and effective model id
+    /// together so bootstrap consumers cannot combine facts from two profiles.
     #[must_use]
-    pub fn resolve_default_model(&self) -> Option<String> {
+    pub fn resolve_default_model_selection(&self) -> Option<ModelSelection<'_>> {
         self.providers
             .models
-            .first_entry_with_model()
-            .and_then(|(_, _, base)| base.model.as_deref())
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-            .map(ToString::to_string)
+            .iter_entries()
+            .find_map(|(family, alias, _)| {
+                let provider_ref = format!("{family}.{alias}");
+                self.resolve_model_selection(&provider_ref)
+                    .filter(|selection| {
+                        selection
+                            .model_id
+                            .as_deref()
+                            .map(str::trim)
+                            .is_some_and(|model| !model.is_empty())
+                    })
+            })
+    }
+
+    /// Return the first concrete model id available for use as a default.
+    /// This is the model-only projection of
+    /// [`Self::resolve_default_model_selection`].
+    #[must_use]
+    pub fn resolve_default_model(&self) -> Option<String> {
+        if self.providers.models.has_canonical_models()
+            && let Ok(registry) = self.provider_registry()
+            && let Some(model) = registry.models.values().find(|model| {
+                model.capability() == zeroclaw_api::capability::Capability::Chat
+                    && model
+                        .upstream_model()
+                        .is_some_and(|value| !value.trim().is_empty())
+            })
+        {
+            return model
+                .upstream_model()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+        }
+        self.resolve_default_model_selection()
+            .and_then(|selection| selection.model_id)
+            .map(|model| model.trim().to_string())
+    }
+
+    /// Resolve a model ID from either the canonical exact-key registry or the
+    /// legacy family/alias maps. Canonical keys are checked first and are
+    /// never split on `.`.
+    #[must_use]
+    pub fn resolve_model_id(&self, model_ref: &str) -> Option<String> {
+        let model_ref = model_ref.trim();
+        if self.providers.models.has_canonical_models()
+            && let Ok(registry) = self.provider_registry()
+            && let Ok(selection) =
+                registry.resolve_chat(&crate::provider_registry::ModelRef::from(model_ref))
+        {
+            return selection
+                .upstream_model()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+        }
+        self.resolve_model_selection(model_ref)
+            .and_then(|selection| selection.model_id)
+            .map(|model| model.trim().to_owned())
+            .filter(|model| !model.is_empty())
+    }
+
+    /// Resolve model-owned text extraction after API/preset/model overlays.
+    /// Canonical and legacy selections share the same provider defaults.
+    /// Exact keys containing dots are resolved without splitting them.
+    #[must_use]
+    pub fn model_text_extraction(
+        &self,
+        model_ref: &str,
+    ) -> crate::provider_registry::TextExtraction {
+        self.provider_registry()
+            .ok()
+            .and_then(|registry| {
+                registry
+                    .resolve_chat(&crate::provider_registry::ModelRef::from(model_ref))
+                    .ok()
+                    .map(|chat| chat.text_extraction())
+            })
+            .or_else(|| {
+                self.resolve_model_selection(model_ref).map(|selection| {
+                    let native_tools = selection
+                        .model_entry
+                        .and_then(|model| model.native_tools)
+                        .or(selection.entry.native_tools);
+                    crate::provider_registry::TextExtraction::for_provider(
+                        selection.entry.kind.as_deref().unwrap_or(selection.family),
+                        selection.entry.wire_api,
+                        native_tools,
+                    )
+                })
+            })
+            .unwrap_or_default()
+    }
+
+    /// Resolve a model's configured temperature from the canonical registry,
+    /// falling back to the legacy selection lens. Explicit Clear means the
+    /// request omits temperature and therefore resolves to `None`.
+    #[must_use]
+    pub fn resolve_model_temperature(&self, model_ref: &str) -> Option<f64> {
+        if self.providers.models.has_canonical_models()
+            && let Ok(registry) = self.provider_registry()
+            && let Ok(selection) =
+                registry.resolve_chat(&crate::provider_registry::ModelRef::from(model_ref.trim()))
+        {
+            return selection
+                .options
+                .temperature
+                .as_ref()
+                .and_then(|value| match value {
+                    crate::provider_registry::Override::Set(value) => Some(*value),
+                    crate::provider_registry::Override::Clear => None,
+                });
+        }
+        self.resolve_model_selection(model_ref)
+            .and_then(|selection| selection.temperature())
+    }
+
+    /// Test whether a reference names an exact-key model in the canonical
+    /// registry. Canonical references are never split on `.` and are kept
+    /// separate from the legacy family/alias maps so consumers can choose the
+    /// correct resolution path without losing credentials or other legacy
+    /// provider fields.
+    #[must_use]
+    pub fn is_canonical_model_ref(&self, model_ref: &str) -> bool {
+        self.providers.models.has_canonical_models()
+            && self
+                .providers
+                .models
+                .canonical_model(&crate::provider_registry::ModelRef::from(model_ref.trim()))
+                .is_some()
+    }
+
+    /// Test whether a reference names a canonical model or a legacy model
+    /// profile/entry. Callers that only need admission should use this instead
+    /// of destructuring the legacy `ModelSelection` type.
+    #[must_use]
+    pub fn is_configured_model_ref(&self, model_ref: &str) -> bool {
+        self.is_canonical_model_ref(model_ref)
+            || self.resolve_model_selection(model_ref.trim()).is_some()
     }
 
     /// Resolve the risk profile for an explicit agent alias.
@@ -4737,8 +5164,22 @@ impl Config {
     #[must_use]
     pub fn configured_model_context_window(&self, agent_alias: &str) -> Option<usize> {
         // Provider config (config.toml) is the source of truth for this value.
-        self.resolved_model_provider_for_agent(agent_alias)
-            .and_then(|(_, _, provider_config)| provider_config.context_window)
+        let agent = self.agent(agent_alias)?;
+        if self.providers.models.has_canonical_models()
+            && let Ok(registry) = self.provider_registry()
+            && let Ok(selection) = registry.resolve_chat(&crate::provider_registry::ModelRef::from(
+                agent.model_provider.as_str(),
+            ))
+        {
+            return match selection.selection.model {
+                crate::provider_registry::ModelDefinition::Chat(model) => {
+                    model.metadata.context_window
+                }
+                _ => None,
+            };
+        }
+        self.resolve_model_selection(&agent.model_provider)
+            .and_then(|selection| selection.configured_context_window())
     }
 
     /// Returns the model's context window size (max input tokens).
@@ -4762,10 +5203,9 @@ impl Config {
             };
         };
         let model = self
-            .model_provider_for_agent(agent_alias)
-            .and_then(|provider| provider.model.as_deref())
+            .resolve_model_id(agent.model_provider.as_str())
             .unwrap_or_default();
-        self.resolved_model_context_window_for_route(agent.model_provider.as_str(), model)
+        self.resolved_model_context_window_for_route(agent.model_provider.as_str(), &model)
     }
 
     /// Resolve model capacity for the provider alias and model selected for a
@@ -4791,26 +5231,84 @@ impl Config {
         model_provider_ref: &str,
         selected_model: &str,
     ) -> ResolvedModelContextWindow {
-        let configured =
-            model_provider_ref
-                .split_once('.')
-                .and_then(|(provider_type, provider_alias)| {
-                    self.providers.models.find(provider_type, provider_alias)
-                });
+        if self.providers.models.has_canonical_models()
+            && let Ok(registry) = self.provider_registry()
+            && let Ok(selection) = registry.resolve_chat(&crate::provider_registry::ModelRef::from(
+                model_provider_ref.trim(),
+            ))
+        {
+            let configured_window = match selection.selection.model {
+                crate::provider_registry::ModelDefinition::Chat(model) => {
+                    let resolved_model = model
+                        .model
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
+                    if selected_model.trim().is_empty()
+                        || resolved_model.is_none()
+                        || resolved_model == Some(selected_model.trim())
+                    {
+                        model.metadata.context_window
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            return configured_window.map_or(
+                ResolvedModelContextWindow {
+                    tokens: UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
+                    source: ModelContextWindowSource::CompatibilityFallback,
+                },
+                |tokens| ResolvedModelContextWindow {
+                    tokens,
+                    source: ModelContextWindowSource::Configured,
+                },
+            );
+        }
+        let selection = self.resolve_model_selection(model_provider_ref);
         let selected_model = selected_model.trim();
-        let configured_model = configured
-            .and_then(|provider| provider.model.as_deref())
-            .map(str::trim)
-            .filter(|model| !model.is_empty());
+        let configured_window = selection.and_then(|selection| {
+            let resolved_model = selection
+                .model_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|model| !model.is_empty());
+            if selected_model.is_empty()
+                || resolved_model.is_none()
+                || resolved_model == Some(selected_model)
+            {
+                return selection.configured_context_window();
+            }
 
-        let configured_window = configured
-            .filter(|_| {
-                selected_model.is_empty()
-                    || configured_model.is_none()
-                    || configured_model == Some(selected_model)
-            })
-            .and_then(|provider| provider.context_window)
-            .filter(|window| *window > 0);
+            // Runtime attribution intentionally normalizes a nested selection
+            // to `<family>.<alias>`. Resolve the actual served model back to a
+            // unique nested entry on demand so route-aware limits still follow
+            // that model without snapshotting a second copy of config state.
+            let mut matches = selection.entry.models.values().filter(|entry| {
+                entry
+                    .id
+                    .as_deref()
+                    .or(selection.entry.model.as_deref())
+                    .map(str::trim)
+                    == Some(selected_model)
+            });
+            let matched = matches.next();
+            if matches.next().is_some() {
+                return None;
+            }
+            if let Some(entry) = matched {
+                entry.context_window.or(selection.entry.context_window)
+            } else {
+                selection
+                    .entry
+                    .model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|model| *model == selected_model)
+                    .and(selection.entry.context_window)
+            }
+        });
 
         configured_window.map_or(
             ResolvedModelContextWindow {
@@ -4833,8 +5331,22 @@ impl Config {
         model_provider_ref: &str,
         selected_model: &str,
     ) -> ResolvedContextLimits {
+        // Legacy bare-family overrides inherit the agent's selected model and
+        // tuning. Recover that source at use time, while keeping the physical
+        // provider/billing family independent. Explicit different model IDs
+        // must not borrow the inherited model's capacity.
+        let capacity_ref = self
+            .agent(agent_alias)
+            .filter(|_| !model_provider_ref.contains('.'))
+            .filter(|agent| {
+                self.resolve_model_selection(&agent.model_provider)
+                    .is_some_and(|selection| {
+                        selection.model_id.as_deref().map(str::trim) == Some(selected_model.trim())
+                    })
+            })
+            .map_or(model_provider_ref, |agent| agent.model_provider.as_str());
         let model_context_window =
-            self.resolved_model_context_window_for_route(model_provider_ref, selected_model);
+            self.resolved_model_context_window_for_route(capacity_ref, selected_model);
         let mut runtime = ResolvedRuntime {
             max_context_tokens: self.effective_max_context_tokens(agent_alias),
             model_context_window: model_context_window.tokens,
@@ -4855,33 +5367,19 @@ impl Config {
     /// of the agent-alias variant when the live provider identity is
     /// known (e.g., from `Agent.attribution_fields().1` or
     /// `SessionOverrides.model_provider`). Returns `None` when the
-    /// ref is unparseable, the entry has no `context_window`, or the
-    /// served model does not match the entry's configured primary
-    /// `model`, so the wire omission path preserves absence (no 32k
-    /// stub leak) and fallback/vision/override models never borrow
-    /// another model's capacity.
+    /// ref is unparseable, the selected profile or nested entry has no
+    /// `context_window`, or the served model cannot be matched to that
+    /// selection, so the wire omission path preserves absence (no 32k stub
+    /// leak) and fallback/vision/override models never borrow another model's
+    /// capacity.
     #[must_use]
     pub fn model_provider_context_window_opt(
         &self,
         provider_ref: &str,
         model: &str,
     ) -> Option<usize> {
-        let (type_key, alias_key) = provider_ref.split_once('.')?;
-        let (_, _, cfg) = self
-            .providers
-            .models
-            .iter_entries()
-            .find(|(ty, al, _)| *ty == type_key && *al == alias_key)?;
-        let configured = cfg
-            .model
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())?;
-        let served = model.trim();
-        if served.is_empty() || configured != served {
-            return None;
-        }
-        cfg.context_window
+        let resolved = self.resolved_model_context_window_for_route(provider_ref, model);
+        (resolved.source == ModelContextWindowSource::Configured).then_some(resolved.tokens)
     }
 
     #[must_use]
@@ -4983,7 +5481,6 @@ impl Config {
             ..ResolvedRuntime::default()
         };
         if let Some(profile) = self.runtime_profile_for_agent(agent_alias) {
-            resolved.strict_tool_parsing = profile.strict_tool_parsing;
             resolved.thinking = profile.thinking.clone();
             resolved.history_pruning = profile.history_pruning.clone();
             resolved.eval = profile.eval.clone();
@@ -5029,8 +5526,8 @@ impl Config {
     #[must_use]
     pub fn model_provider_for_agent(&self, agent_alias: &str) -> Option<&ModelProviderConfig> {
         let agent = self.agents.get(agent_alias)?;
-        let (type_key, alias_key) = agent.model_provider.split_once('.')?;
-        self.providers.models.find(type_key, alias_key)
+        self.resolve_model_selection(&agent.model_provider)
+            .map(|selection| selection.entry)
     }
 
     /// Resolve `(provider_type, provider_alias, &ModelProviderConfig)` for an
@@ -5046,11 +5543,202 @@ impl Config {
         agent_alias: &str,
     ) -> Option<(&'static str, &str, &ModelProviderConfig)> {
         let agent = self.agents.get(agent_alias)?;
-        let (type_key, alias_key) = agent.model_provider.split_once('.')?;
-        self.providers
+        self.resolve_model_selection(&agent.model_provider)
+            .map(|selection| (selection.family, selection.alias, selection.entry))
+    }
+
+    /// Resolve a model_provider reference into its provider profile, the
+    /// selected model entry (if any), and the provider-local model id to send.
+    ///
+    /// Accepts two reference shapes:
+    /// - Three or more segments first resolve the longest configured provider
+    ///   alias. An exact alias wins; otherwise the remaining suffix selects a
+    ///   named entry under the provider profile's `models` map. This preserves
+    ///   legacy aliases containing dots while supporting nested model refs.
+    /// - Two segments `<family>.<alias>` — selects a model entry by these
+    ///   rules, in order: the entry named `default`; else, when exactly one
+    ///   entry exists, that sole entry; else the provider profile's own `model`
+    ///   field (legacy single-model behavior).
+    ///
+    /// The returned model id is the entry's `id` (falling back to the provider
+    /// profile's `model`) for the three-segment / entry-selected cases, or the
+    /// provider profile's `model` for the legacy path. Returns `None` when the
+    /// reference is unparseable, the provider profile is missing, or a named
+    /// three-segment model entry does not exist. Returns `Some` with
+    /// `model_id == None` when no model id can be determined (caller decides
+    /// whether an override rescues it).
+    #[must_use]
+    pub fn resolve_model_selection<'a>(
+        &'a self,
+        model_provider_ref: &str,
+    ) -> Option<ModelSelection<'a>> {
+        let (family, tail) = model_provider_ref.split_once('.')?;
+        if family.is_empty() || tail.is_empty() {
+            return None;
+        }
+
+        let (family, alias_str) = self.providers.models.profile_ref(model_provider_ref)?;
+        let (family_key, alias_str, entry) = self
+            .providers
             .models
             .iter_entries()
-            .find(|(ty, al, _)| *ty == type_key && *al == alias_key)
+            .find(|(ty, alias, _)| *ty == family && *alias == alias_str)?;
+        let model_alias = tail
+            .strip_prefix(alias_str)?
+            .strip_prefix('.')
+            .filter(|model_alias| !model_alias.is_empty());
+
+        let model_entry: Option<(&str, &ModelEntryConfig)> = match model_alias {
+            // Three-segment ref: the named entry must exist.
+            Some(name) => Some((name, entry.models.get(name)?)),
+            // Two-segment ref: prefer `default`, then a sole entry, else legacy.
+            None => entry
+                .models
+                .get("default")
+                .map(|e| ("default", e))
+                .or_else(|| {
+                    if entry.models.len() == 1 {
+                        entry.models.iter().next().map(|(k, v)| (k.as_str(), v))
+                    } else {
+                        None
+                    }
+                }),
+        };
+
+        let model_id = match model_entry {
+            Some((_, e)) => {
+                e.id.as_deref()
+                    .or(entry.model.as_deref())
+                    .map(str::to_string)
+            }
+            None => entry.model.as_deref().map(str::to_string),
+        };
+
+        Some(ModelSelection {
+            family: family_key,
+            alias: alias_str,
+            entry,
+            model_entry: model_entry.map(|(_, e)| e),
+            model_alias: model_entry.map(|(k, _)| k.to_string()),
+            model_id,
+        })
+    }
+
+    /// Resolve a legacy profile model edit to its effective, explicitly set
+    /// nested id. Tuning-only entries continue to inherit the profile model.
+    #[must_use]
+    pub fn effective_model_edit_path(&self, requested_path: &str) -> String {
+        let Some(profile_path) = requested_path.strip_suffix(".model") else {
+            return requested_path.to_string();
+        };
+        let Some(reference) = profile_path.strip_prefix("providers.models.") else {
+            return requested_path.to_string();
+        };
+        let Some(selection) = self.resolve_model_selection(reference) else {
+            return requested_path.to_string();
+        };
+        if selection
+            .model_entry
+            .and_then(|entry| entry.id.as_deref())
+            .is_none_or(|id| id.trim().is_empty())
+        {
+            return requested_path.to_string();
+        }
+        selection.model_alias.map_or_else(
+            || requested_path.to_string(),
+            |alias| format!("{profile_path}.models.{alias}.id"),
+        )
+    }
+
+    /// Enumerate every configured model across all provider profiles, as the
+    /// CLI surfaces (`models list/status`, `zeroclaw status`) and `doctor`
+    /// report them. A legacy single-model profile yields one entry with
+    /// `model_alias: None`; a profile hosting a `models` map yields one entry
+    /// per nested model alias (deterministically sorted), each resolving its
+    /// model id the same way [`Self::resolve_model_selection`] does.
+    ///
+    /// `provider_override` narrows the enumeration, matched by full
+    /// `type.alias` or `type.alias.model_alias` ref, or by bare family name —
+    /// the same filters the doctor commands accept.
+    #[must_use]
+    pub fn configured_model_entries(
+        &self,
+        provider_override: Option<&str>,
+    ) -> Vec<ConfiguredModelEntry> {
+        let filter = provider_override.map(str::trim).filter(|p| !p.is_empty());
+        let mut entries = Vec::new();
+        // Canonical models are already complete model references.  List
+        // them before the legacy family maps and compare filters against the
+        // exact key or its referenced connection; never split a dotted key.
+        if self.providers.models.has_canonical_models()
+            && let Ok(registry) = self.provider_registry()
+        {
+            for (model_ref, model) in &registry.models {
+                if model.capability() != zeroclaw_api::capability::Capability::Chat {
+                    continue;
+                }
+                let provider_ref = model_ref.to_string();
+                let connection_ref = model.provider().to_string();
+                if filter.is_some_and(|f| f != provider_ref && f != connection_ref) {
+                    continue;
+                }
+                entries.push(ConfiguredModelEntry {
+                    provider_ref,
+                    profile_ref: connection_ref,
+                    model_alias: None,
+                    model_id: model.upstream_model().map(str::to_owned),
+                });
+            }
+        }
+        for (ty, alias, entry) in self.providers.models.iter_entries() {
+            let profile_ref = format!("{ty}.{alias}");
+            let selected_model_alias = filter
+                .and_then(|f| f.strip_prefix(&format!("{profile_ref}.")))
+                .filter(|model_alias| entry.models.contains_key(*model_alias));
+            let passes = match filter {
+                Some(f) => {
+                    profile_ref == f
+                        || profile_ref.split('.').next() == Some(f)
+                        || selected_model_alias.is_some()
+                }
+                None => true,
+            };
+            if !passes {
+                continue;
+            }
+            if !entry.models.is_empty() {
+                // One three-segment entry per nested model alias, using the
+                // resolved model id from the model entry (or profile
+                // fallback).
+                let mut model_aliases: Vec<&str> =
+                    entry.models.keys().map(String::as_str).collect();
+                model_aliases.sort_unstable();
+                for model_alias in model_aliases {
+                    if selected_model_alias.is_some_and(|selected| selected != model_alias) {
+                        continue;
+                    }
+                    let three_seg = format!("{profile_ref}.{model_alias}");
+                    let model_id = self
+                        .resolve_model_selection(&three_seg)
+                        .and_then(|s| s.model_id);
+                    entries.push(ConfiguredModelEntry {
+                        provider_ref: three_seg,
+                        profile_ref: profile_ref.clone(),
+                        model_alias: Some(model_alias.to_string()),
+                        model_id,
+                    });
+                }
+            } else {
+                // Legacy path: no nested models, the profile-level model.
+                entries.push(ConfiguredModelEntry {
+                    provider_ref: profile_ref.clone(),
+                    profile_ref,
+                    model_alias: None,
+                    model_id: entry.model.clone(),
+                });
+            }
+        }
+        entries
     }
 
     /// Reverse-lookup the agent alias that owns a configured channel
@@ -12846,6 +13534,12 @@ pub struct MemoryConfig {
     /// Source of embedding vectors for semantic search. `none` = keyword-only retrieval (no API calls, no vector cost); `openai` = OpenAI's embedding API; `custom:URL` = any OpenAI-compatible embedding endpoint (LiteLLM, local gateway, etc.).
     #[serde(default = "default_embedding_provider")]
     pub embedding_provider: String,
+    /// Canonical logical model reference from `[providers.models]`. When set,
+    /// the embedding connection, upstream model, credential, and dimensions
+    /// are resolved from the provider registry; the legacy provider/model
+    /// fields remain the explicit V4 migration fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_model_ref: Option<String>,
     /// Embedding model identifier — must match a model your chosen embedding model_provider serves (e.g. `text-embedding-3-small` for OpenAI). Changing this invalidates existing embeddings: the change is detected at startup and stale vectors are cleared automatically; run `zeroclaw memory reindex` to re-embed (or set `auto_reindex_on_identity_change`).
     #[serde(default = "default_embedding_model")]
     pub embedding_model: String,
@@ -13466,6 +14160,7 @@ impl Default for MemoryConfig {
             daily_retention_days: default_zero_retention(),
             core_retention_days: default_zero_retention(),
             embedding_provider: default_embedding_provider(),
+            embedding_model_ref: None,
             embedding_model: default_embedding_model(),
             embedding_dimensions: default_embedding_dims(),
             auto_reindex_on_identity_change: false,
@@ -15029,7 +15724,6 @@ pub struct RuntimeProfileConfig {
     /// the system-prompt builder and the `read_skill` tool-registration gate
     /// consult so they always agree on the effective mode.
     pub prompt_injection_mode: Option<SkillsPromptInjectionMode>,
-    pub strict_tool_parsing: bool,
     #[nested]
     pub thinking: crate::scattered_types::ThinkingConfig,
     #[nested]
@@ -15073,7 +15767,6 @@ impl Default for RuntimeProfileConfig {
             keep_tool_context_turns: None,
             memory_recall_limit: None,
             prompt_injection_mode: None,
-            strict_tool_parsing: false,
             thinking: crate::scattered_types::ThinkingConfig::default(),
             history_pruning: crate::scattered_types::HistoryPrunerConfig::default(),
             eval: crate::scattered_types::EvalConfig::default(),
@@ -15486,9 +16179,9 @@ pub struct ModelRouteConfig {
     /// Empty strings are rejected by `Config::validate()`.
     #[serde(default)]
     pub model_provider: String,
-    /// Provider-local model identifier to use with that provider profile
+    /// Provider-local model identifier to use with that provider profile.
+    /// When omitted, the model selected by `model_provider` is used.
     /// `#[serde(default)]` is required for `Default` + `create_map_key` construction.
-    /// Empty strings are rejected by `Config::validate()`.
     #[serde(default)]
     pub model: String,
     /// Optional API key override for this route's model provider
@@ -15497,6 +16190,31 @@ pub struct ModelRouteConfig {
     #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_key: Option<String>,
+}
+
+impl ModelRouteConfig {
+    /// The provider-local model this route requests: the explicit `model`
+    /// when set, otherwise the model id selected by the `model_provider`
+    /// reference — a three-segment `<type>.<alias>.<model_alias>` ref names a
+    /// nested model entry, and a two-segment ref resolves the profile's
+    /// default. Empty when neither resolves.
+    pub fn effective_model(&self, config: &Config) -> String {
+        let explicit = self.model.trim();
+        if !explicit.is_empty() {
+            return explicit.to_string();
+        }
+        // Canonical model references are exact TOML keys. Resolve them before
+        // the legacy family/alias parser, which intentionally treats dots as
+        // profile separators and therefore cannot identify a dotted key.
+        let canonical_ref = crate::provider_registry::ModelRef::from(self.model_provider.trim());
+        if let Some(model) = config.providers.models.canonical_model(&canonical_ref) {
+            return model.upstream_model().unwrap_or_default().to_owned();
+        }
+        config
+            .resolve_model_selection(&self.model_provider)
+            .and_then(|selection| selection.model_id)
+            .unwrap_or_default()
+    }
 }
 
 // ── Model cache (shared between CLI refresh and channel reader) ──
@@ -15539,7 +16257,8 @@ pub struct EmbeddingRouteConfig {
     /// are rejected by `Config::validate()`.
     #[serde(default)]
     pub hint: String,
-    /// Dotted embedding-capable provider profile ref
+    /// Two-segment embedding-capable provider profile ref (`<type>.<alias>`).
+    /// Select the provider-local embedding model with the separate `model` field.
     /// `#[serde(default)]` is required for `Default` + `create_map_key` construction.
     /// Empty strings are rejected by `Config::validate()`.
     #[serde(default)]
@@ -22986,6 +23705,105 @@ impl Config {
         out
     }
 
+    /// Return unknown leaves inside canonical model option patches. The
+    /// options patch structs intentionally ignore unrecognized leaves so a
+    /// typo cannot abort an otherwise valid config; the startup loader calls
+    /// this scanner once to make that loss visible. It operates on TOML
+    /// tables directly, preserving quoted dotted registry keys as one key.
+    pub fn unknown_canonical_option_fields(raw_toml: &str) -> Vec<String> {
+        fn option_fields(capability: &str) -> &'static [&'static str] {
+            match capability {
+                "chat" => crate::provider_registry::ChatOptionsPatch::FIELDS,
+                "tts" => crate::provider_registry::TtsOptionsPatch::FIELDS,
+                "asr" => crate::provider_registry::AsrOptionsPatch::FIELDS,
+                _ => &[],
+            }
+        }
+        fn key_segment(key: &str) -> String {
+            toml_edit::Key::new(key).to_string()
+        }
+        fn scan_options(
+            options: Option<&toml::Value>,
+            capability: &str,
+            path: &str,
+            out: &mut Vec<String>,
+        ) {
+            let Some(options) = options.and_then(toml::Value::as_table) else {
+                return;
+            };
+            let known = option_fields(capability);
+            for field in options
+                .keys()
+                .filter(|field| !known.contains(&field.as_str()))
+            {
+                out.push(format!("{path}.options.{}", key_segment(field)));
+            }
+        }
+
+        let Ok(raw) = raw_toml.parse::<toml::Table>() else {
+            return Vec::new();
+        };
+        let Some(providers) = raw.get("providers").and_then(toml::Value::as_table) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+
+        if let Some(models) = providers.get("models").and_then(toml::Value::as_table) {
+            for (model_ref, model) in models {
+                let Some(model) = model.as_table() else {
+                    continue;
+                };
+                let Some(capability) = model.get("capability").and_then(toml::Value::as_str) else {
+                    continue;
+                };
+                let path = format!("providers.models.{}", key_segment(model_ref));
+                scan_options(model.get("options"), capability, &path, &mut out);
+            }
+        }
+        if let Some(presets) = providers
+            .get("model_presets")
+            .and_then(toml::Value::as_table)
+        {
+            for (preset_name, value) in presets {
+                let Some(preset_table) = value.as_table() else {
+                    continue;
+                };
+                let Some(capability) = preset_table.get("capability").and_then(toml::Value::as_str)
+                else {
+                    continue;
+                };
+                let path = format!("providers.model_presets.{}", key_segment(preset_name));
+                scan_options(preset_table.get("options"), capability, &path, &mut out);
+            }
+        }
+        if let Some(connections) = providers.get("connections").and_then(toml::Value::as_table) {
+            for (connection_name, value) in connections {
+                let Some(connection_table) = value.as_table() else {
+                    continue;
+                };
+                let Some(api) = connection_table.get("api").and_then(toml::Value::as_table) else {
+                    continue;
+                };
+                for (capability, api_value) in api {
+                    let path = format!(
+                        "providers.connections.{}.api.{}",
+                        key_segment(connection_name),
+                        key_segment(capability)
+                    );
+                    scan_options(
+                        api_value.as_table().and_then(|table| table.get("options")),
+                        capability,
+                        &path,
+                        &mut out,
+                    );
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
     /// Return extra-nested model-provider alias tables that look like a
     /// misplaced provider config, e.g.
     /// `[providers.models.zai.default.default]`.
@@ -23287,6 +24105,15 @@ impl Config {
                     "Unknown config key ignored: \"\". Check config.toml for typos or deprecated options."
                 );
             }
+            for path in Self::unknown_canonical_option_fields(&contents) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"path": path})),
+                    "Unknown canonical model option ignored; check the capability option name"
+                );
+            }
             // Unknown provider families are dropped by serde, so an alias
             // created under a typo'd or unsupported family silently vanishes
             // on reload while agents.*.model_provider still references it.
@@ -23554,7 +24381,6 @@ impl Config {
     pub fn collect_warnings(&self) -> Vec<crate::validation_warnings::ValidationWarning> {
         let mut warnings = Vec::new();
         self.collect_codex_cli_extra_arg_warnings(&mut warnings);
-        self.collect_fallback_warnings(&mut warnings);
         self.collect_server_fallback_model_warnings(&mut warnings);
         self.collect_a2a_exposed_skills_warnings(&mut warnings);
         self.collect_memory_semantic_search_warnings(&mut warnings);
@@ -23773,7 +24599,7 @@ impl Config {
                 "memory.search_mode is {search_mode:?} on sqlite memory, but no effective \
                  embedding provider is configured; vector search is skipped and \
                  recall falls back to keyword-only behavior. Configure \
-                 memory.embedding_provider or a valid memory.embedding_model \
+                 memory.embedding_model_ref, memory.embedding_provider, or a valid memory.embedding_model \
                  hint route, or set memory.search_mode = \"bm25\"."
             ),
             "memory.search_mode",
@@ -23790,6 +24616,23 @@ impl Config {
     }
 
     fn memory_has_effective_embedder(&self) -> bool {
+        if let Some(model_ref) = self
+            .memory
+            .embedding_model_ref
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            && let Ok(registry) = self.provider_registry()
+            && let Ok(resolved) =
+                registry.resolve_embedding(&crate::provider_registry::ModelRef::from(model_ref))
+            && !resolved.model.trim().is_empty()
+            && resolved
+                .dimensions
+                .unwrap_or(self.memory.embedding_dimensions)
+                > 0
+        {
+            return true;
+        }
         let fallback = || Self::memory_embedding_settings_have_effective_embedder(&self.memory);
         let Some(hint) = self
             .memory
@@ -23962,63 +24805,6 @@ impl Config {
         }
     }
 
-    /// Surface non-fatal issues in per-alias `fallback` chains: dangling refs
-    /// (a fallback naming an alias that is not configured) and cycles (a
-    /// fallback path that loops back onto itself). Both are warn-and-skip — the
-    /// chain still loads and runs with the offending edge pruned at build time.
-    fn collect_fallback_warnings(
-        &self,
-        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
-    ) {
-        for (family, alias, cfg) in self.providers.models.iter_entries() {
-            self.collect_fallback_model_warnings(family, alias, cfg, warnings);
-            if cfg.fallback.is_empty() {
-                continue;
-            }
-            let root = format!("{family}.{alias}");
-            let mut visited: Vec<String> = vec![root.clone()];
-            self.walk_fallback(&root, &cfg.fallback, &mut visited, 1, warnings);
-        }
-    }
-
-    /// Surface `fallback_models` entries the build path silently skips: blank
-    /// entries and entries that duplicate the alias's primary `model`. The skip
-    /// itself is safe, but without a warning an operator never learns that a
-    /// listed fallback model is doing nothing.
-    fn collect_fallback_model_warnings(
-        &self,
-        family: &str,
-        alias: &str,
-        cfg: &ModelProviderConfig,
-        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
-    ) {
-        let Some(primary) = cfg.model.as_deref() else {
-            return;
-        };
-        for (i, model) in cfg.fallback_models.iter().enumerate() {
-            let path = format!("providers.models.{family}.{alias}.fallback_models[{i}]");
-            if model.trim().is_empty() {
-                warnings.push(crate::validation_warnings::ValidationWarning::new(
-                    "empty_fallback_model",
-                    format!(
-                        "fallback_models entry {i} on {family}.{alias} is empty; \
-                         it is skipped at runtime"
-                    ),
-                    path,
-                ));
-            } else if model == primary {
-                warnings.push(crate::validation_warnings::ValidationWarning::new(
-                    "fallback_model_duplicates_primary",
-                    format!(
-                        "fallback_models entry {model:?} on {family}.{alias} duplicates the \
-                         primary model; it is skipped at runtime"
-                    ),
-                    path,
-                ));
-            }
-        }
-    }
-
     /// Surface `server_fallback_models` entries the Anthropic request builder
     /// drops before sending: blank entries and entries that duplicate the
     /// alias's primary `model` (the requested model can never be its own
@@ -24056,62 +24842,6 @@ impl Config {
                     ));
                 }
             }
-        }
-    }
-
-    fn walk_fallback(
-        &self,
-        from: &str,
-        refs: &[crate::providers::ModelProviderRef],
-        visited: &mut Vec<String>,
-        depth: usize,
-        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
-    ) {
-        if depth > crate::providers::MAX_FALLBACK_DEPTH {
-            warnings.push(crate::validation_warnings::ValidationWarning::new(
-                "max_fallback_depth_exceeded",
-                format!(
-                    "fallback chain from {from} exceeds the maximum depth of {}; \
-                     deeper links are pruned at runtime",
-                    crate::providers::MAX_FALLBACK_DEPTH
-                ),
-                format!("providers.models.{from}.fallback"),
-            ));
-            return;
-        }
-        for (i, fallback_ref) in refs.iter().enumerate() {
-            let raw = fallback_ref.as_str().trim();
-            if raw.is_empty() {
-                continue;
-            }
-            let path = format!("providers.models.{from}.fallback[{i}]");
-            let Some((family, alias, cfg)) = self.providers.models.find_by_name(raw) else {
-                warnings.push(crate::validation_warnings::ValidationWarning::new(
-                    "dangling_fallback_ref",
-                    format!(
-                        "fallback {raw:?} on {from} does not resolve to a configured \
-                         providers.models entry; this fallback link is skipped at runtime"
-                    ),
-                    path,
-                ));
-                continue;
-            };
-            let resolved = format!("{family}.{alias}");
-            if visited.iter().any(|v| v == &resolved) {
-                warnings.push(crate::validation_warnings::ValidationWarning::new(
-                    "fallback_cycle",
-                    format!(
-                        "fallback {raw:?} on {from} closes a cycle \
-                         ({} -> {resolved}); the cycle edge is pruned at runtime",
-                        visited.join(" -> ")
-                    ),
-                    path,
-                ));
-                continue;
-            }
-            visited.push(resolved.clone());
-            self.walk_fallback(&resolved, &cfg.fallback, visited, depth + 1, warnings);
-            visited.pop();
         }
     }
 
@@ -24990,12 +25720,13 @@ impl Config {
                     "model_routes[{i}].model_provider must not be empty"
                 );
             }
-            // Route refs are dotted `<type>.<alias>` and must resolve to a
-            // configured `[providers.models.<type>.<alias>]` entry. Unresolved
-            // routes are dropped at runtime construction; rejecting them here
-            // keeps that drift visible at config-load time.
-            match mp.split_once('.') {
-                Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
+            // Route refs are dotted `<type>.<alias>` (optionally three-segment
+            // `<type>.<alias>.<model>`) and must resolve to a configured
+            // `[providers.models.<type>.<alias>]` entry. Unresolved routes are
+            // dropped at runtime construction; rejecting them here keeps that
+            // drift visible at config-load time.
+            match self.providers.models.profile_ref(mp) {
+                Some((ty, inner)) => {
                     if self.providers.models.find(ty, inner).is_none() {
                         validation_bail!(
                             DanglingReference,
@@ -25003,18 +25734,43 @@ impl Config {
                             "model_routes[{i}].model_provider = {mp:?} but providers.models.{ty}.{inner} is not configured",
                         );
                     }
+                    if let Some(model_alias) = mp
+                        .strip_prefix(ty)
+                        .and_then(|tail| tail.strip_prefix('.'))
+                        .and_then(|tail| tail.strip_prefix(inner))
+                        .and_then(|tail| tail.strip_prefix('.'))
+                        && !model_alias.is_empty()
+                        && self
+                            .providers
+                            .models
+                            .find_model(ty, inner, model_alias)
+                            .is_none()
+                    {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("model_routes[{i}].model_provider"),
+                            "model_routes[{i}].model_provider = {mp:?} but [providers.models.{ty}.{inner}.models.{model_alias}] is not configured",
+                        );
+                    }
                 }
-                _ => validation_bail!(
+                None => validation_bail!(
                     InvalidFormat,
                     format!("model_routes[{i}].model_provider"),
                     "model_routes[{i}].model_provider must be dotted form `<type>.<alias>` (got {mp:?})",
                 ),
             }
-            if required.model.missing {
+            if route.model.trim().is_empty()
+                && self
+                    .resolve_model_selection(mp)
+                    .and_then(|selection| selection.model_id)
+                    .as_deref()
+                    .map(str::trim)
+                    .is_none_or(str::is_empty)
+            {
                 validation_bail!(
                     RequiredFieldEmpty,
                     format!("model_routes[{i}].model"),
-                    "model_routes[{i}].model must not be empty"
+                    "model_routes[{i}].model may be omitted only when model_provider resolves to a configured model id"
                 );
             }
         }
@@ -25041,10 +25797,19 @@ impl Config {
                     "embedding_routes[{i}].model_provider must not be empty"
                 );
             }
-            // Embedding routes resolve against the same model-provider map;
-            // there is no separate `providers.embeddings` typed section.
-            match mp.split_once('.') {
-                Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
+            // Embedding routes resolve a provider profile here and carry their
+            // provider-local model id in `route.model`. The embedding runtime
+            // does not consume nested model selectors, so reject a third segment
+            // instead of accepting configuration whose selector would be ignored.
+            match self.providers.models.profile_ref(mp) {
+                Some((ty, inner))
+                    if mp
+                        .strip_prefix(ty)
+                        .and_then(|tail| tail.strip_prefix('.'))
+                        .and_then(|tail| tail.strip_prefix(inner))
+                        .and_then(|tail| tail.strip_prefix('.'))
+                        .is_none() =>
+                {
                     if self.providers.models.find(ty, inner).is_none() {
                         validation_bail!(
                             DanglingReference,
@@ -25056,7 +25821,7 @@ impl Config {
                 _ => validation_bail!(
                     InvalidFormat,
                     format!("embedding_routes[{i}].model_provider"),
-                    "embedding_routes[{i}].model_provider must be dotted form `<type>.<alias>` (got {mp:?})",
+                    "embedding_routes[{i}].model_provider must use two-segment `<type>.<alias>` form; set embedding_routes[{i}].model separately (got {mp:?})",
                 ),
             }
             if required.model.missing {
@@ -25091,10 +25856,44 @@ impl Config {
                 .api_key
                 .as_deref()
                 .is_some_and(|v| !v.trim().is_empty());
-            let has_model = profile
+            let has_profile_model = profile
                 .model
                 .as_deref()
                 .is_some_and(|v| !v.trim().is_empty());
+            for (model_alias, model_entry) in &profile.models {
+                let model_path = format!("providers.models.{profile_name}.models.{model_alias}");
+                if model_entry
+                    .id
+                    .as_deref()
+                    .is_some_and(|id| id.trim().is_empty())
+                {
+                    validation_bail!(
+                        RequiredFieldEmpty,
+                        format!("{model_path}.id"),
+                        "{model_path}.id must not be empty when set"
+                    );
+                }
+                if model_entry.id.is_none() && !has_profile_model {
+                    validation_bail!(
+                        RequiredFieldEmpty,
+                        format!("{model_path}.id"),
+                        "{model_path}.id is required when the provider profile has no model"
+                    );
+                }
+                if let Some(temp) = model_entry.temperature {
+                    validate_temperature(temp).map_err(|e| {
+                        anyhow::Error::msg(format!("{model_path}.temperature: {e}"))
+                    })?;
+                }
+                if model_entry.context_window == Some(0) {
+                    validation_bail!(
+                        InvalidNumericRange,
+                        format!("{model_path}.context_window"),
+                        "{model_path}.context_window must be greater than 0"
+                    );
+                }
+            }
+            let has_model = has_profile_model || !profile.models.is_empty();
             if !has_uri && !has_api_key && !has_model {
                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": profile_name, "profile_name": profile_name})), "providers.models. is empty (no uri / api_key / model). \
                      Skipping at runtime; run `zeroclaw quickstart` (or use the dashboard) \
@@ -25613,8 +26412,24 @@ impl Config {
             if value.is_empty() {
                 continue;
             }
-            match value.split_once('.') {
-                Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
+            if let Some(model) = self
+                .providers
+                .models
+                .canonical_model(&crate::provider_registry::ModelRef::from(value))
+            {
+                if model.capability() != zeroclaw_api::capability::Capability::Chat {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("runtime_profiles.{palias}.context_compression.summary_provider"),
+                        "runtime_profiles.{palias}.context_compression.summary_provider = {value:?} must reference a chat model",
+                    );
+                }
+                continue;
+            }
+            // Accepts `<type>.<alias>` or a three-segment `<type>.<alias>.<model>`
+            // (the model entry, if named, must exist under the profile).
+            match self.providers.models.profile_ref(value) {
+                Some((ty, inner)) => {
                     let exists = self
                         .get_map_keys(&format!("providers.models.{ty}"))
                         .is_some_and(|keys| keys.iter().any(|k| k == inner));
@@ -25627,8 +26442,28 @@ impl Config {
                             "runtime_profiles.{palias}.context_compression.summary_provider = {value:?} but providers.models.{ty}.{inner} is not configured",
                         );
                     }
+                    if let Some(model_alias) = value
+                        .strip_prefix(ty)
+                        .and_then(|tail| tail.strip_prefix('.'))
+                        .and_then(|tail| tail.strip_prefix(inner))
+                        .and_then(|tail| tail.strip_prefix('.'))
+                        && !model_alias.is_empty()
+                        && self
+                            .providers
+                            .models
+                            .find_model(ty, inner, model_alias)
+                            .is_none()
+                    {
+                        validation_bail!(
+                            DanglingReference,
+                            format!(
+                                "runtime_profiles.{palias}.context_compression.summary_provider"
+                            ),
+                            "runtime_profiles.{palias}.context_compression.summary_provider = {value:?} but [providers.models.{ty}.{inner}.models.{model_alias}] is not configured",
+                        );
+                    }
                 }
-                _ => validation_bail!(
+                None => validation_bail!(
                     InvalidFormat,
                     format!("runtime_profiles.{palias}.context_compression.summary_provider"),
                     "runtime_profiles.{palias}.context_compression.summary_provider must be dotted form `<type>.<alias>` (got {value:?})",
@@ -25645,8 +26480,9 @@ impl Config {
         for alias in agent_aliases {
             let agent = &self.agents[alias];
 
-            // model_provider: mandatory, dotted `<type>.<inner>` ref into
-            // model_providers.<type>.<inner>.
+            // model_provider: mandatory, dotted ref into
+            // providers.models.<type>.<alias>, optionally with a third segment
+            // selecting a model entry: `<type>.<alias>.<model_alias>`.
             let mp = agent.model_provider.trim();
             if mp.is_empty() {
                 validation_bail!(
@@ -25655,31 +26491,65 @@ impl Config {
                     "agents.{alias}.model_provider must reference a configured model model_provider (e.g. \"anthropic.default\")",
                 );
             }
-            match mp.split_once('.') {
-                Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
-                    if !crate::providers::ModelProviders::slot_names().contains(&ty) {
-                        validation_bail!(
-                            DanglingReference,
-                            format!("agents.{alias}.model_provider"),
-                            "agents.{alias}.model_provider = {mp:?} but {ty:?} is not a known provider family; check [providers.models.<family>.<alias>] in config.toml (valid families: `zeroclaw providers`)",
-                        );
-                    }
-                    let exists = self
-                        .get_map_keys(&format!("providers.models.{ty}"))
-                        .is_some_and(|keys| keys.iter().any(|k| k == inner));
-                    if !exists {
-                        validation_bail!(
-                            DanglingReference,
-                            format!("agents.{alias}.model_provider"),
-                            "agents.{alias}.model_provider = {mp:?} but [providers.models.{ty}.{inner}] is not configured",
-                        );
-                    }
+            if let Some(model) = self
+                .providers
+                .models
+                .canonical_model(&crate::provider_registry::ModelRef::from(mp))
+            {
+                if model.capability() != zeroclaw_api::capability::Capability::Chat {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("agents.{alias}.model_provider"),
+                        "agents.{alias}.model_provider = {mp:?} must reference a chat model",
+                    );
                 }
-                _ => validation_bail!(
-                    InvalidFormat,
-                    format!("agents.{alias}.model_provider"),
-                    "agents.{alias}.model_provider must be dotted form `<type>.<alias>` (got {mp:?})",
-                ),
+            } else {
+                match self.providers.models.profile_ref(mp) {
+                    Some((ty, inner)) => {
+                        let profile_ref = format!("{ty}.{inner}");
+                        let model_seg = mp
+                            .strip_prefix(&profile_ref)
+                            .and_then(|tail| tail.strip_prefix('.'));
+                        if !crate::providers::ModelProviders::slot_names().contains(&ty) {
+                            validation_bail!(
+                                DanglingReference,
+                                format!("agents.{alias}.model_provider"),
+                                "agents.{alias}.model_provider = {mp:?} but {ty:?} is not a known provider family; check [providers.models.<family>.<alias>] in config.toml (valid families: `zeroclaw providers`)",
+                            );
+                        }
+                        let exists = self
+                            .get_map_keys(&format!("providers.models.{ty}"))
+                            .is_some_and(|keys| keys.iter().any(|k| k == inner));
+                        if !exists {
+                            validation_bail!(
+                                DanglingReference,
+                                format!("agents.{alias}.model_provider"),
+                                "agents.{alias}.model_provider = {mp:?} but [providers.models.{ty}.{inner}] is not configured",
+                            );
+                        }
+                        // Three-segment ref: the named model entry must exist under
+                        // the profile's `models` subtable.
+                        if let Some(model_alias) = model_seg {
+                            let model_exists = self
+                                .providers
+                                .models
+                                .find_model(ty, inner, model_alias)
+                                .is_some();
+                            if !model_exists {
+                                validation_bail!(
+                                    DanglingReference,
+                                    format!("agents.{alias}.model_provider"),
+                                    "agents.{alias}.model_provider = {mp:?} but [providers.models.{ty}.{inner}.models.{model_alias}] is not configured",
+                                );
+                            }
+                        }
+                    }
+                    _ => validation_bail!(
+                        InvalidFormat,
+                        format!("agents.{alias}.model_provider"),
+                        "agents.{alias}.model_provider must be dotted form `<type>.<alias>` or `<type>.<alias>.<model>` (got {mp:?})",
+                    ),
+                }
             }
 
             // channels: each entry is a dotted `<type>.<inner>` ref into
@@ -25744,8 +26614,47 @@ impl Config {
                 if value.is_empty() {
                     continue;
                 }
-                match value.split_once('.') {
-                    Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
+                // Canonical capability models are exact registry keys.  A key may
+                // contain dots, so resolve it before entering the legacy
+                // family/alias parser.  The consumer field still constrains
+                // the capability; a chat model cannot silently become an
+                // ASR or TTS backend merely because its name exists.
+                let expected_capability = match *field {
+                    "tts_provider" => Some(zeroclaw_api::capability::Capability::Tts),
+                    "transcription_provider" => Some(zeroclaw_api::capability::Capability::Asr),
+                    "classifier_provider" | "summary_provider" => {
+                        Some(zeroclaw_api::capability::Capability::Chat)
+                    }
+                    _ => None,
+                };
+                if let Some(model) = self
+                    .providers
+                    .models
+                    .canonical_model(&crate::provider_registry::ModelRef::from(*value))
+                {
+                    if let Some(expected) = expected_capability
+                        && model.capability() != expected
+                    {
+                        validation_bail!(
+                            InvalidFormat,
+                            format!("agents.{alias}.{field}"),
+                            "agents.{alias}.{field} = {value:?} references capability {:?}, expected {:?}",
+                            model.capability(),
+                            expected,
+                        );
+                    }
+                    continue;
+                }
+                // classifier_provider / summary_provider point into
+                // providers.models and may carry a third `<model>` segment;
+                // tts_provider / transcription_provider are always two-segment.
+                // `provider_profile_ref` extracts `<type>.<alias>` for both.
+                match if *section_prefix == "providers.models" {
+                    self.providers.models.profile_ref(value)
+                } else {
+                    value.split_once('.')
+                } {
+                    Some((ty, inner)) => {
                         let exists = self
                             .get_map_keys(&format!("{section_prefix}.{ty}"))
                             .is_some_and(|keys| keys.iter().any(|k| k == inner));
@@ -25756,8 +26665,29 @@ impl Config {
                                 "agents.{alias}.{field} = {value:?} but {section_prefix}.{ty}.{inner} is not configured",
                             );
                         }
+                        // A three-segment models ref names a model entry under
+                        // the profile's `models` subtable — validate it exists.
+                        if *section_prefix == "providers.models"
+                            && let Some(model_alias) = value
+                                .strip_prefix(ty)
+                                .and_then(|tail| tail.strip_prefix('.'))
+                                .and_then(|tail| tail.strip_prefix(inner))
+                                .and_then(|tail| tail.strip_prefix('.'))
+                            && !model_alias.is_empty()
+                            && self
+                                .providers
+                                .models
+                                .find_model(ty, inner, model_alias)
+                                .is_none()
+                        {
+                            validation_bail!(
+                                DanglingReference,
+                                format!("agents.{alias}.{field}"),
+                                "agents.{alias}.{field} = {value:?} but [providers.models.{ty}.{inner}.models.{model_alias}] is not configured",
+                            );
+                        }
                     }
-                    _ => validation_bail!(
+                    None => validation_bail!(
                         InvalidFormat,
                         format!("agents.{alias}.{field}"),
                         "agents.{alias}.{field} must be dotted form `<type>.<alias>` (got {value:?})",
@@ -29824,8 +30754,8 @@ mod tests {
         use std::collections::HashMap;
 
         use super::{
-            AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig,
-            RuntimeProfileConfig,
+            AliasedAgentConfig, Config, CustomModelProviderConfig, ModelEntryConfig,
+            ModelProviderConfig, RuntimeProfileConfig,
         };
 
         let mut providers = HashMap::new();
@@ -29883,6 +30813,68 @@ mod tests {
             super::ModelContextWindowSource::CompatibilityFallback
         );
         assert_eq!(unknown_override.context_token_budget, 28_800);
+
+        // A fallback alias may deliberately leave `model` unset so it can
+        // serve the model requested from the primary while retaining its own
+        // endpoint metadata. Its capacity still belongs to that accepted
+        // alias and must not degrade to the compatibility fallback.
+        cfg.providers.models.custom.insert(
+            "backup".to_string(),
+            CustomModelProviderConfig {
+                base: ModelProviderConfig {
+                    context_window: Some(8_000),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        let unpinned_fallback =
+            cfg.resolved_context_limits_for_route("coder", "custom.backup", "large-model");
+        assert_eq!(unpinned_fallback.model_context_window, 8_000);
+        assert_eq!(unpinned_fallback.context_token_budget, 7_200);
+
+        cfg.providers.models.custom.insert(
+            "multi".to_string(),
+            CustomModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("legacy-model".to_string()),
+                    context_window: Some(100_000),
+                    models: HashMap::from([(
+                        "fast".to_string(),
+                        ModelEntryConfig {
+                            id: Some("nested-fast-model".to_string()),
+                            context_window: Some(16_000),
+                            ..ModelEntryConfig::default()
+                        },
+                    )]),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        cfg.agents.get_mut("coder").unwrap().model_provider = "custom.multi.fast".into();
+
+        let nested = cfg.resolved_context_limits_for_route(
+            "coder",
+            "custom.multi.fast",
+            "nested-fast-model",
+        );
+        assert_eq!(nested.model_context_window, 16_000);
+        assert_eq!(nested.context_token_budget, 14_400);
+
+        // Runtime attribution normalizes provider names to two segments. The
+        // actual served model must still resolve the unique nested capacity.
+        let normalized =
+            cfg.resolved_context_limits_for_route("coder", "custom.multi", "nested-fast-model");
+        assert_eq!(normalized, nested);
+        assert_eq!(cfg.effective_model_context_window("coder"), 16_000);
+        assert_eq!(
+            cfg.model_provider_context_window_opt("custom.multi.fast", "nested-fast-model"),
+            Some(16_000)
+        );
+        assert_eq!(
+            cfg.model_provider_context_window_opt("custom.multi", "nested-fast-model"),
+            Some(16_000),
+            "wire attribution normalizes the provider ref but must retain nested capacity"
+        );
     }
 
     /// The whole point of splitting the accessor: an operator-facing caller
@@ -34842,7 +35834,6 @@ reasoning_effort = "turbo"
         assert_eq!(cfg.resolved.max_history_messages, 50);
         assert!(!cfg.resolved.parallel_tools);
         assert_eq!(cfg.resolved.tool_dispatcher, "auto");
-        assert!(!cfg.resolved.strict_tool_parsing);
         assert!(cfg.precheck.enabled);
         assert_eq!(cfg.precheck.timeout_secs, 5);
     }
@@ -34900,7 +35891,6 @@ max_tool_iterations = 20
 max_history_messages = 80
 parallel_tools = true
 tool_dispatcher = "xml"
-strict_tool_parsing = true
 "#;
         let parsed = parse_test_config(raw);
         let agent = parsed
@@ -34909,7 +35899,6 @@ strict_tool_parsing = true
             .expect("[agents.default] parses into agents map");
         assert_eq!(agent.resolved.max_tool_iterations, 10);
         assert_eq!(agent.resolved.tool_dispatcher, "auto");
-        assert!(!agent.resolved.strict_tool_parsing);
     }
 
     #[test]
@@ -37970,6 +38959,218 @@ model = "primary-model"
             },
         );
         assert_eq!(config.resolve_default_model().as_deref(), Some("aaa-model"),);
+    }
+
+    /// A profile whose only model ids live under the nested `models` subtable
+    /// must still count for `resolve_default_model` — the gateway and WS
+    /// onboarding use it to decide whether any model is configured at all.
+    #[test]
+    async fn resolve_default_model_accepts_nested_only_profile() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        config.providers.models.openrouter.insert(
+            "default".to_string(),
+            OpenRouterModelProviderConfig {
+                base: ModelProviderConfig {
+                    // Profile-level `model` stays empty; the ids are nested.
+                    model: None,
+                    models: HashMap::from([(
+                        "default".to_string(),
+                        ModelEntryConfig {
+                            id: Some("or-nested-model".to_string()),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                },
+            },
+        );
+        assert_eq!(
+            config.resolve_default_model().as_deref(),
+            Some("or-nested-model"),
+        );
+    }
+
+    #[test]
+    async fn model_route_effective_model_resolves_nested_refs() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        config.providers.models.openrouter.insert(
+            "default".to_string(),
+            OpenRouterModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("profile-model".to_string()),
+                    models: HashMap::from([
+                        (
+                            "default".to_string(),
+                            ModelEntryConfig {
+                                id: Some("nested-default".to_string()),
+                                ..Default::default()
+                            },
+                        ),
+                        (
+                            "reasoning".to_string(),
+                            ModelEntryConfig {
+                                id: Some("nested-reasoning".to_string()),
+                                ..Default::default()
+                            },
+                        ),
+                    ]),
+                    ..Default::default()
+                },
+            },
+        );
+
+        // A three-segment route ref with no explicit `model` names its nested
+        // model entry instead of dispatching with an empty model string.
+        let route = ModelRouteConfig {
+            hint: "reasoning".to_string(),
+            model_provider: "openrouter.default.reasoning".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(route.effective_model(&config), "nested-reasoning");
+
+        // A two-segment ref resolves the profile default (models.default
+        // before the legacy profile-level `model`).
+        let route = ModelRouteConfig {
+            hint: "fast".to_string(),
+            model_provider: "openrouter.default".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(route.effective_model(&config), "nested-default");
+
+        // An explicit `model` always wins over the ref resolution.
+        let route = ModelRouteConfig {
+            hint: "pinned".to_string(),
+            model_provider: "openrouter.default.reasoning".to_string(),
+            model: "explicit-model".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(route.effective_model(&config), "explicit-model");
+
+        // Nothing set — not even whitespace-only model text — resolves.
+        let route = ModelRouteConfig {
+            hint: "empty".to_string(),
+            model: "  ".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(route.effective_model(&config), "");
+    }
+
+    #[::core::prelude::v1::test]
+    fn validate_accepts_nested_only_route_with_implicit_model() {
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "gateway".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("sk-test".to_string()),
+                    models: HashMap::from([(
+                        "fast".to_string(),
+                        ModelEntryConfig {
+                            id: Some("gpt-nested".to_string()),
+                            temperature: Some(0.2),
+                            context_window: Some(16_384),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                },
+            },
+        );
+        config.model_routes.push(ModelRouteConfig {
+            hint: "fast".to_string(),
+            model_provider: "openai.gateway.fast".to_string(),
+            model: String::new(),
+            api_key: None,
+        });
+
+        assert!(
+            config.validate().is_ok(),
+            "a nested model id makes an omitted route model unambiguous: {:?}",
+            config.validate().err()
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn validate_rejects_malformed_nested_model_entries() {
+        let config_with = |entry: ModelEntryConfig, profile_model: Option<&str>| {
+            let mut config = Config::default();
+            config.providers.models.openai.insert(
+                "gateway".to_string(),
+                OpenAIModelProviderConfig {
+                    base: ModelProviderConfig {
+                        api_key: Some("sk-test".to_string()),
+                        model: profile_model.map(str::to_string),
+                        models: HashMap::from([("fast".to_string(), entry)]),
+                        ..Default::default()
+                    },
+                },
+            );
+            config
+        };
+        let assert_error_path = |config: Config, expected: &str| {
+            let error = config
+                .validate()
+                .expect_err("malformed nested model entry must fail validation")
+                .to_string();
+            assert!(
+                error.contains(expected),
+                "validation error should name {expected}, got: {error}"
+            );
+        };
+
+        assert_error_path(
+            config_with(ModelEntryConfig::default(), None),
+            "models.fast.id",
+        );
+        assert_error_path(
+            config_with(
+                ModelEntryConfig {
+                    id: Some("  ".to_string()),
+                    ..Default::default()
+                },
+                Some("profile-model"),
+            ),
+            "models.fast.id",
+        );
+        assert_error_path(
+            config_with(
+                ModelEntryConfig {
+                    id: Some("gpt-nested".to_string()),
+                    temperature: Some(f64::NAN),
+                    ..Default::default()
+                },
+                None,
+            ),
+            "models.fast.temperature",
+        );
+        assert_error_path(
+            config_with(
+                ModelEntryConfig {
+                    id: Some("gpt-nested".to_string()),
+                    context_window: Some(0),
+                    ..Default::default()
+                },
+                None,
+            ),
+            "models.fast.context_window",
+        );
+
+        let inherited = config_with(
+            ModelEntryConfig {
+                id: None,
+                temperature: Some(0.4),
+                context_window: Some(8_192),
+                ..Default::default()
+            },
+            Some("profile-model"),
+        );
+        assert!(
+            inherited.validate().is_ok(),
+            "an omitted nested id inherits the profile model: {:?}",
+            inherited.validate().err()
+        );
     }
 
     #[test]
@@ -49828,7 +51029,7 @@ allowed_users = []
     ///
     /// Mirrors the production boundary of
     /// `local_whisper_config_init_preserves_transcription_section`
-    /// (crates/zeroclaw-channels/src/transcription.rs) but drives a bare
+    /// (crates/zeroclaw-providers/src/transcription.rs) but drives a bare
     /// full init instead of an exact-prefix one.
     #[test]
     async fn config_init_full_produces_strict_roundtrippable_config() {
@@ -53428,186 +54629,6 @@ group_policy = "all"
         );
     }
 
-    fn provider_entry_with_fallback(fallback: &[&str]) -> OpenAIModelProviderConfig {
-        OpenAIModelProviderConfig {
-            base: ModelProviderConfig {
-                model: Some("gpt-4o".to_string()),
-                fallback: fallback
-                    .iter()
-                    .map(|s| crate::providers::ModelProviderRef::new(*s))
-                    .collect(),
-                ..Default::default()
-            },
-        }
-    }
-
-    #[test]
-    async fn fallback_warns_on_dangling_ref() {
-        let mut config = Config::default();
-        suppress_semantic_memory_warning(&mut config);
-        config.providers.models.openai.insert(
-            "primary".to_string(),
-            provider_entry_with_fallback(&["openai.ghost"]),
-        );
-
-        let warnings = config.collect_warnings();
-        assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0].code, "dangling_fallback_ref");
-        assert_eq!(
-            warnings[0].path,
-            "providers.models.openai.primary.fallback[0]"
-        );
-    }
-
-    #[test]
-    async fn fallback_no_warning_when_ref_resolves() {
-        let mut config = Config::default();
-        suppress_semantic_memory_warning(&mut config);
-        config.providers.models.openai.insert(
-            "primary".to_string(),
-            provider_entry_with_fallback(&["openai.backup"]),
-        );
-        config
-            .providers
-            .models
-            .openai
-            .insert("backup".to_string(), provider_entry_with_fallback(&[]));
-
-        assert!(config.collect_warnings().is_empty());
-    }
-
-    #[test]
-    async fn fallback_warns_on_two_node_cycle() {
-        let mut config = Config::default();
-        suppress_semantic_memory_warning(&mut config);
-        config
-            .providers
-            .models
-            .openai
-            .insert("a".to_string(), provider_entry_with_fallback(&["openai.b"]));
-        config
-            .providers
-            .models
-            .openai
-            .insert("b".to_string(), provider_entry_with_fallback(&["openai.a"]));
-
-        let cycle_warnings: Vec<_> = config
-            .collect_warnings()
-            .into_iter()
-            .filter(|w| w.code == "fallback_cycle")
-            .collect();
-        assert!(
-            !cycle_warnings.is_empty(),
-            "a->b->a must surface at least one fallback_cycle warning"
-        );
-    }
-
-    #[test]
-    async fn fallback_self_reference_is_a_cycle() {
-        let mut config = Config::default();
-        suppress_semantic_memory_warning(&mut config);
-        config.providers.models.openai.insert(
-            "loop".to_string(),
-            provider_entry_with_fallback(&["openai.loop"]),
-        );
-
-        let warnings = config.collect_warnings();
-        assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0].code, "fallback_cycle");
-    }
-
-    #[test]
-    async fn fallback_empty_ref_is_skipped() {
-        let mut config = Config::default();
-        suppress_semantic_memory_warning(&mut config);
-        config
-            .providers
-            .models
-            .openai
-            .insert("primary".to_string(), provider_entry_with_fallback(&[""]));
-
-        assert!(config.collect_warnings().is_empty());
-    }
-
-    #[test]
-    async fn fallback_warns_when_chain_exceeds_max_depth() {
-        let mut config = Config::default();
-        suppress_semantic_memory_warning(&mut config);
-        let n = crate::providers::MAX_FALLBACK_DEPTH + 2;
-        for i in 0..n {
-            let next = if i + 1 < n {
-                vec![format!("openai.a{}", i + 1)]
-            } else {
-                vec![]
-            };
-            let refs: Vec<&str> = next.iter().map(String::as_str).collect();
-            config
-                .providers
-                .models
-                .openai
-                .insert(format!("a{i}"), provider_entry_with_fallback(&refs));
-        }
-
-        let depth_warnings: Vec<_> = config
-            .collect_warnings()
-            .into_iter()
-            .filter(|w| w.code == "max_fallback_depth_exceeded")
-            .collect();
-        assert!(
-            !depth_warnings.is_empty(),
-            "a chain deeper than MAX_FALLBACK_DEPTH must surface a max_fallback_depth_exceeded warning"
-        );
-    }
-
-    #[test]
-    async fn fallback_models_warns_on_empty_entry() {
-        let mut config = Config::default();
-        suppress_semantic_memory_warning(&mut config);
-        let mut entry = provider_entry_with_fallback(&[]);
-        entry.base.fallback_models = vec!["".to_string()];
-        config
-            .providers
-            .models
-            .openai
-            .insert("primary".to_string(), entry);
-
-        let warnings = config.collect_warnings();
-        assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0].code, "empty_fallback_model");
-    }
-
-    #[test]
-    async fn fallback_models_warns_on_duplicate_of_primary() {
-        let mut config = Config::default();
-        suppress_semantic_memory_warning(&mut config);
-        let mut entry = provider_entry_with_fallback(&[]);
-        entry.base.fallback_models = vec!["gpt-4o".to_string()];
-        config
-            .providers
-            .models
-            .openai
-            .insert("primary".to_string(), entry);
-
-        let warnings = config.collect_warnings();
-        assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0].code, "fallback_model_duplicates_primary");
-    }
-
-    #[test]
-    async fn fallback_models_distinct_entries_do_not_warn() {
-        let mut config = Config::default();
-        suppress_semantic_memory_warning(&mut config);
-        let mut entry = provider_entry_with_fallback(&[]);
-        entry.base.fallback_models = vec!["gpt-4o-mini".to_string()];
-        config
-            .providers
-            .models
-            .openai
-            .insert("primary".to_string(), entry);
-
-        assert!(config.collect_warnings().is_empty());
-    }
-
     #[test]
     async fn empty_server_fallback_model_warns() {
         let mut config = Config::default();
@@ -54259,6 +55280,493 @@ model_provider = \"ollama.default\"
         assert!(agent.is_dispatchable());
     }
 
+    #[::core::prelude::v1::test]
+    fn dotted_profile_validation_keeps_the_configured_alias() {
+        let mut config = Config::default();
+        config
+            .risk_profiles
+            .insert("default".into(), RiskProfileConfig::default());
+        config
+            .providers
+            .models
+            .ensure("openai", "edge")
+            .unwrap()
+            .model = Some("prefix-model".into());
+        config
+            .providers
+            .models
+            .ensure("openai", "edge.v2")
+            .unwrap()
+            .model = Some("dotted-model".into());
+        config.agents.insert(
+            "worker".into(),
+            AliasedAgentConfig {
+                model_provider: "openai.edge.v2".into(),
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        config.validate().unwrap();
+        assert_eq!(
+            config.providers.models.profile_ref("openai.edge.v2"),
+            Some(("openai", "edge.v2"))
+        );
+        assert_eq!(
+            config
+                .resolve_model_selection("openai.edge.v2")
+                .unwrap()
+                .model_id
+                .as_deref(),
+            Some("dotted-model")
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn resolve_model_selection_covers_all_paths() {
+        let raw = r#"
+schema_version = 4
+
+[providers.models.openai.gw]
+uri = "https://gw.internal/v1"
+model = "legacy-id"
+
+[providers.models.openai.gw.models.fast]
+id = "gpt-4o-mini"
+temperature = 0.3
+
+[providers.models.openai.gw.models.big]
+id = "gpt-4o"
+
+[providers.models.anthropic.solo]
+uri = "https://api.anthropic.com"
+
+[providers.models.anthropic.solo.models.only]
+id = "claude-sonnet-4-5"
+
+[providers.models.groq.legacy]
+model = "llama-3.3-70b"
+"#;
+        let mut config: Config = toml::from_str(raw).unwrap();
+
+        // Existing provider aliases may contain dots. An exact configured
+        // alias takes precedence over interpreting its suffix as a nested
+        // model selector.
+        let dotted = config
+            .providers
+            .models
+            .ensure("openrouter", "glm-5.2")
+            .expect("known provider family");
+        dotted.model = Some("glm-5.2".to_string());
+        dotted.context_window = Some(1_000_000);
+        let sel = config
+            .resolve_model_selection("openrouter.glm-5.2")
+            .expect("exact dotted alias resolves");
+        assert_eq!(sel.alias, "glm-5.2");
+        assert_eq!(sel.model_alias, None);
+        assert_eq!(sel.model_id.as_deref(), Some("glm-5.2"));
+
+        // Three-segment: selects the named entry and its id.
+        let sel = config.resolve_model_selection("openai.gw.fast").unwrap();
+        assert_eq!(sel.model_id.as_deref(), Some("gpt-4o-mini"));
+        assert_eq!(sel.model_alias.as_deref(), Some("fast"));
+        assert_eq!(sel.model_entry.and_then(|e| e.temperature), Some(0.3));
+
+        // Three-segment, unknown model alias → None.
+        assert!(config.resolve_model_selection("openai.gw.nope").is_none());
+
+        // Two-segment with multiple entries and no `default` → legacy `model`.
+        let sel = config.resolve_model_selection("openai.gw").unwrap();
+        assert_eq!(sel.model_id.as_deref(), Some("legacy-id"));
+        assert!(sel.model_entry.is_none());
+
+        // Two-segment with a sole entry → that entry.
+        let sel = config.resolve_model_selection("anthropic.solo").unwrap();
+        assert_eq!(sel.model_id.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(sel.model_alias.as_deref(), Some("only"));
+
+        // Two-segment legacy profile, no models subtable → entry `model`.
+        let sel = config.resolve_model_selection("groq.legacy").unwrap();
+        assert_eq!(sel.model_id.as_deref(), Some("llama-3.3-70b"));
+        assert!(sel.model_entry.is_none());
+
+        // Unparseable / missing profile → None.
+        assert!(config.resolve_model_selection("openai").is_none());
+        assert!(config.resolve_model_selection("openai.absent").is_none());
+    }
+
+    #[::core::prelude::v1::test]
+    fn model_identity_distinguishes_real_and_equivalent_switches() {
+        let raw = r#"
+schema_version = 4
+
+[providers.models.openai.gw]
+uri = "https://gw.internal/v1"
+
+[providers.models.openai.gw.models.default]
+id = "gpt-4o-mini"
+
+[providers.models.openai.gw.models.cheap]
+id = "gpt-4o-mini"
+
+[providers.models.openai.gw.models.big]
+id = "gpt-4o"
+"#;
+        let config: Config = toml::from_str(raw).unwrap();
+
+        // A two-segment ref naming the profile's default entry and the
+        // three-segment ref naming it explicitly are the same model: a
+        // switch between them must be a no-op, not a rebuild.
+        let two = config.resolve_model_selection("openai.gw").unwrap();
+        let three = config.resolve_model_selection("openai.gw.default").unwrap();
+        assert_eq!(two.identity(None), three.identity(None));
+
+        // Two entries that happen to share a model id are different models:
+        // the entry name is part of the identity, so switching between them
+        // rebuilds (their tuning overlays may differ).
+        let cheap = config.resolve_model_selection("openai.gw.cheap").unwrap();
+        assert_ne!(three.identity(None), cheap.identity(None));
+
+        // An explicit model override replaces the resolved id.
+        let overridden = three.identity(Some("custom-id"));
+        assert_eq!(overridden.model_id, "custom-id");
+        assert_ne!(overridden, three.identity(None));
+    }
+
+    #[::core::prelude::v1::test]
+    fn configured_model_entries_enumerates_nested_and_legacy_profiles() {
+        let raw = r#"
+schema_version = 4
+
+[providers.models.openai.gw]
+uri = "https://gw.internal/v1"
+model = "legacy-fallback"
+
+[providers.models.openai.gw.models.cheap]
+id = "gpt-4o-mini"
+
+[providers.models.openai.gw.models.big]
+id = "gpt-4o"
+
+[providers.models.groq.legacy]
+model = "llama-3.3-70b"
+"#;
+        let config: Config = toml::from_str(raw).unwrap();
+
+        // Nested profile: one entry per alias (sorted), each with its
+        // resolved id; the profile's legacy `model` is only a fallback.
+        // Legacy profile: one entry with the profile-level model.
+        let all = config.configured_model_entries(None);
+        let refs: Vec<&str> = all.iter().map(|e| e.provider_ref.as_str()).collect();
+        assert_eq!(
+            refs,
+            vec!["openai.gw.big", "openai.gw.cheap", "groq.legacy"]
+        );
+        let cheap = &all[1];
+        assert_eq!(cheap.profile_ref, "openai.gw");
+        assert_eq!(cheap.model_alias.as_deref(), Some("cheap"));
+        assert_eq!(cheap.model_id.as_deref(), Some("gpt-4o-mini"));
+        let legacy = &all[2];
+        assert_eq!(legacy.model_alias, None);
+        assert_eq!(legacy.model_id.as_deref(), Some("llama-3.3-70b"));
+
+        // An entry without an id falls back to the profile-level model.
+        let raw_no_id = r#"
+schema_version = 4
+
+[providers.models.openai.gw]
+model = "legacy-fallback"
+
+[providers.models.openai.gw.models.bare]
+temperature = 0.3
+"#;
+        let config: Config = toml::from_str(raw_no_id).unwrap();
+        let all = config.configured_model_entries(None);
+        assert_eq!(
+            all[0].model_id.as_deref(),
+            Some("legacy-fallback"),
+            "an id-less entry inherits the profile-level model"
+        );
+
+        // The filter narrows by full ref or bare family, matching the doctor
+        // commands.
+        let config: Config = toml::from_str(raw).unwrap();
+        assert_eq!(config.configured_model_entries(Some("openai.gw")).len(), 2);
+        let selected = config.configured_model_entries(Some("openai.gw.cheap"));
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].provider_ref, "openai.gw.cheap");
+        assert_eq!(config.configured_model_entries(Some("groq")).len(), 1);
+        assert!(
+            config
+                .configured_model_entries(Some("anthropic.missing"))
+                .is_empty()
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn validate_accepts_and_rejects_three_segment_agent_refs() {
+        let base = r#"
+schema_version = 4
+
+[providers.models.openai.gw]
+api_key = "sk-x"
+
+[providers.models.openai.gw.models.fast]
+id = "gpt-4o-mini"
+
+[risk_profiles.default]
+level = "supervised"
+
+[runtime_profiles.default]
+"#;
+        // Valid three-segment ref resolves and validates.
+        let ok = format!(
+            "{base}\n[agents.a]\nmodel_provider = \"openai.gw.fast\"\nrisk_profile = \"default\"\nruntime_profile = \"default\"\n"
+        );
+        let cfg: Config = toml::from_str(&ok).unwrap();
+        assert!(
+            cfg.validate().is_ok(),
+            "three-segment ref to a configured model entry must validate: {:?}",
+            cfg.validate().err()
+        );
+
+        // Dangling model alias → validation error.
+        let bad = format!(
+            "{base}\n[agents.a]\nmodel_provider = \"openai.gw.nope\"\nrisk_profile = \"default\"\nruntime_profile = \"default\"\n"
+        );
+        let cfg: Config = toml::from_str(&bad).unwrap();
+        let err = cfg
+            .validate()
+            .expect_err("dangling model alias must fail validation")
+            .to_string();
+        assert!(
+            err.contains("models.nope"),
+            "error should name the missing model entry, got: {err}"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn validate_accepts_three_segment_classifier_and_summary_refs() {
+        // classifier_provider / summary_provider (agent + profile) point into
+        // providers.models and must accept a three-segment `<type>.<alias>.<model>`
+        // ref, validating the named model entry — same as model_provider.
+        let base = r#"
+schema_version = 4
+
+[providers.models.openai.gw]
+api_key = "sk-x"
+
+[providers.models.openai.gw.models.fast]
+id = "gpt-4o-mini"
+
+[risk_profiles.default]
+level = "supervised"
+
+[runtime_profiles.default]
+"#;
+        let ok = format!(
+            "{base}\n[agents.a]\nmodel_provider = \"openai.gw.fast\"\nclassifier_provider = \"openai.gw.fast\"\nsummary_provider = \"openai.gw.fast\"\nrisk_profile = \"default\"\nruntime_profile = \"default\"\n"
+        );
+        let cfg: Config = toml::from_str(&ok).unwrap();
+        assert!(
+            cfg.validate().is_ok(),
+            "three-segment classifier/summary refs must validate: {:?}",
+            cfg.validate().err()
+        );
+
+        // Profile-level context_compression.summary_provider, three-segment.
+        let ok_profile = format!(
+            "{base}\ncontext_compression.summary_provider = \"openai.gw.fast\"\n[agents.a]\nmodel_provider = \"openai.gw.fast\"\nrisk_profile = \"default\"\nruntime_profile = \"default\"\n"
+        );
+        let cfg: Config = toml::from_str(&ok_profile).unwrap();
+        assert!(
+            cfg.validate().is_ok(),
+            "three-segment profile summary_provider must validate: {:?}",
+            cfg.validate().err()
+        );
+
+        // Dangling model alias in a three-segment classifier ref → error.
+        let bad = format!(
+            "{base}\n[agents.a]\nmodel_provider = \"openai.gw.fast\"\nclassifier_provider = \"openai.gw.nope\"\nrisk_profile = \"default\"\nruntime_profile = \"default\"\n"
+        );
+        let cfg: Config = toml::from_str(&bad).unwrap();
+        let err = cfg
+            .validate()
+            .expect_err("dangling classifier model alias must fail")
+            .to_string();
+        assert!(
+            err.contains("models.nope"),
+            "error should name the missing model entry, got: {err}"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn validate_route_provider_ref_segment_contracts() {
+        // Model routes select nested models through a three-segment ref.
+        let base = r#"
+schema_version = 4
+
+[providers.models.openai.gw]
+api_key = "sk-x"
+
+[providers.models.openai.gw.models.fast]
+id = "gpt-4o-mini"
+
+[providers.models.openai.gw.models.embed]
+id = "text-embedding-3-small"
+
+[risk_profiles.default]
+level = "supervised"
+
+[runtime_profiles.default]
+
+[[model_routes]]
+hint = "deep"
+model_provider = "openai.gw.fast"
+model = "gpt-4o-mini"
+
+[agents.a]
+model_provider = "openai.gw.fast"
+risk_profile = "default"
+runtime_profile = "default"
+"#;
+        let cfg: Config = toml::from_str(base).unwrap();
+        assert!(
+            cfg.validate().is_ok(),
+            "three-segment model route refs must validate: {:?}",
+            cfg.validate().err()
+        );
+
+        // Dangling model alias in a route → error naming the missing entry.
+        let bad = base.replace(
+            "\"openai.gw.fast\"\nmodel = \"gpt-4o-mini\"",
+            "\"openai.gw.nope\"\nmodel = \"gpt-4o-mini\"",
+        );
+        let cfg: Config = toml::from_str(&bad).unwrap();
+        let err = cfg
+            .validate()
+            .expect_err("dangling route model alias must fail")
+            .to_string();
+        assert!(
+            err.contains("models.nope"),
+            "error should name the missing model entry, got: {err}"
+        );
+
+        // Embedding routes keep the model id in their separate `model` field,
+        // so a two-segment provider profile ref is the supported form.
+        let two_segment_embedding = format!(
+            "{base}\n[[embedding_routes]]\nhint = \"sem\"\nmodel_provider = \"openai.gw\"\nmodel = \"text-embedding-3-small\"\n"
+        );
+        let cfg: Config = toml::from_str(&two_segment_embedding).unwrap();
+        assert!(
+            cfg.validate().is_ok(),
+            "two-segment embedding route refs must validate: {:?}",
+            cfg.validate().err()
+        );
+
+        let three_segment_embedding = two_segment_embedding.replace(
+            "model_provider = \"openai.gw\"",
+            "model_provider = \"openai.gw.embed\"",
+        );
+        let cfg: Config = toml::from_str(&three_segment_embedding).unwrap();
+        let err = cfg
+            .validate()
+            .expect_err("embedding routes must reject ignored nested model selectors")
+            .to_string();
+        assert!(
+            err.contains("embedding_routes[0].model_provider")
+                && err.contains("two-segment `<type>.<alias>`"),
+            "error should explain the embedding route segment contract, got: {err}"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn models_subtable_map_key_crud_reaches_third_level() {
+        // The nested `models` subtable
+        // (`providers.models.<type>.<alias>.models.<model_alias>`) must be
+        // fully manageable through the generic map-key machinery the web
+        // UI / RPC use — list, create, rename, delete — not just readable
+        // via get_prop on already-present entries.
+        let raw = r#"
+schema_version = 4
+[providers.models.openai.gw]
+model = "legacy"
+[providers.models.openai.gw.models.fast]
+id = "gpt-4o-mini"
+"#;
+        let mut cfg: Config = toml::from_str(raw).unwrap();
+        let sub = "providers.models.openai.gw.models";
+
+        // list existing sub-entries
+        assert_eq!(
+            cfg.get_map_keys(sub),
+            Some(vec!["fast".to_string()]),
+            "get_map_keys must list the subtable entry"
+        );
+
+        // create a new sub-entry, then set + read a field on it
+        assert_eq!(
+            cfg.create_map_key(sub, "cheap"),
+            Ok(true),
+            "create_map_key must add a subtable entry"
+        );
+        cfg.set_prop(&format!("{sub}.cheap.id"), "gpt-3-5")
+            .expect("set_prop on a freshly-created subtable entry");
+        assert_eq!(
+            cfg.get_prop(&format!("{sub}.cheap.id")).ok(),
+            Some("gpt-3-5".to_string()),
+            "the created entry's id must round-trip"
+        );
+        let mut keys = cfg.get_map_keys(sub).unwrap();
+        keys.sort();
+        assert_eq!(keys, vec!["cheap".to_string(), "fast".to_string()]);
+
+        // rename
+        assert_eq!(cfg.rename_map_key(sub, "fast", "quick"), Ok(true));
+        let mut keys = cfg.get_map_keys(sub).unwrap();
+        keys.sort();
+        assert_eq!(keys, vec!["cheap".to_string(), "quick".to_string()]);
+
+        // delete
+        assert_eq!(cfg.delete_map_key(sub, "cheap"), Ok(true));
+        assert_eq!(cfg.get_map_keys(sub), Some(vec!["quick".to_string()]));
+
+        // creating a subtable entry validates the alias key (non-resource-key map)
+        assert!(
+            cfg.create_map_key(sub, "Bad Alias").is_err(),
+            "invalid alias key must be rejected"
+        );
+
+        // Regression guard: the alias level itself still lists profiles, and an
+        // unrelated single-level map is unaffected.
+        assert_eq!(
+            cfg.get_map_keys("providers.models.openai"),
+            Some(vec!["gw".to_string()]),
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn models_subtable_empty_lists_and_serializes_clean() {
+        // A profile with no models subtable: get_map_keys returns Some([]) (the
+        // section exists, it's just empty), and serialization emits no empty
+        // `[...models]` table header.
+        let raw = r#"
+schema_version = 4
+[providers.models.openai.gw]
+model = "gpt-4o"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(
+            cfg.get_map_keys("providers.models.openai.gw.models"),
+            Some(vec![]),
+            "empty subtable must list as Some([]), not None"
+        );
+        let out = toml::to_string_pretty(&cfg).unwrap();
+        assert!(
+            !out.contains("gw.models]") && !out.contains(".gw.models\n"),
+            "empty models map must not emit a table header:\n{out}"
+        );
+    }
+
     fn effort_routing_config() -> super::Config {
         let mut config = super::Config::default();
         for alias in ["local", "cloud"] {
@@ -54363,5 +55871,17 @@ model_provider = \"ollama.default\"
         duplicate_route
             .validate()
             .expect("legacy duplicate route hints remain valid");
+    }
+}
+
+impl Config {
+    /// Resolve the canonical provider/model registry for one admission. The
+    /// returned view is rebuilt from the current config and must not be stored
+    /// as a second long-lived configuration snapshot.
+    pub fn provider_registry(
+        &self,
+    ) -> Result<crate::provider_registry::ProviderRegistry, crate::provider_registry::RegistryError>
+    {
+        self.providers.canonical_registry()
     }
 }

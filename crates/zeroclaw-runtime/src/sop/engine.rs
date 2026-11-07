@@ -125,7 +125,7 @@ pub struct SopEngine {
     pending_orphan_settlements: OrphanedRunSettlementQueue,
     /// Decision models by alias, consulted by dispatch for SOPs with a
     /// `[decision]` table. An SOP whose alias is absent resolves fail-closed.
-    decision_models: HashMap<String, Arc<dyn super::decision::DecisionModel>>,
+    decision_models: HashMap<String, Arc<dyn zeroclaw_api::decision::DecisionModel>>,
     /// Store revision of the last record of each held run that this engine
     /// read or wrote. Every write is stamped one past it, so the store's
     /// revision guard refuses a write from a copy another writer (a second
@@ -501,14 +501,17 @@ impl SopEngine {
     /// Register decision models by alias (see [`super::decision`]).
     pub fn with_decision_models(
         mut self,
-        models: HashMap<String, Arc<dyn super::decision::DecisionModel>>,
+        models: HashMap<String, Arc<dyn zeroclaw_api::decision::DecisionModel>>,
     ) -> Self {
         self.decision_models.extend(models);
         self
     }
 
     /// The decision model an SOP selected by `alias`, if configured.
-    pub fn decision_model(&self, alias: &str) -> Option<Arc<dyn super::decision::DecisionModel>> {
+    pub fn decision_model(
+        &self,
+        alias: &str,
+    ) -> Option<Arc<dyn zeroclaw_api::decision::DecisionModel>> {
         self.decision_models.get(alias).cloned()
     }
 

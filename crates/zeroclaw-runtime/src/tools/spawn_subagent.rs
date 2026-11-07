@@ -312,9 +312,6 @@ impl Tool for SpawnSubagentTool {
 
         let run_id = uuid::Uuid::new_v4().to_string();
 
-        let temperature: Option<f64> = config
-            .model_provider_for_agent(&self.parent_alias)
-            .and_then(|e| e.temperature);
         let session_path = std::path::PathBuf::from(format!("subagent-{run_id}"));
 
         let mut run_overrides =
@@ -355,50 +352,17 @@ impl Tool for SpawnSubagentTool {
         // so the child cannot reach a provider or memory store the parent's
         // sources would not have returned.
         let bound = self.capabilities.get().cloned();
-        let config = (*config).clone();
         let run_result = Box::pin(scope!(
             agent_alias: parent_alias,
             session_key: run_id,
             =>
             async {
-                match bound {
-                    Some(bound) => {
-                        crate::agent::run_with_capabilities(
-                            config,
-                            bound.capabilities,
-                            bound.principal,
-                            &self.parent_alias,
-                            Some(prompt),
-                            None,
-                            None,
-                            temperature,
-                            vec![],
-                            false,
-                            Some(session_path),
-                            None,
-                            zeroclaw_api::ingress::TurnOrigin::SubTurn,
-                            run_overrides,
-                        )
-                        .await
-                    }
-                    None => {
-                        crate::agent::run(
-                            config,
-                            &self.parent_alias,
-                            Some(prompt),
-                            None,
-                            None,
-                            temperature,
-                            vec![],
-                            false,
-                            Some(session_path),
-                            None,
-                            zeroclaw_api::ingress::TurnOrigin::SubTurn,
-                            run_overrides,
-                        )
-                        .await
-                    }
-                }
+                let mut request = crate::agent::AgentRunRequest::new(&self.parent_alias);
+                request.message = Some(prompt);
+                request.session_state_file = Some(session_path);
+                request.origin = zeroclaw_api::ingress::TurnOrigin::SubTurn;
+                request.capabilities = bound;
+                crate::agent::run_with_request(config, request, run_overrides).await
             }
         ))
         .await;

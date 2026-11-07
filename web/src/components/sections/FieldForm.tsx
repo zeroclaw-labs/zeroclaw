@@ -70,6 +70,8 @@ import {
   type PatchOp,
 } from "../../lib/api";
 import { useConfigDraft } from "../../lib/draftStore";
+import { entityConfigPath, modelCatalogTarget } from "../../lib/entityLinks";
+import { useModelProfileAliases } from "../../lib/useModelProfileAliases";
 import { fuzzyFilter } from "../../lib/fuzzy";
 import {
   SECRET_MAP_KIND,
@@ -827,12 +829,16 @@ function AgentEmptyAliasFallback({
 function agentAliasJumpPath(
   fieldKind: keyof AgentOptionsResponse,
   alias: string,
+  modelAliases: readonly string[],
 ): string {
   const base = AGENT_ALIAS_SOURCE_PATH[fieldKind];
   // Channels and model_providers use dotted alias (`telegram.default`,
   // `anthropic.work`); split into the two URL segments. Single-tier
   // sections use the alias directly.
-  if (fieldKind === "channels" || fieldKind === "model_providers") {
+  if (fieldKind === "model_providers") {
+    return entityConfigPath('model-provider', alias, modelAliases);
+  }
+  if (fieldKind === "channels") {
     const dot = alias.indexOf(".");
     if (dot > 0) {
       return `${base}/${encodeURIComponent(alias.slice(0, dot))}/${encodeURIComponent(alias.slice(dot + 1))}`;
@@ -1909,16 +1915,18 @@ function FieldRow({
   const [showComment, setShowComment] = useState(comment.length > 0);
   const [providerModels, setProviderModels] = useState<string[] | null>(null);
   const [modelsFetchFailed, setModelsFetchFailed] = useState(false);
-  // Per-alias model field — `providers.models.<type>.<alias>.model`.
-  const isProviderModelField = /^providers\.models\.[^.]+\.[^.]+\.model$/.test(
-    entry.path,
+  // Per-alias model field — the profile-level `providers.models.<type>.<alias>.model`
+  // or a multi-model entry's `providers.models.<type>.<alias>.models.<model_alias>.id`.
+  // Both are provider-local model IDs that get the known-model dropdown.
+  const catalogAliases = useModelProfileAliases(
+    entry.path.startsWith('providers.models.') ? entry.path.slice('providers.models.'.length) : undefined,
   );
-  // The same alias's `fallback_models` array — a list of model IDs from the
-  // same provider catalog, so it gets the same known-model dropdown per row.
-  const isProviderModelArrayField =
-    /^providers\.models\.[^.]+\.[^.]+\.fallback_models$/.test(entry.path);
-  // Either model field needs the provider's catalog fetched.
-  const needsProviderModels = isProviderModelField || isProviderModelArrayField;
+  const catalogTarget = modelCatalogTarget(entry.path, catalogAliases);
+  const isProviderModelField = catalogTarget !== undefined && !catalogTarget.array;
+  // Legacy family/alias model fields still use the provider catalog. Fallbacks
+  // are exact canonical model references under `[providers.fallback]` and do
+  // not use a provider-local model-id array.
+  const needsProviderModels = isProviderModelField;
   // Skill-bundle directory field — `skill-bundles.<alias>.directory` (or
   // the legacy snake form `skill_bundles.<alias>.directory`). When unset
   // the runtime falls back to `<install>/shared/skills/<alias>/`; render
@@ -1995,11 +2003,15 @@ function FieldRow({
   const [agentOptions, setAgentOptions] = useState<AgentOptionsResponse | null>(
     null,
   );
+  const modelProfileAliases = useModelProfileAliases(
+    agentSingleAliasKind === 'model_providers' ? value : undefined,
+  );
 
   useEffect(() => {
     if (!needsProviderModels) return;
     void primeModelProviderCatalog();
-    const [, , provider, alias] = entry.path.split('.');
+    const provider = catalogTarget?.family;
+    const alias = catalogTarget?.alias;
     if (!provider || !alias) return;
     const cacheKey = `${provider}.${alias}`;
     const cached = modelsCache[cacheKey];
@@ -2023,7 +2035,7 @@ function FieldRow({
         setProviderModels([]);
         setModelsFetchFailed(true);
       });
-  }, [needsProviderModels, entry.path]);
+  }, [needsProviderModels, entry.path, catalogTarget?.family, catalogTarget?.alias]);
 
   // Refetch on every mount so newly-created channels / agents / bundles
   // (added in a different section) surface without a page reload.
@@ -2301,7 +2313,7 @@ function FieldRow({
               </select>
               {value && (
                 <Link
-                  to={agentAliasJumpPath(agentSingleAliasKind, value)}
+                  to={agentAliasJumpPath(agentSingleAliasKind, value, modelProfileAliases)}
                   title={`${t("fieldform.edit_in_source_prefix")}${value}${t("fieldform.edit_in_source_suffix")}`}
                   className="btn-icon flex-shrink-0"
                 >
@@ -2335,16 +2347,6 @@ function FieldRow({
             agent={toolAgent}
             value={parseArrayRows(value)}
             onChange={(next) => onChange(JSON.stringify(next))}
-          />
-        ) : isProviderModelArrayField ? (
-          // Fallback models: same array editor, but each row gets the known-
-          // model dropdown (falls back to free text while the catalog loads).
-          <ArrayFieldEditor
-            inputId={entry.path}
-            value={value}
-            onChange={onChange}
-            isOptional={isOptionalArray(entry.type_hint)}
-            suggestions={providerModels ?? undefined}
           />
         ) : renderer === "array" ? (
           <ArrayFieldEditor

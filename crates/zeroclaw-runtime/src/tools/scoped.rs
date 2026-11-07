@@ -2460,6 +2460,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         built.tools.retain(|tool| tool.name() == "memory_export");
@@ -2714,6 +2715,7 @@ mod tests {
             &config,
             None,
             false,
+            None,
             None,
             None,
             None,

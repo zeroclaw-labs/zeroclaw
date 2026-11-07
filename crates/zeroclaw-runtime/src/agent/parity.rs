@@ -154,7 +154,7 @@ async fn parity_l1_engine_honors_excluded_tools() {
                 provider_name: "mock",
                 model: "mock-model",
                 dispatch_model: "mock-model",
-                temperature: None,
+                temperature: None.into(),
             },
             ResolvedIo {
                 tools_registry: &tools_registry,
@@ -174,7 +174,7 @@ async fn parity_l1_engine_honors_excluded_tools() {
                 excluded_tools: &excluded,
                 dedup_exempt_tools: &[],
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 30_000,
                 keep_tool_context_turns: 2,

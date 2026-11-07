@@ -1,48 +1,12 @@
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EmbeddingIdentity {
-    pub provider: String,
-    pub model: String,
-    pub dimensions: usize,
-}
+use zeroclaw_api::embedding::EmbeddingProvider;
+use zeroclaw_config::provider_registry::ResolvedEmbedding;
 
-impl std::fmt::Display for EmbeddingIdentity {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}/{} ({} dims)",
-            self.provider, self.model, self.dimensions
-        )
-    }
-}
+use crate::transport::HttpTransportConfig;
 
-/// Trait for embedding model_providers — convert text to vectors
-#[async_trait]
-pub trait EmbeddingProvider: Send + Sync {
-    /// ModelProvider name
-    fn name(&self) -> &str;
-
-    /// Embedding dimensions
-    fn dimensions(&self) -> usize;
-
-    /// Embed a batch of texts into vectors
-    async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>>;
-
-    /// Embed a single text
-    async fn embed_one(&self, text: &str) -> anyhow::Result<Vec<f32>> {
-        let mut results = self.embed(&[text]).await?;
-        results.pop().ok_or_else(|| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                "embed_one: provider returned no embedding"
-            );
-            anyhow::Error::msg("Empty embedding result")
-        })
-    }
-}
+const EMBEDDING_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 // ── Noop model_provider (keyword-only fallback) ────────────────────
 
@@ -66,64 +30,64 @@ impl EmbeddingProvider for NoopEmbedding {
 // ── OpenAI-compatible embedding model_provider ─────────────────────
 
 pub struct OpenAiEmbedding {
-    base_url: String,
-    api_key: String,
+    transport: HttpTransportConfig,
+    provider_name: String,
     model: String,
     dims: usize,
 }
 
 impl OpenAiEmbedding {
+    /// Legacy constructor for the old `[memory]` embedding settings.
     pub fn new(base_url: &str, api_key: &str, model: &str, dims: usize) -> Self {
         Self {
-            base_url: base_url.trim_end_matches('/').to_string(),
-            api_key: api_key.to_string(),
+            transport: HttpTransportConfig::with_base_url(
+                base_url.trim_end_matches('/'),
+                Some(api_key.to_string()),
+            ),
+            provider_name: "openai".to_owned(),
             model: model.to_string(),
             dims,
         }
     }
 
-    fn http_client(&self) -> reqwest::Client {
-        zeroclaw_config::schema::build_runtime_proxy_client("memory.embeddings")
-    }
-
-    fn has_explicit_api_path(&self) -> bool {
-        let Ok(url) = reqwest::Url::parse(&self.base_url) else {
-            return false;
-        };
-
-        let path = url.path().trim_end_matches('/');
-        !path.is_empty() && path != "/"
-    }
-
-    fn has_embeddings_endpoint(&self) -> bool {
-        let Ok(url) = reqwest::Url::parse(&self.base_url) else {
-            return false;
-        };
-
-        url.path().trim_end_matches('/').ends_with("/embeddings")
-    }
-
-    fn embeddings_url(&self) -> String {
-        if self.has_embeddings_endpoint() {
-            return self.base_url.clone();
+    fn from_config(config: EmbeddingProviderConfig) -> Self {
+        Self {
+            transport: config.transport,
+            provider_name: config.provider_name,
+            model: config.model,
+            dims: config.dimensions,
         }
+    }
 
-        if self.has_explicit_api_path() {
-            format!("{}/embeddings", self.base_url)
-        } else {
-            format!("{}/v1/embeddings", self.base_url)
-        }
+    fn embeddings_url(&self) -> anyhow::Result<String> {
+        self.transport.endpoint("embeddings")
     }
 }
 
 #[async_trait]
 impl EmbeddingProvider for OpenAiEmbedding {
     fn name(&self) -> &str {
-        "openai"
+        &self.provider_name
     }
 
     fn dimensions(&self) -> usize {
         self.dims
+    }
+
+    fn identity(&self) -> zeroclaw_api::embedding::EmbeddingIdentity {
+        let mut digest = Sha256::new();
+        digest.update(self.transport.base_url.as_bytes());
+        for (name, value) in &self.transport.extra_headers {
+            digest.update((name.len() as u64).to_le_bytes());
+            digest.update(name.as_bytes());
+            digest.update((value.len() as u64).to_le_bytes());
+            digest.update(value.as_bytes());
+        }
+        zeroclaw_api::embedding::EmbeddingIdentity {
+            provider: format!("{}:{:x}", self.provider_name, digest.finalize()),
+            model: self.model.clone(),
+            dimensions: self.dims,
+        }
     }
 
     async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
@@ -131,63 +95,67 @@ impl EmbeddingProvider for OpenAiEmbedding {
             return Ok(Vec::new());
         }
 
-        let body = serde_json::json!({
-            "model": self.model,
-            "input": texts,
-        });
+        let body = crate::protocols::openai::embedding::EmbeddingRequest {
+            model: &self.model,
+            input: texts,
+        };
 
+        let client = self
+            .transport
+            .client(EMBEDDING_HTTP_TIMEOUT, "memory.embeddings")?;
         let resp = self
-            .http_client()
-            .post(self.embeddings_url())
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .transport
+            .bearer(client.post(self.embeddings_url()?))
             .header("Content-Type", "application/json")
             .json(&body)
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Embedding API error {status}: {text}");
-        }
-
-        let json: serde_json::Value = resp.json().await?;
-        let data = json.get("data").and_then(|d| d.as_array()).ok_or_else(|| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                "embedding response missing 'data' field"
-            );
-            anyhow::Error::msg("Invalid embedding response: missing 'data'")
-        })?;
-
-        let mut embeddings = Vec::with_capacity(data.len());
-        for item in data {
-            let embedding = item
-                .get("embedding")
-                .and_then(|e| e.as_array())
-                .ok_or_else(|| {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                        "embedding response item missing 'embedding' array"
-                    );
-                    anyhow::Error::msg("Invalid embedding item")
-                })?;
-
-            #[allow(clippy::cast_possible_truncation)]
-            let vec: Vec<f32> = embedding
-                .iter()
-                .filter_map(|v| v.as_f64().map(|f| f as f32))
-                .collect();
-
-            embeddings.push(vec);
-        }
-
-        Ok(embeddings)
+        crate::protocols::openai::embedding::vectors(resp, texts.len(), self.dims).await
     }
+}
+
+/// Fully resolved construction input for the shared OpenAI embeddings wire.
+#[derive(Clone)]
+pub struct EmbeddingProviderConfig {
+    pub(crate) transport: HttpTransportConfig,
+    pub(crate) provider_name: String,
+    pub(crate) model: String,
+    pub(crate) dimensions: usize,
+}
+
+impl EmbeddingProviderConfig {
+    pub fn from_resolved(
+        resolved: &ResolvedEmbedding<'_>,
+        fallback_dimensions: usize,
+        api_key_override: Option<String>,
+    ) -> anyhow::Result<Self> {
+        let model = resolved.model.trim();
+        if model.is_empty() {
+            anyhow::bail!("embedding model name must not be empty");
+        }
+        let dimensions = resolved.dimensions.unwrap_or(fallback_dimensions);
+        if dimensions == 0 {
+            anyhow::bail!("embedding dimensions must be greater than zero");
+        }
+        Ok(Self {
+            transport: {
+                let mut transport =
+                    HttpTransportConfig::from_connection(resolved.selection.connection, None)?;
+                if api_key_override.is_some() {
+                    transport.api_key = api_key_override;
+                }
+                transport
+            },
+            provider_name: resolved.selection.connection.kind().to_owned(),
+            model: model.to_owned(),
+            dimensions,
+        })
+    }
+}
+
+pub fn build_embedding_provider(config: EmbeddingProviderConfig) -> Box<dyn EmbeddingProvider> {
+    Box::new(OpenAiEmbedding::from_config(config))
 }
 
 // ── Factory ──────────────────────────────────────────────────
@@ -329,7 +297,7 @@ mod tests {
     #[test]
     fn openai_trailing_slash_stripped() {
         let p = OpenAiEmbedding::new("https://api.openai.com/", "key", "model", 1536);
-        assert_eq!(p.base_url, "https://api.openai.com");
+        assert_eq!(p.transport.base_url, "https://api.openai.com");
     }
 
     #[test]
@@ -347,7 +315,7 @@ mod tests {
             1536,
         );
         assert_eq!(
-            p.embeddings_url(),
+            p.embeddings_url().unwrap(),
             "https://openrouter.ai/api/v1/embeddings"
         );
     }
@@ -355,13 +323,19 @@ mod tests {
     #[test]
     fn embeddings_url_standard_openai() {
         let p = OpenAiEmbedding::new("https://api.openai.com", "key", "model", 1536);
-        assert_eq!(p.embeddings_url(), "https://api.openai.com/v1/embeddings");
+        assert_eq!(
+            p.embeddings_url().unwrap(),
+            "https://api.openai.com/v1/embeddings"
+        );
     }
 
     #[test]
     fn embeddings_url_base_with_v1_no_duplicate() {
         let p = OpenAiEmbedding::new("https://api.example.com/v1", "key", "model", 1536);
-        assert_eq!(p.embeddings_url(), "https://api.example.com/v1/embeddings");
+        assert_eq!(
+            p.embeddings_url().unwrap(),
+            "https://api.example.com/v1/embeddings"
+        );
     }
 
     #[test]
@@ -373,7 +347,7 @@ mod tests {
             1536,
         );
         assert_eq!(
-            p.embeddings_url(),
+            p.embeddings_url().unwrap(),
             "https://api.example.com/api/coding/v3/embeddings"
         );
     }
@@ -387,7 +361,7 @@ mod tests {
             1536,
         );
         assert_eq!(
-            p.embeddings_url(),
+            p.embeddings_url().unwrap(),
             "https://my-api.example.com/api/v2/embeddings"
         );
     }
