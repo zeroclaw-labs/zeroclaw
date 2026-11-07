@@ -623,7 +623,9 @@ Turning it on needs:
   `[relay.dashboard]`, which is relay-terminated: see
   [secure transport, 3e](../zerocode/secure-transport.md)). Sign-in is
   refused over plain HTTP unless the browser runs on the gateway's own
-  machine.
+  machine. A relay-served dashboard offers sign-in alone: the relay would
+  see a pairing code or token, so pairing and paired tokens are refused
+  there.
 - Behind a reverse proxy, the browser's `Host` passed through unchanged
   (for example `proxy_set_header Host $host;` in nginx). The callback URI
   and the dashboard's own origin are both taken from it, so a proxy that

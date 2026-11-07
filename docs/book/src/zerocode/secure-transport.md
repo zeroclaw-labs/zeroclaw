@@ -567,13 +567,15 @@ A relay can serve a daemon's web dashboard at a host of its own,
 and no port opened on the daemon's side. People then sign in to the
 dashboard as themselves (dashboard sign-in, see
 [Authentication](../security/authentication.md)), each with their own grants.
+Sign-in is the only way in: pairing and paired tokens are refused through the
+relay (see below).
 
 **This route is not end-to-end.** The relay ends the browser's TLS, with
 its operator's wildcard certificate, and forwards the dashboard's HTTP to
 the daemon over the daemon's own relay link. Anyone who can modify the
 relay can read and change that traffic for everyone who uses the address:
-pages, session cookies, CSRF tokens, any token a page shows (such as the
-enrollment token page), and so act as a signed-in user for that session.
+pages, session cookies and CSRF tokens, and so act as a signed-in user for
+that session.
 Both ends say so at startup, and the dashboard's sign-in screen shows a
 notice while it is reached this way. **`zerocode` and other native clients
 through the same relay stay end-to-end**, and a direct HTTPS connection to the
@@ -597,6 +599,16 @@ What the relay does not get, even so:
   other "on this machine" rule treat it as remote. Forwarded headers
   (`X-Forwarded-*`, `X-Real-IP`, `Forwarded`) are dropped from these requests
   whatever `trust_forwarded_headers` says.
+- **A pairing code or a paired token.** The relay sees everything a browser
+  sends through it. A pairing code it saw could be redeemed first for a
+  lasting operator token, and a token sent through it could be kept and used
+  after the browser leaves. So on these connections the gateway refuses
+  pairing (`POST /pair`, `POST /api/pair`, and minting a code) before it reads
+  the code or counts the attempt, and refuses any request that presents a
+  token: in `Authorization`, in a `bearer.` WebSocket subprotocol, or in a
+  `token` query parameter. OIDC enrollment (`/oidc/login/{alias}` and the
+  device grant) is refused too, because it hands the browser an access token.
+  Pair or enroll on a direct connection to the gateway instead.
 - **More than the signed-in user may do.** Authorization stays at the
   gateway.
 - **Another daemon's dashboard.** Each dashboard is its own origin. The
@@ -684,6 +696,8 @@ The daemon refuses `[relay.dashboard]`:
 - without `[relay]` enabled;
 - with `gateway.require_pairing = false`, which would leave the dashboard
   open to anyone who reaches the address;
+- without `[gateway.dashboard_sign_in]` offering at least one provider,
+  because sign-in is the only way in through the relay;
 - with a `gateway.path_prefix`, because the dashboard is served at the root of
   its own host so its cookies can use the `__Host-` prefix;
 - with `relay.relay_insecure = true`, because the daemon's link to the relay
