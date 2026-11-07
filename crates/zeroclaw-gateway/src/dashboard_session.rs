@@ -564,15 +564,85 @@ pub enum DashboardCaller {
 
 tokio::task_local! {
     /// The classification of the request being served, for checks that
-    /// see only the request headers (`require_auth`). Set by [`layer`]
-    /// alone, around the rest of the request.
-    static DASHBOARD_CALLER: DashboardCaller;
+    /// see only the request headers (`require_auth`). Authenticated by [`layer`];
+    /// upgrades and spawned turns carry a non-owning policy reference instead.
+    static DASHBOARD_CALLER: (DashboardCaller, Arc<DashboardAuth>);
+    static HISTORY_ADMISSION: HistoryAdmission;
 }
 
 /// The current request's classification, when it carried a session cookie
 /// and sign-in is on.
 pub(crate) fn current_caller() -> Option<DashboardCaller> {
-    DASHBOARD_CALLER.try_with(Clone::clone).ok()
+    DASHBOARD_CALLER.try_with(|(caller, _)| caller.clone()).ok()
+}
+
+/// An in-process key into the existing browser-session authority. It retains
+/// neither credentials, request-time grants nor the session watch's lifetime.
+#[derive(Clone)]
+pub(crate) struct HistoryAdmission {
+    key: [u8; 32],
+    auth: Weak<DashboardAuth>,
+}
+
+impl HistoryAdmission {
+    pub(crate) fn current(&self, config: &zeroclaw_config::schema::Config) -> anyhow::Result<()> {
+        let auth = self
+            .auth
+            .upgrade()
+            .ok_or_else(|| anyhow::Error::msg("dashboard authentication unavailable"))?;
+        anyhow::ensure!(!auth.is_retired(), "dashboard session ended");
+        let connection = {
+            let sessions = auth.sessions.sessions.lock();
+            let session = sessions
+                .get(&self.key)
+                .ok_or_else(|| anyhow::Error::msg("dashboard session ended"))?;
+            anyhow::ensure!(
+                !session.ended.is_cancelled() && session.expires_at() > now_unix(),
+                "dashboard session ended"
+            );
+            anyhow::ensure!(
+                config.gateway.dashboard_sign_in.offers(&session.alias)
+                    && config
+                        .oidc
+                        .get(&session.alias)
+                        .is_some_and(|entry| ProviderPin::of(entry) == session.provider),
+                "dashboard sign-in provider removed or replaced"
+            );
+            session.auth.clone()
+        };
+        let grants = auth
+            .inbound
+            .current_grants(&connection)
+            .map_err(|denied| anyhow::Error::msg(denied.message))?;
+        anyhow::ensure!(grants.admin, "dashboard administrator access revoked");
+        Ok(())
+    }
+}
+
+pub(crate) fn history_admission() -> Option<HistoryAdmission> {
+    if let Ok(admission) = HISTORY_ADMISSION.try_with(Clone::clone) {
+        return Some(admission);
+    }
+    DASHBOARD_CALLER
+        .try_with(|(caller, auth)| match caller {
+            DashboardCaller::Session(session) => Some(HistoryAdmission {
+                key: session.key,
+                auth: Arc::downgrade(auth),
+            }),
+            DashboardCaller::Rejected(_) => None,
+        })
+        .ok()
+        .flatten()
+}
+
+pub(crate) async fn scope_history<F: std::future::Future>(
+    admission: Option<HistoryAdmission>,
+    future: F,
+) -> F::Output {
+    match admission {
+        Some(admission) => HISTORY_ADMISSION.scope(admission, future).await,
+        None => future.await,
+    }
 }
 
 /// The 403 for a signed-in account that is not an administrator, on a
@@ -1357,6 +1427,13 @@ impl SessionWatch {
         self.session.principal().id.as_str()
     }
 
+    pub(crate) fn history_admission(&self) -> HistoryAdmission {
+        HistoryAdmission {
+            key: self.session.key,
+            auth: Arc::downgrade(&self.auth),
+        }
+    }
+
     /// The ends a stream can see by itself, without waiting for the task
     /// that watches it: the session's own cancellation (sign-out, eviction,
     /// revocation) and its generation's stop. Neither holds anything of the
@@ -1650,7 +1727,9 @@ pub async fn layer(
     // nothing and holds no token, and keeping it lets the browser's other
     // tabs and later requests hear why ("expired") instead of the answer for
     // no credential at all. Sign-out clears it; a new sign-in replaces it.
-    DASHBOARD_CALLER.scope(caller, next.run(request)).await
+    DASHBOARD_CALLER
+        .scope((caller, Arc::clone(&layer.auth)), next.run(request))
+        .await
 }
 
 /// A rejected session's answer as a full response, for routes that answer
@@ -3167,6 +3246,81 @@ mod tests {
             .is_err(),
             "a socket without a session is never closed by it"
         );
+    }
+
+    #[tokio::test]
+    async fn native_history_admission_tracks_sign_out_and_current_admin_grants() {
+        for backend in ["sqlite", "jsonl"] {
+            let server = idp(&["admins"], "gw").await;
+            let mut config = sign_in_config(&server.uri());
+            config.agents.insert("web".into(), Default::default());
+            let pairing = Arc::new(PairingGuard::new(
+                true,
+                &config.gateway.paired_tokens,
+                PairingCodePolicy::default(),
+            ));
+            let rpc = Arc::new(RpcInboundAuth::from_config(&config, pairing.clone()).unwrap());
+            let fixture = fixture_with(
+                config.clone(),
+                pairing,
+                Arc::new(GatewayInboundAuth::from_shared(rpc.clone())),
+                Arc::new(DashboardSessions::default()),
+            );
+            let signed_in = sign_in(&fixture, &server).await;
+            let session = session_for(&fixture, &signed_in.cookie).await;
+            let admission = HistoryAdmission {
+                key: session.key,
+                auth: Arc::downgrade(&fixture.auth),
+            };
+            let directory = tempfile::tempdir().unwrap();
+            let mut state = fixture.state.clone();
+            state.native_sessions = Some(crate::session_history::tests::Source::new(
+                directory.path(),
+                backend,
+                "signed-history",
+            ));
+            let port = scope_history(Some(admission.clone()), async {
+                assert_eq!(
+                    crate::session_history::header_subject(&state, &HeaderMap::new()).unwrap(),
+                    None
+                );
+                crate::session_history::open(&state, "signed-history", "web", None).await
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            port.restore_context().await.unwrap();
+
+            admission.current(&config).unwrap();
+            let mut removed = config.clone();
+            removed.gateway.dashboard_sign_in.oidc.clear();
+            assert!(admission.current(&removed).is_err());
+            let mut repointed = config.clone();
+            repointed.oidc.get_mut("corp").unwrap().issuer = "https://other.invalid".into();
+            assert!(admission.current(&repointed).is_err());
+            let mut revoked = config.clone();
+            revoked
+                .oidc
+                .get_mut("corp")
+                .unwrap()
+                .profile_map
+                .remove("admins");
+            rpc.publish_accepted(&revoked, rpc.accepted_revision() + 1)
+                .unwrap();
+            assert!(port.restore_context().await.is_err());
+            rpc.publish_accepted(&config, rpc.accepted_revision() + 1)
+                .unwrap();
+            assert!(matches!(
+                fixture.auth.recheck(&state, &session).await,
+                DashboardCaller::Session(ref refreshed) if refreshed.is_admin()
+            ));
+            port.restore_context().await.unwrap();
+            fixture.auth.end(&session);
+            assert!(
+                port.restore_context().await.is_err(),
+                "{backend}: ended session must lose history access"
+            );
+        }
     }
 
     // ── Signing in again ─────────────────────────────────────────────

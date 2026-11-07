@@ -14,10 +14,10 @@ but "which surface owns this data, and how long does it live?"
 | --- | --- | --- | --- |
 | Long-term memory | `zeroclaw-memory` behind `Arc<dyn Memory>` | Backend-specific: SQLite/Postgres/Lucid/Qdrant/shared stores, or per-agent Markdown files | Stores and recalls must stay agent-scoped. A tool result, log line, or session row is not long-term memory unless a memory write happened. |
 | Relationship memory | `knowledge` tool and knowledge graph | Graph backend, when enabled | Capture is explicit. Enabling the graph does not automatically ingest conversations, files, or channel data. |
-| Session history | `zeroclaw-infra` session backends, ACP store, and live RPC/session maps | Chat/ACP history can persist; live RPC handles are process-local | History preserves conversation continuity. It is not the canonical store for user preferences, config, or files. |
+| Session history | Standard event store and live RPC/session maps | Chat/ACP history can persist in the configured SQLite or JSONL event store; live RPC handles are process-local | History preserves conversation continuity. It is not the canonical store for user preferences, config, or files. |
 | Current prompt context | Agent loop prompt assembly | Ephemeral provider request | Recalled memory, hardware RAG, current input, system prompt, skills, and tool results may be sent to the provider. This does not make them durable. |
 | History trimming | `agent::history` and `agent::history_trim` | Lossy change to the request/session history shape | Trimming must be visible, preserve tool-call/tool-result pairing, and avoid pretending old context is still available. |
-| Tool result payloads | `ToolResult`, `ToolResultMessage`, and the tool dispatcher | Current turn and any persisted session history that records the turn | Bound size and provenance. Large outputs should be capped or summarized intentionally; nothing in a tool's output text is promoted to an attachment unless the tool declared it. Promotion is explicit: a producing tool declares a `RenderedMarker` attachment, which rides the tool-result carrier at a fixed position (`attachments` array native, `[Tool attachments: N]` count line plus marker lines in prompt mode) and is never recovered by scanning the result text. The runtime infers no attachments from tool text, so a bare image path in any tool's output stays text. |
+| Tool result payloads | `ToolResult`, `ToolResultMessage`, and the tool dispatcher | Current turn and any persisted session history that records the turn | Bound size and provenance. Large outputs should be capped or summarized intentionally. Canonical conversations use `ConversationMessage::ToolResults`, with call identity, outcome, text and explicit `attachments` references. The request adapter renders native tool messages or textual tool blocks according to the selected provider protocol. No attachment or tool-result identity is inferred from message text. |
 | Files and workspaces | Per-agent workspace security policy | Files persist according to the filesystem, not memory | File contents are not memory just because a tool read them. Writes belong in the agent workspace unless policy explicitly allows more. |
 | Media attachments | Channel/gateway media pipeline and `MediaAttachment` | Inbound payload by default; persistence depends on the receiving path | Raw bytes should stay bounded and path-validated. Store summaries or references deliberately rather than silently copying media into memory. |
 | Logs and observer events | `zeroclaw-log`, `ObserverEvent`, runtime trace | Optional runtime trace and live observers | Logs are evidence and diagnostics, not source-of-truth memory. Scrub or bound user/tool payloads before logging. |
@@ -89,7 +89,7 @@ call, while streaming clients can receive correlated `ToolCall` and
 Tool result payloads are easy to over-preserve. Reviewers should check:
 
 - maximum result size, including `max_tool_result_chars`;
-- whether truncation preserves structured envelopes and image markers;
+- whether truncation preserves structured envelopes and attachment fields;
 - whether search/listing tools avoid turning incidental image paths into media
   payloads;
 - whether receipts, logs, and observer events carry bounded, scrubbed evidence

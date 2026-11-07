@@ -27,6 +27,7 @@ impl zeroclaw_api::model_provider::ModelProvider for SopEntryProbe {
         if let Some(result) = request.messages.iter().rev().find(|m| m.role == "tool") {
             *self.result.lock().unwrap() = Some(result.content.clone());
             return Ok(zeroclaw_providers::ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("probe finished".into()),
                 tool_calls: vec![],
                 usage: None,
@@ -36,6 +37,7 @@ impl zeroclaw_api::model_provider::ModelProvider for SopEntryProbe {
         // Request the forbidden name even when the registry does not advertise
         // it: omission from the prompt alone must not be the security boundary.
         Ok(zeroclaw_providers::ChatResponse {
+            output_blocks: Vec::new(),
             text: None,
             tool_calls: vec![zeroclaw_providers::ToolCall {
                 id: "sop-entry-probe".into(),
@@ -281,8 +283,8 @@ fn sop_workshop_principal_fixture(
     let engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
         config.sop.clone(),
     )));
-    let data_dir = config.data_dir.clone();
-    let (mut fixture, _, _, _) = make_persistence_test_dispatcher(config, &data_dir);
+
+    let (mut fixture, _) = make_native_test_dispatcher(config);
     let ctx = Arc::get_mut(&mut fixture.ctx).expect("fixture context is not yet shared");
     ctx.sop_engine = Some(Arc::clone(&engine));
     ctx.sop_audit = Some(Arc::new(crate::sop::SopAuditLogger::new(Arc::new(
@@ -441,10 +443,16 @@ impl zeroclaw_api::model_provider::ModelProvider for SopWorkshopApplyProbe {
                 .messages
                 .iter()
                 .filter(|message| message.role == "tool")
-                .map(|message| serde_json::from_str(&message.content).unwrap())
+                .map(|message| {
+                    json!({
+                        "tool_call_id": message.tool_result.as_ref().unwrap().tool_call_id,
+                        "content": message.content,
+                    })
+                })
                 .collect();
         }
         Ok(zeroclaw_providers::ChatResponse {
+            output_blocks: Vec::new(),
             text: (!first).then(|| "workshop probe complete".into()),
             tool_calls: if first {
                 [

@@ -50,26 +50,33 @@ impl LinqChannel {
         &self.from_phone
     }
 
-    fn media_part_to_image_marker(part: &serde_json::Value) -> Option<String> {
+    fn media_part_reference(
+        part: &serde_json::Value,
+    ) -> Option<zeroclaw_api::media::AttachmentReference> {
         let source = part
             .get("url")
             .or_else(|| part.get("value"))
             .and_then(|value| value.as_str())
             .map(str::trim)
             .filter(|value| !value.is_empty())?;
-
-        let mime_type = part
+        let mime = part
             .get("mime_type")
             .and_then(|value| value.as_str())
-            .map(str::trim)
             .unwrap_or_default()
             .to_ascii_lowercase();
-
-        if !mime_type.starts_with("image/") {
-            return None;
-        }
-
-        Some(format!("[IMAGE:{source}]"))
+        let kind = if mime.starts_with("image/") {
+            zeroclaw_api::media::AttachmentKind::Image
+        } else if mime.starts_with("audio/") {
+            zeroclaw_api::media::AttachmentKind::Audio
+        } else if mime.starts_with("video/") {
+            zeroclaw_api::media::AttachmentKind::Video
+        } else {
+            zeroclaw_api::media::AttachmentKind::Document
+        };
+        Some(zeroclaw_api::media::AttachmentReference {
+            target: source.to_string(),
+            kind,
+        })
     }
 
     fn sender_is_from_me(data: &serde_json::Value) -> bool {
@@ -184,54 +191,31 @@ impl LinqChannel {
             return messages;
         };
 
-        let content_parts: Vec<String> = parts
-            .iter()
-            .filter_map(|part| {
-                let part_type = part.get("type").and_then(|t| t.as_str())?;
-                match part_type {
-                    "text" => part
-                        .get("value")
-                        .and_then(|v| v.as_str())
-                        .map(ToString::to_string),
-                    "media" | "image" => {
-                        if let Some(marker) = Self::media_part_to_image_marker(part) {
-                            Some(marker)
-                        } else {
-                            ::zeroclaw_log::record!(
-                                DEBUG,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Note
-                                )
-                                .with_attrs(::serde_json::json!({"part_type": part_type})),
-                                "skipping unsupported part"
-                            );
-                            None
-                        }
-                    }
-                    _ => {
-                        ::zeroclaw_log::record!(
-                            DEBUG,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_attrs(::serde_json::json!({"part_type": part_type})),
-                            "skipping part"
-                        );
-                        None
+        let mut content_parts = Vec::new();
+        let mut attachments = Vec::new();
+        for part in parts {
+            match part.get("type").and_then(|t| t.as_str()) {
+                Some("text") => {
+                    if let Some(value) = part.get("value").and_then(|v| v.as_str()) {
+                        content_parts.push(value.to_string());
                     }
                 }
-            })
-            .collect();
+                Some("media") | Some("image") => {
+                    if let Some(reference) = Self::media_part_reference(part) {
+                        attachments.push(reference);
+                    }
+                }
+                _ => {}
+            }
+        }
 
-        if content_parts.is_empty() {
+        if content_parts.is_empty() && attachments.is_empty() {
             return messages;
         }
 
         let content = content_parts.join("\n").trim().to_string();
 
-        if content.is_empty() {
+        if content.is_empty() && attachments.is_empty() {
             return messages;
         }
 
@@ -268,7 +252,13 @@ impl LinqChannel {
             timestamp,
             thread_ts: None,
             interruption_scope_id: None,
-            attachments: vec![],
+            attachments: attachments
+                .into_iter()
+                .map(|reference| zeroclaw_api::media::MediaAttachment {
+                    reference: Some(reference),
+                    ..Default::default()
+                })
+                .collect(),
             subject: None,
 
             ..Default::default()
@@ -735,7 +725,7 @@ mod tests {
     }
 
     #[test]
-    fn linq_parse_media_only_translated_to_image_marker() {
+    fn linq_parse_media_only_preserves_image_attachment() {
         let ch = LinqChannel::new(
             "tok".into(),
             "+15551234567".into(),
@@ -761,11 +751,15 @@ mod tests {
 
         let msgs = ch.parse_webhook_payload(&payload);
         assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].content, "[IMAGE:https://example.com/image.jpg]");
+        assert!(msgs[0].content.is_empty());
+        assert_eq!(
+            msgs[0].attachments[0].reference_target(),
+            Some("https://example.com/image.jpg")
+        );
     }
 
     #[test]
-    fn linq_parse_media_non_image_still_skipped() {
+    fn linq_parse_media_non_image_preserves_audio_attachment() {
         let ch = LinqChannel::new(
             "tok".into(),
             "+15551234567".into(),
@@ -790,7 +784,15 @@ mod tests {
         });
 
         let msgs = ch.parse_webhook_payload(&payload);
-        assert!(msgs.is_empty(), "Non-image media should still be skipped");
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0].content.is_empty());
+        assert_eq!(
+            msgs[0].attachments[0].reference.as_ref(),
+            Some(&zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Audio,
+                target: "https://example.com/sound.mp3".into(),
+            })
+        );
     }
 
     #[test]
@@ -1194,7 +1196,11 @@ mod tests {
 
         let msgs = ch.parse_webhook_payload(&payload);
         assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].content, "[IMAGE:https://example.com/photo.png]");
+        assert!(msgs[0].content.is_empty());
+        assert_eq!(
+            msgs[0].attachments[0].reference_target(),
+            Some("https://example.com/photo.png")
+        );
     }
 
     #[test]
@@ -1225,9 +1231,10 @@ mod tests {
 
         let msgs = ch.parse_webhook_payload(&payload);
         assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "Check this out");
         assert_eq!(
-            msgs[0].content,
-            "Check this out\n[IMAGE:https://example.com/img.jpg]"
+            msgs[0].attachments[0].reference_target(),
+            Some("https://example.com/img.jpg")
         );
     }
 

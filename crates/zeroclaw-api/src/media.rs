@@ -17,11 +17,6 @@
 //!
 //! The three are ordered by strictness (`provider_loadable_image_mime` implies
 //! `looks_like_image`), but `kind` is independent and may disagree with both.
-//! Callers that render user-visible annotations must therefore not let two of
-//! these decide the same attachment: the channel that received the bytes
-//! records what it rendered in [`MediaAttachment::marker`], and later stages
-//! defer to that instead of re-deciding.
-
 use serde::{Deserialize, Serialize};
 
 /// Classifies an attachment by MIME type or file extension.
@@ -33,86 +28,47 @@ pub enum MediaKind {
     Unknown,
 }
 
-/// The disposition a receiving channel chose when it rendered an attachment's
-/// marker into the message text.
-///
-/// A channel resolves this against the provider's loadability contract before
-/// it renders: an image the multimodal loader will accept becomes [`Image`],
-/// and one it will not becomes [`Document`] so the saved path stays reachable
-/// without promising the provider bytes it drops.
-///
-/// [`Image`]: MarkerKind::Image
-/// [`Document`]: MarkerKind::Document
+/// The attachment capability selected by its producing adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum MarkerKind {
-    /// A re-loadable `[IMAGE:<target>]` the multimodal loader accepts.
+pub enum AttachmentKind {
     Image,
-    /// An `[AUDIO:<target>]` reference.
     Audio,
-    /// A `[VIDEO:<target>]` reference.
     Video,
-    /// A `[Document: name] <target>`, deliberately not an image.
     Document,
 }
 
-impl MarkerKind {
-    /// Whether a later enrichment stage must defer to this rendered marker
-    /// rather than re-deciding the attachment's kind from its payload.
-    ///
-    /// True for the two visual dispositions a channel resolves against the
-    /// provider's loadability contract. Re-running payload classification on a
-    /// channel-rendered image or document produces a contradictory second
-    /// annotation, and for a non-loadable image document an `[IMAGE:data:...]`
-    /// copy the provider then rejects. Audio and video carry no such
-    /// image/document ambiguity, so they keep the existing per-kind enrichment.
-    pub fn defers_enrichment(self) -> bool {
-        matches!(self, MarkerKind::Image | MarkerKind::Document)
+/// An explicit media reference. Its target is a path, URL, or data URI.
+/// References are carried as fields and never encoded in message text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentReference {
+    pub target: String,
+    pub kind: AttachmentKind,
+}
+
+/// A native geographic pin supplied by a delivery tool, never inferred from text.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LocationAttachment {
+    pub lat: f64,
+    pub lng: f64,
+    pub name: Option<String>,
+    pub address: Option<String>,
+}
+
+impl LocationAttachment {
+    pub fn is_valid(&self) -> bool {
+        (-90.0..=90.0).contains(&self.lat) && (-180.0..=180.0).contains(&self.lng)
     }
 }
 
-/// The marker a receiving channel rendered into the message text for an
-/// attachment's exact bytes: the target it referenced and the disposition it
-/// chose.
-///
-/// The two are kept together so they cannot drift apart. A target without a
-/// disposition cannot say whether the channel rendered an image or a document,
-/// which is exactly the distinction a downstream stage needs to avoid
-/// re-classifying a rendered document as an image.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RenderedMarker {
-    /// The exact target the channel rendered (a saved path or a URL).
-    pub target: String,
-    /// The disposition the channel chose when it rendered the marker.
-    pub kind: MarkerKind,
-}
-
-/// A single media attachment on an inbound message.
+/// Bytes received from a transport, with an optional durable reference supplied
+/// by that transport. The reference is authoritative for attachment disposition.
 #[derive(Debug, Clone, Default)]
 pub struct MediaAttachment {
-    /// Original file name (e.g. `voice.ogg`, `photo.jpg`).
     pub file_name: String,
-    /// Raw bytes of the attachment.
     pub data: Vec<u8>,
-    /// MIME type if known (e.g. `audio/ogg`, `image/jpeg`).
     pub mime_type: Option<String>,
-    /// The marker the receiving channel already rendered into the message text
-    /// for **these** bytes, if it rendered one: the exact target it referenced
-    /// and the disposition it chose.
-    ///
-    /// This field creates the fact. A channel's text rendering is otherwise
-    /// unrecoverable from the envelope: `file_name` is the sender's name,
-    /// which need not equal the on-disk name the channel marked (Discord
-    /// prefixes a UUID; a URL fallback is not a file name at all), and nothing
-    /// else records whether the channel rendered an image or a document.
-    /// Consumers that need to know whether the text already carries a
-    /// re-loadable reference to this attachment, or which disposition the
-    /// channel committed to, must read this rather than pattern-matching the
-    /// rendered text, which also carries sender-authored content.
-    ///
-    /// `None` means the channel supplied bytes without rendering a marker for
-    /// them; consumers must then treat the attachment as unreferenced.
-    pub marker: Option<RenderedMarker>,
+    pub reference: Option<AttachmentReference>,
 }
 
 impl MediaAttachment {
@@ -152,47 +108,29 @@ impl MediaAttachment {
             Some("txt") => Some("text/plain".to_string()),
             _ => Some("application/octet-stream".to_string()),
         };
-        Ok(Self {
+        let mut attachment = Self {
             file_name,
             data,
             mime_type,
-            marker: None,
-        })
+            reference: None,
+        };
+        let kind = match attachment.kind() {
+            MediaKind::Image => AttachmentKind::Image,
+            MediaKind::Audio => AttachmentKind::Audio,
+            MediaKind::Video => AttachmentKind::Video,
+            MediaKind::Unknown => AttachmentKind::Document,
+        };
+        attachment.reference = Some(AttachmentReference {
+            target: p.display().to_string(),
+            kind,
+        });
+        Ok(attachment)
     }
 
-    /// The exact target the receiving channel rendered for these bytes, if it
-    /// rendered a marker. See [`RenderedMarker::target`].
-    pub fn marker_target(&self) -> Option<&str> {
-        self.marker.as_ref().map(|m| m.target.as_str())
-    }
-
-    /// Return the target of a channel-rendered image marker that points at a
-    /// remote URL while the attachment bytes remain available in memory.
-    ///
-    /// Such a marker is a fallback reference rather than an owned,
-    /// reloadable image: the default provider path does not fetch remote
-    /// images. A later media-enrichment stage can therefore remove this exact
-    /// channel marker and replace it with the typed bytes without treating a
-    /// sender-authored marker as channel metadata.
-    pub fn channel_rendered_remote_image_target(&self) -> Option<&str> {
-        self.marker.as_ref().and_then(|marker| {
-            (marker.kind == MarkerKind::Image && is_remote_reference(&marker.target))
-                .then_some(marker.target.as_str())
-        })
-    }
-
-    /// Whether the receiving channel already rendered a marker whose
-    /// disposition a later enrichment stage must not override.
-    ///
-    /// See [`MarkerKind::defers_enrichment`]. The channel saw the payload, the
-    /// sender's declared type, and the transport's own notion of what was
-    /// sent, so its image-or-document verdict wins over a second, payload-only
-    /// classification downstream. A remote URL image fallback is excluded:
-    /// its typed bytes can replace the URL when remote fetching is disabled.
-    pub fn channel_rendered_owned_disposition(&self) -> bool {
-        self.marker
+    pub fn reference_target(&self) -> Option<&str> {
+        self.reference
             .as_ref()
-            .is_some_and(|m| m.kind.defers_enrichment() && !is_remote_reference(&m.target))
+            .map(|reference| reference.target.as_str())
     }
 
     /// Classify this attachment into a [`MediaKind`].
@@ -264,30 +202,20 @@ impl MediaAttachment {
     /// Where [`looks_like_image`](Self::looks_like_image) answers "must this
     /// turn be treated as carrying an image?" (deliberately permissive,
     /// because its consumers only ever *remove* capability), this answers the
-    /// narrower question "will an `[IMAGE:<path>]` reference to these bytes
+    /// narrower question "will an image reference to these bytes
     /// survive provider preparation?" — so it is the signal for any decision
-    /// that *grants* image handling: emitting an image marker, or routing a
+    /// that *grants* image handling: emitting an image reference, or routing a
     /// turn to a vision provider.
     ///
     /// `None` means the loader would reject the reference and drop it in
     /// favour of a "could not be loaded" note. Callers must then keep the
-    /// bytes reachable some other way rather than emitting a marker that is
-    /// guaranteed to be discarded.
+    /// bytes reachable some other way rather than declaring an image reference
+    /// that is guaranteed to be discarded.
     pub fn provider_loadable_image_mime(&self) -> Option<&'static str> {
         provider_loadable_image_mime_for(&self.file_name, &self.data)
     }
 }
 
-fn is_remote_reference(reference: &str) -> bool {
-    reference.starts_with("http://") || reference.starts_with("https://")
-}
-
-/// The provider-loadable image MIME for a `(file_name, bytes)` pair, or `None`
-/// when the loader would reject it. Free-standing so a channel can consult the
-/// same contract before it owns a `MediaAttachment`: Discord decides a marker's
-/// disposition from the borrowed download bytes, and duplicating the precedence
-/// here would let the two drift. `MediaAttachment::provider_loadable_image_mime`
-/// is the borrowing convenience over this.
 pub fn provider_loadable_image_mime_for(file_name: &str, data: &[u8]) -> Option<&'static str> {
     let ext = file_name
         .rsplit_once('.')
@@ -391,7 +319,7 @@ mod tests {
             file_name: file_name.to_string(),
             data: Vec::new(),
             mime_type: mime_type.map(str::to_string),
-            marker: None,
+            reference: None,
         }
     }
 
@@ -439,7 +367,7 @@ mod tests {
             file_name: file_name.to_string(),
             data: data.to_vec(),
             mime_type: mime_type.map(str::to_string),
-            marker: None,
+            reference: None,
         }
     }
 
@@ -510,7 +438,7 @@ mod tests {
     #[test]
     fn provider_loadable_image_mime_rejects_formats_the_loader_drops() {
         // These are images by every conservative signal, but the multimodal
-        // loader cannot normalize them: promising it a marker would lose both
+        // loader cannot normalize them: promising an image reference would lose both
         // the bytes and the path.
         for name in ["photo.heic", "scan.tiff", "logo.svg", "old.bmp"] {
             let a = att(name, None);
@@ -521,7 +449,7 @@ mod tests {
             assert_eq!(
                 a.provider_loadable_image_mime(),
                 None,
-                "{name} must not earn an image marker"
+                "{name} must not earn an image reference"
             );
         }
 
@@ -539,7 +467,7 @@ mod tests {
         // The loader resolves the extension before sniffing, so a name that
         // commits the file to an unsupported format is rejected even when the
         // payload would have sniffed as a supported one. Matching that
-        // precedence here is what keeps the marker decision honest.
+        // precedence here is what keeps the attachment decision honest.
         let a = att_with_data("photo.bmp", None, &[0xFF, 0xD8, 0xFF, 0xE0]);
         assert_eq!(a.provider_loadable_image_mime(), None);
 

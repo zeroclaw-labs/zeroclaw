@@ -681,13 +681,9 @@ pub async fn handle_agents(cmd: AgentsCommands, config: &mut Config) -> Result<(
     }
 }
 
-/// Memory + optional session-backend handles opened from `data_dir` for the
-/// owned-state cascade.
+/// Memory handle retained across config deletion for the owned-state cascade.
 #[cfg(feature = "agent-runtime")]
-type OwnedStateHandles = (
-    std::sync::Arc<dyn zeroclaw_memory::Memory>,
-    Option<std::sync::Arc<dyn zeroclaw_infra::session_backend::SessionBackend>>,
-);
+type OwnedStateHandles = std::sync::Arc<dyn zeroclaw_memory::Memory>;
 
 #[cfg(not(feature = "agent-runtime"))]
 type OwnedStateHandles = ();
@@ -703,18 +699,7 @@ fn build_owned_state_handles(config: &Config) -> Result<OwnedStateHandles> {
                 .context("open memory backend for the owned-state cascade")?,
         )
     };
-    let session_backend = if config.gateway.session_persistence {
-        Some(
-            zeroclaw_infra::make_session_backend(
-                &config.data_dir,
-                &config.channels.session_backend,
-            )
-            .context("open session backend for the owned-state cascade")?,
-        )
-    } else {
-        None
-    };
-    Ok((mem, session_backend))
+    Ok(mem)
 }
 
 #[cfg(not(feature = "agent-runtime"))]
@@ -726,7 +711,8 @@ fn build_owned_state_handles(_config: &Config) -> Result<OwnedStateHandles> {
 fn agent_delete_precheck(config: &Config, alias: &str) -> Result<()> {
     // Fail closed: refuse if live ACP sessions exist, or if the store can't be
     // read to verify (mirrors the gateway delete gate).
-    let live = zeroclaw_runtime::agent_lifecycle::live_acp_session_count(config, alias)
+    let live = zeroclaw_session_host::open_repository(config)?
+        .count_live_sessions_by_agent(alias)
         .context("could not verify live ACP sessions")?;
     if live > 0 {
         let count = live.to_string();
@@ -752,7 +738,7 @@ async fn agent_delete_owned_state(
     config: &Config,
     alias: &str,
     workspace: &std::path::Path,
-    (mem, session_backend): OwnedStateHandles,
+    mem: OwnedStateHandles,
 ) -> Result<()> {
     let archive =
         zeroclaw_runtime::agent_lifecycle::archive_agent_workspace(config, alias, workspace).await;
@@ -770,9 +756,16 @@ async fn agent_delete_owned_state(
     let report = zeroclaw_runtime::agent_lifecycle::cascade_owned_state(
         config,
         &mem,
-        session_backend.as_ref(),
         alias,
         &archive_dir,
+        zeroclaw_session_host::open_repository(config)
+            .map(|store| {
+                std::sync::Arc::new(store)
+                    as std::sync::Arc<
+                        dyn zeroclaw_api::session_events::management::AgentSessionPort,
+                    >
+            })
+            .map_err(|error| error.to_string()),
     )
     .await;
     let memory = report.memory_purged.to_string();
@@ -844,13 +837,20 @@ async fn agent_rename_owned_state(
             );
         }
     }
-    let (mem, session_backend) = build_owned_state_handles(config)?;
+    let mem = build_owned_state_handles(config)?;
     let report = zeroclaw_runtime::agent_lifecycle::cascade_rename_agent(
         config,
         Some(&mem),
-        session_backend.as_ref(),
         from,
         to,
+        zeroclaw_session_host::open_repository(config)
+            .map(|store| {
+                std::sync::Arc::new(store)
+                    as std::sync::Arc<
+                        dyn zeroclaw_api::session_events::management::AgentSessionPort,
+                    >
+            })
+            .map_err(|error| error.to_string()),
     )
     .await;
     let memory = report.memory_rows.to_string();
@@ -964,6 +964,25 @@ pub async fn handle_providers(cmd: ProvidersCommands, config: &mut Config) -> Re
             to,
         } => {
             let category = parse_provider_category(&category)?;
+            #[cfg(feature = "agent-runtime")]
+            let _offline_ownership = if category == ProviderCategory::Models {
+                match route_agent_mutation(
+                    config,
+                    "config/map-key-rename",
+                    serde_json::json!({
+                        "path": format!("providers.models.{family}"),
+                        "from": from,
+                        "to": to,
+                    }),
+                )
+                .await?
+                {
+                    AgentMutationRoute::Daemon(value) => return print_daemon_rename(value),
+                    AgentMutationRoute::Offline(ownership) => Some(ownership),
+                }
+            } else {
+                None
+            };
             rename_config(
                 config,
                 &AliasKind::Provider { category, family },
@@ -1141,7 +1160,7 @@ mod tests {
 
         let workspace = config.agent_workspace_dir("victim");
         let handles = build_owned_state_handles(&config).unwrap();
-        let retained_memory = Arc::clone(&handles.0);
+        let retained_memory = Arc::clone(&handles);
         let agent_id = retained_memory.ensure_agent_uuid("victim").await.unwrap();
         retained_memory
             .store_with_agent(
@@ -1180,9 +1199,9 @@ mod tests {
             ..Config::default()
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
-        zeroclaw_infra::acp_session_store::AcpSessionStore::new(&config.data_dir)
+        zeroclaw_session_host::open_repository(&config)
             .unwrap()
-            .create_session("live-session", "busy", "/ws/busy", None)
+            .create_session("live-session", "test", "busy", "/ws/busy", None)
             .unwrap();
 
         let refusal = agent_delete_precheck(&config, "busy")
@@ -1206,14 +1225,13 @@ mod tests {
             zeroclaw_config::schema::AliasedAgentConfig::default(),
         );
         std::fs::create_dir_all(&config.data_dir).unwrap();
-        let store =
-            zeroclaw_infra::acp_session_store::AcpSessionStore::new(&config.data_dir).unwrap();
+        let store = zeroclaw_session_host::open_repository(&config).unwrap();
         store
-            .create_session("ended-session", "victim", "/ws/victim", None)
+            .create_session("ended-session", "test", "victim", "/ws/victim", None)
             .unwrap();
         store.mark_session_killed("ended-session").unwrap();
         store
-            .create_session("other-session", "bystander", "/ws/bystander", None)
+            .create_session("other-session", "test", "bystander", "/ws/bystander", None)
             .unwrap();
 
         let workspace = config.agent_workspace_dir("victim");

@@ -55,10 +55,15 @@ async fn document_url_failure_falls_back_to_text_link() {
     mock_send_message_ok(&server).await;
 
     let channel = test_channel(&server.uri());
-    let msg = SendMessage::new(
-        "Here is the report [DOCUMENT:https://example.com/page.html]",
-        "123",
-    );
+    let msg = SendMessage::new("Here is the report", "123").with_attachments(vec![
+        zeroclaw_api::media::MediaAttachment {
+            reference: Some(zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Document,
+                target: "https://example.com/page.html".into(),
+            }),
+            ..Default::default()
+        },
+    ]);
 
     // This should NOT error — it should fall back to text
     let result = channel.send(&msg).await;
@@ -86,10 +91,15 @@ async fn photo_url_failure_falls_back_to_text_link() {
     mock_send_message_ok(&server).await;
 
     let channel = test_channel(&server.uri());
-    let msg = SendMessage::new(
-        "Check this [IMAGE:https://internal-server.local/screenshot.png]",
-        "456",
-    );
+    let msg = SendMessage::new("Check this", "456").with_attachments(vec![
+        zeroclaw_api::media::MediaAttachment {
+            reference: Some(zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: "https://internal-server.local/screenshot.png".into(),
+            }),
+            ..Default::default()
+        },
+    ]);
 
     let result = channel.send(&msg).await;
     assert!(
@@ -132,10 +142,15 @@ async fn text_portion_delivered_before_attachment_failure() {
         .await;
 
     let channel = test_channel(&server.uri());
-    let msg = SendMessage::new(
-        "Here is the file [DOCUMENT:https://example.com/report.html]",
-        "789",
-    );
+    let msg = SendMessage::new("Here is the file", "789").with_attachments(vec![
+        zeroclaw_api::media::MediaAttachment {
+            reference: Some(zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Document,
+                target: "https://example.com/report.html".into(),
+            }),
+            ..Default::default()
+        },
+    ]);
 
     let result = channel.send(&msg).await;
     assert!(result.is_ok(), "send should succeed, got: {result:?}");
@@ -185,10 +200,22 @@ async fn multiple_attachments_independent_fallback() {
         .await;
 
     let channel = test_channel(&server.uri());
-    let msg = SendMessage::new(
-        "Files: [DOCUMENT:https://example.com/page.html] and [IMAGE:https://internal.local/pic.png]",
-        "100",
-    );
+    let msg = SendMessage::new("Files:  and", "100").with_attachments(vec![
+        zeroclaw_api::media::MediaAttachment {
+            reference: Some(zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Document,
+                target: "https://example.com/page.html".into(),
+            }),
+            ..Default::default()
+        },
+        zeroclaw_api::media::MediaAttachment {
+            reference: Some(zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: "https://internal.local/pic.png".into(),
+            }),
+            ..Default::default()
+        },
+    ]);
 
     let result = channel.send(&msg).await;
     assert!(
@@ -233,10 +260,15 @@ async fn successful_attachment_no_fallback() {
         .await;
 
     let channel = test_channel(&server.uri());
-    let msg = SendMessage::new(
-        "Report attached [DOCUMENT:https://example.com/report.pdf]",
-        "200",
-    );
+    let msg = SendMessage::new("Report attached", "200").with_attachments(vec![
+        zeroclaw_api::media::MediaAttachment {
+            reference: Some(zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Document,
+                target: "https://example.com/report.pdf".into(),
+            }),
+            ..Default::default()
+        },
+    ]);
 
     let result = channel.send(&msg).await;
     assert!(
@@ -277,7 +309,14 @@ async fn document_only_message_falls_back_to_text() {
 
     let channel = test_channel(&server.uri());
     // Message is ONLY the attachment marker — no surrounding text
-    let msg = SendMessage::new("[DOCUMENT:https://example.com/file.html]", "300");
+    let msg =
+        SendMessage::new("", "300").with_attachments(vec![zeroclaw_api::media::MediaAttachment {
+            reference: Some(zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Document,
+                target: "https://example.com/file.html".into(),
+            }),
+            ..Default::default()
+        }]);
 
     let result = channel.send(&msg).await;
     assert!(

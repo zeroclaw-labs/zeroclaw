@@ -293,6 +293,41 @@ pub async fn process_file_entry(
     persist_upload_bytes(bytes, &filename, session_id, upload_root, sessions).await
 }
 
+/// Historical rendition comes from the exact bytes the upload owner admitted
+/// and persisted. No pathname is re-read and no second file id is allocated.
+pub async fn process_file_entry_with_history(
+    entry: &FileEntry,
+    session_id: &str,
+    upload_root: &str,
+    is_wss: bool,
+    source: Option<&AttachmentSource>,
+    sessions: &SessionStore,
+) -> Result<
+    (
+        FileEntryResult,
+        zeroclaw_api::session_events::capture::EngineFileInput,
+    ),
+    JsonRpcError,
+> {
+    use zeroclaw_api::session_events::{PayloadId, PayloadRecord};
+    let (bytes, filename) = load_file_entry(entry, is_wss, source).await?;
+    let representation =
+        PayloadRecord::new(PayloadId::new(), "session.bytes/v1".into(), bytes.clone())
+            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
+    let result = persist_upload_bytes(bytes, &filename, session_id, upload_root, sessions).await?;
+    let history = zeroclaw_api::session_events::capture::EngineFileInput {
+        file_id: result.ref_id.clone(),
+        representation,
+        registration: file_registration(&filename, &result.workspace_path),
+        policy_evidence: serde_json::json!({"source":"authorized_rpc_attachment","transport":if is_wss {"wss"}else{"local"}}),
+    };
+    Ok((result, history))
+}
+
+pub(super) fn file_registration(filename: &str, workspace_path: &str) -> serde_json::Value {
+    serde_json::json!({"source":"rpc_upload_owner","filename":filename,"workspace_path":workspace_path})
+}
+
 /// Resolve one file entry to its bytes and display filename, without
 /// persisting anything: decode `data_b64`, or read `path` through the
 /// authorized source.
@@ -455,7 +490,7 @@ pub fn persist_into_index(
     // storage name and a directory-handle-bound, no-follow atomic write. This makes
     // the RPC attachment path and the ACP/MCP blob path share one filesystem owner
     // instead of duplicating decode/hash/naming/persistence with a plain,
-    // symlink-following `fs::write`. Marker and session dedup stay RPC-specific.
+    // symlink-following `fs::write`. Reference metadata and session dedup stay RPC-specific.
     let dest = zeroclaw_tools::embedded_resource::persist_content_addressed(
         std::path::Path::new(upload_root),
         bytes,
@@ -469,7 +504,7 @@ pub fn persist_into_index(
     {
         return Ok(FileEntryResult {
             ref_id: existing.ref_id,
-            marker: existing.marker,
+            kind: existing.kind,
             workspace_path: existing.workspace_path,
             size_bytes: existing.size_bytes,
             deduplicated: true,
@@ -479,17 +514,14 @@ pub fn persist_into_index(
     // IMAGE iff the multimodal loader will actually accept these bytes under
     // this name — the canonical provider-loadable contract from
     // `zeroclaw_api::media` — never a declared MIME. A MIME the loader
-    // rejects (image/svg+xml, image/bmp, image/heic) used to earn an
-    // [IMAGE:] marker whose payload the provider path then dropped in
-    // favour of a "could not be loaded" note, stranding the upload.
+    // rejects (image/svg+xml, image/bmp, image/heic) is stored as a document
+    // reference so the model can still reach it through file tools.
     let is_image =
         zeroclaw_api::media::provider_loadable_image_mime_for(&sanitized, bytes).is_some();
-    let marker = if is_image {
-        format!("[IMAGE:{workspace_path}]")
+    let kind = if is_image {
+        zeroclaw_api::media::AttachmentKind::Image
     } else {
-        // Non-image: prose format with workspace path so the agent can
-        // read the file with its tools regardless of transport.
-        format!("[Document: {filename}] {workspace_path}")
+        zeroclaw_api::media::AttachmentKind::Document
     };
 
     let size_bytes = bytes.len() as u64;
@@ -499,7 +531,7 @@ pub fn persist_into_index(
         ref_id.clone(),
         super::session::UploadEntry {
             ref_id: ref_id.clone(),
-            marker: marker.clone(),
+            kind,
             workspace_path: workspace_path.clone(),
             size_bytes,
         },
@@ -507,7 +539,7 @@ pub fn persist_into_index(
 
     Ok(FileEntryResult {
         ref_id,
-        marker,
+        kind,
         workspace_path,
         size_bytes,
         deduplicated: false,
@@ -520,7 +552,7 @@ fn sanitize_filename(name: &str) -> String {
 }
 
 /// Strip the Windows verbatim (`\\?\`) prefix that `canonicalize` prepends so
-/// model-visible file markers contain ordinary local paths.
+/// model-visible attachment references contain ordinary local paths.
 fn strip_windows_verbatim_prefix(path: &str) -> std::borrow::Cow<'_, str> {
     if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
         return std::borrow::Cow::Owned(format!(r"\\{rest}"));
@@ -545,14 +577,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn svg_becomes_a_document_marker_not_an_image() {
+    async fn svg_becomes_a_document_reference_not_an_image() {
         use base64::{Engine, engine::general_purpose::STANDARD};
 
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path().to_string_lossy().to_string();
         let store = setup_store(&ws).await;
 
-        // Declared image MIME cannot earn an [IMAGE:] marker: the provider
+        // Declared image MIME cannot earn an [IMAGE:] reference: the provider
         // loader refuses SVG, so promising it to the model strands the file.
         let entry = FileEntry {
             path: None,
@@ -564,11 +596,7 @@ mod tests {
         let r = process_file_entry(&entry, "s1", &ws, false, None, &store)
             .await
             .unwrap();
-        assert!(
-            r.marker.starts_with("[Document: logo.svg]"),
-            "expected document marker, got {}",
-            r.marker
-        );
+        assert_eq!(r.kind, zeroclaw_api::media::AttachmentKind::Document);
     }
 
     #[tokio::test]
@@ -591,11 +619,7 @@ mod tests {
         let r = process_file_entry(&entry, "s1", &ws, false, None, &store)
             .await
             .unwrap();
-        assert!(
-            r.marker.starts_with("[IMAGE:"),
-            "expected image marker, got {}",
-            r.marker
-        );
+        assert_eq!(r.kind, zeroclaw_api::media::AttachmentKind::Image);
     }
 
     #[tokio::test]
@@ -617,11 +641,7 @@ mod tests {
         let r = process_file_entry(&entry, "s1", &ws, false, None, &store)
             .await
             .unwrap();
-        assert!(
-            r.marker.starts_with("[Document: note.txt]"),
-            "expected document marker, got {}",
-            r.marker
-        );
+        assert_eq!(r.kind, zeroclaw_api::media::AttachmentKind::Document);
     }
 
     #[test]
@@ -633,7 +653,7 @@ mod tests {
     }
 
     #[test]
-    fn strip_windows_verbatim_prefix_keeps_markers_plain() {
+    fn strip_windows_verbatim_prefix_keeps_paths_plain() {
         assert_eq!(
             strip_windows_verbatim_prefix(r"\\?\C:\Users\me\file.png"),
             r"C:\Users\me\file.png"
@@ -747,6 +767,7 @@ mod tests {
             _: Option<f64>,
         ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
             Ok(zeroclaw_providers::ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("stub".into()),
                 tool_calls: vec![],
                 usage: None,
@@ -806,21 +827,17 @@ mod tests {
             .unwrap();
 
         assert!(r.ref_id.starts_with("sha256:"));
-        // Clipboard images: marker must contain the workspace path so the
+        // Clipboard images: reference must contain the workspace path so the
         // multimodal pipeline can load and inline the image bytes. The
-        // previous `[IMAGE from clipboard]` marker had no path and silently
-        // produced text-only requests (model never saw the image).
-        assert!(
-            r.marker.starts_with("[IMAGE:") && r.marker.ends_with(']'),
-            "marker = {}",
-            r.marker
-        );
+        // previous clipboard path did not expose a typed reference and silently
+        // produced text-only requests (the model never saw the image).
+        assert_eq!(r.kind, zeroclaw_api::media::AttachmentKind::Image);
         assert!(
             path_contains_uploads_component(&r.workspace_path),
-            "clipboard image marker should reference workspace uploads path: {}",
-            r.marker
+            "clipboard image reference should reference workspace uploads path: {}",
+            r.workspace_path
         );
-        assert!(r.marker.contains(&r.workspace_path));
+        assert!(Path::new(&r.workspace_path).is_file());
         assert!(!r.deduplicated);
         assert_eq!(r.size_bytes, png_bytes.len() as u64);
         assert!(Path::new(&r.workspace_path).exists());
@@ -1009,17 +1026,13 @@ mod tests {
             .unwrap();
 
         // data_b64 mode: non-image uses prose format with workspace path.
-        assert!(
-            r.marker.starts_with("[Document: report.pdf]"),
-            "marker = {}",
-            r.marker
-        );
+        assert_eq!(r.kind, zeroclaw_api::media::AttachmentKind::Document);
         assert!(
             path_contains_uploads_component(&r.workspace_path),
-            "marker should include workspace uploads path: {}",
-            r.marker
+            "reference should include workspace uploads path: {}",
+            r.workspace_path
         );
-        assert!(r.marker.contains(&r.workspace_path));
+        assert!(Path::new(&r.workspace_path).is_file());
         assert!(!r.deduplicated);
     }
 
@@ -1396,23 +1409,19 @@ mod tests {
 
         assert!(r.ref_id.starts_with("sha256:"));
         // Non-image path mode: prose format with original filename and workspace path.
-        assert!(
-            r.marker.starts_with("[Document: testfile.pdf]"),
-            "marker = {}",
-            r.marker
-        );
+        assert_eq!(r.kind, zeroclaw_api::media::AttachmentKind::Document);
         assert!(
             path_contains_uploads_component(&r.workspace_path),
-            "marker should include workspace path: {}",
-            r.marker
+            "reference should include workspace path: {}",
+            r.workspace_path
         );
-        assert!(r.marker.contains(&r.workspace_path));
+        assert!(Path::new(&r.workspace_path).is_file());
         assert!(!r.deduplicated);
         assert!(Path::new(&r.workspace_path).exists());
     }
 
     #[tokio::test]
-    async fn path_mode_image_marker_survives_original_removal() {
+    async fn path_mode_image_reference_survives_original_removal() {
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path().join("workspace");
         std::fs::create_dir(&ws).unwrap();
@@ -1444,14 +1453,19 @@ mod tests {
             .unwrap();
         std::fs::remove_file(&source_path).unwrap();
 
-        assert_eq!(result.marker, format!("[IMAGE:{}]", result.workspace_path));
+        assert_eq!(result.kind, zeroclaw_api::media::AttachmentKind::Image);
         assert_eq!(std::fs::read(&result.workspace_path).unwrap(), png);
         assert!(Path::new(&result.workspace_path).exists());
 
         let prepared = zeroclaw_providers::multimodal::prepare_messages_for_provider(
-            &[zeroclaw_api::model_provider::ChatMessage::user(
-                result.marker,
-            )],
+            &[
+                zeroclaw_api::model_provider::ChatMessage::user("").with_attachments(vec![
+                    zeroclaw_api::media::AttachmentReference {
+                        kind: result.kind,
+                        target: result.workspace_path,
+                    },
+                ]),
+            ],
             &zeroclaw_config::schema::MultimodalConfig::default(),
         )
         .await

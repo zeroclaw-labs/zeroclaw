@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::fmt::Write;
 use std::sync::Arc;
-use zeroclaw_api::media::{MarkerKind, RenderedMarker};
+use zeroclaw_api::media::{AttachmentKind, AttachmentReference};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
@@ -247,9 +247,9 @@ impl Tool for ImageInfoTool {
             output: output.into(),
             error: None,
         }
-        .with_attachment(RenderedMarker {
+        .with_attachment(AttachmentReference {
             target: marker_path.into_owned(),
-            kind: MarkerKind::Image,
+            kind: AttachmentKind::Image,
         }))
     }
 }
@@ -345,7 +345,7 @@ mod tests {
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["path"].is_object());
         // `include_base64` was removed: the image now reaches vision models via
-        // an inline `[IMAGE:]` marker, not a bare base64 blob
+        // a structured attachment reference, not a bare base64 blob
         assert!(schema["properties"]["include_base64"].is_null());
         let required = schema["required"].as_array().unwrap();
         assert!(required.contains(&json!("path")));
@@ -568,9 +568,9 @@ mod tests {
         let marker_path = expected_marker_path(&png_path).await;
         assert_eq!(
             result.output.attachments(),
-            &[RenderedMarker {
+            &[AttachmentReference {
                 target: marker_path.clone(),
-                kind: MarkerKind::Image,
+                kind: AttachmentKind::Image,
             }],
             "expected exactly one absolute-path image attachment, got: {}",
             result.output
@@ -668,9 +668,9 @@ mod tests {
         let marker_path = expected_marker_path(&png_path).await;
         assert_eq!(
             result.output.attachments(),
-            &[RenderedMarker {
+            &[AttachmentReference {
                 target: marker_path.clone(),
-                kind: MarkerKind::Image,
+                kind: AttachmentKind::Image,
             }],
             "expected absolute-path image attachment, got: {}",
             result.output
@@ -789,9 +789,9 @@ mod tests {
         let marker_path = expected_marker_path(&png_path).await;
         assert_eq!(
             result.output.attachments(),
-            &[RenderedMarker {
+            &[AttachmentReference {
                 target: marker_path,
-                kind: MarkerKind::Image,
+                kind: AttachmentKind::Image,
             }],
             "expected absolute-path image attachment, got: {}",
             result.output

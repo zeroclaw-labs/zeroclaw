@@ -23,6 +23,7 @@ pub(crate) enum ComponentIntent {
     },
     Approval {
         token: String,
+        registration_id: uuid::Uuid,
         decision: super::approval::ApprovalDecision,
     },
 }
@@ -61,6 +62,11 @@ impl PendingComponents {
     pub(crate) fn take(&mut self, custom_id: &str) -> Option<ComponentIntent> {
         let entry = self.entries.remove(custom_id)?;
         (entry.created.elapsed() < COMPONENT_TTL).then_some(entry.intent)
+    }
+
+    pub(crate) fn get(&mut self, custom_id: &str) -> Option<&ComponentIntent> {
+        self.sweep();
+        self.entries.get(custom_id).map(|entry| &entry.intent)
     }
 
     /// Consume a live intent only when the caller's synchronous predicate

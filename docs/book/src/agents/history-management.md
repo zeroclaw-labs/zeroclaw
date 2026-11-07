@@ -76,7 +76,7 @@ fallback remains available for safety calculations, but wire clients receive no
 
 Token counts are estimated by `history::estimate_history_tokens`: roughly four
 characters per token plus four framing tokens per message. This is a heuristic,
-not a provider tokenizer. Loadable `[IMAGE:...]` markers are charged a fixed
+not a provider tokenizer. Loadable image attachments are charged a fixed
 per-image cost only in messages whose images are dispatched: user turns and the
 tool results of the current user turn. A tool result's images are the
 attachments the tool declared, not marker text in its output. Older tool

@@ -287,6 +287,7 @@ impl ModelProvider for PromptProvider {
         sent.prompts.push(system);
         sent.offered.push(offered);
         Ok(ChatResponse {
+            output_blocks: Vec::new(),
             text: Some(REPLY.into()),
             tool_calls: Vec::new(),
             usage: None,

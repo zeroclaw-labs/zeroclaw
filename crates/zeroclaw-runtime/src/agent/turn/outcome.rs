@@ -66,20 +66,7 @@ where
     MODEL_SWITCH_PROVIDER_ALLOWLIST.scope(allowed, future).await
 }
 
-#[derive(Debug)]
-pub struct ToolLoopCancelled;
-
-impl std::fmt::Display for ToolLoopCancelled {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("tool loop cancelled")
-    }
-}
-
-impl std::error::Error for ToolLoopCancelled {}
-
-pub fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
-    err.chain().any(|source| source.is::<ToolLoopCancelled>())
-}
+pub use zeroclaw_api::turn_stop::{ToolLoopCancelled, is_tool_loop_cancelled};
 
 /// The complete provider-facing request cannot fit the active model's capacity.
 #[derive(Debug)]

@@ -40,6 +40,7 @@ impl ModelProvider for EverythingFake {
             "EverythingFake chat"
         );
         Ok(ChatResponse {
+            output_blocks: Vec::new(),
             text: Some(String::new()),
             tool_calls: Vec::new(),
             usage: None,
@@ -98,6 +99,7 @@ impl ModelProvider for EverythingFake {
             "EverythingFake chat_with_tools"
         );
         Ok(ChatResponse {
+            output_blocks: Vec::new(),
             text: Some(String::new()),
             tool_calls: Vec::new(),
             usage: None,

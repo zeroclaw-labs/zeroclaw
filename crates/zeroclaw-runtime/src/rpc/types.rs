@@ -351,14 +351,14 @@ rpc_type! {
 rpc_type! {
     pub struct SessionRenameParams {
         pub session_id: String,
-        pub name: String,
+        pub title: String,
     }
 }
 
 rpc_type! {
     pub struct SessionRenameResult {
         pub session_id: String,
-        pub name: String,
+        pub title: String,
     }
 }
 
@@ -427,7 +427,6 @@ rpc_type! {
 rpc_type! {
     pub struct SessionEntry {
         pub session_id: String,
-        pub session_key: String,
         pub created_at: String,
         pub last_activity: String,
         pub message_count: usize,
@@ -436,7 +435,9 @@ rpc_type! {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub channel_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub name: Option<String>,
+        pub title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub creation_source: Option<String>,
     }
 }
 
@@ -485,6 +486,12 @@ pub enum MessageEntryKind {
 
 rpc_type! {
     pub struct MessageEntry {
+        #[serde(default,skip_serializing_if="Option::is_none")]
+        pub message_id: Option<String>,
+        #[serde(default,skip_serializing_if="Vec::is_empty")]
+        pub file_ids: Vec<String>,
+        #[serde(default,skip_serializing_if="Vec::is_empty")]
+        pub unavailable_parts: Vec<zeroclaw_api::session_events::UnavailableContentPart>,
         pub role: String,
         pub content: String,
         #[serde(default)]
@@ -519,6 +526,9 @@ rpc_type! {
     pub struct SessionDeleteResult {
         pub session_id: String,
         pub deleted: bool,
+        /// Native deletion closes the session; content erasure is a separate command.
+        #[serde(default)]
+        pub history_retained: bool,
     }
 }
 
@@ -1465,7 +1475,7 @@ rpc_type! {
     /// Result for a single file in a `file/attach` response.
     pub struct FileEntryResult {
         pub ref_id: String,
-        pub marker: String,
+        pub kind: zeroclaw_api::media::AttachmentKind,
         pub workspace_path: String,
         pub size_bytes: u64,
         pub deduplicated: bool,

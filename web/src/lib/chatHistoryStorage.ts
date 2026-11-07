@@ -1,4 +1,4 @@
-import type { SessionMessageRow } from '@/types/api';
+import type { AttachmentReference, SessionMessageRow } from '@/types/api';
 import { generateUUID } from '@/lib/uuid';
 
 const MAX_MESSAGES = 100;
@@ -8,6 +8,8 @@ export interface PersistedChatBubble {
   id: string;
   role: 'user' | 'agent';
   content: string;
+  attachments?: AttachmentReference[];
+  fileIds?: string[];
   thinking?: string;
   markdown?: boolean;
   /** Verbatim locally-composed user input — never gateway-prefixed, so the
@@ -72,6 +74,8 @@ export function mapServerMessagesToPersisted(rows: SessionMessageRow[]): Persist
         id: generateUUID(),
         role: 'user',
         content: row.content,
+        fileIds: row.files,
+        attachments: row.attachments,
         timestamp: ts,
       });
     } else if (row.role === 'assistant') {
@@ -79,6 +83,8 @@ export function mapServerMessagesToPersisted(rows: SessionMessageRow[]): Persist
         id: generateUUID(),
         role: 'agent',
         content: row.content,
+        fileIds: row.files,
+        attachments: row.attachments,
         markdown: true,
         timestamp: ts,
       });
@@ -87,6 +93,8 @@ export function mapServerMessagesToPersisted(rows: SessionMessageRow[]): Persist
         id: generateUUID(),
         role: 'agent',
         content: row.content,
+        fileIds: row.files,
+        attachments: row.attachments,
         markdown: false,
         timestamp: ts,
       });
@@ -101,6 +109,8 @@ export function persistedToUiMessages(
   id: string;
   role: 'user' | 'agent';
   content: string;
+  attachments?: AttachmentReference[];
+  fileIds?: string[];
   thinking?: string;
   markdown?: boolean;
   local?: boolean;
@@ -111,6 +121,8 @@ export function persistedToUiMessages(
     id: m.id,
     role: m.role,
     content: m.content,
+    attachments: m.attachments,
+    fileIds: m.fileIds,
     thinking: m.thinking,
     markdown: m.markdown,
     local: m.local,
@@ -124,6 +136,8 @@ export function uiMessagesToPersisted(
     id: string;
     role: 'user' | 'agent';
     content: string;
+    attachments?: AttachmentReference[];
+    fileIds?: string[];
     thinking?: string;
     markdown?: boolean;
     local?: boolean;
@@ -141,6 +155,8 @@ export function uiMessagesToPersisted(
       id: m.id,
       role: m.role,
       content: m.content,
+      attachments: m.attachments,
+      fileIds: m.fileIds,
       thinking: m.thinking,
       markdown: m.markdown,
       // Preserve the verbatim-user-input flag so reloaded bubbles still skip

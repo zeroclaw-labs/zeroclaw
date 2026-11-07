@@ -8,6 +8,9 @@ fn write_config(config_dir: &Path) {
         config_dir.join("config.toml"),
         r#"locale = "en"
 
+[channels]
+session_backend = "jsonl"
+
 [cost]
 enabled = true
 daily_limit_usd = 10.0
@@ -75,15 +78,17 @@ fn usage_record_with_unpriced_tokens(
 fn run_status(records: &[Value]) -> Output {
     let config_dir = tempfile::tempdir().unwrap();
     write_config(config_dir.path());
-    let state_dir = config_dir.path().join("data").join("state");
-    std::fs::create_dir_all(&state_dir).unwrap();
+    let ledger_path = config_dir
+        .path()
+        .join("data/sessions/session-events-jsonl/costs.jsonl");
+    std::fs::create_dir_all(ledger_path.parent().unwrap()).unwrap();
     let mut ledger = records
         .iter()
         .map(Value::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     ledger.push('\n');
-    std::fs::write(state_dir.join("costs.jsonl"), ledger).unwrap();
+    std::fs::write(ledger_path, ledger).unwrap();
 
     Command::new(env!("CARGO_BIN_EXE_zeroclaw"))
         .env("RUST_LOG", "off")

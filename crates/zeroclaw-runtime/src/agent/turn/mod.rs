@@ -356,9 +356,7 @@ fn suppress_quarantined_provider_images(
         .iter()
         .enumerate()
         .rev()
-        .find(|(_, message)| {
-            message.role == "user" && !message.content.trim_start().starts_with("[Tool results]")
-        })
+        .find(|(_, message)| message.role == "user")
         .map(|(index, message)| (index, message.clone()));
     let mut filtered =
         zeroclaw_providers::multimodal::omit_provider_image_ids(messages, quarantined);
@@ -396,9 +394,11 @@ mod provider_image_state_tests {
     use super::*;
 
     fn image_id(payload: &str) -> zeroclaw_providers::multimodal::ProviderImageId {
-        zeroclaw_providers::multimodal::provider_image_ids(&[ChatMessage::user(format!(
-            "[IMAGE:data:image/png;base64,{payload}]"
-        ))])[0]
+        zeroclaw_providers::multimodal::provider_image_ids(&[ChatMessage::user("")
+            .with_attachments(vec![zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: format!("data:image/png;base64,{payload}").to_string(),
+            }])])[0]
     }
 
     fn image_ids(prefix: &str, count: usize) -> Vec<ProviderImageId> {
@@ -496,7 +496,12 @@ mod provider_image_state_tests {
     #[test]
     fn provider_image_recovery_view_includes_newest_unaccepted_image() {
         let image = "data:image/png;base64,AAAA";
-        let messages = vec![ChatMessage::user(format!("new [IMAGE:{image}]"))];
+        let messages = vec![ChatMessage::user("new").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: image.to_string(),
+            },
+        ])];
         let submitted = zeroclaw_providers::multimodal::provider_image_ids(&messages);
 
         let (recovery_messages, replaced) =
@@ -511,22 +516,32 @@ mod provider_image_state_tests {
     fn newest_user_resubmission_bypasses_only_its_own_suppression() {
         let image = "data:image/png;base64,AAAA";
         let messages = vec![
-            ChatMessage::user(format!("old [IMAGE:{image}]")),
+            ChatMessage::user("old").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: image.to_string(),
+                },
+            ]),
             ChatMessage::assistant("retry it"),
-            ChatMessage::user(format!("new [IMAGE:{image}]")),
+            ChatMessage::user("new").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: image.to_string(),
+                },
+            ]),
         ];
         let id = image_id("AAAA");
 
         let filtered = suppress_quarantined_provider_images(&messages, &[id], true);
 
-        assert!(!filtered[0].content.contains("[IMAGE:"));
-        assert!(filtered[2].content.contains("[IMAGE:"));
+        assert!(filtered[0].attachments.is_empty());
+        assert_eq!(filtered[2].attachments, messages[2].attachments);
 
         let continued = suppress_quarantined_provider_images(&messages, &[id], false);
         assert!(
             continued
                 .iter()
-                .all(|message| !message.content.contains("[IMAGE:"))
+                .all(|message| message.attachments.is_empty())
         );
     }
 }
@@ -1157,6 +1172,58 @@ fn record_dispatch_trim(
 /// Drop at most one whole turn, then let the caller rebuild and recount the
 /// actual prepared request. Raw-history estimates cannot decide how many
 /// prepared turns fit, especially after hooks or multimodal expansion.
+async fn capture_oversized_dispatch_trim(
+    injected_memory_preamble: &mut Option<MemoryPreamble>,
+    history: &mut Vec<ChatMessage>,
+    crumb_present: &mut bool,
+    reported_tokens: u64,
+    budget: usize,
+) -> Result<PreDispatchTrimResult> {
+    use zeroclaw_api::session_events::capture::{
+        ContextTransformIntent, current_provider_admission,
+    };
+    let capture = if budget > 0 && reported_tokens > budget as u64 {
+        match current_provider_admission() {
+            Some(port) => {
+                port.begin_context_transform(ContextTransformIntent {
+                    reason_key: "pre_dispatch_budget_trim".into(),
+                    algorithm_version: "whole-turn-budget/v1".into(),
+                    budget: budget as u64,
+                })
+                .await?
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    let result = surface_oversized_dispatch_if_needed(
+        injected_memory_preamble,
+        history,
+        crumb_present,
+        reported_tokens,
+        budget,
+    );
+    if let Some(capture) = capture {
+        if result.dropped_messages > 0 {
+            capture
+                .complete_snapshot(zeroclaw_api::session_events::capture::ContextSnapshot {
+                    messages: (history.clone())
+                        .into_iter()
+                        .map(zeroclaw_api::model_provider::ConversationMessage::Chat)
+                        .collect(),
+                    history_has_trim_breadcrumb: Some(*crumb_present),
+                })
+                .await?;
+        } else {
+            capture
+                .failed("retention floor prevents local budget trim".into())
+                .await?;
+        }
+    }
+    Ok(result)
+}
+
 fn surface_oversized_dispatch_if_needed(
     injected_memory_preamble: &mut Option<MemoryPreamble>,
     history: &mut Vec<ChatMessage>,
@@ -1213,7 +1280,7 @@ async fn enforce_reported_budget(
     agent_alias: Option<&str>,
     turn_id: &str,
     // The multimodal boundary the NEXT request will re-normalize retained
-    // history through. A short `[IMAGE:...]` marker in raw history can become a
+    // history through. A short structured image attachments marker in raw history can become a
     // large base64 provider payload, so selection and the recount must describe
     // the same provider-facing population actually sent next — not the raw
     // transcript the marker-only estimate sees.
@@ -1303,7 +1370,7 @@ async fn enforce_reported_budget(
     refresh_prompt_anchor(&mut trimmed, next_use_native_tools);
     // Re-trim against the provider-facing population. The initial raw-based
     // selection can no-op (or under-trim) when image markers make the raw
-    // estimate look small: a short `[IMAGE:...]` marker in raw history becomes a
+    // estimate look small: a short structured image attachments marker in raw history becomes a
     // large base64 provider payload on the next request. Re-normalize the
     // retained set through the multimodal boundary; while the calibrated
     // prepared count still exceeds the budget, drop the oldest whole turn and
@@ -1560,11 +1627,9 @@ impl<'a> TurnState<'a> {
     /// the cursor.  Wraps `append_tool_round_to_history` + canonical sync.
     fn append_tool_round(
         &mut self,
-        assistant_history_content: String,
+        assistant_history_content: ChatMessage,
         native_tool_calls: &[zeroclaw_providers::ToolCall],
         individual_results: &[results_collect::ToolRoundResult],
-        tool_results: &str,
-        use_native_tools: bool,
     ) {
         let from = self.history.len();
         crate::agent::turn::history_append::append_tool_round_to_history(
@@ -1572,8 +1637,6 @@ impl<'a> TurnState<'a> {
             assistant_history_content,
             native_tool_calls,
             individual_results,
-            tool_results,
-            use_native_tools,
         );
         if let Some(ref mut canonical) = self.canonical {
             canonical.extend_from_slice(&self.history[from..]);
@@ -1654,7 +1717,89 @@ pub fn run_tool_call_loop(
     run_tool_call_loop_impl(p, None, None, None)
 }
 
-async fn run_tool_call_loop_impl<'a>(
+fn run_tool_call_loop_impl<'a>(
+    p: ToolLoop<'a>,
+    initial_ingress: Option<InitialIngressSubject<'a>>,
+    seed_reported_usage: Option<ReportedRequestUsage>,
+    repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
+) -> futures_util::future::BoxFuture<'a, Result<String>> {
+    Box::pin(async move {
+        use zeroclaw_api::session_events::capture::{
+            EngineTurnInput, current_provider_admission, current_session_execution,
+        };
+        if current_provider_admission().is_none()
+            && let Some(port) = current_session_execution()
+        {
+            let input = EngineTurnInput {
+                execution_workspace: None,
+                reply_route: None,
+                turn_id: p.turn_id.to_owned(),
+                agent_alias: p.agent_alias.map(str::to_owned),
+                ingress: p.ingress.clone(),
+                parts: zeroclaw_api::session_events::capture::EngineInputPart::text_and_files(
+                    p.memory
+                        .as_ref()
+                        .map(|memory| memory.query.clone())
+                        .or_else(|| {
+                            p.history
+                                .iter()
+                                .rev()
+                                .find(|message| message.role == "user")
+                                .map(|message| message.content.clone())
+                        })
+                        .ok_or_else(|| {
+                            anyhow::Error::msg("session turn has no observed user input")
+                        })?,
+                    vec![],
+                ),
+                provider_ref: p.exec.model_access.provider_name.to_owned(),
+                model: p.exec.model_access.model.to_owned(),
+            };
+            let history = p.history;
+            let crumb = p.history_has_trim_breadcrumb;
+            let engine = async move {
+                let result = run_tool_call_loop_inner(
+                    ToolLoop {
+                        history: &mut *history,
+                        history_has_trim_breadcrumb: &mut *crumb,
+                        ..p
+                    },
+                    initial_ingress,
+                    seed_reported_usage,
+                    repetition_guard,
+                )
+                .await;
+                if let Some(admission) = current_provider_admission() {
+                    use zeroclaw_api::session_events::capture::{
+                        ContextSnapshot, ContextTransformIntent,
+                    };
+                    let transform = admission
+                        .begin_context_transform(ContextTransformIntent {
+                            reason_key: "turn_history_projection".into(),
+                            algorithm_version: "engine-history/v1".into(),
+                            budget: 0,
+                        })
+                        .await?
+                        .ok_or_else(|| anyhow::Error::msg("native context capture missing"))?;
+                    transform
+                        .complete_snapshot(ContextSnapshot {
+                            messages: (history.clone())
+                                .into_iter()
+                                .map(zeroclaw_api::model_provider::ConversationMessage::Chat)
+                                .collect(),
+                            history_has_trim_breadcrumb: Some(*crumb),
+                        })
+                        .await?;
+                }
+                result
+            };
+            return port.execute(input, Box::pin(engine)).await;
+        }
+        run_tool_call_loop_inner(p, initial_ingress, seed_reported_usage, repetition_guard).await
+    })
+}
+
+async fn run_tool_call_loop_inner<'a>(
     mut p: ToolLoop<'a>,
     initial_ingress: Option<InitialIngressSubject<'a>>,
     seed_reported_usage: Option<ReportedRequestUsage>,
@@ -2025,8 +2170,8 @@ async fn run_tool_call_loop_impl<'a>(
                     // (do not append it) when it is.
                     IngressDecision::Drop { .. } => continue,
                 }
-                let msg = ChatMessage::user(steering_input.into_text());
-                has_new_user_input |= !msg.content.trim_start().starts_with("[Tool results]");
+                let msg = steering_input.into_message();
+                has_new_user_input |= msg.role != "tool";
                 turn_state.push_dual(msg);
             }
         }
@@ -2253,7 +2398,9 @@ async fn run_tool_call_loop_impl<'a>(
             && provider_request_messages
                 .iter()
                 .zip(pre_hook_messages.iter())
-                .all(|(a, b)| a.role == b.role && a.content == b.content);
+                .all(|(a, b)| {
+                    a.role == b.role && a.content == b.content && a.timestamp == b.timestamp
+                });
         let hook_suffix = if hook_appended_suffix_only {
             provider_request_messages[pre_hook_messages.len()..].to_vec()
         } else {
@@ -2464,13 +2611,14 @@ async fn run_tool_call_loop_impl<'a>(
         // rebuilt post-hook request re-measured below is authoritative. A
         // floor is fatal only when the rebuilt request exceeds model capacity.
         // A newest turn above the proactive target can still be dispatched.
-        let mut trim_result = surface_oversized_dispatch_if_needed(
+        let mut trim_result = capture_oversized_dispatch_trim(
             injected_memory_preamble,
             turn_state.history,
             &mut turn_state.crumb_present,
             tokens_before_dispatch,
             trim_budget,
-        );
+        )
+        .await?;
         *history_has_trim_breadcrumb = turn_state.crumb_present;
         let history_was_trimmed = turn_state.history.len() != history_len_before
             || turn_state.crumb_present != crumb_before;
@@ -2502,9 +2650,9 @@ async fn run_tool_call_loop_impl<'a>(
             let mut tokens_after_dispatch = tokens_before_dispatch;
             let max_iterations = crate::agent::history_trim::count_turns(turn_state.history) + 1;
             for _ in 0..max_iterations {
-                // Wire roles cannot identify turns: prompt-mode results are
-                // plain user messages. Remove precisely the durable source
-                // span, preserving prepared media and the hook suffix.
+                // The wire projection may change roles for text-only
+                // providers, so remove the durable source span from the
+                // structured history and preserve prepared media and hooks.
                 let removed_rows =
                     original_body_start..original_body_start + total_dropped_messages;
                 let mut trimmed_post_hook: Vec<_> = post_hook_snapshot
@@ -2568,13 +2716,14 @@ async fn run_tool_call_loop_impl<'a>(
                 // heuristic that decided the previous round stopped early.
                 let before_len = turn_state.history.len();
                 let before_crumb = turn_state.crumb_present;
-                trim_result = surface_oversized_dispatch_if_needed(
+                trim_result = capture_oversized_dispatch_trim(
                     injected_memory_preamble,
                     turn_state.history,
                     &mut turn_state.crumb_present,
                     tokens_after_dispatch,
                     trim_budget,
-                );
+                )
+                .await?;
                 *history_has_trim_breadcrumb = turn_state.crumb_present;
                 total_dropped_messages += trim_result.dropped_messages;
                 dropped_turns += usize::from(trim_result.dropped_messages > 0);
@@ -2812,6 +2961,18 @@ async fn run_tool_call_loop_impl<'a>(
             );
         }
 
+        use zeroclaw_api::session_events::capture::{
+            ProviderRouteSource, scope_provider_route_source,
+        };
+        let route_source = if hook_selected_model.is_some() {
+            ProviderRouteSource::BeforeCallHook
+        } else if vision_model_provider_box.is_some() {
+            ProviderRouteSource::Vision
+        } else if dispatch_model.starts_with("hint:") {
+            ProviderRouteSource::Routing
+        } else {
+            ProviderRouteSource::Configured
+        };
         let ProviderCallOutcome {
             chat_result,
             attempts,
@@ -2820,25 +2981,28 @@ async fn run_tool_call_loop_impl<'a>(
             streamed_protocol_suppressed,
             streamed_visible_text,
             image_recovery_succeeded,
-        } = call_provider(
-            &ctx,
-            active_model_provider,
-            active_model_provider_name,
-            provider_request_model,
-            provider_dispatch_model,
-            zeroclaw_api::model_provider::ChatRequest {
-                messages: &provider_request_messages,
-                tools: request_tools,
-                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                    .try_with(Clone::clone)
-                    .ok()
-                    .flatten(),
-            },
-            image_recovery_messages.as_deref(),
-            should_consume_provider_stream,
-            policy,
-            iteration,
-            use_native_tools.then_some(iteration_tool_specs.tool_specs.as_slice()),
+        } = scope_provider_route_source(
+            route_source,
+            call_provider(
+                &ctx,
+                active_model_provider,
+                active_model_provider_name,
+                provider_request_model,
+                provider_dispatch_model,
+                zeroclaw_api::model_provider::ChatRequest {
+                    messages: &provider_request_messages,
+                    tools: request_tools,
+                    thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                        .try_with(Clone::clone)
+                        .ok()
+                        .flatten(),
+                },
+                image_recovery_messages.as_deref(),
+                should_consume_provider_stream,
+                policy,
+                iteration,
+                use_native_tools.then_some(iteration_tool_specs.tool_specs.as_slice()),
+            ),
         )
         .await?;
         let accepted_request_messages = if image_recovery_succeeded {
@@ -2993,7 +3157,7 @@ async fn run_tool_call_loop_impl<'a>(
                     turn_id,
                     &mut turn_state.crumb_present,
                 )
-                .await;
+                .await?;
                 if recovered.recovered() {
                     continue;
                 }
@@ -3355,6 +3519,7 @@ async fn run_tool_call_loop_impl<'a>(
             mut executable_indices,
             mut executable_calls,
             mut stream_calls,
+            capture_handles,
         } = prepare_tool_calls(
             &ctx,
             tools_registry,
@@ -3393,12 +3558,13 @@ async fn run_tool_call_loop_impl<'a>(
                             repetition::call_signature(&name, &call.arguments) == warned_call
                         });
                 if recovery && recovery_admitted {
-                    call_prep::abandon_unexecuted_prepared_contexts(
+                    let _ = call_prep::abandon_unexecuted_prepared_contexts(
                         &ctx,
                         iteration,
                         &[call_idx],
                         std::slice::from_ref(&call),
                         &[],
+                        &capture_handles,
                     )
                     .await;
                     let outcome = crate::agent::tool_execution::ToolExecutionOutcome {
@@ -3491,6 +3657,10 @@ async fn run_tool_call_loop_impl<'a>(
             knobs.provider_attempt_allowlist.clone(),
             execution,
         );
+        let execution = zeroclaw_api::session_events::capture::scope_tool_batch(
+            capture_handles.clone(),
+            execution,
+        );
         let execution_result = match shared_budget.clone() {
             Some(budget) => ExecutionTreeBudget::scope(budget, Box::pin(execution)).await,
             None => execution.await,
@@ -3510,8 +3680,9 @@ async fn run_tool_call_loop_impl<'a>(
                     &executable_indices,
                     &executable_calls,
                     &[],
+                    &capture_handles,
                 )
-                .await;
+                .await?;
                 return Err(e);
             }
         };
@@ -3578,8 +3749,9 @@ async fn run_tool_call_loop_impl<'a>(
                 &executable_indices,
                 &executable_calls,
                 &executed_completed_indices,
+                &capture_handles,
             )
-            .await;
+            .await?;
             for (idx, call) in tool_calls.iter().enumerate() {
                 if ordered_results[idx].is_none() {
                     ordered_results[idx] = Some((
@@ -3629,7 +3801,6 @@ async fn run_tool_call_loop_impl<'a>(
 
         let CollectedResults {
             individual_results,
-            tool_results,
             detection_relevant_output,
         } = collect_tool_results(
             ordered_results,
@@ -3661,8 +3832,6 @@ async fn run_tool_call_loop_impl<'a>(
             assistant_history_content,
             &native_tool_calls,
             &individual_results,
-            &tool_results,
-            use_native_tools,
         );
 
         if cancelled_mid_batch {
@@ -4169,7 +4338,6 @@ pub(crate) async fn assemble_owned_execution_with_capabilities(
             execution_capability: execution_admission
                 .as_ref()
                 .map(AgentExecutionAdmission::capability),
-            acp_sessions: None,
         })?,
         None => crate::tools::supplied_registry_base()?,
     };
@@ -4233,15 +4401,19 @@ pub(crate) async fn assemble_owned_execution_with_capabilities(
                 "SOP step agent '{alias}' has no resolved model provider"
             ))
         })?;
-    let (model_provider, provider_name, model, _model_route_resolver) =
-        crate::agent::agent::build_session_model_provider_with_capabilities(
-            capabilities,
-            config,
-            alias,
-            &provider_ref,
-            None,
-            principal,
-        )?;
+    let zeroclaw_providers::factory::SessionModelProvider {
+        provider: model_provider,
+        provider_ref: provider_name,
+        model,
+        ..
+    } = crate::agent::agent::build_session_model_provider_with_capabilities(
+        capabilities,
+        config,
+        alias,
+        &provider_ref,
+        None,
+        principal,
+    )?;
     // The step agent's own configured temperature — the same source the
     // headless driver reads for `crate::agent::run`.
     let temperature = config
@@ -5800,7 +5972,7 @@ mod reported_budget_tests {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
 
         // `estimate_history_tokens` now charges the same fixed per-image cost
-        // whether a `[IMAGE:...]` marker holds a path or the base64 payload
+        // whether a structured image attachments marker holds a path or the base64 payload
         // preparation resolves it to, so the raw and prepared populations for
         // this history are equal by design (see `IMAGE_TOKEN_ESTIMATE`).
         // Selection and the emitted recount must still describe the
@@ -5818,11 +5990,14 @@ mod reported_budget_tests {
             STANDARD.decode(PNG_B64).expect("valid PNG fixture"),
         )
         .unwrap();
-        let marker = format!("[IMAGE:{}]", image_path.display());
+        let attachment = zeroclaw_api::media::AttachmentReference {
+            kind: zeroclaw_api::media::AttachmentKind::Image,
+            target: image_path.display().to_string(),
+        };
         let big = "x".repeat(2000);
         let mut history = vec![
             ChatMessage::system("system"),
-            ChatMessage::user(format!("turn1 {marker}")),
+            ChatMessage::user("turn1").with_attachments(vec![attachment]),
             ChatMessage::assistant("a1".to_string()),
             ChatMessage::user(format!("turn2 {big}")),
             ChatMessage::assistant("a2".to_string()),
@@ -6689,7 +6864,12 @@ mod active_route_context_tests {
             ChatMessage::system("system"),
             ChatMessage::user(format!("old question {large}")),
             ChatMessage::assistant(format!("old answer {large}")),
-            ChatMessage::user("inspect [IMAGE:/tmp/image.png]"),
+            ChatMessage::user("inspect").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: "/tmp/image.png".to_string(),
+                },
+            ]),
         ];
         let tokens_before = crate::agent::history::estimate_history_tokens(&history);
         assert!(tokens_before < text_limits.context_token_budget);
@@ -6739,6 +6919,7 @@ mod active_route_context_tests {
         };
         let call_ctx = base_ctx.for_route("custom.vision", "vision-model", vision_limits);
         let response = ChatResponse {
+            output_blocks: Vec::new(),
             text: Some("done".to_string()),
             tool_calls: Vec::new(),
             usage: Some(TokenUsage {
@@ -6968,6 +7149,7 @@ vision_model_provider = "custom.vision"
                 let n = self.calls.fetch_add(1, Ordering::SeqCst);
                 if n == 0 {
                     Ok(ChatResponse {
+                        output_blocks: Vec::new(),
                         text: None,
                         tool_calls: vec![ToolCall {
                             id: "c1".into(),
@@ -6980,6 +7162,7 @@ vision_model_provider = "custom.vision"
                     })
                 } else {
                     Ok(ChatResponse {
+                        output_blocks: Vec::new(),
                         text: Some("text follow-up".into()),
                         tool_calls: Vec::new(),
                         usage: None,
@@ -7021,9 +7204,9 @@ vision_model_provider = "custom.vision"
                 // The producer declares its image; under the attachment
                 // contract nothing in the result text is promoted.
                 Ok(ToolResult::ok("here it is").with_attachment(
-                    zeroclaw_api::media::RenderedMarker {
+                    zeroclaw_api::media::AttachmentReference {
                         target: self.path.clone(),
-                        kind: zeroclaw_api::media::MarkerKind::Image,
+                        kind: zeroclaw_api::media::AttachmentKind::Image,
                     },
                 ))
             }
@@ -7865,6 +8048,7 @@ mod sop_step_reassembly_tests {
             _temperature: Option<f64>,
         ) -> Result<ChatResponse> {
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(String::new()),
                 tool_calls: vec![ToolCall {
                     id: "c1".into(),
@@ -7943,6 +8127,7 @@ mod sop_step_reassembly_tests {
             _temperature: Option<f64>,
         ) -> Result<ChatResponse> {
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("done".to_string()),
                 tool_calls: Vec::new(),
                 usage: None,
@@ -8008,6 +8193,7 @@ mod sop_step_reassembly_tests {
                 temperature,
             ));
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("child-done".to_string()),
                 tool_calls: Vec::new(),
                 usage: None,
@@ -8338,6 +8524,7 @@ mod sop_step_reassembly_tests {
         ) -> Result<ChatResponse> {
             if request.tools.is_none_or(<[_]>::is_empty) {
                 return Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("local-cap-summary".into()),
                     tool_calls: Vec::new(),
                     usage: None,
@@ -8346,6 +8533,7 @@ mod sop_step_reassembly_tests {
             }
 
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(String::new()),
                 tool_calls: vec![ToolCall {
                     id: "budget-call".into(),
@@ -8509,8 +8697,23 @@ mod sop_step_reassembly_tests {
                 })
             }
         }
-        let carrier = r#"{"content":null,"tool_calls":[{"id":"call_parent","name":"echo","arguments":"{\"text\":\"hi\"}"}]}"#;
-        let result = r#"{"tool_call_id":"call_parent","content":"echo: hi"}"#;
+        let carrier = ChatMessage::assistant_tool_calls(
+            "",
+            vec![zeroclaw_api::model_provider::ToolCall {
+                id: "call_parent".into(),
+                name: "echo".into(),
+                arguments: r#"{"text":"hi"}"#.into(),
+                extra_content: None,
+            }],
+            None,
+        );
+        let result = ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+            tool_call_id: "call_parent".into(),
+            tool_name: "echo".into(),
+            content: "echo: hi".into(),
+            success: Some(true),
+            attachments: vec![],
+        });
         let step_prompt = "[SOP: Deploy (run r1) — Step 1 of 1]\n\nCurrent step: **report**\nWhen done, report your result.\n";
         let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
             NamedEchoTool,
@@ -8523,8 +8726,8 @@ mod sop_step_reassembly_tests {
             };
             let mut history = vec![
                 ChatMessage::user("parent request"),
-                ChatMessage::assistant(carrier),
-                ChatMessage::tool(result),
+                carrier.clone(),
+                result.clone(),
                 ChatMessage::user(interrupting_row),
                 ChatMessage::assistant("step done"),
                 ChatMessage::user("[Tool call parse error]\nresume"),
@@ -8545,8 +8748,10 @@ mod sop_step_reassembly_tests {
             .expect("the resumed parent completes");
             let captured = requests.lock().expect("capture lock");
             let sent = &captured[0].0;
-            let has_call = sent.iter().any(|m| m.content == carrier);
-            let has_result = sent.iter().any(|m| m.role == "tool" && m.content == result);
+            let has_call = sent.iter().any(|m| !m.tool_calls.is_empty());
+            let has_result = sent
+                .iter()
+                .any(|m| m.role == "tool" && m.content == result.content);
             assert_eq!(
                 (has_call, has_result),
                 (must_keep, must_keep),
@@ -8599,12 +8804,15 @@ mod sop_step_reassembly_tests {
                     request
                         .messages
                         .iter()
-                        .any(|m| m.content.contains("data:image/png;base64,")),
+                        .any(|m| m.attachments.iter().any(|attachment| attachment
+                            .target
+                            .starts_with("data:image/png;base64,"))),
                     self.2,
                     "summary must apply quarantine for the hook-selected model"
                 );
                 assert!(request.messages.iter().any(|m| m.content == "hook-rewrite"));
                 Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("prepared summary".into()),
                     tool_calls: vec![],
                     usage: None,
@@ -8629,7 +8837,9 @@ mod sop_step_reassembly_tests {
                 assert!(
                     messages
                         .iter()
-                        .any(|m| m.content.contains("data:image/png;base64,")),
+                        .any(|m| m.attachments.iter().any(|attachment| attachment
+                            .target
+                            .starts_with("data:image/png;base64,"))),
                     "hooks must see prepared images"
                 );
                 if self.cancel {
@@ -8656,11 +8866,16 @@ mod sop_step_reassembly_tests {
             ],
         )
         .unwrap();
-        let prompt = format!("describe [IMAGE:{}]", image.display());
+        let prompt = ChatMessage::user("describe").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (image.display()).to_string(),
+            },
+        ]);
         let multimodal = zeroclaw_config::schema::MultimodalConfig::default();
         let mut id_cache = zeroclaw_providers::multimodal::LocalImageCache::new();
         let prepared = prepare_messages_for_iteration(
-            &[ChatMessage::user(prompt.clone())],
+            std::slice::from_ref(&prompt),
             &multimodal,
             false,
             Some(&mut id_cache),
@@ -8693,7 +8908,7 @@ mod sop_step_reassembly_tests {
                 change_model,
             }));
             let budget = ExecutionTreeBudget::root(1);
-            let mut history = vec![ChatMessage::user(prompt.clone())];
+            let mut history = vec![prompt.clone()];
             let mut image_cache = zeroclaw_providers::multimodal::LocalImageCache::new();
             let mut provider_image_state = ProviderImageState::default();
             provider_image_state.record_recovery(
@@ -8732,7 +8947,7 @@ mod sop_step_reassembly_tests {
                 assert!(!response.contains("maximum tool iterations"));
             }
             assert_eq!(
-                history[0].content, prompt,
+                history[0].content, prompt.content,
                 "preparation must not rewrite durable user history"
             );
             assert_eq!(
@@ -8741,7 +8956,7 @@ mod sop_step_reassembly_tests {
                 "hook cancellation must prevent dispatch"
             );
         }
-        let mut history = vec![ChatMessage::user(prompt)];
+        let mut history = vec![prompt.clone()];
         let result = run_budgeted_test_loop_with_hooks(
             &TextProvider,
             &mut history,
@@ -9874,8 +10089,8 @@ mod sop_step_reassembly_tests {
     #[tokio::test]
     async fn a_same_agent_step_in_a_bound_loop_routes_vision_through_the_binding() {
         use crate::composition::test_support::{
-            IMAGE_TURN, VISION_REFUSAL, VISION_REPLY, VisionRouteProviders,
-            capabilities_with_providers, counting_endpoint,
+            VISION_REFUSAL, VISION_REPLY, VisionRouteProviders, capabilities_with_providers,
+            counting_endpoint, image_turn,
         };
 
         let principal =
@@ -9909,10 +10124,12 @@ mod sop_step_reassembly_tests {
                 capabilities: capabilities_with_providers(Arc::clone(&providers) as _),
                 principal: Some(principal.clone()),
             };
-            let (engine, run_id, action) = start_single_same_agent_step(IMAGE_TURN);
+            let (engine, run_id, action) =
+                start_single_same_agent_step("describe the supplied image");
             let parent_tools =
                 crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
             let mut history = vec![ChatMessage::system("helper system prompt")];
+            history.push(image_turn());
             let mut exec_cache = std::collections::HashMap::new();
 
             drive_step_full(
@@ -10704,6 +10921,7 @@ mod sop_step_reassembly_tests {
             _temperature: Option<f64>,
         ) -> Result<ChatResponse> {
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(String::new()),
                 tool_calls: vec![ToolCall {
                     id: "00000000-0000-0000-0000-000000000099".into(),
@@ -11065,6 +11283,7 @@ mod tool_lifecycle_abandonment_tests {
 
     fn text_response() -> ChatResponse {
         ChatResponse {
+            output_blocks: Vec::new(),
             text: Some("done".to_string()),
             tool_calls: Vec::new(),
             usage: None,
@@ -11413,12 +11632,12 @@ mod tool_lifecycle_abandonment_tests {
             requests: Mutex::new(Vec::new()),
             error_message: "rejected request",
         };
-        let retained_user = "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]";
+        let retained_user = ChatMessage::user("inspect").with_attachments(vec![zeroclaw_api::media::AttachmentReference { kind: zeroclaw_api::media::AttachmentKind::Image, target: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC".to_string() }]);
         let mut history = vec![
             ChatMessage::system("You are helpful."),
             ChatMessage::user(format!("discarded-old-turn {}", "old ".repeat(10_000))),
             ChatMessage::assistant("old answer"),
-            ChatMessage::user(retained_user),
+            retained_user.clone(),
         ];
         let mut cache = zeroclaw_providers::multimodal::LocalImageCache::new();
         let mut provider_state = ProviderImageState::default();
@@ -11466,11 +11685,9 @@ mod tool_lifecycle_abandonment_tests {
                 .iter()
                 .all(|m| !m.content.contains("discarded-old-turn"))
         );
-        assert!(
-            history
-                .iter()
-                .any(|m| m.role == "user" && m.content == retained_user)
-        );
+        assert!(history.iter().any(|m| m.role == "user"
+            && m.content == retained_user.content
+            && m.attachments == retained_user.attachments));
     }
 
     #[tokio::test]
@@ -11480,11 +11697,8 @@ mod tool_lifecycle_abandonment_tests {
                 requests: Mutex::new(Vec::new()),
                 error_message: "rejected request",
             };
-            let user = "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]";
-            let mut history = vec![
-                ChatMessage::system("You are helpful."),
-                ChatMessage::user(user),
-            ];
+            let user = ChatMessage::user("inspect").with_attachments(vec![zeroclaw_api::media::AttachmentReference { kind: zeroclaw_api::media::AttachmentKind::Image, target: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC".to_string() }]);
+            let mut history = vec![ChatMessage::system("You are helpful."), user.clone()];
             let mut cache = zeroclaw_providers::multimodal::LocalImageCache::new();
             let mut provider_state = ProviderImageState::default();
             let registry = registry_with(Vec::new());
@@ -11527,11 +11741,9 @@ mod tool_lifecycle_abandonment_tests {
                 let error = result.expect_err("stateless callers keep the original error");
                 assert!(error.to_string().contains("rejected request"));
             }
-            assert!(
-                history
-                    .iter()
-                    .any(|message| message.role == "user" && message.content == user)
-            );
+            assert!(history.iter().any(|message| message.role == "user"
+                && message.content == user.content
+                && message.attachments == user.attachments));
             assert!(
                 history
                     .iter()
@@ -11547,12 +11759,12 @@ mod tool_lifecycle_abandonment_tests {
             requests: Mutex::new(Vec::new()),
             error_message: "prompt is too long",
         };
-        let user = "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]";
+        let user = ChatMessage::user("inspect").with_attachments(vec![zeroclaw_api::media::AttachmentReference { kind: zeroclaw_api::media::AttachmentKind::Image, target: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC".to_string() }]);
         let mut history = vec![
             ChatMessage::system("You are helpful."),
             ChatMessage::user(format!("old-context {}", "old ".repeat(10_000))),
             ChatMessage::assistant("old answer"),
-            ChatMessage::user(user),
+            user.clone(),
         ];
         let mut cache = zeroclaw_providers::multimodal::LocalImageCache::new();
         let mut provider_state = ProviderImageState::default();
@@ -11596,11 +11808,9 @@ mod tool_lifecycle_abandonment_tests {
         );
         let route = ProviderImageState::route("scripted", "scripted-model");
         assert!(provider_state.quarantined(&route).is_empty());
-        assert!(
-            history
-                .iter()
-                .any(|message| message.role == "user" && message.content == user)
-        );
+        assert!(history.iter().any(|message| message.role == "user"
+            && message.content == user.content
+            && message.attachments == user.attachments));
     }
 
     #[tokio::test]
@@ -11696,6 +11906,7 @@ mod tool_lifecycle_abandonment_tests {
         let runner = lifecycle_runner(Arc::clone(&events), Vec::new());
         let provider = ScriptedProvider {
             responses: Mutex::new(vec![ChatResponse {
+                output_blocks: Vec::new(),
                 text: None,
                 tool_calls: vec![
                     tool_call("call-a", "echo_first", serde_json::json!({"n": 1})),
@@ -11749,6 +11960,7 @@ mod tool_lifecycle_abandonment_tests {
         let runner = lifecycle_runner(Arc::clone(&events), Vec::new());
         let provider = ScriptedProvider {
             responses: Mutex::new(vec![ChatResponse {
+                output_blocks: Vec::new(),
                 text: None,
                 tool_calls: vec![tool_call(
                     "call-1",
@@ -11797,6 +12009,7 @@ mod tool_lifecycle_abandonment_tests {
         let token = CancellationToken::new();
         let provider = ScriptedProvider {
             responses: Mutex::new(vec![ChatResponse {
+                output_blocks: Vec::new(),
                 text: None,
                 tool_calls: vec![
                     tool_call("call-a", "interrupt_tool", serde_json::json!({"n": 1})),
@@ -11966,6 +12179,7 @@ mod tool_lifecycle_abandonment_tests {
         let token = CancellationToken::new();
         let provider = ScriptedProvider {
             responses: Mutex::new(vec![ChatResponse {
+                output_blocks: Vec::new(),
                 text: None,
                 tool_calls: vec![tool_call(
                     "call-a",

@@ -264,82 +264,26 @@ fn looks_like_failure(content: &str) -> bool {
 }
 
 pub fn extract_skill_executions_from_history(history: &[ChatMessage]) -> Vec<(String, bool)> {
-    let mut results: Vec<(String, bool)> = Vec::new();
+    let mut results = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
-    for (i, msg) in history.iter().enumerate() {
-        let content = &msg.content;
-
-        // Format 1: XML <tool_result name="slug.tool">…</tool_result>.
-        let open_marker = "<tool_result name=\"";
-        let close_marker = "</tool_result>";
-        let mut pos = 0;
-        while pos < content.len() {
-            let Some(start) = content[pos..].find(open_marker) else {
-                break;
-            };
-            let abs = pos + start + open_marker.len();
-            let Some(end) = content[abs..].find('"') else {
-                break;
-            };
-            let name = &content[abs..abs + end];
-            if let Some(dot_pos) = name.find('.') {
-                let slug = name[..dot_pos].to_string();
-                let after_tag = abs + end + 1;
-                let body_start = content[after_tag..].find('>').map(|p| after_tag + p + 1);
-                let body_end = content[after_tag..].find(close_marker);
-                let body = match (body_start, body_end) {
-                    (Some(s), Some(e)) if s <= after_tag + e => &content[s..after_tag + e],
-                    _ => "",
-                };
-                let succeeded = !looks_like_failure(body);
-                let key = (slug.clone(), succeeded);
-                if seen.insert(key) {
-                    results.push((slug, succeeded));
-                }
-            }
-            pos = abs + end + 1;
+    for message in history {
+        let Some(result) = message.tool_result.as_ref() else {
+            continue;
+        };
+        let Some(dot_pos) = result.tool_name.find('.') else {
+            continue;
+        };
+        let slug = result.tool_name[..dot_pos].to_string();
+        if slug.is_empty() {
+            continue;
         }
-
-        // Format 2: native tool-role message preceded by an assistant message
-        // whose JSON tool-call carries a dotted `"name": "slug.tool"`.
-        if msg.role == "tool" && i > 0 {
-            let prev = &history[i - 1];
-            if prev.role == "assistant" {
-                let prev_content = &prev.content;
-                let name_marker = "\"name\"";
-                let mut pos = 0;
-                while pos < prev_content.len() {
-                    let Some(start) = prev_content[pos..].find(name_marker) else {
-                        break;
-                    };
-                    let after = pos + start + name_marker.len();
-                    let rest = prev_content[after..].trim_start();
-                    let Some(rest) = rest.strip_prefix(':') else {
-                        pos = after + 1;
-                        continue;
-                    };
-                    let rest = rest.trim_start();
-                    let Some(rest) = rest.strip_prefix('"') else {
-                        pos = after + 1;
-                        continue;
-                    };
-                    let Some(end) = rest.find('"') else {
-                        break;
-                    };
-                    let name = &rest[..end];
-                    if let Some(dot_pos) = name.find('.') {
-                        let slug = name[..dot_pos].to_string();
-                        let succeeded = !looks_like_failure(content);
-                        let key = (slug.clone(), succeeded);
-                        if seen.insert(key) {
-                            results.push((slug, succeeded));
-                        }
-                    }
-                    let consumed = prev_content.len() - rest.len() + end + 1;
-                    pos = consumed;
-                }
-            }
+        let succeeded = result
+            .success
+            .unwrap_or_else(|| !looks_like_failure(&message.content));
+        let key = (slug.clone(), succeeded);
+        if seen.insert(key) {
+            results.push((slug, succeeded));
         }
     }
 
@@ -640,24 +584,32 @@ mod tests {
     // ── History extraction ──────────────────────────────────
 
     #[test]
-    fn extract_executions_xml_marks_failure() {
+    fn extract_executions_typed_result_marks_failure() {
         let history = vec![
             ChatMessage::user("run my-skill"),
-            ChatMessage::assistant(
-                "<tool_result name=\"my-skill.run\">Error: command not found</tool_result>",
-            ),
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "call-1".into(),
+                tool_name: "my-skill.run".into(),
+                success: Some(false),
+                content: "Error: command not found".into(),
+                attachments: Vec::new(),
+            }),
         ];
         let executions = extract_skill_executions_from_history(&history);
         assert_eq!(executions, vec![("my-skill".to_string(), false)]);
     }
 
     #[test]
-    fn extract_executions_xml_marks_success() {
+    fn extract_executions_typed_result_marks_success() {
         let history = vec![
             ChatMessage::user("run my-skill"),
-            ChatMessage::assistant(
-                "<tool_result name=\"my-skill.run\">Done. Wrote 3 files.</tool_result>",
-            ),
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "call-1".into(),
+                tool_name: "my-skill.run".into(),
+                success: Some(true),
+                content: "Done. Wrote 3 files.".into(),
+                attachments: Vec::new(),
+            }),
         ];
         let executions = extract_skill_executions_from_history(&history);
         assert_eq!(executions, vec![("my-skill".to_string(), true)]);
@@ -668,17 +620,20 @@ mod tests {
         let history = vec![
             ChatMessage::user("run it"),
             ChatMessage::assistant("{\"tool_calls\": [{\"name\": \"deploy.run\", \"args\": {}}]}"),
-            ChatMessage {
-                role: "tool".into(),
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "deploy-call".into(),
+                tool_name: "deploy.run".into(),
+                success: Some(false),
                 content: "Error: connection refused".into(),
-            },
+                attachments: Vec::new(),
+            }),
         ];
         let executions = extract_skill_executions_from_history(&history);
         assert_eq!(executions, vec![("deploy".to_string(), false)]);
     }
 
     #[test]
-    fn extract_slugs_dedupes() {
+    fn literal_protocol_text_is_not_reclassified() {
         let history = vec![
             ChatMessage::user("run my-skill"),
             ChatMessage::assistant(
@@ -686,7 +641,6 @@ mod tests {
                  <tool_result name=\"my-skill.run\">Error</tool_result>",
             ),
         ];
-        let slugs = extract_skill_slugs_from_history(&history);
-        assert_eq!(slugs, vec!["my-skill".to_string()]);
+        assert!(extract_skill_slugs_from_history(&history).is_empty());
     }
 }

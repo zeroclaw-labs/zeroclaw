@@ -36,6 +36,9 @@ pub struct TurnRoutingEntry {
     pub modality: OutputModality,
     /// Explicit recipient override. `None` = inherit from `msg.reply_target`.
     pub recipient: Option<String>,
+    /// Files explicitly selected for this reply by the delivery tool.
+    pub attachments: Vec<zeroclaw_api::media::MediaAttachment>,
+    pub locations: Vec<zeroclaw_api::media::LocationAttachment>,
 }
 
 /// Handle to one turn's routing state. The orchestrator creates a fresh handle
@@ -112,6 +115,89 @@ impl SendViaTool {
         } else {
             false
         }
+    }
+
+    fn load_attachments(
+        security: &SecurityPolicy,
+        value: Option<&serde_json::Value>,
+    ) -> anyhow::Result<Vec<zeroclaw_api::media::MediaAttachment>> {
+        use crate::helpers::filesystem_boundary::{open_absolute_dir_nofollow, open_file_nofollow};
+        use std::io::Read;
+        use zeroclaw_api::media::{AttachmentReference, MediaAttachment};
+        let Some(value) = value else {
+            return Ok(Vec::new());
+        };
+        let items: Vec<AttachmentReference> = serde_json::from_value(value.clone())?;
+        items
+            .iter()
+            .map(|item| {
+                if let Ok(url) = reqwest::Url::parse(&item.target)
+                    && matches!(url.scheme(), "http" | "https")
+                {
+                    // The selected channel owns remote-URL support and policy.
+                    // Do not fetch the URL or reinterpret its target here.
+                    return Ok(MediaAttachment {
+                        file_name: url
+                            .path_segments()
+                            .and_then(|mut segments| segments.next_back())
+                            .filter(|name| !name.is_empty())
+                            .unwrap_or("attachment")
+                            .to_string(),
+                        reference: Some(item.clone()),
+                        ..Default::default()
+                    });
+                }
+                let path = item.target.as_str();
+                if !security.is_path_allowed(path) {
+                    return Err(anyhow::Error::msg(
+                        "attachment path is outside the workspace",
+                    ));
+                }
+                let path_buf = security.resolve_tool_path(path).canonicalize()?;
+                anyhow::ensure!(
+                    security.is_resolved_path_readable(&path_buf),
+                    "attachment path is not readable under the active policy"
+                );
+                let parent = open_absolute_dir_nofollow(
+                    path_buf
+                        .parent()
+                        .ok_or_else(|| anyhow::Error::msg("attachment has no parent"))?,
+                )?;
+                let file = open_file_nofollow(
+                    &parent,
+                    std::path::Path::new(
+                        path_buf
+                            .file_name()
+                            .ok_or_else(|| anyhow::Error::msg("attachment has no file name"))?,
+                    ),
+                )?;
+                let limit = crate::embedded_resource::MAX_EMBEDDED_FILE_BYTES;
+                anyhow::ensure!(
+                    file.metadata()?.len() <= limit,
+                    "attachment exceeds delivery size limit"
+                );
+                let mut data = Vec::new();
+                file.take(limit + 1).read_to_end(&mut data)?;
+                anyhow::ensure!(
+                    data.len() as u64 <= limit,
+                    "attachment exceeds delivery size limit"
+                );
+                let file_name = path_buf
+                    .file_name()
+                    .and_then(|v| v.to_str())
+                    .unwrap_or("attachment")
+                    .to_string();
+                Ok(zeroclaw_api::media::MediaAttachment {
+                    file_name,
+                    data,
+                    mime_type: None,
+                    reference: Some(zeroclaw_api::media::AttachmentReference {
+                        kind: item.kind,
+                        target: path_buf.display().to_string(),
+                    }),
+                })
+            })
+            .collect()
     }
 
     /// Resolve `target` to `(channel_key, channel, peer_group_output_modality)`.
@@ -290,6 +376,24 @@ impl Tool for SendViaTool {
                     "type": "string",
                     "description": "Message content for an immediate fanout send. \
                                     Omit to set a routing instruction for the current reply instead."
+                },
+                "attachments": {
+                    "type": "array",
+                    "items": { "type": "object", "properties": {
+                        "target": { "type": "string", "description": "Existing workspace file or HTTP(S) URL supported by the destination channel" },
+                        "kind": { "type": "string", "enum": ["image", "audio", "video", "document"] }
+                    }, "required": ["target", "kind"], "additionalProperties": false },
+                    "description": "Files to attach. Sent with body immediately, or with the final reply when body is omitted."
+                },
+                "locations": {
+                    "type": "array", "items": {
+                        "type": "object", "properties": {
+                            "lat": {"type":"number", "minimum":-90, "maximum":90},
+                            "lng": {"type":"number", "minimum":-180, "maximum":180},
+                            "name": {"type":"string"}, "address": {"type":"string"}
+                        }, "required":["lat","lng"], "additionalProperties":false
+                    },
+                    "description": "Native location pins for supported WhatsApp destinations."
                 }
             }
         })
@@ -320,6 +424,38 @@ impl Tool for SendViaTool {
             .map(str::trim)
             .filter(|v| !v.is_empty())
             .map(str::to_string);
+
+        let attachment_value = args.get("attachments").cloned();
+        let locations: Vec<zeroclaw_api::media::LocationAttachment> = match args.get("locations") {
+            Some(value) => serde_json::from_value(value.clone())?,
+            None => Vec::new(),
+        };
+        anyhow::ensure!(
+            locations.iter().all(|location| location.is_valid()),
+            "invalid_location"
+        );
+        let security = Arc::clone(&self.security);
+        let attachments = match tokio::task::spawn_blocking(move || {
+            Self::load_attachments(&security, attachment_value.as_ref())
+        })
+        .await?
+        {
+            Ok(attachments) => attachments,
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(serde_json::json!({"error": error.to_string()})),
+                    "send_via_attachment_rejected"
+                );
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(error.to_string()),
+                });
+            }
+        };
 
         let explicit_modality = args.get("modality").and_then(|v| v.as_str()).map(|s| {
             if s == "voice" {
@@ -380,11 +516,13 @@ impl Tool for SendViaTool {
             };
 
             let modality = explicit_modality.unwrap_or(pg_modality);
-            let message = match modality {
+            let mut message = match modality {
                 OutputModality::Voice => SendMessage::new(&body, &recipient).force_voice(),
                 OutputModality::Text => SendMessage::new(&body, &recipient).suppress_voice(),
                 OutputModality::Mirror => SendMessage::new(&body, &recipient),
             };
+            message.attachments = attachments;
+            message.locations = locations;
 
             return match channel.send(&message).await {
                 Ok(()) => Ok(ToolResult {
@@ -410,7 +548,11 @@ impl Tool for SendViaTool {
         }
 
         // ── Routing instruction mode (no body) ───────────────────────────────
-        if target.is_none() && explicit_modality.is_none() {
+        if target.is_none()
+            && explicit_modality.is_none()
+            && attachments.is_empty()
+            && locations.is_empty()
+        {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::json(json!({
@@ -462,7 +604,10 @@ impl Tool for SendViaTool {
         } else {
             // No target → same channel. Keep this branch total even if the
             // validation above is later rearranged.
-            let Some(modality) = explicit_modality else {
+            let Some(modality) = explicit_modality
+                .or((!attachments.is_empty() || !locations.is_empty())
+                    .then_some(OutputModality::Mirror))
+            else {
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::json(json!({
@@ -479,6 +624,8 @@ impl Tool for SendViaTool {
             channel: resolved_channel.clone(),
             modality: resolved_modality,
             recipient: resolved_recipient,
+            attachments,
+            locations,
         };
 
         // Write to the current turn's routing handle. Each turn scopes its own
@@ -621,6 +768,48 @@ mod tests {
             output_modality: OutputModality::Text,
             ..PeerGroupConfig::default()
         }
+    }
+
+    #[test]
+    fn remote_attachment_is_a_typed_reference_without_a_local_read_or_fetch() {
+        let input = json!([{"kind":"image", "target":"https://example.invalid/photo.png"}]);
+        let attachments =
+            SendViaTool::load_attachments(&SecurityPolicy::default(), Some(&input)).unwrap();
+        assert_eq!(attachments.len(), 1);
+        assert!(attachments[0].data.is_empty());
+        assert_eq!(attachments[0].file_name, "photo.png");
+        assert_eq!(
+            attachments[0].reference.as_ref().unwrap().target,
+            "https://example.invalid/photo.png"
+        );
+    }
+
+    #[test]
+    fn local_attachment_keeps_bytes_and_kind_and_enforces_the_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("report.txt");
+        std::fs::write(&path, "original bytes").unwrap();
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.path().to_path_buf(),
+            ..Default::default()
+        };
+        let input = json!([{"kind":"document", "target":path.display().to_string()}]);
+        let attachments = SendViaTool::load_attachments(&policy, Some(&input)).unwrap();
+        assert_eq!(attachments[0].data, b"original bytes");
+        assert_eq!(
+            attachments[0].reference.as_ref().unwrap().kind,
+            zeroclaw_api::media::AttachmentKind::Document
+        );
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("outside.txt");
+        std::fs::write(&target, "outside").unwrap();
+        assert!(
+            SendViaTool::load_attachments(
+                &policy,
+                Some(&json!([{"kind":"document", "target":target.display().to_string()}]))
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -13,7 +13,7 @@ import { t } from '@/lib/i18n';
 interface SessionRow {
   /** Bare session id — what `/ws/chat`, rename and abort all take. */
   id: string;
-  name?: string;
+  title?: string;
   messageCount: number;
   lastActivity: string | null;
   /** False for the active conversation before its first persisted turn. */
@@ -21,7 +21,7 @@ interface SessionRow {
 }
 
 function rowLabel(row: SessionRow): string {
-  if (row.name) return row.name;
+  if (row.title) return row.title;
   return `${t('agent.session_untitled')} ${row.id.slice(0, 8)}`;
 }
 
@@ -94,22 +94,17 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
       const all = await getSessions();
       if (superseded()) return;
       const mine = all
-        // Gateway web-chat sessions only, keyed on the storage prefix rather
-        // than merely "has no channel": the TUI's chat pane stores sessions as
-        // `rpc_<id>` with this same alias stamped and no channel_id, so an
-        // absence check would list terminal conversations here. It matters
-        // beyond tidiness — every action in this menu addresses a session by
-        // its bare `session_id`, and only a `gw_` key round-trips that way
-        // through /ws/chat, rename, abort, messages and delete.
+        // Creation protocol is metadata; the canonical id round-trips through
+        // chat, rename, abort, messages and delete without prefix conversion.
         .filter(
           (s) =>
-            s.session_key.startsWith('gw_') &&
+            s.creation_source === 'gateway' &&
             s.channel_id === null &&
             s.agent_alias === agentAlias,
         )
         .map<SessionRow>((s) => ({
           id: s.session_id,
-          name: s.name,
+          title: s.title,
           messageCount: s.message_count,
           lastActivity: s.last_activity,
           persisted: true,
@@ -452,7 +447,7 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
                         setConfirmingDeleteId(null);
                         setRenameFailed(false);
                         setRenamingId(row.id);
-                        setRenameDraft(row.name ?? '');
+                        setRenameDraft(row.title ?? '');
                       }}
                       // Renaming is safe from either pane; only opening and
                       // deleting would collide.

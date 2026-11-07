@@ -55,9 +55,14 @@ pub(super) struct Options {
 
 #[derive(Debug, Deserialize)]
 pub(super) struct ApiChatResponse {
+    #[serde(default)]
+    pub(super) model: Option<String>,
+
     pub(super) message: ResponseMessage,
     #[serde(default)]
     pub(super) done: Option<bool>,
+    #[serde(default)]
+    pub(super) done_reason: Option<String>,
     #[serde(default)]
     pub(super) prompt_eval_count: Option<u64>,
     #[serde(default)]

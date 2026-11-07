@@ -558,7 +558,7 @@ fn destination_identity(parent: &Dir, name: &OsStr, out: &Path) -> Result<Option
 
 /// The identity of an opened source root, recorded so publication can refuse
 /// to retire a tree this export read.
-fn source_identity(dir: &Dir, path: &Path) -> Result<ObjectId> {
+fn session_identity(dir: &Dir, path: &Path) -> Result<ObjectId> {
     let metadata = dir
         .dir_metadata()
         .with_context(|| format!("failed to inspect {}", path.display()))?;
@@ -1027,7 +1027,7 @@ fn copy_workspace(
             )
         ),
     };
-    sources.push(source_identity(&source, &plan.workspace_source)?);
+    sources.push(session_identity(&source, &plan.workspace_source)?);
     let target = open_bundle_dir(dest)?;
     let spec = CopySpec {
         root: WORKSPACE_DIR.to_string(),
@@ -1097,7 +1097,7 @@ fn copy_skill_bundles(
                 )
             ),
         };
-        sources.push(source_identity(&bundle, &source.source)?);
+        sources.push(session_identity(&bundle, &source.source)?);
         skills_root.create_dir(&source.alias).with_context(|| {
             format!(
                 "failed to create {SKILLS_DIR}/{} in the bundle",
@@ -2027,7 +2027,7 @@ mod tests {
 
         assert_eq!(copied.skills.bundles, 1);
         assert_eq!(copied.skills.tally.files, 2);
-        assert!(copied.skills.without_content.is_empty());
+        assert_eq!(copied.skills.without_content, Vec::<String>::new());
 
         let carried = out.join(SKILLS_DIR).join("research_tools");
         assert!(carried.join("web_search/SKILL.md").is_file());
@@ -3095,7 +3095,7 @@ mod tests {
 
         assert_eq!(copied.workspace.replaced_skipped, 1);
         assert_eq!(copied.workspace.files, 0);
-        assert!(all_files(&out.join(WORKSPACE_DIR)).is_empty());
+        assert_eq!(all_files(&out.join(WORKSPACE_DIR)), Vec::<PathBuf>::new());
         assert_eq!(
             std::fs::read_to_string(source.join("notes/secret.md")).unwrap(),
             "host secret bytes"
@@ -3589,7 +3589,7 @@ mod tests {
 
         assert!(moved.join("bundle").join(MANIFEST_FILE).is_file());
         // The impostor that took the admitted parent's name is untouched.
-        assert!(entry_names(&parent).is_empty());
+        assert_eq!(entry_names(&parent), Vec::<String>::new());
     }
 
     /// Root ignores mode bits, so probe rather than assume the permission-denied

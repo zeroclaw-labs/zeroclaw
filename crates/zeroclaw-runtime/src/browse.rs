@@ -168,10 +168,9 @@ const AGENT_WORKSPACE_PROTECTED_FILES: &[&str] = &[
     "DAILY.md",
 ];
 
-/// Top-level agent-workspace directories the runtime owns. `sessions/`
-/// holds the per-agent session DB (`sessions/sessions.db`) created on first
-/// session write by `zeroclaw_infra::session_sqlite`. Deleting it wipes
-/// session history.
+/// Preserve `sessions/` while an agent workspace still contains history from
+/// the legacy storage layout. The installation upgrader imports that history
+/// into the standard event store.
 const AGENT_WORKSPACE_PROTECTED_DIRS: &[&str] = &["sessions"];
 
 fn agent_root(config: &Config, agent_alias: &str) -> PathBuf {

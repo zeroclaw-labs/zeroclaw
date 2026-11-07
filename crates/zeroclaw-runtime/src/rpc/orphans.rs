@@ -167,62 +167,104 @@ async fn retire(
 /// Whether the live history of `session` is already held by its durable
 /// store. Nothing is written here.
 ///
-/// An ACP session's turns each commit through its checkpoint, and a turn whose
-/// checkpoint fails removes its live session, so a live ACP session's history
-/// is already in the ACP store.
-///
-/// A chat session's post-turn write can fail, a daemon can run without a chat
-/// store, and other writers (the gateway's message and delete routes) change
-/// the stored transcript without the live session. So the stored transcript is
-/// compared with the live one by role and content. Retirement goes ahead only
-/// when the store holds everything live, alone or followed by messages another
-/// writer added. A store that lacks part of the live history, differs from it,
-/// or can't be read keeps the session live. Retirement writes nothing, so it
-/// can't recreate a deleted session or reorder another writer's messages.
+/// Native entrances share the same retained-context projection. Compare its
+/// typed messages and trim state with the live agent before retiring it. A
+/// missing, unreadable or different projection keeps the session live. This
+/// check never writes, so it cannot recreate deleted history. The old chat
+/// transcript path below is confined to migration-era test fixtures.
 async fn transcript_is_stored(ctx: &RpcContext, session: &OwnedSession) -> bool {
+    // Verify the committed retained context, including typed tool/reasoning
+    // fields. Merely having a source does not prove that this turn persisted.
+    if ctx.native_sessions.is_some() {
+        let Some(agent) = ctx.sessions.get_agent(&session.id).await else {
+            return false;
+        };
+        let Ok(agent) = tokio::time::timeout(AGENT_WAIT, agent.lock()).await else {
+            return false;
+        };
+        let messages: Vec<_> = agent
+            .history()
+            .iter()
+            .flat_map(zeroclaw_api::model_provider::ConversationMessage::chat_messages)
+            .collect();
+        let live = match zeroclaw_api::session_events::canonical_json(&messages) {
+            Ok(live) => live,
+            Err(_) => return false,
+        };
+        let trim_breadcrumb = agent.history_has_trim_breadcrumb();
+        drop(agent);
+        let Some(repository) = ctx.session_repository.clone() else {
+            return false;
+        };
+        let session_id = session.id.clone();
+        return matches!(
+            tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                let Some(stored) = repository.load_session(&session_id)? else {
+                    return Ok(false);
+                };
+                Ok(stored.trim_breadcrumb == trim_breadcrumb
+                    && zeroclaw_api::session_events::canonical_json(&stored.messages)? == live)
+            })
+            .await,
+            Ok(Ok(true))
+        );
+    }
+
+    #[cfg(not(test))]
+    {
+        let _ = session;
+        false
+    }
+
+    #[cfg(test)]
     if matches!(
         ctx.sessions.chat_mode(&session.id).await,
         Some(crate::rpc::types::ChatMode::Acp)
     ) {
         return true;
     }
-    let Some(agent) = ctx.sessions.get_agent(&session.id).await else {
-        return false;
-    };
-    let Ok(agent) = tokio::time::timeout(AGENT_WAIT, agent.lock()).await else {
-        return false;
-    };
-    let live = zeroclaw_providers::durable_chat_messages(agent.history());
-    drop(agent);
-    let Some(backend) = ctx.session_backend.as_ref() else {
-        return live.is_empty();
-    };
-    let stored = match backend.try_load(&format!("rpc_{}", session.id)) {
-        Ok(stored) => stored,
-        Err(error) => return keep_live(session, "could not read its stored history", &error),
-    };
-    let held = stored.len() >= live.len()
-        && stored
-            .iter()
-            .zip(&live)
-            .all(|(stored, live)| stored.role == live.role && stored.content == live.content);
-    if !held {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_category(::zeroclaw_log::EventCategory::Agent)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({
-                    "session_id": session.id,
-                    "stored_messages": stored.len(),
-                    "live_messages": live.len(),
-                })),
-            "An orphaned session's store does not hold all of its history; keeping it live"
-        );
+
+    #[cfg(test)]
+    {
+        let Some(agent) = ctx.sessions.get_agent(&session.id).await else {
+            return false;
+        };
+        let Ok(agent) = tokio::time::timeout(AGENT_WAIT, agent.lock()).await else {
+            return false;
+        };
+        let live = zeroclaw_providers::durable_chat_messages(agent.history());
+        drop(agent);
+        let Some(backend) = ctx.session_backend.as_ref() else {
+            return live.is_empty();
+        };
+        let stored = match backend.try_load(&format!("rpc_{}", session.id)) {
+            Ok(stored) => stored,
+            Err(error) => return keep_live(session, "could not read its stored history", &error),
+        };
+        let held = stored.len() >= live.len()
+            && stored
+                .iter()
+                .zip(&live)
+                .all(|(stored, live)| stored.role == live.role && stored.content == live.content);
+        if !held {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "session_id": session.id,
+                        "stored_messages": stored.len(),
+                        "live_messages": live.len(),
+                    })),
+                "An orphaned session's store does not hold all of its history; keeping it live"
+            );
+        }
+        held
     }
-    held
 }
 
+#[cfg(test)]
 fn keep_live(session: &OwnedSession, what: &str, error: &std::io::Error) -> bool {
     ::zeroclaw_log::record!(
         WARN,

@@ -819,6 +819,20 @@ pub async fn run_with_authority(
         )?,
     );
 
+    // One generation-scoped history source is shared by every entrance. Its
+    // physical backend connection is reusable; authorization remains per call.
+    let source = registry.take_session_source().ok_or_else(|| {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+            "Session source was not supplied by application composition"
+        );
+        anyhow::Error::msg("session source must be supplied by application composition")
+    })?(live_config_authority.live_handle());
+    source.sessions().await?;
+    let native_sessions = Some(source);
+
     if let Some(gateway_start) = registry.take_gateway_start() {
         gateway_required = true;
         let gateway_cfg = config.clone();
@@ -826,6 +840,7 @@ pub async fn run_with_authority(
             pairing: pairing_guard.as_ref().clone(),
             inbound_auth: std::sync::Arc::clone(&inbound_auth),
             config: live_config.clone(),
+            native_sessions: native_sessions.clone(),
         };
         let gateway_host = host.clone();
         let gateway_event_bus = event_bus.clone();
@@ -913,6 +928,11 @@ pub async fn run_with_authority(
             let cancel_for_supervisor = channels_cancel.clone();
             let generation_control = channel_generation_control.clone();
             let channels_live_config_authority = live_config_authority.clone();
+            let channels_native_sessions = config
+                .channels
+                .session_persistence
+                .then(|| native_sessions.clone())
+                .flatten();
             channels_handle = Some(spawn_component_supervisor(
                 "channels",
                 initial_backoff,
@@ -923,6 +943,7 @@ pub async fn run_with_authority(
                     let cancel = cancel_for_supervisor.clone();
                     let generation_control = generation_control.clone();
                     let live_config_authority = channels_live_config_authority.clone();
+                    let native_sessions = channels_native_sessions.clone();
                     async move {
                         let Some(attempt) = generation_control.begin_attempt(&cancel) else {
                             // A retired generation must never retry the old
@@ -932,7 +953,8 @@ pub async fn run_with_authority(
                             return Ok(());
                         };
                         let attempt_cancel = attempt.cancel();
-                        let result = start(live_config_authority, attempt_cancel).await;
+                        let result =
+                            start(live_config_authority, attempt_cancel, native_sessions).await;
                         drop(attempt);
                         result
                     }
@@ -1007,16 +1029,6 @@ pub async fn run_with_authority(
                 }
             });
         }
-        let session_backend = open_rpc_session_backend(
-            || {
-                zeroclaw_infra::make_session_backend(
-                    &config.data_dir,
-                    &config.channels.session_backend,
-                )
-            },
-            RPC_SESSION_STORE_RETRY_DELAY,
-        )
-        .await;
 
         // Wire the memory subsystem so `memory/list` and `memory/search`
         // work over RPC transports (same pattern as the gateway).
@@ -1039,12 +1051,11 @@ pub async fn run_with_authority(
             }
         };
 
-        // Open the ACP session DB at boot so the file exists from the
-        // moment the daemon is up, not when (if ever) `zeroclaw acp`
-        // runs. Best-effort: on failure, log and continue with `None`.
-        let acp_session_store: Option<
-            std::sync::Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
-        > = match zeroclaw_infra::acp_session_store::AcpSessionStore::new(&config.data_dir) {
+        // Bind protocol metadata queries to the standard session repository.
+        // The application-supplied source has already upgraded storage.
+        let session_repository: Option<
+            std::sync::Arc<zeroclaw_infra::session_repository::SessionRepository>,
+        > = match zeroclaw_infra::session_repository::SessionRepository::new(&config.data_dir) {
             Ok(s) => Some(std::sync::Arc::new(s)),
             Err(e) => {
                 ::zeroclaw_log::record!(
@@ -1052,7 +1063,7 @@ pub async fn run_with_authority(
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({"error": e.to_string()})),
-                    "Failed to open ACP session store at daemon boot"
+                    "Failed to open session repository at daemon boot"
                 );
                 None
             }
@@ -1065,7 +1076,7 @@ pub async fn run_with_authority(
         // siblings and races them into duplicate sequence numbers, which makes
         // `verify_chain` reject a file no single writer got wrong.
         //
-        // Best-effort, like the ACP store above: a logger that cannot be
+        // Best-effort, like the session repository above: a logger that cannot be
         // constructed (e.g. `sign_events` with no usable signing key) leaves
         // `cert_audit` unset, and the certificate paths then refuse to issue
         // rather than issue untraceably.
@@ -1109,7 +1120,9 @@ pub async fn run_with_authority(
             agent_lifecycle: live_config_authority.agent_lifecycle(),
             channel_generation_control: Some(channel_generation_control.clone()),
             sessions,
-            session_backend,
+            native_sessions: native_sessions.clone(),
+            #[cfg(test)]
+            session_backend: None,
             memory: rpc_memory,
             // Process-global tracker shared with the gateway and channel
             // supervisor. Without this the RPC/zerocode-TUI turn path has no
@@ -1117,6 +1130,7 @@ pub async fn run_with_authority(
             cost_tracker: crate::cost::CostTracker::get_or_init_global(
                 config.cost.clone(),
                 &config.data_dir,
+                &config.channels.session_backend,
             ),
             event_tx: Some(event_tx.clone()),
             event_history: Some(std::sync::Arc::clone(event_bus.history())),
@@ -1131,7 +1145,7 @@ pub async fn run_with_authority(
                 crate::rpc::context::ApprovalPendingMap::default(),
             ),
             tui_registry,
-            acp_session_store,
+            session_repository,
             sop_engine,
             sop_audit,
             sop_driver_handles,
@@ -1321,6 +1335,7 @@ pub async fn run_with_authority(
         let scheduler_cfg = config.clone();
         let scheduler_event_tx = event_tx.clone();
         let scheduler_cancel = channels_cancel.clone();
+        let scheduler_history = native_sessions.clone();
         handles.push(spawn_component_supervisor(
             "scheduler",
             initial_backoff,
@@ -1331,14 +1346,22 @@ pub async fn run_with_authority(
                 let tx = scheduler_event_tx.clone();
                 let cancel = scheduler_cancel.clone();
                 let execution_capability = daemon_execution_capability.clone();
+                let history = scheduler_history.clone();
                 async move {
-                    Box::pin(crate::cron::scheduler::run_with_capability(
+                    let scheduler = Box::pin(crate::cron::scheduler::run_with_capability(
                         cfg,
                         Some(tx),
                         cancel,
                         Some(execution_capability),
-                    ))
-                    .await
+                    ));
+                    if let Some(source) = history {
+                        zeroclaw_kernel::session::engine::scope_engine_session_source(
+                            source, scheduler,
+                        )
+                        .await
+                    } else {
+                        scheduler.await
+                    }
                 }
             },
         ));
@@ -1771,53 +1794,6 @@ fn settle_exit_against_channel_retirement(
          down instead so a replacement generation cannot overlap it"
     );
     Ok(DaemonExit::Shutdown)
-}
-
-/// Pause before the RPC plane's one retry of a failed session-store open.
-const RPC_SESSION_STORE_RETRY_DELAY: Duration = Duration::from_millis(250);
-
-/// Open the RPC plane's session store, retrying once.
-///
-/// Every `session/*` RPC method refuses without the store, so a failed open
-/// is reported at ERROR instead of being dropped, and retried once in case
-/// another component was creating the same fresh database at that moment.
-async fn open_rpc_session_backend<T>(
-    mut open: impl FnMut() -> std::io::Result<T>,
-    retry_delay: Duration,
-) -> Option<T> {
-    let first = match open() {
-        Ok(backend) => return Some(backend),
-        Err(error) => error,
-    };
-    ::zeroclaw_log::record!(
-        ERROR,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-            .with_attrs(::serde_json::json!({ "error": format!("{first:#}") })),
-        "RPC session store failed to open; retrying once"
-    );
-    tokio::time::sleep(retry_delay).await;
-    match open() {
-        Ok(backend) => {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Success),
-                "RPC session store opened on retry"
-            );
-            Some(backend)
-        }
-        Err(error) => {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({ "error": format!("{error:#}") })),
-                "RPC session store unavailable after a retry; session RPC methods will refuse until the daemon restarts"
-            );
-            None
-        }
-    }
 }
 
 fn spawn_component_supervisor<F, Fut>(
@@ -3181,39 +3157,6 @@ mod tests {
     const DAEMON_DEADLOCK_GUARD: Duration = Duration::from_secs(30);
 
     #[tokio::test]
-    async fn rpc_session_store_open_is_retried_once_after_a_failure() {
-        let mut calls = 0;
-        let opened = open_rpc_session_backend(
-            || {
-                calls += 1;
-                if calls == 1 {
-                    Err(std::io::Error::other("database is locked"))
-                } else {
-                    Ok(calls)
-                }
-            },
-            Duration::ZERO,
-        )
-        .await;
-        assert_eq!(opened, Some(2));
-    }
-
-    #[tokio::test]
-    async fn rpc_session_store_open_gives_up_after_one_retry() {
-        let mut calls = 0;
-        let opened: Option<()> = open_rpc_session_backend(
-            || {
-                calls += 1;
-                Err(std::io::Error::other("unable to open database file"))
-            },
-            Duration::ZERO,
-        )
-        .await;
-        assert_eq!(opened, None);
-        assert_eq!(calls, 2);
-    }
-
-    #[tokio::test]
     async fn retiring_channel_generation_clears_admission_and_joins_active_attempt() {
         let cleared = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let clearer_state = std::sync::Arc::clone(&cleared);
@@ -3322,7 +3265,10 @@ mod tests {
         let reload_rx = std::sync::Arc::new(parking_lot::Mutex::new(Some(reload_rx)));
 
         let mut registry = DaemonRegistry::new();
-        registry.register_channels(Box::new(move |authority, cancel| {
+        registry.register_session_source(Box::new(|config| {
+            std::sync::Arc::new(zeroclaw_session_host::NativeSessionHub::new(config))
+        }));
+        registry.register_channels(Box::new(move |authority, cancel, _native_sessions| {
             let attempt_tx = attempt_tx.clone();
             let attempt = attempts_for_channels.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let published_rx = (attempt == 0).then(|| published_rx.lock().take().unwrap());
@@ -4598,6 +4544,9 @@ mod tests {
         let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let mut registry = DaemonRegistry::new();
+        registry.register_session_source(Box::new(|config| {
+            std::sync::Arc::new(zeroclaw_session_host::NativeSessionHub::new(config))
+        }));
         registry.register_gateway(Box::new(
             move |host,
                   port,
@@ -4683,6 +4632,9 @@ mod tests {
         let (signalled_tx, mut signalled_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let mut registry = DaemonRegistry::new();
+        registry.register_session_source(Box::new(|config| {
+            std::sync::Arc::new(zeroclaw_session_host::NativeSessionHub::new(config))
+        }));
         registry.register_gateway(Box::new(
             move |_host,
                   _port,
@@ -4741,6 +4693,9 @@ mod tests {
             let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
 
             let mut registry = DaemonRegistry::new();
+            registry.register_session_source(Box::new(|config| {
+                std::sync::Arc::new(zeroclaw_session_host::NativeSessionHub::new(config))
+            }));
             registry.register_socket(Box::new(move |_ctx, _cancel, _client_count, _readiness| {
                 let started_tx = started_tx.clone();
                 Box::pin(async move {
@@ -4825,6 +4780,9 @@ mod tests {
         let attempts_for_socket = attempts.clone();
 
         let mut registry = DaemonRegistry::new();
+        registry.register_session_source(Box::new(|config| {
+            std::sync::Arc::new(zeroclaw_session_host::NativeSessionHub::new(config))
+        }));
         registry.register_socket(Box::new(move |_ctx, _cancel, _client_count, _readiness| {
             let attempts = attempts_for_socket.clone();
             Box::pin(async move {
@@ -4878,6 +4836,9 @@ mod tests {
         let attempts_for_socket = attempts.clone();
 
         let mut registry = DaemonRegistry::new();
+        registry.register_session_source(Box::new(|config| {
+            std::sync::Arc::new(zeroclaw_session_host::NativeSessionHub::new(config))
+        }));
         registry.register_socket(Box::new(move |_ctx, _cancel, client_count, readiness| {
             let attempts = attempts_for_socket.clone();
             Box::pin(async move {
@@ -4904,7 +4865,7 @@ mod tests {
         }));
 
         let exit = timeout(
-            Duration::from_secs(8),
+            DAEMON_DEADLOCK_GUARD,
             run(config, "127.0.0.1".to_string(), 0, registry, true, true),
         )
         .await
@@ -4947,6 +4908,9 @@ mod tests {
         let socket_session_ready = session_ready.clone();
         let (sessions_tx, mut sessions_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut registry = DaemonRegistry::new();
+        registry.register_session_source(Box::new(|config| {
+            std::sync::Arc::new(zeroclaw_session_host::NativeSessionHub::new(config))
+        }));
         registry.register_socket(Box::new(move |ctx, cancel, _count, readiness| {
             let session_ready = socket_session_ready.clone();
             let sessions_tx = sessions_tx.clone();
@@ -5110,6 +5074,9 @@ mod tests {
         reset_scheduler_clean_shutdown_observed();
 
         let mut registry = DaemonRegistry::new();
+        registry.register_session_source(Box::new(|config| {
+            std::sync::Arc::new(zeroclaw_session_host::NativeSessionHub::new(config))
+        }));
         registry.register_gateway(Box::new(
             move |_host,
                   _port,
@@ -7350,6 +7317,9 @@ mod tests {
         let drained_for_socket = drained.clone();
 
         let mut registry = DaemonRegistry::new();
+        registry.register_session_source(Box::new(|config| {
+            std::sync::Arc::new(zeroclaw_session_host::NativeSessionHub::new(config))
+        }));
         registry.register_socket(Box::new(move |_ctx, cancel, client_count, readiness| {
             let accepted = accepted_for_socket.clone();
             let drained = drained_for_socket.clone();
@@ -7446,7 +7416,10 @@ mod tests {
             },
         );
         // No gateway is registered: the daemon runs with the gateway disabled.
-        let registry = DaemonRegistry::new();
+        let mut registry = DaemonRegistry::new();
+        registry.register_session_source(Box::new(|config| {
+            std::sync::Arc::new(zeroclaw_session_host::NativeSessionHub::new(config))
+        }));
         let daemon = run(config, "127.0.0.1".to_string(), 0, registry, false, false);
         tokio::pin!(daemon);
 
@@ -7599,6 +7572,9 @@ mod tests {
             // 0 = not started, 1 = started without a reporter, 2 = with one.
             let received = Arc::new(AtomicU8::new(0));
             let mut registry = DaemonRegistry::new();
+            registry.register_session_source(Box::new(|config| {
+                std::sync::Arc::new(zeroclaw_session_host::NativeSessionHub::new(config))
+            }));
             {
                 let received = received.clone();
                 registry.register_gateway(Box::new(
@@ -7665,6 +7641,9 @@ mod tests {
         // The gateway starter captures the live configuration the daemon hands it.
         let handed = Arc::new(std::sync::Mutex::new(None));
         let mut registry = DaemonRegistry::new();
+        registry.register_session_source(Box::new(|config| {
+            std::sync::Arc::new(zeroclaw_session_host::NativeSessionHub::new(config))
+        }));
         {
             let handed = handed.clone();
             registry.register_gateway(Box::new(

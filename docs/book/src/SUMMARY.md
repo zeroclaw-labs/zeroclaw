@@ -59,6 +59,7 @@
     - [ADR-018: Runtime security and provenance](./architecture/decisions/ADR-018-runtime-security-and-provenance.md)
   - [Logging](./architecture/logging.md)
   - [Runtime state and persistence](./architecture/runtime-state-and-persistence.md)
+  - [Append-only session events](./architecture/session-events.md)
   - [Memory and payload lifecycle](./architecture/memory-payload-lifecycle.md)
   - [Config lifecycle](./architecture/config-lifecycle.md)
   - [Generated documentation pipeline](./architecture/generated-documentation-pipeline.md)

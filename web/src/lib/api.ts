@@ -2253,35 +2253,31 @@ export function getSessionMessages(
 /**
  * Give a persisted session a display name.
  *
- * Takes the bare session id (the `gw_`-stripped `session_id`, not
- * `session_key`) because the handler prefixes `gw_` itself. Answers 404 when
- * the gateway has no metadata row for the session — notably when session
- * persistence is disabled.
+ * Takes the canonical session id. Answers 404 when the gateway has no
+ * persisted session — notably when session persistence is disabled.
  */
 export function renameSession(
   id: string,
-  name: string,
-): Promise<{ session_id: string; name: string }> {
-  return apiFetch<{ session_id: string; name: string }>(
+  title: string,
+): Promise<{ session_id: string; title: string }> {
+  return apiFetch<{ session_id: string; title: string }>(
     `/api/sessions/${encodeURIComponent(id)}`,
-    { method: "PUT", body: JSON.stringify({ name }) },
+    { method: "PUT", body: JSON.stringify({ title }) },
   ).finally(() => invalidateInFlightGet("/api/sessions"));
 }
 
 /**
- * Delete a persisted session. Accepts either the full DB key or a bare gateway
- * session id — the handler prefixes `gw_` only when the id carries no
- * underscore. Unlike {@link renameSession}, which needs the bare id.
+ * Delete a persisted session using the canonical id returned by the listing.
  */
 export function deleteSession(
-  sessionKey: string,
+  sessionId: string,
 ): Promise<{ deleted: boolean }> {
   // A listing fetched before this delete settled must not be what a
   // post-delete refresh reports: it would list the row just removed. Also on
   // failure — a 404 means another client already deleted it, so an in-flight
   // listing may be stale in exactly the same way.
   return apiFetch<{ deleted: boolean }>(
-    `/api/sessions/${encodeURIComponent(sessionKey)}`,
+    `/api/sessions/${encodeURIComponent(sessionId)}`,
     { method: "DELETE" },
   ).finally(() => invalidateInFlightGet("/api/sessions"));
 }
@@ -2462,15 +2458,14 @@ export function getCliTools(): Promise<CliTool[]> {
 export interface UploadImageResult {
   /** Absolute path of the saved file inside the agent workspace. */
   path: string;
-  /** `[IMAGE:<path>]` marker ready to embed in a chat message. */
-  marker: string;
+  attachment: import('../types/api').AttachmentReference;
 }
 
 /**
  * Upload an image for the given agent's chat. The body is the raw file — the
  * gateway types it by magic bytes (client MIME and filename are never
  * trusted), saves it under the agent workspace, and returns the
- * `[IMAGE:<path>]` marker to embed in the next message.
+ * typed attachment reference to send with the next message.
  */
 export function uploadChatImage(
   agent: string,

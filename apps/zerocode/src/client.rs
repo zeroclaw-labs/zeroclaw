@@ -4610,7 +4610,6 @@ mod dashboard_status_tests {
 #[serde(rename_all = "snake_case")]
 pub struct SessionEntry {
     pub session_id: String,
-    pub session_key: String,
     pub created_at: String,
     pub last_activity: String,
     pub message_count: usize,
@@ -4619,7 +4618,7 @@ pub struct SessionEntry {
     #[serde(default)]
     pub channel_id: Option<String>,
     #[serde(default)]
-    pub name: Option<String>,
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]

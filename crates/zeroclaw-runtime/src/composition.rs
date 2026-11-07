@@ -348,8 +348,6 @@ pub struct NativeRecipeInputs<'a> {
     pub live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     /// The caller's execution capability, for tools that start nested work.
     pub execution_capability: Option<crate::live_config_authority::AgentExecutionCapability>,
-    /// A read view of ACP sessions, for entry points that serve ACP.
-    pub acp_sessions: Option<crate::tools::AcpSessionReadView>,
 }
 
 /// A native compatibility recipe: builds the native registry for one eager
@@ -494,6 +492,7 @@ pub(crate) mod test_support {
             _temperature: Option<f64>,
         ) -> anyhow::Result<zeroclaw_api::model_provider::ChatResponse> {
             Ok(zeroclaw_api::model_provider::ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(STUB_REPLY.into()),
                 tool_calls: vec![],
                 usage: None,
@@ -739,8 +738,15 @@ pub(crate) mod test_support {
     pub(crate) const VISION_REFUSAL: &str = "this source does not serve the vision route";
     pub(crate) const VISION_REPLY: &str = "vision stub reply";
 
-    /// A tiny valid PNG as an image marker, for image-bearing turns.
-    pub(crate) const IMAGE_TURN: &str = "describe this image [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]";
+    /// A tiny valid PNG carried by a typed message attachment.
+    pub(crate) fn image_turn() -> zeroclaw_api::model_provider::ChatMessage {
+        zeroclaw_api::model_provider::ChatMessage::user("describe this image").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC".into(),
+            },
+        ])
+    }
 
     /// Serves session starts with the text-only [`StubProvider`], records
     /// every vision-route request, and either refuses the route or serves it
@@ -813,6 +819,7 @@ pub(crate) mod test_support {
             _temperature: Option<f64>,
         ) -> anyhow::Result<zeroclaw_api::model_provider::ChatResponse> {
             Ok(zeroclaw_api::model_provider::ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(VISION_REPLY.into()),
                 tool_calls: vec![],
                 usage: None,

@@ -361,7 +361,7 @@ mod tests {
         );
         assert_eq!(
             tool_result.output.attachments()[0].kind,
-            zeroclaw_api::media::MarkerKind::Image
+            zeroclaw_api::media::AttachmentKind::Image
         );
         assert!(
             tool_result.output.attachments()[0].target.ends_with(".png"),

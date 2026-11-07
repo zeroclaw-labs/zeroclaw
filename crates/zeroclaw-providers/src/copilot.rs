@@ -192,12 +192,16 @@ struct NativeToolCall {
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     kind: Option<String>,
     function: NativeFunctionCall,
+    #[serde(flatten)]
+    extensions: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct NativeFunctionCall {
     name: String,
     arguments: String,
+    #[serde(flatten)]
+    extensions: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Multi-part content for vision messages (OpenAI format).
@@ -227,6 +231,8 @@ struct ApiChatResponse {
     choices: Vec<Choice>,
     #[serde(default)]
     usage: Option<UsageInfo>,
+    #[serde(default)]
+    model: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -240,14 +246,22 @@ struct UsageInfo {
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: ResponseMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ResponseMessage {
     #[serde(default)]
-    content: Option<String>,
+    content: Option<serde_json::Value>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<NativeToolCall>>,
+    #[serde(flatten)]
+    extensions: serde_json::Map<String, serde_json::Value>,
 }
 
 // ── ModelProvider ─────────────────────────────────────────────────────
@@ -342,13 +356,18 @@ impl CopilotModelProvider {
     }
 
     /// Convert message content to API format, with multi-part support for
-    /// user messages containing `[IMAGE:...]` markers.
-    fn to_api_content(role: &str, content: &str) -> Option<ApiContent> {
+    /// user messages carrying image attachments.
+    fn to_api_content(message: &ChatMessage) -> Option<ApiContent> {
+        let role = message.role.as_str();
+        let content = message.content.as_str();
         if role != "user" {
             return Some(ApiContent::Text(content.to_string()));
         }
 
-        let (cleaned_text, image_refs) = crate::multimodal::parse_user_message_image_refs(content);
+        let (cleaned_text, image_refs) = (
+            message.content.clone(),
+            crate::multimodal::message_image_refs(message),
+        );
         if image_refs.is_empty() {
             return Some(ApiContent::Text(content.to_string()));
         }
@@ -370,11 +389,13 @@ impl CopilotModelProvider {
     }
 
     fn convert_messages(messages: &[ChatMessage]) -> Vec<ApiMessage> {
+        let projected = crate::multimodal::project_attachment_metadata(messages);
+        let messages = projected.as_ref();
         messages
             .iter()
             .map(|message| {
                 if message.role == "assistant"
-                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content)
+                    && let Some(value) = crate::tool_protocol::tool_message_value(message)
                     && let Some(tool_calls_value) = value.get("tool_calls")
                     && let Ok(parsed_calls) =
                         serde_json::from_value::<Vec<ProviderToolCall>>(tool_calls_value.clone())
@@ -384,9 +405,11 @@ impl CopilotModelProvider {
                         .map(|tool_call| {
                             let name = tool_call.name;
                             NativeToolCall {
+                                extensions: Default::default(),
                                 id: Some(tool_call.id),
                                 kind: Some("function".to_string()),
                                 function: NativeFunctionCall {
+                                    extensions: Default::default(),
                                     arguments: crate::compatible::sanitize_tool_arguments(
                                         &name,
                                         &tool_call.arguments,
@@ -409,7 +432,7 @@ impl CopilotModelProvider {
                 }
 
                 if message.role == "tool"
-                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content)
+                    && let Some(value) = crate::tool_protocol::tool_message_value(message)
                 {
                     let tool_call_id = value
                         .get("tool_call_id")
@@ -430,7 +453,7 @@ impl CopilotModelProvider {
 
                 ApiMessage {
                     role: message.role.clone(),
-                    content: Self::to_api_content(&message.role, &message.content),
+                    content: Self::to_api_content(message),
                     tool_call_id: None,
                     tool_calls: None,
                 }
@@ -495,6 +518,55 @@ impl CopilotModelProvider {
             anyhow::Error::msg("No response from GitHub Copilot")
         })?;
 
+        use zeroclaw_api::model_provider::ProviderOutputBlock;
+        let (text, mut output_blocks) =
+            crate::output::assistant_content(choice.message.content.as_ref());
+        for (representation, reasoning) in [
+            ("reasoning_content", &choice.message.reasoning_content),
+            ("reasoning", &choice.message.reasoning),
+        ] {
+            if let Some(reasoning) = reasoning {
+                output_blocks.push(ProviderOutputBlock::Reasoning {
+                    representation: representation.into(),
+                    bytes: reasoning.to_owned().into_bytes(),
+                    replay_requirement: "provider_defined".into(),
+                });
+            }
+        }
+        if let Some(calls) = &choice.message.tool_calls {
+            for call in calls {
+                output_blocks.extend(crate::output::chat_tool_metadata(
+                    call.id.as_deref(),
+                    &call.extensions,
+                    Some(&call.function.extensions),
+                ));
+            }
+        }
+        for (name, content) in choice.message.extensions {
+            if name == "role" {
+                continue;
+            }
+            if name == "audio" {
+                output_blocks.extend(crate::output::content_blocks(
+                    &serde_json::json!({"type":"audio","source":content}),
+                ));
+            } else {
+                output_blocks.push(ProviderOutputBlock::Other {
+                    type_name: format!("assistant.{name}"),
+                    content,
+                });
+            }
+        }
+        if let Some(model) = api_response.model {
+            output_blocks.push(ProviderOutputBlock::ProtocolMetadata {
+                metadata: serde_json::json!({"kind":"served_attribution","protocol":"chat_completions","model":model,"source":"provider_response"}),
+            });
+        }
+        if let Some(reason) = choice.finish_reason {
+            output_blocks.push(ProviderOutputBlock::ProtocolMetadata {
+                metadata: serde_json::json!({"kind":"finish","protocol":"chat_completions","finish_reason":reason}),
+            });
+        }
         let tool_calls = choice
             .message
             .tool_calls
@@ -511,10 +583,14 @@ impl CopilotModelProvider {
             .collect();
 
         Ok(ProviderChatResponse {
-            text: choice.message.content,
+            output_blocks,
+            text,
             tool_calls,
             usage,
-            reasoning_content: None,
+            reasoning_content: choice
+                .message
+                .reasoning_content
+                .or(choice.message.reasoning),
         })
     }
 
@@ -922,7 +998,7 @@ impl ModelProvider for CopilotModelProvider {
         }
         messages.push(ApiMessage {
             role: "user".to_string(),
-            content: Self::to_api_content("user", message),
+            content: Self::to_api_content(&ChatMessage::user(message)),
             tool_call_id: None,
             tool_calls: None,
         });
@@ -1071,8 +1147,13 @@ mod tests {
 
     #[test]
     fn to_api_content_user_with_image_returns_parts() {
-        let content = "describe this [IMAGE:data:image/png;base64,abc123]";
-        let result = CopilotModelProvider::to_api_content("user", content).unwrap();
+        let message = ChatMessage::user("describe this").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: "data:image/png;base64,abc123".into(),
+            },
+        ]);
+        let result = CopilotModelProvider::to_api_content(&message).unwrap();
         match result {
             ApiContent::Parts(parts) => {
                 assert_eq!(parts.len(), 2);
@@ -1089,16 +1170,18 @@ mod tests {
 
     #[test]
     fn to_api_content_user_plain_returns_text() {
-        let result = CopilotModelProvider::to_api_content("user", "hello world").unwrap();
+        let result =
+            CopilotModelProvider::to_api_content(&ChatMessage::user("hello world")).unwrap();
         assert!(matches!(result, ApiContent::Text(ref s) if s == "hello world"));
     }
 
     #[test]
     fn to_api_content_non_user_returns_text() {
-        let result = CopilotModelProvider::to_api_content("system", "you are helpful").unwrap();
+        let result =
+            CopilotModelProvider::to_api_content(&ChatMessage::system("you are helpful")).unwrap();
         assert!(matches!(result, ApiContent::Text(ref s) if s == "you are helpful"));
 
-        let result = CopilotModelProvider::to_api_content("assistant", "sure").unwrap();
+        let result = CopilotModelProvider::to_api_content(&ChatMessage::assistant("sure")).unwrap();
         assert!(matches!(result, ApiContent::Text(ref s) if s == "sure"));
     }
 
@@ -1109,11 +1192,16 @@ mod tests {
         // covered in `compatible::tests::sanitize_tool_arguments_*`.
         use zeroclaw_api::model_provider::ChatMessage;
 
-        let messages = vec![ChatMessage {
-            role: "assistant".into(),
-            content: r#"{"content":"trying","tool_calls":[{"id":"call_bad","name":"shell","arguments":"{\"command\":\"rm -rf"}]}"#
-                .into(),
-        }];
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            "trying",
+            vec![zeroclaw_api::model_provider::ToolCall {
+                id: "call_bad".into(),
+                name: "shell".into(),
+                arguments: "{\"command\":\"rm -rf".into(),
+                extra_content: None,
+            }],
+            None,
+        )];
 
         let api_messages = CopilotModelProvider::convert_messages(&messages);
         assert_eq!(api_messages.len(), 1);
@@ -1129,11 +1217,16 @@ mod tests {
         // Companion regression: valid JSON must round-trip byte-for-byte.
         use zeroclaw_api::model_provider::ChatMessage;
 
-        let messages = vec![ChatMessage {
-            role: "assistant".into(),
-            content: r#"{"content":"using","tool_calls":[{"id":"call_ok","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#
-                .into(),
-        }];
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            "using",
+            vec![zeroclaw_api::model_provider::ToolCall {
+                id: "call_ok".into(),
+                name: "shell".into(),
+                arguments: "{\"command\":\"pwd\"}".into(),
+                extra_content: None,
+            }],
+            None,
+        )];
 
         let api_messages = CopilotModelProvider::convert_messages(&messages);
         let tool_calls = api_messages[0].tool_calls.as_ref().unwrap();

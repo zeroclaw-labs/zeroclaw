@@ -8,8 +8,8 @@ use zeroclaw_api::model_provider::ChatMessage;
 pub struct SessionMetadata {
     /// Session key (e.g. `telegram_user123`).
     pub key: String,
-    /// Optional human-readable name (e.g. `eyrie-commander-briefing`).
-    pub name: Option<String>,
+    /// Optional human-readable title (e.g. `eyrie-commander-briefing`).
+    pub title: Option<String>,
     /// When the session was first created.
     pub created_at: DateTime<Utc>,
     /// When the last message was appended.
@@ -60,24 +60,17 @@ pub struct SessionQuery {
     pub limit: Option<usize>,
 }
 
-/// One persisted message with the optional `created_at` the backend
-/// stamped on it. JSONL / in-memory backends return `None`; SQLite
-/// returns the row's `created_at` column.
-#[derive(Debug, Clone)]
-pub struct TimestampedMessage {
-    pub message: ChatMessage,
-    pub created_at: Option<DateTime<Utc>>,
-}
+pub use crate::session_events::import::TimestampedMessage;
 
-/// A caller-owned, synchronous authority hold. Storage knows no runtime policy.
-pub trait SessionEffectGuard {}
-impl<T> SessionEffectGuard for T {}
-
-pub type SessionEffectAuthorization<'a> =
-    dyn Fn(Option<&str>) -> std::io::Result<Box<dyn SessionEffectGuard + 'a>> + 'a;
-
-/// Trait for session persistence backends shared across async tasks.
+/// Trait for session persistence backends.
+/// Implementations must be `Send + Sync` for sharing across async tasks.
 pub trait SessionBackend: Send + Sync {
+    /// Legacy inspection must fail once installation history is native.
+    /// In-memory backends have no installation fence.
+    fn require_legacy_access(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
     /// Load all messages for a session. Returns empty vec if session doesn't exist.
     fn load(&self, session_key: &str) -> Vec<ChatMessage>;
 
@@ -150,7 +143,7 @@ pub trait SessionBackend: Send + Sync {
                 let messages = self.load(&key);
                 SessionMetadata {
                     key,
-                    name: None,
+                    title: None,
                     created_at: Utc::now(),
                     last_activity: Utc::now(),
                     message_count: messages.len(),
@@ -208,13 +201,13 @@ pub trait SessionBackend: Send + Sync {
         self.get_session_metadata(session_key).is_some()
     }
 
-    /// Set or update the human-readable name for a session.
-    fn set_session_name(&self, _session_key: &str, _name: &str) -> std::io::Result<()> {
+    /// Set or update the human-readable title for a session.
+    fn set_session_title(&self, _session_key: &str, _title: &str) -> std::io::Result<()> {
         Ok(())
     }
 
-    /// Get the human-readable name for a session (if set).
-    fn get_session_name(&self, _session_key: &str) -> std::io::Result<Option<String>> {
+    /// Get the human-readable title for a session (if set).
+    fn get_session_title(&self, _session_key: &str) -> std::io::Result<Option<String>> {
         Ok(None)
     }
 
@@ -334,7 +327,7 @@ pub trait SessionBackend: Send + Sync {
         }
         Some(SessionMetadata {
             key: session_key.to_string(),
-            name: self.get_session_name(session_key).ok().flatten(),
+            title: self.get_session_title(session_key).ok().flatten(),
             created_at: Utc::now(),
             last_activity: Utc::now(),
             message_count: messages.len(),
@@ -363,49 +356,11 @@ pub trait SessionBackend: Send + Sync {
         ))
     }
 
-    /// Invoke a disclosure effect under the backend's owner-read boundary.
-    fn with_session_owner(
-        &self,
-        _session_key: &str,
-        _effect: &mut dyn FnMut(Option<&str>) -> std::io::Result<()>,
-    ) -> std::io::Result<()> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "guarded session disclosure unsupported",
-        ))
-    }
-
-    /// Authorize after the backend serialization boundary, retaining the guard
-    /// through the exact-owner mutation. Unsupported stores fail closed.
-    fn delete_session_authorized(
-        &self,
-        _session_key: &str,
-        _expected_owner: Option<&str>,
-        _authorize: &SessionEffectAuthorization<'_>,
-    ) -> std::io::Result<bool> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "guarded session deletion unsupported",
-        ))
-    }
-
-    /// Backends with no state effect still admit against the caller's locked
-    /// live incarnation. Persisting implementations must resolve the stored owner
-    /// under their mutation lock instead of trusting this fallback identity.
-    fn set_session_state_authorized(
-        &self,
-        _session_key: &str,
-        _state: &str,
-        _turn_id: Option<&str>,
-        live_owner: Option<&str>,
-        authorize: &SessionEffectAuthorization<'_>,
-    ) -> std::io::Result<()> {
-        let _authority = authorize(live_owner)?;
-        Ok(())
-    }
-
-    /// Delete only a matching stored owner. Backends without ownership support
-    /// fail closed without deleting anything.
+    /// Delete a session ONLY if `owner_principal_id` matches the stored
+    /// owner: the ownership check and the destruction of the ownership row
+    /// are one SQL statement (the RFC 7141 atomic storage predicate), so a
+    /// concurrent re-stamp cannot race them apart. Backends without
+    /// ownership support fail closed: `Ok(false)`, nothing deleted.
     fn delete_session_owned(
         &self,
         _session_key: &str,
@@ -450,34 +405,4 @@ pub struct SessionState {
     pub turn_id: Option<String>,
     /// When the current state was entered.
     pub turn_started_at: Option<DateTime<Utc>>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn session_metadata_is_constructible() {
-        let meta = SessionMetadata {
-            key: "test".into(),
-            name: None,
-            created_at: Utc::now(),
-            last_activity: Utc::now(),
-            message_count: 5,
-            agent_alias: None,
-            channel_id: None,
-            room_id: None,
-            sender_id: None,
-            principal_id: None,
-        };
-        assert_eq!(meta.key, "test");
-        assert_eq!(meta.message_count, 5);
-    }
-
-    #[test]
-    fn session_query_defaults() {
-        let q = SessionQuery::default();
-        assert!(q.keyword.is_none());
-        assert!(q.limit.is_none());
-    }
 }

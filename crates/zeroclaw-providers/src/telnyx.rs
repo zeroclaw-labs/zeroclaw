@@ -243,7 +243,10 @@ impl ModelProvider for TelnyxModelProvider {
             )
         })?;
 
-        let api_messages: Vec<Message> = messages
+        let mut messages = messages.to_vec();
+        crate::tool_protocol::render_text_tool_protocol(&mut messages)?;
+        let projected = crate::multimodal::project_attachment_metadata(&messages);
+        let api_messages: Vec<Message> = projected
             .iter()
             .map(|m| Message {
                 role: m.role.clone(),

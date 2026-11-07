@@ -45,8 +45,12 @@ pub fn tool_loop_cost_tracking_context_for_agent(
     config: &Config,
     agent_alias: &str,
 ) -> Option<ToolLoopCostTrackingContext> {
-    CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir)
-        .map(|tracker| tool_loop_cost_tracking_context_from_tracker(config, agent_alias, tracker))
+    CostTracker::get_or_init_global(
+        config.cost.clone(),
+        &config.data_dir,
+        &config.channels.session_backend,
+    )
+    .map(|tracker| tool_loop_cost_tracking_context_from_tracker(config, agent_alias, tracker))
 }
 
 pub fn tool_loop_cost_tracking_context_from_tracker(
@@ -568,9 +572,8 @@ fn record_tool_loop_cost_usage_inner_with_live(
         }
     }
 
-    // The session key scoped around this turn is the chat conversation the
-    // spend belongs to; the tracker's own id is daemon-lifetime scoped.
-    let conversation_id = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+    // Resolve the actual session from the current turn scope.
+    let session_id = zeroclaw_api::TOOL_LOOP_SESSION_KEY
         .try_with(Clone::clone)
         .ok()
         .flatten();
@@ -579,7 +582,7 @@ fn record_tool_loop_cost_usage_inner_with_live(
             cost_usage.clone(),
             ctx.agent_alias.as_deref(),
             None,
-            conversation_id,
+            session_id,
         )
     {
         ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_category(::zeroclaw_log::EventCategory::Provider).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": model_provider_name, "model": model, "error": format!("{}", error)})), "Failed to record cost tracking usage: ");
@@ -778,6 +781,7 @@ mod tests {
             CostTracker::new(
                 zeroclaw_config::schema::CostConfig::default(),
                 workspace.path(),
+                "jsonl",
             )
             .unwrap(),
         );
@@ -804,8 +808,11 @@ mod tests {
 
         let expected = (100.0 * 2.0 + 20.0 * 5.0) / 1_000_000.0;
         assert!((cost_usd - expected).abs() < 1e-12);
-        let stored = std::fs::read_to_string(workspace.path().join("state").join("costs.jsonl"))
-            .expect("costs.jsonl should be written");
+        let stored = std::fs::read_to_string(
+            zeroclaw_infra::cost_ledger::resolve_path(workspace.path(), "jsonl")
+                .expect("cost ledger path"),
+        )
+        .expect("cost ledger should be written");
         let record: zeroclaw_config::cost::types::CostRecord =
             serde_json::from_str(stored.lines().next().expect("one record")).unwrap();
         assert!(record.usage.pricing_available);
@@ -822,6 +829,7 @@ mod tests {
                     ..Default::default()
                 },
                 workspace.path(),
+                "jsonl",
             )
             .unwrap(),
         );
@@ -890,13 +898,14 @@ mod tests {
             })
             .await;
 
-        let records = std::fs::read_to_string(workspace.path().join("state").join("costs.jsonl"))
-            .unwrap()
-            .lines()
-            .map(|line| {
-                serde_json::from_str::<zeroclaw_config::cost::types::CostRecord>(line).unwrap()
-            })
-            .collect::<Vec<_>>();
+        let records = std::fs::read_to_string(
+            zeroclaw_infra::cost_ledger::resolve_path(workspace.path(), "jsonl")
+                .expect("cost ledger path"),
+        )
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<zeroclaw_config::cost::types::CostRecord>(line).unwrap())
+        .collect::<Vec<_>>();
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].usage.model, "model-a");
         assert_eq!(records[1].usage.model, "model-b");
@@ -914,6 +923,7 @@ mod tests {
                     ..Default::default()
                 },
                 workspace.path(),
+                "jsonl",
             )
             .unwrap(),
         );
@@ -1026,6 +1036,7 @@ mod tests {
             _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("ok".to_string()),
                 tool_calls: Vec::new(),
                 usage: Some(zeroclaw_providers::traits::TokenUsage {
@@ -1072,6 +1083,7 @@ mod tests {
             _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("fail".to_string()),
                 tool_calls: Vec::new(),
                 usage: Some(zeroclaw_providers::traits::TokenUsage {
@@ -1118,6 +1130,7 @@ mod tests {
             _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("ok".to_string()),
                 tool_calls: Vec::new(),
                 usage: None,
@@ -1619,6 +1632,7 @@ mod tests {
             CostTracker::new(
                 zeroclaw_config::schema::CostConfig::default(),
                 workspace.path(),
+                "jsonl",
             )
             .unwrap(),
         );
@@ -1649,8 +1663,11 @@ mod tests {
         assert_eq!(total_tokens, 5_200);
         assert!((cost_usd - expected).abs() < 1e-12);
 
-        let stored = std::fs::read_to_string(workspace.path().join("state").join("costs.jsonl"))
-            .expect("costs.jsonl should be written");
+        let stored = std::fs::read_to_string(
+            zeroclaw_infra::cost_ledger::resolve_path(workspace.path(), "jsonl")
+                .expect("cost ledger path"),
+        )
+        .expect("cost ledger should be written");
         let record: zeroclaw_config::cost::types::CostRecord =
             serde_json::from_str(stored.lines().next().expect("one record")).unwrap();
         assert_eq!(record.usage.cached_input_tokens, 4_000);
@@ -1664,6 +1681,7 @@ mod tests {
             CostTracker::new(
                 zeroclaw_config::schema::CostConfig::default(),
                 workspace.path(),
+                "jsonl",
             )
             .unwrap(),
         );
@@ -1695,18 +1713,20 @@ mod tests {
             ));
         }
 
-        let stored = std::fs::read_to_string(workspace.path().join("state").join("costs.jsonl"))
-            .expect("costs.jsonl should be written");
-        let mut conversation_ids = Vec::new();
+        let stored = std::fs::read_to_string(
+            zeroclaw_infra::cost_ledger::resolve_path(workspace.path(), "jsonl")
+                .expect("cost ledger path"),
+        )
+        .expect("cost ledger should be written");
+        let mut session_ids = Vec::new();
         for line in stored.lines() {
             let record: zeroclaw_config::cost::types::CostRecord =
                 serde_json::from_str(line).unwrap();
-            assert_eq!(record.session_id, tracker.session_id());
-            conversation_ids.push(record.conversation_id.expect("conversation id"));
+            session_ids.push(record.session_id.expect("session id"));
         }
-        conversation_ids.sort();
+        session_ids.sort();
         assert_eq!(
-            conversation_ids,
+            session_ids,
             vec!["chat-session-a".to_string(), "chat-session-b".to_string()],
             "two chat sessions on one daemon must stay separable in the ledger"
         );
@@ -1719,6 +1739,7 @@ mod tests {
             CostTracker::new(
                 zeroclaw_config::schema::CostConfig::default(),
                 workspace.path(),
+                "jsonl",
             )
             .unwrap(),
         );
@@ -1751,8 +1772,11 @@ mod tests {
         assert_eq!(total_tokens, 5_200);
         assert!((cost_usd - expected).abs() < 1e-12);
 
-        let stored = std::fs::read_to_string(workspace.path().join("state").join("costs.jsonl"))
-            .expect("costs.jsonl should be written");
+        let stored = std::fs::read_to_string(
+            zeroclaw_infra::cost_ledger::resolve_path(workspace.path(), "jsonl")
+                .expect("cost ledger path"),
+        )
+        .expect("cost ledger should be written");
         let record: zeroclaw_config::cost::types::CostRecord =
             serde_json::from_str(stored.lines().next().expect("one record")).unwrap();
         assert_eq!(record.usage.cache_creation_input_tokens, 1_000);
@@ -1765,6 +1789,7 @@ mod tests {
             CostTracker::new(
                 zeroclaw_config::schema::CostConfig::default(),
                 workspace.path(),
+                "jsonl",
             )
             .unwrap(),
         );
@@ -1832,6 +1857,7 @@ mod tests {
             CostTracker::new(
                 zeroclaw_config::schema::CostConfig::default(),
                 workspace.path(),
+                "jsonl",
             )
             .unwrap(),
         );
@@ -1861,8 +1887,11 @@ mod tests {
 
         let expected = (700.0 * 10.0 + 300.0 * 12.5 + 200.0 * 1.0 + 500.0 * 15.0) / 1e6;
         assert!((cost_usd - expected).abs() < 1e-12);
-        let stored = std::fs::read_to_string(workspace.path().join("state").join("costs.jsonl"))
-            .expect("costs.jsonl should be written");
+        let stored = std::fs::read_to_string(
+            zeroclaw_infra::cost_ledger::resolve_path(workspace.path(), "jsonl")
+                .expect("cost ledger path"),
+        )
+        .expect("cost ledger should be written");
         let record: zeroclaw_config::cost::types::CostRecord =
             serde_json::from_str(stored.lines().next().expect("one record")).unwrap();
         assert!(record.usage.pricing_available);
@@ -1876,6 +1905,7 @@ mod tests {
             CostTracker::new(
                 zeroclaw_config::schema::CostConfig::default(),
                 workspace.path(),
+                "jsonl",
             )
             .unwrap(),
         );
@@ -1914,8 +1944,11 @@ mod tests {
 
         let expected = (700.0 * 10.0 + 300.0 * 12.5 + 200.0 * 1.0 + 500.0 * 15.0) / 1e6;
         assert!((cost_usd - expected).abs() < 1e-12);
-        let stored = std::fs::read_to_string(workspace.path().join("state").join("costs.jsonl"))
-            .expect("costs.jsonl should be written");
+        let stored = std::fs::read_to_string(
+            zeroclaw_infra::cost_ledger::resolve_path(workspace.path(), "jsonl")
+                .expect("cost ledger path"),
+        )
+        .expect("cost ledger should be written");
         let record: zeroclaw_config::cost::types::CostRecord =
             serde_json::from_str(stored.lines().next().expect("one record")).unwrap();
         assert!(record.usage.pricing_available);
@@ -1929,6 +1962,7 @@ mod tests {
             CostTracker::new(
                 zeroclaw_config::schema::CostConfig::default(),
                 workspace.path(),
+                "jsonl",
             )
             .unwrap(),
         );
@@ -1966,8 +2000,11 @@ mod tests {
                 .expect("unpriced usage");
         });
 
-        let stored = std::fs::read_to_string(workspace.path().join("state").join("costs.jsonl"))
-            .expect("costs.jsonl should be written");
+        let stored = std::fs::read_to_string(
+            zeroclaw_infra::cost_ledger::resolve_path(workspace.path(), "jsonl")
+                .expect("cost ledger path"),
+        )
+        .expect("cost ledger should be written");
         let records: Vec<zeroclaw_config::cost::types::CostRecord> = stored
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
@@ -1987,6 +2024,7 @@ mod tests {
             CostTracker::new(
                 zeroclaw_config::schema::CostConfig::default(),
                 workspace.path(),
+                "jsonl",
             )
             .unwrap(),
         );
@@ -2036,8 +2074,11 @@ mod tests {
             }
         });
 
-        let stored = std::fs::read_to_string(workspace.path().join("state").join("costs.jsonl"))
-            .expect("costs.jsonl should be written");
+        let stored = std::fs::read_to_string(
+            zeroclaw_infra::cost_ledger::resolve_path(workspace.path(), "jsonl")
+                .expect("cost ledger path"),
+        )
+        .expect("cost ledger should be written");
         let records: Vec<zeroclaw_config::cost::types::CostRecord> = stored
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
@@ -2059,6 +2100,7 @@ mod tests {
             CostTracker::new(
                 zeroclaw_config::schema::CostConfig::default(),
                 workspace.path(),
+                "jsonl",
             )
             .unwrap(),
         );
@@ -2084,8 +2126,11 @@ mod tests {
             .expect("extreme-rate usage must remain observable");
         assert_eq!(result, (10_000_000, 0.0));
 
-        let stored = std::fs::read_to_string(workspace.path().join("state").join("costs.jsonl"))
-            .expect("the safety record must not be dropped");
+        let stored = std::fs::read_to_string(
+            zeroclaw_infra::cost_ledger::resolve_path(workspace.path(), "jsonl")
+                .expect("cost ledger path"),
+        )
+        .expect("the safety record must not be dropped");
         let record: zeroclaw_config::cost::types::CostRecord =
             serde_json::from_str(stored.lines().next().expect("one record")).unwrap();
         assert!(record.usage.cost_usd.is_finite());
@@ -2106,11 +2151,15 @@ mod tests {
             CostTracker::new(
                 zeroclaw_config::schema::CostConfig::default(),
                 workspace.path(),
+                "jsonl",
             )
             .unwrap(),
         );
-        std::fs::create_dir_all(workspace.path().join("state").join("costs.jsonl"))
-            .expect("make costs.jsonl path unwritable as a directory");
+        let ledger_path = zeroclaw_infra::cost_ledger::resolve_path(workspace.path(), "jsonl")
+            .expect("cost ledger path");
+        std::fs::remove_file(&ledger_path).expect("remove initialized cost ledger file");
+        std::fs::create_dir_all(&ledger_path)
+            .expect("make cost ledger path unwritable as a directory");
         let ctx = ToolLoopCostTrackingContext::new(
             Arc::clone(&tracker),
             Arc::new(HashMap::from([(
@@ -2204,6 +2253,7 @@ mod tests {
                     ..zeroclaw_config::schema::CostConfig::default()
                 },
                 workspace.path(),
+                "jsonl",
             )
             .unwrap(),
         );

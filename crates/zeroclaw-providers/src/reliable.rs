@@ -1553,9 +1553,7 @@ fn provider_exhausted_attrs(
 }
 
 fn is_context_turn_boundary(message: &ChatMessage) -> bool {
-    message.role == "user"
-        && !zeroclaw_api::tool_carrier::is_tool_result_carrier(&message.role, &message.content)
-        && !message.is_pruned_context_separator()
+    message.role == "user" && !message.is_pruned_context_separator()
 }
 
 fn context_truncation_limit(messages: &[ChatMessage]) -> &'static str {
@@ -2457,6 +2455,14 @@ impl ReliableModelProvider {
 
 #[async_trait]
 impl ModelProvider for ReliableModelProvider {
+    fn dispatch_reference(&self) -> &str {
+        &self.alias
+    }
+
+    fn is_dispatch_composite(&self) -> bool {
+        true
+    }
+
     fn has_stable_request_identity(&self, model: &str) -> bool {
         if self.model_providers.len() != 1
             || self
@@ -2642,6 +2648,10 @@ impl ModelProvider for ReliableModelProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
+                            if zeroclaw_api::session_events::capture::is_capture_stopped(&e) {
+                                return Err(e);
+                            }
+
                             remember_refusal(&mut refusal_seen, &mut rejected_attempt_usage, &e);
                             if is_semantic_empty_completion_error(&e) {
                                 if attempt < self.max_retries {
@@ -2939,6 +2949,10 @@ impl ModelProvider for ReliableModelProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
+                            if zeroclaw_api::session_events::capture::is_capture_stopped(&e) {
+                                return Err(e);
+                            }
+
                             remember_refusal(&mut refusal_seen, &mut rejected_attempt_usage, &e);
                             if is_semantic_empty_completion_error(&e) {
                                 if attempt < self.max_retries {
@@ -3128,13 +3142,16 @@ impl ModelProvider for ReliableModelProvider {
     }
 
     fn supports_single_tool_rounds(&self, model: &str) -> bool {
-        !self.model_providers.is_empty()
+        self.eligible_provider_count() > 0
             && self.model_chain(model).iter().all(|model| {
-                self.model_providers.iter().all(|entry| {
-                    entry
-                        .provider()
-                        .supports_single_tool_rounds(entry.served_model(model))
-                })
+                self.model_providers
+                    .iter()
+                    .filter(|entry| Self::provider_allowed_for_turn(entry))
+                    .all(|entry| {
+                        entry
+                            .provider()
+                            .supports_single_tool_rounds(entry.served_model(model))
+                    })
             })
     }
 
@@ -3390,6 +3407,10 @@ impl ModelProvider for ReliableModelProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
+                            if zeroclaw_api::session_events::capture::is_capture_stopped(&e) {
+                                return Err(e);
+                            }
+
                             remember_refusal(&mut refusal_seen, &mut rejected_attempt_usage, &e);
                             if is_semantic_empty_completion_error(&e) {
                                 if attempt < retry_limit {
@@ -3767,6 +3788,10 @@ impl ModelProvider for ReliableModelProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
+                            if zeroclaw_api::session_events::capture::is_capture_stopped(&e) {
+                                return Err(e);
+                            }
+
                             remember_refusal(&mut refusal_seen, &mut rejected_attempt_usage, &e);
                             if is_semantic_empty_completion_error(&e) {
                                 if attempt < retry_limit {
@@ -4884,6 +4909,7 @@ mod tests {
             _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(self.serve(model)),
                 tool_calls: Vec::new(),
                 usage: None,
@@ -5745,6 +5771,7 @@ mod tests {
         ) -> anyhow::Result<ChatResponse> {
             let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: (attempt > 0).then(|| "recovered".to_string()),
                 tool_calls: Vec::new(),
                 usage: Some(TokenUsage {
@@ -5766,6 +5793,7 @@ mod tests {
         ) -> anyhow::Result<ChatResponse> {
             let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: (attempt > 0).then(|| "recovered".to_string()),
                 tool_calls: Vec::new(),
                 usage: Some(TokenUsage {
@@ -5813,6 +5841,7 @@ mod tests {
         ) -> anyhow::Result<ChatResponse> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: None,
                 tool_calls: Vec::new(),
                 usage: Some(TokenUsage {
@@ -5834,6 +5863,7 @@ mod tests {
         ) -> anyhow::Result<ChatResponse> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: None,
                 tool_calls: Vec::new(),
                 usage: Some(TokenUsage {
@@ -9615,6 +9645,7 @@ mod tests {
                 anyhow::bail!(self.error);
             }
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(self.response_text.to_string()),
                 tool_calls: self.tool_calls.clone(),
                 usage: None,
@@ -9949,6 +9980,7 @@ mod tests {
                 anyhow::bail!("500 model {} unavailable", model);
             }
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(self.response_text.to_string()),
                 tool_calls: vec![],
                 usage: None,
@@ -10194,33 +10226,28 @@ mod tests {
     }
 
     fn native_tool_call(ids: &[&str]) -> ChatMessage {
-        let tool_calls = ids
-            .iter()
-            .map(|id| {
-                serde_json::json!({
-                    "id": id,
-                    "name": "shell",
-                    "arguments": "{}",
+        ChatMessage::assistant_tool_calls(
+            "",
+            ids.iter()
+                .map(|id| crate::ToolCall {
+                    id: (*id).into(),
+                    name: "shell".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
                 })
-            })
-            .collect::<Vec<_>>();
-        ChatMessage::assistant(
-            serde_json::json!({
-                "content": "",
-                "tool_calls": tool_calls,
-            })
-            .to_string(),
+                .collect(),
+            None,
         )
     }
 
     fn native_tool_result(id: &str) -> ChatMessage {
-        ChatMessage::tool(
-            serde_json::json!({
-                "tool_call_id": id,
-                "content": format!("result for {id}"),
-            })
-            .to_string(),
-        )
+        ChatMessage::tool_result(crate::ToolResultMessage {
+            tool_call_id: id.into(),
+            tool_name: "shell".into(),
+            success: Some(true),
+            content: format!("result for {id}"),
+            attachments: Vec::new(),
+        })
     }
 
     fn context_overflow_native_tool_history() -> Vec<ChatMessage> {
@@ -10304,7 +10331,13 @@ mod tests {
             ChatMessage::assistant("old response"),
             ChatMessage::user("run a prompt tool"),
             ChatMessage::assistant("<tool_call>...</tool_call>"),
-            ChatMessage::user("[Tool results]\n<tool_result>ok</tool_result>"),
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: ("call-a").to_string(),
+                tool_name: ("shell").to_string(),
+                content: ("ok").to_string(),
+                success: None,
+                attachments: Vec::new(),
+            }),
             ChatMessage::assistant("tool summary"),
             ChatMessage::user("current question"),
         ];
@@ -10350,6 +10383,7 @@ mod tests {
                 anyhow::bail!("maximum context length exceeded");
             }
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("recovered".to_string()),
                 tool_calls: Vec::new(),
                 usage: None,
@@ -10463,6 +10497,7 @@ mod tests {
         ) -> anyhow::Result<ChatResponse> {
             self.record_attempt(messages.len())?;
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("recovered after truncation".to_string()),
                 tool_calls: Vec::new(),
                 usage: None,
@@ -10478,6 +10513,7 @@ mod tests {
         ) -> anyhow::Result<ChatResponse> {
             self.record_attempt(request.messages.len())?;
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("recovered after truncation".to_string()),
                 tool_calls: Vec::new(),
                 usage: None,
@@ -11233,6 +11269,7 @@ mod tests {
         ) -> anyhow::Result<ChatResponse> {
             self.chat_calls.fetch_add(1, Ordering::SeqCst);
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("must not replay".to_string()),
                 tool_calls: Vec::new(),
                 usage: None,
@@ -11301,6 +11338,7 @@ mod tests {
                 anyhow::bail!("ModelProvider error: overloaded_error: Overloaded");
             }
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("must not replay".to_string()),
                 tool_calls: Vec::new(),
                 usage: None,
@@ -11373,6 +11411,7 @@ mod tests {
                 anyhow::bail!("ModelProvider error: overloaded_error: Overloaded");
             }
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("recovered after overload".to_string()),
                 tool_calls: Vec::new(),
                 usage: None,
@@ -11421,6 +11460,7 @@ mod tests {
         ) -> anyhow::Result<ChatResponse> {
             self.chat_calls.fetch_add(1, Ordering::SeqCst);
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("must not replay".to_string()),
                 tool_calls: Vec::new(),
                 usage: None,
@@ -11479,12 +11519,14 @@ mod tests {
             self.chat_calls.fetch_add(1, Ordering::SeqCst);
             match self.chat_result {
                 SemanticRecoveryChatResult::Success => Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("recovered".to_string()),
                     tool_calls: Vec::new(),
                     usage: None,
                     reasoning_content: None,
                 }),
                 SemanticRecoveryChatResult::Empty => Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: None,
                     tool_calls: Vec::new(),
                     usage: None,
@@ -13988,6 +14030,7 @@ mod tests {
         struct CapabilityMock {
             vision: bool,
             native_tools: bool,
+            single_tool_rounds: bool,
             streaming: bool,
             streaming_tool_events: bool,
         }
@@ -14010,6 +14053,10 @@ mod tests {
 
             fn supports_native_tools(&self) -> bool {
                 self.native_tools
+            }
+
+            fn supports_single_tool_rounds(&self, _model: &str) -> bool {
+                self.single_tool_rounds
             }
 
             fn supports_streaming(&self) -> bool {
@@ -14043,6 +14090,7 @@ mod tests {
                     Box::new(CapabilityMock {
                         vision: true,
                         native_tools: true,
+                        single_tool_rounds: true,
                         streaming: false,
                         streaming_tool_events: false,
                     }) as Box<dyn ModelProvider>,
@@ -14052,6 +14100,7 @@ mod tests {
                     Box::new(CapabilityMock {
                         vision: false,
                         native_tools: false,
+                        single_tool_rounds: false,
                         streaming: true,
                         streaming_tool_events: true,
                     }) as Box<dyn ModelProvider>,
@@ -14065,11 +14114,17 @@ mod tests {
         scope_provider_attempt_allowlist(Some(allowed), async {
             assert!(provider.supports_vision());
             assert!(provider.supports_native_tools());
+            assert!(provider.supports_single_tool_rounds("model"));
             assert!(!provider.supports_streaming());
             assert!(!provider.supports_streaming_tool_events());
             assert!(provider.capabilities_for_model("model").vision);
             assert!(provider.capabilities_for_model("model").native_tool_calling);
             assert_eq!(provider.vision_limited_by("model"), None);
+        })
+        .await;
+        assert!(!provider.supports_single_tool_rounds("model"));
+        scope_provider_attempt_allowlist(Some(Arc::new(HashSet::new())), async {
+            assert!(!provider.supports_single_tool_rounds("model"));
         })
         .await;
     }

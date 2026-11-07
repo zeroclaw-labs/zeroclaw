@@ -59,6 +59,73 @@ fn delegate_failure_error(agent_name: &str, error: &anyhow::Error) -> String {
         .unwrap_or_else(|| format!("Agent '{agent_name}' failed: {error}"))
 }
 
+async fn prepare_child_capture(
+    agent: &str,
+    prompt: &str,
+    mode: zeroclaw_api::session_events::ChildExecutionMode,
+    task_id: Option<String>,
+) -> anyhow::Result<Option<Arc<dyn zeroclaw_api::session_events::capture::ChildExecutionPort>>> {
+    let Some(parent) = zeroclaw_api::session_events::capture::current_provider_admission() else {
+        return Ok(None);
+    };
+    Ok(Some(
+        parent
+            .begin_child(zeroclaw_api::session_events::capture::ChildDispatchIntent {
+                relation: "delegate".into(),
+                target_agent: agent.into(),
+                prompt: prompt.into(),
+                execution_mode: mode,
+                task_id,
+            })
+            .await?,
+    ))
+}
+
+async fn run_child_capture<F>(
+    child: Option<Arc<dyn zeroclaw_api::session_events::capture::ChildExecutionPort>>,
+    engine: F,
+) -> anyhow::Result<ToolResult>
+where
+    F: Future<Output = anyhow::Result<ToolResult>> + Send,
+{
+    let Some(child) = child else {
+        return engine.await;
+    };
+    let mut observed = None;
+    let recorded = child
+        .execute(Box::pin(async {
+            let result = engine.await;
+            let value = match &result {
+                Ok(result) if result.success => Ok(result.output.as_str().to_owned()),
+                Ok(result) => Err(anyhow::Error::msg(
+                    result
+                        .error
+                        .as_deref()
+                        .unwrap_or("child_execution_failed")
+                        .to_owned(),
+                )),
+                Err(error) => Err(anyhow::Error::msg(
+                    crate::agent::Agent::session_execution_diagnostic(error),
+                )),
+            };
+            observed = Some(result);
+            value
+        }))
+        .await;
+    if let Err(error) = recorded
+        && (zeroclaw_api::session_events::capture::is_capture_stopped(&error)
+            || error.chain().any(|source| {
+                source.is::<zeroclaw_kernel::session::SessionError>()
+                    || source.is::<zeroclaw_api::session_events::AppendError>()
+                    || source.is::<zeroclaw_api::session_events::ReadError>()
+            })
+            || observed.is_none())
+    {
+        return Err(error);
+    }
+    observed.ok_or_else(|| anyhow::Error::msg("child engine result missing"))?
+}
+
 async fn scope_delegate_session_key<F>(session_key: Option<String>, future: F) -> F::Output
 where
     F: std::future::Future,
@@ -1323,6 +1390,7 @@ impl DelegateTool {
                 let tracker = crate::cost::CostTracker::get_or_init_global(
                     config.cost.clone(),
                     &config.data_dir,
+                    &config.channels.session_backend,
                 )?;
                 let flags = tracker.enforcement_flags();
                 (tracker, flags)
@@ -1563,15 +1631,19 @@ impl DelegateTool {
     ) -> anyhow::Result<(Box<dyn ModelProvider>, String, String)> {
         if let Some(config) = config.or(self.root_config.as_deref()) {
             let binding = self.target_binding();
-            let (provider, provider_name, model_name, _resolver) =
-                crate::agent::agent::build_session_model_provider_with_capabilities(
-                    &binding.capabilities,
-                    config,
-                    agent_name,
-                    model_provider,
-                    None,
-                    binding.principal.as_ref(),
-                )?;
+            let zeroclaw_providers::factory::SessionModelProvider {
+                provider,
+                provider_ref: provider_name,
+                model: model_name,
+                ..
+            } = crate::agent::agent::build_session_model_provider_with_capabilities(
+                &binding.capabilities,
+                config,
+                agent_name,
+                model_provider,
+                None,
+                binding.principal.as_ref(),
+            )?;
             return Ok((provider, provider_name, model_name));
         }
         // A delegate bound to supplied capabilities resolves targets only
@@ -1825,7 +1897,6 @@ impl DelegateTool {
                 sop_audit: None,
                 live_config: self.live_config.clone(),
                 execution_capability: self.execution_capability.clone(),
-                acp_sessions: None,
             })?,
             None => crate::tools::supplied_registry_base()?,
         };
@@ -3114,6 +3185,44 @@ impl DelegateTool {
         admission: DelegateAdmission,
         execution_admission: Option<AgentExecutionAdmission>,
     ) -> anyhow::Result<ToolResult> {
+        let context = args
+            .get("context")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        let captured_input = if context.is_empty() {
+            prompt.to_owned()
+        } else {
+            format!("[Context]\n{context}\n\n[Task]\n{prompt}")
+        };
+        let child = prepare_child_capture(
+            agent_name,
+            &captured_input,
+            zeroclaw_api::session_events::ChildExecutionMode::Sync,
+            None,
+        )
+        .await?;
+        run_child_capture(
+            child,
+            self.execute_sync_with_target_admission_body(
+                agent_name,
+                prompt,
+                args,
+                admission,
+                execution_admission,
+            ),
+        )
+        .await
+    }
+
+    async fn execute_sync_with_target_admission_body(
+        &self,
+        agent_name: &str,
+        prompt: &str,
+        args: &serde_json::Value,
+        admission: DelegateAdmission,
+        execution_admission: Option<AgentExecutionAdmission>,
+    ) -> anyhow::Result<ToolResult> {
         if let Some(execution_admission) = execution_admission.as_ref() {
             execution_admission.revalidate()?;
         }
@@ -3450,6 +3559,13 @@ impl DelegateTool {
                 })
             });
         let dispatcher = ProviderDispatch::from_ref(&*model_provider);
+        let mut messages = Vec::new();
+        if let Some(system) = system_prompt_ref {
+            messages.push(ChatMessage::system(system));
+        }
+        messages.push(
+            ChatMessage::user(&full_prompt).with_timestamp(chrono::Utc::now().timestamp_millis()),
+        );
         // A single-call background delegate has no tool loop to observe, so
         // its one model request and the reply are recorded here.
         if let Some(sink) = self.progress.as_deref() {
@@ -3458,7 +3574,7 @@ impl DelegateTool {
         }
         let result = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
-            dispatcher.chat_with_system(system_prompt_ref, &full_prompt, &model, temperature),
+            dispatcher.chat_with_history(&messages, &model, temperature),
         )
         .await;
         if let Some(sink) = self.progress.as_deref() {
@@ -3768,6 +3884,31 @@ impl DelegateTool {
             });
         }
 
+        let child_capture = match prepare_child_capture(
+            agent_name,
+            &full_prompt,
+            zeroclaw_api::session_events::ChildExecutionMode::Background,
+            Some(task_id.clone()),
+        )
+        .await
+        {
+            Ok(child) => child,
+            Err(error) => {
+                // TaskRegistry owns the already-created task. Refused capture
+                // must settle it before returning; no detached worker exists.
+                Self::settle_background_task(
+                    task_control_plane.store.as_ref(),
+                    &result_path,
+                    initial_result,
+                    crate::control_plane::TaskStatus::Failed,
+                    Some(format!("{error:#}")),
+                    std::process::id(),
+                    task_control_plane.boot_id.clone(),
+                )
+                .await?;
+                return Err(error);
+            }
+        };
         let agents = Arc::clone(&self.agents);
         // Carried ceiling: the resolved target policy's effective per-hop
         // daily limit (`0` = inherit the global limit), read before the
@@ -3955,16 +4096,16 @@ impl DelegateTool {
 
                 let worker: std::pin::Pin<
                     Box<dyn Future<Output = anyhow::Result<ToolResult>> + Send + '_>,
-                > = Box::pin(inner.execute_sync_with_target_admission(
+                > = Box::pin(run_child_capture(child_capture.clone(),inner.execute_sync_with_target_admission_body(
                     &agent_name_owned,
                     &full_prompt,
                     &args_inner,
                     DelegateAdmission::Prevalidated,
                     target_execution_admission.clone(),
-                ));
+                )));
 
                 // Race the delegation against cancellation
-                let outcome = tokio::select! {
+                let mut outcome = tokio::select! {
                     () = child_token.cancelled() => {
                         Err("Cancelled by parent session".to_string())
                     }
@@ -3982,6 +4123,16 @@ impl DelegateTool {
                     }
                 };
 
+                if child_token.is_cancelled()
+                    && let Some(child) = child_capture
+                    && let Err(error) = async {
+                        child.request_cancellation("parent_task_cancelled_child_future").await?;
+                        child.interrupted("parent_task_cancelled_child_future").await
+                    }.await {
+                            // TaskRegistry still settles below. Capture failure
+                            // is retained as the task error, not ignored.
+                            outcome = Err(format!("session_capture_failed: {error:#}"));
+                }
                 drop(inner);
                 drop(args_inner);
                 drop(agent_name_owned);
@@ -4289,6 +4440,21 @@ impl DelegateTool {
                 )
                 .map(|ctx| (agent_name.clone(), ctx));
 
+            let child_prompt = args_clone
+                .get("context")
+                .and_then(serde_json::Value::as_str)
+                .filter(|context| !context.is_empty())
+                .map_or_else(
+                    || prompt.clone(),
+                    |context| format!("[Context]\n{context}\n\n[Task]\n{prompt}"),
+                );
+            let child_capture = prepare_child_capture(
+                &agent_name,
+                &child_prompt,
+                zeroclaw_api::session_events::ChildExecutionMode::ParallelMember,
+                None,
+            )
+            .await?;
             handles.push(zeroclaw_spawn::spawn!(
                 async move {
                     let inner = DelegateTool {
@@ -4344,12 +4510,15 @@ impl DelegateTool {
                                                         > + Send
                                                         + '_,
                                                 >,
-                                            > = Box::pin(inner.execute_sync_with_target_admission(
-                                                &agent_name,
-                                                &prompt,
-                                                &args_clone,
-                                                DelegateAdmission::Required,
-                                                target_execution_admission,
+                                            > = Box::pin(run_child_capture(
+                                                child_capture,
+                                                inner.execute_sync_with_target_admission_body(
+                                                    &agent_name,
+                                                    &prompt,
+                                                    &args_clone,
+                                                    DelegateAdmission::Required,
+                                                    target_execution_admission,
+                                                ),
                                             ));
                                             worker.await
                                         })
@@ -4676,6 +4845,11 @@ impl DelegateTool {
                 error: Some(format!("No result found for task_id '{task_id}'")),
             });
         };
+        if !state.is_pending()
+            && let Some(port) = zeroclaw_api::session_events::capture::current_provider_admission()
+        {
+            port.consume_child_result(task_id, &value).await?;
+        }
         let success = state.is_success() && task_error.is_none();
 
         Ok(ToolResult {
@@ -4758,6 +4932,23 @@ impl DelegateTool {
                             .into(),
                     )
                 };
+                if let Some(port) =
+                    zeroclaw_api::session_events::capture::current_provider_admission()
+                {
+                    for result in &results {
+                        if result
+                            .get("status")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|status| {
+                                !matches!(status, "pending" | "running" | "queued")
+                            })
+                            && let Some(task_id) =
+                                result.get("task_id").and_then(serde_json::Value::as_str)
+                        {
+                            port.consume_child_result(task_id, result).await?;
+                        }
+                    }
+                }
                 return Ok(ToolResult {
                     success,
                     output: serde_json::to_string_pretty(&json!({
@@ -5130,8 +5321,7 @@ impl DelegateTool {
             .add_section(Box::new(crate::agent::prompt::ShellSection))
             .add_section(Box::new(crate::agent::prompt::SkillsSection))
             .add_section(Box::new(crate::agent::prompt::WorkspaceSection))
-            .add_section(Box::new(crate::agent::prompt::RuntimeSection))
-            .add_section(Box::new(crate::agent::prompt::DateTimeSection));
+            .add_section(Box::new(crate::agent::prompt::RuntimeSection));
 
         let mut enriched = builder
             .build_with_approval_policy(&ctx, &always_ask_values)
@@ -5176,7 +5366,7 @@ impl DelegateTool {
         provider_type: &str,
         model: &str,
         model_provider: &dyn ModelProvider,
-        full_prompt: &str,
+        full_prompt: impl Into<ChatMessage>,
         temperature: Option<f64>,
     ) -> anyhow::Result<ToolResult> {
         self.execute_agentic_with_admission(
@@ -5200,7 +5390,7 @@ impl DelegateTool {
         provider_type: &str,
         model: &str,
         model_provider: &dyn ModelProvider,
-        full_prompt: &str,
+        full_prompt: impl Into<ChatMessage>,
         temperature: Option<f64>,
         admission: DelegateAdmission,
         target_config: Option<&Config>,
@@ -5229,7 +5419,7 @@ impl DelegateTool {
         provider_type: &str,
         model: &str,
         model_provider: &dyn ModelProvider,
-        full_prompt: &str,
+        full_prompt: impl Into<ChatMessage>,
         temperature: Option<f64>,
         admission: DelegateAdmission,
         approval_context: DelegateApprovalContext<'_>,
@@ -5637,7 +5827,7 @@ impl DelegateTool {
             })
         });
 
-        // Build enriched system prompt with tools, skills, workspace, datetime context.
+        // Build stable system context; message time is provider-request metadata.
         // Independent delegation builds it from the TARGET's workspace (`sub_workspace`), so
         // the skill prompt content matches the target's skill tools; bounded delegation
         // keeps the caller's `self.workspace_dir`.
@@ -5699,7 +5889,11 @@ impl DelegateTool {
         if let Some(system_prompt) = enriched_system_prompt.as_ref() {
             history.push(ChatMessage::system(system_prompt.clone()));
         }
-        history.push(ChatMessage::user(full_prompt.to_string()));
+        let mut message = full_prompt.into();
+        if message.timestamp.is_none() {
+            message.timestamp = Some(chrono::Utc::now().timestamp_millis());
+        }
+        history.push(message);
 
         let noop_observer = NoopObserver;
 
@@ -7909,6 +8103,7 @@ mod tests {
                     .unwrap()
                     .push(tool_message.content.clone());
                 return Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("done".to_string()),
                     tool_calls: Vec::new(),
                     usage: None,
@@ -7916,6 +8111,7 @@ mod tests {
                 });
             }
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: None,
                 tool_calls: vec![ToolCall {
                     id: "approval_probe".to_string(),
@@ -7966,6 +8162,7 @@ mod tests {
             let has_tool_message = request.messages.iter().any(|m| m.role == "tool");
             if has_tool_message {
                 Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("done".to_string()),
                     tool_calls: Vec::new(),
                     usage: None,
@@ -7973,6 +8170,7 @@ mod tests {
                 })
             } else {
                 Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: None,
                     tool_calls: vec![ToolCall {
                         id: "call_1".to_string(),
@@ -8040,6 +8238,7 @@ mod tests {
             if !tool_messages.is_empty() {
                 self.tool_messages.lock().unwrap().extend(tool_messages);
                 return Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("done".to_string()),
                     tool_calls: Vec::new(),
                     usage: None,
@@ -8048,6 +8247,7 @@ mod tests {
             }
 
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: None,
                 tool_calls: vec![
                     ToolCall {
@@ -8123,6 +8323,7 @@ mod tests {
             if let Some(tool_message) = request.messages.iter().find(|m| m.role == "tool") {
                 *self.tool_message.lock().unwrap() = Some(tool_message.content.clone());
                 Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("done".to_string()),
                     tool_calls: Vec::new(),
                     usage: None,
@@ -8130,6 +8331,7 @@ mod tests {
                 })
             } else {
                 Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: None,
                     tool_calls: vec![ToolCall {
                         id: "call_1".to_string(),
@@ -8177,6 +8379,7 @@ mod tests {
             _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(
                     r#"<tool_call>{"name":"echo_tool","arguments":{"value":"ignored"}}</tool_call>"#
                         .to_string(),
@@ -8221,6 +8424,7 @@ mod tests {
             _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: None,
                 tool_calls: vec![ToolCall {
                     id: "loop".to_string(),
@@ -8530,6 +8734,7 @@ mod tests {
                 None
             };
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: call.is_none().then(|| format!("{} completed", self.alias)),
                 tool_calls: call
                     .into_iter()
@@ -9907,7 +10112,6 @@ mod tests {
                 sop_audit: None,
                 live_config: None,
                 execution_capability: None,
-                acp_sessions: None,
             },
         )
         .unwrap();
@@ -10080,6 +10284,7 @@ mod tests {
             let tool_message_count = request.messages.iter().filter(|m| m.role == "tool").count();
             match tool_message_count {
                 0 => Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: None,
                     tool_calls: vec![ToolCall {
                         id: "call_store".to_string(),
@@ -10096,6 +10301,7 @@ mod tests {
                     reasoning_content: None,
                 }),
                 1 => Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: None,
                     tool_calls: vec![ToolCall {
                         id: "call_recall".to_string(),
@@ -10120,6 +10326,7 @@ mod tests {
                             .unwrap_or_default();
                     }
                     Ok(ChatResponse {
+                        output_blocks: Vec::new(),
                         text: Some("memory workflow done".to_string()),
                         tool_calls: Vec::new(),
                         usage: None,
@@ -10665,6 +10872,7 @@ mod tests {
                 );
                 assert_eq!(request.tools.is_none_or(<[_]>::is_empty), self.0 == Some(1));
                 Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("independent completion".into()),
                     tool_calls: Vec::new(),
                     usage: None,
@@ -10722,8 +10930,8 @@ mod tests {
     #[tokio::test]
     async fn an_agentic_delegate_asks_the_owners_source_for_the_vision_route() {
         use crate::composition::test_support::{
-            IMAGE_TURN, StubProvider, VISION_REFUSAL, VISION_REPLY, VisionRouteProviders,
-            capabilities_with_providers,
+            StubProvider, VISION_REFUSAL, VISION_REPLY, VisionRouteProviders,
+            capabilities_with_providers, image_turn,
         };
 
         let principal =
@@ -10777,7 +10985,7 @@ mod tests {
                         "custom",
                         "delegate-test-model",
                         &StubProvider,
-                        IMAGE_TURN,
+                        image_turn(),
                         None,
                     )
                     .await;
@@ -11569,14 +11777,8 @@ mod tests {
         assert!(result.output.contains("tool count matched: 1"));
     }
 
-    /// The bounded agentic child turn gates image markers with the PARENT's
-    /// policy (`self.security`): a marker under the parent policy's
-    /// workspace on a non-vision provider refuses the child turn with the
-    /// capability error, before any provider dispatch. If the child
-    /// `ResolvedIo` regressed to `security: None`, the gate would fail
-    /// closed to the degrade and the child turn would succeed instead.
     #[tokio::test]
-    async fn bounded_agentic_child_refuses_policy_readable_marker_on_non_vision_provider() {
+    async fn bounded_agentic_child_keeps_literal_media_text_as_text() {
         let workspace = tempfile::tempdir().expect("workspace tempdir should create");
         let image_path = workspace.path().join("shot.png");
         std::fs::write(&image_path, b"policy-readable marker fixture")
@@ -11607,15 +11809,9 @@ mod tests {
             .unwrap();
 
         assert!(
-            !result.success,
-            "a policy-readable marker under the parent policy workspace must refuse \
-             the bounded child turn, got error: {:?}",
+            result.success,
+            "literal marker text cannot grant image semantics: {:?}",
             result.error
-        );
-        let error = result.error.as_deref().unwrap_or_default();
-        assert!(
-            error.contains("image marker") && error.contains("vision"),
-            "the refusal must surface the capability error text, got: {error}"
         );
     }
 
@@ -14482,6 +14678,7 @@ target = "memory_recall"
             let has_tool_message = request.messages.iter().any(|m| m.role == "tool");
             if has_tool_message {
                 Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("mcp done".to_string()),
                     tool_calls: Vec::new(),
                     usage: None,
@@ -14489,6 +14686,7 @@ target = "memory_recall"
                 })
             } else {
                 Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: None,
                     tool_calls: vec![ToolCall {
                         id: "call_mcp".to_string(),
@@ -14540,6 +14738,7 @@ target = "memory_recall"
             _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("delegate saw tool".to_string()),
                 tool_calls: Vec::new(),
                 usage: None,
@@ -14579,6 +14778,7 @@ target = "memory_recall"
             _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: None,
                 tool_calls: Vec::new(),
                 usage: None,
@@ -14628,6 +14828,7 @@ target = "memory_recall"
                 .any(|message| message.role == "tool")
             {
                 return Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: None,
                     tool_calls: Vec::new(),
                     usage: None,
@@ -14636,6 +14837,7 @@ target = "memory_recall"
             }
 
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: None,
                 tool_calls: vec![ToolCall {
                     id: "call_1".to_string(),
@@ -14694,6 +14896,7 @@ target = "memory_recall"
                 "unexpected delegated tool count"
             );
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(format!("tool count matched: {actual_tools}")),
                 tool_calls: Vec::new(),
                 usage: None,
@@ -14770,6 +14973,7 @@ target = "memory_recall"
                 temperature,
             });
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("delegate complete".to_string()),
                 tool_calls: Vec::new(),
                 usage: None,
@@ -15257,7 +15461,7 @@ target = "memory_recall"
     }
 
     #[test]
-    fn enriched_prompt_includes_tools_workspace_date() {
+    fn enriched_prompt_includes_tools_workspace_without_generated_date() {
         let config = AliasedAgentConfig {
             model_provider: "openrouter.test".into(),
             ..Default::default()
@@ -15297,8 +15501,8 @@ target = "memory_recall"
             "should contain workspace path"
         );
         assert!(
-            prompt.contains("## CRITICAL CONTEXT: CURRENT DATE"),
-            "should contain date section"
+            !prompt.contains("## CRITICAL CONTEXT: CURRENT DATE"),
+            "system context must not contain a generated date"
         );
         assert!(!prompt.contains("CURRENT DATE & TIME"));
         assert!(!prompt.contains("Time:"));
@@ -16429,7 +16633,8 @@ target = "memory_recall"
             .error
             .as_deref()
             .expect("fixture provider failure retained");
-        assert!(error.contains("Ollama API error (400 Bad Request)"));
+        // This fixture uses the direct provider, without Reliable's aggregate.
+        assert!(error.contains("Ollama API error (400)"), "{error}");
         assert!(error.contains("background persistence fixture provider failure"));
         let snapshot = tool
             .background_control_plane()
@@ -18147,6 +18352,7 @@ target = "memory_recall"
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 return Ok(ChatResponse {
                     text: Some("middle finished after all".to_string()),
+                    output_blocks: vec![],
                     tool_calls: Vec::new(),
                     usage: None,
                     reasoning_content: None,
@@ -18154,6 +18360,7 @@ target = "memory_recall"
             }
             Ok(ChatResponse {
                 text: None,
+                output_blocks: vec![],
                 tool_calls: vec![ToolCall {
                     id: "call_leaf_bg".to_string(),
                     name: DelegateTool::NAME.to_string(),
@@ -18367,6 +18574,7 @@ target = "memory_recall"
             if let Some(tool_message) = request.messages.iter().find(|m| m.role == "tool") {
                 *self.tool_message.lock().unwrap() = Some(tool_message.content.clone());
                 return Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("sub-delegation finished".to_string()),
                     tool_calls: Vec::new(),
                     usage: None,
@@ -18396,6 +18604,7 @@ target = "memory_recall"
                 }
             };
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: None,
                 tool_calls: vec![ToolCall {
                     id: "call_1".to_string(),
@@ -20872,6 +21081,7 @@ target = "sessions_history"
                 .collect();
             if tool_messages.is_empty() {
                 return Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: None,
                     tool_calls: vec![ToolCall {
                         id: "call_echo".to_string(),
@@ -20885,6 +21095,7 @@ target = "sessions_history"
             }
             self.tool_messages.lock().unwrap().extend(tool_messages);
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("done".to_string()),
                 tool_calls: Vec::new(),
                 usage: None,
@@ -22557,6 +22768,7 @@ command = "rm independent-delegate-marker"
                 for tool in tools {
                     if self.forbidden_names.iter().any(|f| f == &tool.name) {
                         return Ok(ChatResponse {
+                            output_blocks: Vec::new(),
                             text: Some(format!("forbidden_tool_seen:{}", tool.name)),
                             tool_calls: Vec::new(),
                             usage: None,
@@ -22566,6 +22778,7 @@ command = "rm independent-delegate-marker"
                 }
             }
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("done".to_string()),
                 tool_calls: Vec::new(),
                 usage: None,
@@ -23375,6 +23588,7 @@ command = "rm independent-delegate-marker"
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        root_config.channels.session_backend = "jsonl".into();
         root_config.cost = CostConfig {
             enabled: cost_tracking_enabled,
             track_per_agent,
@@ -23472,6 +23686,7 @@ command = "rm independent-delegate-marker"
                 ..CostConfig::default()
             },
             data_dir,
+            "jsonl",
         )
         .expect("reader tracker over the fixture ledger");
         tracker
@@ -23501,9 +23716,12 @@ command = "rm independent-delegate-marker"
     fn record_seed_spend(fixture: &DelegateCostFixture, usd: f64) {
         use crate::cost::CostTracker;
 
-        let tracker =
-            CostTracker::get_or_init_global(fixture.config.cost.clone(), &fixture.data_dir)
-                .expect("global cost tracker over the fixture ledger");
+        let tracker = CostTracker::get_or_init_global(
+            fixture.config.cost.clone(),
+            &fixture.data_dir,
+            &fixture.config.channels.session_backend,
+        )
+        .expect("global cost tracker over the fixture ledger");
         tracker
             .record_usage(crate::cost::TokenUsage::new(
                 "seed-model",
@@ -23523,9 +23741,12 @@ command = "rm independent-delegate-marker"
     fn record_agent_seed_spend(fixture: &DelegateCostFixture, alias: &str, usd: f64) {
         use crate::cost::CostTracker;
 
-        let tracker =
-            CostTracker::get_or_init_global(fixture.config.cost.clone(), &fixture.data_dir)
-                .expect("global cost tracker over the fixture ledger");
+        let tracker = CostTracker::get_or_init_global(
+            fixture.config.cost.clone(),
+            &fixture.data_dir,
+            &fixture.config.channels.session_backend,
+        )
+        .expect("global cost tracker over the fixture ledger");
         tracker
             .record_usage_with_agent(
                 crate::cost::TokenUsage::new(
@@ -23658,6 +23879,7 @@ command = "rm independent-delegate-marker"
                     ..zeroclaw_config::schema::CostConfig::default()
                 },
                 workspace.path(),
+                "jsonl",
             )
             .expect("cost tracker should initialize"),
         );
@@ -23950,6 +24172,7 @@ command = "rm independent-delegate-marker"
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        root_config.channels.session_backend = "jsonl".into();
         root_config.cost = CostConfig {
             enabled: true,
             track_per_agent: true,
@@ -24060,6 +24283,7 @@ command = "rm independent-delegate-marker"
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        root_config.channels.session_backend = "jsonl".into();
         root_config.cost = CostConfig {
             enabled: true,
             track_per_agent: true,
@@ -24503,6 +24727,7 @@ command = "rm independent-delegate-marker"
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        root_config.channels.session_backend = "jsonl".into();
         root_config.cost = CostConfig {
             enabled: true,
             track_per_agent: true,
@@ -25037,6 +25262,7 @@ command = "rm independent-delegate-marker"
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if request.messages.iter().any(|m| m.role == "tool") {
                 return Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("second provider call was reached".to_string()),
                     tool_calls: Vec::new(),
                     usage: None,
@@ -25044,6 +25270,7 @@ command = "rm independent-delegate-marker"
                 });
             }
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: None,
                 tool_calls: vec![ToolCall {
                     id: "call_lower".to_string(),
@@ -25156,6 +25383,7 @@ command = "rm independent-delegate-marker"
             let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
             if call > self.tool_calls {
                 return Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("later provider call was reached".to_string()),
                     tool_calls: Vec::new(),
                     usage: None,
@@ -25163,6 +25391,7 @@ command = "rm independent-delegate-marker"
                 });
             }
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: None,
                 tool_calls: vec![ToolCall {
                     id: format!("call_flip_{call}"),
@@ -25219,6 +25448,7 @@ command = "rm independent-delegate-marker"
                     ..CostConfig::default()
                 },
                 workspace.path(),
+                "jsonl",
             )
             .expect("base tracker"),
         );
@@ -25324,6 +25554,7 @@ command = "rm independent-delegate-marker"
                     ..CostConfig::default()
                 },
                 workspace.path(),
+                "jsonl",
             )
             .expect("base tracker"),
         );
@@ -25437,6 +25668,7 @@ command = "rm independent-delegate-marker"
                     ..CostConfig::default()
                 },
                 workspace.path(),
+                "jsonl",
             )
             .expect("base tracker"),
         );

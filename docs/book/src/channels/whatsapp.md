@@ -76,7 +76,7 @@ notice a business-mode deployment gets.
 
 ## PDF previews (`document_thumbnails`)
 
-When the agent sends a PDF through a `[DOCUMENT:...]` marker, WhatsApp phones
+When the agent sends a PDF through a typed document attachment, WhatsApp phones
 show a generic file card unless the message itself carries a preview. With
 `document_thumbnails = true` (Web mode, default `false`), the channel renders
 the first page and reads the page count, and both go on the same document

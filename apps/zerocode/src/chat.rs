@@ -4894,10 +4894,9 @@ impl Chat {
 
     /// The persisted sessions this pane may load, from the pane's own store.
     ///
-    /// ACP and Chat live in separate stores and must not cross-pick:
-    ///  • Chat → unified session_backend (filter out channel-backed
-    ///    sessions; those are owned by the channels pane).
-    ///  • ACP  → dedicated acp-sessions.db, listed by a separate RPC.
+    /// Both panes read the canonical session catalog. Chat filters out
+    /// channel-owned sessions, while ACP keeps its compatibility list method
+    /// but uses the same backend and session identities.
     async fn list_pane_sessions(
         rpc: &RpcClient,
         pane_kind: PaneKind,
@@ -4969,7 +4968,7 @@ impl Chat {
     /// focused session stays live in `background` (no `session/close`).
     async fn switch_to_session_entry(&mut self, entry: crate::client::SessionEntry) {
         let new_sid = entry.session_id;
-        let new_name = entry.name;
+        let new_name = entry.title;
 
         // Dismiss the overlay on the currently focused state first.
         let (active_sid, fallback_alias) = match &mut self.phase {
@@ -8929,7 +8928,7 @@ fn render_session_list_overlay(
     let items: Vec<ListItem> = sessions
         .iter()
         .map(|s| {
-            let name = s.name.as_deref().unwrap_or(&s.session_id);
+            let name = s.title.as_deref().unwrap_or(&s.session_id);
             let agent = s.agent_alias.as_deref().unwrap_or("?");
             let label = format!("{name}  ({agent}, {} msgs)", s.message_count);
             ListItem::new(Span::styled(label, theme::body_style()))
@@ -17413,13 +17412,12 @@ mod tests {
 
         let entry = crate::client::SessionEntry {
             session_id: "sess-9".to_string(),
-            session_key: "sess-9".to_string(),
             created_at: "2026-07-07T00:00:00Z".to_string(),
             last_activity: "2026-07-07T00:05:00Z".to_string(),
             message_count: 0,
             agent_alias: Some("myagent".to_string()),
             channel_id: None,
-            name: Some("Other work".to_string()),
+            title: Some("Other work".to_string()),
         };
 
         let switch = tokio::spawn(async move {
@@ -21632,23 +21630,21 @@ mod tests {
                 "sessions": [
                     {
                         "session_id": "sess-ghost",
-                        "session_key": "sess-ghost",
                         "created_at": "2026-07-07T00:00:00Z",
                         "last_activity": "2026-07-07T00:10:00Z",
                         "message_count": 1,
                         "agent_alias": "ghost",
                         "channel_id": null,
-                        "name": "Ghost"
+                        "title": "Ghost"
                     },
                     {
                         "session_id": "sess-beta",
-                        "session_key": "sess-beta",
                         "created_at": "2026-07-07T00:00:00Z",
                         "last_activity": "2026-07-07T00:05:00Z",
                         "message_count": 2,
                         "agent_alias": "beta",
                         "channel_id": null,
-                        "name": "Beta work"
+                        "title": "Beta work"
                     }
                 ]
             }),
@@ -21706,13 +21702,12 @@ mod tests {
                 "sessions": [
                     {
                         "session_id": "sess-beta",
-                        "session_key": "sess-beta",
                         "created_at": "2026-07-07T00:00:00Z",
                         "last_activity": "2026-07-07T00:05:00Z",
                         "message_count": 2,
                         "agent_alias": "beta",
                         "channel_id": null,
-                        "name": "Beta work"
+                        "title": "Beta work"
                     }
                 ]
             }),
@@ -21815,13 +21810,12 @@ mod tests {
                 "sessions": [
                     {
                         "session_id": "sess-beta",
-                        "session_key": "sess-beta",
                         "created_at": "2026-07-07T00:00:00Z",
                         "last_activity": "2026-07-07T00:05:00Z",
                         "message_count": 2,
                         "agent_alias": "beta",
                         "channel_id": null,
-                        "name": "Beta work"
+                        "title": "Beta work"
                     }
                 ]
             }),
@@ -21973,13 +21967,12 @@ mod tests {
     fn listed_session(id: &str, name: Option<&str>, channel: Option<&str>) -> serde_json::Value {
         serde_json::json!({
             "session_id": id,
-            "session_key": id,
             "created_at": "2026-10-27T00:00:00Z",
             "last_activity": "2026-10-27T00:05:00Z",
             "message_count": 2,
             "agent_alias": "alpha",
             "channel_id": channel,
-            "name": name,
+            "title": name,
         })
     }
 
@@ -24512,13 +24505,12 @@ mod tests {
         state.session_overlay = SessionOverlay::List {
             sessions: vec![crate::client::SessionEntry {
                 session_id: "sess-new".to_string(),
-                session_key: "sess-new".to_string(),
                 created_at: "2026-07-07T00:00:00Z".to_string(),
                 last_activity: "2026-07-07T00:01:00Z".to_string(),
                 message_count: 1,
                 agent_alias: Some("beta".to_string()),
                 channel_id: None,
-                name: Some("Beta work".to_string()),
+                title: Some("Beta work".to_string()),
             }],
             list_state,
         };
@@ -24609,13 +24601,12 @@ mod tests {
         state.session_overlay = SessionOverlay::List {
             sessions: vec![crate::client::SessionEntry {
                 session_id: "sess-dead".to_string(),
-                session_key: "sess-dead".to_string(),
                 created_at: "2026-07-07T00:00:00Z".to_string(),
                 last_activity: "2026-07-07T00:01:00Z".to_string(),
                 message_count: 1,
                 agent_alias: Some("beta".to_string()),
                 channel_id: None,
-                name: Some("Dead work".to_string()),
+                title: Some("Dead work".to_string()),
             }],
             list_state,
         };
@@ -24683,13 +24674,12 @@ mod tests {
         state.session_overlay = SessionOverlay::List {
             sessions: vec![crate::client::SessionEntry {
                 session_id: "sess-broken".to_string(),
-                session_key: "sess-broken".to_string(),
                 created_at: "2026-07-07T00:00:00Z".to_string(),
                 last_activity: "2026-07-07T00:01:00Z".to_string(),
                 message_count: 1,
                 agent_alias: Some("beta".to_string()),
                 channel_id: None,
-                name: Some("Broken work".to_string()),
+                title: Some("Broken work".to_string()),
             }],
             list_state,
         };
@@ -25001,7 +24991,7 @@ mod tests {
             &rpc,
             &request,
             serde_json::json!({"sessions": [{
-                "session_id": "sess-b", "session_key": "sess-b", "agent_alias": "beta",
+                "session_id": "sess-b", "agent_alias": "beta",
                 "created_at": "2026-09-05T00:00:00Z", "last_activity": "2026-09-05T00:00:00Z", "message_count": 0
             }]}),
         );
@@ -28398,12 +28388,11 @@ mod tests {
 
         let sessions = vec![SessionEntry {
             session_id: "session-1".to_string(),
-            session_key: "session-1".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             last_activity: "2026-01-01T00:00:00Z".to_string(),
             agent_alias: Some("agent".to_string()),
             channel_id: None,
-            name: Some("first prompt".to_string()),
+            title: Some("first prompt".to_string()),
             message_count: 1,
         }];
         let mut list_state = ListState::default();
@@ -28644,12 +28633,11 @@ mod tests {
         let _theme_guard = theme::set_active_for_test(theme::default_theme());
         let sessions = vec![SessionEntry {
             session_id: "session-1".to_string(),
-            session_key: "session-1".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             last_activity: "2026-01-01T00:00:00Z".to_string(),
             agent_alias: Some("agent".to_string()),
             channel_id: None,
-            name: Some("first prompt".to_string()),
+            title: Some("first prompt".to_string()),
             message_count: 1,
         }];
         let mut list_state = ListState::default();
@@ -28695,12 +28683,11 @@ mod tests {
         let _theme_guard = theme::set_active_for_test(theme::default_theme());
         let sessions = vec![SessionEntry {
             session_id: "session-1".to_string(),
-            session_key: "session-1".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             last_activity: "2026-01-01T00:00:00Z".to_string(),
             agent_alias: Some("agent".to_string()),
             channel_id: None,
-            name: Some("first prompt".to_string()),
+            title: Some("first prompt".to_string()),
             message_count: 1,
         }];
         let mut list_state = ListState::default();
@@ -28741,12 +28728,11 @@ mod tests {
         let _theme_guard = theme::set_active_for_test(theme::default_theme());
         let sessions = vec![SessionEntry {
             session_id: "session-1".to_string(),
-            session_key: "session-1".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             last_activity: "2026-01-01T00:00:00Z".to_string(),
             agent_alias: Some("agent".to_string()),
             channel_id: None,
-            name: Some("first prompt".to_string()),
+            title: Some("first prompt".to_string()),
             message_count: 1,
         }];
         let mut list_state = ListState::default();
@@ -29135,12 +29121,11 @@ mod tests {
         let sessions: Vec<SessionEntry> = (0..30)
             .map(|i| SessionEntry {
                 session_id: format!("session-{i}"),
-                session_key: format!("session-{i}"),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 last_activity: "2026-01-01T00:00:00Z".to_string(),
                 agent_alias: Some("agent".to_string()),
                 channel_id: None,
-                name: Some(format!("prompt {i}")),
+                title: Some(format!("prompt {i}")),
                 message_count: 1,
             })
             .collect();
@@ -29200,12 +29185,11 @@ mod tests {
         let sessions: Vec<SessionEntry> = (0..40)
             .map(|i| SessionEntry {
                 session_id: format!("sess-{i}"),
-                session_key: format!("sess-{i}"),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 last_activity: "2026-01-01T00:00:00Z".to_string(),
                 agent_alias: Some("agent".to_string()),
                 channel_id: None,
-                name: Some(format!("prompt {i}")),
+                title: Some(format!("prompt {i}")),
                 message_count: 1,
             })
             .collect();

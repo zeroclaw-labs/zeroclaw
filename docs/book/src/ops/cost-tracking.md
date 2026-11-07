@@ -151,9 +151,19 @@ is populated; there's no retroactive repricing of past records.
 ## Persistence
 
 `CostTracker::record_usage_with_agent` appends one `CostRecord` per
-token-bearing response to `<workspace>/state/costs.jsonl`, one JSON object
-per line. The ledger is read on startup so the dashboard's current-month
+token-bearing response to the selected session backend. SQLite stores rows in
+`session_cost_records`; JSONL stores one JSON object per line in
+`session-events-jsonl/costs.jsonl`. The ledger is read on startup so the
+dashboard's current-month
 per-agent rollup survives restarts.
+
+The optional `session_id` identifies the actual session that incurred the
+usage, resolved from the runtime turn scope. Unscoped usage has no session ID;
+the tracker does not generate a substitute identity. Migrating the master
+ledger maps its `conversation_id` to `session_id` and discards the old
+process-local tracker ID while preserving usage, costs, record IDs, and
+the original file as a backup. Historical records
+without actual session attribution remain unassigned.
 
 Each `TokenUsage` record carries two pricing-provenance fields:
 
@@ -249,7 +259,7 @@ it because their historical pricing provenance is unknown.
 The dashboard's **Cost** tab shows three panels plus a Window picker
 (today / last 7 days / last 30 days / this month / all time):
 
-- **Spend totals**: daily and monthly totals from `costs.jsonl`.
+- **Spend totals**: daily and monthly totals from the selected session backend.
 - **Spend by agent · `<window>`**: per-agent rollup over the picked
   window. Visible when `track_per_agent` is true.
 - **Spend by model · `<window>`**: per-model rollup. Each row's model

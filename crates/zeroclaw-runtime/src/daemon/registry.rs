@@ -12,6 +12,14 @@ use crate::LiveConfigAuthority;
 use crate::rpc::context::RpcContext;
 use crate::rpc::tui_identity::TuiRegistry;
 
+pub type SessionSourceBuilder = Box<
+    dyn Fn(
+            zeroclaw_config::live::LiveConfigHandle,
+        ) -> Arc<dyn zeroclaw_kernel::session::engine::EngineSessionSource>
+        + Send
+        + Sync,
+>;
+
 pub type ChannelRegistryClearer = Arc<dyn Fn() + Send + Sync>;
 
 pub type StarterFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
@@ -75,6 +83,8 @@ pub struct DaemonInboundAuthority {
     pub inbound_auth: Arc<crate::rpc::auth::RpcInboundAuth>,
     /// The live configuration the RPC context reads and writes.
     pub config: zeroclaw_config::live::LiveConfigHandle,
+    /// Generation-scoped history implementation, shared by all entrances.
+    pub native_sessions: Option<Arc<dyn zeroclaw_kernel::session::engine::EngineSessionSource>>,
 }
 
 pub type GatewayStarter = Box<
@@ -99,8 +109,15 @@ pub type GatewayStarter = Box<
 >;
 
 /// Starts the supervised channel orchestrator for one daemon run/reload iteration.
-pub type ChannelsStarter =
-    Box<dyn Fn(LiveConfigAuthority, CancellationToken) -> StarterFuture + Send + Sync>;
+pub type ChannelsStarter = Box<
+    dyn Fn(
+            LiveConfigAuthority,
+            CancellationToken,
+            Option<Arc<dyn zeroclaw_kernel::session::engine::EngineSessionSource>>,
+        ) -> StarterFuture
+        + Send
+        + Sync,
+>;
 
 /// Starts the local IPC transport and optionally reports its secured bind.
 pub type SocketStarter = Box<
@@ -124,6 +141,7 @@ pub type MqttStarter = Box<dyn Fn(MqttConfig) -> StarterFuture + Send + Sync>;
 
 #[derive(Default)]
 pub struct DaemonRegistry {
+    session_source: Option<SessionSourceBuilder>,
     gateway_start: Option<GatewayStarter>,
     channels_start: Option<ChannelsStarter>,
     channel_registry_clearer: Option<ChannelRegistryClearer>,
@@ -153,6 +171,15 @@ impl DaemonRegistry {
     /// optional subsystems by `daemon::run`.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn register_session_source(&mut self, source: SessionSourceBuilder) -> &mut Self {
+        self.session_source = Some(source);
+        self
+    }
+
+    pub(crate) fn take_session_source(&mut self) -> Option<SessionSourceBuilder> {
+        self.session_source.take()
     }
 
     pub fn register_gateway(&mut self, starter: GatewayStarter) -> &mut Self {
@@ -295,7 +322,7 @@ mod tests {
     }
 
     fn channels_starter() -> ChannelsStarter {
-        Box::new(|_, _| Box::pin(async { Ok(()) }))
+        Box::new(|_, _, _| Box::pin(async { Ok(()) }))
     }
 
     fn socket_starter() -> SocketStarter {
@@ -380,7 +407,7 @@ mod tests {
         });
         let channels: ChannelsStarter = Box::new({
             let expected_handle = expected_handle.clone();
-            move |received_authority, _| {
+            move |received_authority, _, _| {
                 assert!(
                     expected_handle.same_storage(&received_authority.live_handle()),
                     "channels starter must receive the daemon generation's authority"
@@ -401,6 +428,6 @@ mod tests {
             None,
             None,
         ));
-        std::mem::drop(channels(authority, CancellationToken::new()));
+        std::mem::drop(channels(authority, CancellationToken::new(), None));
     }
 }

@@ -5,7 +5,8 @@ use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::channel::{
-    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
+    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelChoiceOutcome, ChannelMessage,
+    SendMessage,
 };
 use zeroclaw_api::elicitation::{
     ElicitationCapabilities, ElicitationMode, ElicitationRequest, ElicitationResponse,
@@ -55,7 +56,7 @@ impl AcpChannel {
         question: &str,
         choices: &[String],
         timeout: Duration,
-    ) -> anyhow::Result<Option<String>> {
+    ) -> anyhow::Result<ChannelChoiceOutcome> {
         // Build permission options. Each choice becomes its own option with a
         // synthetic id; we map the response id back to the choice text.
         // `kind` mirrors how Toad/Zed render: `allow_once` looks like a
@@ -94,7 +95,7 @@ impl AcpChannel {
             Ok(Err(e)) => {
                 anyhow::bail!("ACP request_permission failed: {} ({})", e.message, e.code)
             }
-            Err(_) => anyhow::bail!("ACP request_permission timed out after {timeout:?}"),
+            Err(_) => return Ok(ChannelChoiceOutcome::TimedOut),
         };
 
         // Response shape: { outcome: { outcome: "selected", optionId: "..." } | { outcome: "cancelled" } }
@@ -113,11 +114,11 @@ impl AcpChannel {
                     .strip_prefix("choice-")
                     .and_then(|s| s.parse::<usize>().ok());
                 match idx.and_then(|i| choices.get(i)) {
-                    Some(text) => Ok(Some(text.clone())),
+                    Some(text) => Ok(ChannelChoiceOutcome::Answered(text.clone())),
                     None => anyhow::bail!("ACP returned unknown optionId: {option_id}"),
                 }
             }
-            "cancelled" => Ok(None),
+            "cancelled" => Ok(ChannelChoiceOutcome::Cancelled),
             other => anyhow::bail!("ACP returned unexpected outcome: {other}"),
         }
     }
@@ -130,7 +131,7 @@ impl AcpChannel {
         question: &str,
         choices: &[String],
         timeout: Duration,
-    ) -> anyhow::Result<Option<String>> {
+    ) -> anyhow::Result<ChannelChoiceOutcome> {
         let req = ElicitationRequest {
             session_id: self.session_id.clone(),
             mode: ElicitationMode::Form,
@@ -149,7 +150,7 @@ impl AcpChannel {
             Ok(Err(e)) => {
                 anyhow::bail!("ACP elicitation/create failed: {} ({})", e.message, e.code)
             }
-            Err(_) => anyhow::bail!("ACP elicitation/create timed out after {timeout:?}"),
+            Err(_) => return Ok(ChannelChoiceOutcome::TimedOut),
         };
 
         let parsed: ElicitationResponse = serde_json::from_value(response_value)
@@ -158,9 +159,10 @@ impl AcpChannel {
             ElicitationResponse::Accept { content } => {
                 let text =
                     zeroclaw_api::elicitation::decode_single_select_accept(&content, choices)?;
-                Ok(Some(text))
+                Ok(ChannelChoiceOutcome::Answered(text))
             }
-            ElicitationResponse::Decline | ElicitationResponse::Cancel => Ok(None),
+            ElicitationResponse::Decline => Ok(ChannelChoiceOutcome::Declined),
+            ElicitationResponse::Cancel => Ok(ChannelChoiceOutcome::Cancelled),
         }
     }
 }
@@ -342,6 +344,17 @@ impl Channel for AcpChannel {
         choices: &[String],
         timeout: Duration,
     ) -> anyhow::Result<Option<String>> {
+        self.request_choice_outcome(question, choices, timeout)
+            .await?
+            .into_legacy_response()
+    }
+
+    async fn request_choice_outcome(
+        &self,
+        question: &str,
+        choices: &[String],
+        timeout: Duration,
+    ) -> anyhow::Result<ChannelChoiceOutcome> {
         if choices.is_empty() {
             // Caller should already gate on this via supports_free_form_ask,
             // but be defensive — both downstream paths require at least one
@@ -527,8 +540,20 @@ impl Channel for AcpChannel {
                     }
                     other => anyhow::bail!("ACP returned unknown permission optionId: {other}"),
                 };
+                let reply_event_id = if let Some(prepared) =
+                    zeroclaw_api::session_events::capture::current_tool_preparation()
+                {
+                    Some(prepared.record_approval_reply(
+                        zeroclaw_api::session_events::EventActor::System { component: "approval_identity_unavailable".into() },
+                        response.clone(),
+                        json!({"transport":"acp","identity_unavailable_reason":"permission_response_has_no_authenticated_responder_identity"}),
+                    ).await.map_err(zeroclaw_api::session_events::capture::capture_stopped)?)
+                } else {
+                    None
+                };
                 Ok(Some(
-                    zeroclaw_api::channel::AttributedApprovalResponse::operator(response),
+                    zeroclaw_api::channel::AttributedApprovalResponse::operator(response)
+                        .with_reply_event_id(reply_event_id),
                 ))
             }
             // The client withdrew the prompt; nobody chose anything. Still a
@@ -749,6 +774,46 @@ mod tests {
     }
 
     // -- Elicitation-path tests (Task 5) ---------------------------------
+
+    #[tokio::test]
+    async fn choice_outcome_preserves_wire_decline_cancel_and_timeout() {
+        for (form, action, expected) in [
+            (true, Some("decline"), ChannelChoiceOutcome::Declined),
+            (true, Some("cancel"), ChannelChoiceOutcome::Cancelled),
+            (true, None, ChannelChoiceOutcome::TimedOut),
+            (false, Some("cancel"), ChannelChoiceOutcome::Cancelled),
+            (false, None, ChannelChoiceOutcome::TimedOut),
+        ] {
+            let (rpc, mut rx) = make_rpc();
+            let ch = AcpChannel::new(
+                "acp",
+                "sess-1",
+                rpc.clone(),
+                Duration::from_secs(30),
+                ElicitationCapabilities { form, url: false },
+            );
+            let timeout = if action.is_some() {
+                Duration::from_secs(2)
+            } else {
+                Duration::from_millis(50)
+            };
+            let task = zeroclaw_spawn::spawn!(async move {
+                ch.request_choice_outcome("Pick one", &["A".into()], timeout)
+                    .await
+            });
+            let line = rx.recv().await.unwrap();
+            let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if let Some(action) = action {
+                let value = if form {
+                    json!({"action":action})
+                } else {
+                    json!({"outcome":{"outcome":"cancelled"}})
+                };
+                rpc.dispatch_response(frame["id"].as_str().unwrap(), Some(value), None);
+            }
+            assert_eq!(task.await.unwrap().unwrap(), expected);
+        }
+    }
 
     fn form_caps() -> ElicitationCapabilities {
         ElicitationCapabilities {

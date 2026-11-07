@@ -3,7 +3,7 @@
 //! Accepts raw image bytes in the request body, types them by magic bytes
 //! (never the client-declared Content-Type or filename), and writes them to
 //! `<agent workspace>/webui_uploads/`. The response carries the saved path and
-//! the `[IMAGE:<path>]` marker the dashboard embeds in the next chat message,
+//! a typed attachment reference the dashboard sends with the next chat message,
 //! which the multimodal provider path resolves into image content at
 //! request time (`zeroclaw_providers::multimodal`).
 //!
@@ -46,8 +46,7 @@ pub struct UploadQuery {
 pub struct UploadResponse {
     /// Absolute path of the saved file inside the agent workspace.
     pub path: String,
-    /// `[IMAGE:<path>]` marker ready to embed in a chat message.
-    pub marker: String,
+    pub attachment: zeroclaw_api::media::AttachmentReference,
 }
 
 /// Why an upload payload was refused. Carries everything the HTTP layer needs
@@ -179,8 +178,11 @@ pub async fn handle_upload(
     }
 
     let path = local_path.display().to_string();
-    let marker = format!("[IMAGE:{path}]");
-    Ok(Json(UploadResponse { path, marker }))
+    let attachment = zeroclaw_api::media::AttachmentReference {
+        target: path.clone(),
+        kind: zeroclaw_api::media::AttachmentKind::Image,
+    };
+    Ok(Json(UploadResponse { path, attachment }))
 }
 
 /// `{code, message}` mirrors the structured error envelope the dashboard's

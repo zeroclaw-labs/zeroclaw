@@ -977,13 +977,6 @@ fn clean_for_display(content: &str) -> String {
         .expect("static OTel timestamp regex must compile");
     cleaned = timestamp_regex.replace_all(&cleaned, "").to_string();
 
-    // Remove tool results prefix
-    let tool_results_prefix_regex = regex::Regex::new(r"(?m)^\[Tool results\]\s*\n?")
-        .expect("static OTel tool-result prefix regex must compile");
-    cleaned = tool_results_prefix_regex
-        .replace_all(&cleaned, "")
-        .to_string();
-
     // Clean up extra whitespace
     cleaned = cleaned
         .lines()
@@ -2131,10 +2124,10 @@ mod tests {
     }
 
     #[test]
-    fn clean_for_display_removes_tool_results_prefix() {
+    fn clean_for_display_preserves_literal_tool_results_prefix() {
         let input = "[Tool results]\nHere is the answer";
         let cleaned = clean_for_display(input);
-        assert_eq!(cleaned, "Here is the answer");
+        assert_eq!(cleaned, input);
     }
 
     #[test]

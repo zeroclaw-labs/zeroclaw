@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use zeroclaw_api::model_provider::{ChatRequest, ChatResponse, SemanticEmptyTerminalCompletion};
 use zeroclaw_config::schema::{MultimodalConfig, PacingConfig, ResolvedContextLimits};
 use zeroclaw_providers::dispatch::{AccountedAttempt, with_exact_dispatch_route};
-use zeroclaw_providers::{ModelProvider, ProviderDispatch, multimodal};
+use zeroclaw_providers::{ModelProvider, ProviderDispatch};
 
 use super::{ContextLimitsResolver, LoopKnobs, ModelSwitchCallback};
 use crate::agent::tool_receipts::ReceiptGenerator;
@@ -82,28 +82,8 @@ impl ResolvedModelAccess<'_> {
         // Fail closed before spending a provider call when the enclosing turn's
         // cost budget is already exhausted. No-op when unscoped.
         crate::agent::turn::provider_call::enforce_tool_loop_budget()?;
-        // This one-shot seam does not run the full multimodal preparation
-        // (`prepare_messages_for_provider`): callers that want images in the
-        // request normalize before calling, and the max-iteration graceful
-        // summary does. As a fail-closed backstop for every other caller,
-        // loadable audio markers are replaced with a placeholder here, and
-        // image references that are not inline `data:` URIs are dropped the
-        // same way: a path or URL marker in a legacy body becomes a
-        // placeholder, while a declared carrier keeps its body verbatim and
-        // loses only the undeliverable attachments from its declared list.
-        // Both helpers borrow the input untouched when clean.
-        let ChatRequest {
-            messages,
-            tools,
-            thinking,
-        } = request;
-        let sanitized = multimodal::sanitize_audio_markers(messages);
-        let sanitized = multimodal::sanitize_image_markers(&sanitized);
-        let request = ChatRequest {
-            messages: &sanitized,
-            tools,
-            thinking,
-        };
+        // Media fields remain intact through dispatch. Each provider adapter
+        // owns its native wire projection; runtime never recovers media from text.
         let dispatcher = ProviderDispatch::from_ref(self.model_provider);
         let scope = zeroclaw_providers::dispatch::AccountedChatScope::new();
         let result = scope
@@ -370,6 +350,7 @@ mod run_model_query_tests {
             _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("ok".to_string()),
                 tool_calls: Vec::new(),
                 usage: Some(TokenUsage {
@@ -418,6 +399,7 @@ mod run_model_query_tests {
             let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
             let rejected = self.persist_empty || attempt == 0;
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: (!rejected).then(|| "recovered".to_string()),
                 tool_calls: Vec::new(),
                 usage: Some(TokenUsage {
@@ -677,6 +659,7 @@ mod run_model_query_tests {
             crate::cost::CostTracker::new(
                 zeroclaw_config::schema::CostConfig::default(),
                 workspace.path(),
+                "jsonl",
             )
             .unwrap(),
         );
@@ -694,6 +677,7 @@ mod run_model_query_tests {
         // accepted: exactly the rejected-attempt shape under test.
         let provider = DirectResponseProvider {
             response: ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(String::new()),
                 tool_calls: Vec::new(),
                 usage: Some(TokenUsage {
@@ -736,8 +720,11 @@ mod run_model_query_tests {
         assert_eq!(summaries[0].cached_input_tokens, Some(4_000));
         assert_eq!(summaries[0].output_tokens, Some(200));
         let projected = summaries[0].cost_usd.expect("rejected cost is priced");
-        let stored = std::fs::read_to_string(workspace.path().join("state").join("costs.jsonl"))
-            .expect("costs.jsonl should be written");
+        let stored = std::fs::read_to_string(
+            zeroclaw_infra::cost_ledger::resolve_path(workspace.path(), "jsonl")
+                .expect("cost ledger path"),
+        )
+        .expect("cost ledger should be written");
         let record: zeroclaw_config::cost::types::CostRecord =
             serde_json::from_str(stored.lines().next().expect("one record")).unwrap();
         assert_eq!(record.usage.cache_creation_input_tokens, 1_000);
@@ -760,6 +747,7 @@ mod run_model_query_tests {
         for text in ["", " \n\t", "<think>internal reasoning</think>"] {
             let provider = DirectResponseProvider {
                 response: ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some(text.to_string()),
                     tool_calls: Vec::new(),
                     usage: Some(TokenUsage {
@@ -805,6 +793,7 @@ mod run_model_query_tests {
     async fn run_model_query_keeps_direct_tool_only_response_valid() {
         let provider = DirectResponseProvider {
             response: ChatResponse {
+                output_blocks: Vec::new(),
                 text: None,
                 tool_calls: vec![ToolCall {
                     id: "call_1".to_string(),

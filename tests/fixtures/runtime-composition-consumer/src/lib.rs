@@ -90,6 +90,7 @@ mod tests {
             let first = self.0.catalogs.lock().unwrap().len() == 1;
             if first {
                 Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: None,
                     tool_calls: vec![ToolCall {
                         id: "consumer-call".into(),
@@ -114,6 +115,7 @@ mod tests {
                     "supplied channel did not deliver"
                 );
                 Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("consumer turn complete".into()),
                     tool_calls: Vec::new(),
                     usage: None,
@@ -485,15 +487,12 @@ mod tests {
         );
     }
 
-    /// The canonical native tool factory opens the session backend while
-    /// constructing its session tools. This externally visible trap catches
-    /// constructing-and-discarding native tools, not only catalog leaks.
+    /// The native factory offers session tools. Their authorized history port
+    /// is resolved at execution time, so construction does not open a store.
     #[test]
-    fn native_tool_construction_trap_is_armed() {
+    fn native_tool_factory_offers_session_tools() {
         let root = tempfile::TempDir::new().unwrap();
         let c = config(root.path());
-        let marker = c.data_dir.join("sessions/sessions.db");
-        assert!(!marker.exists());
         let security =
             Arc::new(zeroclaw_config::policy::SecurityPolicy::for_agent(&c, AGENT).unwrap());
         let memory: Arc<dyn Memory> = Arc::new(SuppliedMemory(Arc::new(Evidence::default())));
@@ -521,10 +520,6 @@ mod tests {
             built.tools.iter().any(|t| t.name() == "sessions_list"),
             "native session tool was not constructed"
         );
-        assert!(
-            marker.is_file(),
-            "native factory no longer arms the construction trap"
-        );
     }
 
     #[test]
@@ -543,27 +538,58 @@ mod tests {
             observer: Arc::new(SuppliedObserver(evidence.clone())),
         };
         let turn_evidence = evidence.clone();
-        std::thread::Builder::new().name("public-consumer".into()).stack_size(8 * 1024 * 1024).spawn(move || {
-            let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).thread_stack_size(8 * 1024 * 1024).enable_all().build().unwrap();
-            runtime.block_on(async move {
-                let root = tempfile::TempDir::new().unwrap();
-                let c = config(root.path());
-                let trap_config = c.clone();
-                let native_marker = c.data_dir.join("sessions/sessions.db");
-                assert!(!native_marker.exists(), "tool construction trap must start unarmed");
-                let reply = tokio::time::timeout(Duration::from_secs(30), Box::pin(zeroclaw_runtime::agent::run_with_capabilities(
-                    c, capabilities, None, AGENT, Some("Use consumer_echo to record the supplied value.".into()),
-                    None, None, None, Vec::new(), false, None, None, TurnOrigin::Interactive,
-                    zeroclaw_runtime::agent::loop_::AgentRunOverrides::default(),
-                ))).await.expect("public consumer turn timed out").expect("public consumer turn failed");
-                assert_eq!(reply, "consumer turn complete");
-                assert_eq!(turn_evidence.tool_calls.load(Ordering::SeqCst), 1);
-                println!("consumer catalogs: {:?}", turn_evidence.catalogs.lock().unwrap());
-                println!("native tool constructor marker present: {}", native_marker.exists());
-                assert!(!native_marker.exists(), "generic turn constructed native session tools, even if their catalog is later hidden");
-                assert_eq!(peripheral_loads(&trap_config), 0, "generic turn invoked the native peripheral constructor");
-            });
-        }).unwrap().join().unwrap_or_else(|p| std::panic::resume_unwind(p));
+        std::thread::Builder::new()
+            .name("public-consumer".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .thread_stack_size(8 * 1024 * 1024)
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async move {
+                    let root = tempfile::TempDir::new().unwrap();
+                    let c = config(root.path());
+                    let trap_config = c.clone();
+                    let reply = tokio::time::timeout(
+                        Duration::from_secs(30),
+                        Box::pin(zeroclaw_runtime::agent::run_with_capabilities(
+                            c,
+                            capabilities,
+                            None,
+                            AGENT,
+                            Some("Use consumer_echo to record the supplied value.".into()),
+                            None,
+                            None,
+                            None,
+                            Vec::new(),
+                            false,
+                            None,
+                            None,
+                            TurnOrigin::Interactive,
+                            zeroclaw_runtime::agent::loop_::AgentRunOverrides::default(),
+                        )),
+                    )
+                    .await
+                    .expect("public consumer turn timed out")
+                    .expect("public consumer turn failed");
+                    assert_eq!(reply, "consumer turn complete");
+                    assert_eq!(turn_evidence.tool_calls.load(Ordering::SeqCst), 1);
+                    println!(
+                        "consumer catalogs: {:?}",
+                        turn_evidence.catalogs.lock().unwrap()
+                    );
+                    assert_eq!(
+                        peripheral_loads(&trap_config),
+                        0,
+                        "generic turn invoked the native peripheral constructor"
+                    );
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap_or_else(|p| std::panic::resume_unwind(p));
         assert_eq!(evidence.provider_requests.load(Ordering::SeqCst), 1);
         assert_eq!(evidence.memory_requests.load(Ordering::SeqCst), 1);
         assert_eq!(evidence.tool_requests.load(Ordering::SeqCst), 1);
@@ -657,7 +683,6 @@ mod tests {
                 let root = tempfile::TempDir::new().unwrap();
                 let c = config(root.path());
                 let trap_config = c.clone();
-                let native_marker = c.data_dir.join("sessions/sessions.db");
                 let reply = tokio::time::timeout(
                     Duration::from_secs(30),
                     Box::pin(zeroclaw_runtime::agent::run_with_capabilities(
@@ -682,10 +707,6 @@ mod tests {
                 .expect("native-recipe consumer turn failed");
                 assert_eq!(reply, "consumer turn complete");
                 assert_eq!(turn_evidence.tool_calls.load(Ordering::SeqCst), 1);
-                assert!(
-                    native_marker.is_file(),
-                    "the native recipe built the session tools"
-                );
                 assert!(
                     peripheral_loads(&trap_config) > 0,
                     "the native recipe loaded peripherals"
@@ -782,6 +803,7 @@ mod tests {
                     .collect(),
             );
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("empty turn complete".into()),
                 tool_calls: Vec::new(),
                 usage: None,
@@ -807,7 +829,6 @@ mod tests {
                 let mut c = config(root.path());
                 // Native integrations in config cannot enlarge an empty source.
                 c.pipeline.enabled = true;
-                let marker = c.data_dir.join("sessions/sessions.db");
                 let evidence = Arc::new(Evidence::default());
                 let mut caps = capabilities(&evidence);
                 caps.providers = Arc::new(NoToolProviders(evidence.clone()));
@@ -835,10 +856,6 @@ mod tests {
                     evidence.catalogs.lock().unwrap().as_slice(),
                     [Vec::<String>::new()]
                 );
-                assert!(
-                    !marker.exists(),
-                    "empty source must not invoke native fallback"
-                );
             })
         });
     }
@@ -858,7 +875,6 @@ mod tests {
             runtime.block_on(async {
                 let root = tempfile::TempDir::new().unwrap();
                 let c = config(root.path());
-                let marker = c.data_dir.join("sessions/sessions.db");
                 let evidence = Arc::new(Evidence::default());
                 let mut caps = capabilities(&evidence);
                 caps.providers = Arc::new(RefusingProviders);
@@ -884,7 +900,6 @@ mod tests {
                 assert_eq!(evidence.tool_calls.load(Ordering::SeqCst), 0);
                 assert!(evidence.delivered.lock().unwrap().is_empty());
                 assert_eq!(evidence.flushes.load(Ordering::SeqCst), 1);
-                assert!(!marker.exists());
             })
         });
     }
@@ -912,7 +927,6 @@ mod tests {
         on_large_runtime(|runtime| {
             runtime.block_on(async {
             let root = tempfile::TempDir::new().unwrap(); let c = config(root.path());
-            let marker = c.data_dir.join("sessions/sessions.db");
             let evidence = Arc::new(Evidence::default()); let mut caps = capabilities(&evidence);
             let entered = Arc::new(tokio::sync::Notify::new()); let released = Arc::new(AtomicUsize::new(0));
             caps.memory = Arc::new(BlockingMemory { entered: entered.clone(), released: released.clone() });
@@ -926,7 +940,6 @@ mod tests {
             assert_eq!(released.load(Ordering::SeqCst), 1, "cancel must drop the active construction future");
             assert_eq!(evidence.flushes.load(Ordering::SeqCst), 1);
             assert_eq!(evidence.tool_requests.load(Ordering::SeqCst), 0);
-            assert!(!marker.exists());
         })
         });
     }

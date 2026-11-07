@@ -227,7 +227,7 @@ impl EmailChannel {
                 file_name,
                 data,
                 mime_type: mime_str,
-                marker: None,
+                reference: None,
             });
         }
         attachments
@@ -1209,7 +1209,7 @@ mod tests {
             file_name: file_name.into(),
             data,
             mime_type: None,
-            marker: None,
+            reference: None,
         }
     }
 
@@ -2431,6 +2431,7 @@ mod tests {
             attachments: Vec::new(),
             in_reply_to: None,
             references: Vec::new(),
+            locations: Vec::new(),
             suppress_voice: false,
             force_voice: false,
         }

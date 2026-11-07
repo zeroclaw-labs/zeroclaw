@@ -1,198 +1,80 @@
-//! End-to-end proof that the new `channel_id` / `room_id` / `sender_id`
-//! columns on `session_metadata` actually exist after the migration runs
-//! and that `set_session_context` writes through to disk where a raw
-//! sqlite reader can see them.
-
-use std::path::PathBuf;
+//! Master-format routing metadata must survive installation migration without
+//! initializing another legacy backend or changing the backed-up schema.
 
 use rusqlite::Connection;
-use zeroclaw_api::model_provider::ChatMessage;
-use zeroclaw_infra::session_backend::{SessionBackend, SessionContext};
-use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
+use zeroclaw_infra::session_events::{
+    catalog::SessionCatalog, installation::NativeBackend, scoped::EventStorePool,
+    upgrade::upgrade_installation,
+};
 
 #[test]
-fn migration_adds_routing_columns_and_set_session_context_persists() {
-    let tmp = tempfile::TempDir::new().expect("tempdir");
-    let sessions_dir = tmp.path().join("sessions");
-    std::fs::create_dir_all(&sessions_dir).expect("mkdir");
-    let db_path = sessions_dir.join("sessions.db");
-
-    if let Ok(live) = std::env::var("ZEROCLAW_LIVE_SESSIONS_DB") {
-        let live_path = PathBuf::from(&live);
-        if live_path.exists() {
-            std::fs::copy(&live_path, &db_path).expect("copy live db");
-            let bytes = std::fs::metadata(&db_path).unwrap().len();
-            println!(
-                "Seeded tempdir from live daemon DB ({live}, {bytes} bytes) -> {}",
-                db_path.display()
-            );
+fn legacy_routing_metadata_is_imported_to_the_native_catalog() {
+    for backend in [NativeBackend::Sqlite, NativeBackend::Jsonl] {
+        if backend == NativeBackend::Jsonl && !cfg!(unix) {
+            continue;
         }
-    } else {
-        println!("ZEROCLAW_LIVE_SESSIONS_DB unset; running migration over empty file");
+        for routing_columns in [false, true] {
+            let directory = tempfile::tempdir().expect("directory");
+            let sessions = directory.path().join("sessions");
+            std::fs::create_dir(&sessions).expect("sessions directory");
+            let db_path = sessions.join("sessions.db");
+            let conn = Connection::open(&db_path).expect("old database");
+            conn.execute_batch(
+                "CREATE TABLE sessions (id INTEGER PRIMARY KEY, session_key TEXT, role TEXT,
+                    content TEXT, created_at TEXT);
+                 CREATE TABLE session_metadata (session_key TEXT PRIMARY KEY, name TEXT,
+                    created_at TEXT, last_activity TEXT, message_count INTEGER);
+                 INSERT INTO sessions VALUES (1,'gw_migrated','user','retained input','2020-01-02T03:04:05Z');
+                 INSERT INTO session_metadata VALUES ('gw_migrated','Migrated title',
+                    '2020-01-02T03:04:05Z','2020-01-02T03:04:05Z',1);",
+            ).expect("master schema");
+            if routing_columns {
+                conn.execute_batch(
+                    "ALTER TABLE session_metadata ADD COLUMN agent_alias TEXT;
+                     ALTER TABLE session_metadata ADD COLUMN channel_id TEXT;
+                     ALTER TABLE session_metadata ADD COLUMN room_id TEXT;
+                     ALTER TABLE session_metadata ADD COLUMN sender_id TEXT;
+                     ALTER TABLE session_metadata ADD COLUMN principal_id TEXT;
+                     UPDATE session_metadata SET agent_alias='fixture', channel_id='discord.fixture',
+                        room_id='fixture-room', sender_id='fixture-sender', principal_id='fixture-owner';",
+                ).expect("routing metadata");
+            }
+            drop(conn);
+            let original = std::fs::read(&db_path).expect("original bytes");
+            upgrade_installation(directory.path(), backend, |_| "fallback".into())
+                .expect("native migration");
+            assert!(!db_path.exists());
+            assert_eq!(
+                std::fs::read(sessions.join("sessions.db.backup")).expect("backup"),
+                original
+            );
+
+            let pool = EventStorePool::default();
+            let catalog = SessionCatalog::open(directory.path(), &pool)
+                .expect("catalog")
+                .expect("native installation");
+            let records = catalog.query().index_records().expect("index");
+            assert_eq!(records.len(), 1);
+            let record = &records[0];
+            assert_eq!(record.session_id.as_str(), "migrated");
+            assert_eq!(record.title.as_deref(), Some("Migrated title"));
+            assert_eq!(record.message_count, 1);
+            assert_eq!(record.creation_source.as_deref(), Some("gateway"));
+            assert_eq!(record.first_user_preview.as_deref(), Some("retained input"));
+            assert_eq!(
+                record.owning_agent.as_deref(),
+                Some(if routing_columns {
+                    "fixture"
+                } else {
+                    "fallback"
+                })
+            );
+            if routing_columns {
+                assert_eq!(record.metadata["channel_id"], "discord.fixture");
+                assert_eq!(record.metadata["room_id"], "fixture-room");
+                assert_eq!(record.metadata["sender_id"], "fixture-sender");
+                assert_eq!(record.metadata["principal_id"], "fixture-owner");
+            }
+        }
     }
-
-    println!("\n=== BEFORE migration ===");
-    if db_path.exists() {
-        let conn = Connection::open(&db_path).expect("open before");
-        dump_table_info(&conn, "session_metadata");
-    } else {
-        println!("  (no DB yet)");
-    }
-
-    let backend = SqliteSessionBackend::new(tmp.path()).expect("open backend (runs migration)");
-
-    println!("\n=== AFTER migration (PRAGMA table_info session_metadata) ===");
-    let columns = {
-        let conn = Connection::open(&db_path).expect("open after");
-        dump_table_info(&conn, "session_metadata")
-    };
-    assert!(
-        columns.contains(&"channel_id".to_string()),
-        "channel_id missing"
-    );
-    assert!(columns.contains(&"room_id".to_string()), "room_id missing");
-    assert!(
-        columns.contains(&"sender_id".to_string()),
-        "sender_id missing"
-    );
-
-    let session_key = "proof_session_42";
-    backend
-        .append(session_key, &ChatMessage::user("ping"))
-        .expect("append");
-    backend
-        .set_session_context(
-            session_key,
-            SessionContext {
-                channel_id: Some("discord.clamps"),
-                room_id: Some("1234567890"),
-                sender_id: Some("singlerider"),
-            },
-        )
-        .expect("set_session_context");
-    backend
-        .set_session_agent_alias(session_key, "clamps")
-        .expect("set_session_agent_alias");
-
-    println!("\n=== Wrote one row via SessionBackend trait ===");
-    println!(
-        "  session_key={session_key:?} agent_alias=clamps channel_id=discord.clamps room_id=1234567890 sender_id=singlerider"
-    );
-
-    println!("\n=== Reading back via raw rusqlite (bypasses backend code) ===");
-    let conn = Connection::open(&db_path).expect("open read");
-    let row = conn
-        .query_row(
-            "SELECT session_key, agent_alias, channel_id, room_id, sender_id, message_count \
-             FROM session_metadata WHERE session_key = ?1",
-            rusqlite::params![session_key],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, i64>(5)?,
-                ))
-            },
-        )
-        .expect("row exists");
-    println!(
-        "  session_key={:?} agent_alias={:?} channel_id={:?} room_id={:?} sender_id={:?} message_count={}",
-        row.0, row.1, row.2, row.3, row.4, row.5
-    );
-    assert_eq!(row.1.as_deref(), Some("clamps"));
-    assert_eq!(row.2.as_deref(), Some("discord.clamps"));
-    assert_eq!(row.3.as_deref(), Some("1234567890"));
-    assert_eq!(row.4.as_deref(), Some("singlerider"));
-    assert_eq!(row.5, 1);
-
-    println!("\n=== Indexes on session_metadata (proves CREATE INDEX ran) ===");
-    let mut stmt = conn
-        .prepare(
-            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='session_metadata' \
-             ORDER BY name",
-        )
-        .expect("prepare");
-    let mut rows = stmt.query([]).expect("query");
-    let mut idx_names: Vec<String> = Vec::new();
-    while let Some(row) = rows.next().expect("next") {
-        let name: String = row.get(0).expect("name");
-        println!("  {name}");
-        idx_names.push(name);
-    }
-    for required in [
-        "idx_session_metadata_channel_id",
-        "idx_session_metadata_room_id",
-        "idx_session_metadata_sender_id",
-    ] {
-        assert!(
-            idx_names.iter().any(|n| n == required),
-            "expected index {required} to exist; got {idx_names:?}"
-        );
-    }
-
-    println!("\n=== Additive COALESCE behaviour (second call with None must not clobber) ===");
-    backend
-        .set_session_context(
-            session_key,
-            SessionContext {
-                channel_id: None,
-                room_id: Some("changed-room"),
-                sender_id: None,
-            },
-        )
-        .expect("second call");
-    let after = conn
-        .query_row(
-            "SELECT channel_id, room_id, sender_id FROM session_metadata WHERE session_key = ?1",
-            rusqlite::params![session_key],
-            |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            },
-        )
-        .expect("second read");
-    println!(
-        "  channel_id={:?} room_id={:?} sender_id={:?}",
-        after.0, after.1, after.2
-    );
-    assert_eq!(
-        after.0.as_deref(),
-        Some("discord.clamps"),
-        "channel_id should not have been cleared by a None passthrough"
-    );
-    assert_eq!(after.1.as_deref(), Some("changed-room"));
-    assert_eq!(
-        after.2.as_deref(),
-        Some("singlerider"),
-        "sender_id should not have been cleared by a None passthrough"
-    );
-
-    println!("\n=== PROOF COMPLETE: migration ran, columns exist, writes persisted ===");
-}
-
-fn dump_table_info(conn: &Connection, table: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut stmt = conn
-        .prepare(&format!("PRAGMA table_info({table})"))
-        .expect("prepare");
-    let mut rows = stmt.query([]).expect("query");
-    while let Some(row) = rows.next().expect("next") {
-        let name: String = row.get(1).expect("name");
-        let ty: String = row.get(2).expect("type");
-        let notnull: i64 = row.get(3).expect("notnull");
-        let dflt: Option<String> = row.get(4).expect("default");
-        let pk: i64 = row.get(5).expect("pk");
-        println!(
-            "  {name:<22} {ty:<10} notnull={notnull} default={} pk={pk}",
-            dflt.as_deref().unwrap_or("-")
-        );
-        names.push(name);
-    }
-    names
 }

@@ -84,15 +84,14 @@ where
 ///
 /// SOP delivery needs to distinguish an infrastructure failure created by the
 /// bridge from a terminal-completion cause reported by the model provider.
-pub(super) fn run_bridged_anyhow<T, F>(fut: F, timeout: Duration, what: &str) -> anyhow::Result<T>
+/// The caller owns its deadline inside the effect future. This bridge waits for
+/// the execution owner to settle durable outcomes, without dropping an in-flight
+/// commit or turning a remote timeout into a safely retryable local failure.
+pub(super) fn run_bridged_anyhow<T, F>(fut: F, what: &str) -> anyhow::Result<T>
 where
     T: Send + 'static,
     F: Future<Output = anyhow::Result<T>> + Send + 'static,
 {
-    let timeout_error = format!(
-        "timed out after {}s waiting for the {what}",
-        timeout.as_secs()
-    );
     let (tx, rx) = sync_channel(1);
     let handle = std::thread::Builder::new()
         .name(format!("sop-bridge-{what}"))
@@ -101,12 +100,7 @@ where
                 .enable_all()
                 .build()
             {
-                Ok(rt) => rt.block_on(async move {
-                    match tokio::time::timeout(timeout, fut).await {
-                        Ok(result) => result,
-                        Err(_) => Err(anyhow::Error::msg(timeout_error)),
-                    }
-                }),
+                Ok(rt) => rt.block_on(fut),
                 Err(error) => Err(anyhow::Error::msg(format!(
                     "bridge runtime build failed: {error}"
                 ))),
@@ -124,9 +118,9 @@ where
         }
         Err(_) => {
             let _ = handle.join();
-            Err(anyhow::Error::msg(format!(
-                "{what} task died before reporting a result"
-            )))
+            Err(zeroclaw_api::session_events::capture::capture_stopped(
+                anyhow::Error::msg(format!("{what} task died before reporting a result")),
+            ))
         }
     }
 }
@@ -249,6 +243,36 @@ mod tests {
             dropped.load(Ordering::SeqCst),
             "the timed-out future must be dropped before the caller can retry"
         );
+    }
+
+    #[test]
+    fn typed_bridge_waits_for_deadline_settlement_and_panics_stop_retries() {
+        let settled = Arc::new(AtomicBool::new(false));
+        let marker = settled.clone();
+        let error = run_bridged_anyhow(
+            async move {
+                let result = tokio::time::timeout(
+                    Duration::from_millis(10),
+                    std::future::pending::<anyhow::Result<()>>(),
+                )
+                .await;
+                assert!(result.is_err());
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                marker.store(true, Ordering::SeqCst);
+                Err::<(), _>(
+                    anyhow::Error::msg("fixture_unknown")
+                        .context(zeroclaw_api::session_events::capture::SessionCaptureStopped),
+                )
+            },
+            "fixture",
+        )
+        .expect_err("unknown");
+        assert!(settled.load(Ordering::SeqCst));
+        assert!(error.is::<zeroclaw_api::session_events::capture::SessionCaptureStopped>());
+        let error =
+            run_bridged_anyhow::<(), _>(async { panic!("fixture bridge panic") }, "panic fixture")
+                .expect_err("panic");
+        assert!(error.is::<zeroclaw_api::session_events::capture::SessionCaptureStopped>());
     }
 
     #[test]

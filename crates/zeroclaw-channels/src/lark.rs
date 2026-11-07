@@ -531,28 +531,16 @@ enum LarkOutgoingMediaKind {
     File { file_type: &'static str },
 }
 
-impl LarkOutgoingMediaKind {
-    fn from_marker_kind(kind: &str) -> Option<Self> {
-        match kind.trim().to_ascii_uppercase().as_str() {
-            "IMAGE" | "PHOTO" => Some(Self::Image),
-            "DOCUMENT" | "FILE" => Some(Self::File {
-                file_type: "stream",
-            }),
-            "VIDEO" => Some(Self::File { file_type: "mp4" }),
-            "AUDIO" | "VOICE" => Some(Self::File { file_type: "opus" }),
-            _ => None,
-        }
-    }
-}
+impl LarkOutgoingMediaKind {}
 
 #[derive(Debug, Clone)]
-struct LarkOutgoingMediaMarker {
+struct LarkOutgoingAttachment {
     kind: LarkOutgoingMediaKind,
     target: String,
 }
 
 #[derive(Debug, Clone)]
-struct LarkResolvedMediaMarker {
+struct LarkResolvedAttachment {
     kind: LarkOutgoingMediaKind,
     path: PathBuf,
     file_name: String,
@@ -564,17 +552,7 @@ struct LarkPreparedMediaMessage {
     content: serde_json::Value,
 }
 
-fn lark_outgoing_media_from_marker(
-    kind: String,
-    target: String,
-) -> Option<LarkOutgoingMediaMarker> {
-    Some(LarkOutgoingMediaMarker {
-        kind: LarkOutgoingMediaKind::from_marker_kind(&kind)?,
-        target,
-    })
-}
-
-fn validate_lark_marker_target(
+fn validate_lark_attachment_target(
     target: &str,
     workspace_dir: Option<&Path>,
 ) -> anyhow::Result<PathBuf> {
@@ -650,11 +628,11 @@ fn validate_lark_marker_target(
     Ok(candidate)
 }
 
-fn resolve_lark_media_marker(
-    marker: &LarkOutgoingMediaMarker,
+fn resolve_lark_attachment(
+    marker: &LarkOutgoingAttachment,
     workspace_dir: Option<&Path>,
-) -> anyhow::Result<LarkResolvedMediaMarker> {
-    let path = validate_lark_marker_target(&marker.target, workspace_dir)?;
+) -> anyhow::Result<LarkResolvedAttachment> {
+    let path = validate_lark_attachment_target(&marker.target, workspace_dir)?;
     let metadata = std::fs::metadata(&path).map_err(|err| {
         anyhow::Error::msg(format!(
             "read Lark/Feishu marker target metadata failed: {err}"
@@ -672,14 +650,14 @@ fn resolve_lark_media_marker(
         .unwrap_or("attachment")
         .to_string();
 
-    Ok(LarkResolvedMediaMarker {
+    Ok(LarkResolvedAttachment {
         kind: marker.kind,
         path,
         file_name,
     })
 }
 
-async fn build_lark_image_upload_form(marker: &LarkResolvedMediaMarker) -> anyhow::Result<Form> {
+async fn build_lark_image_upload_form(marker: &LarkResolvedAttachment) -> anyhow::Result<Form> {
     let bytes = fs::read(&marker.path).await.map_err(|err| {
         anyhow::Error::msg(format!(
             "read Lark/Feishu image marker target failed: {err}"
@@ -692,7 +670,7 @@ async fn build_lark_image_upload_form(marker: &LarkResolvedMediaMarker) -> anyho
 }
 
 async fn build_lark_file_upload_form(
-    marker: &LarkResolvedMediaMarker,
+    marker: &LarkResolvedAttachment,
     file_type: &'static str,
 ) -> anyhow::Result<Form> {
     let bytes = fs::read(&marker.path).await.map_err(|err| {
@@ -711,7 +689,9 @@ async fn build_lark_file_upload_form(
 /// Used to (a) wake the awaiting future via `sender` and (b) re-render
 /// the card after the click so the buttons disappear.
 struct PendingApproval {
-    sender: tokio::sync::oneshot::Sender<zeroclaw_api::channel::ChannelApprovalResponse>,
+    registration_id: Uuid,
+    audit: crate::util::ApprovalAudit,
+    sender: tokio::sync::oneshot::Sender<zeroclaw_api::channel::ApprovalReplyResult>,
     destination: String,
     /// `data.message_id` returned by the send-card POST. Empty string is a
     /// sentinel meaning "card was sent but message_id was missing from the
@@ -720,6 +700,23 @@ struct PendingApproval {
     tool_name: String,
     arguments_summary: String,
 }
+
+impl crate::util::ApprovalRegistration for PendingApproval {
+    fn registration_id(&self) -> Uuid {
+        self.registration_id
+    }
+}
+
+#[derive(Debug)]
+struct RejectedCardAction(&'static str);
+
+impl std::fmt::Display for RejectedCardAction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for RejectedCardAction {}
 
 #[derive(Clone)]
 pub struct LarkChannel {
@@ -748,7 +745,7 @@ pub struct LarkChannel {
     ws_seen_ids: Arc<RwLock<HashMap<String, Instant>>>,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
-    /// Workspace root that bounds outbound media marker reads. Resolved by
+    /// Workspace root that bounds outbound attachment reads. Resolved by
     /// the orchestrator from `Config::channel_workspace_dir("lark.<alias>")`.
     workspace_dir: Option<PathBuf>,
     transcription: Option<zeroclaw_config::schema::TranscriptionConfig>,
@@ -1022,12 +1019,23 @@ async fn handle_lark_http_event(
         .pointer("/header/event_type")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    if state
+    match state
         .channel
         .handle_card_action_ingress(event_type, payload.get("event"))
         .await
     {
-        return (StatusCode::OK, "ok").into_response();
+        Ok(true) => return (StatusCode::OK, "ok").into_response(),
+        Ok(false) => {}
+        Err(error) => {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                "Lark webhook: approval callback failed"
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
     }
 
     let messages = state.channel.parse_event_payload_async(&payload).await;
@@ -1589,7 +1597,7 @@ impl LarkChannel {
                     };
                     if self
                         .handle_card_action_ingress(&event.header.event_type, Some(&event.event))
-                        .await
+                        .await?
                     {
                         continue;
                     }
@@ -1628,6 +1636,7 @@ impl LarkChannel {
                     }
 
                     // Decode content by type (mirrors clawdbot-feishu parsing)
+                    let mut attachments = Vec::new();
                     let (text, post_mentioned_open_ids) = match lark_msg.message_type.as_str() {
                         "text" => {
                             let v: serde_json::Value = match serde_json::from_str(&lark_msg.content) {
@@ -1652,11 +1661,11 @@ impl LarkChannel {
                                 Some(k) => k.to_string(),
                                 None => { ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "WS: image message missing image_key"); continue; }
                             };
-                            match self.download_image_as_marker(&lark_msg.message_id, &image_key).await {
+                            match self.download_image_attachment(&lark_msg.message_id, &image_key, &mut attachments).await {
                                 Some(marker) => (marker, Vec::new()),
                                 None => {
                                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"image_key": image_key})), "WS: failed to download image");
-                                    (format!("[IMAGE:{image_key} | download failed]"), Vec::new())
+                                    (format!("Image download failed: {image_key}"), Vec::new())
                                 }
                             }
                         }
@@ -1673,11 +1682,11 @@ impl LarkChannel {
                                 .and_then(|n| n.as_str())
                                 .unwrap_or("unknown_file")
                                 .to_string();
-                            match self.download_file_as_content(&lark_msg.message_id, &file_key, &file_name).await {
+                            match self.download_file_as_content(&lark_msg.message_id, &file_key, &file_name, &mut attachments).await {
                                 Some(content) => (content, Vec::new()),
                                 None => {
                                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"file_key": file_key})), "WS: failed to download file");
-                                    (format!("[ATTACHMENT:{file_name} | download failed]"), Vec::new())
+                                    (format!("Attachment download failed: {file_name}"), Vec::new())
                                 }
                             }
                         }
@@ -1702,7 +1711,7 @@ impl LarkChannel {
                     };
 
                     let text = text.trim().to_string();
-                    if text.is_empty() { continue; }
+                    if text.is_empty() && attachments.is_empty() { continue; }
 
                     // Group-chat: only respond when explicitly @-mentioned
                     let bot_open_id = self.resolved_bot_open_id();
@@ -1762,7 +1771,7 @@ impl LarkChannel {
                             .as_secs(),
                         thread_ts: None,
                         interruption_scope_id: None,
-                    attachments: vec![],
+                    attachments,
                         subject: None,
 
                         ..Default::default()};
@@ -1851,8 +1860,13 @@ impl LarkChannel {
         *cached = None;
     }
 
-    /// Download an image from the Lark API and return an `[IMAGE:data:...]` marker string.
-    async fn download_image_as_marker(&self, message_id: &str, image_key: &str) -> Option<String> {
+    /// Download an image from the Lark API and return a structured attachment.
+    async fn download_image_attachment(
+        &self,
+        message_id: &str,
+        image_key: &str,
+        attachments: &mut Vec<zeroclaw_api::media::MediaAttachment>,
+    ) -> Option<String> {
         let url = self.image_resource_url(message_id, image_key);
         let mut retried_token = false;
 
@@ -1981,7 +1995,14 @@ impl LarkChannel {
             }
 
             let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
-            return Some(format!("[IMAGE:data:{mime};base64,{encoded}]"));
+            attachments.push(zeroclaw_api::media::MediaAttachment {
+                reference: Some(zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: format!("data:{mime};base64,{encoded}"),
+                }),
+                ..Default::default()
+            });
+            return Some(String::new());
         }
     }
 
@@ -1992,6 +2013,7 @@ impl LarkChannel {
         message_id: &str,
         file_key: &str,
         file_name: &str,
+        attachments: &mut Vec<zeroclaw_api::media::MediaAttachment>,
     ) -> Option<String> {
         let token = match self.get_tenant_access_token().await {
             Ok(t) => t,
@@ -2054,7 +2076,7 @@ impl LarkChannel {
                 "file too large for : bytes exceeds limit"
             );
             return Some(format!(
-                "[ATTACHMENT:{file_name} | size={cl} bytes | too large to inline]"
+                "File unavailable: {file_name} ({cl} bytes, exceeds download limit)"
             ));
         }
 
@@ -2099,8 +2121,27 @@ impl LarkChannel {
             && LARK_SUPPORTED_IMAGE_MIMES.contains(&mime.as_str())
         {
             let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
-            return Some(format!("[IMAGE:data:{mime};base64,{encoded}]"));
+            attachments.push(zeroclaw_api::media::MediaAttachment {
+                reference: Some(zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: format!("data:{mime};base64,{encoded}"),
+                }),
+                ..Default::default()
+            });
+            return Some(String::new());
         }
+
+        attachments.push(zeroclaw_api::media::MediaAttachment {
+            file_name: file_name.to_string(),
+            reference: Some(zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Document,
+                target: format!(
+                    "data:{content_type};base64,{}",
+                    base64::engine::general_purpose::STANDARD.encode(&bytes)
+                ),
+            }),
+            ..Default::default()
+        });
 
         // If the file looks like text, inline it
         if bytes.len() <= LARK_FILE_MAX_BYTES
@@ -2116,11 +2157,11 @@ impl LarkChannel {
             let text = String::from_utf8_lossy(&bytes);
             let truncated = lark_inline_text_file_preview(text);
             let ext = file_name.rsplit('.').next().unwrap_or("text");
-            return Some(format!("[FILE:{file_name}]\n```{ext}\n{truncated}\n```"));
+            return Some(format!("{file_name}\n```{ext}\n{truncated}\n```"));
         }
 
         Some(format!(
-            "[ATTACHMENT:{file_name} | mime={content_type} | size={} bytes]",
+            "File attached: {file_name} ({content_type}, {} bytes)",
             bytes.len()
         ))
     }
@@ -2517,7 +2558,7 @@ impl LarkChannel {
     async fn upload_lark_image(
         &self,
         token: &mut String,
-        marker: &LarkResolvedMediaMarker,
+        marker: &LarkResolvedAttachment,
     ) -> anyhow::Result<String> {
         let url = format!("{}/im/v1/images", self.api_base());
         let form = build_lark_image_upload_form(marker).await?;
@@ -2551,7 +2592,7 @@ impl LarkChannel {
     async fn upload_lark_file(
         &self,
         token: &mut String,
-        marker: &LarkResolvedMediaMarker,
+        marker: &LarkResolvedAttachment,
         file_type: &'static str,
     ) -> anyhow::Result<String> {
         let url = format!("{}/im/v1/files", self.api_base());
@@ -2583,10 +2624,10 @@ impl LarkChannel {
             .ok_or_else(|| anyhow::Error::msg("Lark/Feishu file upload returned no file_key"))
     }
 
-    async fn prepare_lark_media_marker(
+    async fn prepare_lark_attachment(
         &self,
         token: &mut String,
-        marker: &LarkResolvedMediaMarker,
+        marker: &LarkResolvedAttachment,
     ) -> anyhow::Result<LarkPreparedMediaMessage> {
         let (msg_type, content) = match marker.kind {
             LarkOutgoingMediaKind::Image => {
@@ -2688,6 +2729,7 @@ impl LarkChannel {
             .and_then(|m| m.as_str())
             .unwrap_or("");
 
+        let mut attachments = Vec::new();
         let (text, post_mentioned_open_ids): (String, Vec<String>) = match msg_type {
             "text" => {
                 let extracted = serde_json::from_str::<serde_json::Value>(content_str)
@@ -2717,7 +2759,9 @@ impl LarkChannel {
                     });
                 match image_key {
                     Some(key) => {
-                        let marker = match self.download_image_as_marker(evt_message_id, &key).await
+                        let marker = match self
+                            .download_image_attachment(evt_message_id, &key, &mut attachments)
+                            .await
                         {
                             Some(m) => m,
                             None => {
@@ -2731,7 +2775,7 @@ impl LarkChannel {
                                     .with_attrs(::serde_json::json!({"key": key})),
                                     "failed to download image"
                                 );
-                                format!("[IMAGE:{key} | download failed]")
+                                format!("Image download failed: {key}")
                             }
                         };
                         (marker, Vec::new())
@@ -2763,7 +2807,12 @@ impl LarkChannel {
                 match file_key {
                     Some(key) => {
                         let content = match self
-                            .download_file_as_content(evt_message_id, &key, &file_name)
+                            .download_file_as_content(
+                                evt_message_id,
+                                &key,
+                                &file_name,
+                                &mut attachments,
+                            )
                             .await
                         {
                             Some(c) => c,
@@ -2778,7 +2827,7 @@ impl LarkChannel {
                                     .with_attrs(::serde_json::json!({"key": key})),
                                     "failed to download file"
                                 );
-                                format!("[ATTACHMENT:{file_name} | download failed]")
+                                format!("Attachment download failed: {file_name}")
                             }
                         };
                         (content, Vec::new())
@@ -2858,7 +2907,7 @@ impl LarkChannel {
             timestamp,
             thread_ts: None,
             interruption_scope_id: None,
-            attachments: vec![],
+            attachments,
             subject: None,
 
             ..Default::default()
@@ -2886,18 +2935,37 @@ impl Channel for LarkChannel {
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let mut token = self.get_tenant_access_token().await?;
         let url = self.send_message_url(&message.recipient);
-        let (text_content, raw_markers) = super::util::parse_attachment_markers(&message.content);
-        let markers = raw_markers
-            .into_iter()
-            .filter_map(|(kind, target)| lark_outgoing_media_from_marker(kind, target))
+        let text_content = message.content.clone();
+        let markers = message
+            .attachments
+            .iter()
+            .filter_map(|attachment| {
+                let reference = attachment.reference.as_ref()?;
+                let kind = match reference.kind {
+                    zeroclaw_api::media::AttachmentKind::Image => LarkOutgoingMediaKind::Image,
+                    zeroclaw_api::media::AttachmentKind::Audio => {
+                        LarkOutgoingMediaKind::File { file_type: "opus" }
+                    }
+                    zeroclaw_api::media::AttachmentKind::Video => {
+                        LarkOutgoingMediaKind::File { file_type: "mp4" }
+                    }
+                    zeroclaw_api::media::AttachmentKind::Document => LarkOutgoingMediaKind::File {
+                        file_type: "stream",
+                    },
+                };
+                Some(LarkOutgoingAttachment {
+                    kind,
+                    target: reference.target.clone(),
+                })
+            })
             .collect::<Vec<_>>();
         let resolved_markers = markers
             .iter()
-            .map(|marker| resolve_lark_media_marker(marker, self.workspace_dir.as_deref()))
+            .map(|marker| resolve_lark_attachment(marker, self.workspace_dir.as_deref()))
             .collect::<anyhow::Result<Vec<_>>>()?;
         let mut prepared_media = Vec::with_capacity(resolved_markers.len());
         for marker in &resolved_markers {
-            prepared_media.push(self.prepare_lark_media_marker(&mut token, marker).await?);
+            prepared_media.push(self.prepare_lark_attachment(&mut token, marker).await?);
         }
 
         if !text_content.is_empty() || markers.is_empty() {
@@ -3178,17 +3246,20 @@ impl Channel for LarkChannel {
         recipient: &str,
         request: &zeroclaw_api::channel::ChannelApprovalRequest,
     ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
-        let approval_id = Uuid::new_v4().to_string();
+        let registration_id = Uuid::new_v4();
+        let approval_id = registration_id.to_string();
         let card = build_approval_card(
             &approval_id,
             &request.tool_name,
             &request.arguments_summary,
             request.position_counter(),
         );
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
         self.pending_approvals.lock().await.insert(
             approval_id.clone(),
             PendingApproval {
+                registration_id,
+                audit: crate::util::ApprovalAudit::current(),
                 sender: tx,
                 destination: recipient.to_string(),
                 message_id: String::new(),
@@ -3199,9 +3270,10 @@ impl Channel for LarkChannel {
         let mut guard = crate::util::PendingApprovalGuard::new(
             Arc::clone(&self.pending_approvals),
             approval_id.clone(),
+            registration_id,
         );
 
-        let send_result = async {
+        let send_prompt = async {
             let token = self.get_tenant_access_token().await?;
             let url = self.send_message_url(recipient);
             let body = serde_json::json!({
@@ -3243,15 +3315,20 @@ impl Channel for LarkChannel {
                     );
                     String::new()
                 });
-            anyhow::Ok(message_id)
-        }
-        .await;
+            if let Some(pending) = self.pending_approvals.lock().await.get_mut(&approval_id) {
+                pending.message_id = message_id;
+            }
+            anyhow::Ok(())
+        };
 
-        match send_result {
-            Ok(message_id) => {
-                if let Some(pending) = self.pending_approvals.lock().await.get_mut(&approval_id) {
-                    pending.message_id = message_id;
-                }
+        match zeroclaw_api::channel::await_approval_prompt_send(send_prompt, &mut rx).await {
+            Ok(zeroclaw_api::channel::ApprovalPromptOutcome::Sent(())) => {}
+            Ok(zeroclaw_api::channel::ApprovalPromptOutcome::Replied(response)) => {
+                guard.disarm();
+                return Ok(Some(response));
+            }
+            Err(error) if zeroclaw_api::session_events::capture::is_capture_stopped(&error) => {
+                return Err(error);
             }
             Err(err) => {
                 guard.remove().await;
@@ -3259,7 +3336,7 @@ impl Channel for LarkChannel {
             }
         }
 
-        Ok(Some(self.wait_for_decision(rx, &mut guard).await))
+        Ok(Some(self.wait_for_decision(rx, &mut guard).await?))
     }
 
     fn supports_draft_updates(&self) -> bool {
@@ -3373,20 +3450,7 @@ impl Channel for LarkChannel {
         self.last_draft_edit.lock().await.remove(message_id);
 
         let mut token = self.get_tenant_access_token().await?;
-        let (text_content, raw_markers) = super::util::parse_attachment_markers(text);
-        let markers = raw_markers
-            .into_iter()
-            .filter_map(|(kind, target)| lark_outgoing_media_from_marker(kind, target))
-            .collect::<Vec<_>>();
-        let resolved_markers = markers
-            .iter()
-            .map(|marker| resolve_lark_media_marker(marker, self.workspace_dir.as_deref()))
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        let mut prepared_media = Vec::with_capacity(resolved_markers.len());
-        for marker in &resolved_markers {
-            prepared_media.push(self.prepare_lark_media_marker(&mut token, marker).await?);
-        }
-
+        let text_content = text.to_string();
         let chunks = split_markdown_chunks(&text_content, LARK_CARD_MARKDOWN_MAX_BYTES);
         let first = chunks.first().copied().unwrap_or("");
         self.patch_card_content(message_id, first).await?;
@@ -3398,11 +3462,6 @@ impl Channel for LarkChannel {
                 self.send_json_with_token_refresh(&url, &mut token, &body, "finalize_draft chunk")
                     .await?;
             }
-        }
-
-        for media in &prepared_media {
-            self.send_lark_media_message(&mut token, recipient, media)
-                .await?;
         }
 
         Ok(())
@@ -3527,30 +3586,30 @@ impl LarkChannel {
     /// deny, so the caller does not report an operator refusal nobody made.
     async fn wait_for_decision(
         &self,
-        rx: tokio::sync::oneshot::Receiver<zeroclaw_api::channel::ChannelApprovalResponse>,
+        rx: tokio::sync::oneshot::Receiver<zeroclaw_api::channel::ApprovalReplyResult>,
         guard: &mut crate::util::PendingApprovalGuard<PendingApproval>,
-    ) -> zeroclaw_api::channel::AttributedApprovalResponse {
+    ) -> zeroclaw_api::channel::ApprovalReplyResult {
         use zeroclaw_api::channel::{
             ApprovalSource, AttributedApprovalResponse, ChannelApprovalResponse,
         };
         match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
             Ok(Ok(response)) => {
                 guard.disarm();
-                AttributedApprovalResponse::operator(response)
+                response
             }
             Ok(Err(_)) => {
                 guard.remove().await;
-                AttributedApprovalResponse::from_runtime(
+                Ok(AttributedApprovalResponse::from_runtime(
                     ChannelApprovalResponse::Deny,
                     ApprovalSource::Unreachable,
-                )
+                ))
             }
             Err(_) => {
                 guard.remove().await;
-                AttributedApprovalResponse::from_runtime(
+                Ok(AttributedApprovalResponse::from_runtime(
                     ChannelApprovalResponse::Deny,
                     ApprovalSource::TimedOut,
-                )
+                ))
             }
         }
     }
@@ -3714,9 +3773,9 @@ impl LarkChannel {
         &self,
         event_type: &str,
         event_payload: Option<&serde_json::Value>,
-    ) -> bool {
+    ) -> anyhow::Result<bool> {
         if event_type != "card.action.trigger" {
-            return false;
+            return Ok(false);
         }
         let Some(event_payload) = event_payload else {
             ::zeroclaw_log::record!(
@@ -3725,9 +3784,12 @@ impl LarkChannel {
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure),
                 "Lark card action ingress: missing event payload"
             );
-            return true;
+            return Ok(true);
         };
         if let Err(e) = self.handle_card_action_event(event_payload).await {
+            if !e.is::<RejectedCardAction>() {
+                return Err(e);
+            }
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Dispatch)
@@ -3736,7 +3798,7 @@ impl LarkChannel {
                 "Lark card action ingress: callback rejected"
             );
         }
-        true
+        Ok(true)
     }
 
     async fn handle_card_action_event(
@@ -3765,7 +3827,7 @@ impl LarkChannel {
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure),
                     "card.action.trigger: missing event.action.value or event.action.behaviors[0].value"
                 );
-                anyhow::Error::msg(
+                RejectedCardAction(
                     "card.action.trigger: missing event.action.value or event.action.behaviors[0].value",
                 )
             })?;
@@ -3780,21 +3842,33 @@ impl LarkChannel {
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure),
                     "card.action.trigger: missing approval_id in value"
                 );
-                anyhow::Error::msg("card.action.trigger: missing approval_id in value")
+                RejectedCardAction("card.action.trigger: missing approval_id in value")
             })?;
 
-        let decision_str = value
-            .get("decision")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
+        let audit = self
+            .pending_approvals
+            .lock()
+            .await
+            .get(approval_id)
+            .map(|pending| pending.audit.clone())
+            .unwrap_or_default();
+        let decision_str = match value.get("decision").and_then(|v| v.as_str()) {
+            Some(decision) => decision,
+            None => {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure),
                     "card.action.trigger: missing decision in value"
                 );
-                anyhow::Error::msg("card.action.trigger: missing decision in value")
-            })?;
+                audit
+                    .record_rejection("missing_decision", serde_json::json!({}))
+                    .await?;
+                return Err(
+                    RejectedCardAction("card.action.trigger: missing decision in value").into(),
+                );
+            }
+        };
 
         let decision = match decision_str {
             "approve" => ChannelApprovalResponse::Approve,
@@ -3815,9 +3889,12 @@ impl LarkChannel {
                         .with_attrs(::serde_json::json!({"decision_str": other})),
                     "Lark: unknown approval decision — rejecting the callback without resolving the approval"
                 );
-                return Err(anyhow::Error::msg(
-                    "card.action.trigger: unknown decision value",
-                ));
+                audit
+                    .record_rejection("invalid_decision", serde_json::json!({"decision": other}))
+                    .await?;
+                return Err(
+                    RejectedCardAction("card.action.trigger: unknown decision value").into(),
+                );
             }
         };
 
@@ -3833,18 +3910,41 @@ impl LarkChannel {
         let pending = self
             .take_pending_approval(approval_id, responder, destination)
             .await;
-        let Some(pending) = pending else {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "approval_id": approval_id,
-                        "decision": format!("{decision:?}"),
-                    })),
-                "Lark: card action for unknown/expired approval_id"
-            );
-            return Ok(());
+        let pending = match pending {
+            Ok(pending) => pending,
+            Err((classification, audit, closed_registration_id)) => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "approval_id": approval_id,
+                            "decision": format!("{decision:?}"),
+                        })),
+                    "Lark: card action rejected before approval resolution"
+                );
+                audit
+                    .record_rejection(
+                        classification,
+                        serde_json::json!({
+                            "decision": format!("{decision:?}"),
+                            "responder_present": !responder.is_empty(),
+                            "destination_present": !destination.is_empty(),
+                        }),
+                    )
+                    .await?;
+                if let Some(registration_id) = closed_registration_id {
+                    let mut approvals = self.pending_approvals.lock().await;
+                    if approvals
+                        .get(approval_id)
+                        .is_some_and(|pending| pending.registration_id == registration_id)
+                    {
+                        approvals.remove(approval_id);
+                    }
+                    return Err(anyhow::Error::msg("Lark approval response receiver closed"));
+                }
+                return Ok(());
+            }
         };
 
         ::zeroclaw_log::record!(
@@ -3860,7 +3960,25 @@ impl LarkChannel {
             "Lark: card action received"
         );
 
-        let _ = pending.sender.send(decision.clone());
+        if !pending
+            .audit
+            .deliver_reply(
+                pending.sender,
+                crate::util::approval_reply_actor(self, responder),
+                decision.clone(),
+                serde_json::json!({"surface": "card", "destination": destination}),
+            )
+            .await?
+        {
+            pending
+                .audit
+                .record_rejection(
+                    "receiver_closed",
+                    serde_json::json!({"decision": format!("{decision:?}")}),
+                )
+                .await?;
+            return Err(anyhow::Error::msg("Lark approval response receiver closed"));
+        }
 
         if !pending.message_id.is_empty() {
             self.patch_approval_card_resolved(
@@ -3880,19 +3998,35 @@ impl LarkChannel {
         approval_id: &str,
         responder: &str,
         destination: &str,
-    ) -> Option<PendingApproval> {
-        if responder.is_empty() || destination.is_empty() || !self.is_user_allowed(responder) {
-            return None;
-        }
-
+    ) -> Result<PendingApproval, (&'static str, crate::util::ApprovalAudit, Option<Uuid>)> {
         let mut pending_approvals = self.pending_approvals.lock().await;
-        let destination_matches = pending_approvals
-            .get(approval_id)
-            .is_some_and(|pending| pending.destination == destination);
-        if !destination_matches {
-            return None;
+        let Some(pending) = pending_approvals.get(approval_id) else {
+            return Err((
+                "unknown_or_expired_request",
+                crate::util::ApprovalAudit::default(),
+                None,
+            ));
+        };
+        if responder.is_empty() || !self.is_user_allowed(responder) {
+            return Err(("unauthorized_responder", pending.audit.clone(), None));
         }
-        pending_approvals.remove(approval_id)
+        if destination.is_empty() || pending.destination != destination {
+            return Err(("wrong_destination", pending.audit.clone(), None));
+        }
+        if pending.sender.is_closed() {
+            return Err((
+                "receiver_closed",
+                pending.audit.clone(),
+                Some(pending.registration_id),
+            ));
+        }
+        pending_approvals.remove(approval_id).ok_or_else(|| {
+            (
+                "unknown_or_expired_request",
+                crate::util::ApprovalAudit::default(),
+                None,
+            )
+        })
     }
 }
 
@@ -4659,36 +4793,13 @@ mod tests {
     }
 
     #[test]
-    fn lark_outgoing_media_kind_maps_shared_marker_kinds() {
-        assert_eq!(
-            LarkOutgoingMediaKind::from_marker_kind("image"),
-            Some(LarkOutgoingMediaKind::Image)
-        );
-        assert_eq!(
-            LarkOutgoingMediaKind::from_marker_kind("document"),
-            Some(LarkOutgoingMediaKind::File {
-                file_type: "stream"
-            })
-        );
-        assert_eq!(
-            LarkOutgoingMediaKind::from_marker_kind("video"),
-            Some(LarkOutgoingMediaKind::File { file_type: "mp4" })
-        );
-        assert_eq!(
-            LarkOutgoingMediaKind::from_marker_kind("voice"),
-            Some(LarkOutgoingMediaKind::File { file_type: "opus" })
-        );
-        assert_eq!(LarkOutgoingMediaKind::from_marker_kind("embed"), None);
-    }
-
-    #[test]
     fn lark_marker_target_accepts_workspace_relative_file() {
         let workspace = tempfile::tempdir().expect("tempdir");
         let file = workspace.path().join("image.png");
         std::fs::write(&file, b"png").expect("write file");
 
-        let resolved =
-            validate_lark_marker_target("image.png", Some(workspace.path())).expect("valid target");
+        let resolved = validate_lark_attachment_target("image.png", Some(workspace.path()))
+            .expect("valid target");
 
         assert_eq!(resolved, file.canonicalize().expect("canonical file"));
     }
@@ -4700,7 +4811,7 @@ mod tests {
         let file = outside.path().join("secret.txt");
         std::fs::write(&file, b"secret").expect("write outside file");
 
-        let err = validate_lark_marker_target(&file.to_string_lossy(), Some(workspace.path()))
+        let err = validate_lark_attachment_target(&file.to_string_lossy(), Some(workspace.path()))
             .expect_err("outside workspace must be refused");
 
         assert!(
@@ -4713,9 +4824,11 @@ mod tests {
     fn lark_marker_target_rejects_url_schemes() {
         let workspace = tempfile::tempdir().expect("workspace");
 
-        let err =
-            validate_lark_marker_target("https://example.com/image.png", Some(workspace.path()))
-                .expect_err("url target must be refused");
+        let err = validate_lark_attachment_target(
+            "https://example.com/image.png",
+            Some(workspace.path()),
+        )
+        .expect_err("url target must be refused");
 
         assert!(
             err.to_string().contains("disallowed scheme"),
@@ -6494,6 +6607,8 @@ mod tests {
             ch.pending_approvals.lock().await.insert(
                 approval_id.to_string(),
                 PendingApproval {
+                    registration_id: Uuid::new_v4(),
+                    audit: crate::util::ApprovalAudit::default(),
                     sender: tx,
                     destination: event
                         .pointer("/context/open_chat_id")
@@ -6512,8 +6627,9 @@ mod tests {
             let result = tokio::time::timeout(std::time::Duration::from_secs(1), rx)
                 .await
                 .unwrap_or_else(|_| panic!("receive {name} decision timed out"))
-                .unwrap_or_else(|e| panic!("receive {name} decision: {e}"));
-            assert_eq!(result, expected, "fixture {name}");
+                .unwrap_or_else(|e| panic!("receive {name} decision: {e}"))
+                .unwrap_or_else(|e| panic!("capture {name} decision: {e}"));
+            assert_eq!(result.response, expected, "fixture {name}");
         }
     }
 
@@ -6530,6 +6646,8 @@ mod tests {
         ch.pending_approvals.lock().await.insert(
             approval_id.clone(),
             PendingApproval {
+                registration_id: Uuid::new_v4(),
+                audit: crate::util::ApprovalAudit::default(),
                 sender: tx,
                 destination: "oc_test_chat".to_string(),
                 message_id: String::new(),
@@ -6552,8 +6670,8 @@ mod tests {
         ch.handle_card_action_event(&event)
             .await
             .expect("handler ok");
-        let result = rx.await.expect("oneshot delivered");
-        assert_eq!(result, ChannelApprovalResponse::AlwaysApprove);
+        let result = rx.await.expect("oneshot delivered").unwrap();
+        assert_eq!(result.response, ChannelApprovalResponse::AlwaysApprove);
     }
 
     #[tokio::test]
@@ -6569,6 +6687,8 @@ mod tests {
             approvals.insert(
                 "AUTH0001".to_string(),
                 PendingApproval {
+                    registration_id: Uuid::new_v4(),
+                    audit: crate::util::ApprovalAudit::default(),
                     sender: approved_tx,
                     destination: "oc_origin".to_string(),
                     message_id: String::new(),
@@ -6579,6 +6699,8 @@ mod tests {
             approvals.insert(
                 "WRONG001".to_string(),
                 PendingApproval {
+                    registration_id: Uuid::new_v4(),
+                    audit: crate::util::ApprovalAudit::default(),
                     sender: wrong_chat_tx,
                     destination: "oc_origin".to_string(),
                     message_id: String::new(),
@@ -6589,6 +6711,8 @@ mod tests {
             approvals.insert(
                 "OTHER001".to_string(),
                 PendingApproval {
+                    registration_id: Uuid::new_v4(),
+                    audit: crate::util::ApprovalAudit::default(),
                     sender: unauthorized_tx,
                     destination: "oc_origin".to_string(),
                     message_id: String::new(),
@@ -6632,7 +6756,8 @@ mod tests {
                 .expect("outer card-action event type");
             assert!(
                 ch.handle_card_action_ingress(event_type, envelope.get("event"))
-                    .await,
+                    .await
+                    .unwrap(),
                 "card-action envelopes must be consumed before ordinary message dispatch"
             );
             assert!(
@@ -6645,7 +6770,9 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(1), approved_rx)
                 .await
                 .expect("authorized callback should resolve")
-                .expect("approval sender should stay open"),
+                .expect("approval sender should stay open")
+                .expect("approval capture should succeed")
+                .response,
             ChannelApprovalResponse::Approve
         );
         let approvals = ch.pending_approvals.lock().await;
@@ -6737,6 +6864,8 @@ mod tests {
                 approvals.insert(
                     approval_id.to_string(),
                     PendingApproval {
+                        registration_id: Uuid::new_v4(),
+                        audit: crate::util::ApprovalAudit::default(),
                         sender,
                         destination: destination.to_string(),
                         message_id: String::new(),
@@ -6790,7 +6919,10 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK);
         }
 
-        assert_eq!(approved_rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(
+            approved_rx.await.unwrap().unwrap().response,
+            ChannelApprovalResponse::Approve
+        );
         assert!(
             channel
                 .pending_approvals
@@ -6868,9 +7000,162 @@ mod tests {
         .await;
         assert_eq!(encrypted_response.status(), StatusCode::OK);
         assert_eq!(
-            encrypted_rx.await.unwrap(),
+            encrypted_rx.await.unwrap().unwrap().response,
             ChannelApprovalResponse::Approve
         );
+    }
+
+    #[tokio::test]
+    async fn authenticated_card_reply_preserves_identity_and_durable_receipt() {
+        use crate::util::approval_audit_test_support::ApprovalRecorder;
+        use zeroclaw_api::channel::{ApprovalSource, ChannelApprovalResponse};
+
+        let ch = make_channel();
+        let recorder = Arc::new(ApprovalRecorder::default());
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        ch.pending_approvals.lock().await.insert(
+            "identity-request".into(),
+            PendingApproval {
+                registration_id: Uuid::new_v4(),
+                audit: recorder.capture().await,
+                sender,
+                destination: "oc_origin".into(),
+                message_id: String::new(),
+                tool_name: "shell".into(),
+                arguments_summary: String::new(),
+            },
+        );
+        ch.handle_card_action_event(&serde_json::json!({
+            "action": {"value": {"approval_id": "identity-request", "decision": "always"}},
+            "context": {"open_chat_id": "oc_origin"},
+            "operator": {"open_id": "ou_testuser123"}
+        }))
+        .await
+        .unwrap();
+        let reply = receiver.await.unwrap().unwrap();
+        assert_eq!(reply.response, ChannelApprovalResponse::AlwaysApprove);
+        assert_eq!(reply.source, ApprovalSource::Operator);
+        assert!(reply.reply_event_id.is_some());
+        assert_eq!(
+            recorder.replies.lock().unwrap()[0].0,
+            crate::util::approval_reply_actor(&ch, "ou_testuser123")
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_approval_receiver_records_rejection_without_patching_card() {
+        use crate::util::approval_audit_test_support::ApprovalRecorder;
+        use std::sync::atomic::Ordering;
+
+        let server = wiremock::MockServer::start().await;
+        let mut ch = make_channel();
+        ch.api_base_override = Some(server.uri());
+        let recorder = Arc::new(ApprovalRecorder::default());
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        drop(receiver);
+        ch.pending_approvals.lock().await.insert(
+            "closed-request".to_string(),
+            PendingApproval {
+                registration_id: Uuid::new_v4(),
+                audit: recorder.capture().await,
+                sender,
+                destination: "oc_origin".to_string(),
+                message_id: "message-to-keep-pending".to_string(),
+                tool_name: "shell".to_string(),
+                arguments_summary: String::new(),
+            },
+        );
+        let event = serde_json::json!({
+            "action": { "value": { "approval_id": "closed-request", "decision": "approve" } },
+            "context": { "open_chat_id": "oc_origin" },
+            "operator": { "open_id": "ou_testuser123" }
+        });
+
+        recorder.fail.store(true, Ordering::SeqCst);
+        let error = ch
+            .handle_card_action_ingress("card.action.trigger", Some(&event))
+            .await
+            .expect_err("failed audit must preserve the closed registration");
+        assert!(error.to_string().contains("test_approval_append_failed"));
+        assert!(
+            ch.pending_approvals
+                .lock()
+                .await
+                .contains_key("closed-request")
+        );
+        assert!(recorder.records.lock().unwrap().is_empty());
+
+        recorder.fail.store(false, Ordering::SeqCst);
+        let error = ch
+            .handle_card_action_ingress("card.action.trigger", Some(&event))
+            .await
+            .expect_err("closed delivery must reach ingress as an error");
+        assert!(error.to_string().contains("receiver closed"));
+        assert_eq!(recorder.records.lock().unwrap()[0].0, "receiver_closed");
+        assert!(ch.pending_approvals.lock().await.is_empty());
+        assert_eq!(Arc::strong_count(&recorder), 1);
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejected_card_actions_keep_binding_and_surface_failed_audit_at_http_boundary() {
+        use crate::util::approval_audit_test_support::ApprovalRecorder;
+        use std::sync::atomic::Ordering;
+
+        let ch = Arc::new(make_channel());
+        let recorder = Arc::new(ApprovalRecorder::default());
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
+        ch.pending_approvals.lock().await.insert(
+            "audited-request".to_string(),
+            PendingApproval {
+                registration_id: Uuid::new_v4(),
+                audit: recorder.capture().await,
+                sender,
+                destination: "oc_origin".to_string(),
+                message_id: String::new(),
+                tool_name: String::new(),
+                arguments_summary: String::new(),
+            },
+        );
+        let missing = serde_json::json!({
+            "action": { "value": { "approval_id": "audited-request" } }
+        });
+        assert!(
+            ch.handle_card_action_ingress("card.action.trigger", Some(&missing))
+                .await
+                .unwrap()
+        );
+        assert_eq!(recorder.records.lock().unwrap()[0].0, "missing_decision");
+
+        recorder.fail.store(true, Ordering::SeqCst);
+        let (tx, mut messages) = tokio::sync::mpsc::channel(1);
+        let payload = serde_json::json!({
+            "header": { "event_type": "card.action.trigger", "token": "test_verification_token" },
+            "event": missing
+        });
+        let response = handle_lark_http_event(
+            State(LarkHttpAppState {
+                verification_token: "test_verification_token".to_string(),
+                channel: Arc::clone(&ch),
+                tx,
+            }),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from(serde_json::to_vec(&payload).unwrap()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(
+            ch.pending_approvals
+                .lock()
+                .await
+                .contains_key("audited-request")
+        );
+        assert!(messages.try_recv().is_err());
+        assert_eq!(recorder.records.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -6889,6 +7174,8 @@ mod tests {
         ch.pending_approvals.lock().await.insert(
             approval_id.clone(),
             PendingApproval {
+                registration_id: Uuid::new_v4(),
+                audit: crate::util::ApprovalAudit::default(),
                 sender: tx,
                 destination: String::new(),
                 message_id: String::new(),
@@ -6949,6 +7236,8 @@ mod tests {
         ch.pending_approvals.lock().await.insert(
             approval_id.clone(),
             PendingApproval {
+                registration_id: Uuid::new_v4(),
+                audit: crate::util::ApprovalAudit::default(),
                 sender: tx,
                 destination: "oc_origin".to_string(),
                 message_id: String::new(),
@@ -6981,7 +7270,10 @@ mod tests {
             "operator": { "open_id": "ou_testuser123" }
         });
         ch.handle_card_action_event(&authorized).await.unwrap();
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::AlwaysApprove);
+        assert_eq!(
+            rx.await.unwrap().unwrap().response,
+            ChannelApprovalResponse::AlwaysApprove
+        );
         assert!(ch.pending_approvals.lock().await.is_empty());
     }
     async fn mount_lark_token_and_send_mocks(
@@ -7068,10 +7360,18 @@ mod tests {
         };
         let callback_fut = {
             let ch = Arc::clone(&ch);
+            let mock_server = &mock_server;
             async move {
                 let approval_id = tokio::time::timeout(Duration::from_secs(2), async {
                     loop {
-                        if let Some(id) = ch.pending_approvals.lock().await.keys().next().cloned() {
+                        let approval_id = ch.pending_approvals.lock().await.keys().next().cloned();
+                        let prompt_received = mock_server
+                            .received_requests()
+                            .await
+                            .unwrap()
+                            .iter()
+                            .any(|request| request.url.path() == "/im/v1/messages");
+                        if let Some(id) = approval_id.filter(|_| prompt_received) {
                             return id;
                         }
                         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -7096,6 +7396,115 @@ mod tests {
         assert_eq!(attributed.response, ChannelApprovalResponse::Approve);
         assert_eq!(attributed.source, ApprovalSource::Operator);
         assert!(ch.pending_approvals.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn early_capture_error_survives_delayed_send_failure_and_outer_timeout() {
+        use crate::util::approval_audit_test_support::ApprovalRecorder;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        use zeroclaw_api::channel::ChannelApprovalRequest;
+        use zeroclaw_api::session_events::capture::{
+            PreparedToolPort, is_capture_stopped, scope_tool_preparation,
+        };
+
+        for outer_deadline in [false, true] {
+            let mock_server = wiremock::MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/auth/v3/tenant_access_token/internal"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "code": 0,
+                    "tenant_access_token": "test-tenant-token",
+                    "expire": 7200
+                })))
+                .mount(&mock_server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/im/v1/messages"))
+                .respond_with(
+                    ResponseTemplate::new(if outer_deadline { 200 } else { 500 })
+                        .set_delay(Duration::from_secs(4))
+                        .set_body_json(serde_json::json!({
+                            "code": 0,
+                            "data": { "message_id": "om_capture_failure" }
+                        })),
+                )
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+
+            let mut ch = make_channel();
+            ch.api_base_override = Some(mock_server.uri());
+            ch.approval_timeout_secs = 5;
+            let ch = Arc::new(ch);
+            let recorder = Arc::new(ApprovalRecorder::default());
+            recorder.fail.store(true, Ordering::SeqCst);
+            let prepared: Arc<dyn PreparedToolPort> = recorder;
+            let request_fut = {
+                let ch = Arc::clone(&ch);
+                scope_tool_preparation(prepared, async move {
+                    let request = ChannelApprovalRequest {
+                        tool_name: "demo_tool".to_string(),
+                        arguments_summary: "demo args".to_string(),
+                        raw_arguments: None,
+                        position: None,
+                    };
+                    if outer_deadline {
+                        ch.request_approval_attributed_with_timeout(
+                            "oc_test_chat",
+                            &request,
+                            Duration::from_secs(2),
+                        )
+                        .await
+                    } else {
+                        ch.request_approval_attributed("oc_test_chat", &request)
+                            .await
+                    }
+                })
+            };
+            let callback_fut = {
+                let ch = Arc::clone(&ch);
+                let mock_server = &mock_server;
+                async move {
+                    let approval_id = tokio::time::timeout(Duration::from_secs(1), async {
+                        loop {
+                            let approval_id =
+                                ch.pending_approvals.lock().await.keys().next().cloned();
+                            let prompt_received = mock_server
+                                .received_requests()
+                                .await
+                                .unwrap()
+                                .iter()
+                                .any(|request| request.url.path() == "/im/v1/messages");
+                            if let Some(id) = approval_id.filter(|_| prompt_received) {
+                                break id;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .expect("callback must arrive before the delayed send ACK");
+                    ch.handle_card_action_event(&serde_json::json!({
+                        "action": { "value": { "approval_id": approval_id, "decision": "approve" } },
+                        "context": { "open_chat_id": "oc_test_chat" },
+                        "operator": { "open_id": "ou_testuser123" }
+                    })).await.unwrap_err()
+                }
+            };
+            let (request_result, callback_error) = tokio::join!(request_fut, callback_fut);
+            let request_error = request_result.expect_err("failed audit must stop the waiter");
+            for error in [&callback_error, &request_error] {
+                assert!(is_capture_stopped(error));
+                assert!(error.chain().any(|source| {
+                    source
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|source| source.kind() == std::io::ErrorKind::BrokenPipe)
+                }));
+            }
+            assert!(ch.pending_approvals.lock().await.is_empty());
+        }
     }
 
     async fn assert_send_body_matches_recipient_and_text(
@@ -7242,7 +7651,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lark_send_uploads_workspace_image_marker_after_text() {
+    async fn lark_send_uploads_workspace_image_attachment_after_text() {
         use wiremock::matchers::{method, path, query_param};
         use wiremock::{Mock, ResponseTemplate};
 
@@ -7291,7 +7700,15 @@ mod tests {
             .with_workspace_dir(workspace.path().to_path_buf());
         ch.api_base_override = Some(mock_server.uri());
 
-        let message = SendMessage::new("caption [IMAGE:photo.png]", "oc_test_chat_id");
+        let message = SendMessage::new("caption", "oc_test_chat_id").with_attachments(vec![
+            zeroclaw_api::media::MediaAttachment {
+                reference: Some(zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: "photo.png".into(),
+                }),
+                ..Default::default()
+            },
+        ]);
         Channel::send(&ch, &message)
             .await
             .expect("Channel::send should upload and send image marker");
@@ -7380,7 +7797,15 @@ mod tests {
             .with_workspace_dir(workspace.path().to_path_buf());
         ch.api_base_override = Some(mock_server.uri());
 
-        let message = SendMessage::new("see attached [DOCUMENT:brief.txt]", "oc_test_chat_id");
+        let message = SendMessage::new("see attached", "oc_test_chat_id").with_attachments(vec![
+            zeroclaw_api::media::MediaAttachment {
+                reference: Some(zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Document,
+                    target: "brief.txt".into(),
+                }),
+                ..Default::default()
+            },
+        ]);
         Channel::send(&ch, &message)
             .await
             .expect("Channel::send should upload and send document marker");
@@ -7412,94 +7837,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lark_finalize_draft_cleans_marker_text_and_sends_media() {
-        use wiremock::matchers::{method, path, path_regex, query_param};
+    async fn lark_finalize_draft_treats_media_markers_as_literal_text() {
+        use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
-
-        let mock_server = wiremock::MockServer::start().await;
+        let server = wiremock::MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/auth/v3/tenant_access_token/internal"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "code": 0,
-                "tenant_access_token": "test-tenant-token",
-                "expire": 7200
+                "code": 0, "tenant_access_token": "test-token", "expire": 7200
             })))
-            .mount(&mock_server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/im/v1/images"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "code": 0,
-                "data": { "image_key": "draft_img_key" }
-            })))
-            .expect(1)
-            .mount(&mock_server)
+            .mount(&server)
             .await;
         Mock::given(method("PATCH"))
-            .and(path_regex("/im/v1/messages/om_draft_media"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "code": 0 })),
+            .and(path("/im/v1/messages/om_draft_media"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code":0})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut channel = make_channel().with_streaming(StreamMode::Partial, 500);
+        channel.api_base_override = Some(server.uri());
+        channel
+            .finalize_draft(
+                "oc_test_chat_id",
+                "om_draft_media",
+                "literal [IMAGE:draft.png]",
+                false,
             )
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/im/v1/messages"))
-            .and(query_param("receive_id_type", "chat_id"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "code": 0,
-                "data": { "message_id": "om_test_message_id" }
-            })))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let workspace = tempfile::tempdir().expect("workspace");
-        std::fs::write(workspace.path().join("draft.png"), b"\x89PNG\r\n\x1a\n")
-            .expect("write image");
-        let mut ch = make_channel()
-            .with_streaming(StreamMode::Partial, 500)
-            .with_workspace_dir(workspace.path().to_path_buf());
-        ch.api_base_override = Some(mock_server.uri());
-
-        ch.finalize_draft(
-            "oc_test_chat_id",
-            "om_draft_media",
-            "final caption [IMAGE:draft.png]",
-            false,
-        )
-        .await
-        .expect("finalize_draft should clean text and send image");
-
-        let requests = mock_server
-            .received_requests()
             .await
-            .expect("mock server should record requests");
+            .expect("finalize literal draft");
+        let requests = server.received_requests().await.unwrap();
         let patch = requests
             .iter()
             .find(|request| request.method.as_str() == "PATCH")
-            .expect("expected draft PATCH");
-        let patch_body = String::from_utf8_lossy(&patch.body);
-        assert!(patch_body.contains("final caption"));
+            .unwrap();
+        assert!(String::from_utf8_lossy(&patch.body).contains("literal [IMAGE:draft.png]"));
         assert!(
-            !patch_body.contains("[IMAGE:"),
-            "final draft body must not leak marker text: {patch_body}"
+            !requests
+                .iter()
+                .any(|request| request.url.path() == "/im/v1/images")
         );
-        let image_send = requests
-            .iter()
-            .filter(|request| request.url.path() == "/im/v1/messages")
-            .map(|request| {
-                serde_json::from_slice::<serde_json::Value>(&request.body)
-                    .expect("send body should be valid JSON")
-            })
-            .find(|body| body["msg_type"].as_str() == Some("image"))
-            .expect("expected image send after draft finalization");
-        let content = image_send["content"]
-            .as_str()
-            .expect("image content should be a JSON string");
-        let content_json: serde_json::Value =
-            serde_json::from_str(content).expect("image content should parse as JSON");
-        assert_eq!(content_json["image_key"].as_str(), Some("draft_img_key"));
     }
 
     #[test]

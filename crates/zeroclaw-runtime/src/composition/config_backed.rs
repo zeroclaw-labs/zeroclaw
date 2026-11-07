@@ -128,13 +128,13 @@ impl ProviderSource for ConfigProviders {
         let (Some(provider_ref), Some(model)) = (request.provider_ref, request.model) else {
             return self.model_provider(request);
         };
-        let (provider, _resolver) = crate::agent::agent::config_switch_provider(
+        let binding = zeroclaw_providers::factory::build_switched_model_provider(
             request.config,
             request.agent_alias,
             provider_ref,
             model,
         )?;
-        Ok(Arc::from(provider))
+        Ok(Arc::from(binding.provider))
     }
 
     /// The vision route is built through the alias-aware factory the turn's
@@ -202,7 +202,6 @@ pub fn native_compat_registry(
         sop_audit,
         live_config,
         execution_capability,
-        acp_sessions,
     } = inputs;
     let config = request.config.as_ref();
     let risk_profile = config
@@ -243,7 +242,6 @@ pub fn native_compat_registry(
         sop_audit,
         live_config,
         execution_capability,
-        acp_sessions,
     )
 }
 

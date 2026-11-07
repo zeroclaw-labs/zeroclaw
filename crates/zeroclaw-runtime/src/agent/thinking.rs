@@ -146,6 +146,32 @@ pub fn resolve_thinking_level(
         .unwrap_or(config.default_level)
 }
 
+pub(crate) async fn restore_session_thinking_override() -> anyhow::Result<Option<ThinkingLevel>> {
+    use zeroclaw_api::session_events::capture::{
+        ModelOverrideSelection, current_session_execution,
+    };
+    let Some(port) = current_session_execution() else {
+        return Ok(None);
+    };
+    let level = match port.restore_model_override().await? {
+        Some(ModelOverrideSelection::Set { thinking, .. })
+        | Some(ModelOverrideSelection::Inherit { thinking }) => thinking,
+        _ => None,
+    };
+    level
+        .map(|level| {
+            ThinkingLevel::from_str_insensitive(&level).ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail),
+                    "invalid_native_thinking_selection"
+                );
+                anyhow::Error::msg("invalid native thinking selection")
+            })
+        })
+        .transpose()
+}
+
 /// Clamp a temperature value to the valid range `[0.0, 2.0]`.
 pub fn clamp_temperature(temp: f64) -> f64 {
     temp.clamp(0.0, 2.0)

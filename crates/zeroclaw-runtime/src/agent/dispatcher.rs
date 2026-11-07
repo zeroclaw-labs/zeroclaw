@@ -1,8 +1,6 @@
 use crate::tools::{Tool, ToolSpec};
 use serde_json::Value;
-use std::fmt::Write;
-use zeroclaw_api::media::RenderedMarker;
-use zeroclaw_api::tool_carrier::{render_native_attachments, render_prompt_tool_carrier};
+use zeroclaw_api::media::AttachmentReference;
 use zeroclaw_providers::{ChatMessage, ChatResponse, ConversationMessage, ToolResultMessage};
 
 #[derive(Debug, Clone)]
@@ -18,6 +16,7 @@ pub struct ToolExecutionResult {
     pub output: String,
     pub success: bool,
     pub tool_call_id: Option<String>,
+    pub attachments: Vec<AttachmentReference>,
 }
 
 pub trait ToolDispatcher: Send + Sync {
@@ -108,22 +107,7 @@ impl ToolDispatcher for XmlToolDispatcher {
     }
 
     fn format_results(&self, results: &[ToolExecutionResult]) -> ConversationMessage {
-        let mut content = String::new();
-        // Attachments are declared where the tool ran, not here: this typed
-        // replay path carries no declarations, so the carrier declares zero.
-        let attachments: Vec<RenderedMarker> = Vec::new();
-        for result in results {
-            let status = if result.success { "ok" } else { "error" };
-            let _ = writeln!(
-                content,
-                "<tool_result name=\"{}\" status=\"{}\">\n{}\n</tool_result>",
-                result.name, status, result.output
-            );
-        }
-        ConversationMessage::Chat(ChatMessage::user(render_prompt_tool_carrier(
-            &content,
-            &attachments,
-        )))
+        NativeToolDispatcher.format_results(results)
     }
 
     fn prompt_instructions(&self, tools: &[Box<dyn Tool>]) -> String {
@@ -144,34 +128,9 @@ impl ToolDispatcher for XmlToolDispatcher {
     }
 
     fn to_provider_messages(&self, history: &[ConversationMessage]) -> Vec<ChatMessage> {
-        history
-            .iter()
-            .flat_map(|msg| match msg {
-                ConversationMessage::Chat(chat) => vec![chat.clone()],
-                ConversationMessage::AssistantToolCalls { text, .. } => {
-                    vec![ChatMessage::assistant(text.clone().unwrap_or_default())]
-                }
-                ConversationMessage::ToolResults(results) => {
-                    let mut content = String::new();
-                    // Typed replay carries no declarations; a bare image path
-                    // in stored tool text stays text under the
-                    // attachment-identity boundary: nothing in tool text is
-                    // promoted unless the tool declared it.
-                    let attachments: Vec<RenderedMarker> = Vec::new();
-                    for result in results {
-                        let _ = writeln!(
-                            content,
-                            "<tool_result id=\"{}\">\n{}\n</tool_result>",
-                            result.tool_call_id, result.content
-                        );
-                    }
-                    vec![ChatMessage::user(render_prompt_tool_carrier(
-                        &content,
-                        &attachments,
-                    ))]
-                }
-            })
-            .collect()
+        // Keep tool identity through context budgeting and media preparation.
+        // Text-only providers render these messages at physical dispatch.
+        NativeToolDispatcher.to_provider_messages(history)
     }
 
     fn should_send_tool_specs(&self) -> bool {
@@ -203,18 +162,18 @@ impl ToolDispatcher for NativeToolDispatcher {
         let messages = results
             .iter()
             .map(|result| ToolResultMessage {
+                success: Some(result.success),
                 tool_call_id: result
                     .tool_call_id
                     .clone()
                     .unwrap_or_else(|| "unknown".to_string()),
                 // Retain the producing tool name as replay metadata. It is
-                // no longer read for promotion: attachments come only from
-                // the producing tool's own declarations.
+                // rendered only by a provider adapter that needs it.
                 tool_name: result.name.clone(),
                 // The verbatim output. The body is never rewritten into
-                // marker syntax, and this typed shape carries no attachment
-                // declarations (a known, disclosed replay limitation).
+                // marker syntax; attachments remain sibling fields.
                 content: result.output.clone(),
+                attachments: result.attachments.clone(),
             })
             .collect();
         ConversationMessage::ToolResults(messages)
@@ -227,40 +186,7 @@ impl ToolDispatcher for NativeToolDispatcher {
     fn to_provider_messages(&self, history: &[ConversationMessage]) -> Vec<ChatMessage> {
         history
             .iter()
-            .flat_map(|msg| match msg {
-                ConversationMessage::Chat(chat) => vec![chat.clone()],
-                ConversationMessage::AssistantToolCalls {
-                    text,
-                    tool_calls,
-                    reasoning_content,
-                } => {
-                    let mut payload = serde_json::json!({
-                        "content": text,
-                        "tool_calls": tool_calls,
-                    });
-                    if let Some(rc) = reasoning_content {
-                        payload["reasoning_content"] = serde_json::json!(rc);
-                    }
-                    vec![ChatMessage::assistant(payload.to_string())]
-                }
-                ConversationMessage::ToolResults(results) => results
-                    .iter()
-                    .map(|result| {
-                        // Typed replay writes the declared shape (array key
-                        // always present) with no inferred attachments: a
-                        // bare image path in stored tool text stays text.
-                        let attachments: Vec<RenderedMarker> = Vec::new();
-                        ChatMessage::tool(
-                            serde_json::json!({
-                                "tool_call_id": result.tool_call_id,
-                                "content": result.content,
-                                "attachments": render_native_attachments(&attachments),
-                            })
-                            .to_string(),
-                        )
-                    })
-                    .collect(),
-            })
+            .flat_map(ConversationMessage::chat_messages)
             .collect()
     }
 
@@ -276,6 +202,7 @@ mod tests {
     #[test]
     fn xml_dispatcher_parses_tool_calls() {
         let response = ChatResponse {
+            output_blocks: Vec::new(),
             text: Some(
                 "Checking\n<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}</tool_call>"
                     .into(),
@@ -293,6 +220,7 @@ mod tests {
     #[test]
     fn xml_dispatcher_strips_think_before_tool_call() {
         let response = ChatResponse {
+            output_blocks: Vec::new(),
             text: Some(
                 "<think>I should list files</think>\n<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}</tool_call>"
                     .into(),
@@ -314,6 +242,7 @@ mod tests {
     #[test]
     fn xml_dispatcher_think_only_returns_no_calls() {
         let response = ChatResponse {
+            output_blocks: Vec::new(),
             text: Some("<think>Just thinking</think>".into()),
             tool_calls: vec![],
             usage: None,
@@ -327,6 +256,7 @@ mod tests {
     #[test]
     fn native_dispatcher_roundtrip() {
         let response = ChatResponse {
+            output_blocks: Vec::new(),
             text: Some("ok".into()),
             tool_calls: vec![zeroclaw_providers::ToolCall {
                 id: "tc1".into(),
@@ -347,6 +277,7 @@ mod tests {
             output: "hello".into(),
             success: true,
             tool_call_id: Some("tc1".into()),
+            attachments: Vec::new(),
         }]);
         match msg {
             ConversationMessage::ToolResults(results) => {
@@ -358,20 +289,21 @@ mod tests {
     }
 
     #[test]
-    fn xml_format_results_contains_tool_result_tags() {
+    fn xml_format_results_retains_typed_result_fields() {
         let dispatcher = XmlToolDispatcher;
         let msg = dispatcher.format_results(&[ToolExecutionResult {
             name: "shell".into(),
             output: "ok".into(),
             success: true,
             tool_call_id: None,
+            attachments: Vec::new(),
         }]);
-        let rendered = match msg {
-            ConversationMessage::Chat(chat) => chat.content,
-            _ => String::new(),
+        let ConversationMessage::ToolResults(results) = msg else {
+            panic!("expected typed tool results");
         };
-        assert!(rendered.contains("<tool_result"));
-        assert!(rendered.contains("shell"));
+        assert_eq!(results[0].tool_name, "shell");
+        assert_eq!(results[0].content, "ok");
+        assert_eq!(results[0].success, Some(true));
     }
 
     #[test]
@@ -382,6 +314,7 @@ mod tests {
             output: "ok".into(),
             success: true,
             tool_call_id: Some("tc-1".into()),
+            attachments: Vec::new(),
         }]);
 
         match msg {
@@ -406,8 +339,8 @@ mod tests {
         result: ToolExecutionResult,
     ) -> String {
         match dispatcher.format_results(&[result]) {
-            ConversationMessage::Chat(chat) => chat.content,
-            _ => panic!("XmlToolDispatcher::format_results must return a Chat message"),
+            ConversationMessage::ToolResults(results) => results[0].content.clone(),
+            _ => panic!("expected typed tool results"),
         }
     }
 
@@ -435,6 +368,7 @@ mod tests {
                     output: format!("match: {path}"),
                     success: true,
                     tool_call_id: None,
+                    attachments: Vec::new(),
                 },
             );
             assert!(
@@ -462,6 +396,7 @@ mod tests {
                     output: format!("found: {path}"),
                     success: true,
                     tool_call_id: Some("tc1".into()),
+                    attachments: Vec::new(),
                 },
             );
             assert!(
@@ -489,6 +424,7 @@ mod tests {
                 output: format!("saved to {path}"),
                 success: true,
                 tool_call_id: None,
+                attachments: Vec::new(),
             },
         );
         assert!(
@@ -499,8 +435,7 @@ mod tests {
             rendered.contains(&path),
             "the literal path text must survive (XML)"
         );
-        // The prompt carrier declares zero attachments for this round.
-        assert!(rendered.contains("[Tool attachments: 0]"));
+        assert!(!rendered.contains("[Tool attachments:"));
 
         let native = NativeToolDispatcher;
         let content = native_format_results_content(
@@ -510,6 +445,7 @@ mod tests {
                 output: format!("saved to {path}"),
                 success: true,
                 tool_call_id: Some("tc1".into()),
+                attachments: Vec::new(),
             },
         );
         // The stored body stays verbatim; no attachment is inferred.
@@ -521,13 +457,11 @@ mod tests {
     }
 
     fn native_tool_message_content(message: &ChatMessage) -> String {
-        let payload: serde_json::Value = serde_json::from_str(&message.content).unwrap();
-        payload["content"].as_str().unwrap().to_owned()
+        message.content.clone()
     }
 
     fn native_tool_message_attachments(message: &ChatMessage) -> serde_json::Value {
-        let payload: serde_json::Value = serde_json::from_str(&message.content).unwrap();
-        payload["attachments"].clone()
+        serde_json::to_value(&message.attachments).unwrap()
     }
 
     fn native_round_trip_tool_content(
@@ -555,6 +489,7 @@ mod tests {
                     output: format!("found: {path}"),
                     success: true,
                     tool_call_id: Some("tc1".into()),
+                    attachments: Vec::new(),
                 },
             );
             assert!(
@@ -582,6 +517,7 @@ mod tests {
             output: format!("saved to {path}"),
             success: true,
             tool_call_id: Some("tc1".into()),
+            attachments: Vec::new(),
         }]);
         let messages = native.to_provider_messages(&[stored]);
         assert_eq!(messages.len(), 1);
@@ -607,6 +543,8 @@ mod tests {
         let native = NativeToolDispatcher;
 
         let history = vec![ConversationMessage::ToolResults(vec![ToolResultMessage {
+            success: None,
+            attachments: Vec::new(),
             tool_call_id: "tc1".into(),
             content: format!("Saved image to {path}"),
             tool_name: String::new(),
@@ -647,7 +585,7 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "assistant");
 
-        let payload: serde_json::Value = serde_json::from_str(&messages[0].content).unwrap();
+        let payload: serde_json::Value = serde_json::to_value(&messages[0]).unwrap();
         assert_eq!(payload["reasoning_content"].as_str(), Some("thinking step"));
         assert_eq!(payload["content"].as_str(), Some("answer"));
         assert!(payload["tool_calls"].is_array());
@@ -670,12 +608,12 @@ mod tests {
         let messages = dispatcher.to_provider_messages(&history);
         assert_eq!(messages.len(), 1);
 
-        let payload: serde_json::Value = serde_json::from_str(&messages[0].content).unwrap();
+        let payload: serde_json::Value = serde_json::to_value(&messages[0]).unwrap();
         assert!(payload.get("reasoning_content").is_none());
     }
 
     #[test]
-    fn xml_to_provider_messages_ignores_reasoning_content() {
+    fn xml_dispatcher_preserves_structure_until_provider_projection() {
         let dispatcher = XmlToolDispatcher;
         let history = vec![ConversationMessage::AssistantToolCalls {
             text: Some("answer".into()),
@@ -685,14 +623,15 @@ mod tests {
                 arguments: "{}".into(),
                 extra_content: None,
             }],
-            reasoning_content: Some("should be ignored".into()),
+            reasoning_content: Some("raw reasoning".into()),
         }];
 
         let messages = dispatcher.to_provider_messages(&history);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "assistant");
-        // XmlToolDispatcher returns text only, not JSON payload
-        assert_eq!(messages[0].content, "answer");
-        assert!(!messages[0].content.contains("reasoning_content"));
+        let payload: serde_json::Value = serde_json::to_value(&messages[0]).unwrap();
+        assert_eq!(payload["content"], "answer");
+        assert_eq!(payload["tool_calls"][0]["id"], "tc_1");
+        assert_eq!(payload["reasoning_content"], "raw reasoning");
     }
 }

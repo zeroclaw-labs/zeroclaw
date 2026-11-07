@@ -39,12 +39,14 @@ impl StreamProviderFailure {
         matches!(
             self.source,
             zeroclaw_api::model_provider::StreamError::Terminal(_)
+                | zeroclaw_api::model_provider::StreamError::CaptureStopped(_)
         )
     }
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct StreamedChatOutcome {
+    pub(crate) output_blocks: Vec<zeroclaw_api::model_provider::ProviderOutputBlock>,
     pub(crate) response_text: String,
     pub(crate) reasoning_content: String,
     pub(crate) tool_calls: Vec<ToolCall>,
@@ -284,10 +286,17 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
             }
         };
         match event {
+            StreamEvent::OutputBlock(block) => {
+                replay_blocking_activity = true;
+                outcome.output_blocks.push(block);
+            }
             StreamEvent::Final => break,
             StreamEvent::Usage(usage) => {
                 outcome.usage = Some(usage);
             }
+            // The bound provider capture persists protocol evidence; it is
+            // neither visible content nor provider conversation context.
+            StreamEvent::ProtocolMetadata(_) | StreamEvent::ContentPosition(_) => {}
             StreamEvent::ToolCall(tool_call) => {
                 replay_blocking_activity = true;
                 outcome.tool_calls.push(tool_call);
@@ -322,10 +331,14 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
             // Pre-executed tool events are for observability only: they are
             // relayed as TurnEvents but do not affect the agent's tool
             // dispatch loop.
-            StreamEvent::PreExecutedToolCall { name, args } => {
+            StreamEvent::PreExecutedToolCall {
+                provider_call_id,
+                name,
+                args,
+            } => {
                 replay_blocking_activity = true;
                 outcome.saw_pre_executed_tool_activity = true;
-                let id = Uuid::new_v4().to_string();
+                let id = provider_call_id.unwrap_or_else(|| Uuid::new_v4().to_string());
                 pre_executed_ids
                     .entry(name.clone())
                     .or_default()
@@ -341,13 +354,26 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
                         .await;
                 }
             }
-            StreamEvent::PreExecutedToolResult { name, output } => {
+            StreamEvent::PreExecutedToolResult {
+                provider_call_id,
+                name,
+                output,
+            } => {
                 replay_blocking_activity = true;
                 outcome.saw_pre_executed_tool_activity = true;
-                let id = pre_executed_ids
-                    .get_mut(&name)
-                    .and_then(|ids| ids.pop_front())
-                    .unwrap_or_else(|| Uuid::new_v4().to_string());
+                let id = if let Some(id) = provider_call_id {
+                    if let Some(ids) = pre_executed_ids.get_mut(&name)
+                        && let Some(index) = ids.iter().position(|prior| prior == &id)
+                    {
+                        ids.remove(index);
+                    }
+                    id
+                } else {
+                    pre_executed_ids
+                        .get_mut(&name)
+                        .and_then(|ids| ids.pop_front())
+                        .unwrap_or_else(|| Uuid::new_v4().to_string())
+                };
                 if let Some(tx) = event_tx {
                     visible_event_output = true;
                     let _ = tx

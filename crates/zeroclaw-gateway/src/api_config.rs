@@ -1606,7 +1606,6 @@ async fn delete_agent_cascade(
     // channel-generation control all live in a task that request cancellation
     // cannot abort; the request only awaits the handle.
     let memory = Arc::clone(&state.mem);
-    let session_backend = state.session_backend.clone();
     let pending_reload = Arc::clone(&state.pending_reload);
     let reload_controls = state.reload_tx.clone();
     let cleanup_alias = alias.to_string();
@@ -1642,7 +1641,6 @@ async fn delete_agent_cascade(
             let owned = crate::agent_owned_state::cascade_owned_state(
                 &working,
                 &memory,
-                session_backend.as_ref(),
                 &cleanup_alias,
                 &archive_dir,
             )
@@ -2085,26 +2083,34 @@ pub async fn handle_rename_map_key(
         Ok(commit) => commit,
         Err(e) => return error_response(config_commit_admission_error(e)),
     };
-    let working = _cfg_guard.current_config();
-
     match zeroclaw_config::alias_refs::alias_kind_for_map_path(&body.path) {
         Some(zeroclaw_config::alias_refs::AliasKind::Agent) => {
-            rename_agent_cascade(
+            // Each cascade contains large config/task futures. Keep their
+            // state on the heap rather than inflating the transport future.
+            Box::pin(rename_agent_cascade(
                 &state,
                 &principal,
-                working,
+                _cfg_guard.current_config(),
                 &body,
                 _cfg_guard,
                 agent_lifecycle_leases,
-            )
+            ))
             .await
         }
         Some(kind) => {
-            rename_config_cascade(&state, &principal, working, &kind, &body, _cfg_guard).await
+            Box::pin(rename_config_cascade(
+                &state,
+                &principal,
+                _cfg_guard.current_config(),
+                &kind,
+                &body,
+                _cfg_guard,
+            ))
+            .await
         }
         None => {
             // Non-aliased section: the generic key-swap rename (unchanged).
-            let mut working = working;
+            let mut working = _cfg_guard.current_config();
             let renamed = match working.rename_map_key(&body.path, &body.from, &body.to) {
                 Ok(b) => b,
                 Err(msg) => {
@@ -2121,18 +2127,17 @@ pub async fn handle_rename_map_key(
                 working.mark_dirty(&to_path);
                 // Source and destination are both in the write set: a
                 // rename removes one entry and creates another.
-                let before = state.config.read().clone();
-                let authorization = match authorize_config_write(
-                    &principal,
+                let writes = {
+                    let before = state.config.read();
                     ConfigWriteSet::by_effect(
                         &before,
                         &working,
                         working.dirty_paths.iter().map(String::as_str),
                     )
                     .with(from_path, Verb::Delete)
-                    .with(to_path, Verb::Create),
-                    &_cfg_guard,
-                ) {
+                    .with(to_path, Verb::Create)
+                };
+                let authorization = match authorize_config_write(&principal, writes, &_cfg_guard) {
                     Ok(authorization) => authorization,
                     Err(denied) => return denied.into_response(),
                 };
@@ -2174,12 +2179,11 @@ async fn rename_config_cascade(
     for path in &report.dirty_paths {
         working.mark_dirty(path);
     }
-    let before = state.config.read().clone();
-    let authorization = match authorize_config_write(
-        principal,
-        rename_write_set(&before, &working, body),
-        &guard,
-    ) {
+    let writes = {
+        let before = state.config.read();
+        rename_write_set(&before, &working, body)
+    };
+    let authorization = match authorize_config_write(principal, writes, &guard) {
         Ok(authorization) => authorization,
         Err(denied) => return denied.into_response(),
     };
@@ -2251,11 +2255,11 @@ async fn rename_residue_exists(
     state: &AppState,
     working: &zeroclaw_config::schema::Config,
     from: &str,
-) -> bool {
+) -> anyhow::Result<bool> {
     // Workspace: the default per-alias dir for `from`. A custom/alias-independent
     // path is not moved by the cascade, so it is not residue.
     if working.agent_workspace_dir(from).exists() {
-        return true;
+        return Ok(true);
     }
 
     // Short-lived clone for the DB-backed stores - never hold the lock across an
@@ -2267,32 +2271,27 @@ async fn rename_residue_exists(
         .map(|jobs| !jobs.is_empty())
         .unwrap_or(false)
     {
-        return true;
+        return Ok(true);
     }
 
-    // ACP sessions (live OR killed) still owned by `from`.
-    if let Ok(store) = zeroclaw_infra::acp_session_store::AcpSessionStore::new(&cfg.data_dir)
-        && store
-            .list_sessions_by_agent(from)
-            .map(|s| !s.is_empty())
-            .unwrap_or(false)
-    {
-        return true;
+    // Standard sessions (live or closed) still owned by `from`.
+    let owner = from.to_owned();
+    let has_sessions = tokio::task::spawn_blocking(move || {
+        zeroclaw_session_host::open_repository(&cfg)?
+            .list_sessions_by_agent(&owner)
+            .map(|sessions| !sessions.is_empty())
+    })
+    .await??;
+    if has_sessions {
+        return Ok(true);
     }
 
     // Memory rows still attributed to `from`.
     if state.mem.count_agent(from).await.unwrap_or(0) > 0 {
-        return true;
+        return Ok(true);
     }
 
-    // Session-metadata attribution still pointing at `from`.
-    if let Some(backend) = state.session_backend.as_ref()
-        && backend.count_agent_attribution(from).unwrap_or(0) > 0
-    {
-        return true;
-    }
-
-    false
+    Ok(false)
 }
 
 async fn rename_agent_cascade(
@@ -2310,7 +2309,6 @@ async fn rename_agent_cascade(
     // all, the residue re-run included (it writes no config but moves the
     // agent's owned state). The complete write set, once the cascade has
     // computed it, is authorized again below before the persist.
-    let before = state.config.read().clone();
     if let Err(denied) = authorize_config_write(
         principal,
         ConfigWriteSet::default()
@@ -2326,7 +2324,19 @@ async fn rename_agent_cascade(
     let old_ws = working.agent_workspace_dir(from);
 
     let committed_to = working.agent(from).is_none() && working.agent(to).is_some();
-    let skip_persist = committed_to && rename_residue_exists(state, &working, from).await;
+    let skip_persist = if committed_to {
+        match rename_residue_exists(state, &working, from).await {
+            Ok(exists) => exists,
+            Err(error) => {
+                return error_response(ConfigApiError::new(
+                    ConfigApiCode::InternalError,
+                    error.to_string(),
+                ));
+            }
+        }
+    } else {
+        false
+    };
     let (dirty_count, authorization) = if skip_persist {
         (0, None)
     } else {
@@ -2336,11 +2346,11 @@ async fn rename_agent_cascade(
                     working.mark_dirty(path);
                 }
                 let dirty_count = report.dirty_paths.len();
-                let authorization = match authorize_config_write(
-                    principal,
-                    rename_write_set(&before, &working, body),
-                    &guard,
-                ) {
+                let writes = {
+                    let before = state.config.read();
+                    rename_write_set(&before, &working, body)
+                };
+                let authorization = match authorize_config_write(principal, writes, &guard) {
                     Ok(authorization) => authorization,
                     Err(denied) => return denied.into_response(),
                 };
@@ -2364,7 +2374,6 @@ async fn rename_agent_cascade(
     // workspace path is alias-independent, so `old_ws == new_ws` and we skip.
     let ws_existed = old_ws != new_ws && old_ws.exists();
     let memory = Arc::clone(&state.mem);
-    let session_backend = state.session_backend.clone();
     let pending_reload = Arc::clone(&state.pending_reload);
     let reload_controls = state.reload_tx.clone();
     let cleanup_from = from.clone();
@@ -2403,7 +2412,6 @@ async fn rename_agent_cascade(
         let owned = crate::agent_owned_state::cascade_rename_agent(
             &working,
             Some(&memory),
-            session_backend.as_ref(),
             &cleanup_from,
             &cleanup_to,
         )
@@ -3491,7 +3499,8 @@ mod tests {
             mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
-            session_backend: None,
+
+            native_sessions: None,
             session_queue: Arc::new(crate::session_queue::SessionActorQueue::new(8, 30, 600)),
             device_registry: None,
             canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
@@ -5074,6 +5083,108 @@ mod tests {
                 .iter()
                 .any(|k| k == "default"),
             "unsupported provider delete must not fall back to raw deletion"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_provider_alias_rename_updates_config_and_allows_other_alias_renames() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config
+            .create_map_key("providers.models.openai", "primary")
+            .unwrap();
+        config
+            .create_map_key("providers.tts.elevenlabs", "voice")
+            .unwrap();
+        config.save().await.unwrap();
+        let config_path = config.config_path.clone();
+        let saved = std::fs::read(&config_path).unwrap();
+        let mut state = test_state(config);
+        state.native_sessions = Some(Arc::new(zeroclaw_session_host::NativeSessionHub::new(
+            state.config.clone(),
+        )));
+        let before = serde_json::to_value(state.config.snapshot()).unwrap();
+        for (from, to, expected_status, code) in [
+            (
+                "primary",
+                "primary",
+                StatusCode::BAD_REQUEST,
+                "validation_failed",
+            ),
+            (
+                "missing",
+                "renamed",
+                StatusCode::NOT_FOUND,
+                "path_not_found",
+            ),
+        ] {
+            let (status, body) = response_json(
+                handle_rename_map_key(
+                    State(state.clone()),
+                    None,
+                    Json(RenameMapKeyBody {
+                        path: "providers.models.openai".into(),
+                        from: from.into(),
+                        to: to.into(),
+                    }),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, expected_status, "{body}");
+            assert_eq!(body["code"], code);
+            assert_eq!(body["path"], format!("providers.models.openai.{from}"));
+            assert_eq!(
+                serde_json::to_value(state.config.snapshot()).unwrap(),
+                before
+            );
+            assert_eq!(std::fs::read(&config_path).unwrap(), saved);
+        }
+        let (status, body) = response_json(
+            handle_rename_map_key(
+                State(state.clone()),
+                None,
+                Json(RenameMapKeyBody {
+                    path: "providers.models.openai".into(),
+                    from: "primary".into(),
+                    to: "renamed".into(),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["renamed"], true);
+        let (status, body) = response_json(
+            handle_rename_map_key(
+                State(state.clone()),
+                None,
+                Json(RenameMapKeyBody {
+                    path: "providers.tts.elevenlabs".into(),
+                    from: "voice".into(),
+                    to: "studio".into(),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["renamed"], true);
+        assert_eq!(
+            state
+                .config
+                .read()
+                .get_map_keys("providers.tts.elevenlabs")
+                .unwrap(),
+            vec!["studio".to_string()]
+        );
+        assert_eq!(
+            state
+                .config
+                .read()
+                .get_map_keys("providers.models.openai")
+                .unwrap(),
+            vec!["renamed".to_string()]
         );
     }
 

@@ -3,8 +3,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use zeroclaw_providers::ChatMessage;
-use zeroclaw_providers::multimodal::ImageMarkerDisposition;
-use zeroclaw_providers::multimodal::image_marker_dispositions;
+use zeroclaw_providers::multimodal::AttachmentDisposition;
+use zeroclaw_providers::multimodal::attachment_dispositions;
 use zeroclaw_providers::multimodal::message_image_summary;
 
 /// Default complete-turn retention limit. Prefer passing the config-driven
@@ -20,57 +20,6 @@ pub const DEFAULT_MAX_HISTORY_MESSAGES: usize = 50;
 pub fn floor_char_boundary(s: &str, index: usize) -> usize {
     // Keep downstream callers source-compatible without retaining duplicate boundary logic.
     s.floor_char_boundary(index)
-}
-
-/// Indicates which side of a truncated string a boundary belongs to when
-/// nudging it away from a half-cut `[IMAGE:...]` marker.
-#[derive(Clone, Copy)]
-enum TruncationSide {
-    /// Boundary is the end of the kept head; nudge backward (out of the marker).
-    Head,
-    /// Boundary is the start of the kept tail; nudge forward (out of the marker).
-    Tail,
-}
-
-fn nudge_around_image_marker(s: &str, boundary: usize, side: TruncationSide) -> usize {
-    const OPEN: &str = "[IMAGE:";
-    if boundary == 0 || boundary >= s.len() {
-        return boundary;
-    }
-
-    // Walk forward to find the most recent `[IMAGE:` whose `[` is strictly
-    // before `boundary`. Searching forward (rather than `rfind` on a prefix)
-    // correctly handles the case where `boundary` itself splits the literal
-    // `[IMAGE:` token.
-    let mut search_from = 0usize;
-    let mut last_open: Option<usize> = None;
-    while let Some(rel) = s[search_from..].find(OPEN) {
-        let open_idx = search_from + rel;
-        if open_idx >= boundary {
-            break;
-        }
-        last_open = Some(open_idx);
-        search_from = open_idx + OPEN.len();
-    }
-    let Some(open_idx) = last_open else {
-        return boundary;
-    };
-
-    // First `]` after the opener closes the marker (canonicalize regex
-    // forbids `]` inside paths, so this is unambiguous in practice).
-    let close_idx = match s[open_idx..].find(']') {
-        Some(rel) => open_idx + rel,
-        None => return boundary, // malformed input — leave the boundary alone
-    };
-
-    if close_idx < boundary {
-        return boundary; // marker fully closed before boundary — safe
-    }
-
-    match side {
-        TruncationSide::Head => open_idx,
-        TruncationSide::Tail => (close_idx + 1).min(s.len()),
-    }
 }
 
 /// Output plus byte-accurate measurements from one tool-result truncation.
@@ -116,12 +65,6 @@ pub(crate) fn truncate_tool_result_with_metadata(
         pos
     };
 
-    // Step boundaries away from any `[IMAGE:...]` marker they would bisect.
-    // `[IMAGE:` and `]` are pure ASCII, so the adjusted indices land on
-    // valid UTF-8 char boundaries.
-    let head_end = nudge_around_image_marker(output, head_end, TruncationSide::Head);
-    let tail_start = nudge_around_image_marker(output, tail_start, TruncationSide::Tail);
-
     // Guard against overlap when max_chars is very small
     if head_end >= tail_start {
         let retained_bytes = output.floor_char_boundary(max_chars);
@@ -151,29 +94,8 @@ pub fn truncate_tool_result(output: &str, max_chars: usize) -> String {
     truncate_tool_result_with_metadata(output, max_chars).output
 }
 
-/// Truncate a tool message's content, preserving JSON structure when the
-/// message stores `tool_call_id` alongside `content` (native tool-call
-/// format). Without this, `truncate_tool_result` destroys the JSON envelope
-/// and downstream model_providers receive a `null` `call_id`.
-pub fn truncate_tool_message(msg_content: &str, max_chars: usize) -> String {
-    if max_chars == 0 || msg_content.len() <= max_chars {
-        return msg_content.to_string();
-    }
-    if let Ok(mut obj) =
-        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(msg_content)
-        && obj.contains_key("tool_call_id")
-        && let Some(serde_json::Value::String(inner)) = obj.get("content")
-    {
-        let truncated = truncate_tool_result(inner, max_chars);
-        obj.insert("content".to_string(), serde_json::Value::String(truncated));
-        return serde_json::to_string(&obj).unwrap_or_else(|_| msg_content.to_string());
-    }
-    truncate_tool_result(msg_content, max_chars)
-}
-
 /// Fixed per-image charge in the history estimate, applied to the images
-/// preparation dispatches: the markers it lifts from user messages and the
-/// attachments a tool-result carrier declares. Approximates the
+/// preparation dispatches from structured user and tool-result attachments. Approximates the
 /// standard-tier Anthropic maximum (1,568 tokens for an image
 /// at the 1568px downscale). High-resolution tiers and some models bill more
 /// (Anthropic high-res up to 4,784; GPT-4o-mini base 2,833; Qwen-VL ~4k per
@@ -184,44 +106,37 @@ pub const IMAGE_TOKEN_ESTIMATE: usize = 1_600;
 /// Estimate the token cost of a single message: the ~4 chars/token heuristic
 /// plus ~4 framing tokens (role, delimiters). Images follow preparation
 /// ([`message_image_summary`]): a tool-result carrier is charged for the
-/// attachments it declared, with marker syntax in its body counted as text,
-/// and a user message is charged for the loadable `[IMAGE:...]` markers
-/// preparation lifts. The per-image charge applies only when preparation
-/// dispatches the images ([`ImageMarkerDisposition::Normalized`]); stale
+/// attachments it declared, with any attachment-looking syntax in its body counted as text,
+/// and a user message is charged for its loadable structured image attachments.
+/// The per-image charge applies only when preparation
+/// dispatches the images ([`AttachmentDisposition::Normalized`]); stale
 /// tool-result carriers are priced as their bytes (the same formula as
 /// literal text; see the arm below), and system or assistant content
-/// stays literal text. A message whose markers are all
-/// placeholders keeps the plain-text formula. Single-sourced so the history
+/// stays literal text. A message without loadable attachments keeps the
+/// plain-text formula. Single-sourced so the history
 /// and system-floor estimates stay in lock-step.
-fn estimate_message_tokens(message: &ChatMessage, disposition: ImageMarkerDisposition) -> usize {
-    let text_estimate = message.content.len().div_ceil(4) + 4;
-    if disposition == ImageMarkerDisposition::Literal {
+fn estimate_message_tokens(message: &ChatMessage, disposition: AttachmentDisposition) -> usize {
+    let text_estimate = message.context_text_bytes().div_ceil(4) + 4;
+    if disposition == AttachmentDisposition::Literal {
         return text_estimate;
     }
-    // The summary cannot be skipped on a marker-free fast path: a declared
-    // native carrier carries its images as JSON attachments with no marker
-    // syntax in the content at all.
+    // Attachment fields are independent of the message text.
     let summary = message_image_summary(message);
     match disposition {
-        ImageMarkerDisposition::Normalized => {
+        AttachmentDisposition::Normalized => {
             summary.text_bytes.div_ceil(4) + summary.image_refs * IMAGE_TOKEN_ESTIMATE + 4
         }
-        // A stale carrier is priced as its bytes: the replay delivers a
-        // legacy carrier verbatim and re-declares a declared one without
-        // touching its body, so the full content length is the price. (A
-        // stale declared envelope still carries its original attachment
-        // list in these bytes; that overcount is the accepted, conservative
-        // known limit.)
-        ImageMarkerDisposition::Stripped => text_estimate,
+        // Stripped attachments are not sent; only the text is charged.
+        AttachmentDisposition::Stripped => text_estimate,
         // Unreachable after the guard; keeps the arm total.
-        ImageMarkerDisposition::Literal => text_estimate,
+        AttachmentDisposition::Literal => text_estimate,
     }
 }
 
 /// Estimate token count for a message history using the ~4 chars/token
 /// heuristic plus ~4 framing tokens per message. Images are charged per
-/// image only where preparation dispatches them: the markers lifted from
-/// user turns and the attachments declared by the tool-result carriers of
+/// image only where preparation dispatches them: structured attachments on
+/// user turns and on the tool-result carriers of
 /// the current user turn. Stale tool-result carriers are priced as their
 /// bytes, and system or assistant content is priced
 /// as text. Trim
@@ -229,7 +144,7 @@ fn estimate_message_tokens(message: &ChatMessage, disposition: ImageMarkerDispos
 /// the current turn's tool-result carriers carry the same disposition in
 /// every probe as in the full history.
 pub fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
-    let dispositions = image_marker_dispositions(history);
+    let dispositions = attachment_dispositions(history);
     history
         .iter()
         .zip(dispositions)
@@ -259,7 +174,7 @@ pub fn estimate_system_floor_tokens(history: &[ChatMessage]) -> usize {
     history
         .iter()
         .filter(|m| m.role == "system")
-        .map(|m| estimate_message_tokens(m, ImageMarkerDisposition::Literal))
+        .map(|m| estimate_message_tokens(m, AttachmentDisposition::Literal))
         .sum()
 }
 
@@ -469,6 +384,7 @@ pub fn save_interactive_session_history_with_crumb(
     history: &[ChatMessage],
     has_crumb: bool,
 ) -> Result<()> {
+    let lease = zeroclaw_infra::session_events::cli_state::CliStateGuard::acquire_legacy(path)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -476,7 +392,7 @@ pub fn save_interactive_session_history_with_crumb(
     let payload = serde_json::to_string_pretty(&InteractiveSessionState::from_history_with_crumb(
         history, has_crumb,
     ))?;
-    std::fs::write(path, payload)?;
+    std::fs::write(lease.path(), payload)?;
     Ok(())
 }
 
@@ -514,10 +430,14 @@ mod tests {
     }
 
     #[test]
-    fn image_path_marker_is_charged_per_image_not_per_byte() {
-        // The marker is 18 bytes of text: bytes/4 would price it at ~9
-        // tokens against the ~1.5k the provider bills after downscale.
-        let message = ChatMessage::user("[IMAGE:/tmp/a.png]");
+    fn image_path_attachment_is_charged_per_image_not_per_byte() {
+        // The short path must not reduce the image's estimated token cost.
+        let message = ChatMessage::user("").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: "/tmp/a.png".to_string(),
+            },
+        ]);
 
         assert_eq!(
             estimate_history_tokens(&[message]),
@@ -526,11 +446,16 @@ mod tests {
     }
 
     #[test]
-    fn image_data_uri_marker_is_charged_per_image_not_per_byte() {
+    fn image_data_uri_attachment_is_charged_per_image_not_per_byte() {
         // ~600 KB of base64 would price at ~150k tokens under the text
         // heuristic, against ~1.5k billed.
         let payload = format!("data:image/png;base64,{}", "A".repeat(600_000));
-        let message = ChatMessage::user(format!("[IMAGE:{payload}]"));
+        let message = ChatMessage::user("").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: payload,
+            },
+        ]);
 
         assert_eq!(
             estimate_history_tokens(&[message]),
@@ -543,9 +468,19 @@ mod tests {
         // Invariant 2: the same image costs the same however it is
         // referenced, so the raw-history estimate bounds the prepared
         // payload from above.
-        let via_path = ChatMessage::user("[IMAGE:/tmp/scene.png]");
+        let via_path = ChatMessage::user("").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: "/tmp/scene.png".to_string(),
+            },
+        ]);
         let payload = format!("data:image/png;base64,{}", "B".repeat(600_000));
-        let via_data_uri = ChatMessage::user(format!("[IMAGE:{payload}]"));
+        let via_data_uri = ChatMessage::user("").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: payload,
+            },
+        ]);
 
         let path_estimate = estimate_history_tokens(&[via_path]);
         assert_eq!(path_estimate, estimate_history_tokens(&[via_data_uri]));
@@ -554,9 +489,8 @@ mod tests {
 
     #[test]
     fn placeholder_marker_stays_text() {
-        // `parse_image_markers` keeps placeholder markers in the text, so
-        // they retain the plain-text pricing.
-        for placeholder in ["[IMAGE:...]", "[IMAGE:<path>]"] {
+        // Literal marker syntax has no attachment semantics.
+        for placeholder in ["[IMAGE:...]", "structured image attachments"] {
             let message = ChatMessage::user(placeholder);
 
             assert_eq!(
@@ -564,19 +498,6 @@ mod tests {
                 placeholder.len().div_ceil(4) + 4
             );
         }
-    }
-
-    #[test]
-    fn mixed_text_and_images_sum() {
-        let content = "see [IMAGE:/a.png] and [IMAGE:/b.png] ok";
-        let message = ChatMessage::user(content);
-
-        let (text, refs) = zeroclaw_providers::multimodal::parse_image_markers(content);
-        assert_eq!(refs.len(), 2);
-        assert_eq!(text, "see  and  ok");
-
-        let expected = text.len().div_ceil(4) + 2 * IMAGE_TOKEN_ESTIMATE + 4;
-        assert_eq!(estimate_history_tokens(&[message]), expected);
     }
 
     #[test]
@@ -623,67 +544,6 @@ mod tests {
         );
     }
 
-    /// A native tool-result carrier in the shape the runtime writes: call
-    /// id, verbatim body, and the attachments array at the fixed position.
-    fn native_image_carrier(body: &str, images: &[&str]) -> ChatMessage {
-        let attachments: Vec<_> = images
-            .iter()
-            .map(|target| zeroclaw_api::media::RenderedMarker {
-                target: (*target).to_string(),
-                kind: zeroclaw_api::media::MarkerKind::Image,
-            })
-            .collect();
-        ChatMessage::tool(
-            serde_json::json!({
-                "tool_call_id": "call-1",
-                "content": body,
-                "attachments": zeroclaw_api::tool_carrier::render_native_attachments(&attachments),
-            })
-            .to_string(),
-        )
-    }
-
-    #[test]
-    fn declared_tool_attachments_are_charged_not_body_markers() {
-        // A declared carrier in the current turn: one image attachment, a
-        // body quoting two markers. The markers are text; the attachment is
-        // the only image. The expected numbers are computed by hand from the
-        // fixture strings, not by a second estimate call.
-        let body = "see [IMAGE:/x.png] and [IMAGE:/y.png]";
-        let tool = native_image_carrier(body, &["/tmp/declared.png"]);
-        let history = vec![ChatMessage::user("u"), ChatMessage::assistant("c"), tool];
-        let expected = "u".len().div_ceil(4)
-            + 4
-            + "c".len().div_ceil(4)
-            + 4
-            + body.len().div_ceil(4)
-            + IMAGE_TOKEN_ESTIMATE
-            + 4;
-        assert_eq!(
-            estimate_history_tokens(&history),
-            expected,
-            "one declared attachment plus text, never the two body markers"
-        );
-
-        // A legacy carrier in the same position: two body markers, no
-        // declaration, so preparation promotes nothing and the charge is
-        // text only.
-        let legacy_body = "got [IMAGE:/a.png] plus [IMAGE:/b.png] done";
-        let legacy = ChatMessage::tool(legacy_body);
-        let history = vec![ChatMessage::user("u"), ChatMessage::assistant("c"), legacy];
-        let expected = "u".len().div_ceil(4)
-            + 4
-            + "c".len().div_ceil(4)
-            + 4
-            + legacy_body.len().div_ceil(4)
-            + 4;
-        assert_eq!(
-            estimate_history_tokens(&history),
-            expected,
-            "a legacy carrier's body markers are text, never images"
-        );
-    }
-
     #[test]
     fn estimate_tool_schema_tokens_counts_name_description_and_parameters() {
         let spec = crate::tools::ToolSpec::new(
@@ -725,9 +585,7 @@ mod tests {
     }
 
     #[test]
-    fn truncate_tool_result_does_not_split_image_marker_at_head_boundary() {
-        // 200-byte path → marker length 207 bytes. With max_chars=80 the
-        // naive head_end (= 80 * 2 / 3 = 53) falls inside the marker.
+    fn truncate_tool_result_treats_literal_media_syntax_as_plain_text() {
         let path = format!("/tmp/{}.png", "a".repeat(200));
         let marker = format!("[IMAGE:{path}]");
         let output = format!("prefix-text {marker} trailing-text padding-padding");
@@ -738,16 +596,12 @@ mod tests {
             truncated.contains("[... ") && truncated.contains("characters truncated ...]"),
             "expected truncation marker in output, got: {truncated}"
         );
-        // No half-`[IMAGE:` marker should leak into the surviving content.
-        let stripped = truncated.replace(&marker, "");
-        assert!(
-            !stripped.contains("[IMAGE:"),
-            "half-`[IMAGE:` marker leaked into truncated output: {truncated}"
-        );
+        assert!(truncated.starts_with(&output[..80 * 2 / 3]));
+        assert!(truncated.ends_with(&output[output.len() - (80 - 80 * 2 / 3)..]));
     }
 
     #[test]
-    fn truncate_tool_result_does_not_split_image_marker_at_tail_boundary() {
+    fn truncate_tool_result_retains_plain_text_tail_inside_literal_media_syntax() {
         // Marker placed near the end so tail_start (~max_chars / 3 from the
         // end) lands inside it.
         let path = format!("/tmp/{}.png", "b".repeat(200));
@@ -756,11 +610,7 @@ mod tests {
 
         let truncated = truncate_tool_result(&output, 90);
 
-        let stripped = truncated.replace(&marker, "");
-        assert!(
-            !stripped.contains("[IMAGE:") && !stripped.contains(".png]"),
-            "half-`[IMAGE:` marker leaked into truncated output: {truncated}"
-        );
+        assert!(truncated.ends_with(&output[output.len() - 30..]));
     }
 
     #[test]

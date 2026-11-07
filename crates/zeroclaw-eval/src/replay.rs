@@ -125,6 +125,7 @@ impl ModelProvider for TraceLlmProvider {
                 input_tokens,
                 output_tokens,
             } => Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(content),
                 tool_calls: vec![],
                 usage: Some(TokenUsage {
@@ -150,6 +151,7 @@ impl ModelProvider for TraceLlmProvider {
                     })
                     .collect();
                 Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some(String::new()),
                     tool_calls: calls,
                     usage: Some(TokenUsage {

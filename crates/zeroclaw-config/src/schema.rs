@@ -121,6 +121,8 @@ static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, RuntimeProxyC
 
 struct RuntimeProxyCachedClient {
     generation: u64,
+    // Pooled connection tasks belong to the runtime that constructed this client.
+    runtime_id: tokio::runtime::Id,
     client: reqwest::Client,
 }
 
@@ -7269,7 +7271,7 @@ impl Default for PipelineConfig {
 pub struct MultimodalConfig {
     /// Maximum number of image attachments accepted per request.
     ///
-    /// Caps the total number of `[IMAGE:...]` markers that survive into the
+    /// Caps the total number of image attachments that survive into the
     /// provider request after multimodal preprocessing. Older images are
     /// dropped first. When a new image takes the count past the limit, the
     /// oldest images are removed in one batch, down to half the limit
@@ -7316,7 +7318,7 @@ pub struct MultimodalConfig {
     #[serde(default)]
     pub allow_remote_fetch: bool,
     /// ModelProvider name to use for vision/image messages (e.g. `"ollama"`).
-    /// When set, messages containing `[IMAGE:]` markers are routed to this
+    /// When set, messages containing image attachments are routed to this
     /// model_provider instead of the default text model_provider.
     #[serde(default)]
     pub vision_model_provider: Option<String>,
@@ -11932,21 +11934,26 @@ fn runtime_proxy_cache_key(
 }
 
 fn runtime_proxy_cached_client(cache_key: &str) -> Option<reqwest::Client> {
+    let runtime_id = tokio::runtime::Handle::try_current().ok()?.id();
     let generation = runtime_proxy_current_generation();
     match runtime_proxy_client_cache().read() {
         Ok(guard) => guard
             .get(cache_key)
-            .filter(|entry| entry.generation == generation)
+            .filter(|entry| entry.generation == generation && entry.runtime_id == runtime_id)
             .map(|entry| entry.client.clone()),
         Err(poisoned) => poisoned
             .into_inner()
             .get(cache_key)
-            .filter(|entry| entry.generation == generation)
+            .filter(|entry| entry.generation == generation && entry.runtime_id == runtime_id)
             .map(|entry| entry.client.clone()),
     }
 }
 
 fn set_runtime_proxy_cached_client(cache_key: String, generation: u64, client: reqwest::Client) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let runtime_id = runtime.id();
     if generation != runtime_proxy_current_generation() {
         return;
     }
@@ -11954,13 +11961,27 @@ fn set_runtime_proxy_cached_client(cache_key: String, generation: u64, client: r
     match runtime_proxy_client_cache().write() {
         Ok(mut guard) => {
             if generation == runtime_proxy_config_generation() {
-                guard.insert(cache_key, RuntimeProxyCachedClient { generation, client });
+                guard.insert(
+                    cache_key,
+                    RuntimeProxyCachedClient {
+                        generation,
+                        runtime_id,
+                        client,
+                    },
+                );
             }
         }
         Err(poisoned) => {
             let mut guard = poisoned.into_inner();
             if generation == runtime_proxy_config_generation() {
-                guard.insert(cache_key, RuntimeProxyCachedClient { generation, client });
+                guard.insert(
+                    cache_key,
+                    RuntimeProxyCachedClient {
+                        generation,
+                        runtime_id,
+                        client,
+                    },
+                );
             }
         }
     }
@@ -31925,6 +31946,64 @@ open_skills_enabled = false
         ));
     }
 
+    #[tokio::test]
+    async fn v4_upgrade_preserves_session_storage_selection_and_existing_history() {
+        let _env_guard = env_override_lock().await;
+        let _workspace_guard = EnvValueGuard::remove("ZEROCLAW_WORKSPACE");
+        let _data_guard = EnvValueGuard::remove("ZEROCLAW_DATA_DIR");
+        for backend in ["sqlite", "jsonl"] {
+            let dir = TempDir::new().unwrap();
+            let _config_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", dir.path());
+            let path = dir.path().join("config.toml");
+            let raw = format!(
+                "schema_version = 3\n\n[channels]\nsession_backend = \"{backend}\"\n\
+                 session_persistence = false\nsession_ttl_hours = 4\n\n\
+                 [agents.writer]\ncompact_context = true\n"
+            );
+            fs::write(&path, &raw).await.unwrap();
+            let history = dir.path().join("workspace/sessions/existing.jsonl");
+            fs::create_dir_all(history.parent().unwrap()).await.unwrap();
+            let recorded = "{\"role\":\"user\",\"content\":\"existing history\"}\n";
+            fs::write(&history, recorded).await.unwrap();
+
+            let config = Box::pin(Config::load_or_init()).await.unwrap();
+            assert_eq!(
+                config.schema_version,
+                crate::migration::CURRENT_SCHEMA_VERSION
+            );
+            assert_eq!(config.channels.session_backend, backend);
+            assert!(!config.channels.session_persistence);
+            assert_eq!(config.channels.session_ttl_hours, 4);
+            assert!(config.agents.contains_key("writer"));
+            assert!(!config.agents.contains_key("default"));
+            assert!(config.migration_notices.iter().any(|notice| matches!(
+                notice,
+                crate::migration::MigrationNotice::Removed { path, .. }
+                    if path == "agents.writer.compact_context"
+            )));
+            assert_eq!(fs::read_to_string(&path).await.unwrap(), raw);
+            config.save().await.unwrap();
+            assert_eq!(
+                fs::read_to_string(dir.path().join("config.toml.v3.backup"))
+                    .await
+                    .unwrap(),
+                raw
+            );
+            // Full saves omit values equal to defaults (including SQLite).
+            // Verify the effective selection after loading those defaults.
+            let reloaded = Box::pin(Config::load_or_init()).await.unwrap();
+            assert_eq!(reloaded.channels.session_backend, backend);
+            assert!(!reloaded.channels.session_persistence);
+            assert_eq!(reloaded.channels.session_ttl_hours, 4);
+            assert_eq!(fs::read_to_string(&history).await.unwrap(), recorded);
+            assert!(
+                !dir.path()
+                    .join("agents/default/workspace/sessions")
+                    .exists()
+            );
+        }
+    }
+
     #[test]
     async fn runtime_profile_deferred_builtin_tools_is_opt_in() {
         assert!(!RuntimeProfileConfig::default().deferred_builtin_tools);
@@ -40156,6 +40235,115 @@ api_token = "tok"
     }
 
     #[test]
+    async fn runtime_proxy_client_cache_is_bound_to_request_runtime() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let _env_guard = env_override_lock().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP fixture listener");
+        let url = format!(
+            "http://{}/",
+            listener.local_addr().expect("fixture address")
+        );
+        let server = zeroclaw_spawn::spawn!(async move {
+            loop {
+                let (socket, _) = listener.accept().await.expect("HTTP fixture connection");
+                zeroclaw_spawn::spawn!(async move {
+                    let mut socket = BufReader::new(socket);
+                    let mut line = String::new();
+                    // Pool checkout can race a speculative connection. Bind a
+                    // socket to its first request's runtime, not an accept ID.
+                    let mut connection_runtime = None;
+                    loop {
+                        let mut request_runtime = None;
+                        loop {
+                            line.clear();
+                            if socket.read_line(&mut line).await.expect("request header") == 0 {
+                                return;
+                            }
+                            if line == "\r\n" {
+                                break;
+                            }
+                            if let Some((name, value)) = line.split_once(':')
+                                && name.eq_ignore_ascii_case("x-fixture-runtime")
+                            {
+                                request_runtime = Some(value.trim().to_owned());
+                            }
+                        }
+                        let body = connection_runtime.get_or_insert(
+                            request_runtime.expect("request must identify its runtime"),
+                        );
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        );
+                        if socket
+                            .get_mut()
+                            .write_all(response.as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let outcome = tokio::task::spawn_blocking(move || {
+            let new_runtime = || {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .enable_all()
+                    .build()
+                    .expect("request runtime")
+            };
+            let first = new_runtime();
+            let second = new_runtime();
+            let service_key = format!("model_provider.runtime_scope.{}", uuid::Uuid::new_v4());
+            let cache_key = runtime_proxy_cache_key(&service_key, Some(5), Some(5));
+            let request = |runtime: &tokio::runtime::Runtime, label: &str, cached: bool| {
+                runtime.block_on(async {
+                    assert_eq!(runtime_proxy_cache_contains(&cache_key), cached);
+                    let client = build_runtime_proxy_client_with_timeouts(&service_key, 5, 5);
+                    {
+                        let cache = runtime_proxy_client_cache().read().unwrap();
+                        let entry = cache.get(&cache_key).expect("cached client");
+                        assert_eq!(entry.runtime_id, runtime.handle().id());
+                        assert_eq!(entry.generation, runtime_proxy_current_generation());
+                    }
+                    client
+                        .get(&url)
+                        .header("x-fixture-runtime", label)
+                        .send()
+                        .await
+                        .expect("request must use a live runtime")
+                        .text()
+                        .await
+                        .expect("connection runtime")
+                })
+            };
+            assert_eq!(request(&first, "first", false), "first");
+            assert_eq!(request(&first, "first", true), "first");
+            assert_eq!(
+                request(&second, "second", false),
+                "second",
+                "another runtime cannot borrow the first runtime's connection"
+            );
+            drop(first);
+            assert_eq!(
+                request(&second, "second", true),
+                "second",
+                "the second runtime's pool must survive the first runtime's shutdown"
+            );
+        })
+        .await;
+        server.abort();
+        assert!(server.await.expect_err("fixture is stopped").is_cancelled());
+        outcome.expect("cross-runtime requests must succeed");
+    }
+
+    #[test]
     async fn environment_proxy_detection_respects_scheme_and_no_proxy() {
         let values = HashMap::from([
             ("HTTP_PROXY", "http://http-proxy.example:3128"),
@@ -40260,6 +40448,7 @@ api_token = "tok"
                     cache_key.clone(),
                     RuntimeProxyCachedClient {
                         generation: stale_generation,
+                        runtime_id: tokio::runtime::Handle::current().id(),
                         client: reqwest::Client::new(),
                     },
                 );
@@ -40270,6 +40459,7 @@ api_token = "tok"
                     cache_key.clone(),
                     RuntimeProxyCachedClient {
                         generation: stale_generation,
+                        runtime_id: tokio::runtime::Handle::current().id(),
                         client: reqwest::Client::new(),
                     },
                 );

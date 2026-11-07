@@ -6,7 +6,7 @@ use serde_json::json;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use zeroclaw_api::media::{MarkerKind, RenderedMarker};
+use zeroclaw_api::media::{AttachmentKind, AttachmentReference};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, with_ephemeral_workspace_warning};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
@@ -469,9 +469,9 @@ impl ImageGenTool {
             output: output.into(),
             error: None,
         }
-        .with_attachment(RenderedMarker {
+        .with_attachment(AttachmentReference {
             target: path_display,
-            kind: MarkerKind::Image,
+            kind: AttachmentKind::Image,
         }))
     }
 }
@@ -1058,9 +1058,9 @@ mod tests {
 
     #[test]
     fn ephemeral_warning_keeps_the_declared_attachment() {
-        let marker = RenderedMarker {
+        let marker = AttachmentReference {
             target: "/ws/images/generated_image_42.png".into(),
-            kind: MarkerKind::Image,
+            kind: AttachmentKind::Image,
         };
         let generated = ToolResult {
             success: true,

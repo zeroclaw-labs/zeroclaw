@@ -256,6 +256,7 @@ async fn wait_for_listener_health(
 
 fn outbound(content: &str, recipient: &str) -> SendMessage {
     SendMessage {
+        locations: Vec::new(),
         content: content.to_string(),
         recipient: recipient.to_string(),
         subject: None,

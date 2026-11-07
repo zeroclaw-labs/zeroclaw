@@ -7,7 +7,7 @@ import {
   type ReactTestInstance,
   type ReactTestRenderer,
 } from 'react-test-renderer';
-import type { ApprovalDecision, SessionMessagesResponse, WsMessage } from '../types/api.ts';
+import type { ApprovalDecision, AttachmentReference, SessionMessagesResponse, WsMessage } from '../types/api.ts';
 import type {
   AgentContextValue,
   AgentSessionRuntime,
@@ -69,6 +69,7 @@ let configPutCalls: ConfigPutRequest[] = [];
 let missingSessions = new Set<string>();
 let deleteFailures = new Set<string>();
 let configPutHandler: ((request: ConfigPutRequest) => Promise<Response>) | null = null;
+let uploadResponder: (() => Promise<{ attachment: AttachmentReference }>) | null = null;
 
 globalThis.fetch = async (input, init) => {
   const url = typeof input === 'string'
@@ -77,7 +78,8 @@ globalThis.fetch = async (input, init) => {
       ? input.toString()
       : input.url;
   let body: unknown;
-  if (url.includes('/api/config/catalog')) body = { providers: [] };
+  if (url.includes('/api/upload?') && uploadResponder) body = await uploadResponder();
+  else if (url.includes('/api/config/catalog')) body = { providers: [] };
   else if (url.includes('/api/status')) body = { model: 'test-model' };
   else if (url.includes('/api/config/prop') && init?.method === 'PUT') {
     const request = JSON.parse(String(init.body)) as ConfigPutRequest;
@@ -112,7 +114,7 @@ globalThis.fetch = async (input, init) => {
 
 const { AgentProvider, useAgent } = await import('./AgentContext.tsx');
 const { deleteSession, HttpError, ApiError } = await import('../lib/api.ts');
-const { DraftContext } = await import('../hooks/useDraft.ts');
+const { DraftContext, useDraft, useDraftStore } = await import('../hooks/useDraft.ts');
 const { AgentChatInner } = await import('../pages/AgentChat.tsx');
 const { MemoryRouter } = await import('react-router-dom');
 
@@ -140,6 +142,7 @@ class FakeSocket implements SessionSocket {
   connectCalls = 0;
   disconnectCalls = 0;
   sent: string[] = [];
+  sentAttachments: AttachmentReference[][] = [];
   approvalResponses: Array<{ requestId: string; decision: ApprovalDecision }> = [];
   private open = false;
 
@@ -151,9 +154,10 @@ class FakeSocket implements SessionSocket {
   connect(): void { this.connectCalls += 1; }
   disconnect(): void { this.disconnectCalls += 1; this.open = false; }
   get connected(): boolean { return this.open; }
-  sendMessage(content: string): void {
+  sendMessage(content: string, attachments: AttachmentReference[] = []): void {
     if (!this.open) throw new Error('closed');
     this.sent.push(content);
+    this.sentAttachments.push(attachments);
   }
   sendApprovalResponse(requestId: string, decision: ApprovalDecision): void {
     this.approvalResponses.push({ requestId, decision });
@@ -176,7 +180,7 @@ class FakeSessionRuntime implements AgentSessionRuntime {
   readonly messageCalls: string[] = [];
   readonly messagePlans = new Map<string, MessageFactory[]>();
   readonly deletePlans = new Map<string, DeleteFactory[]>();
-  readonly renameDeferred = new Map<string, Deferred<{ session_id: string; name: string }>>();
+  readonly renameDeferred = new Map<string, Deferred<{ session_id: string; title: string }>>();
   mintedIds: string[] = [];
 
   createSocket({ agentAlias, sessionId }: { agentAlias: string; sessionId: string }): FakeSocket {
@@ -197,10 +201,10 @@ class FakeSessionRuntime implements AgentSessionRuntime {
     return plan ? plan() : Promise.resolve({ deleted: true });
   }
 
-  rename(sessionId: string, name: string): Promise<{ session_id: string; name: string }> {
+  rename(sessionId: string, name: string): Promise<{ session_id: string; title: string }> {
     this.renameCalls.push({ id: sessionId, name });
     return this.renameDeferred.get(sessionId)?.promise
-      ?? Promise.resolve({ session_id: sessionId, name });
+      ?? Promise.resolve({ session_id: sessionId, title: name });
   }
 
   mintId(): string {
@@ -247,10 +251,13 @@ async function mountChat(
 ): Promise<MountedChat> {
   let currentContext: AgentContextValue | null = null;
   const drafts = new Map<string, string>();
+  const attachments = new Map<string, AttachmentReference[]>();
   const draftStore = {
     getDraft: (key: string) => drafts.get(key) ?? '',
     setDraft: (key: string, value: string) => { drafts.set(key, value); },
-    clearDraft: (key: string) => { drafts.delete(key); },
+    clearDraft: (key: string) => { drafts.delete(key); attachments.delete(key); },
+    getAttachments: (key: string) => attachments.get(key) ?? [],
+    setAttachments: (key: string, value: AttachmentReference[]) => { attachments.set(key, value); },
   };
 
   function Probe() {
@@ -351,16 +358,17 @@ beforeEach(() => {
   missingSessions = new Set();
   deleteFailures = new Set();
   configPutHandler = null;
+  uploadResponder = null;
   sessionsResponder = null;
   storage.setItem('zeroclaw_active_session.ops', 'A');
   listedSessions = [
     {
-      session_id: 'A', session_key: 'gw_A', name: 'First', message_count: 0,
+      session_id: 'A', creation_source: 'gateway', title: 'First', message_count: 0,
       last_activity: '2026-08-05T00:00:00Z', created_at: '2026-08-05T00:00:00Z',
       agent_alias: 'ops', channel_id: null,
     },
     {
-      session_id: 'B', session_key: 'gw_B', name: 'Second', message_count: 0,
+      session_id: 'B', creation_source: 'gateway', title: 'Second', message_count: 0,
       last_activity: '2026-08-04T00:00:00Z', created_at: '2026-08-04T00:00:00Z',
       agent_alias: 'ops', channel_id: null,
     },
@@ -579,7 +587,7 @@ test('a deferred model PUT rebuilds the latest selected session socket', async (
 
 test('manual rename is the only name write when the first message is sent', async () => {
   const runtime = new FakeSessionRuntime();
-  const rename = new Deferred<{ session_id: string; name: string }>();
+  const rename = new Deferred<{ session_id: string; title: string }>();
   runtime.renameDeferred.set('A', rename);
   runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
   const mounted = await mountChat(runtime);
@@ -592,7 +600,7 @@ test('manual rename is the only name write when the first message is sent', asyn
   assert.deepEqual(runtime.sockets[0]?.sent, ['Draft the rollout']);
 
   await act(async () => {
-    rename.resolve({ session_id: 'A', name: 'Release planning' });
+    rename.resolve({ session_id: 'A', title: 'Release planning' });
     await pendingRename;
   });
   assert.equal(runtime.renameCalls.length, 1);
@@ -934,6 +942,109 @@ test('composer drafts follow agent and session without crossing conversations', 
   await openSocket(runtime, 3);
   await settle();
   assert.equal(textarea(mounted.renderer).props.value, 'draft-B');
+  await unmount(mounted.renderer);
+});
+
+test('composer retains typed attachment drafts per conversation and sends only their fields', async () => {
+  const runtime = new FakeSessionRuntime();
+  for (const id of ['A', 'A', 'B']) {
+    runtime.queueMessages(id, () => Promise.resolve(messagesResponse(id, true)));
+  }
+  const mounted = await mountChat(runtime, true);
+  await openSocket(runtime, 0);
+  await settle();
+  const attachment: AttachmentReference = { kind: 'image', target: '/uploads/photo-A.png' };
+  uploadResponder = async () => ({ attachment });
+  await act(async () => {
+    mounted.renderer.root.findByProps({ type: 'file' }).props.onChange({
+      target: { files: [new File(['image'], 'photo-A.png', { type: 'image/png' })], value: 'photo-A.png' },
+    });
+    await Promise.resolve();
+  });
+  await settle();
+  assert.equal(textarea(mounted.renderer).props.value, '');
+  assert.ok(nodeText(mounted.renderer.root).includes('photo-A.png'));
+  assert.equal(await goToSession(mounted, 'B'), true);
+  await settle();
+  assert.ok(!nodeText(mounted.renderer.root).includes('photo-A.png'));
+  assert.equal(await goToSession(mounted, 'A'), true);
+  await settle();
+  await openSocket(runtime, 2);
+  await settle();
+  assert.ok(nodeText(mounted.renderer.root).includes('photo-A.png'));
+  await act(async () => {
+    textarea(mounted.renderer).props.onKeyDown({
+      key: 'Enter', shiftKey: false, nativeEvent: { isComposing: false }, preventDefault() {},
+    });
+  });
+  assert.deepEqual(runtime.sockets[2]!.sent, ['']);
+  assert.deepEqual(runtime.sockets[2]!.sentAttachments, [[attachment]]);
+  assert.ok(!nodeText(mounted.renderer.root).includes('[IMAGE:'));
+  await unmount(mounted.renderer);
+});
+
+test('the draft store preserves text and structured attachments across composer remounts', async () => {
+  let active!: ReturnType<typeof useDraft>;
+  function Probe() { active = useDraft('A'); return null; }
+  function Harness({ visible }: { visible: boolean }) {
+    const store = useDraftStore();
+    return createElement(DraftContext.Provider, { value: store }, visible ? createElement(Probe) : null);
+  }
+  let renderer!: ReactTestRenderer;
+  await act(async () => { renderer = create(createElement(Harness, { visible: true })); });
+  const attachment: AttachmentReference = { kind: 'image', target: '/uploads/photo.png' };
+  active.saveDraft('look');
+  active.updateAttachments(() => [attachment]);
+  await act(async () => { renderer.update(createElement(Harness, { visible: false })); });
+  await act(async () => { renderer.update(createElement(Harness, { visible: true })); });
+  assert.equal(active.draft, 'look');
+  assert.deepEqual(active.attachments, [attachment]);
+  active.clearDraft();
+  await act(async () => { renderer.update(createElement(Harness, { visible: true })); });
+  assert.equal(active.draft, '');
+  assert.deepEqual(active.attachments, []);
+  await unmount(renderer);
+});
+
+test('a late upload stays with its original conversation draft', async () => {
+  const runtime = new FakeSessionRuntime();
+  for (const id of ['A', 'A', 'B']) {
+    runtime.queueMessages(id, () => Promise.resolve(messagesResponse(id, true)));
+  }
+  const mounted = await mountChat(runtime, true);
+  await openSocket(runtime, 0);
+  await settle();
+  const deferred = new Deferred<{ attachment: AttachmentReference }>();
+  const attachment: AttachmentReference = { kind: 'image', target: '/uploads/late-photo-A.png' };
+  uploadResponder = () => deferred.promise;
+  await act(async () => {
+    mounted.renderer.root.findByProps({ type: 'file' }).props.onChange({
+      target: { files: [new File(['image'], 'late-photo-A.png', { type: 'image/png' })], value: 'late-photo-A.png' },
+    });
+  });
+  assert.equal(await goToSession(mounted, 'B'), true);
+  await settle();
+  await act(async () => { deferred.resolve({ attachment }); });
+  await settle();
+  assert.ok(!nodeText(mounted.renderer.root).includes('late-photo-A.png'));
+  assert.equal(await goToSession(mounted, 'A'), true);
+  await settle();
+  await openSocket(runtime, 2);
+  await settle();
+  assert.ok(nodeText(mounted.renderer.root).includes('late-photo-A.png'));
+  await typeInComposer(mounted.renderer, '/help');
+  await act(async () => {
+    textarea(mounted.renderer).props.onKeyDown({
+      key: 'Enter', shiftKey: false, nativeEvent: { isComposing: false }, preventDefault() {},
+    });
+  });
+  assert.equal(textarea(mounted.renderer).props.value, '');
+  await act(async () => {
+    textarea(mounted.renderer).props.onKeyDown({
+      key: 'Enter', shiftKey: false, nativeEvent: { isComposing: false }, preventDefault() {},
+    });
+  });
+  assert.deepEqual(runtime.sockets[2]!.sentAttachments, [[attachment]]);
   await unmount(mounted.renderer);
 });
 

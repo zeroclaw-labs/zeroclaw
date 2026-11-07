@@ -13,7 +13,6 @@ use crate::traits::{
 use zeroclaw_api::model_provider::ModelProvider;
 use zeroclaw_config::schema::MemoryConfig;
 use zeroclaw_providers::ProviderDispatch;
-use zeroclaw_providers::multimodal::strip_media_markers;
 
 /// Output of consolidation extraction.
 #[derive(Debug, serde::Deserialize)]
@@ -66,11 +65,7 @@ pub async fn consolidate_turn(
     user_message: &str,
     assistant_response: &str,
 ) -> anyhow::Result<()> {
-    let turn_text = format!(
-        "User: {}\nAssistant: {}",
-        strip_media_markers(user_message),
-        strip_media_markers(assistant_response),
-    );
+    let turn_text = format!("User: {}\nAssistant: {}", user_message, assistant_response,);
 
     // Truncate very long turns to avoid wasting tokens on consolidation.
     // Use char-boundary-safe slicing to prevent panic on multi-byte UTF-8 (e.g. CJK text).
@@ -1435,7 +1430,7 @@ mod consolidate_turn_tests {
     }
 
     #[tokio::test]
-    async fn media_markers_are_stripped_from_the_outbound_prompt() {
+    async fn literal_media_syntax_is_preserved_in_the_outbound_prompt() {
         let tmp = TempDir::new().unwrap();
         let memory = SqliteMemory::new("sqlite", tmp.path()).unwrap();
         let provider = ScriptedProvider::replying(
@@ -1455,12 +1450,8 @@ mod consolidate_turn_tests {
         .unwrap();
 
         let prompt = provider.last_prompt().expect("model must be called");
-        assert!(prompt.contains(zeroclaw_providers::multimodal::MEDIA_PLACEHOLDER));
-        assert!(
-            !prompt.contains("/home/user/private/cat.png"),
-            "local paths must not reach the model"
-        );
-        assert!(!prompt.contains("/tmp/notes.pdf"));
+        assert!(prompt.contains("please review [IMAGE:/home/user/private/cat.png]"));
+        assert!(prompt.contains("described the picture in [DOCUMENT:/tmp/notes.pdf]"));
         assert!(prompt.contains("User:"));
         assert!(prompt.contains("Assistant:"));
     }

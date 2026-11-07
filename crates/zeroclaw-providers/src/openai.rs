@@ -1,10 +1,10 @@
 use crate::compatible::{MAX_MODELS_RESPONSE_BYTES, read_body_capped};
 use crate::openai_codex::{
     ResponsesStreamApiError, ResponsesStreamState, ResponsesToolSpec, append_utf8_stream_chunk,
-    build_responses_input, convert_tools, first_nonempty, parse_responses_usage, process_sse_chunk,
+    build_responses_input, convert_tools, first_nonempty, incomplete_responses_sse_error,
+    parse_responses_usage, process_sse_chunk,
 };
 use crate::opencode_session::OPENCODE_SESSION_HEADER;
-use crate::stream_guard::AbortOnDrop;
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
     ModelProvider, ProviderCapabilities, StreamChunk, StreamError, StreamEvent, StreamOptions,
@@ -175,19 +175,47 @@ struct NativeToolCall {
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     kind: Option<String>,
     function: NativeFunctionCall,
+    #[serde(flatten)]
+    extensions: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct NativeFunctionCall {
     name: String,
     arguments: String,
+    #[serde(flatten)]
+    extensions: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(from = "RawNativeChatResponse")]
 struct NativeChatResponse {
     choices: Vec<NativeChoice>,
     #[serde(default)]
     usage: Option<UsageInfo>,
+}
+#[derive(Debug, Deserialize)]
+struct RawNativeChatResponse {
+    choices: Vec<NativeChoice>,
+    #[serde(default)]
+    usage: Option<UsageInfo>,
+    #[serde(default)]
+    model: Option<String>,
+}
+impl From<RawNativeChatResponse> for NativeChatResponse {
+    fn from(mut raw: RawNativeChatResponse) -> Self {
+        if let Some(model) = raw.model {
+            for choice in &mut raw.choices {
+                choice.message.output_blocks.push(zeroclaw_api::model_provider::ProviderOutputBlock::ProtocolMetadata {
+                    metadata: serde_json::json!({"kind":"served_attribution", "protocol":"chat_completions", "model":model, "source":"provider_response"}),
+                });
+            }
+        }
+        Self {
+            choices: raw.choices,
+            usage: raw.usage,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -209,17 +237,85 @@ struct PromptTokensDetails {
 #[derive(Debug, Deserialize)]
 struct NativeChoice {
     message: NativeResponseMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+impl NativeChoice {
+    fn into_message(mut self) -> NativeResponseMessage {
+        if let Some(reason) = self.finish_reason {
+            self.message.output_blocks.push(zeroclaw_api::model_provider::ProviderOutputBlock::ProtocolMetadata {
+                metadata: serde_json::json!({"kind":"finish", "protocol":"chat_completions", "finish_reason":reason}),
+            });
+        }
+        self.message
+    }
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(from = "RawNativeResponseMessage")]
 struct NativeResponseMessage {
-    #[serde(default)]
     content: Option<String>,
+    reasoning_content: Option<String>,
+    tool_calls: Option<Vec<NativeToolCall>>,
+    output_blocks: Vec<zeroclaw_api::model_provider::ProviderOutputBlock>,
+}
+#[derive(Debug, Deserialize)]
+struct RawNativeResponseMessage {
+    #[serde(default)]
+    content: Option<serde_json::Value>,
     /// Reasoning/thinking models may return output in `reasoning_content`.
     #[serde(default)]
     reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<NativeToolCall>>,
+    #[serde(flatten)]
+    extensions: serde_json::Map<String, serde_json::Value>,
+}
+impl From<RawNativeResponseMessage> for NativeResponseMessage {
+    fn from(raw: RawNativeResponseMessage) -> Self {
+        use zeroclaw_api::model_provider::ProviderOutputBlock;
+        let (content, mut output_blocks) = crate::output::assistant_content(raw.content.as_ref());
+        if let Some(reasoning) = &raw.reasoning_content {
+            output_blocks.insert(
+                0,
+                ProviderOutputBlock::Reasoning {
+                    representation: "reasoning_content".into(),
+                    bytes: reasoning.to_owned().into_bytes(),
+                    replay_requirement: "provider_defined".into(),
+                },
+            );
+        }
+        if let Some(calls) = &raw.tool_calls {
+            for call in calls {
+                output_blocks.extend(crate::output::chat_tool_metadata(
+                    call.id.as_deref(),
+                    &call.extensions,
+                    Some(&call.function.extensions),
+                ));
+            }
+        }
+        for (name, content) in raw.extensions {
+            if name == "role" {
+                continue;
+            }
+            if name == "audio" {
+                output_blocks.extend(crate::output::content_blocks(
+                    &serde_json::json!({"type":"audio","source":content}),
+                ));
+            } else {
+                output_blocks.push(ProviderOutputBlock::Other {
+                    type_name: format!("assistant.{name}"),
+                    content,
+                });
+            }
+        }
+        Self {
+            content,
+            reasoning_content: raw.reasoning_content,
+            tool_calls: raw.tool_calls,
+            output_blocks,
+        }
+    }
 }
 
 impl NativeResponseMessage {
@@ -371,11 +467,13 @@ impl OpenAiModelProvider {
     }
 
     fn convert_messages(messages: &[ChatMessage]) -> Vec<NativeMessage> {
+        let projected = crate::multimodal::project_attachment_metadata(messages);
+        let messages = projected.as_ref();
         messages
             .iter()
             .map(|m| {
                 if m.role == "assistant"
-                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&m.content)
+                    && let Some(value) = crate::tool_protocol::tool_message_value(m)
                     && let Some(tool_calls_value) = value.get("tool_calls")
                     && let Ok(parsed_calls) =
                         serde_json::from_value::<Vec<ProviderToolCall>>(tool_calls_value.clone())
@@ -385,9 +483,11 @@ impl OpenAiModelProvider {
                         .map(|tc| {
                             let name = tc.name;
                             NativeToolCall {
+                                extensions: Default::default(),
                                 id: Some(tc.id),
                                 kind: Some("function".to_string()),
                                 function: NativeFunctionCall {
+                                    extensions: Default::default(),
                                     arguments: crate::compatible::sanitize_tool_arguments(
                                         &name,
                                         &tc.arguments,
@@ -412,7 +512,7 @@ impl OpenAiModelProvider {
                 }
 
                 if m.role == "tool"
-                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&m.content)
+                    && let Some(value) = crate::tool_protocol::tool_message_value(m)
                 {
                     let tool_call_id = value
                         .get("tool_call_id")
@@ -457,7 +557,15 @@ impl OpenAiModelProvider {
             })
             .collect::<Vec<_>>();
 
+        let mut output_blocks = message.output_blocks;
+        output_blocks.extend(
+            tool_calls
+                .iter()
+                .cloned()
+                .map(|call| zeroclaw_api::model_provider::ProviderOutputBlock::ToolCall { call }),
+        );
         ProviderChatResponse {
+            output_blocks,
             text,
             tool_calls,
             usage: None,
@@ -650,7 +758,7 @@ impl ModelProvider for OpenAiModelProvider {
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message)
+            .map(NativeChoice::into_message)
             .ok_or_else(|| {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -738,7 +846,7 @@ impl ModelProvider for OpenAiModelProvider {
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message)
+            .map(NativeChoice::into_message)
             .ok_or_else(|| {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -820,6 +928,10 @@ fn has_responses_tools(tools: Option<&[ResponsesToolSpec]>) -> bool {
 #[derive(Debug, Deserialize)]
 struct ResponsesApiBody {
     #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    incomplete_details: Option<serde_json::Value>,
+    #[serde(default)]
     output: Vec<serde_json::Value>,
     #[serde(default)]
     output_text: Option<String>,
@@ -899,6 +1011,11 @@ pub(crate) async fn run_responses_sse(
             let _ = tx
                 .send(Err(if err.is_connect() {
                     StreamError::ConnectFailed(super::stream_idle_error_message(&err, idle_timeout))
+                } else if err.is_timeout() {
+                    StreamError::ResponseTimeout(super::stream_idle_error_message(
+                        &err,
+                        idle_timeout,
+                    ))
                 } else {
                     StreamError::ModelProvider(super::stream_idle_error_message(&err, idle_timeout))
                 }))
@@ -912,9 +1029,10 @@ pub(crate) async fn run_responses_sse(
         let body = http_response.text().await.unwrap_or_default();
         let sanitized = super::sanitize_api_error(&body);
         let _ = tx
-            .send(Err(StreamError::ModelProvider(format!(
-                "OpenAI API error ({status}): {sanitized}"
-            ))))
+            .send(Err(StreamError::HttpStatus {
+                status: status.as_u16(),
+                message: sanitized,
+            }))
             .await;
         return;
     }
@@ -924,29 +1042,21 @@ pub(crate) async fn run_responses_sse(
     let mut pending_utf8: Vec<u8> = Vec::new();
     let mut chunk_buf = String::new();
 
-    'stream: loop {
-        match byte_stream.next().await {
+    loop {
+        let decode_error = match byte_stream.next().await {
             Some(Ok(bytes)) => {
-                if let Err(err) =
-                    append_utf8_stream_chunk(&mut chunk_buf, &mut pending_utf8, &bytes)
-                {
-                    let _ = tx
-                        .send(Err(StreamError::ModelProvider(err.to_string())))
-                        .await;
-                    return;
-                }
+                append_utf8_stream_chunk(&mut chunk_buf, &mut pending_utf8, &bytes).err()
             }
             Some(Err(err)) => {
                 let _ = tx
-                    .send(Err(StreamError::ModelProvider(
-                        super::stream_idle_error_message(&err, idle_timeout),
-                    )))
+                    .send(Err(super::stream_read_error(&err, idle_timeout)))
                     .await;
                 return;
             }
             None => break,
-        }
+        };
 
+        chunk_buf = chunk_buf.replace("\r\n", "\n");
         while let Some(idx) = chunk_buf.find("\n\n") {
             let chunk_str = chunk_buf[..idx].to_string();
             chunk_buf = chunk_buf[idx + 2..].to_string();
@@ -969,32 +1079,48 @@ pub(crate) async fn run_responses_sse(
                             return;
                         }
                     }
-                    if state.saw_completion {
-                        break 'stream;
-                    }
                 }
                 Err(err) => {
-                    if err.downcast_ref::<ResponsesStreamApiError>().is_some() {
-                        let _ = tx
-                            .send(Err(StreamError::ModelProvider(err.to_string())))
-                            .await;
-                        return;
-                    }
+                    let failure = if err.downcast_ref::<ResponsesStreamApiError>().is_some() {
+                        StreamError::ProtocolFailure(
+                            err.reallocate_into_boxed_dyn_error_without_backtrace(),
+                        )
+                    } else {
+                        StreamError::InvalidSse(err.to_string())
+                    };
+                    let _ = tx.send(Err(failure)).await;
+                    return;
                 }
             }
+            if state.saw_completion {
+                chunk_buf.clear();
+                break;
+            }
+        }
+        if let Some(error) = decode_error {
+            let _ = tx
+                .send(Err(StreamError::InvalidSse(error.to_string())))
+                .await;
+            return;
+        }
+        if state.saw_completion {
+            break;
         }
     }
 
-    if !state.saw_completion
-        && !chunk_buf.trim().is_empty()
-        && let Ok(events) = process_sse_chunk(&chunk_buf, &mut state)
-    {
-        for event in events {
-            let _ = tx.send(Ok(event)).await;
-        }
+    if let Err(error) = std::str::from_utf8(&pending_utf8) {
+        let _ = tx
+            .send(Err(StreamError::InvalidSse(error.to_string())))
+            .await;
+        return;
     }
 
-    if !state.saw_text_delta
+    if let Some(error) = incomplete_responses_sse_error(&chunk_buf) {
+        let _ = tx.send(Err(error)).await;
+        return;
+    }
+
+    if !state.saw_text_delta()
         && let Some(text) = state.fallback_text.filter(|t| !t.is_empty())
     {
         let chunk = if count_tokens {
@@ -1464,7 +1590,14 @@ impl ModelProvider for OpenAiResponsesModelProvider {
             return Err(super::api_error("OpenAI", response).await);
         }
         let body: ResponsesApiBody = response.json().await?;
+        let mut output_blocks = crate::output::responses_blocks(&body.output);
+        if let Some(status) = &body.status {
+            output_blocks.push(zeroclaw_api::model_provider::ProviderOutputBlock::ProtocolMetadata {
+                metadata: serde_json::json!({"kind":"finish", "protocol":"responses", "status":status, "incomplete_details":body.incomplete_details}),
+            });
+        }
         Ok(ProviderChatResponse {
+            output_blocks,
             text: extract_responses_api_text(&body),
             tool_calls: extract_responses_api_tool_calls(&body),
             usage: parse_responses_usage(body.usage.as_ref()),
@@ -1525,7 +1658,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         let alias = ::zeroclaw_log::debug_enabled().then(|| self.alias.clone());
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
-        let handle = ::zeroclaw_spawn::spawn!(async move {
+        let parser = async move {
             let (instructions, input) = build_responses_input(&messages_owned);
             let instructions = if instructions.is_empty() {
                 None
@@ -1580,13 +1713,9 @@ impl ModelProvider for OpenAiResponsesModelProvider {
             let request_builder = request_builder.json(&req);
 
             run_responses_sse(request_builder, &tx, count_tokens, idle_timeout).await;
-        });
+        };
 
-        let guard = AbortOnDrop::new(handle.abort_handle());
-        stream::unfold((rx, guard), |(mut rx, guard)| async move {
-            rx.recv().await.map(|event| (event, (rx, guard)))
-        })
-        .boxed()
+        crate::stream_guard::parser_stream(parser, rx)
     }
 }
 
@@ -1668,6 +1797,7 @@ mod tool_round_policy_tests {
                 anyhow::bail!("503 temporarily unavailable");
             }
             Ok(ProviderChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("ok".into()),
                 tool_calls: vec![],
                 usage: None,
@@ -1820,6 +1950,7 @@ mod tool_round_policy_tests {
         policy: Option<ToolRoundPolicy>,
         tool_shape: u8,
     ) -> serde_json::Value {
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
         let captured = Arc::new(Mutex::new(None));
         let capture = Arc::clone(&captured);
         let path = match wire {
@@ -1900,12 +2031,23 @@ mod tool_round_policy_tests {
         let dispatch = ProviderDispatch::new(Arc::clone(&provider));
         let messages = [
             ChatMessage::user("continue"),
-            ChatMessage::assistant(
-                r#"{"content":"working","tool_calls":[{"id":"call-one","name":"echo","arguments":"{}"}]}"#,
+            ChatMessage::assistant_tool_calls(
+                "working",
+                vec![zeroclaw_api::model_provider::ToolCall {
+                    id: "call-one".into(),
+                    name: "echo".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                None,
             ),
-            ChatMessage::tool(
-                r#"{"tool_call_id":"call-one","tool_name":"echo","content":"result-one"}"#,
-            ),
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "call-one".into(),
+                tool_name: "".into(),
+                success: None,
+                content: "result-one".into(),
+                attachments: Vec::new(),
+            }),
         ];
         let tools = if tool_shape == 2 {
             vec![ToolSpec::new(
@@ -2020,6 +2162,25 @@ mod tool_round_policy_tests {
 mod tests {
     use super::*;
 
+    #[test]
+    fn native_plain_reasoning_is_preserved_without_inferring_signed_content() {
+        let reasoning =
+            r#"{"thinking":"ordinary token=fixture-token","signature":"sk-fixture-signature"}"#;
+        let message: NativeResponseMessage = serde_json::from_value(serde_json::json!({
+            "content":"answer", "reasoning_content":reasoning,
+        }))
+        .expect("native response");
+        assert_eq!(message.reasoning_content.as_deref(), Some(reasoning));
+        let zeroclaw_api::model_provider::ProviderOutputBlock::Reasoning { bytes, .. } =
+            &message.output_blocks[0]
+        else {
+            panic!("typed reasoning");
+        };
+        assert_eq!(bytes, reasoning.to_owned().as_bytes());
+        assert!(String::from_utf8_lossy(bytes).contains("fixture-token"));
+        assert!(String::from_utf8_lossy(bytes).contains("sk-fixture-signature"));
+    }
+
     #[tokio::test]
     async fn responses_model_listing_parses_normal_body() {
         use axum::{Json, Router, routing::get};
@@ -2110,6 +2271,7 @@ mod tests {
     async fn responses_model_listing_carries_header_only_profile_and_surfaces_auth_failure() {
         use axum::{Json, Router, extract::Request, http::StatusCode, routing::get};
         use tokio::net::TcpListener;
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
 
         // Success case: the configured X-Auth header must arrive, and no
         // Authorization header should be synthesized for a header-only profile.
@@ -2220,6 +2382,7 @@ mod tests {
     async fn responses_completed_ignores_trailing_events_without_eof() {
         use axum::{Router, response::IntoResponse, routing::post};
 
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
         let app = Router::new().route(
             "/responses",
             post(|| async {
@@ -2258,7 +2421,6 @@ mod tests {
         .await
         .expect("response.completed must finish without waiting for EOF");
         drop(tx);
-        server.abort();
 
         let mut text = None;
         let mut saw_final = false;
@@ -2271,6 +2433,37 @@ mod tests {
         }
         assert_eq!(text.as_deref(), Some("fallback"));
         assert!(saw_final, "response.completed must emit Final");
+
+        let directory = tempfile::tempdir().expect("provider state");
+        let provider = crate::openai_codex::OpenAiCodexModelProvider::new(
+            "fixture",
+            &crate::ModelProviderRuntimeOptions {
+                provider_api_url: Some(format!("http://{addr}")),
+                zeroclaw_dir: Some(directory.path().to_path_buf()),
+                secrets_encrypt: false,
+                ..Default::default()
+            },
+            Some("fixture-key"),
+        )
+        .expect("buffered Responses provider");
+        let messages = [ChatMessage::user("fixture")];
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            provider.chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "fixture",
+                None,
+            ),
+        )
+        .await
+        .expect("buffered completion must finish without EOF")
+        .expect("buffered response");
+        assert_eq!(response.text.as_deref(), Some("fallback"));
+        server.abort();
     }
 
     #[tokio::test]
@@ -3225,17 +3418,16 @@ mod tests {
     fn convert_messages_round_trips_reasoning_content() {
         use zeroclaw_api::model_provider::ChatMessage;
 
-        let history_json = serde_json::json!({
-            "content": "I will check",
-            "tool_calls": [{
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            ("I will check").to_string(),
+            serde_json::from_value(serde_json::json!([{
                 "id": "tc_1",
                 "name": "shell",
                 "arguments": "{}"
-            }],
-            "reasoning_content": "Let me think..."
-        });
-
-        let messages = vec![ChatMessage::assistant(history_json.to_string())];
+            }]))
+            .unwrap(),
+            Some(("Let me think...").to_string()),
+        )];
         let native = OpenAiModelProvider::convert_messages(&messages);
         assert_eq!(native.len(), 1);
         assert_eq!(
@@ -3248,16 +3440,16 @@ mod tests {
     fn convert_messages_no_reasoning_content_when_absent() {
         use zeroclaw_api::model_provider::ChatMessage;
 
-        let history_json = serde_json::json!({
-            "content": "I will check",
-            "tool_calls": [{
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            ("I will check").to_string(),
+            serde_json::from_value(serde_json::json!([{
                 "id": "tc_1",
                 "name": "shell",
                 "arguments": "{}"
-            }]
-        });
-
-        let messages = vec![ChatMessage::assistant(history_json.to_string())];
+            }]))
+            .unwrap(),
+            None,
+        )];
         let native = OpenAiModelProvider::convert_messages(&messages);
         assert_eq!(native.len(), 1);
         assert!(native[0].reasoning_content.is_none());
@@ -3270,8 +3462,15 @@ mod tests {
         // covered in `compatible::tests::sanitize_tool_arguments_*`.
         use zeroclaw_api::model_provider::ChatMessage;
 
-        let messages = vec![ChatMessage::assistant(
-            r#"{"content":"trying","tool_calls":[{"id":"call_bad","name":"shell","arguments":"{\"command\":\"rm -rf"}]}"#.to_string(),
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            "trying",
+            vec![zeroclaw_api::model_provider::ToolCall {
+                id: "call_bad".into(),
+                name: "shell".into(),
+                arguments: "{\"command\":\"rm -rf".into(),
+                extra_content: None,
+            }],
+            None,
         )];
 
         let native = OpenAiModelProvider::convert_messages(&messages);
@@ -3287,8 +3486,15 @@ mod tests {
         // Companion regression: valid JSON must round-trip byte-for-byte.
         use zeroclaw_api::model_provider::ChatMessage;
 
-        let messages = vec![ChatMessage::assistant(
-            r#"{"content":"using","tool_calls":[{"id":"call_ok","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#.to_string(),
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            "using",
+            vec![zeroclaw_api::model_provider::ToolCall {
+                id: "call_ok".into(),
+                name: "shell".into(),
+                arguments: "{\"command\":\"pwd\"}".into(),
+                extra_content: None,
+            }],
+            None,
         )];
 
         let native = OpenAiModelProvider::convert_messages(&messages);
@@ -3792,7 +3998,7 @@ mod tests {
             .expect("stalled Responses stream must yield an error");
         server.abort();
         let message = match item {
-            Err(StreamError::ModelProvider(message)) => message,
+            Err(StreamError::ResponseTimeout(message)) => message,
             Err(other) => panic!("expected a model provider error, got {other:?}"),
             Ok(_) => panic!("expected an error from the stalled Responses stream"),
         };

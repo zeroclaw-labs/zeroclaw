@@ -879,7 +879,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_args_for_export_scrubs_provider_tokens_and_image_markers() {
+    fn prepare_args_for_export_scrubs_tokens_and_preserves_literal_media_text() {
         let provider_token = ["ghp_", "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"].concat();
         let args = serde_json::json!({
             "request": {
@@ -894,7 +894,7 @@ mod tests {
         assert!(!exported.to_string().contains(&provider_token));
         assert_eq!(
             exported["request"]["attachment"],
-            "[IMAGE:<image data elided>]"
+            "[IMAGE:data:image/png;base64,AAAA]"
         );
     }
 

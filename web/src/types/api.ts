@@ -1,5 +1,10 @@
 import type { components } from "../lib/api-generated";
 
+export interface AttachmentReference {
+  target: string;
+  kind: 'image' | 'audio' | 'video' | 'document';
+}
+
 export type StatusResponse = components["schemas"]["StatusResponse"];
 
 export interface ProcessStats {
@@ -168,16 +173,13 @@ export interface CliTool {
 }
 
 export interface Session {
-  /** Display form: `gw_` stripped for gateway sessions, full composite for
-   * channel-driven sessions. */
+  /** Canonical session identifier used by all session APIs. */
   session_id: string;
-  /** Full DB key. Use this when calling DELETE / messages / abort
-   * endpoints — `session_id` is for display only. */
-  session_key: string;
   created_at: string;
   last_activity: string;
   message_count: number;
-  name?: string;
+  title?: string;
+  creation_source?: string | null;
   /** Alias of the agent that owned this session. `null` for legacy rows
    * with no attribution at all (channel_id null too). */
   agent_alias: string | null;
@@ -310,6 +312,8 @@ export interface PendingApproval {
 export interface SessionMessageRow {
   role: string;
   content: string;
+  files?: string[];
+  attachments?: AttachmentReference[];
   /** RFC 3339 timestamp recorded when the row was persisted. `null` for
    * backends that don't stamp per-row timestamps (JSONL / in-memory). */
   created_at: string | null;

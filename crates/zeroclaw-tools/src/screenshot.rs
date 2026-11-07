@@ -3,7 +3,7 @@ use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use zeroclaw_api::media::{MarkerKind, RenderedMarker};
+use zeroclaw_api::media::{AttachmentKind, AttachmentReference};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
@@ -162,9 +162,9 @@ impl ScreenshotTool {
                 .into(),
                 error: None,
             }
-            .with_attachment(RenderedMarker {
+            .with_attachment(AttachmentReference {
                 target: output_path.display().to_string(),
-                kind: MarkerKind::Image,
+                kind: AttachmentKind::Image,
             })),
             Err(e) => Ok(ToolResult {
                 success: false,
@@ -326,7 +326,7 @@ mod tests {
 
         assert!(result.success);
         assert_eq!(result.output.attachments().len(), 1);
-        assert_eq!(result.output.attachments()[0].kind, MarkerKind::Image);
+        assert_eq!(result.output.attachments()[0].kind, AttachmentKind::Image);
         assert_eq!(
             result.output.attachments()[0].target,
             image.display().to_string()

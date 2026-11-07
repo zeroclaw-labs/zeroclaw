@@ -217,10 +217,9 @@ pub(crate) async fn finish_after_max_iterations(
                 &selected_model,
             );
             let suffix_only = messages.len() >= pre_hook_messages.len()
-                && messages
-                    .iter()
-                    .zip(&pre_hook_messages)
-                    .all(|(a, b)| a.role == b.role && a.content == b.content);
+                && messages.iter().zip(&pre_hook_messages).all(|(a, b)| {
+                    a.role == b.role && a.content == b.content && a.timestamp == b.timestamp
+                });
             let hook_suffix = if suffix_only {
                 messages[pre_hook_messages.len()..].to_vec()
             } else {
@@ -598,6 +597,7 @@ mod graceful_summary_metering_tests {
         ) -> anyhow::Result<ChatResponse> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("wrap-up summary".to_string()),
                 tool_calls: Vec::new(),
                 usage: Some(TokenUsage {
@@ -644,6 +644,7 @@ mod graceful_summary_metering_tests {
         ) -> anyhow::Result<ChatResponse> {
             Ok(ChatResponse {
                 text: Some("wrap-up summary".to_string()),
+                output_blocks: vec![],
                 tool_calls: Vec::new(),
                 usage: None,
                 reasoning_content: None,
@@ -835,7 +836,7 @@ mod graceful_summary_metering_tests {
             monthly_limit_usd: -1.0,
             ..CostConfig::default()
         };
-        let tracker = Arc::new(crate::cost::CostTracker::new(cfg, tmp.path()).unwrap());
+        let tracker = Arc::new(crate::cost::CostTracker::new(cfg, tmp.path(), "jsonl").unwrap());
         let ctx = ToolLoopCostTrackingContext::new(tracker, Arc::new(HashMap::new()));
 
         let result = TOOL_LOOP_COST_TRACKING_CONTEXT
@@ -871,6 +872,7 @@ mod graceful_summary_metering_tests {
             _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("<think>internal reasoning</think>".to_string()),
                 tool_calls: Vec::new(),
                 usage: Some(TokenUsage {
@@ -972,11 +974,22 @@ mod graceful_summary_metering_tests {
             let joined = request
                 .messages
                 .iter()
-                .map(|m| m.content.clone())
+                .map(|message| {
+                    std::iter::once(message.content.as_str())
+                        .chain(
+                            message
+                                .attachments
+                                .iter()
+                                .map(|attachment| attachment.target.as_str()),
+                        )
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             self.seen.lock().unwrap().push(joined);
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("wrap-up summary".to_string()),
                 tool_calls: Vec::new(),
                 usage: None,
@@ -1138,15 +1151,20 @@ mod graceful_summary_metering_tests {
                 ChatMessage::user("obsolete context ".repeat(800)),
                 ChatMessage::assistant("obsolete answer"),
                 ChatMessage::user("capture the screenshot"),
-                ChatMessage::assistant(assistant_content),
-                ChatMessage::tool(
-                    serde_json::json!({
-                        "content": "captured screenshot",
-                        "tool_call_id": "toolu_image",
-                        "attachments": [{"kind": "image", "target": image_reference}],
-                    })
-                    .to_string(),
-                ),
+                assistant_content,
+                ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                    tool_call_id: ("toolu_image").to_string(),
+                    tool_name: String::new(),
+                    content: ("captured screenshot").to_string(),
+                    success: None,
+                    attachments: Vec::new(),
+                })
+                .with_attachments(vec![
+                    zeroclaw_api::media::AttachmentReference {
+                        kind: zeroclaw_api::media::AttachmentKind::Image,
+                        target: image_reference.clone(),
+                    },
+                ]),
             ];
             let prepared = super::super::vision_route::prepare_messages_for_iteration(
                 &history,
@@ -1323,30 +1341,41 @@ mod graceful_summary_metering_tests {
         }
     }
 
-    // The summary request must drop declared audio attachments before dispatch,
-    // just like an in-loop request. Legacy tool text is not scanned for markers.
+    // Internal requests carry audio as an attachment until the provider adapter
+    // renders its wire protocol; the tool's text remains unchanged.
     #[tokio::test]
-    async fn graceful_summary_drops_declared_tool_audio_attachment() {
+    async fn graceful_summary_preserves_structured_audio_attachment() {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider = CapturingProvider {
             seen: Arc::clone(&seen),
             vision: false,
             ..Default::default()
         };
-        let attachments = vec![zeroclaw_api::media::RenderedMarker {
+        let attachments = vec![zeroclaw_api::media::AttachmentReference {
             target: "/tmp/clip.wav".to_string(),
-            kind: zeroclaw_api::media::MarkerKind::Audio,
+            kind: zeroclaw_api::media::AttachmentKind::Audio,
         }];
-        let tool_content = serde_json::json!({
-            "content": "recorded 3:00 PM",
-            "tool_call_id": "toolu_1",
-            "attachments": zeroclaw_api::tool_carrier::render_native_attachments(&attachments),
-        })
-        .to_string();
+        let tool_content =
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                content: ("recorded 3:00 PM").to_string(),
+                tool_call_id: "toolu_1".into(),
+                tool_name: "shell".into(),
+                success: Some(true),
+                attachments,
+            });
         let mut history = vec![
             ChatMessage::user("call the tool and tell me what you hear"),
-            ChatMessage::assistant(r#"{"tool_calls":[{"id":"toolu_1"}]}"#),
-            ChatMessage::tool(tool_content),
+            ChatMessage::assistant_tool_calls(
+                "",
+                vec![zeroclaw_api::model_provider::ToolCall {
+                    id: "toolu_1".into(),
+                    name: "shell".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                None,
+            ),
+            tool_content,
         ];
         let pacing = PacingConfig::default();
         let knobs = LoopKnobs::default();
@@ -1387,12 +1416,12 @@ mod graceful_summary_metering_tests {
         assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
         let captured = seen.lock().unwrap().join("\n");
         assert!(
-            !captured.contains("/tmp/clip.wav"),
-            "declared audio path reached the provider on the max-iteration path: {captured}"
+            captured.contains("/tmp/clip.wav"),
+            "the provider must receive the declared audio attachment: {captured}"
         );
         assert!(
             captured.contains("recorded 3:00 PM"),
-            "tool text should survive dropping the audio attachment: {captured}"
+            "the declared audio attachment must preserve tool text: {captured}"
         );
     }
 
@@ -1406,9 +1435,9 @@ mod graceful_summary_metering_tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let bogus_image = temp.path().join("shot.txt");
         std::fs::write(&bogus_image, b"not an image").expect("write text bytes");
-        let attachments = vec![zeroclaw_api::media::RenderedMarker {
+        let attachments = vec![zeroclaw_api::media::AttachmentReference {
             target: bogus_image.display().to_string(),
-            kind: zeroclaw_api::media::MarkerKind::Image,
+            kind: zeroclaw_api::media::AttachmentKind::Image,
         }];
 
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1421,16 +1450,27 @@ mod graceful_summary_metering_tests {
         // envelope, so the orphan sweep keeps the exchange intact and the
         // declared attachment reaches the summary preparation as a
         // latest-run tool result.
-        let tool_content = serde_json::json!({
-            "content": "shot",
-            "tool_call_id": "toolu_img",
-            "attachments": zeroclaw_api::tool_carrier::render_native_attachments(&attachments),
-        })
-        .to_string();
+        let tool_content =
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                content: ("shot").to_string(),
+                tool_call_id: "toolu_img".into(),
+                tool_name: "shell".into(),
+                success: Some(true),
+                attachments,
+            });
         let mut history = vec![
             ChatMessage::user("call the tool and describe the screenshot"),
-            ChatMessage::assistant(r#"{"tool_calls":[{"id":"toolu_img"}]}"#),
-            ChatMessage::tool(tool_content),
+            ChatMessage::assistant_tool_calls(
+                "",
+                vec![zeroclaw_api::model_provider::ToolCall {
+                    id: "toolu_img".into(),
+                    name: "shell".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                None,
+            ),
+            tool_content,
         ];
         let pacing = PacingConfig::default();
         let knobs = LoopKnobs::default();
@@ -1491,7 +1531,7 @@ mod graceful_summary_metering_tests {
     // arrive as the same payload. This pins the normalize decision for the
     // summary path: the summary may see the turn's images.
     #[tokio::test]
-    async fn graceful_summary_normalizes_local_and_inline_tool_image_markers() {
+    async fn graceful_summary_normalizes_local_and_inline_tool_attachments() {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
 
         const PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
@@ -1504,13 +1544,13 @@ mod graceful_summary_metering_tests {
         .expect("write PNG fixture");
         let inline_uri = format!("data:image/png;base64,{PNG_B64}");
         let attachments = vec![
-            zeroclaw_api::media::RenderedMarker {
+            zeroclaw_api::media::AttachmentReference {
                 target: png_path.display().to_string(),
-                kind: zeroclaw_api::media::MarkerKind::Image,
+                kind: zeroclaw_api::media::AttachmentKind::Image,
             },
-            zeroclaw_api::media::RenderedMarker {
+            zeroclaw_api::media::AttachmentReference {
                 target: inline_uri.to_string(),
-                kind: zeroclaw_api::media::MarkerKind::Image,
+                kind: zeroclaw_api::media::AttachmentKind::Image,
             },
         ];
 
@@ -1520,16 +1560,27 @@ mod graceful_summary_metering_tests {
             vision: true,
             ..Default::default()
         };
-        let tool_content = serde_json::json!({
-            "content": "both shots",
-            "tool_call_id": "toolu_two",
-            "attachments": zeroclaw_api::tool_carrier::render_native_attachments(&attachments),
-        })
-        .to_string();
+        let tool_content =
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                content: ("both shots").to_string(),
+                tool_call_id: "toolu_two".into(),
+                tool_name: "shell".into(),
+                success: Some(true),
+                attachments,
+            });
         let mut history = vec![
             ChatMessage::user("call the tool and describe both screenshots"),
-            ChatMessage::assistant(r#"{"tool_calls":[{"id":"toolu_two"}]}"#),
-            ChatMessage::tool(tool_content),
+            ChatMessage::assistant_tool_calls(
+                "",
+                vec![zeroclaw_api::model_provider::ToolCall {
+                    id: "toolu_two".into(),
+                    name: "shell".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                None,
+            ),
+            tool_content,
         ];
         let pacing = PacingConfig::default();
         let knobs = LoopKnobs::default();
@@ -1584,96 +1635,6 @@ mod graceful_summary_metering_tests {
         );
     }
 
-    // Legacy control: a tool result whose body embeds image marker syntax
-    // with no declaration is never promoted, even when the referenced file
-    // is a valid image. Nothing is loaded, no note is appended, and the body
-    // is delivered as the legacy path delivers it: the one-shot seam's
-    // compatibility sweep replaces the path reference with a placeholder.
-    #[tokio::test]
-    async fn graceful_summary_does_not_promote_legacy_tool_body_markers() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let png_path = temp.path().join("shot.png");
-        std::fs::write(&png_path, [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a])
-            .expect("write png signature");
-        let marker = format!("[{}:{}]", "IMAGE", png_path.display());
-
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let provider = CapturingProvider {
-            seen: Arc::clone(&seen),
-            vision: true,
-            ..Default::default()
-        };
-        let tool_content = serde_json::json!({
-            "content": format!("saw {marker} in output"),
-            "tool_call_id": "toolu_legacy",
-        })
-        .to_string();
-        let mut history = vec![
-            ChatMessage::user("call the tool and describe the screenshot"),
-            ChatMessage::assistant(r#"{"tool_calls":[{"id":"toolu_legacy"}]}"#),
-            ChatMessage::tool(tool_content.clone()),
-        ];
-        let pacing = PacingConfig::default();
-        let knobs = LoopKnobs::default();
-        let multimodal_config = MultimodalConfig::default();
-
-        let out = finish_after_max_iterations(
-            &mut None,
-            &provider,
-            &mut history,
-            "custom",
-            "test-model",
-            "test-model",
-            None,
-            &pacing,
-            None,
-            CompletionLimit::LocalIterations(2),
-            String::new(),
-            "trace-req-img-legacy",
-            &knobs,
-            None,
-            None,
-            None,
-            None,
-            &multimodal_config,
-            None,
-            None,
-            None,
-            None,
-            |_, _| ResolvedContextLimits::legacy_fallback(0),
-            &mut false,
-            None,
-            &crate::observability::NoopObserver,
-            None,
-        )
-        .await
-        .expect("graceful summary should succeed");
-
-        assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
-        let captured = seen.lock().unwrap().join("\n");
-        assert!(
-            !captured.contains("data:image"),
-            "a legacy body marker must not be promoted to an image: {captured}"
-        );
-        assert!(
-            !captured.contains("could not be loaded"),
-            "nothing is loaded for a legacy body, so no note is appended: {captured}"
-        );
-        // A legacy carrier is delivered as its bytes: the body reaches the
-        // provider verbatim, quoted marker syntax and raw path included, as
-        // text. Nothing infers, sweeps, or strips it. Compare the whole
-        // carrier: its JSON escaping doubles a Windows path's backslashes, so
-        // the unescaped body never appears in it there.
-        assert!(
-            captured.contains(&tool_content),
-            "the legacy body is delivered verbatim: {captured}"
-        );
-        assert!(
-            !captured.contains(zeroclaw_providers::multimodal::MEDIA_PLACEHOLDER),
-            "no seam rewrites a legacy carrier's body: {captured}"
-        );
-    }
-
     // A declared count-zero tool result whose body quotes a path marker: the
     // body is text under the attachment-identity contract, and the one-shot
     // dispatch seam behind the graceful summary must deliver it byte for
@@ -1694,16 +1655,27 @@ mod graceful_summary_metering_tests {
             vision: true,
             ..Default::default()
         };
-        let native_content = serde_json::json!({
-            "content": body,
-            "tool_call_id": "toolu_quote",
-            "attachments": zeroclaw_api::tool_carrier::render_native_attachments(&[]),
-        })
-        .to_string();
+        let native_content =
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                content: (body).to_string(),
+                tool_call_id: "toolu_quote".into(),
+                tool_name: "shell".into(),
+                success: Some(true),
+                attachments: Vec::new(),
+            });
         let mut history = vec![
             ChatMessage::user("call the tool and read the file"),
-            ChatMessage::assistant(r#"{"tool_calls":[{"id":"toolu_quote"}]}"#),
-            ChatMessage::tool(native_content.clone()),
+            ChatMessage::assistant_tool_calls(
+                "",
+                vec![zeroclaw_api::model_provider::ToolCall {
+                    id: "toolu_quote".into(),
+                    name: "shell".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                None,
+            ),
+            native_content.clone(),
         ];
         let pacing = PacingConfig::default();
         let knobs = LoopKnobs::default();
@@ -1744,63 +1716,8 @@ mod graceful_summary_metering_tests {
         assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
         let captured = seen.lock().unwrap().join("\n");
         assert!(
-            captured.contains(&native_content),
+            captured.contains(&native_content.content),
             "the declared count-zero native body must arrive byte for byte: {captured}"
-        );
-        assert!(
-            !captured.contains(zeroclaw_providers::multimodal::MEDIA_PLACEHOLDER),
-            "no placeholder may be substituted at the seam: {captured}"
-        );
-
-        // Prompt shape: a count-zero prompt carrier in a user-role message.
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let provider = CapturingProvider {
-            seen: Arc::clone(&seen),
-            vision: true,
-            ..Default::default()
-        };
-        let carrier = zeroclaw_api::tool_carrier::render_prompt_tool_carrier(&body, &[]);
-        let mut history = vec![
-            ChatMessage::user("call the tool and read the file"),
-            ChatMessage::user(carrier.clone()),
-        ];
-        let out = finish_after_max_iterations(
-            &mut None,
-            &provider,
-            &mut history,
-            "custom",
-            "test-model",
-            "test-model",
-            None,
-            &pacing,
-            None,
-            CompletionLimit::LocalIterations(2),
-            String::new(),
-            "trace-req-img-quote-prompt",
-            &knobs,
-            None,
-            None,
-            None,
-            None,
-            &multimodal_config,
-            None,
-            None,
-            None,
-            None,
-            |_, _| ResolvedContextLimits::legacy_fallback(0),
-            &mut false,
-            None,
-            &crate::observability::NoopObserver,
-            None,
-        )
-        .await
-        .expect("graceful summary should succeed");
-
-        assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
-        let captured = seen.lock().unwrap().join("\n");
-        assert!(
-            captured.contains(&carrier),
-            "the declared count-zero prompt carrier must arrive byte for byte: {captured}"
         );
         assert!(
             !captured.contains(zeroclaw_providers::multimodal::MEDIA_PLACEHOLDER),
@@ -1832,14 +1749,14 @@ mod graceful_summary_metering_tests {
         );
         let mut history = vec![
             ChatMessage::user("run the tool"),
-            ChatMessage::assistant(assistant_content.clone()),
-            ChatMessage::tool(
-                serde_json::json!({
-                    "content": "done",
-                    "tool_call_id": "toolu_think",
-                })
-                .to_string(),
-            ),
+            assistant_content.clone(),
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: ("toolu_think").to_string(),
+                tool_name: String::new(),
+                content: ("done").to_string(),
+                success: None,
+                attachments: Vec::new(),
+            }),
         ];
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider = CapturingProvider {
@@ -1886,7 +1803,7 @@ mod graceful_summary_metering_tests {
         assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
         let captured = seen.lock().unwrap().join("\n");
         assert!(
-            captured.contains(&assistant_content),
+            captured.contains(&assistant_content.content),
             "the assistant envelope (signed thinking included) must reach the provider byte-for-byte: {captured}"
         );
         assert!(
@@ -1920,15 +1837,20 @@ mod graceful_summary_metering_tests {
             Some(&reasoning),
         );
         let mut history = vec![
-            ChatMessage::user(format!("run the tool on {user_marker}")),
-            ChatMessage::assistant(assistant_content.clone()),
-            ChatMessage::tool(
-                serde_json::json!({
-                    "content": "done",
-                    "tool_call_id": "toolu_think",
-                })
-                .to_string(),
-            ),
+            ChatMessage::user(format!("run the tool on {user_marker}")).with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    target: "/tmp/degrade.png".into(),
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                },
+            ]),
+            assistant_content.clone(),
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: ("toolu_think").to_string(),
+                tool_name: String::new(),
+                content: ("done").to_string(),
+                success: None,
+                attachments: Vec::new(),
+            }),
             ChatMessage::user("continue without images"),
         ];
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1976,7 +1898,7 @@ mod graceful_summary_metering_tests {
         assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
         let captured = seen.lock().unwrap().join("\n");
         assert!(
-            captured.contains(&assistant_content),
+            captured.contains(&assistant_content.content),
             "the assistant envelope (signed thinking included) must survive the degrade path byte-for-byte: {captured}"
         );
         assert!(
@@ -2074,6 +1996,7 @@ mod graceful_summary_metering_tests {
             _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(self.text.clone()),
                 tool_calls: Vec::new(),
                 usage: None,

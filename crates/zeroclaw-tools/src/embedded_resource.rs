@@ -5,7 +5,7 @@
 use base64::Engine;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use zeroclaw_api::media::{MarkerKind, RenderedMarker};
+use zeroclaw_api::media::{AttachmentKind, AttachmentReference};
 
 /// Per-file decoded size limit for embedded blobs (matches RPC attach / ACP).
 pub const MAX_EMBEDDED_FILE_BYTES: u64 = 10 * 1024 * 1024;
@@ -59,7 +59,7 @@ fn estimated_decoded_blob_len(blob: &str) -> u64 {
 #[derive(Debug)]
 pub struct MaterializedResource {
     pub abs_path: PathBuf,
-    pub marker: String,
+    pub reference: zeroclaw_api::media::AttachmentReference,
     pub mime_type: String,
     pub filename: String,
 }
@@ -130,7 +130,7 @@ pub fn decode_embedded_blob(blob_b64: &str) -> Result<Vec<u8>, EmbeddedResourceE
 }
 
 /// Decode `blob_b64`, enforce size limits, write under `{workspace}/uploads/`,
-/// and return a prompt marker (`[Document: …]` or `[IMAGE:…]`). Thin base64
+/// and return a typed attachment reference. Thin base64
 /// front door over [`materialize_bytes`].
 pub fn materialize_resource_blob(
     workspace_dir: &Path,
@@ -259,15 +259,22 @@ pub fn materialize_bytes(
     let abs_path = persist_content_addressed(workspace_dir, bytes, &ext)?;
 
     let abs_display = strip_windows_verbatim_prefix(&abs_path.to_string_lossy()).into_owned();
-    let marker = if mime.starts_with("image/") {
-        format!("[IMAGE:{abs_display}]")
+    let kind = if mime.starts_with("image/") {
+        zeroclaw_api::media::AttachmentKind::Image
+    } else if mime.starts_with("audio/") {
+        zeroclaw_api::media::AttachmentKind::Audio
+    } else if mime.starts_with("video/") {
+        zeroclaw_api::media::AttachmentKind::Video
     } else {
-        format!("[Document: {filename}] {abs_display}")
+        zeroclaw_api::media::AttachmentKind::Document
     };
 
     Ok(MaterializedResource {
         abs_path,
-        marker,
+        reference: zeroclaw_api::media::AttachmentReference {
+            target: abs_display,
+            kind,
+        },
         mime_type: mime.to_string(),
         filename: filename.to_string(),
     })
@@ -509,8 +516,8 @@ fn all_text_content(result: &serde_json::Value) -> Option<String> {
 ///
 /// When `content` contains any `resource` blob or `type: "image"`/`"audio"`
 /// item, the full result is returned as JSON with only the binary payloads
-/// redacted: a resource `blob` becomes a `materialized` reference (a Document
-/// marker for non-image mimes, the saved path for image mimes); a valid
+/// removed: a resource `blob` becomes a `materialized` path and a typed
+/// attachment reference; a valid
 /// `type: "image"` item is materialized under `{workspace}/uploads/` and
 /// rewritten to a text item carrying its saved path, with the item's
 /// `annotations`/`_meta` and other non-binary fields preserved; a `type:
@@ -525,12 +532,9 @@ fn all_text_content(result: &serde_json::Value) -> Option<String> {
 /// as that text alone — see [`all_text_content`]. Results without binary content
 /// that cannot be compacted keep the existing pretty-printed JSON shape.
 ///
-/// Materialized images are declared in the returned attachment list (one
-/// `RenderedMarker` per written image file) instead of being written into the
-/// text as marker syntax: the caller attaches them to the `ToolResult`, so they
-/// ride the tool carrier grammar. A non-image resource blob keeps its Document
-/// marker in the text — that syntax is the channel delivery contract, and it
-/// was never image-promotable.
+/// Materialized resources are declared in the returned attachment list instead
+/// of being written into model-facing text as marker syntax. The caller attaches
+/// them to the `ToolResult`, so every media kind rides the typed tool carrier.
 ///
 /// Crate-internal: the only caller is [`crate::mcp_tool::McpToolWrapper`]; the
 /// serialized `CallToolResult` from `McpRegistry::call_tool` remains the public
@@ -538,7 +542,7 @@ fn all_text_content(result: &serde_json::Value) -> Option<String> {
 pub(crate) fn format_mcp_tool_result_for_model(
     mut result: serde_json::Value,
     workspace_dir: &Path,
-) -> Result<(String, Vec<RenderedMarker>), EmbeddedResourceError> {
+) -> Result<(String, Vec<AttachmentReference>), EmbeddedResourceError> {
     // An all-text result needs none of the machinery below: no content item can
     // hold binary data, and the envelope around the text is proven redundant.
     // An all-text result has no binary item, so it can declare no attachment.
@@ -609,7 +613,7 @@ pub(crate) fn format_mcp_tool_result_for_model(
         let text = serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string());
         return Ok((text, Vec::new()));
     };
-    let mut attachments: Vec<RenderedMarker> = Vec::new();
+    let mut attachments: Vec<AttachmentReference> = Vec::new();
     for item in items.iter_mut() {
         let typ = item
             .get("type")
@@ -658,20 +662,8 @@ pub(crate) fn format_mcp_tool_result_for_model(
                                 &materialized.abs_path.to_string_lossy(),
                             )
                             .into_owned();
-                            if materialized.mime_type.starts_with("image/") {
-                                attachments.push(RenderedMarker {
-                                    target: abs_display.clone(),
-                                    kind: MarkerKind::Image,
-                                });
-                                // The image rides the attachment list; the
-                                // text references the plain path.
-                                abs_display
-                            } else {
-                                // Non-image resources keep their inline
-                                // Document marker: it is the channel delivery
-                                // contract and was never image-promotable.
-                                materialized.marker
-                            }
+                            attachments.push(materialized.reference.clone());
+                            abs_display
                         }
                         Err(e) => format!("[attachment unavailable: {e}]"),
                     }
@@ -708,9 +700,9 @@ pub(crate) fn format_mcp_tool_result_for_model(
                                 &materialized.abs_path.to_string_lossy(),
                             )
                             .into_owned();
-                            attachments.push(RenderedMarker {
+                            attachments.push(AttachmentReference {
                                 target: abs_display.clone(),
-                                kind: MarkerKind::Image,
+                                kind: AttachmentKind::Image,
                             });
                             // The image rides the attachment list; the text
                             // item carries the saved path, never marker
@@ -737,9 +729,8 @@ pub(crate) fn format_mcp_tool_result_for_model(
                 // Audio is intentionally NOT materialized in this slice: the image
                 // intake is split from audio per the accepted issue scope, and no
                 // provider resolves an audio path into content parts today — the
-                // provider layer rewrites a loadable [AUDIO:<path>] to a
-                // placeholder before dispatch, so writing the file delivers
-                // nothing. Restore the non-materializing placeholder: strip the
+                // current model wire adapters do not consume MCP audio bytes.
+                // Preserve the existing non-materializing behavior: strip the
                 // base64 `data` and replace it with a concise marker, never
                 // touching disk. Other non-binary fields carry through.
                 let mime = item
@@ -752,7 +743,7 @@ pub(crate) fn format_mcp_tool_result_for_model(
                 {
                     obj.insert(
                         "materialized".to_string(),
-                        serde_json::Value::String(format!("[audio attachment: {mime}]")),
+                        serde_json::Value::String(format!("Audio attachment unavailable ({mime})")),
                     );
                 }
             }
@@ -863,10 +854,12 @@ mod tests {
         )
         .unwrap();
         assert!(out.abs_path.exists());
-        assert!(out.marker.contains("[Document: report.docx]"));
+        assert_eq!(out.reference.kind, AttachmentKind::Document);
         assert!(
-            out.marker.contains(out.abs_path.to_string_lossy().as_ref())
-                || out.marker.contains(
+            out.reference
+                .target
+                .contains(out.abs_path.to_string_lossy().as_ref())
+                || out.reference.target.contains(
                     strip_windows_verbatim_prefix(&out.abs_path.to_string_lossy()).as_ref()
                 )
         );
@@ -880,7 +873,7 @@ mod tests {
         let out =
             materialize_resource_blob(dir.path(), Some("file:///a.png"), Some("image/png"), &b64)
                 .unwrap();
-        assert!(out.marker.starts_with("[IMAGE:"));
+        assert_eq!(out.reference.kind, AttachmentKind::Image);
     }
 
     #[test]
@@ -1065,9 +1058,14 @@ mod tests {
                 }
             ]
         });
-        let (out, _) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        let (out, attachments) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
         assert!(out.contains("Fetched original"));
-        assert!(out.contains("[Document: report.pdf]"));
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(
+            attachments[0].kind,
+            zeroclaw_api::media::AttachmentKind::Document
+        );
+        assert!(out.contains(&json_escaped(&attachments[0].target)));
         assert!(
             !out.contains(&b64),
             "base64 must not reach the model: {out}"
@@ -1100,7 +1098,10 @@ mod tests {
             1,
             "an image-mime resource blob must be declared as an attachment"
         );
-        assert_eq!(attachments[0].kind, zeroclaw_api::media::MarkerKind::Image);
+        assert_eq!(
+            attachments[0].kind,
+            zeroclaw_api::media::AttachmentKind::Image
+        );
         assert!(
             out.contains(json_escaped(&attachments[0].target).as_str()),
             "the materialized field must reference the saved path: {out}"
@@ -1193,7 +1194,7 @@ mod tests {
     }
 
     #[test]
-    fn mcp_intake_image_item_yields_marker_not_base64() {
+    fn mcp_intake_image_item_yields_typed_attachments_not_base64() {
         // A non-resource `image` block materializes and is declared as an
         // attachment carrying the saved path, never its base64 data. The old
         // MCP fields (mimeType, materialized) must NOT leak into the
@@ -1228,17 +1229,20 @@ mod tests {
         );
         assert_eq!(
             attachments.len(),
-            1,
-            "the image item must be declared as exactly one attachment"
+            2,
+            "the document and image must both be declared as attachments"
         );
-        assert_eq!(attachments[0].kind, zeroclaw_api::media::MarkerKind::Image);
+        assert_eq!(
+            attachments[1].kind,
+            zeroclaw_api::media::AttachmentKind::Image
+        );
         assert!(
-            attachments[0].target.contains("uploads"),
+            attachments[1].target.contains("uploads"),
             "attachment target must point at the materialized file: {:?}",
-            attachments[0].target
+            attachments[1].target
         );
         assert!(
-            out.contains(json_escaped(&attachments[0].target).as_str()),
+            out.contains(json_escaped(&attachments[1].target).as_str()),
             "the text item must reference the saved path: {out}"
         );
         assert!(
@@ -1316,7 +1320,8 @@ mod tests {
         );
         assert!(out.contains("summary"));
         // Binary blob is materialized to disk and never leaked as base64.
-        assert!(out.contains("[Document: report.pdf]"));
+        assert!(out.contains("materialized"));
+        assert!(!out.contains("[Document:"));
         assert!(!out.contains(&b64), "base64 leaked: {out}");
         assert_eq!(
             std::fs::read_dir(dir.path().join("uploads"))
@@ -1425,7 +1430,7 @@ mod tests {
         for (sibling, marker) in [
             (
                 json!({ "type": "audio", "data": b64, "mimeType": "audio/wav" }),
-                "[audio attachment:",
+                "Audio attachment unavailable",
             ),
             (
                 json!({ "type": "resource_link", "uri": "file:///kb/report.pdf" }),
@@ -1467,7 +1472,10 @@ mod tests {
             1,
             "the image item must be declared as exactly one attachment"
         );
-        assert_eq!(attachments[0].kind, zeroclaw_api::media::MarkerKind::Image);
+        assert_eq!(
+            attachments[0].kind,
+            zeroclaw_api::media::AttachmentKind::Image
+        );
         assert!(
             attachments[0].target.contains("uploads"),
             "attachment target must point at the materialized file: {:?}",
@@ -1562,9 +1570,15 @@ mod tests {
                 }
             ]
         });
-        let (out, _) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
-        assert!(out.contains("[Document: a.txt]"));
-        assert!(out.contains("[Document: b.txt]"));
+        let (out, attachments) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert_eq!(attachments.len(), 2);
+        for attachment in &attachments {
+            assert_eq!(
+                attachment.kind,
+                zeroclaw_api::media::AttachmentKind::Document
+            );
+            assert!(out.contains(&json_escaped(&attachment.target)));
+        }
         assert!(dir.path().join("uploads").exists());
     }
 
@@ -1647,7 +1661,8 @@ mod tests {
             !out.contains("aggregate blob size exceeds limit"),
             "an exact-limit blob must not be rejected by the aggregate gate"
         );
-        assert!(out.contains("[Document: big.bin]"));
+        assert!(out.contains("materialized"));
+        assert!(!out.contains("[Document:"));
         assert!(dir.path().join("uploads").exists());
     }
 
@@ -1733,7 +1748,7 @@ mod tests {
     }
 
     #[test]
-    fn mcp_intake_audio_degrades_to_placeholder_without_writing() {
+    fn mcp_intake_audio_reports_unavailable_without_writing() {
         // Audio is NOT materialized in this slice: the base64 `data` is stripped
         // and replaced with a non-materializing `[audio attachment: <mime>]`
         // placeholder, and nothing is written to disk.
@@ -1746,7 +1761,7 @@ mod tests {
         });
         let (out, _) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
         assert!(
-            out.contains("[audio attachment: audio/wav]"),
+            out.contains("Audio attachment unavailable (audio/wav)"),
             "missing audio placeholder: {out}"
         );
         assert!(
@@ -1931,18 +1946,13 @@ mod tests {
         // The MIME-to-extension behavior is confined to the MCP image entry
         // point. The shared materialize_resource_blob (used by ACP) keeps its
         // master semantics for a URI-less blob: a non-image is a Document named
-        // upload.bin, and an image still resolves to an [IMAGE:] marker so ACP
-        // image delivery is unaffected.
+        // upload.bin; an image carries a typed image reference.
         let dir = tempdir().unwrap();
         let pdf =
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"%PDF-1.7 body");
         let doc =
             materialize_resource_blob(dir.path(), None, Some("application/pdf"), &pdf).unwrap();
-        assert!(
-            doc.marker.contains("[Document:"),
-            "uri-less non-image should be a Document: {}",
-            doc.marker
-        );
+        assert_eq!(doc.reference.kind, AttachmentKind::Document);
         assert!(
             doc.abs_path.to_string_lossy().ends_with(".bin"),
             "uri-less blob keeps the .bin name, not a MIME-derived extension: {:?}",
@@ -1951,11 +1961,7 @@ mod tests {
 
         let img = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"img-bytes");
         let out = materialize_resource_blob(dir.path(), None, Some("image/png"), &img).unwrap();
-        assert!(
-            out.marker.starts_with("[IMAGE:"),
-            "ACP image blob still materializes as IMAGE: {}",
-            out.marker
-        );
+        assert_eq!(out.reference.kind, AttachmentKind::Image);
     }
 
     #[test]

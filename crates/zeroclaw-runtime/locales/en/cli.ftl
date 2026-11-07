@@ -1603,8 +1603,8 @@ cli-delegate-error-invalid-semantic-completion = Agent '{$agent_name}' failed: m
 cli-agent-error-invalid-semantic-completion = The model provider returned an invalid semantic completion.
 cli-delegate-error-incomplete-after-provider-tools = Agent '{$agent_name}' failed: the model provider ended after provider-executed tools without a final response.
 cli-agent-error-incomplete-after-provider-tools = The model provider ended after provider-executed tools without a final response.
-cli-agent-vision-unsupported-by-fallback = received {$marker_count} image marker(s), but fallback model_provider={$fallback_name} does not support vision input
-cli-agent-vision-unsupported-by-provider = received {$marker_count} image marker(s), but this model_provider does not support vision input
+cli-agent-vision-unsupported-by-fallback = received {$marker_count} image reference(s), but fallback model_provider={$fallback_name} does not support vision input
+cli-agent-vision-unsupported-by-provider = received {$marker_count} image reference(s), but this model_provider does not support vision input
 cli-agent-error-provider-context-window = The request is too large for the selected model. Reduce the conversation or choose a model with a larger context window.
 cli-agent-error-provider-credentials-missing = The selected model provider has no configured credentials. Add its API key or choose another provider.
 cli-agent-error-provider-credentials-missing-named = The model provider {$provider} has no configured credentials. Add its API key or choose another provider.

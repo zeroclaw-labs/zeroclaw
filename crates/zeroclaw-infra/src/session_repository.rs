@@ -1,0 +1,827 @@
+//! Standard session repository used by protocol entrances. Event storage and
+//! projections are shared; the protocol is metadata on a session, never part
+//! of its identity.
+use crate::session_events::{catalog::SessionCatalog, scoped::EventStorePool};
+use anyhow::{Context, Result};
+use chrono::Utc;
+use std::path::{Path, PathBuf};
+#[cfg(any(test, feature = "test-util"))]
+use zeroclaw_api::model_provider::ConversationMessage;
+use zeroclaw_api::plan::PlanEntry;
+use zeroclaw_log::{Action, EventOutcome};
+mod models;
+mod view;
+pub use models::*;
+
+impl zeroclaw_api::session_events::management::AgentSessionPort for SessionRepository {
+    fn count_live(&self, agent: &str) -> Result<usize> {
+        self.count_live_sessions_by_agent(agent)
+    }
+    fn list_by_agent(
+        &self,
+        agent: &str,
+    ) -> Result<Vec<zeroclaw_api::session_events::catalog::Session>> {
+        Ok(self
+            .catalog()?
+            .query()
+            .indexed_summaries()?
+            .into_iter()
+            .map(|(_, session)| session)
+            .filter(|session| session.owning_agent.as_deref() == Some(agent))
+            .collect())
+    }
+    fn close_by_agent(&self, agent: &str) -> Result<usize> {
+        self.delete_sessions_by_agent(agent)
+    }
+    fn rename_agent(&self, from: &str, to: &str) -> Result<usize> {
+        self.rename_sessions_by_agent(from, to)
+    }
+}
+
+macro_rules! legacy_fixture {
+    ($repository:expr, $method:ident($($argument:expr),* $(,)?)) => {
+        #[cfg(any(test, feature = "test-util"))]
+        if let Some(legacy) = $repository.fixture()? {
+            return legacy.$method($($argument),*);
+        }
+    };
+}
+
+#[cfg(any(test, feature = "test-util"))]
+mod legacy_fixture;
+
+pub struct SessionRepository {
+    data_dir: PathBuf,
+    stores: EventStorePool,
+    #[cfg(any(test, feature = "test-util"))]
+    legacy_fixture: Option<crate::session_events::upgrade::legacy_acp::LegacyAcpStore>,
+}
+
+impl SessionRepository {
+    /// Bind the installation's canonical session store. Creation protocol is
+    /// supplied separately as metadata when a session is created.
+    pub fn new(data_dir: &Path) -> Result<Self> {
+        Ok(Self {
+            data_dir: data_dir.into(),
+            stores: Default::default(),
+            #[cfg(any(test, feature = "test-util"))]
+            legacy_fixture: None,
+        })
+    }
+
+    /// Query and command capabilities share the standard installation catalog.
+    /// No protocol-specific connection or metadata state is retained.
+    pub fn catalog(&self) -> Result<SessionCatalog> {
+        SessionCatalog::open(&self.data_dir, &self.stores)?
+            .context("standard session storage has not been initialized")
+    }
+
+    /// Run a synchronous effect while the canonical catalog holds its owner
+    /// read boundary. Metadata changes and backend cutover take the same lock.
+    pub fn with_session_owner<R>(
+        &self,
+        session_id: &str,
+        effect: impl FnOnce(Option<&str>) -> Result<R>,
+    ) -> Result<R> {
+        let view = self.view()?;
+        let record = view.required(session_id)?;
+        let owner: Option<String> = view::RepositoryView::value(&record, "principal_id", None)?;
+        effect(owner.as_deref())
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn legacy_fixture(data_dir: &Path) -> Result<Self> {
+        let mut repository = Self::new(data_dir)?;
+        if !data_dir.join("sessions/session-format.json").try_exists()? {
+            repository.legacy_fixture =
+                Some(crate::session_events::upgrade::legacy_acp::LegacyAcpStore::new(data_dir)?);
+        }
+        Ok(repository)
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    fn fixture(
+        &self,
+    ) -> Result<Option<&crate::session_events::upgrade::legacy_acp::LegacyAcpStore>> {
+        Ok(
+            if self
+                .data_dir
+                .join("sessions/session-format.json")
+                .try_exists()?
+            {
+                None
+            } else {
+                self.legacy_fixture.as_ref()
+            },
+        )
+    }
+
+    fn view(&self) -> Result<view::RepositoryView> {
+        let catalog = self.catalog()?;
+        Ok(view::RepositoryView(catalog))
+    }
+    pub fn create_session(
+        &self,
+        session_uuid: &str,
+        creation_source: &str,
+        agent_alias: &str,
+        workspace_dir: &str,
+        principal_id: Option<&str>,
+    ) -> Result<i64> {
+        legacy_fixture!(
+            self,
+            create_session(session_uuid, agent_alias, workspace_dir, principal_id)
+        );
+
+        self.create_session_with_interaction_surface(
+            session_uuid,
+            creation_source,
+            agent_alias,
+            workspace_dir,
+            None,
+            principal_id,
+        )
+    }
+
+    pub fn create_session_with_interaction_surface(
+        &self,
+        session_uuid: &str,
+        creation_source: &str,
+        agent_alias: &str,
+        workspace_dir: &str,
+        interaction_surface: Option<&str>,
+        principal_id: Option<&str>,
+    ) -> Result<i64> {
+        legacy_fixture!(
+            self,
+            create_session_with_interaction_surface(
+                session_uuid,
+                agent_alias,
+                workspace_dir,
+                interaction_surface,
+                principal_id,
+            )
+        );
+
+        let native = self.view()?;
+
+        native.create(
+            session_uuid,
+            creation_source,
+            agent_alias,
+            vec![
+                ("workspace_dir", serde_json::json!(workspace_dir)),
+                (
+                    "interaction_surface",
+                    serde_json::json!(interaction_surface),
+                ),
+                ("principal_id", serde_json::json!(principal_id)),
+            ],
+        )
+    }
+
+    pub fn delete_session_owned(
+        &self,
+        session_uuid: &str,
+        owner_principal_id: &str,
+    ) -> Result<bool> {
+        legacy_fixture!(self, delete_session_owned(session_uuid, owner_principal_id));
+
+        let native = self.view()?;
+
+        native.delete(session_uuid, Some(owner_principal_id))
+    }
+
+    // Distinguish a missing session from an existing unscoped session.
+    #[allow(clippy::option_option)]
+    pub fn session_principal(&self, session_uuid: &str) -> Result<Option<Option<String>>> {
+        legacy_fixture!(self, session_principal(session_uuid));
+
+        let native = self.view()?;
+
+        native
+            .record(session_uuid)?
+            .map(|record| view::RepositoryView::value(&record, "principal_id", None))
+            .transpose()
+    }
+
+    pub fn session_owner_and_surface(
+        &self,
+        session_uuid: &str,
+    ) -> Result<Option<(Option<String>, Option<String>)>> {
+        legacy_fixture!(self, session_owner_and_surface(session_uuid));
+
+        let native = self.view()?;
+
+        native
+            .record(session_uuid)?
+            .map(|record| {
+                Ok((
+                    view::RepositoryView::value(&record, "principal_id", None)?,
+                    view::RepositoryView::value(&record, "interaction_surface", None)?,
+                ))
+            })
+            .transpose()
+    }
+
+    pub fn bind_interaction_surface_if_unset(
+        &self,
+        session_uuid: &str,
+        interaction_surface: &str,
+    ) -> Result<String> {
+        legacy_fixture!(
+            self,
+            bind_interaction_surface_if_unset(session_uuid, interaction_surface)
+        );
+
+        self.bind_interaction_surface_if_unset_authorized(session_uuid, interaction_surface, |_| {
+            Ok(())
+        })
+    }
+
+    pub fn bind_interaction_surface_if_unset_authorized<G>(
+        &self,
+        session_uuid: &str,
+        interaction_surface: &str,
+        authorize: impl FnOnce(Option<&str>) -> Result<G>,
+    ) -> Result<String> {
+        let native = self.view()?;
+
+        let record = native.required(session_uuid)?;
+        let owner: Option<String> = view::RepositoryView::value(&record, "principal_id", None)?;
+        let _authority = authorize(owner.as_deref())?;
+        let surface: Option<String> =
+            view::RepositoryView::value(&record, "interaction_surface", None)?;
+        if let Some(surface) = surface {
+            return Ok(surface);
+        }
+        native.0.commands().change(
+            &record,
+            vec![(
+                "interaction_surface",
+                serde_json::json!(interaction_surface),
+            )],
+        )?;
+        Ok(interaction_surface.into())
+    }
+
+    pub fn load_session(&self, session_uuid: &str) -> Result<Option<SessionTranscript>> {
+        legacy_fixture!(self, load_session(session_uuid));
+
+        let native = self.view()?;
+
+        native
+            .detail(session_uuid)?
+            .map(|record| native.data(session_uuid, &record))
+            .transpose()
+    }
+
+    pub fn load_session_for_agent(
+        &self,
+        session_uuid: &str,
+        agent_alias: &str,
+    ) -> Result<Option<SessionTranscript>> {
+        legacy_fixture!(self, load_session_for_agent(session_uuid, agent_alias));
+
+        let native = self.view()?;
+
+        native
+            .detail(session_uuid)?
+            .filter(|record| record.owning_agent.as_deref() == Some(agent_alias))
+            .map(|record| native.data(session_uuid, &record))
+            .transpose()
+    }
+
+    pub fn classify_session_for_agent(
+        &self,
+        session_uuid: &str,
+        agent_alias: &str,
+    ) -> Result<SessionOwnership> {
+        legacy_fixture!(self, classify_session_for_agent(session_uuid, agent_alias));
+
+        let native = self.view()?;
+
+        Ok(match native.record(session_uuid)? {
+            Some(record) if record.owning_agent.as_deref() == Some(agent_alias) => {
+                SessionOwnership::Owned
+            }
+            Some(_) => SessionOwnership::Foreign,
+            None => SessionOwnership::Missing,
+        })
+    }
+
+    pub fn is_live_session_for_agent(&self, session_uuid: &str, agent_alias: &str) -> Result<bool> {
+        legacy_fixture!(self, is_live_session_for_agent(session_uuid, agent_alias));
+
+        let native = self.view()?;
+
+        Ok(native.record(session_uuid)?.is_some_and(|record| {
+            record.owning_agent.as_deref() == Some(agent_alias) && !record.closed
+        }))
+    }
+
+    pub fn list_session_ids(&self) -> Result<Vec<String>> {
+        legacy_fixture!(self, list_session_ids());
+
+        let native = self.view()?;
+
+        Ok(native.summaries()?.into_iter().map(|(id, _)| id).collect())
+    }
+
+    pub fn load_session_for_restore(&self, session_uuid: &str) -> Result<SessionRestore> {
+        legacy_fixture!(self, load_session_for_restore(session_uuid));
+
+        let native = self.view()?;
+
+        Ok(match native.detail(session_uuid)? {
+            None => SessionRestore::Missing,
+            Some(record) if record.closed => SessionRestore::Killed,
+            Some(record) => {
+                SessionRestore::Restorable(Box::new(native.data(session_uuid, &record)?))
+            }
+        })
+    }
+
+    pub fn list_sessions(&self) -> Result<Vec<SessionListEntry>> {
+        legacy_fixture!(self, list_sessions());
+
+        let native = self.view()?;
+
+        native
+            .summaries()?
+            .into_iter()
+            .filter(|(_, record)| !record.closed)
+            .map(|(id, record)| view::RepositoryView::summary(id, record))
+            .collect()
+    }
+
+    pub fn list_live_sessions_by_agent(&self, agent_alias: &str) -> Result<Vec<SessionListEntry>> {
+        legacy_fixture!(self, list_live_sessions_by_agent(agent_alias));
+
+        let native = self.view()?;
+
+        native
+            .summaries()?
+            .into_iter()
+            .filter(|(_, record)| {
+                !record.closed && record.owning_agent.as_deref() == Some(agent_alias)
+            })
+            .map(|(id, record)| view::RepositoryView::summary(id, record))
+            .collect()
+    }
+
+    pub fn contains_session(&self, session_uuid: &str) -> Result<bool> {
+        legacy_fixture!(self, contains_session(session_uuid));
+
+        let native = self.view()?;
+
+        Ok(native.record(session_uuid)?.is_some())
+    }
+
+    pub fn set_latest_context_input_tokens(
+        &self,
+        session_uuid: &str,
+        latest_context_input_tokens: u64,
+    ) -> Result<()> {
+        legacy_fixture!(
+            self,
+            set_token_count(session_uuid, latest_context_input_tokens)
+        );
+
+        let native = self.view()?;
+
+        native.change(
+            session_uuid,
+            vec![(
+                "latest_context_input_tokens",
+                serde_json::json!(latest_context_input_tokens),
+            )],
+        )
+    }
+
+    pub fn clear_latest_context_input_tokens(&self, session_uuid: &str) -> Result<()> {
+        legacy_fixture!(self, clear_token_count(session_uuid));
+
+        let native = self.view()?;
+
+        native.change(
+            session_uuid,
+            vec![("latest_context_input_tokens", serde_json::json!(0))],
+        )
+    }
+
+    pub fn persist_usage_snapshot(
+        &self,
+        session_uuid: &str,
+        input_tokens: Option<u64>,
+        accepted: bool,
+    ) -> Result<()> {
+        legacy_fixture!(
+            self,
+            persist_usage_snapshot(session_uuid, input_tokens, accepted)
+        );
+
+        if !accepted {
+            return Ok(());
+        }
+        match input_tokens {
+            Some(v) => self.set_latest_context_input_tokens(session_uuid, v),
+            None => self.clear_latest_context_input_tokens(session_uuid),
+        }
+    }
+
+    pub fn set_plan(&self, session_uuid: &str, entries: &[PlanEntry]) -> Result<()> {
+        legacy_fixture!(self, set_plan(session_uuid, entries));
+
+        let native = self.view()?;
+
+        native.change(session_uuid, vec![("plan", serde_json::json!(entries))])
+    }
+
+    pub fn get_plan(&self, session_uuid: &str) -> Result<Vec<PlanEntry>> {
+        legacy_fixture!(self, get_plan(session_uuid));
+
+        let native = self.view()?;
+
+        native
+            .record(session_uuid)?
+            .map(|record| view::RepositoryView::value(&record, "plan", vec![]))
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+
+    pub fn append_event(
+        &self,
+        session_uuid: &str,
+        action: Action,
+        outcome: EventOutcome,
+        payload: Option<&str>,
+    ) -> Result<()> {
+        legacy_fixture!(self, append_event(session_uuid, action, outcome, payload));
+
+        let native = self.view()?;
+
+        native.change(session_uuid, vec![("protocol_observation", serde_json::json!({"action":action.as_str(),"outcome":outcome.as_str(),"payload":payload}))])
+    }
+
+    pub fn delete_session(&self, session_uuid: &str) -> Result<bool> {
+        legacy_fixture!(self, delete_session(session_uuid));
+
+        let native = self.view()?;
+
+        native.delete(session_uuid, None)
+    }
+
+    pub fn count_live_sessions_by_agent(&self, agent_alias: &str) -> Result<usize> {
+        legacy_fixture!(self, count_live_sessions_by_agent(agent_alias));
+
+        let native = self.view()?;
+
+        Ok(native
+            .summaries()?
+            .iter()
+            .filter(|(_, record)| {
+                !record.closed && record.owning_agent.as_deref() == Some(agent_alias)
+            })
+            .count())
+    }
+
+    pub fn list_sessions_by_agent(&self, agent_alias: &str) -> Result<Vec<SessionListEntry>> {
+        legacy_fixture!(self, list_sessions_by_agent(agent_alias));
+
+        let native = self.view()?;
+
+        native
+            .summaries()?
+            .into_iter()
+            .filter(|(_, record)| record.owning_agent.as_deref() == Some(agent_alias))
+            .map(|(id, record)| view::RepositoryView::summary(id, record))
+            .collect()
+    }
+
+    pub fn projected_message_count(&self, session_uuid: &str) -> Result<Option<usize>> {
+        legacy_fixture!(self, projected_message_count(session_uuid));
+
+        let native = self.view()?;
+
+        Ok(native
+            .record(session_uuid)?
+            .map(|record| record.message_count))
+    }
+
+    pub fn delete_sessions_by_agent(&self, agent_alias: &str) -> Result<usize> {
+        legacy_fixture!(self, delete_sessions_by_agent(agent_alias));
+
+        let native = self.view()?;
+
+        let records = native.summaries()?;
+        let mut changed = 0;
+        for (_, record) in records
+            .into_iter()
+            .filter(|(_, record)| record.owning_agent.as_deref() == Some(agent_alias))
+        {
+            native.0.commands().close(&record, "session_deleted")?;
+            changed += 1;
+        }
+        Ok(changed)
+    }
+
+    pub fn rename_sessions_by_agent(&self, from: &str, to: &str) -> Result<usize> {
+        legacy_fixture!(self, rename_sessions_by_agent(from, to));
+
+        let native = self.view()?;
+
+        let records = native.summaries()?;
+        let mut changed = 0;
+        for (_, record) in records
+            .into_iter()
+            .filter(|(_, record)| record.owning_agent.as_deref() == Some(from))
+        {
+            native
+                .0
+                .commands()
+                .change(&record, vec![("owning_agent", serde_json::json!(to))])?;
+            changed += 1;
+        }
+        Ok(changed)
+    }
+
+    pub fn mark_session_killed_atomic(&self, session_uuid: &str) -> Result<SessionKillTransition> {
+        legacy_fixture!(self, mark_session_killed_atomic(session_uuid));
+
+        self.mark_session_killed_atomic_for_owner(session_uuid, None)
+    }
+
+    pub fn mark_session_killed_atomic_for_owner(
+        &self,
+        session_uuid: &str,
+        owner_principal_id: Option<&str>,
+    ) -> Result<SessionKillTransition> {
+        legacy_fixture!(
+            self,
+            mark_session_killed_atomic_for_owner(session_uuid, owner_principal_id)
+        );
+
+        self.mark_session_killed_atomic_for_owner_authorized(
+            session_uuid,
+            owner_principal_id,
+            |_| Ok(()),
+        )
+    }
+
+    pub fn mark_session_killed_atomic_for_owner_authorized<G>(
+        &self,
+        session_uuid: &str,
+        owner_principal_id: Option<&str>,
+        authorize: impl FnOnce(Option<&str>) -> Result<G>,
+    ) -> Result<SessionKillTransition> {
+        let native = self.view()?;
+        let Some(record) = native.record(session_uuid)? else {
+            return Ok(SessionKillTransition::Missing);
+        };
+        let owner: Option<String> = view::RepositoryView::value(&record, "principal_id", None)?;
+        let _authority = authorize(owner.as_deref())?;
+        native.kill(session_uuid, owner_principal_id)
+    }
+
+    pub fn mark_session_killed(&self, session_uuid: &str) -> Result<bool> {
+        legacy_fixture!(self, mark_session_killed(session_uuid));
+
+        Ok(matches!(
+            self.mark_session_killed_atomic(session_uuid)?,
+            SessionKillTransition::Marked | SessionKillTransition::AlreadyKilled
+        ))
+    }
+
+    pub fn is_session_killed(&self, session_uuid: &str) -> Result<bool> {
+        legacy_fixture!(self, is_session_killed(session_uuid));
+
+        let native = self.view()?;
+
+        Ok(native
+            .record(session_uuid)?
+            .is_some_and(|record| record.closed))
+    }
+
+    pub fn touch_session(&self, session_uuid: &str) -> Result<()> {
+        legacy_fixture!(self, touch_session(session_uuid));
+
+        let native = self.view()?;
+
+        if let Some(record) = native.record(session_uuid)? {
+            native.0.commands().change(
+                &record,
+                vec![(
+                    "last_activity",
+                    serde_json::json!(Utc::now().timestamp_millis()),
+                )],
+            )?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session_events::{installation::NativeBackend, upgrade::upgrade_installation};
+
+    #[test]
+    fn native_owner_effect_refusal_preserves_metadata_and_lifecycle() {
+        for backend in [NativeBackend::Sqlite, NativeBackend::Jsonl] {
+            let directory = tempfile::tempdir().expect("directory");
+            upgrade_installation(directory.path(), backend, |_| "agent".into()).expect("ready");
+            let repository = SessionRepository::new(directory.path()).expect("repository");
+            repository
+                .create_session("owned", "rpc", "agent", "/workspace", Some("owner"))
+                .expect("session");
+            assert!(
+                repository
+                    .bind_interaction_surface_if_unset_authorized(
+                        "owned",
+                        "code",
+                        |owner| -> Result<()> {
+                            assert_eq!(owner, Some("owner"));
+                            anyhow::bail!("authority revoked")
+                        }
+                    )
+                    .is_err()
+            );
+            assert!(
+                repository
+                    .mark_session_killed_atomic_for_owner_authorized(
+                        "owned",
+                        Some("owner"),
+                        |owner| -> Result<()> {
+                            assert_eq!(owner, Some("owner"));
+                            anyhow::bail!("authority revoked")
+                        }
+                    )
+                    .is_err()
+            );
+            assert!(
+                repository
+                    .with_session_owner("owned", |owner| -> Result<()> {
+                        assert_eq!(owner, Some("owner"));
+                        anyhow::bail!("disclosure refused")
+                    })
+                    .is_err()
+            );
+            assert_eq!(
+                repository
+                    .session_owner_and_surface("owned")
+                    .expect("metadata"),
+                Some((Some("owner".into()), None))
+            );
+            assert!(!repository.is_session_killed("owned").expect("lifecycle"));
+            assert_eq!(
+                repository
+                    .bind_interaction_surface_if_unset_authorized("owned", "code", |_| Ok(()))
+                    .expect("surface"),
+                "code"
+            );
+            assert!(matches!(
+                repository
+                    .mark_session_killed_atomic_for_owner_authorized(
+                        "owned",
+                        Some("owner"),
+                        |_| Ok(())
+                    )
+                    .expect("kill"),
+                SessionKillTransition::Marked
+            ));
+        }
+    }
+
+    #[test]
+    fn protocol_entries_share_one_canonical_session_without_changing_owner_or_creation_source() {
+        for backend in [NativeBackend::Sqlite, NativeBackend::Jsonl] {
+            let directory = tempfile::tempdir().expect("directory");
+            upgrade_installation(directory.path(), backend, |_| "unattributed".into())
+                .expect("ready");
+            let acp = SessionRepository::new(directory.path()).expect("repository");
+            let rpc = SessionRepository::new(directory.path()).expect("repository");
+            acp.create_session("same", "acp", "agent", "/workspace", Some("owner"))
+                .expect("create ACP");
+            rpc.create_session("same", "rpc", "agent", "/workspace", Some("owner"))
+                .expect("reopen through RPC");
+            assert!(
+                rpc.create_session("same", "rpc", "agent", "/workspace", Some("other"))
+                    .is_err()
+            );
+            assert_eq!(acp.list_session_ids().expect("ACP list"), vec!["same"]);
+            assert_eq!(rpc.list_session_ids().expect("RPC list"), vec!["same"]);
+            let catalog = acp.catalog().expect("catalog");
+            let id = zeroclaw_api::session_events::SessionId::parse("same").expect("id");
+            let record = catalog
+                .query()
+                .summary(&id)
+                .expect("summary")
+                .expect("session");
+            assert_eq!(record.stream(), &id);
+            assert_eq!(record.creation_source(), Some("acp"));
+            assert!(!directory.path().join("sessions/acp-sessions.db").exists());
+        }
+    }
+
+    #[test]
+    fn nested_copies_restore_frozen_history_and_inherit_ownership_and_index_preview() {
+        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+        use zeroclaw_api::session_events::*;
+        for backend in [NativeBackend::Sqlite, NativeBackend::Jsonl] {
+            let directory = tempfile::tempdir().expect("directory");
+            let legacy =
+                SessionRepository::legacy_fixture(directory.path()).expect("legacy fixture");
+            legacy
+                .create_session("original", "acp", "agent", "/workspace", Some("owner"))
+                .expect("source");
+            let messages = vec![ConversationMessage::Chat(ChatMessage::user(
+                "original input",
+            ))];
+            legacy.append_turn("original", &messages).expect("history");
+            upgrade_installation(directory.path(), backend, |_| "agent".into()).expect("upgrade");
+            let repository = SessionRepository::new(directory.path()).expect("repository");
+            let catalog = repository.catalog().expect("catalog");
+            let original = SessionId::parse("original").expect("id");
+            let copied = SessionId::parse("copied").expect("id");
+            let nested = SessionId::parse("nested").expect("id");
+            for (target, source) in [(&copied, &original), (&nested, &copied)] {
+                let row = catalog
+                    .query()
+                    .summary(source)
+                    .expect("summary")
+                    .expect("source");
+                catalog
+                    .commands()
+                    .create_copy(crate::session_events::catalog::SessionCopy {
+                        session_id: target,
+                        source: &context_read::CopySource {
+                            cursor: row.head,
+                            branch_id: BranchId::parse(format!("branch-{source}")).expect("branch"),
+                        },
+                        creation_source: "rpc",
+                        owning_agent: "agent",
+                    })
+                    .expect("copy");
+            }
+            let body = PayloadRecord::json(
+                "session.context/v1",
+                &serde_json::json!({"message_refs":[]}),
+            )
+            .expect("later empty context");
+            let mut context = SessionEvent::typed(
+                original.clone(),
+                EventData::ContextProjectionCreated {
+                    source_ranges: vec![],
+                    summary_ref: None,
+                    budget: 0,
+                    reason_key: "fixture_replacement".into(),
+                    algorithm_version: "fixture/v1".into(),
+                    result_ref: StoredPayloadRef::from(&body),
+                    summary_source_refs: vec![],
+                    transform_started_event_id: None,
+                },
+                EventActor::default(),
+            )
+            .expect("context");
+            context.branch_id = Some(BranchId::parse("branch-original").expect("branch"));
+            catalog
+                .store()
+                .append_batch(AppendRequest {
+                    session_id: original.clone(),
+                    expected_head: catalog.store().head(&original).expect("head"),
+                    idempotency_key: "later-source-context".into(),
+                    events: vec![context],
+                    payloads: vec![body],
+                    erasure_reference_commitment: None,
+                })
+                .expect("later source write");
+            drop(catalog);
+            assert!(
+                repository
+                    .load_session("original")
+                    .expect("source")
+                    .expect("source exists")
+                    .messages
+                    .is_empty()
+            );
+            for id in [&copied, &nested] {
+                let copy = repository
+                    .load_session(id.as_str())
+                    .expect("load copy")
+                    .expect("copy exists");
+                assert_eq!(copy.principal_id.as_deref(), Some("owner"));
+                assert_eq!(copy.workspace_dir, "/workspace");
+                assert_eq!(
+                    serde_json::to_value(copy.messages).expect("copy messages"),
+                    serde_json::to_value(&messages).expect("original messages")
+                );
+            }
+            let catalog = repository.catalog().expect("catalog");
+            for row in catalog.query().index_records().expect("index") {
+                assert_eq!(row.message_count, 1);
+                assert_eq!(row.first_user_preview.as_deref(), Some("original input"));
+            }
+        }
+    }
+}

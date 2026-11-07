@@ -106,7 +106,7 @@ impl SqliteTaskStore {
         })
     }
 
-    /// Admin enumeration — count this agent's records (mirrors AcpSessionStore's
+    /// Admin enumeration — count this agent's records (mirrors SessionRepository's
     /// `count_*_by_agent`; used by alias-delete cascades / observability).
     pub fn count_by_agent(&self, agent: &str) -> Result<u64> {
         let conn = self.conn.lock();

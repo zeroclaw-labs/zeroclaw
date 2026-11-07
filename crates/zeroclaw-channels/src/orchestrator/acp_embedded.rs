@@ -26,7 +26,10 @@ mod tests {
         )
         .unwrap();
         assert!(out.abs_path.exists());
-        assert!(out.marker.contains("[Document: report.docx]"));
+        assert_eq!(
+            out.reference.kind,
+            zeroclaw_api::media::AttachmentKind::Document
+        );
         assert_eq!(std::fs::read(&out.abs_path).unwrap(), bytes);
     }
 }

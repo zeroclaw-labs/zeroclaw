@@ -7,12 +7,13 @@ use std::sync::Arc;
 use serde_json::Value;
 use tokio::sync::oneshot;
 
-use zeroclaw_api::channel::ChannelApprovalResponse;
+use zeroclaw_api::channel::{ApprovalReplyResult, ChannelApprovalResponse};
 use zeroclaw_config::cost::tracker::CostTracker;
 use zeroclaw_config::live::LiveConfigHandle;
 use zeroclaw_config::schema::Config;
-use zeroclaw_infra::acp_session_store::AcpSessionStore;
-use zeroclaw_infra::session_backend::SessionBackend;
+#[cfg(test)]
+use zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend;
+use zeroclaw_infra::session_repository::SessionRepository;
 
 use super::session::SessionStore;
 use super::tui_identity::TuiRegistry;
@@ -31,13 +32,63 @@ pub struct ApprovalPendingMap {
 }
 
 struct PendingApprovalEntry {
+    registration: Arc<ApprovalRegistration>,
+    tx: oneshot::Sender<ApprovalReplyResult>,
+}
+
+/// The pending entry owns routing and the prepared approval's audit capability.
+/// Retained references identify this registration across authorization awaits.
+pub struct ApprovalRegistration {
     session_id: String,
-    tx: oneshot::Sender<ChannelApprovalResponse>,
+    audit: Option<Arc<dyn zeroclaw_api::session_events::capture::PreparedToolPort>>,
+}
+
+impl ApprovalRegistration {
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub async fn record_reply(
+        &self,
+        actor: zeroclaw_api::session_events::EventActor,
+        response: ChannelApprovalResponse,
+        evidence: Value,
+    ) -> anyhow::Result<Option<zeroclaw_api::session_events::EventId>> {
+        if let Some(audit) = &self.audit {
+            return audit
+                .record_approval_reply(actor, response, evidence)
+                .await
+                .map(Some);
+        }
+        Ok(None)
+    }
+
+    pub async fn record_rejection(
+        &self,
+        classification: &str,
+        evidence: Value,
+    ) -> anyhow::Result<()> {
+        if let Some(audit) = &self.audit {
+            audit
+                .record_approval_reply_rejected(classification.into(), evidence)
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ApprovalResolution {
+    Resolved,
+    StaleRegistration,
+    WrongSession,
+    ReceiverClosed,
 }
 
 pub struct PendingApproval {
     map: Arc<ApprovalPendingMap>,
     request_id: String,
+    registration: Arc<ApprovalRegistration>,
     active: bool,
 }
 
@@ -50,7 +101,8 @@ impl PendingApproval {
 impl Drop for PendingApproval {
     fn drop(&mut self) {
         if self.active {
-            self.map.remove(&self.request_id);
+            self.map
+                .remove_registered(&self.request_id, &self.registration);
         }
     }
 }
@@ -60,12 +112,13 @@ impl ApprovalPendingMap {
         self: &Arc<Self>,
         request_id: String,
         session_id: String,
-        tx: oneshot::Sender<ChannelApprovalResponse>,
+        tx: oneshot::Sender<ApprovalReplyResult>,
     ) -> PendingApproval {
-        self.insert(request_id.clone(), session_id, tx);
+        let registration = self.insert(request_id.clone(), session_id, tx);
         PendingApproval {
             map: Arc::clone(self),
             request_id,
+            registration,
             active: true,
         }
     }
@@ -74,43 +127,109 @@ impl ApprovalPendingMap {
         &self,
         request_id: String,
         session_id: String,
-        tx: oneshot::Sender<ChannelApprovalResponse>,
-    ) {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(request_id, PendingApprovalEntry { session_id, tx });
+        tx: oneshot::Sender<ApprovalReplyResult>,
+    ) -> Arc<ApprovalRegistration> {
+        let registration = Arc::new(ApprovalRegistration {
+            session_id,
+            audit: zeroclaw_api::session_events::capture::current_tool_preparation(),
+        });
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            request_id,
+            PendingApprovalEntry {
+                registration: registration.clone(),
+                tx,
+            },
+        );
+        registration
     }
 
+    #[cfg(test)]
     pub fn resolve(
         &self,
         request_id: &str,
         session_id: &str,
         response: ChannelApprovalResponse,
     ) -> bool {
+        let Some(registration) = self.registration_for(request_id) else {
+            return false;
+        };
+        self.resolve_registered(request_id, session_id, &registration, response)
+            == ApprovalResolution::Resolved
+    }
+
+    #[cfg(test)]
+    pub fn resolve_registered(
+        &self,
+        request_id: &str,
+        session_id: &str,
+        registration: &Arc<ApprovalRegistration>,
+        response: ChannelApprovalResponse,
+    ) -> ApprovalResolution {
+        match self.take_registered(request_id, session_id, registration) {
+            Ok(tx) => {
+                if tx
+                    .send(Ok(
+                        zeroclaw_api::channel::AttributedApprovalResponse::operator(response),
+                    ))
+                    .is_ok()
+                {
+                    ApprovalResolution::Resolved
+                } else {
+                    ApprovalResolution::ReceiverClosed
+                }
+            }
+            Err(resolution) => resolution,
+        }
+    }
+
+    /// Consume only the registration that was authorized before the wait.
+    /// Its sender stays local while the reply is durably observed.
+    pub fn take_registered(
+        &self,
+        request_id: &str,
+        session_id: &str,
+        registration: &Arc<ApprovalRegistration>,
+    ) -> Result<oneshot::Sender<ApprovalReplyResult>, ApprovalResolution> {
         let mut pending = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if pending
             .get(request_id)
-            .is_none_or(|entry| entry.session_id != session_id)
+            .is_none_or(|entry| !Arc::ptr_eq(&entry.registration, registration))
         {
-            return false;
+            return Err(ApprovalResolution::StaleRegistration);
+        }
+        if registration.session_id != session_id {
+            return Err(ApprovalResolution::WrongSession);
         }
         if let Some(entry) = pending.remove(request_id) {
-            let _ = entry.tx.send(response);
-            return true;
+            return Ok(entry.tx);
         }
-        false
+        Err(ApprovalResolution::StaleRegistration)
+    }
+
+    pub fn registration_for(&self, request_id: &str) -> Option<Arc<ApprovalRegistration>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(request_id)
+            .map(|entry| Arc::clone(&entry.registration))
     }
 
     /// The session id an in-flight approval was raised for, if still
     /// pending. `session/approve` authorizes the caller against this
     /// session's owner, never against client-supplied routing.
     pub fn session_for(&self, request_id: &str) -> Option<String> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        self.registration_for(request_id)
+            .map(|registration| registration.session_id.clone())
+    }
+
+    fn remove_registered(&self, request_id: &str, registration: &Arc<ApprovalRegistration>) {
+        let mut pending = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if pending
             .get(request_id)
-            .map(|entry| entry.session_id.clone())
+            .is_some_and(|entry| Arc::ptr_eq(&entry.registration, registration))
+        {
+            pending.remove(request_id);
+        }
     }
 
     pub fn remove(&self, request_id: &str) -> bool {
@@ -128,7 +247,7 @@ impl ApprovalPendingMap {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
-            .any(|entry| entry.session_id == session_id)
+            .any(|entry| entry.registration.session_id == session_id)
     }
 
     #[cfg(test)]
@@ -168,9 +287,13 @@ pub struct RpcContext {
     /// In-memory session store for active RPC sessions.
     pub sessions: Arc<SessionStore>,
 
-    /// Persistent session backend (SQLite / JSONL) for history and
-    /// session metadata. `None` when persistence is disabled.
+    /// Legacy transcript backend used only by compatibility fixtures.
+    #[cfg(test)]
     pub session_backend: Option<Arc<dyn SessionBackend>>,
+
+    /// Injected application composition; this transport cannot construct a
+    /// session writer or select an independent backend.
+    pub native_sessions: Option<Arc<dyn zeroclaw_kernel::session::engine::EngineSessionSource>>,
 
     /// Memory subsystem (`dyn Memory` from `zeroclaw-api`).
     pub memory: Option<Arc<dyn zeroclaw_api::memory_traits::Memory>>,
@@ -205,11 +328,9 @@ pub struct RpcContext {
     /// **Source of truth** for "which TUIs are connected right now."
     pub tui_registry: Arc<TuiRegistry>,
 
-    /// ACP session persistence. Opened (and the DB file created) at
-    /// daemon boot under `<data_dir>/sessions/acp-sessions.db`. `None`
-    /// when the store could not be opened (read-only FS, bad perms) —
-    /// callers must treat persistence as best-effort.
-    pub acp_session_store: Option<Arc<AcpSessionStore>>,
+    /// Metadata view over the standard session catalog, shared by entrances.
+    /// `None` when unavailable; required metadata operations fail closed.
+    pub session_repository: Option<Arc<SessionRepository>>,
 
     /// Shared SOP engine from the daemon (for RPC/TUI agent sessions).
     /// `None` when standalone — sessions build their own.
@@ -289,7 +410,9 @@ impl RpcContext {
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
+            #[cfg(test)]
             session_backend: None,
+            native_sessions: None,
             memory: None,
             cost_tracker: None,
             event_tx: None,
@@ -299,7 +422,7 @@ impl RpcContext {
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
-            acp_session_store: None,
+            session_repository: None,
             sop_engine: None,
             sop_driver_handles: None,
             sop_audit: None,
@@ -322,6 +445,7 @@ impl RpcContext {
             data_dir.clone(),
         )
         .ok();
+        let session_repository = SessionRepository::new(&data_dir).ok().map(Arc::new);
         let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {
@@ -330,7 +454,9 @@ impl RpcContext {
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
+            #[cfg(test)]
             session_backend: None,
+            native_sessions: None,
             memory: None,
             cost_tracker: None,
             event_tx: None,
@@ -340,7 +466,7 @@ impl RpcContext {
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry,
-            acp_session_store: AcpSessionStore::new(data_dir.as_path()).ok().map(Arc::new),
+            session_repository,
             sop_engine: None,
             sop_driver_handles: None,
             sop_audit: None,
@@ -362,7 +488,9 @@ impl RpcContext {
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
+            #[cfg(test)]
             session_backend: None,
+            native_sessions: None,
             memory: None,
             cost_tracker: None,
             event_tx: None,
@@ -372,7 +500,7 @@ impl RpcContext {
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
-            acp_session_store: None,
+            session_repository: None,
             sop_engine: None,
             sop_driver_handles: None,
             sop_audit: None,
@@ -403,7 +531,9 @@ impl RpcContext {
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
+            #[cfg(test)]
             session_backend: None,
+            native_sessions: None,
             memory: None,
             cost_tracker: None,
             event_tx: None,
@@ -413,7 +543,7 @@ impl RpcContext {
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
-            acp_session_store: None,
+            session_repository: None,
             sop_engine: None,
             sop_driver_handles: None,
             sop_audit: None,
@@ -485,7 +615,9 @@ impl RpcContext {
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
+            #[cfg(test)]
             session_backend: None,
+            native_sessions: None,
             memory: None,
             cost_tracker: None,
             event_tx: Some(event_tx),
@@ -495,7 +627,7 @@ impl RpcContext {
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
-            acp_session_store: None,
+            session_repository: None,
             sop_engine: None,
             sop_driver_handles: None,
             sop_audit: None,
@@ -521,7 +653,9 @@ impl RpcContext {
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
+            #[cfg(test)]
             session_backend: None,
+            native_sessions: None,
             memory: None,
             cost_tracker: None,
             event_tx: None,
@@ -531,7 +665,7 @@ impl RpcContext {
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
-            acp_session_store: None,
+            session_repository: None,
             sop_engine: Some(sop_engine),
             sop_driver_handles: Some(crate::sop::SopDriverHandles::default()),
             sop_audit: None,
@@ -563,7 +697,9 @@ impl RpcContext {
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
+            #[cfg(test)]
             session_backend: None,
+            native_sessions: None,
             memory: None,
             cost_tracker: None,
             event_tx: None,
@@ -573,7 +709,7 @@ impl RpcContext {
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
-            acp_session_store: None,
+            session_repository: None,
             sop_engine: Some(sop_engine),
             sop_driver_handles,
             sop_audit: Some(sop_audit),
@@ -598,7 +734,9 @@ impl RpcContext {
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
+            #[cfg(test)]
             session_backend: None,
+            native_sessions: None,
             memory: Some(memory),
             cost_tracker: None,
             event_tx: None,
@@ -608,7 +746,7 @@ impl RpcContext {
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
-            acp_session_store: None,
+            session_repository: None,
             sop_engine: None,
             sop_driver_handles: None,
             sop_audit: None,
@@ -634,7 +772,9 @@ impl RpcContext {
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
+            #[cfg(test)]
             session_backend: None,
+            native_sessions: None,
             memory: None,
             cost_tracker: Some(cost_tracker),
             event_tx: None,
@@ -644,7 +784,7 @@ impl RpcContext {
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
-            acp_session_store: None,
+            session_repository: None,
             sop_engine: None,
             sop_driver_handles: None,
             sop_audit: None,
@@ -661,7 +801,7 @@ impl RpcContext {
         config: Config,
         sessions: Arc<SessionStore>,
         session_backend: Option<Arc<dyn SessionBackend>>,
-        acp_session_store: Option<Arc<AcpSessionStore>>,
+        session_repository: Option<Arc<SessionRepository>>,
     ) -> Arc<Self> {
         let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         let authority = LiveConfigAuthority::for_tests(config);
@@ -672,6 +812,7 @@ impl RpcContext {
             channel_generation_control: None,
             sessions,
             session_backend,
+            native_sessions: None,
             memory: None,
             cost_tracker: None,
             event_tx: None,
@@ -681,7 +822,7 @@ impl RpcContext {
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
-            acp_session_store,
+            session_repository,
             sop_engine: None,
             sop_driver_handles: None,
             sop_audit: None,
@@ -708,7 +849,9 @@ impl RpcContext {
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
+            #[cfg(test)]
             session_backend: None,
+            native_sessions: None,
             memory: None,
             cost_tracker: None,
             event_tx: None,
@@ -718,7 +861,7 @@ impl RpcContext {
             gateway_shutdown_tx,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
-            acp_session_store: None,
+            session_repository: None,
             sop_engine: None,
             sop_driver_handles: None,
             sop_audit: None,
@@ -781,17 +924,20 @@ mod tests {
     #[test]
     fn pending_map_insert_and_resolve() {
         let map = ApprovalPendingMap::default();
-        let (tx, mut rx) = oneshot::channel::<ChannelApprovalResponse>();
+        let (tx, mut rx) = oneshot::channel::<zeroclaw_api::channel::ApprovalReplyResult>();
         map.insert("req-1".to_string(), "sess-1".to_string(), tx);
         assert!(map.resolve("req-1", "sess-1", ChannelApprovalResponse::Approve));
         assert!(!map.contains("req-1"));
-        assert_eq!(rx.try_recv().unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(
+            rx.try_recv().unwrap().expect("approval reply").response,
+            ChannelApprovalResponse::Approve
+        );
     }
 
     #[test]
     fn pending_map_binds_approvals_to_their_session() {
         let map = ApprovalPendingMap::default();
-        let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
+        let (tx, _rx) = oneshot::channel::<zeroclaw_api::channel::ApprovalReplyResult>();
         map.insert("req-9".to_string(), "sess-42".to_string(), tx);
         assert_eq!(map.session_for("req-9").as_deref(), Some("sess-42"));
         assert_eq!(map.session_for("other"), None);
@@ -812,17 +958,45 @@ mod tests {
     #[test]
     fn pending_map_insert_then_drop_is_safe() {
         let map = ApprovalPendingMap::default();
-        let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
+        let (tx, rx) = oneshot::channel::<zeroclaw_api::channel::ApprovalReplyResult>();
         map.insert("req-2".to_string(), "sess-2".to_string(), tx);
-        // _rx is dropped — resolve sends to a closed channel; must not panic
-        assert!(map.resolve("req-2", "sess-2", ChannelApprovalResponse::Approve));
+        drop(rx);
+        assert!(!map.resolve("req-2", "sess-2", ChannelApprovalResponse::Approve));
         assert!(!map.contains("req-2"));
+    }
+
+    #[test]
+    fn replaced_registration_rejects_stale_resolution_and_guard_cleanup() {
+        let map = Arc::new(ApprovalPendingMap::default());
+        let (old_tx, old_rx) = oneshot::channel();
+        let old_guard = map.register("reused".into(), "owner".into(), old_tx);
+        let old = map.registration_for("reused").expect("old registration");
+        let (new_tx, mut new_rx) = oneshot::channel();
+        let new_guard = map.register("reused".into(), "owner".into(), new_tx);
+        assert_eq!(
+            map.resolve_registered("reused", "owner", &old, ChannelApprovalResponse::Approve),
+            ApprovalResolution::StaleRegistration
+        );
+        drop(old_guard);
+        drop(old_rx);
+        assert!(map.contains("reused"));
+        assert!(new_rx.try_recv().is_err());
+        assert!(map.resolve("reused", "owner", ChannelApprovalResponse::Deny));
+        assert_eq!(
+            new_rx
+                .try_recv()
+                .expect("new response")
+                .expect("approval reply")
+                .response,
+            ChannelApprovalResponse::Deny
+        );
+        drop(new_guard);
     }
 
     #[test]
     fn pending_map_remove_drops_stale_request() {
         let map = ApprovalPendingMap::default();
-        let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
+        let (tx, _rx) = oneshot::channel::<zeroclaw_api::channel::ApprovalReplyResult>();
         map.insert("req-3".to_string(), "sess-3".to_string(), tx);
         assert!(map.contains("req-3"));
         assert!(map.remove("req-3"));
@@ -833,7 +1007,7 @@ mod tests {
     #[test]
     fn pending_guard_drop_removes_registered_request() {
         let map = Arc::new(ApprovalPendingMap::default());
-        let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
+        let (tx, _rx) = oneshot::channel::<zeroclaw_api::channel::ApprovalReplyResult>();
         let guard = map.register("req-4".to_string(), "sess-4".to_string(), tx);
         assert!(map.contains("req-4"));
         drop(guard);
@@ -843,7 +1017,7 @@ mod tests {
     #[test]
     fn pending_guard_can_be_disarmed_after_resolution() {
         let map = Arc::new(ApprovalPendingMap::default());
-        let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
+        let (tx, _rx) = oneshot::channel::<zeroclaw_api::channel::ApprovalReplyResult>();
         let mut guard = map.register("req-5".to_string(), "sess-5".to_string(), tx);
         assert!(map.resolve("req-5", "sess-5", ChannelApprovalResponse::Approve));
         guard.disarm();
@@ -854,13 +1028,16 @@ mod tests {
     #[test]
     fn pending_map_rejects_foreign_session_without_consuming_request() {
         let map = ApprovalPendingMap::default();
-        let (tx, mut rx) = oneshot::channel::<ChannelApprovalResponse>();
+        let (tx, mut rx) = oneshot::channel::<zeroclaw_api::channel::ApprovalReplyResult>();
         map.insert("req-6".to_string(), "sess-owner".to_string(), tx);
 
         assert!(!map.resolve("req-6", "sess-foreign", ChannelApprovalResponse::Approve));
         assert!(map.contains("req-6"));
         assert!(rx.try_recv().is_err());
         assert!(map.resolve("req-6", "sess-owner", ChannelApprovalResponse::Deny));
-        assert_eq!(rx.try_recv().unwrap(), ChannelApprovalResponse::Deny);
+        assert_eq!(
+            rx.try_recv().unwrap().expect("approval reply").response,
+            ChannelApprovalResponse::Deny
+        );
     }
 }

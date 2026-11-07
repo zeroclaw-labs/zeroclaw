@@ -34,9 +34,9 @@ pub(crate) fn resolve_session(sessions: &[SessionEntry], query: &str) -> Session
     let lowered = query.to_lowercase();
     let tiers: [&dyn Fn(&SessionEntry) -> bool; 4] = [
         &|s| s.session_id == query,
-        &|s| s.name.as_deref() == Some(query),
+        &|s| s.title.as_deref() == Some(query),
         &|s| {
-            s.name
+            s.title
                 .as_deref()
                 .is_some_and(|n| n.to_lowercase() == lowered)
         },
@@ -60,13 +60,12 @@ mod tests {
     fn entry(id: &str, name: Option<&str>) -> SessionEntry {
         SessionEntry {
             session_id: id.to_string(),
-            session_key: id.to_string(),
             created_at: "2026-10-27T00:00:00Z".to_string(),
             last_activity: "2026-10-27T00:05:00Z".to_string(),
             message_count: 0,
             agent_alias: Some("alpha".to_string()),
             channel_id: None,
-            name: name.map(str::to_string),
+            title: name.map(str::to_string),
         }
     }
 

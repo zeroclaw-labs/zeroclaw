@@ -2579,17 +2579,12 @@ pub fn strip_tool_result_blocks(text: &str) -> String {
     static THINK_RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?s)<think>.*?</think>").expect("THINK_RE regex must compile")
     });
-    static TOOL_RESULTS_PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?m)^\[Tool results\]\s*\n?")
-            .expect("TOOL_RESULTS_PREFIX_RE regex must compile")
-    });
     static EXCESS_BLANK_LINES_RE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"\n{3,}").expect("EXCESS_BLANK_LINES_RE regex must compile"));
 
     let result = TOOL_RESULT_RE.replace_all(text, "");
     let result = THINKING_RE.replace_all(&result, "");
     let result = THINK_RE.replace_all(&result, "");
-    let result = TOOL_RESULTS_PREFIX_RE.replace_all(&result, "");
     let result = EXCESS_BLANK_LINES_RE.replace_all(result.trim(), "\n\n");
 
     result.trim().to_string()
@@ -2678,47 +2673,27 @@ pub fn build_native_assistant_history_from_parsed_calls(
     text: &str,
     tool_calls: &[ParsedToolCall],
     reasoning_content: Option<&str>,
-) -> Option<String> {
-    // Strict provider validators (DeepSeek V4, NVIDIA NIM, ...) reject
-    // assistant messages that carry `tool_calls: []`. When there are no
-    // parsed calls, return None so the caller falls through to a plain
-    // text assistant message.
+) -> Option<zeroclaw_api::model_provider::ChatMessage> {
+    use zeroclaw_api::model_provider::{ChatMessage, ToolCall};
     if tool_calls.is_empty() {
         return None;
     }
-
-    let calls_json = tool_calls
+    let calls = tool_calls
         .iter()
-        .map(|tc| {
-            Some(serde_json::json!({
-                "id": tc.tool_call_id.clone()?,
-                "name": tc.name,
-                "arguments": serde_json::to_string(&tc.arguments).unwrap_or_else(|_| "{}".to_string()),
-            }))
+        .map(|call| {
+            Some(ToolCall {
+                id: call.tool_call_id.clone()?,
+                name: call.name.clone(),
+                arguments: call.arguments.to_string(),
+                extra_content: None,
+            })
         })
         .collect::<Option<Vec<_>>>()?;
-
-    let content = if text.trim().is_empty() {
-        serde_json::Value::Null
-    } else {
-        serde_json::Value::String(text.trim().to_string())
-    };
-
-    let mut obj = serde_json::json!({
-        "content": content,
-        "tool_calls": calls_json,
-    });
-
-    if let Some(rc) = reasoning_content
-        && let Some(obj) = obj.as_object_mut()
-    {
-        obj.insert(
-            "reasoning_content".to_string(),
-            serde_json::Value::String(rc.to_string()),
-        );
-    }
-
-    Some(obj.to_string())
+    Some(ChatMessage::assistant_tool_calls(
+        text.trim(),
+        calls,
+        reasoning_content.map(str::to_owned),
+    ))
 }
 
 #[cfg(test)]
@@ -3387,7 +3362,7 @@ mod tests {
         }];
         let result = build_native_assistant_history_from_parsed_calls("answer", &calls, None);
         let s = result.expect("Some(_) for non-empty tool_calls");
-        let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
+        let parsed: serde_json::Value = serde_json::to_value(&s).unwrap();
         assert_eq!(parsed["content"].as_str(), Some("answer"));
         let arr = parsed["tool_calls"].as_array().expect("tool_calls array");
         assert_eq!(arr.len(), 1);
@@ -4387,9 +4362,8 @@ Final answer."#;
     }
 
     #[test]
-    fn strip_tool_result_blocks_removes_prefix() {
-        let input =
-            "[Tool results]\n<tool_result name=\"shell\" status=\"ok\">\nok\n</tool_result>\nDone.";
+    fn strip_tool_result_blocks_removes_blocks() {
+        let input = "<tool_result name=\"shell\" status=\"ok\">\nok\n</tool_result>\nDone.";
         assert_eq!(strip_tool_result_blocks(input), "Done.");
     }
 
@@ -5300,7 +5274,7 @@ Let me check the result."#;
             Some("deep thought"),
         );
         assert!(result.is_some());
-        let parsed: serde_json::Value = serde_json::from_str(result.as_deref().unwrap()).unwrap();
+        let parsed: serde_json::Value = serde_json::to_value(result.as_ref().unwrap()).unwrap();
         assert_eq!(parsed["content"].as_str(), Some("answer"));
         assert_eq!(parsed["reasoning_content"].as_str(), Some("deep thought"));
         assert!(parsed["tool_calls"].is_array());
@@ -5315,7 +5289,7 @@ Let me check the result."#;
         }];
         let result = build_native_assistant_history_from_parsed_calls("answer", &calls, None);
         assert!(result.is_some());
-        let parsed: serde_json::Value = serde_json::from_str(result.as_deref().unwrap()).unwrap();
+        let parsed: serde_json::Value = serde_json::to_value(result.as_ref().unwrap()).unwrap();
         assert_eq!(parsed["content"].as_str(), Some("answer"));
         assert!(parsed.get("reasoning_content").is_none());
     }

@@ -1,4 +1,4 @@
-//! Outbound media markers and the egress trust boundary.
+//! Outbound attachments, rich-message parsing, and the egress trust boundary.
 
 use anyhow::Context as _;
 use serde::Deserialize;
@@ -13,28 +13,15 @@ pub(crate) enum DiscordAttachmentKind {
     Document,
     Video,
     Audio,
-    Voice,
 }
 
 impl DiscordAttachmentKind {
-    fn from_marker(kind: &str) -> Option<Self> {
-        match kind.trim().to_ascii_uppercase().as_str() {
-            "IMAGE" | "PHOTO" => Some(Self::Image),
-            "DOCUMENT" | "FILE" => Some(Self::Document),
-            "VIDEO" => Some(Self::Video),
-            "AUDIO" => Some(Self::Audio),
-            "VOICE" => Some(Self::Voice),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn marker_name(&self) -> &'static str {
+    pub(crate) fn name(&self) -> &'static str {
         match self {
             Self::Image => "IMAGE",
             Self::Document => "DOCUMENT",
             Self::Video => "VIDEO",
             Self::Audio => "AUDIO",
-            Self::Voice => "VOICE",
         }
     }
 }
@@ -43,51 +30,6 @@ impl DiscordAttachmentKind {
 pub(crate) struct DiscordAttachment {
     pub(crate) kind: DiscordAttachmentKind,
     pub(crate) target: String,
-}
-
-pub(crate) fn parse_attachment_markers(message: &str) -> (String, Vec<DiscordAttachment>) {
-    let mut cleaned = String::with_capacity(message.len());
-    let mut attachments = Vec::new();
-    let mut cursor = 0usize;
-
-    while let Some(rel_start) = message[cursor..].find('[') {
-        let start = cursor + rel_start;
-        cleaned.push_str(&message[cursor..start]);
-
-        let Some(rel_end) = message[start..].find(']') else {
-            cleaned.push_str(&message[start..]);
-            cursor = message.len();
-            break;
-        };
-        let end = start + rel_end;
-        let marker_text = &message[start + 1..end];
-
-        let parsed = marker_text.split_once(':').and_then(|(kind, target)| {
-            let kind = DiscordAttachmentKind::from_marker(kind)?;
-            let target = target.trim();
-            if target.is_empty() {
-                return None;
-            }
-            Some(DiscordAttachment {
-                kind,
-                target: target.to_string(),
-            })
-        });
-
-        if let Some(attachment) = parsed {
-            attachments.push(attachment);
-        } else {
-            cleaned.push_str(&message[start..=end]);
-        }
-
-        cursor = end + 1;
-    }
-
-    if cursor < message.len() {
-        cleaned.push_str(&message[cursor..]);
-    }
-
-    (cleaned.trim().to_string(), attachments)
 }
 
 const EMBED_TAG: &str = "[EMBED:";
@@ -898,6 +840,29 @@ pub(crate) fn validate_marker_target(
     Ok(DiscordMarkerTarget::Local(target_canon))
 }
 
+pub(crate) fn classify_structured_outgoing_attachments(
+    attachments: &[zeroclaw_api::media::MediaAttachment],
+    workspace_dir: Option<&Path>,
+) -> (Vec<PathBuf>, Vec<String>, Vec<DiscordMarkerFailure>) {
+    let declared: Vec<DiscordAttachment> = attachments
+        .iter()
+        .filter_map(|attachment| {
+            let reference = attachment.reference.as_ref()?;
+            let kind = match reference.kind {
+                zeroclaw_api::media::AttachmentKind::Image => DiscordAttachmentKind::Image,
+                zeroclaw_api::media::AttachmentKind::Audio => DiscordAttachmentKind::Audio,
+                zeroclaw_api::media::AttachmentKind::Video => DiscordAttachmentKind::Video,
+                zeroclaw_api::media::AttachmentKind::Document => DiscordAttachmentKind::Document,
+            };
+            Some(DiscordAttachment {
+                kind,
+                target: reference.target.clone(),
+            })
+        })
+        .collect();
+    classify_outgoing_attachments(&declared, workspace_dir)
+}
+
 pub(crate) fn classify_outgoing_attachments(
     attachments: &[DiscordAttachment],
     workspace_dir: Option<&Path>,
@@ -915,7 +880,7 @@ pub(crate) fn classify_outgoing_attachments(
                     DiscordMarkerFailure::Refused => "trust boundary",
                     DiscordMarkerFailure::NotFound => "not found",
                 };
-                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"kind": attachment.kind.marker_name(), "target": attachment.target, "reason": kind_label, "error": format!("{}", e)})), "dropping unresolved outbound attachment marker");
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"kind": attachment.kind.name(), "target": attachment.target, "reason": kind_label, "error": format!("{}", e)})), "dropping unresolved outbound attachment");
                 failures.push(e.kind());
             }
         }

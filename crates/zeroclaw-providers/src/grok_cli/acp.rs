@@ -19,6 +19,7 @@ use zeroclaw_api::jsonrpc::{
     ACP_PROTOCOL_VERSION, JSONRPC_VERSION, JsonRpcError, JsonRpcRequest, JsonRpcResponse,
     error_codes::METHOD_NOT_FOUND, field,
 };
+use zeroclaw_api::model_provider::{ProviderOutputBlock, StreamChunk, StreamEvent};
 
 /// Maximum size of one newline-delimited JSON-RPC frame.
 ///
@@ -103,6 +104,16 @@ impl AcpPromptContent {
 
 #[derive(Debug, Error)]
 pub(super) enum AcpError {
+    #[error("Grok ACP request timed out")]
+    Timeout {
+        #[source]
+        source: crate::traits::StreamError,
+    },
+    #[error("Grok ACP session capture failed")]
+    Capture {
+        #[source]
+        source: anyhow::Error,
+    },
     #[error("Grok ACP transport failed while writing {phase}")]
     Write { phase: &'static str },
     #[error("Grok ACP transport failed while reading {phase}")]
@@ -121,11 +132,10 @@ pub(super) enum AcpError {
     InvalidJson { phase: &'static str },
     /// Remote JSON-RPC error. Public text stays phase-stable; only a sanitized
     /// integer JSON-RPC code is retained when present (never child free-text).
-    #[error("Grok ACP returned an error during {phase}{code}")]
+    #[error("Grok ACP returned an error during {phase}{code}", code = public_remote_error_code(.failure))]
     Remote {
         phase: &'static str,
-        /// Empty, or `" (code N)"` for an integer JSON-RPC error code only.
-        code: &'static str,
+        failure: Box<crate::dispatch::ProviderProtocolFailure>,
     },
     #[error("Grok ACP {phase} response was incomplete")]
     Incomplete { phase: &'static str },
@@ -142,8 +152,17 @@ pub(super) enum AcpError {
 }
 
 impl AcpError {
+    pub(super) fn protocol_failure(&self) -> Option<&crate::dispatch::ProviderProtocolFailure> {
+        match self {
+            Self::Remote { failure, .. } => Some(failure),
+            _ => None,
+        }
+    }
+
     pub(super) fn error_key(&self) -> &'static str {
         match self {
+            Self::Timeout { .. } => "grok_cli_timeout",
+            Self::Capture { .. } => "grok_cli_capture_failed",
             Self::Write { .. } => "grok_cli_acp_write_failed",
             Self::Read { .. } => "grok_cli_acp_read_failed",
             Self::Closed { .. } => "grok_cli_acp_closed",
@@ -163,12 +182,43 @@ impl AcpError {
     }
 }
 
+tokio::task_local! {
+    static REQUEST_DEADLINE: tokio::time::Instant;
+}
+
+pub(super) async fn scope_deadline<F: std::future::Future>(
+    duration: std::time::Duration,
+    future: F,
+) -> F::Output {
+    REQUEST_DEADLINE
+        .scope(tokio::time::Instant::now() + duration, future)
+        .await
+}
+
+async fn deadline_io<F: std::future::Future>(future: F) -> Result<F::Output, AcpError> {
+    let Ok(deadline) = REQUEST_DEADLINE.try_with(|deadline| *deadline) else {
+        return Ok(future.await);
+    };
+    let elapsed = || AcpError::Timeout {
+        source: crate::traits::StreamError::ResponseTimeout("grok_acp deadline elapsed".into()),
+    };
+    // A completed checkpoint may consume the remaining time. Check before
+    // polling another read/write, even if that I/O is immediately ready.
+    if tokio::time::Instant::now() >= deadline {
+        return Err(elapsed());
+    }
+    tokio::time::timeout_at(deadline, future)
+        .await
+        .map_err(|_| elapsed())
+}
+
 /// Map a small set of well-known integer JSON-RPC codes to fixed public
 /// suffixes. Unknown or non-integer codes stay empty so hostile strings never
 /// escape into provider errors.
-fn remote_error(phase: &'static str, message: &Value) -> AcpError {
-    let code = message
-        .pointer("/error/code")
+fn public_remote_error_code(failure: &crate::dispatch::ProviderProtocolFailure) -> &'static str {
+    failure
+        .error()
+        .get("code")
         .and_then(Value::as_i64)
         .and_then(|code| match code {
             -32700 => Some(" (code -32700)"),
@@ -178,8 +228,16 @@ fn remote_error(phase: &'static str, message: &Value) -> AcpError {
             -32603 => Some(" (code -32603)"),
             _ => None,
         })
-        .unwrap_or("");
-    AcpError::Remote { phase, code }
+        .unwrap_or("")
+}
+
+fn remote_error(phase: &'static str, message: &Value) -> AcpError {
+    AcpError::Remote {
+        phase,
+        failure: Box::new(crate::dispatch::ProviderProtocolFailure::new(json!({
+            "error": message.get("error"),
+        }))),
+    }
 }
 
 /// Exact request/response ID equality for this client.
@@ -312,6 +370,11 @@ where
         Some(session_id.as_str()),
     )
     .await?;
+    observe(&StreamEvent::ProtocolMetadata(json!({
+        "kind":"finish", "protocol":"grok_acp",
+        "stop_reason":prompt_result.get("stopReason").or_else(|| prompt_result.get("stop_reason")),
+    })))
+    .await?;
     reject_failed_stop_reason(&prompt_result)?;
 
     settle_trailing_output(
@@ -370,10 +433,8 @@ where
 
     async fn read_frame(&mut self, phase: &'static str) -> Result<Option<Vec<u8>>, AcpError> {
         loop {
-            let available = self
-                .inner
-                .fill_buf()
-                .await
+            let available = deadline_io(self.inner.fill_buf())
+                .await?
                 .map_err(|_| AcpError::Read { phase })?;
             if available.is_empty() {
                 return if self.pending_frame.is_empty() {
@@ -455,6 +516,7 @@ where
 
         if message.get(field::METHOD).is_some() && message.get(field::ID).is_some() {
             if session_matches(&message, session_id) {
+                observe_session_message(&message, session_id).await?;
                 discard_non_final_output(&message, assistant);
                 handle_server_request(stdin, &message, permission_policy).await?;
             } else {
@@ -466,6 +528,7 @@ where
         }
         if message.get(field::METHOD).is_some() && message.get(field::ID).is_none() {
             if session_matches(&message, session_id) {
+                observe_session_message(&message, session_id).await?;
                 discard_non_final_output(&message, assistant);
                 append_agent_message_chunk(&message, assistant)?;
             }
@@ -569,11 +632,12 @@ where
 
     let mut encoded = writer.bytes;
     encoded.push(b'\n');
-    stdin
-        .write_all(&encoded)
-        .await
+    deadline_io(stdin.write_all(&encoded))
+        .await?
         .map_err(|_| AcpError::Write { phase })?;
-    stdin.flush().await.map_err(|_| AcpError::Write { phase })
+    deadline_io(stdin.flush())
+        .await?
+        .map_err(|_| AcpError::Write { phase })
 }
 
 async fn handle_server_request<W>(
@@ -592,13 +656,26 @@ where
 
     if method == "session/request_permission" || method.ends_with("/session/request_permission") {
         let outcome = permission_outcome(message, permission_policy);
+        observe(&StreamEvent::ProtocolMetadata(json!({
+            "kind":"provider_permission_response",
+            "protocol":"grok_acp",
+            "request_id": id,
+            "phase":"selected",
+            "outcome": outcome,
+        })))
+        .await?;
         let response = JsonRpcResponse {
             jsonrpc: JSONRPC_VERSION,
             result: Some(json!({ "outcome": outcome })),
             error: None,
             id,
         };
-        return write_line(stdin, &response, "permission response").await;
+        write_line(stdin, &response, "permission response").await?;
+        return observe(&StreamEvent::ProtocolMetadata(json!({
+            "kind":"provider_permission_response", "protocol":"grok_acp",
+            "request_id":response.id, "phase":"sent", "response":response.result,
+        })))
+        .await;
     }
 
     let response = JsonRpcResponse {
@@ -685,6 +762,7 @@ where
                 quiet_intervals = 0;
                 if message.get(field::METHOD).is_some() && message.get(field::ID).is_some() {
                     if session_matches(&message, session_id) {
+                        observe_session_message(&message, session_id).await?;
                         discard_non_final_output(&message, assistant);
                         handle_server_request(stdin, &message, permission_policy).await?;
                     } else {
@@ -693,6 +771,7 @@ where
                 } else if message.get(field::METHOD).is_some()
                     && session_matches(&message, session_id)
                 {
+                    observe_session_message(&message, session_id).await?;
                     discard_non_final_output(&message, assistant);
                     append_agent_message_chunk(&message, assistant)?;
                 }
@@ -719,6 +798,78 @@ fn append_agent_message_chunk(message: &Value, assistant: &mut String) -> Result
     }
     assistant.push_str(chunk);
     Ok(())
+}
+
+async fn observe(event: &StreamEvent) -> Result<(), AcpError> {
+    crate::dispatch::capture::observe_adapter_event(event)
+        .await
+        .map_err(|source| AcpError::Capture { source })
+}
+
+/// Capture at the wire boundary before display projection or a permission reply.
+/// Native provider tool work is evidence, never a local tool execution intent.
+async fn observe_session_message(
+    message: &Value,
+    session_id: Option<&str>,
+) -> Result<(), AcpError> {
+    if session_id.is_none() {
+        return Ok(());
+    }
+    if is_permission_request(message) {
+        return observe(&StreamEvent::ProtocolMetadata(json!({
+            "kind":"provider_permission_request",
+            "protocol":"grok_acp",
+            "request_id":message.get(field::ID),
+            "request":message.get("params"),
+        })))
+        .await;
+    }
+    let Some(method) = message.get(field::METHOD).and_then(Value::as_str) else {
+        return Ok(());
+    };
+    if method != "session/update" && !method.ends_with("/session/update") {
+        return Ok(());
+    }
+    let Some(update) = message.pointer("/params/update") else {
+        return Ok(());
+    };
+    let kind = update
+        .get("sessionUpdate")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    if matches!(kind, "agent_message_chunk" | "agent_thought_chunk")
+        && let Some(content) = update.get("content")
+    {
+        if kind == "agent_thought_chunk" {
+            if content.get("type").and_then(Value::as_str) == Some("text")
+                && let Some(text) = content.get("text").and_then(Value::as_str)
+            {
+                return observe(&StreamEvent::TextDelta(StreamChunk::reasoning(text))).await;
+            }
+            return observe(&StreamEvent::ProtocolMetadata(json!({
+                "kind":"partial_content","protocol":"grok_acp",
+                "type_name":"grok_acp.agent_thought_chunk","component":"reasoning",
+                "content":content,
+            })))
+            .await;
+        }
+        return observe(&StreamEvent::OutputBlock(crate::output::content_block(
+            content,
+        )))
+        .await;
+    }
+    if kind.starts_with("tool_") {
+        return observe(&StreamEvent::ProtocolMetadata(json!({
+            "kind":"provider_tool_activity","protocol":"grok_acp",
+            "provider_call_id":update.get("toolCallId"),"activity":update,
+        })))
+        .await;
+    }
+    observe(&StreamEvent::OutputBlock(ProviderOutputBlock::Other {
+        type_name: format!("grok_acp.{kind}"),
+        content: update.clone(),
+    }))
+    .await
 }
 
 /// Grok can emit user-visible progress as `agent_message_chunk` before it
@@ -915,6 +1066,9 @@ mod tests {
         assert!(!display.contains("EVIL_STRING"));
         assert!(!display.contains("leak me"));
         assert!(display.contains("session/prompt"));
+        let full = format!("{:#}", anyhow::Error::new(hostile_code));
+        assert!(!full.contains("EVIL_STRING"));
+        assert!(!full.contains("leak me"));
 
         let known_code = remote_error(
             "initialize",

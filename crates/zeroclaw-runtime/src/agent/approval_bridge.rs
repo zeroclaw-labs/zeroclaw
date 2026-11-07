@@ -67,7 +67,7 @@ impl Channel for AskUserApprovalBridge {
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<Option<AttributedApprovalResponse>> {
         let inherited_route = if let Some(route) = &self.route {
-            match resolve_routed_approval(&self.handles, route, recipient, request).await {
+            match resolve_routed_approval(&self.handles, route, recipient, request).await? {
                 // Cross-crate construction: `AttributedApprovalResponse` is
                 // `#[non_exhaustive]`, so struct-literal syntax is forbidden
                 // from here. Build via the dedicated constructors.
@@ -75,10 +75,12 @@ impl Channel for AskUserApprovalBridge {
                     response,
                     decider,
                     source,
+                    reply_event_id,
                 } => {
                     return Ok(Some(
                         AttributedApprovalResponse::from_runtime(response, source)
-                            .with_decider_opt(decider),
+                            .with_decider_opt(decider)
+                            .with_reply_event_id(reply_event_id),
                     ));
                 }
                 RoutedApproval::Fallthrough => {
@@ -119,6 +121,9 @@ impl Channel for AskUserApprovalBridge {
                     return Ok(Some(attributed.with_decider(channel_name.clone())));
                 }
                 Ok(None) => continue,
+                Err(e) if zeroclaw_api::session_events::capture::is_capture_stopped(&e) => {
+                    return Err(e);
+                }
                 Err(e) => {
                     saw_error = true;
                     ::zeroclaw_log::record!(

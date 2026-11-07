@@ -94,7 +94,7 @@ pub struct SessionOverrides {
 #[derive(Clone, Debug)]
 pub struct UploadEntry {
     pub ref_id: String,
-    pub marker: String,
+    pub kind: zeroclaw_api::media::AttachmentKind,
     pub workspace_path: String,
     pub size_bytes: u64,
 }
@@ -158,7 +158,7 @@ pub enum DurableSession {
     /// A chat-backend row under this exact storage key (`rpc_<id>`,
     /// `gw_<id>`, or the raw id for channel sessions).
     Chat { key: String },
-    /// A row in the dedicated ACP session store, keyed by the session UUID.
+    /// The ACP family namespace in the standard session repository.
     Acp,
 }
 
@@ -296,16 +296,6 @@ type PromptRegistrationPause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notif
 #[cfg(test)]
 type RetirementCommitHook = Box<dyn FnMut(bool) + Send>;
 
-#[cfg(test)]
-type PromptRehydrationPause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
-
-#[cfg(test)]
-type RemovalSignalPause = (
-    Arc<tokio::sync::Notify>,
-    Arc<tokio::sync::Notify>,
-    Arc<tokio::sync::Notify>,
-);
-
 type CancelTokenEntry = (u64, Option<u64>, tokio_util::sync::CancellationToken);
 
 #[cfg(test)]
@@ -325,10 +315,6 @@ pub struct SessionStore {
     sessions: Mutex<HashMap<String, RpcSession>>,
     #[cfg(test)]
     model_provider_update_waiting: Arc<tokio::sync::Notify>,
-    #[cfg(test)]
-    agent_lock_waiting: Arc<tokio::sync::Notify>,
-    #[cfg(test)]
-    pending_generation_waiting: Arc<tokio::sync::Notify>,
     cancel_tokens: std::sync::Mutex<HashMap<String, CancelTokenEntry>>,
     cancel_generation: std::sync::atomic::AtomicU64,
     cancel_causes: std::sync::Mutex<HashMap<String, CancelCause>>,
@@ -353,17 +339,6 @@ pub struct SessionStore {
     test_effect_pauses: std::sync::Mutex<HashMap<&'static str, RehydrateSeedPause>>,
     #[cfg(test)]
     test_gated_op_pause: std::sync::Mutex<Option<GatedOpPause>>,
-    /// Test-only pause immediately after a prompt registers its cancellation
-    /// token. Removal-race tests use this to issue close/kill/delete while the
-    /// prompt owns admission but before any fallible setup or provider work.
-    #[cfg(test)]
-    test_prompt_registration_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
-    #[cfg(test)]
-    test_prompt_execution_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
-    /// Test-only pause right after `session/steer` or `session/abort` has
-    /// taken its identity snapshot and before it acts. Fires once.
-    #[cfg(test)]
-    test_control_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
     #[cfg(test)]
     pub(crate) rehydration_publication_waiting: tokio::sync::Notify,
     #[cfg(test)]
@@ -371,12 +346,6 @@ pub struct SessionStore {
     #[cfg(test)]
     pub(crate) test_construction_publication_pause:
         std::sync::Mutex<Option<PromptRegistrationPause>>,
-    #[cfg(test)]
-    test_prompt_rehydration_pause: std::sync::Mutex<Option<PromptRehydrationPause>>,
-    /// Test-only pause after a removal handler captures the target generation
-    /// but before it signals an in-flight turn.
-    #[cfg(test)]
-    test_removal_signal_pause: std::sync::Mutex<Option<RemovalSignalPause>>,
     #[cfg(test)]
     test_prompt_admission_hook: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Test-only pause before a rehydrated candidate is seeded and published.
@@ -454,10 +423,6 @@ impl SessionStore {
             sessions: Mutex::new(HashMap::new()),
             #[cfg(test)]
             model_provider_update_waiting: Arc::new(tokio::sync::Notify::new()),
-            #[cfg(test)]
-            agent_lock_waiting: Arc::new(tokio::sync::Notify::new()),
-            #[cfg(test)]
-            pending_generation_waiting: Arc::new(tokio::sync::Notify::new()),
             cancel_tokens: std::sync::Mutex::new(HashMap::new()),
             cancel_generation: std::sync::atomic::AtomicU64::new(0),
             cancel_causes: std::sync::Mutex::new(HashMap::new()),
@@ -471,21 +436,11 @@ impl SessionStore {
             #[cfg(test)]
             test_gated_op_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
-            test_prompt_registration_pause: std::sync::Mutex::new(None),
-            #[cfg(test)]
-            test_prompt_execution_pause: std::sync::Mutex::new(None),
-            #[cfg(test)]
-            test_control_pause: std::sync::Mutex::new(None),
-            #[cfg(test)]
             rehydration_publication_waiting: tokio::sync::Notify::new(),
             #[cfg(test)]
             test_rehydration_published_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_construction_publication_pause: std::sync::Mutex::new(None),
-            #[cfg(test)]
-            test_prompt_rehydration_pause: std::sync::Mutex::new(None),
-            #[cfg(test)]
-            test_removal_signal_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_prompt_admission_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -935,48 +890,11 @@ impl SessionStore {
     }
 
     /// Lock a session's Agent for a prompt's final authorization.
-    #[cfg(not(test))]
     pub(crate) async fn lock_agent_for_prompt<'a>(
         &self,
         agent: &'a Mutex<Agent>,
     ) -> tokio::sync::MutexGuard<'a, Agent> {
         agent.lock().await
-    }
-
-    /// Lock a session's Agent for a prompt's final authorization. The first
-    /// time the lock is contended it notifies [`Self::agent_lock_waiting`],
-    /// so a test can change policy while the prompt waits here.
-    #[cfg(test)]
-    pub(crate) async fn lock_agent_for_prompt<'a>(
-        &self,
-        agent: &'a Mutex<Agent>,
-    ) -> tokio::sync::MutexGuard<'a, Agent> {
-        let waiting = Arc::clone(&self.agent_lock_waiting);
-        let mut lock = std::pin::pin!(agent.lock());
-        let mut notified = false;
-        std::future::poll_fn(
-            move |cx| match std::future::Future::poll(lock.as_mut(), cx) {
-                std::task::Poll::Pending => {
-                    if !notified {
-                        waiting.notify_one();
-                        notified = true;
-                    }
-                    std::task::Poll::Pending
-                }
-                ready => ready,
-            },
-        )
-        .await
-    }
-
-    #[cfg(test)]
-    pub(crate) fn agent_lock_waiting(&self) -> Arc<tokio::sync::Notify> {
-        Arc::clone(&self.agent_lock_waiting)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn pending_generation_waiting(&self) -> Arc<tokio::sync::Notify> {
-        Arc::clone(&self.pending_generation_waiting)
     }
 
     /// Await confirmation of a session's provisional binding, waiting at most
@@ -1037,8 +955,6 @@ impl SessionStore {
             Some(_) => {}
         }
         drop(current);
-        #[cfg(test)]
-        self.pending_generation_waiting.notify_one();
         tokio::time::timeout(timeout, notified)
             .await
             .map_err(|_| WaitForProviderUpdateError::Timeout)?;
@@ -2088,124 +2004,6 @@ impl SessionStore {
     }
 
     #[cfg(test)]
-    pub(crate) async fn wait_test_prompt_registration_pause(&self) {
-        let (entered, release) = {
-            let guard = self.test_prompt_registration_pause.lock().unwrap();
-            match &*guard {
-                Some((entered, release)) => (Arc::clone(entered), Arc::clone(release)),
-                None => return,
-            }
-        };
-        entered.notify_one();
-        release.notified().await;
-    }
-
-    #[cfg(not(test))]
-    #[inline(always)]
-    pub(crate) async fn wait_test_prompt_registration_pause(&self) {}
-
-    /// Park a prompt once, right after its final authorization under the
-    /// Agent lock and before any effect it gates: the running state, an ACP
-    /// turn checkpoint, and the hand-off to the execution task.
-    #[cfg(test)]
-    pub(crate) async fn wait_test_prompt_execution_pause(&self) {
-        let pause = self.test_prompt_execution_pause.lock().unwrap().take();
-        if let Some((entered, release)) = pause {
-            entered.notify_one();
-            release.notified().await;
-        }
-    }
-
-    #[cfg(not(test))]
-    #[inline(always)]
-    pub(crate) async fn wait_test_prompt_execution_pause(&self) {}
-
-    #[cfg(test)]
-    pub(crate) fn set_test_prompt_execution_pause(&self) -> PromptRegistrationPause {
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        *self.test_prompt_execution_pause.lock().unwrap() =
-            Some((Arc::clone(&entered), Arc::clone(&release)));
-        (entered, release)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_test_prompt_registration_pause(&self) -> PromptRegistrationPause {
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        *self.test_prompt_registration_pause.lock().unwrap() =
-            Some((Arc::clone(&entered), Arc::clone(&release)));
-        (entered, release)
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn wait_test_prompt_rehydration_pause(&self) {
-        let (entered, release) = {
-            let guard = self.test_prompt_rehydration_pause.lock().unwrap();
-            match &*guard {
-                Some((entered, release)) => (Arc::clone(entered), Arc::clone(release)),
-                None => return,
-            }
-        };
-        entered.notify_one();
-        release.notified().await;
-    }
-
-    #[cfg(not(test))]
-    #[inline(always)]
-    pub(crate) async fn wait_test_prompt_rehydration_pause(&self) {}
-
-    #[cfg(test)]
-    pub(crate) fn set_test_prompt_rehydration_pause(&self) -> PromptRehydrationPause {
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        *self.test_prompt_rehydration_pause.lock().unwrap() =
-            Some((Arc::clone(&entered), Arc::clone(&release)));
-        (entered, release)
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn wait_test_removal_signal_pause(&self) {
-        let (entered, release) = {
-            let guard = self.test_removal_signal_pause.lock().unwrap();
-            match &*guard {
-                Some((entered, release, _)) => (Arc::clone(entered), Arc::clone(release)),
-                None => return,
-            }
-        };
-        entered.notify_one();
-        release.notified().await;
-    }
-
-    #[cfg(not(test))]
-    #[inline(always)]
-    pub(crate) async fn wait_test_removal_signal_pause(&self) {}
-
-    #[cfg(test)]
-    pub(crate) fn set_test_removal_signal_pause(&self) -> RemovalSignalPause {
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        let attempted = Arc::new(tokio::sync::Notify::new());
-        *self.test_removal_signal_pause.lock().unwrap() = Some((
-            Arc::clone(&entered),
-            Arc::clone(&release),
-            Arc::clone(&attempted),
-        ));
-        (entered, release, attempted)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn notify_test_removal_signal_attempted(&self) {
-        if let Some((_, _, attempted)) = self.test_removal_signal_pause.lock().unwrap().as_ref() {
-            attempted.notify_one();
-        }
-    }
-
-    #[cfg(not(test))]
-    #[inline(always)]
-    pub(crate) fn notify_test_removal_signal_attempted(&self) {}
-
-    #[cfg(test)]
     pub(crate) async fn wait_test_retirement_pause(&self) {
         let Some((entered, release)) = self.test_retirement_pause.lock().unwrap().take() else {
             return;
@@ -2251,28 +2049,6 @@ impl SessionStore {
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
         *self.test_retirement_pause.lock().unwrap() =
-            Some((Arc::clone(&entered), Arc::clone(&release)));
-        (entered, release)
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn wait_test_control_pause(&self) {
-        let Some((entered, release)) = self.test_control_pause.lock().unwrap().take() else {
-            return;
-        };
-        entered.notify_one();
-        release.notified().await;
-    }
-
-    #[cfg(not(test))]
-    #[inline(always)]
-    pub(crate) async fn wait_test_control_pause(&self) {}
-
-    #[cfg(test)]
-    pub(crate) fn set_test_control_pause(&self) -> PromptRegistrationPause {
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        *self.test_control_pause.lock().unwrap() =
             Some((Arc::clone(&entered), Arc::clone(&release)));
         (entered, release)
     }
@@ -3029,6 +2805,7 @@ mod tests {
             _: Option<f64>,
         ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
             Ok(zeroclaw_providers::ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("stub".into()),
                 tool_calls: vec![],
                 usage: None,

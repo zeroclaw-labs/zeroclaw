@@ -29,6 +29,7 @@ use zeroclaw_config::schema::Config;
 
 const PEER_SETTLEMENT_RETRY_DELAY: Duration = Duration::from_millis(25);
 const PEER_SETTLEMENT_MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
+mod history;
 
 #[derive(Debug, Clone)]
 struct PeerInboxTask {
@@ -348,11 +349,52 @@ impl Tool for SendMessageToPeerTool {
             let task_id = task.id.clone();
             let task_owner_pid = task.owner_pid;
             let task_owner_boot_id = task.owner_boot_id.clone();
+            let history_source = zeroclaw_kernel::session::engine::current_engine_session_source();
+            let history_admission = admission.clone();
+            let history_channel = channel.clone();
             zeroclaw_spawn::spawn!(async move {
-                let internal_principal =
+                let native = async {
+                    match history_source {
+                        Some(source) => {
+                            let admission = history_admission.ok_or_else(|| {
+                                anyhow::Error::msg("peer_history_target_admission_missing")
+                            })?;
+                            history::open(
+                                source,
+                                admission,
+                                &task_id,
+                                &sender,
+                                &recipient_alias,
+                                &history_channel,
+                            )
+                            .await
+                            .map(Some)
+                        }
+                        None => Ok(None),
+                    }
+                }
+                .await;
+                let mut ingress = zeroclaw_api::ingress::IngressContext::agent_direct();
+                ingress.origin = zeroclaw_api::ingress::TurnOrigin::AgentDirect;
+                ingress.internal_principal =
                     Some(zeroclaw_api::ingress::InternalPrincipal::PeerAgent {
                         sender_alias: sender.clone(),
                     });
+                let internal_principal = ingress.internal_principal.clone();
+                let input = zeroclaw_api::session_events::capture::EngineTurnInput {
+                    execution_workspace: None,
+                    reply_route: None,
+                    turn_id: format!("peer-turn-{task_id}"),
+                    agent_alias: Some(recipient_alias.clone()),
+                    ingress,
+                    parts: zeroclaw_api::session_events::capture::EngineInputPart::text_and_files(
+                        body.clone(),
+                        vec![],
+                    ),
+                    provider_ref: String::new(),
+                    model: String::new(),
+                };
+                // Keep the admitted recipient turn out of the cost-scope wrappers.
                 let turn: Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> = match bound {
                     Some(bound) => Box::pin(crate::agent::loop_::process_message_shared_with_capabilities(
                         cfg, live_config, bound.capabilities, bound.principal,
@@ -364,6 +406,13 @@ impl Tool for SendMessageToPeerTool {
                         zeroclaw_api::ingress::TurnOrigin::AgentDirect, admission, internal_principal,
                     )),
                 };
+                let turn = Box::pin(async {
+                    match native {
+                        Ok(Some(port)) => port.execute(input, turn).await,
+                        Ok(None) => turn.await,
+                        Err(error) => Err(error),
+                    }
+                });
                 let result = run_peer_turn_with_panic_recovery(cost_ctx, turn_usage, turn).await;
                 if let Err(error) = settle_peer_inbox_task(
                     task_store.as_ref(),
@@ -1397,6 +1446,7 @@ mod tests {
                     ..CostConfig::default()
                 },
                 workspace.path(),
+                "jsonl",
             )
             .expect("cost tracker should initialize"),
         );
@@ -1490,6 +1540,7 @@ mod tests {
                     ..CostConfig::default()
                 },
                 capped_workspace.path(),
+                "jsonl",
             )
             .expect("capped cost tracker should initialize"),
         );
@@ -1547,6 +1598,47 @@ mod tests {
     #[tokio::test]
     async fn peer_turn_cost_scope_through_execute_boundary_attributes_recipient_and_shares_budget()
     {
+        if run_peer_boundary_in_isolated_process(
+            "tools::send_message_to_peer::tests::peer_turn_cost_scope_through_execute_boundary_attributes_recipient_and_shares_budget",
+        ) {
+            return;
+        }
+        peer_turn_boundary(None, false).await;
+    }
+    #[tokio::test]
+    async fn native_peer_detached_owner_and_live_revocation_preserve_execution_evidence() {
+        if run_peer_boundary_in_isolated_process(
+            "tools::send_message_to_peer::tests::native_peer_detached_owner_and_live_revocation_preserve_execution_evidence",
+        ) {
+            return;
+        }
+        for backend in ["sqlite", "jsonl"] {
+            peer_turn_boundary(Some(backend), false).await;
+            peer_turn_boundary(Some(backend), true).await;
+        }
+    }
+    fn run_peer_boundary_in_isolated_process(test_name: &str) -> bool {
+        // Other tests replace or disable the process-global cost tracker.
+        // Exercise the real singleton in an isolated process so the detached
+        // recipient and its observer always refer to the same ledger owner.
+        const ISOLATED: &str = "ZEROCLAW_TEST_PEER_BOUNDARY_ISOLATED";
+        if std::env::var(ISOLATED).as_deref() != Ok(test_name) {
+            let result = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args(["--exact", test_name, "--nocapture"])
+                .env(ISOLATED, test_name)
+                .output()
+                .expect("isolated peer test");
+            assert!(
+                result.status.success(),
+                "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr),
+            );
+            return true;
+        }
+        false
+    }
+    async fn peer_turn_boundary(native_backend: Option<&str>, revoke: bool) {
         use crate::agent::turn::provider_call::enforce_tool_loop_budget;
         use crate::control_plane::ControlPlaneHandle;
         use crate::cost::CostTracker;
@@ -1610,6 +1702,11 @@ mod tests {
             config_path: workspace.path().join("config.toml"),
             ..Config::default()
         };
+        if let Some(backend) = native_backend {
+            config.channels.session_backend = backend.into();
+        }
+        config.memory.backend = "none".into();
+        config.memory.auto_save = false;
         config.cost = CostConfig {
             enabled: true,
             track_per_agent: true,
@@ -1670,14 +1767,27 @@ mod tests {
             Some(authority.execution_capability()),
         )
         .with_control_plane(control_plane);
-        let result = tool
-            .execute(json!({
-                "channel": "telegram.prod",
-                "target": "recipient",
-                "message": "produce a one-line status update for the on-call rotation"
-            }))
-            .await
-            .expect("execute should accept the peer send for detached delivery");
+        let source = native_backend.map(|_| {
+            Arc::new(zeroclaw_session_host::NativeSessionHub::new(
+                authority.live_handle(),
+            ))
+        });
+        let execute = tool.execute(json!({
+            "channel": "telegram.prod",
+            "target": "recipient",
+            "message": "produce a one-line status update for the on-call rotation"
+        }));
+        let result = match &source {
+            Some(source) => {
+                zeroclaw_kernel::session::engine::scope_engine_session_source(
+                    source.clone(),
+                    execute,
+                )
+                .await
+            }
+            None => execute.await,
+        }
+        .expect("execute should accept the peer send for detached delivery");
         assert!(
             result.success,
             "execute should accept the send for in-process delivery: {result:?}"
@@ -1696,7 +1806,14 @@ mod tests {
             .await
             .expect("recipient reaches paused provider");
         drop(tool);
-        drop(authority);
+        if revoke {
+            let mut updated = config.clone();
+            updated.peer_groups.clear();
+            authority.publish_for_test(updated);
+        }
+        if !revoke {
+            drop(authority);
+        }
         assert!(
             matches!(
                 lifecycle.begin_delete("recipient"),
@@ -1711,30 +1828,115 @@ mod tests {
         // Fetch the SAME Arc: same data_dir means same ledger path, so
         // `CostTracker::resolve_global` reuses it rather than building a
         // second one, to observe what the detached turn records.
-        let tracker = CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir)
-            .expect("execute() must have resolved a process-global cost tracker for an enabled cost config");
+        let tracker = CostTracker::get_or_init_global(
+            config.cost.clone(),
+            &config.data_dir,
+            &config.channels.session_backend,
+        )
+        .expect(
+            "execute() must have resolved a process-global cost tracker for an enabled cost config",
+        );
 
         // The recipient's turn runs inside a detached `zeroclaw_spawn::spawn!`
         // task that `execute()` does not join. Poll for its completion with a
         // bounded, sleep-free yield loop (the same pattern already used for
         // detached-task synchronization in `rpc/dispatch.rs`), never a fixed
         // sleep.
-        let mut recipient_summary = None;
-        for _ in 0..20_000 {
-            let summary = tracker
-                .get_summary_for_agent("recipient")
-                .expect("recipient cost summary should be queryable");
-            if summary.request_count >= 1 {
-                recipient_summary = Some(summary);
-                break;
-            }
-            tokio::task::yield_now().await;
+        if revoke {
+            let snapshot = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let snapshot = task_store
+                        .get_snapshot(&task_id)
+                        .await
+                        .expect("snapshot")
+                        .expect("task");
+                    if snapshot.task.status.is_terminal() {
+                        break snapshot;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("revoked task settles");
+            assert_eq!(snapshot.task.status, TaskStatus::Failed);
+            assert_eq!(
+                *request_count.lock(),
+                1,
+                "revocation never causes provider replay"
+            );
+            let family = task_id.clone();
+            assert!(source.is_some(), "native source");
+            let stream =
+                zeroclaw_api::session_events::SessionId::parse(family.clone()).expect("stream");
+            let store = zeroclaw_infra::session_events::scoped::ScopedEventStore::open(
+                workspace.path(),
+                &family,
+            )
+            .expect("store");
+            let page = zeroclaw_api::session_events::SessionEventStore::read_page(
+                &store,
+                &stream,
+                &zeroclaw_api::session_events::EventCursor::beginning(stream.clone()),
+                None,
+                256,
+            )
+            .expect("events");
+            assert!(page.events.iter().any(|event| event.body.kind()
+                == zeroclaw_api::session_events::EventKind::ProviderAttemptStarted));
+            assert!(
+                page.events.iter().any(|event| event.body.kind()
+                    == zeroclaw_api::session_events::EventKind::ProviderAttemptCompleted),
+                "revocation preserves the already admitted provider result"
+            );
+            let completions = page
+                .events
+                .iter()
+                .filter_map(|event| match &event.body.data {
+                    zeroclaw_api::session_events::EventData::TurnCommitted { completion_ref } => {
+                        Some(completion_ref)
+                    }
+                    _ => None,
+                })
+                .map(|reference| {
+                    let zeroclaw_api::session_events::PayloadRead::Present(payload) =
+                        zeroclaw_api::session_events::SessionEventStore::read_payload(
+                            &store,
+                            &reference.payload_id,
+                        )
+                        .expect("completion payload")
+                    else {
+                        panic!("completion payload must remain readable");
+                    };
+                    serde_json::from_slice::<zeroclaw_api::session_events::TurnCompletion>(
+                        &payload.body,
+                    )
+                    .expect("typed completion")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(completions.len(), 1, "revocation records one turn outcome");
+            assert!(
+                matches!(
+                    completions[0],
+                    zeroclaw_api::session_events::TurnCompletion::Failed { .. }
+                ),
+                "revocation records failure and cannot settle the turn successfully"
+            );
+            server.abort();
+            return;
         }
-        let recipient_summary = recipient_summary.expect(
-            "the detached recipient turn must complete and record usage against the \
-             recipient alias; if this fires, execute() is no longer threading the \
-             cost-tracking scope into the spawned process_message future",
-        );
+        let recipient_summary = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let summary = tracker
+                    .get_summary_for_agent("recipient")
+                    .expect("recipient cost summary");
+                if summary.request_count >= 1 {
+                    break summary;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached recipient records usage against its own alias");
 
         let terminal_snapshot = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -1752,6 +1954,41 @@ mod tests {
         .await
         .expect("peer task should reach a terminal state");
         assert_eq!(terminal_snapshot.task.status, TaskStatus::Completed);
+        if source.is_some() {
+            let family = task_id.clone();
+            let stream =
+                zeroclaw_api::session_events::SessionId::parse(family.clone()).expect("stream");
+            let store = zeroclaw_infra::session_events::scoped::ScopedEventStore::open(
+                workspace.path(),
+                &family,
+            )
+            .expect("family");
+            let page = zeroclaw_api::session_events::SessionEventStore::read_page(
+                &store,
+                &stream,
+                &zeroclaw_api::session_events::EventCursor::beginning(stream.clone()),
+                None,
+                256,
+            )
+            .expect("events");
+            assert_eq!(
+                page.events
+                    .iter()
+                    .filter(|event| event.body.kind()
+                        == zeroclaw_api::session_events::EventKind::ProviderAttemptCompleted)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                page.events
+                    .iter()
+                    .filter(|event| event.body.kind()
+                        == zeroclaw_api::session_events::EventKind::TurnCommitted)
+                    .count(),
+                1
+            );
+        }
+
         assert_eq!(
             terminal_snapshot.output.as_deref(),
             Some("peer turn complete")

@@ -102,6 +102,7 @@ mod tests {
         let ch = CliChannel::new("cli");
         let result = ch
             .send(&SendMessage {
+                locations: Vec::new(),
                 content: "hello".into(),
                 recipient: "user".into(),
                 subject: None,
@@ -122,6 +123,7 @@ mod tests {
         let ch = CliChannel::new("cli");
         let result = ch
             .send(&SendMessage {
+                locations: Vec::new(),
                 content: String::new(),
                 recipient: String::new(),
                 subject: None,

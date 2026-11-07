@@ -3,12 +3,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::Context;
 use zeroclaw_api::memory_traits::Memory;
+use zeroclaw_api::session_events::management::AgentSessionPort;
 use zeroclaw_config::alias_refs::{self, AliasKind};
 use zeroclaw_config::schema::Config;
-use zeroclaw_infra::acp_session_store::AcpSessionStore;
-use zeroclaw_infra::session_backend::SessionBackend;
+#[cfg(test)]
+use zeroclaw_infra::session_repository::SessionRepository;
 
 #[derive(Debug, Clone)]
 pub struct AgentDeletePreflight {
@@ -18,13 +18,6 @@ pub struct AgentDeletePreflight {
     pub scrubs: Vec<String>,
     pub owned_state: Vec<String>,
     pub workspace: Option<PathBuf>,
-}
-
-/// Reusable, fail-closed agent deletion preflight.
-#[must_use]
-pub fn plan_agent_delete(config: &Config, alias: &str) -> AgentDeletePreflight {
-    let live_acp = live_acp_session_count(config, alias).map_err(|error| error.to_string());
-    plan_agent_delete_with_acp_count(config, alias, live_acp)
 }
 
 /// Build a deletion preflight from an ACP count obtained by the owning adapter.
@@ -99,14 +92,6 @@ pub fn plan_agent_delete_with_acp_count(
         owned_state,
         workspace: Some(workspace),
     }
-}
-
-pub fn live_acp_session_count(config: &Config, alias: &str) -> anyhow::Result<usize> {
-    let store = AcpSessionStore::new(&config.data_dir)
-        .context("open ACP session store to verify live sessions")?;
-    store
-        .count_live_sessions_by_agent(alias)
-        .context("count live ACP sessions for agent")
 }
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
@@ -192,9 +177,9 @@ async fn write_json(path: &Path, bytes: Vec<u8>) {
 pub async fn cascade_owned_state(
     config: &Config,
     mem: &Arc<dyn Memory>,
-    session_backend: Option<&Arc<dyn SessionBackend>>,
     alias: &str,
     archive_dir: &Path,
+    sessions: Result<Arc<dyn AgentSessionPort>, String>,
 ) -> OwnedStateReport {
     let cascade_dir = archive_dir.join("cascade");
     let _ = tokio::fs::create_dir_all(&cascade_dir).await;
@@ -256,25 +241,25 @@ pub async fn cascade_owned_state(
         }
     };
 
-    let acp_data_dir = config.data_dir.clone();
+    let export_sessions = sessions.clone();
     let acp_alias = alias.to_string();
     let acp_export = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let store = AcpSessionStore::new(&acp_data_dir)?;
-        let sessions = store.list_sessions_by_agent(&acp_alias).unwrap_or_default();
+        let store = export_sessions.map_err(anyhow::Error::msg)?;
+        let sessions = store.list_by_agent(&acp_alias)?;
         let json = sessions
             .iter()
-            .map(|session| {
-                serde_json::json!({
-                    "session_uuid": session.session_uuid,
-                    "agent_alias": session.agent_alias,
-                    "workspace_dir": session.workspace_dir,
-                    "token_count": session.token_count,
+            .map(|session| -> anyhow::Result<_> {
+                Ok(serde_json::json!({
+                    "session_id": session.head.session_id,
+                    "agent_alias": session.owning_agent,
+                    "workspace_dir": session.field("workspace_dir", String::new())?,
+                    "latest_context_input_tokens": session.field("latest_context_input_tokens", 0u64)?,
                     "message_count": session.message_count,
-                    "created_at": session.created_at.to_rfc3339(),
-                    "last_activity": session.last_activity.to_rfc3339(),
-                })
+                    "created_at": session.created_at,
+                    "last_activity": session.last_activity,
+                }))
             })
-            .collect::<Vec<_>>();
+            .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(json)
     })
     .await;
@@ -291,42 +276,24 @@ pub async fn cascade_owned_state(
             warnings.push(format!("acp export task failed: {error}"));
         }
     }
-    let acp_data_dir = config.data_dir.clone();
-    let acp_alias = alias.to_string();
-    let acp_removed = match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        AcpSessionStore::new(&acp_data_dir)?.delete_sessions_by_agent(&acp_alias)
+    // All protocols share the same repository; close each session once.
+    let session_alias = alias.to_string();
+    let sessions_cleared = match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        sessions
+            .map_err(anyhow::Error::msg)?
+            .close_by_agent(&session_alias)
     })
     .await
     {
         Ok(Ok(count)) => count,
         Ok(Err(error)) => {
-            warnings.push(format!("acp delete: {error}"));
+            warnings.push(format!("session delete: {error}"));
             0
         }
         Err(error) => {
-            warnings.push(format!("acp delete task failed: {error}"));
+            warnings.push(format!("session delete task failed: {error}"));
             0
         }
-    };
-
-    let sessions_cleared = match session_backend {
-        Some(backend) => {
-            let backend = Arc::clone(backend);
-            let alias = alias.to_string();
-            match tokio::task::spawn_blocking(move || backend.clear_agent_attribution(&alias)).await
-            {
-                Ok(Ok(count)) => count,
-                Ok(Err(error)) => {
-                    warnings.push(format!("session attribution clear: {error}"));
-                    0
-                }
-                Err(error) => {
-                    warnings.push(format!("session attribution task failed: {error}"));
-                    0
-                }
-            }
-        }
-        None => 0,
     };
 
     let control_plane_tasks_removed = if config.data_dir.join("control_plane.db").exists() {
@@ -366,7 +333,8 @@ pub async fn cascade_owned_state(
     let report = OwnedStateReport {
         memory_purged,
         cron_removed,
-        acp_removed,
+        // Compatibility report field: no separate ACP storage remains.
+        acp_removed: 0,
         sessions_cleared,
         control_plane_tasks_removed,
         archived_to: Some(archive_dir.display().to_string()),
@@ -399,9 +367,9 @@ pub struct RenameStateReport {
 pub async fn cascade_rename_agent(
     config: &Config,
     mem: Option<&Arc<dyn Memory>>,
-    session_backend: Option<&Arc<dyn SessionBackend>>,
     from: &str,
     to: &str,
+    sessions: Result<Arc<dyn AgentSessionPort>, String>,
 ) -> RenameStateReport {
     let mut warnings = Vec::new();
     let memory_rows = match mem {
@@ -412,7 +380,6 @@ pub async fn cascade_rename_agent(
         None => 0,
     };
     let blocking_config = config.clone();
-    let blocking_backend = session_backend.cloned();
     let blocking_from = from.to_string();
     let blocking_to = to.to_string();
     let blocking = tokio::task::spawn_blocking(move || {
@@ -423,27 +390,17 @@ pub async fn cascade_rename_agent(
                     warnings.push(format!("cron rename: {error}"));
                     0
                 });
-        let acp_sessions = match AcpSessionStore::new(&blocking_config.data_dir) {
-            Ok(store) => store
-                .rename_sessions_by_agent(&blocking_from, &blocking_to)
-                .unwrap_or_else(|error| {
-                    warnings.push(format!("acp rename: {error}"));
-                    0
-                }),
-            Err(error) => {
-                warnings.push(format!("acp store open: {error}"));
-                0
-            }
-        };
-        let sessions_repointed = match blocking_backend {
-            Some(backend) => backend
-                .rename_agent_attribution(&blocking_from, &blocking_to)
-                .unwrap_or_else(|error| {
-                    warnings.push(format!("session attribution rename: {error}"));
-                    0
-                }),
-            None => 0,
-        };
+        // Installation upgrade fences every legacy writer. Rename every
+        // session through the same standard repository once.
+        let sessions = (|| -> anyhow::Result<_> {
+            let store = sessions.map_err(anyhow::Error::msg)?;
+            let changed = store.rename_agent(&blocking_from, &blocking_to)?;
+            Ok((0, changed))
+        })();
+        let (acp_sessions, sessions_repointed) = sessions.unwrap_or_else(|error| {
+            warnings.push(format!("session rename: {error}"));
+            (0, 0)
+        });
         (cron_jobs, acp_sessions, sessions_repointed, warnings)
     })
     .await;
@@ -474,6 +431,18 @@ pub async fn cascade_rename_agent(
 mod tests {
     use super::*;
     use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+
+    fn sessions(config: &Config) -> Result<Arc<dyn AgentSessionPort>, String> {
+        zeroclaw_session_host::open_repository(config)
+            .map(|repository| Arc::new(repository) as Arc<dyn AgentSessionPort>)
+            .map_err(|error| error.to_string())
+    }
+
+    fn plan_agent_delete(config: &Config, alias: &str) -> AgentDeletePreflight {
+        let count = sessions(config)
+            .and_then(|store| store.count_live(alias).map_err(|error| error.to_string()));
+        super::plan_agent_delete_with_acp_count(config, alias, count)
+    }
 
     #[test]
     fn preflight_refuses_reserved_and_missing_aliases() {
@@ -538,9 +507,15 @@ mod tests {
             .insert("victim".to_string(), AliasedAgentConfig::default());
         config.heartbeat.enabled = true;
         config.heartbeat.agent = "victim".to_string();
-        AcpSessionStore::new(&config.data_dir)
+        zeroclaw_infra::session_events::upgrade::upgrade_installation(
+            &config.data_dir,
+            zeroclaw_infra::session_events::installation::NativeBackend::Sqlite,
+            |_| "victim".into(),
+        )
+        .unwrap();
+        SessionRepository::new(&config.data_dir)
             .unwrap()
-            .create_session("live", "victim", "/tmp/victim", None)
+            .create_session("live", "test", "victim", "/tmp/victim", None)
             .unwrap();
 
         let preview = plan_agent_delete(&config, "victim");
@@ -600,6 +575,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn standard_session_cascades_cover_acp_and_chat_on_both_backends() {
+        for backend in ["sqlite", "jsonl"] {
+            let temp = tempfile::TempDir::new().unwrap();
+            let mut config = Config {
+                data_dir: temp.path().join("data"),
+                ..Config::default()
+            };
+            config.channels.session_backend = backend.into();
+            let repository = zeroclaw_session_host::open_repository(&config).unwrap();
+            for (id, owner) in [
+                ("acp_fixture", "from"),
+                ("chat_fixture", "from"),
+                ("chat_untouched", "other"),
+            ] {
+                repository
+                    .create_session(id, "test", owner, "/fixture", None)
+                    .unwrap();
+            }
+
+            let renamed =
+                cascade_rename_agent(&config, None, "from", "to", sessions(&config)).await;
+            assert!(renamed.warnings.is_empty(), "{:?}", renamed.warnings);
+            assert_eq!((renamed.acp_sessions, renamed.sessions_repointed), (0, 2));
+            assert!(
+                repository
+                    .list_sessions_by_agent("from")
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(repository.list_sessions_by_agent("to").unwrap().len(), 2);
+
+            let memory: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("none"));
+            let archive = temp.path().join("archive");
+            let deleted =
+                cascade_owned_state(&config, &memory, "to", &archive, sessions(&config)).await;
+            assert!(
+                deleted
+                    .warnings
+                    .iter()
+                    .all(|warning| !warning.starts_with("session")),
+                "{:?}",
+                deleted.warnings
+            );
+            assert_eq!((deleted.acp_removed, deleted.sessions_cleared), (0, 2));
+            assert!(repository.list_sessions_by_agent("to").unwrap().is_empty());
+            assert_eq!(repository.list_sessions_by_agent("other").unwrap().len(), 1);
+            assert!(!config.data_dir.join("acp-sessions.db").exists());
+            assert!(!config.data_dir.join("sessions/sessions.db").exists());
+        }
+    }
+
+    #[tokio::test]
     async fn owned_state_cascade_removes_control_plane_tasks() {
         use crate::control_plane::{
             SqliteTaskStore, TaskKind, TaskRecord, TaskRegistry, TaskStatus,
@@ -635,7 +662,8 @@ mod tests {
         let memory: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("none"));
         let archive_dir = temp.path().join("archive");
 
-        let report = cascade_owned_state(&config, &memory, None, "victim", &archive_dir).await;
+        let report =
+            cascade_owned_state(&config, &memory, "victim", &archive_dir, sessions(&config)).await;
 
         assert_eq!(report.control_plane_tasks_removed, 1);
         assert_eq!(store.count_by_agent("victim").unwrap(), 0);

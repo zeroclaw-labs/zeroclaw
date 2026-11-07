@@ -63,23 +63,24 @@ impl zeroclaw_api::model_provider::ModelProvider for SessionToolsAfterSteering {
                 .messages
                 .iter()
                 .filter(|m| m.role == "tool")
-                .map(|m| m.content.clone())
+                .map(|m| json!({"tool_call_id": m.tool_result.as_ref().unwrap().tool_call_id, "content": m.content}).to_string())
                 .collect();
         }
         Ok(zeroclaw_providers::ChatResponse {
+            output_blocks: Vec::new(),
             text: (call > 1).then(|| "steering probe complete".into()),
             // Ask even when the tool was not offered: execution must refuse it too.
             tool_calls: if call == 1 {
                 [
-                    ("sessions_history", json!({"session_id":"rpc_victim"})),
-                    ("peek__history", json!({"session_id":"rpc_victim"})),
+                    ("sessions_history", json!({"session_id":"victim"})),
+                    ("peek__history", json!({"session_id":"victim"})),
                     (
                         "sessions_send",
-                        json!({"session_id":"rpc_victim", "message":APPEND}),
+                        json!({"session_id":"victim", "message":APPEND}),
                     ),
                     (
                         "peek__send",
-                        json!({"session_id":"rpc_victim", "message":APPEND}),
+                        json!({"session_id":"victim", "message":APPEND}),
                     ),
                     ("calculator", json!({"function":"add", "values":[2,2]})),
                     ("sessions_current", json!({})),
@@ -135,8 +136,7 @@ async fn session_tools_after_steering(demotion: Demotion, wildcard: bool) {
         },
     );
     config.agents.get_mut("test-agent").unwrap().skill_bundles = vec!["probe".into()];
-    let data_dir = config.data_dir.clone();
-    let (fixture, sessions, backend, _) = make_persistence_test_dispatcher(config, &data_dir);
+    let (fixture, sessions) = make_native_test_dispatcher(config);
     let ctx = Arc::clone(&fixture.ctx);
     scoped_dispatcher(&ctx, 4343)
         .await
@@ -145,10 +145,8 @@ async fn session_tools_after_steering(demotion: Demotion, wildcard: bool) {
         )
         .await
         .unwrap();
-    backend
-        .append("rpc_victim", &ChatMessage::assistant(FOREIGN))
-        .unwrap();
-    let before = serde_json::to_value(backend.load("rpc_victim")).unwrap();
+    seed_native_assistant(&fixture, "victim", FOREIGN).await;
+    let before = native_test_transcript(&ctx, "victim");
     let (mut alice, mut alice_rx) = roster_peer(&ctx, 4242).await;
     let (mut steerer, mut steerer_rx) = roster_peer(&ctx, 4242).await;
     let created = rpc(
@@ -234,7 +232,7 @@ async fn session_tools_after_steering(demotion: Demotion, wildcard: bool) {
     );
     if denied {
         assert_eq!(
-            serde_json::to_value(backend.load("rpc_victim")).unwrap(),
+            native_test_transcript(&ctx, "victim"),
             before,
             "foreign transcript must remain byte-for-byte equivalent"
         );
@@ -260,12 +258,16 @@ async fn session_tools_after_steering(demotion: Demotion, wildcard: bool) {
             assert!(guard.tool_names().contains(&"delegate"));
         }
     } else {
+        assert_eq!(
+            native_test_transcript(&ctx, "victim"),
+            before,
+            "native history mutation tools refuse the write even for an administrator"
+        );
         assert!(
-            backend
-                .load("rpc_victim")
+            output
                 .iter()
-                .any(|m| m.content.contains(APPEND)),
-            "admin control proves the append probe reaches storage"
+                .any(|text| text.contains("cannot mutate native event history")),
+            "admin control reaches the native mutation refusal: {output:?}"
         );
         assert!(
             !agent
@@ -298,4 +300,258 @@ async fn steering_keeps_session_tools_for_unchanged_admin() {
     for wildcard in [true, false] {
         session_tools_after_steering(Demotion::Never, wildcard).await;
     }
+}
+
+const STEER_TEXT: &str = "please also check the second file";
+struct RecordingTurnProvider {
+    started: tokio::sync::mpsc::UnboundedSender<()>,
+    release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+#[async_trait]
+impl zeroclaw_api::model_provider::ModelProvider for RecordingTurnProvider {
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: Option<f64>,
+    ) -> anyhow::Result<String> {
+        Ok("ok".to_string())
+    }
+
+    fn supports_native_tools(&self) -> bool {
+        true
+    }
+
+    async fn chat(
+        &self,
+        _request: zeroclaw_providers::ChatRequest<'_>,
+        _model: &str,
+        _temperature: Option<f64>,
+    ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+        let _ = self.started.send(());
+        let gate = self.release.lock().await.take();
+        if let Some(gate) = gate {
+            let _ = gate.await;
+        }
+        Ok(zeroclaw_providers::ChatResponse {
+            output_blocks: Vec::new(),
+            text: Some("steered reply".to_string()),
+            tool_calls: vec![],
+            usage: None,
+            reasoning_content: None,
+        })
+    }
+}
+
+impl zeroclaw_api::attribution::Attributable for RecordingTurnProvider {
+    fn role(&self) -> zeroclaw_api::attribution::Role {
+        zeroclaw_api::attribution::Role::Provider(zeroclaw_api::attribution::ProviderKind::Model(
+            zeroclaw_api::attribution::ModelProviderKind::Custom,
+        ))
+    }
+    fn alias(&self) -> &str {
+        "recording-provider"
+    }
+}
+
+struct RecordingHandles {
+    started: tokio::sync::mpsc::UnboundedReceiver<()>,
+    release: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl RecordingHandles {
+    async fn await_start(&mut self) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), self.started.recv())
+            .await
+            .expect("the turn must reach the provider")
+            .expect("the provider stays alive");
+    }
+
+    fn release(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+fn recording_provider(gated: bool) -> (RecordingTurnProvider, RecordingHandles) {
+    let (started_tx, started) = tokio::sync::mpsc::unbounded_channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    (
+        RecordingTurnProvider {
+            started: started_tx,
+            release: tokio::sync::Mutex::new(gated.then_some(release_rx)),
+        },
+        RecordingHandles {
+            started,
+            release: gated.then_some(release_tx),
+        },
+    )
+}
+
+struct GatedMemory {
+    stored: Arc<std::sync::Mutex<Vec<String>>>,
+    gate_on: String,
+    started: tokio::sync::mpsc::UnboundedSender<()>,
+    release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+impl GatedMemory {
+    async fn write(&self, content: &str) {
+        self.stored.lock().unwrap().push(content.to_string());
+        if content.contains(&self.gate_on) {
+            let gate = self.release.lock().await.take();
+            if let Some(gate) = gate {
+                let _ = self.started.send(());
+                let _ = gate.await;
+            }
+        }
+    }
+}
+
+impl zeroclaw_api::attribution::Attributable for GatedMemory {
+    fn role(&self) -> zeroclaw_api::attribution::Role {
+        zeroclaw_api::attribution::Role::Memory(zeroclaw_api::attribution::MemoryKind::None)
+    }
+    fn alias(&self) -> &str {
+        "gated"
+    }
+}
+
+#[async_trait]
+impl zeroclaw_api::memory_traits::Memory for GatedMemory {
+    fn name(&self) -> &str {
+        "gated"
+    }
+
+    async fn store(
+        &self,
+        _key: &str,
+        content: &str,
+        _category: zeroclaw_api::memory_traits::MemoryCategory,
+        _session_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.write(content).await;
+        Ok(())
+    }
+
+    async fn recall(
+        &self,
+        _query: &str,
+        _limit: usize,
+        _session_id: Option<&str>,
+        _since: Option<&str>,
+        _until: Option<&str>,
+    ) -> anyhow::Result<Vec<zeroclaw_api::memory_traits::MemoryEntry>> {
+        Ok(Vec::new())
+    }
+
+    async fn get(
+        &self,
+        _key: &str,
+    ) -> anyhow::Result<Option<zeroclaw_api::memory_traits::MemoryEntry>> {
+        Ok(None)
+    }
+
+    async fn list(
+        &self,
+        _category: Option<&zeroclaw_api::memory_traits::MemoryCategory>,
+        _session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<zeroclaw_api::memory_traits::MemoryEntry>> {
+        Ok(Vec::new())
+    }
+
+    async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    async fn purge_session_for_agent(
+        &self,
+        _session_id: &str,
+        _agent_id: &str,
+    ) -> anyhow::Result<usize> {
+        Ok(0)
+    }
+
+    async fn count(&self) -> anyhow::Result<usize> {
+        Ok(0)
+    }
+
+    async fn health_check(&self) -> bool {
+        true
+    }
+
+    async fn store_with_agent(
+        &self,
+        _key: &str,
+        content: &str,
+        _category: zeroclaw_api::memory_traits::MemoryCategory,
+        _session_id: Option<&str>,
+        _namespace: Option<&str>,
+        _importance: Option<f64>,
+        _agent_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.write(content).await;
+        Ok(())
+    }
+
+    async fn recall_for_agents(
+        &self,
+        _allowed_agent_ids: &[&str],
+        _query: &str,
+        _limit: usize,
+        _session_id: Option<&str>,
+        _since: Option<&str>,
+        _until: Option<&str>,
+    ) -> anyhow::Result<Vec<zeroclaw_api::memory_traits::MemoryEntry>> {
+        Ok(Vec::new())
+    }
+}
+
+/// Read frames until the response with `id`, returning it and every
+/// notification that preceded it.
+async fn response_and_notifications(
+    rx: &mut tokio::sync::mpsc::Receiver<String>,
+    id: u64,
+) -> (Value, Vec<Value>) {
+    let mut notifications = Vec::new();
+    loop {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("a response within 10s")
+            .expect("writer channel open");
+        let value: Value = serde_json::from_str(&frame).expect("valid JSON-RPC frame");
+        if value.get("id") == Some(&json!(id)) {
+            return (value, notifications);
+        }
+        notifications.push(value);
+    }
+}
+
+/// Send `session/prompt` through `process_line` with a client turn
+/// generation.
+async fn send_prompt(
+    dispatcher: &mut RpcDispatcher,
+    id: u64,
+    session_id: &str,
+    client_turn_generation: u64,
+) {
+    let line = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "session/prompt",
+        "params": {
+            "session_id": session_id,
+            "prompt": "hello",
+            "client_turn_generation": client_turn_generation,
+        },
+    })
+    .to_string();
+    dispatcher.process_line(&line).await;
 }

@@ -24,5 +24,13 @@ sha2 = "0.10"
 tokio = { version = "1.50", default-features = false, features = ["sync", "time"] }
 url = "2.5"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
+
+[features]
+# Explicit old-schema fixtures for migration and protocol compatibility tests.
+# Runtime constructors never use this path.
+test-util = []
