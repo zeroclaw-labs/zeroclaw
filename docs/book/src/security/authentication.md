@@ -284,6 +284,22 @@ they only relay what the IdP grants after the user approves. Design
 rationale and failure-mode table:
 `docs/security/oidc-browser-pkce-design-8289.md` in the repository.
 
+The gateway browser flow also requires a short-lived `HttpOnly` binding
+cookie from the browser that started it. The cookie grants no session or
+API access. A callback with no matching cookie is refused before code
+exchange and consumes the pending flow; open a new login in the intended
+browser instead of forwarding a callback URL between browsers. Each tab
+has its own flow cookie. A relay-capacity refusal retains a valid flow and
+cookie for retry within the original ten-minute deadline.
+
+Binding cookies use `SameSite=Lax` for the identity provider's top-level
+GET redirect. They have no `Domain` attribute and use `Path=/`, including
+behind a gateway path prefix; HTTPS also uses `Secure` and the `__Host-`
+name prefix. Serve remote enrollment over HTTPS. Plain-HTTP cookie scope
+still spans ports on the same host; this is not isolation from another
+application running on that host. Cookie blocking prevents browser
+enrollment; the device flow remains available.
+
 The rate limiting works in layers. Requests that start a flow
 (`POST /api/oidc/{alias}/device/start`, `GET /oidc/login/{alias}`, and
 `GET /oidc/callback`) count against an enrollment-specific instance of
@@ -322,7 +338,18 @@ the store away from everyone else for the ten minutes those flows live. Loopback
 exempt from the per-client budgets, as they are from every other gateway
 auth limit, so a reverse proxy sitting on the same host must enable
 `trust_forwarded_headers` for the per-client limits to apply to the real
-callers behind it. Every enrollment response carries
+callers behind it. When that setting is on, the gateway takes the
+rightmost address from `X-Forwarded-For` (the hop the immediate proxy
+added) or else `X-Real-IP`. Configure the proxy to append or overwrite
+rather than forward a client-supplied list unchanged, for example nginx
+`proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`.
+If you set only `X-Real-IP`, also clear the higher-priority list with
+`proxy_set_header X-Forwarded-For "";` together with
+`proxy_set_header X-Real-IP $remote_addr;`; otherwise a client-supplied
+`X-Forwarded-For` still wins. A forwarded loopback address is skipped so
+it cannot claim the local-only limiter exemption; when the chain is
+loopback-only the gateway uses a non-exempt key rather than the loopback
+peer. Every enrollment response carries
 `Cache-Control: no-store` and `Pragma: no-cache` on top of the gateway's
 `no-referrer` policy, because device codes and access tokens travel in
 those bodies.
@@ -481,10 +508,22 @@ the shared resolver's grants at prompt admission.
 
 That composition does not cover every route to an agent's tools. Cron jobs
 and SOP authoring check only the agent selector. A constrained principal
-holding cron grants can create a shell job for its agent, though agent jobs
-are refused to it as described above, and one holding SOP create or update
+holding cron grants can create or edit a shell job for its agent with RPC
+`cron/add` and `cron/patch`. The command meets the agent's approval policy
+there, as it does from the CLI and the dashboard, so under supervised
+autonomy a command that needs approval is refused rather than stored. Agent
+jobs are refused to it as described above. One holding SOP create or update
 grants can save a procedure whose trigger runs it later. Treat cron and SOP
 authoring grants as grants of the agent's tools.
+
+These checks run again when the job is written, not only when the request
+arrives. A grant withdrawn, or a paired device revoked, while a cron write
+waits for the database either stops that write or waits for it to finish.
+
+A tool called from a `pipeline` step or through a skill alias never inherits
+an approval. The runtime approves only the call it dispatched, so under
+supervised autonomy a command that needs approval is refused there; call the
+tool directly to be asked.
 
 Principal-owned sessions may use synchronous and parallel delegation when
 their grants allow it. Background delegation and its `check_result`,
@@ -574,6 +613,29 @@ provider registry and resolver:
 - CORS preflight (`OPTIONS`) passes through unauthenticated, as it
   always has. Any other method outside GET, HEAD, POST, PUT, PATCH and
   DELETE is refused.
+
+Verifying an OIDC bearer is work an unauthenticated caller makes the
+gateway do, and with `validation = "introspection"` each verification
+is one authenticated round trip to the identity provider under the
+daemon's own client credentials. Two limits bound it. A refused
+credential counts against a per-client ledger with the same thresholds
+as a bad pairing token (10 in a minute, then a 5-minute lockout, with
+loopback exempt), kept on its own ledger, so a client replaying a token
+past its expiry never locks its operator out of pairing, and a pairing
+lockout never blocks a bearer. The bearer ledger reads
+`gateway.trust_forwarded_headers` from the live configuration for each
+request, so a saved proxy-trust change applies without rebuilding the
+router. A transport failure on the gateway's own
+leg to the identity provider, and a verified identity the policy grants
+nothing, say nothing about the caller and are not billed to it. At most
+16 bearer verifications are in flight at once across all clients,
+loopback included, which bounds what the gateway will do to the
+identity provider on everyone's behalf; the slot is held for the
+verification alone, never across the request it admits. A locked-out
+client gets HTTP 429 and a verification refused for capacity gets HTTP
+503, each with a `Retry-After` naming the delay in seconds. Dashboard
+sessions are verified by their own layer and never compete for these
+limits.
 
 A scoped principal's `Config` grants are enforced in two steps. The
 route layer applies a coarse floor per HTTP method: a read needs
