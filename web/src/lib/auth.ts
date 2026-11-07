@@ -31,6 +31,8 @@ export interface OidcSession {
   features: {
     chat: boolean;
     operator_pages: boolean;
+    /** May read config: the config routes' own rule. Absent means no. */
+    config?: boolean;
   };
 }
 
