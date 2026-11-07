@@ -4886,6 +4886,7 @@ mod approval_tests {
             arguments_summary: "rm -rf /".into(),
             raw_arguments: None,
             position: None,
+            thread_ts: None,
         }
     }
 
@@ -5090,6 +5091,7 @@ mod approval_tests {
             arguments_summary: "rm -rf /".into(),
             raw_arguments: None,
             position: None,
+            thread_ts: None,
         };
 
         // `send` fails against the unreachable test host, which surfaces as an

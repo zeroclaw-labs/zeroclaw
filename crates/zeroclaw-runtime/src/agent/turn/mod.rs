@@ -1905,6 +1905,7 @@ async fn run_tool_call_loop_impl<'a>(
         approval,
         channel_name,
         channel_reply_target,
+        channel_thread_ts: ingress.thread_ts.as_deref(),
         cancellation_token: cancellation_token.as_ref(),
         on_delta: on_delta.as_ref(),
         event_tx: event_tx.as_ref(),
@@ -6736,6 +6737,7 @@ mod active_route_context_tests {
             parent_agent_alias: None,
             serving_provider_name: None,
             serving_model: None,
+            channel_thread_ts: None,
         };
         let call_ctx = base_ctx.for_route("custom.vision", "vision-model", vision_limits);
         let response = ChatResponse {

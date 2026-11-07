@@ -8251,6 +8251,7 @@ impl RpcDispatcher {
             trust: TrustClass::Untrusted,
             origin: TurnOrigin::Interactive,
             internal_principal: None,
+            thread_ts: None,
         });
         match self.ctx.sessions.steer_session_for_generation(
             &req.session_id,
@@ -24166,6 +24167,7 @@ mod tests {
                             arguments_summary: "private-approval".into(),
                             raw_arguments: None,
                             position: None,
+                            thread_ts: None,
                         },
                     )
                     .await

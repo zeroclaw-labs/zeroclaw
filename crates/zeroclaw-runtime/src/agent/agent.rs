@@ -242,6 +242,11 @@ pub(crate) async fn resolve_routed_approval(
     let (reason, source): (&str, zeroclaw_api::channel::ApprovalSource) =
         if let Some((channel_name, channel)) = approver {
             let approver_recipient = approver_recipient.unwrap_or_default();
+            // The origin's thread does not exist in the approver's conversation.
+            let request = &zeroclaw_api::channel::ChannelApprovalRequest {
+                thread_ts: None,
+                ..request.clone()
+            };
             let dur = std::time::Duration::from_secs(route.timeout_secs.max(1));
             // Attributed, not legacy: if the approver channel synthesizes its own
             // `Some(Deny)` (its inner timeout firing before this outer one), that
@@ -5937,6 +5942,7 @@ mod tests {
             trust: zeroclaw_api::ingress::TrustClass::Untrusted,
             origin: zeroclaw_api::ingress::TurnOrigin::Interactive,
             internal_principal: None,
+            thread_ts: None,
         }
     }
 
@@ -23058,6 +23064,7 @@ mod approval_route_tests {
         behavior: StubBehavior,
         seen_recipient: Arc<parking_lot::Mutex<Option<String>>>,
         seen_route_timeout: Option<Arc<parking_lot::Mutex<Option<std::time::Duration>>>>,
+        seen_thread: Arc<parking_lot::Mutex<Option<String>>>,
     }
 
     impl zeroclaw_api::attribution::Attributable for StubChannel {
@@ -23107,6 +23114,7 @@ mod approval_route_tests {
             request: &ChannelApprovalRequest,
         ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
             *self.seen_recipient.lock() = Some(recipient.to_string());
+            self.seen_thread.lock().clone_from(&request.thread_ts);
             if matches!(&self.behavior, StubBehavior::RuntimeTimeout) {
                 return Ok(Some(
                     zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
@@ -23163,6 +23171,7 @@ mod approval_route_tests {
             arguments_summary: "rm -rf /".into(),
             raw_arguments: None,
             position: None,
+            thread_ts: None,
         }
     }
 
@@ -23185,6 +23194,7 @@ mod approval_route_tests {
             behavior,
             seen_recipient: seen_recipient(),
             seen_route_timeout: None,
+            seen_thread: Arc::default(),
         }
     }
 
@@ -23233,6 +23243,31 @@ mod approval_route_tests {
             seen.lock().as_deref(),
             Some("configured-approver-recipient"),
             "the approver hop must not reuse the origin recipient"
+        );
+    }
+
+    #[tokio::test]
+    async fn routed_approval_drops_the_origin_thread() {
+        let approver = stub(
+            "ops",
+            StubBehavior::Answer(ChannelApprovalResponse::Approve),
+        );
+        let seen = Arc::clone(&approver.seen_thread);
+        *seen.lock() = Some("unset".into());
+        let h = registry(vec![approver]);
+        let request = ChannelApprovalRequest {
+            thread_ts: Some("$root:server".into()),
+            ..req()
+        };
+
+        let out =
+            resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "origin", &request)
+                .await;
+        assert!(matches!(out, RoutedApproval::Decided { .. }));
+        assert_eq!(
+            seen.lock().as_deref(),
+            None,
+            "the origin's thread does not exist in the approver's conversation"
         );
     }
 

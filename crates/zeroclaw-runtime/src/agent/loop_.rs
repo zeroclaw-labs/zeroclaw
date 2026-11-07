@@ -7964,6 +7964,7 @@ mod tests {
             trust: zeroclaw_api::ingress::TrustClass::Untrusted,
             origin: zeroclaw_api::ingress::TurnOrigin::Channel,
             internal_principal: None,
+            thread_ts: None,
         })
         .await;
 

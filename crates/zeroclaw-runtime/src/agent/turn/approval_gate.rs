@@ -64,6 +64,7 @@ pub(crate) async fn gate_tool_approval(
                     arguments_summary,
                     raw_arguments: Some(request.arguments.clone()),
                     position: Some(position),
+                    thread_ts: ctx.channel_thread_ts.map(str::to_owned),
                 };
                 let recipient = ctx.channel_reply_target.unwrap_or_default();
                 // Narration rides the async delta queue to the draft updater,
@@ -349,6 +350,7 @@ mod tests {
             turn_id: "trace-approval-gate",
             serving_provider_name: None,
             serving_model: None,
+            channel_thread_ts: None,
         }
     }
 
@@ -509,6 +511,7 @@ mod tests {
 
     struct ApprovingChannel {
         approval_requests: Arc<AtomicUsize>,
+        threads: Arc<std::sync::Mutex<Vec<Option<String>>>>,
     }
 
     impl Attributable for ApprovingChannel {
@@ -540,9 +543,10 @@ mod tests {
         async fn request_approval(
             &self,
             _recipient: &str,
-            _request: &ChannelApprovalRequest,
+            request: &ChannelApprovalRequest,
         ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
             self.approval_requests.fetch_add(1, Ordering::SeqCst);
+            self.threads.lock().unwrap().push(request.thread_ts.clone());
             Ok(Some(ChannelApprovalResponse::Approve))
         }
     }
@@ -609,6 +613,7 @@ mod tests {
         let requests = Arc::new(AtomicUsize::new(0));
         let channel = ApprovingChannel {
             approval_requests: Arc::clone(&requests),
+            threads: Arc::default(),
         };
         let ctx = test_ctx(&observer, &pacing, Some(&approval), Some(&channel));
 
@@ -665,6 +670,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn channel_approval_request_carries_the_turn_thread() {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let profile = full_always_ask_profile();
+        let approval = ApprovalManager::for_non_interactive_backchannel(&profile);
+        let threads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let channel = ApprovingChannel {
+            approval_requests: Arc::new(AtomicUsize::new(0)),
+            threads: Arc::clone(&threads),
+        };
+        for thread in [Some("$root:server"), None] {
+            let ctx = TurnCtx {
+                channel_thread_ts: thread,
+                ..test_ctx(&observer, &pacing, Some(&approval), Some(&channel))
+            };
+            let outcome = gate_tool_approval(
+                &ctx,
+                "shell",
+                &serde_json::json!({"command": "ls"}),
+                0,
+                zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
+            )
+            .await;
+            assert!(matches!(
+                outcome,
+                ApprovalGateOutcome::Proceed { approved: true }
+            ));
+        }
+        assert_eq!(
+            *threads.lock().unwrap(),
+            vec![Some("$root:server".to_string()), None]
+        );
+    }
+
+    #[tokio::test]
     async fn cancelling_turn_drops_pending_channel_approval() {
         let (writer_tx, mut writer_rx) = mpsc::channel::<String>(4);
         let rpc = Arc::new(RpcOutbound::new(writer_tx));
@@ -704,6 +744,7 @@ mod tests {
             parent_agent_alias: None,
             serving_provider_name: None,
             serving_model: None,
+            channel_thread_ts: None,
         };
 
         let arguments = serde_json::json!({"command": "sleep 60"});
