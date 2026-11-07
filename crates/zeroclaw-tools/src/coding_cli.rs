@@ -18,6 +18,7 @@ use tokio::process::Command;
     feature = "tool-claude-code",
     feature = "tool-codex-cli",
     feature = "tool-gemini-cli",
+    feature = "tool-agy-cli",
     feature = "tool-opencode-cli"
 ))]
 const SAFE_ENV_VARS: &[&str] = &[
@@ -32,6 +33,7 @@ const SAFE_ENV_VARS: &[&str] = &[
     feature = "tool-claude-code",
     feature = "tool-codex-cli",
     feature = "tool-gemini-cli",
+    feature = "tool-agy-cli",
     feature = "tool-opencode-cli"
 ))]
 const SAFE_ENV_VARS: &[&str] = &[
@@ -258,6 +260,7 @@ pub fn add_safe_env(command: &mut CodingCliCommand, safe_vars: &[&str], passthro
     feature = "tool-claude-code",
     feature = "tool-codex-cli",
     feature = "tool-gemini-cli",
+    feature = "tool-agy-cli",
     feature = "tool-opencode-cli"
 ))]
 pub(crate) fn add_coding_cli_env(command: &mut CodingCliCommand, passthrough: &[String]) {
@@ -374,6 +377,7 @@ mod tests {
         feature = "tool-claude-code",
         feature = "tool-codex-cli",
         feature = "tool-gemini-cli",
+        feature = "tool-agy-cli",
         feature = "tool-opencode-cli"
     ))]
     #[cfg(target_os = "windows")]
@@ -484,15 +488,17 @@ mod tests {
         );
     }
 
-    /// The adapter tests need all four coding-CLI tools compiled in.
+    /// The adapter tests need all five coding-CLI tools compiled in.
     #[cfg(all(
         feature = "tool-claude-code",
         feature = "tool-codex-cli",
         feature = "tool-gemini-cli",
+        feature = "tool-agy-cli",
         feature = "tool-opencode-cli"
     ))]
     mod adapters {
         use super::*;
+        use crate::agy_cli::AgyCliTool;
         use crate::claude_code::ClaudeCodeTool;
         use crate::codex_cli::CodexCliTool;
         use crate::gemini_cli::GeminiCliTool;
@@ -502,7 +508,7 @@ mod tests {
         use zeroclaw_config::autonomy::AutonomyLevel;
         use zeroclaw_config::policy::SecurityPolicy;
         use zeroclaw_config::schema::{
-            ClaudeCodeConfig, CodexCliConfig, GeminiCliConfig, OpenCodeCliConfig,
+            AgyCliConfig, ClaudeCodeConfig, CodexCliConfig, GeminiCliConfig, OpenCodeCliConfig,
         };
 
         #[derive(Default)]
@@ -568,6 +574,14 @@ mod tests {
                     },
                     recorder.clone(),
                 )),
+                Box::new(AgyCliTool::new_with_executor(
+                    security.clone(),
+                    AgyCliConfig {
+                        env_passthrough: passthrough.clone(),
+                        ..AgyCliConfig::default()
+                    },
+                    recorder.clone(),
+                )),
                 Box::new(OpenCodeCliTool::new_with_executor(
                     security,
                     OpenCodeCliConfig {
@@ -594,7 +608,7 @@ mod tests {
                     .iter()
                     .map(|command| command.program.clone())
                     .collect::<Vec<_>>(),
-                ["claude", "codex", "gemini", "opencode"]
+                ["claude", "codex", "gemini", "agy", "opencode"]
                     .map(OsString::from)
                     .to_vec()
             );
