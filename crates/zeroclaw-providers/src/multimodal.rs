@@ -3046,7 +3046,10 @@ fn image_format_for_mime(source: &str, mime: &str) -> anyhow::Result<image::Imag
 /// Lossless decode allocates a `width * height * 4` RGBA scratch and converts
 /// it to the 3 B/px (`Rgb8`) output: scratch = 4 B/px. A lossless still with
 /// alpha decodes straight into its 4 B/px (`Rgba8`) output: measured at 4.0 B/px
-/// in total on 2364 to 2730 px files, so 5 is generous there. A lossy decode
+/// in total on 2364 to 2730 px files, so 5 is generous there. That is the
+/// decode alone: the PNG that `webp_to_png` then encodes is not in the charge,
+/// and for incompressible content the whole ingest was measured at up to
+/// 18 B/px (127 MiB at 2730 px per side). A lossy decode
 /// holds the VP8 planes instead, 1.5 B/px. 5 covers all of these with room to
 /// spare. A *lossy* still with alpha is charged
 /// [`WEBP_STILL_ALPHA_SCRATCH_BYTES_PER_PIXEL`].
@@ -8934,7 +8937,7 @@ mod tests {
         // alpha (cap crossed between 2896 and 2897 px per side), 4 + 5 for a
         // lossless still with the VP8X alpha flag (between 2730 and 2731) and
         // 4 + 8 for a lossy one (between 2364 and 2365). The lossy fixtures
-        // also carry a 10-byte `VP8 ` chunk, charged 4 B per byte, which moves
+        // also carry a 10-byte `VP8 ` chunk, charged 5 B per byte, which moves
         // none of these boundaries. The sanity asserts tie those sides to the
         // constants, so a change to either fails here rather than silently
         // moving the boundary under the cases below.
@@ -9338,6 +9341,21 @@ mod tests {
             base + (boundary - 1) * WEBP_VP8_INPUT_BYTES_MULTIPLIER < MAX_DECODED_IMAGE_ALLOC_BYTES
         );
         assert!(base + boundary * WEBP_VP8_INPUT_BYTES_MULTIPLIER >= MAX_DECODED_IMAGE_ALLOC_BYTES);
+
+        // The boundary above follows the constant, so it holds for any value.
+        // This pins the value itself: 3.00 B held per chunk byte measured, plus
+        // one for the validator's copy of the input, plus one of margin.
+        let small = u64::from(64u16) * u64::from(64u16) * per_pixel;
+        assert_eq!(
+            projected_allocation(
+                "pin.webp",
+                "image/webp",
+                &lossy_still_with_chunk_of(64, 1_000_000)
+            )
+            .expect("the header parses"),
+            small + 5_000_000,
+            "one million bytes of VP8 chunk are charged 5 B each"
+        );
 
         let admitted = lossy_still_with_chunk_of(side, boundary as usize - 1);
         ensure_decode_within_per_image_cap("pad.webp", "image/webp", &admitted)

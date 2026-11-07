@@ -622,6 +622,11 @@ fn a_vp8_chunk_is_held_no_more_than_the_gate_charges_for() {
 /// about 25 MB. The charge of 8 is for the lossy-with-ALPH path; a lossless
 /// file must not pay it. Predicted before the first run: admitted, peak near
 /// 4 B/px, well under the charge.
+///
+/// The image is one flat colour, so the PNG that the ingest builds compresses
+/// to almost nothing and `ingest` here is the decode. With uniformly random
+/// pixels the same ingest was measured at 18 B/px (127 MiB at 2730 px), twice
+/// the cap, which the charge does not model: the PNG-encode residual.
 #[test]
 fn a_lossless_alpha_still_is_not_charged_like_a_lossy_one() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
