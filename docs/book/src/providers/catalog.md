@@ -525,6 +525,19 @@ model = "..."
 api_key = "..."
 ```
 
+**Standard Compute**: slot `standardcompute`. OpenAI-compatible endpoint
+`https://api.stdcmpt.com/v1` with bearer-token auth; monthly plans with a fixed
+compute budget. The model `standardcompute` routes each request to one of the
+models enabled in the account; an exact ID such as `anthropic/claude-sonnet-5.5`
+pins one model. `GET https://api.stdcmpt.com/v1/models` lists the IDs without a
+key. Key from [standardcompute.com](https://standardcompute.com).
+
+```toml
+[providers.models.standardcompute.default]
+model = "standardcompute"
+api_key = "..."
+```
+
 > Credentials come only from config (`api_key`) or the `--credential` override at run
 > time, these slots do **not** read a per-provider `*_API_KEY` environment variable.
 

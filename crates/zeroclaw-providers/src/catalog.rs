@@ -72,6 +72,7 @@ pub fn catalog_source_for(family: &str) -> Option<(Option<&'static str>, Option<
         // Atlas Cloud exposes a no-auth OpenAI-compatible `/models` endpoint.
         // `list_models_for_family` handles that path before using this tuple.
         "atlascloud" => (None, None),
+        "standardcompute" => (Some("standardcompute"), None),
         "synthetic" => (Some("synthetic"), None),
         "opencode" => (Some("opencode"), None),
         "atomic_chat" => (Some("atomic-chat"), None),
@@ -492,6 +493,13 @@ mod tests {
     fn nearai_family_uses_provider_catalog_source() {
         let (md, or) = catalog_source_for("nearai").expect("nearai is canonical");
         assert_eq!(md, None);
+        assert_eq!(or, None);
+    }
+
+    #[test]
+    fn standardcompute_family_uses_models_dev_catalog_source() {
+        let (md, or) = catalog_source_for("standardcompute").expect("standardcompute is canonical");
+        assert_eq!(md, Some("standardcompute"));
         assert_eq!(or, None);
     }
 
