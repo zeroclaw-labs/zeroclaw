@@ -12,7 +12,6 @@ import { ThemeProvider } from "./contexts/ThemeContext";
 
 import { loadLocale, saveLocale } from "./contexts/ThemeContext";
 import { ReauthPrompt } from "./components/auth/ReauthPrompt";
-import { RelayNotice } from "./components/auth/RelayNotice";
 import { SignInScreen } from "./components/auth/SignInScreen";
 import { AuthProvider, useAuth } from "./hooks/useAuth";
 import { DraftContext, useDraftStore } from "./hooks/useDraft";
@@ -195,7 +194,6 @@ function AppContent() {
       <ConfigDraftProvider>
         <LocaleContext.Provider value={{ locale, setAppLocale }}>
           <FreshInstallRedirect />
-          {viaRelay && <RelayNotice bar />}
           <ReauthPrompt />
           <Router />
         </LocaleContext.Provider>
