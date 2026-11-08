@@ -27,7 +27,18 @@ pub struct SpawnSubagentTool {
     /// any spawn work happens. Set by the agent loop from
     /// `AgentRunOverrides.is_subagent` at registry construction time.
     is_subagent_caller: bool,
+    /// The capabilities and principal the parent turn was built from. When
+    /// bound, the child runs through them, so it uses the parent's provider,
+    /// memory and supplied tools and resolves for the same principal. Empty
+    /// only for a registry no capability entry point bound, which keeps the
+    /// config-backed child run.
+    capabilities: crate::composition::CapabilitySlot,
     execution_capability: Option<AgentExecutionCapability>,
+    /// The session memory of the registry this tool was assembled into. Once
+    /// that session is pinned to its owner's private plane, the child runs
+    /// over the same routed memory instead of building the agent's shared
+    /// memory for itself.
+    session_memory: Option<Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>>,
 }
 
 impl SpawnSubagentTool {
@@ -45,8 +56,54 @@ impl SpawnSubagentTool {
             parent_alias: parent_alias.into(),
             security,
             is_subagent_caller: false,
+            capabilities: Arc::new(std::sync::OnceLock::new()),
             execution_capability: None,
+            session_memory: None,
         }
+    }
+
+    /// Share the session memory route of the registry this tool is assembled
+    /// into.
+    #[must_use]
+    pub fn with_session_memory(
+        mut self,
+        route: Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>,
+    ) -> Self {
+        self.session_memory = Some(route);
+        self
+    }
+
+    /// The memory a child of this tool's session runs over: the session's
+    /// routed memory once it is pinned, or `None` for an unowned session, in
+    /// which case the child builds the agent's memory as before.
+    fn child_memory(&self) -> Option<Arc<dyn zeroclaw_memory::Memory>> {
+        self.session_memory
+            .as_ref()
+            .and_then(|route| route.routed())
+            .map(|routed| Arc::clone(&routed.memory))
+    }
+
+    /// Run children through `capabilities` for `principal`. The first
+    /// binding wins.
+    #[must_use]
+    pub fn with_capabilities(
+        self,
+        capabilities: crate::composition::RuntimeCapabilities,
+        principal: Option<zeroclaw_api::principal::PrincipalId>,
+    ) -> Self {
+        let _ = self
+            .capabilities
+            .set(crate::composition::BoundCapabilities {
+                capabilities,
+                principal,
+            });
+        self
+    }
+
+    /// The slot this tool reads its capabilities from, for the registry that
+    /// builds it to hand to the owning entry point.
+    pub(crate) fn capabilities_slot(&self) -> crate::composition::CapabilitySlot {
+        Arc::clone(&self.capabilities)
     }
 
     /// Mark this tool instance as belonging to a SubAgent's tool
@@ -76,10 +133,15 @@ impl SpawnSubagentTool {
 /// tools every step turn drops. The scope is carried, not resolved here — the
 /// child re-resolves it against its own registry, so a differently assembled
 /// child registry is narrowed by the same contract.
-fn child_run_overrides(policy: Arc<SecurityPolicy>) -> AgentRunOverrides {
+fn child_run_overrides(
+    policy: Arc<SecurityPolicy>,
+    memory: Option<Arc<dyn zeroclaw_memory::Memory>>,
+) -> AgentRunOverrides {
     AgentRunOverrides {
         security: Some(policy),
-        memory: None,
+        // A pinned session's child stays on its owner's plane. `None` only for
+        // an unowned session, whose child builds the agent's shared memory.
+        memory,
         is_subagent: true,
         // Sub-turn origin already skips memory injection; explicit for
         // the same future-proofing reason as `is_subagent` above.
@@ -103,6 +165,15 @@ fn child_run_overrides(policy: Arc<SecurityPolicy>) -> AgentRunOverrides {
         // internal-turn contract; until then absence is explicit.
         internal_principal: None,
     }
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    /// Test-only: records the memory each child run is started with, so a
+    /// regression can observe what an assembled registry hands the child
+    /// without running a model.
+    pub(crate) static CHILD_MEMORY_SINK:
+        Arc<std::sync::Mutex<Option<Option<Arc<dyn zeroclaw_memory::Memory>>>>>;
 }
 
 #[async_trait]
@@ -246,8 +317,13 @@ impl Tool for SpawnSubagentTool {
             .and_then(|e| e.temperature);
         let session_path = std::path::PathBuf::from(format!("subagent-{run_id}"));
 
-        let mut run_overrides = child_run_overrides(subagent_ctx.policy.clone());
+        let mut run_overrides =
+            child_run_overrides(subagent_ctx.policy.clone(), self.child_memory());
         run_overrides.execution_admission = execution_admission.clone();
+        #[cfg(test)]
+        let _ = CHILD_MEMORY_SINK.try_with(|sink| {
+            *sink.lock().unwrap() = Some(run_overrides.memory.clone());
+        });
         let parent_alias = subagent_ctx.parent_alias.clone();
 
         let cp_task_id = run_id.clone();
@@ -275,24 +351,55 @@ impl Tool for SpawnSubagentTool {
                 .await;
         }
 
+        // A bound parent passes its capabilities and principal to the child,
+        // so the child cannot reach a provider or memory store the parent's
+        // sources would not have returned.
+        let bound = self.capabilities.get().cloned();
+        let config = (*config).clone();
         let run_result = Box::pin(scope!(
             agent_alias: parent_alias,
             session_key: run_id,
             =>
-            crate::agent::run(
-                (*config).clone(),
-                &self.parent_alias,
-                Some(prompt),
-                None,
-                None,
-                temperature,
-                vec![],
-                false,
-                Some(session_path),
-                None,
-                zeroclaw_api::ingress::TurnOrigin::SubTurn,
-                run_overrides,
-            )
+            async {
+                match bound {
+                    Some(bound) => {
+                        crate::agent::run_with_capabilities(
+                            config,
+                            bound.capabilities,
+                            bound.principal,
+                            &self.parent_alias,
+                            Some(prompt),
+                            None,
+                            None,
+                            temperature,
+                            vec![],
+                            false,
+                            Some(session_path),
+                            None,
+                            zeroclaw_api::ingress::TurnOrigin::SubTurn,
+                            run_overrides,
+                        )
+                        .await
+                    }
+                    None => {
+                        crate::agent::run(
+                            config,
+                            &self.parent_alias,
+                            Some(prompt),
+                            None,
+                            None,
+                            temperature,
+                            vec![],
+                            false,
+                            Some(session_path),
+                            None,
+                            zeroclaw_api::ingress::TurnOrigin::SubTurn,
+                            run_overrides,
+                        )
+                        .await
+                    }
+                }
+            }
         ))
         .await;
 
@@ -353,6 +460,63 @@ mod tests {
             },
         );
         config
+    }
+
+    /// A bound spawn tool runs its child through the bound provider and
+    /// memory sources for the bound principal. The configured endpoint is
+    /// unroutable, so a child built from config could not answer.
+    #[tokio::test]
+    async fn a_bound_spawn_runs_the_child_on_the_bound_capabilities() {
+        use crate::composition::test_support::{
+            NoTools, RecordingMemory, RecordingProviders, STUB_REPLY, recording_capabilities,
+        };
+        use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = config_with_agent("alpha");
+        config.data_dir = tmp.path().join("data");
+        config.config_path = tmp.path().join("config.toml");
+        config.memory.backend = "none".to_string();
+        config.providers.models.openai.insert(
+            "alpha".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o-mini".to_string()),
+                    uri: Some("http://127.0.0.1:9".to_string()),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        if let Some(agent) = config.agents.get_mut("alpha") {
+            agent.model_provider = "openai.alpha".into();
+        }
+        let security =
+            Arc::new(SecurityPolicy::for_agent(&config, "alpha").expect("alpha has a policy"));
+        let providers = Arc::new(RecordingProviders::default());
+        let memory = Arc::new(RecordingMemory::default());
+        let principal =
+            zeroclaw_api::principal::PrincipalId::for_oidc("https://issuer.example", "subject-p");
+        let tool = SpawnSubagentTool::new(Arc::new(config), "alpha", security).with_capabilities(
+            recording_capabilities(
+                Arc::clone(&providers),
+                Arc::clone(&memory),
+                Arc::new(NoTools),
+            ),
+            Some(principal.clone()),
+        );
+
+        let result = tool
+            .execute(json!({ "prompt": "Summarize this private task" }))
+            .await
+            .expect("execute returns a result");
+
+        assert!(result.success, "child failed: {:?}", result.error);
+        assert!(result.output.contains(STUB_REPLY));
+        let seen = providers.seen.lock();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].agent_alias, "alpha");
+        assert_eq!(seen[0].principal, Some(principal));
+        assert!(memory.agents.lock().iter().any(|alias| alias == "alpha"));
     }
 
     #[tokio::test]
@@ -759,7 +923,7 @@ mod tests {
 
         let inherited =
             crate::sop::active_scope::with_active_headless_step_scope(scoped_step(), async {
-                child_run_overrides(Arc::new(SecurityPolicy::default())).sop_step_scope
+                child_run_overrides(Arc::new(SecurityPolicy::default()), None).sop_step_scope
             })
             .await
             .expect("a child started inside a headless step must carry that step's scope");
@@ -781,11 +945,41 @@ mod tests {
         );
     }
 
+    /// Once the parent session is pinned, the child is
+    /// started over the session's routed memory; before the pin, and for an
+    /// unowned session, it is started with none and builds the agent's memory.
+    #[test]
+    fn a_pinned_sessions_child_is_started_over_the_routed_memory() {
+        let route = Arc::new(zeroclaw_tools::session_memory::SessionMemoryRoute::default());
+        let tool = SpawnSubagentTool::new(
+            Arc::new(config_with_agent("alpha")),
+            "alpha",
+            Arc::new(SecurityPolicy::default()),
+        )
+        .with_session_memory(Arc::clone(&route));
+        assert!(
+            tool.child_memory().is_none(),
+            "unpinned: the child builds its own"
+        );
+
+        let routed: Arc<dyn zeroclaw_memory::Memory> =
+            Arc::new(zeroclaw_memory::NoneMemory::new("routed"));
+        route
+            .pin(Arc::clone(&routed), Arc::new(SecurityPolicy::default()))
+            .unwrap();
+        let overrides =
+            child_run_overrides(Arc::new(SecurityPolicy::default()), tool.child_memory());
+        let handed = overrides
+            .memory
+            .expect("a pinned session hands its child memory");
+        assert!(Arc::ptr_eq(&handed, &routed));
+    }
+
     /// The inheritance is bounded by the step: an ordinary agent turn spawns a
     /// child with no step scope at all.
     #[tokio::test]
     async fn child_run_outside_a_headless_step_carries_no_scope() {
-        let overrides = child_run_overrides(Arc::new(SecurityPolicy::default()));
+        let overrides = child_run_overrides(Arc::new(SecurityPolicy::default()), None);
         assert!(overrides.sop_step_scope.is_none());
         assert!(
             overrides.is_subagent,

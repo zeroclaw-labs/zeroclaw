@@ -18,7 +18,15 @@ Full field reference: [config reference](../reference/config.md#channels).
 
 ## Safety
 
-When the listener starts, it refuses to watch the broad system roots `/`, `/home`, `/etc`, `/var`, `/proc`, `/sys`, `/dev`, and `/tmp` unless `allow_broad_roots` is set. On Windows it also refuses:
+When the listener starts, it refuses to watch the broad system roots `/`, `/home`, `/etc`, `/var`, `/proc`, `/sys`, `/dev`, and `/tmp` unless `allow_broad_roots` is set. On macOS it also refuses:
+
+- `/Users` and each folder in it: its home directories (`/Users/<name>`) and `/Users/Shared`
+- `/Volumes` and each mounted volume in it (`/Volumes/<name>`), including the startup disk's entry, which links to `/`
+- `/private`, and `/private/etc`, `/private/tmp`, and `/private/var`, the directories that `/etc`, `/tmp`, and `/var` link to
+
+On macOS, paths match case-insensitively, as a default macOS volume resolves them, and repeated or trailing `/` are ignored, so `/TMP` and `//Users` are refused as well.
+
+On Windows it also refuses:
 
 - every drive root (`C:\`), volume root, and network share root (`\\server\share`)
 - beneath a drive root: `Windows`, `Windows\Temp`, `Users`, each user profile in `Users` (`C:\Users\<name>`), `Program Files`, `Program Files (x86)`, and `ProgramData`
@@ -27,6 +35,8 @@ When the listener starts, it refuses to watch the broad system roots `/`, `/home
 The listener checks each path twice: as written, and as it resolves on disk, which follows `..` segments, symlinks, junctions, substituted drives, and short names such as `C:\PROGRA~1`. It refuses the path when either form is a broad root, refuses a path it cannot resolve, such as one that does not exist, and keeps watching the path as written.
 
 Written Windows paths match case-insensitively with either separator, ignoring repeated and trailing separators. Outside `\\?\` paths, `.` and `..` segments and trailing dots and spaces resolve as Windows resolves them. The `\\?\` and `\\.\` device spellings (`\\?\C:\`, `\\?\UNC\server\share`) match the drive or share they name. A drive-relative spelling such as `C:` or `C:Windows` is read from the drive's root, because the check cannot know that drive's current folder.
+
+The check never reads `$HOME`, so its result does not depend on the account the daemon runs as. macOS and Windows instead reject home directories in their standard location (`/Users/<name>`, `C:\Users\<name>`). A home directory elsewhere, such as root's `/var/root` on macOS, is not recognized. Linux and other Unix systems accept a home directory such as `/home/<name>`. On every platform, point `paths` at the folder your SOPs need rather than a whole home directory.
 
 Symlink event paths are rejected before any metadata, hash, or content read by default; `follow_symlinks` opts in but still requires the canonical target to resolve inside a watched root.
 

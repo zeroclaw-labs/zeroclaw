@@ -6,8 +6,9 @@
 # `paths-ignore: tests/**`.
 #
 # NOTE: inline `#[cfg(test)]` fixtures inside src/*.rs cannot be excluded by path
-# (they share a file with production code). Those surface once in the full-scan
-# baseline and are handled by dismissing them in the Security tab, not here.
+# (they share a file with production code). Silence one such finding with an
+# inline `nosemgrep: <rule-id>` comment on the matched line; ci-code-analysis.yml
+# drops suppressed findings before the SARIF upload.
 
 # Test trees carry deliberate example secrets/tokens/keys for detectors to match.
 tests/

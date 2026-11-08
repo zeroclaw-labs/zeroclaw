@@ -14,7 +14,8 @@ export type ColorThemeId =
   | 'cobalt2'
   | 'flexoki-dark' | 'flexoki-light'
   | 'hacker-green'
-  | 'material-dark' | 'material-light';
+  | 'material-dark' | 'material-light'
+  | 'oxocarbon';
 
 export interface ColorThemeDef {
   id: ColorThemeId;
