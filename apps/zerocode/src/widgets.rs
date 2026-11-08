@@ -104,9 +104,9 @@ use ratatui::{
 /// Returns `None` from `widget()` when there is nothing to show.
 pub struct CtxBar {
     pub input_tokens: Option<u64>,
-    /// Provenance of `input_tokens` ("provider" or "estimate"). When the count
-    /// is estimated the label is prefixed with `~` so a derived value is never
-    /// presented with the same authority as provider-reported usage.
+    /// Provenance of `input_tokens`, using the wire values of
+    /// `zeroclaw_api::agent::TokenCountSource`. Derived counts are prefixed with
+    /// `~` so they are not presented as provider-reported usage.
     pub input_tokens_source: Option<String>,
     /// Preemptive-trim budget: the point where history trimming triggers.
     pub max_tokens: Option<u64>,

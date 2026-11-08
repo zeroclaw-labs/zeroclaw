@@ -30,38 +30,36 @@ test('a done frame without capacity clears the previous route denominator', () =
 });
 
 test('a real trim replaces only the count and preserves the canonical budget', () => {
-  const current = { inputTokens: 180_000, maxTokens: 160_000 };
+  const current = { inputTokens: 180_000, source: 'provider' };
   const trimmed = applyHistoryTrimToDisplayedBudget(current, {
     tokens_after: 90_000,
     dropped_messages: 4,
+    tokens_after_source: 'calibrated',
   });
-  assert.deepEqual(trimmed, { inputTokens: 90_000, maxTokens: 160_000 });
+  assert.deepEqual(trimmed, { inputTokens: 90_000, source: 'calibrated' });
 
-  const rendered = resolveContextBarState(trimmed.maxTokens, 200_000, trimmed.inputTokens);
+  const rendered = resolveContextBarState(160_000, 200_000, trimmed.inputTokens);
   assert.ok(rendered);
   assert.equal(rendered.used, 90_000);
   assert.equal(rendered.denominator, 200_000);
 });
 
 test('a message-limit trim leaves the displayed budget alone', () => {
-  const current = { inputTokens: 12_000, maxTokens: 32_000 };
+  const current = { inputTokens: 12_000, source: 'provider' };
   assert.deepEqual(applyHistoryTrimToDisplayedBudget(current, {}), current);
 });
 
-
 test('a zero-drop floor notice cannot replace the displayed count', () => {
-  const current = { inputTokens: 12_000, maxTokens: 8_000 };
+  const current = { inputTokens: 12_000, source: 'provider' };
   assert.equal(applyHistoryTrimToDisplayedBudget(current, {
     dropped_messages: 0,
     tokens_after: 4_000,
   }), current);
 });
 
-test('real trims cannot enable a disabled or unknown budget', () => {
-  for (const maxTokens of [0, null]) {
-    assert.deepEqual(applyHistoryTrimToDisplayedBudget(
-      { inputTokens: 12_000, maxTokens },
-      { dropped_messages: 2, tokens_after: 6_000 },
-    ), { inputTokens: 6_000, maxTokens });
-  }
+test('a trim without provenance cannot inherit a previous provider label', () => {
+  assert.deepEqual(applyHistoryTrimToDisplayedBudget(
+    { inputTokens: 12_000, source: 'provider' },
+    { dropped_messages: 2, tokens_after: 6_000 },
+  ), { inputTokens: 6_000, source: null });
 });

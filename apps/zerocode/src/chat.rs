@@ -10193,9 +10193,9 @@ pub struct ChatState {
     /// provider (input + cached + output) is added on arrival. Cleared on
     /// session reset only.
     pub context_input_tokens: Option<u64>,
-    /// Provenance of `context_input_tokens` ("provider" or "estimate"). An
-    /// estimated count must be rendered as approximate, never as measured
-    /// usage. Always set and cleared together with the count it describes.
+    /// Provenance of `context_input_tokens`, using the wire values of
+    /// `zeroclaw_api::agent::TokenCountSource`. Derived counts are rendered as
+    /// approximate. Always set and cleared together with the count it describes.
     pub context_input_tokens_source: Option<String>,
     /// Preemptive-trim budget for this session (the bar fills toward this).
     pub context_max_tokens: Option<u64>,

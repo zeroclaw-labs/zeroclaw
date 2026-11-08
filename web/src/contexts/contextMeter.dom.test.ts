@@ -92,6 +92,12 @@ async function mountMeter() {
     async receive(frame: WsMessage) {
       await act(async () => { socket.onMessage?.(frame); });
     },
+    async receiveBatch(frames: WsMessage[]) {
+      await act(async () => { for (const frame of frames) socket.onMessage?.(frame); });
+    },
+    async switchSession() {
+      await act(async () => { assert.equal(current?.goToSession('next-meter-session'), true); });
+    },
     meter(): string | null {
       // AgentChat's visible meter is the span containing its token bar.
       return [...container.querySelectorAll('span')]
@@ -179,11 +185,46 @@ test('actual web meter does not restore pre-trim usage on done', async () => {
   } finally { await mounted.unmount(); }
 });
 
-const capturedFrames = process.env.ZEROCLAW_CONTEXT_METER_TEST_FRAMES_PATH;
-test('real gateway terminal frames reach the actual web meter unchanged', {
-  skip: capturedFrames ? false : 'set ZEROCLAW_CONTEXT_METER_TEST_FRAMES_PATH to the real WS regression capture',
-}, async () => {
-  const frames = JSON.parse(await readFile(capturedFrames!, 'utf8')) as WsMessage[];
+test('actual web meter labels derived counts and clears provenance with measured or absent usage', async () => {
+  const mounted = await mountMeter();
+  try {
+    await mounted.receive(done());
+    const measured = mounted.meter();
+    assert.ok(measured && !measured.includes('~'), measured ?? 'missing meter');
+    for (const source of ['calibrated', 'estimate']) {
+      await mounted.receive(trim({ tokens_after_source: source }));
+      const derived = mounted.meter();
+      assert.ok(derived, 'derived meter is present');
+      assert.ok(derived.includes('~ 90,000 / 200,000'), derived);
+      assert.ok(derived.includes('~45%'), derived);
+      assert.equal(derived.length, measured.length, 'source marker reuses the measured separator cells');
+      await mounted.receive(trim({ dropped_messages: 0, tokens_after_source: 'provider' }));
+      assert.equal(mounted.meter(), derived);
+      await mounted.receive(trim({ tokens_after: undefined, tokens_after_source: 'provider' }));
+      assert.equal(mounted.meter(), derived);
+      await mounted.receive(done({ context_input_tokens: 90_000, context_input_tokens_source: source }));
+      assert.equal(mounted.meter(), derived, 'done preserves both derived count and source');
+      await mounted.receive(done({ last_input_tokens: 90_000 }));
+      assert.ok(!mounted.meter()?.includes('~'), 'same count with measured provenance clears the marker');
+    }
+    await mounted.receiveBatch([done(), trim()]);
+    assert.ok(mounted.meter()?.includes('~45%'), 'batched frames retain count and source together');
+    await mounted.receive(done({ last_input_tokens: null }));
+    assertCount(mounted.meter(), 0);
+    assert.ok(!mounted.meter()?.includes('~'), 'absent usage clears provenance');
+    await mounted.receive(trim());
+    await mounted.switchSession();
+    assertCount(mounted.meter(), 0);
+    assert.ok(!mounted.meter()?.includes('~'), 'session reset clears provenance with count');
+  } finally { await mounted.unmount(); }
+});
+
+// Recorded from websocket_terminal_trim_survives_done_without_changing_usage_or_next_turn.
+// Override with a fresh capture to prove both ends on the same revision.
+const capturedFrames = process.env.ZEROCLAW_CONTEXT_METER_TEST_FRAMES_PATH
+  ?? new URL('./fixtures/context-meter-ws-frames.json', import.meta.url);
+test('real gateway terminal frames reach the actual web meter unchanged', async () => {
+  const frames = JSON.parse(await readFile(capturedFrames, 'utf8')) as WsMessage[];
   const terminal = [...frames].reverse().find((frame) => frame.type === 'done');
   const lastTrim = [...frames].reverse().find((frame) => frame.type === 'history_trimmed');
   assert.ok(terminal && lastTrim && typeof lastTrim.tokens_after === 'number');
@@ -196,6 +237,11 @@ test('real gateway terminal frames reach the actual web meter unchanged', {
     for (const frame of frames) await mounted.receive(frame);
     assertCount(mounted.meter(), lastTrim.tokens_after, terminal.model_context_window ?? terminal.max_context_tokens);
     assert.equal(terminal.context_input_tokens, lastTrim.tokens_after);
+    assert.equal(terminal.context_input_tokens_source, lastTrim.tokens_after_source);
+    const denominator = terminal.model_context_window ?? terminal.max_context_tokens;
+    assert.ok(denominator);
+    const approximatePercent = `~${(100 * lastTrim.tokens_after / denominator).toFixed(0)}%`;
+    assert.ok(mounted.meter()?.includes(approximatePercent), 'captured calibrated count remains approximate');
   } finally { await mounted.unmount(); }
 });
 
