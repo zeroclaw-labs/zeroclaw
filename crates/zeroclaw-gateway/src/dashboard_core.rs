@@ -3015,6 +3015,29 @@ mod tests {
         assert_eq!(done["full_response"], "hello from support");
     }
 
+    /// A runtime profile is optional: a turn without one runs on the global
+    /// defaults, so an enabled agent that names none still takes a chat.
+    #[tokio::test]
+    async fn an_enabled_agent_without_a_runtime_profile_takes_a_chat() {
+        let fixture = Fixture::with_config(|config| {
+            config
+                .agents
+                .get_mut("support")
+                .expect("the fixture's agent")
+                .runtime_profile = Default::default();
+        })
+        .await;
+        let addr = serve(fixture.router()).await;
+        let (alice, _) = fixture.sign_in("alice").await;
+        let mut socket = open_chat(addr, &alice, "support", "plain")
+            .await
+            .expect("an enabled agent without a runtime profile takes a chat");
+        await_frame(&mut socket, "session_start").await;
+        let done = chat_once(&mut socket, "no runtime profile").await;
+        assert_eq!(done["type"], "done", "{done}");
+        assert_eq!(done["full_response"], "hello from support");
+    }
+
     /// Whether an agent the account was not granted is configured, or could
     /// run, is not this account's to learn: each is refused alike, before
     /// the core or the model sees anything.

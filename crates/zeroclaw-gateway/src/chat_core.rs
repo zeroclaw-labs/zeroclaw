@@ -149,7 +149,7 @@ pub(crate) async fn ws_chat_through_core(
     }
     // Read live, as again before each prompt: an agent that is disabled, or
     // lacks what a turn runs on, takes no new conversation.
-    if !is_dispatchable(&state, &agent_alias) {
+    if !agent_takes_turns(&state, &agent_alias) {
         return agent_not_dispatchable(&agent_alias);
     }
     // The socket closes once the session ends, or stops granting what was
@@ -517,7 +517,7 @@ impl Chat {
         // opened gets no prompt, and the chat stays open for when it is
         // enabled again.
         let agent = self.core.agent_alias();
-        if !is_dispatchable(&self.state, agent) {
+        if !agent_takes_turns(&self.state, agent) {
             let error = json!({
                 "type": "error",
                 "message": not_dispatchable_message(agent),
@@ -1077,15 +1077,20 @@ fn failure_frame(failure: &CoreFailure) -> (String, &'static str) {
     }
 }
 
-/// Whether the live config has `alias` able to take a turn: configured,
-/// enabled, and bound to what a turn runs on
-/// ([`AliasedAgentConfig::is_dispatchable`]).
-fn is_dispatchable(state: &AppState, alias: &str) -> bool {
-    state
-        .config
-        .read()
-        .agent(alias)
-        .is_some_and(AliasedAgentConfig::is_dispatchable)
+/// Whether the live config has `alias` configured and able to take a turn
+/// ([`takes_turns`]).
+fn agent_takes_turns(state: &AppState, alias: &str) -> bool {
+    state.config.read().agent(alias).is_some_and(takes_turns)
+}
+
+/// What a turn needs from an agent's config: enabled, with a model provider
+/// and a risk profile. Not [`AliasedAgentConfig::is_dispatchable`], which
+/// also wants a runtime profile: that one is optional, and a turn without it
+/// runs on the global defaults.
+fn takes_turns(agent: &AliasedAgentConfig) -> bool {
+    agent.enabled
+        && !agent.model_provider.trim().is_empty()
+        && !agent.risk_profile.trim().is_empty()
 }
 
 fn not_dispatchable_message(alias: &str) -> String {
