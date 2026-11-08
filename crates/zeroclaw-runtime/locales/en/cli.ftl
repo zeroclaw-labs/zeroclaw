@@ -181,6 +181,7 @@ cli-oidc-token-expiry = The token expires in { $seconds } seconds.
 cli-oidc-browser-open = Opening your browser to sign in. If nothing opens, visit:
     { $uri }
 cli-oidc-browser-waiting = Waiting for the browser sign-in to complete...
+cli-oidc-browser-start-failed = could not start sign-in
 cli-auth-list-about = List auth profiles
 cli-auth-status-about = Show auth status with active profile and token expiry info
 

@@ -280,6 +280,22 @@ they only relay what the IdP grants after the user approves. Design
 rationale and failure-mode table:
 `docs/security/oidc-browser-pkce-design-8289.md` in the repository.
 
+The gateway browser flow also requires a short-lived `HttpOnly` binding
+cookie from the browser that started it. The cookie grants no session or
+API access. A callback with no matching cookie is refused before code
+exchange and consumes the pending flow; open a new login in the intended
+browser instead of forwarding a callback URL between browsers. Each tab
+has its own flow cookie. A relay-capacity refusal retains a valid flow and
+cookie for retry within the original ten-minute deadline.
+
+Binding cookies use `SameSite=Lax` for the identity provider's top-level
+GET redirect. They have no `Domain` attribute and use `Path=/`, including
+behind a gateway path prefix; HTTPS also uses `Secure` and the `__Host-`
+name prefix. Serve remote enrollment over HTTPS. Plain-HTTP cookie scope
+still spans ports on the same host; this is not isolation from another
+application running on that host. Cookie blocking prevents browser
+enrollment; the device flow remains available.
+
 The rate limiting works in layers. Requests that start a flow
 (`POST /api/oidc/{alias}/device/start`, `GET /oidc/login/{alias}`, and
 `GET /oidc/callback`) count against an enrollment-specific instance of
@@ -476,10 +492,22 @@ the shared resolver's grants at prompt admission.
 
 That composition does not cover every route to an agent's tools. Cron jobs
 and SOP authoring check only the agent selector. A constrained principal
-holding cron grants can create a shell job for its agent, though agent jobs
-are refused to it as described above, and one holding SOP create or update
+holding cron grants can create or edit a shell job for its agent with RPC
+`cron/add` and `cron/patch`. The command meets the agent's approval policy
+there, as it does from the CLI and the dashboard, so under supervised
+autonomy a command that needs approval is refused rather than stored. Agent
+jobs are refused to it as described above. One holding SOP create or update
 grants can save a procedure whose trigger runs it later. Treat cron and SOP
 authoring grants as grants of the agent's tools.
+
+These checks run again when the job is written, not only when the request
+arrives. A grant withdrawn, or a paired device revoked, while a cron write
+waits for the database either stops that write or waits for it to finish.
+
+A tool called from a `pipeline` step or through a skill alias never inherits
+an approval. The runtime approves only the call it dispatched, so under
+supervised autonomy a command that needs approval is refused there; call the
+tool directly to be asked.
 
 Principal-owned sessions may use synchronous and parallel delegation when
 their grants allow it. Background delegation and its `check_result`,
