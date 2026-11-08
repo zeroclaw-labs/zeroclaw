@@ -6423,7 +6423,9 @@ mod tests {
             "file_read"
         );
 
-        let long = "echo ".to_string() + &"a".repeat(200);
+        // `format!` rather than `String + &String`: under `ci-all`, decancer's
+        // `impl Add<Translation> for String` blocks that coercion.
+        let long = format!("echo {}", "a".repeat(200));
         let title = acp_tool_title("shell", &serde_json::json!({"command": long}));
         assert_eq!(title.chars().count(), ACP_TOOL_TITLE_MAX_CHARS);
         assert!(title.ends_with('…'));
