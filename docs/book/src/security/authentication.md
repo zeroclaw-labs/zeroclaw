@@ -74,12 +74,18 @@ RPC config methods, which is what zerocode's config editor uses, the web
 dashboard's config API when the gateway runs under the daemon, and
 `zeroclaw config set`, `zeroclaw config patch`, or `zeroclaw user` (see
 [Managing users from the command line](#managing-users-from-the-command-line))
-when the daemon accepts the edit from the CLI. Editing
-`[permission_profiles]`, `[users]`, `[oidc]`, `security.trust_daemon_uid`,
-or `[security.password_auth]` that way re-compiles the policy at save time.
+when the daemon accepts the edit from the CLI. The RPC methods and the
+supervised gateway's config API share the daemon generation's live
+configuration, config write lock, and accepted authorization authority.
+Editing `[permission_profiles]`, `[users]`, `[oidc]`,
+`security.trust_daemon_uid`, or `[security.password_auth]` that way compiles
+and publishes the policy at save time, before the write returns success.
 Established native-token and local connections re-resolve at their next
 operation, with no reconnect or restart, and an OIDC connection must
-initialize again.
+initialize again. The dashboard's pending-reload flag still covers
+daemon-owned subsystems that need rebuilding; it does not delay this
+authorization publication. Edits made directly in `config.toml` apply at
+the next daemon reload or restart.
 
 For `zeroclaw config`, an authorization edit is one that writes or changes
 `[permission_profiles]`, `[users]`, `[oidc]`, `security.trust_daemon_uid`,
@@ -929,10 +935,11 @@ against the accepted snapshot as it stands. Nothing on the request
 path recompiles policy, so a request that read the configuration
 before a concurrent persist can never reinstall the older policy over
 the newer one; a persisted change to a provider's verification
-settings, a roster or a profile takes effect on the next request. Under
-the daemon, the gateway and the RPC surface share one accepted policy
-and one live configuration, so a change persisted through either binds
-both before the writer returns. A standalone gateway holds its own.
+settings, a roster or a profile takes effect on the next request. In a
+supervised run, the gateway and RPC surface share the live configuration,
+write lock, and accepted policy authority, so a save through either surface
+publishes to both. A standalone gateway has its own authority; it does not
+publish changes to a separately running daemon.
 Other gateway surfaces keep the pairing check per handler and adopt the
 layer in follow-ups; a [dashboard sign-in](#dashboard-sign-in) session
 also satisfies that check when its account is an administrator.
