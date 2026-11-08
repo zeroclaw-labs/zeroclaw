@@ -231,11 +231,17 @@ impl CostLedger {
 
     fn migrate_legacy(&self) -> Result<()> {
         let workspace = self.workspace_dir()?;
-        let canonical_sources = self.canonical_session_sources()?;
         let candidates = [
             workspace.join("state/costs.jsonl"),
             workspace.join(".zeroclaw/costs.db"),
         ];
+        if !candidates
+            .iter()
+            .any(|source| source.exists() && source != &self.path)
+        {
+            return Ok(());
+        }
+        let canonical_sources = self.canonical_session_sources()?;
         for source in candidates {
             if !source.exists() || source == self.path {
                 continue;
