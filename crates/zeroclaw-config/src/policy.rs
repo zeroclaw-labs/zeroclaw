@@ -384,7 +384,7 @@ pub struct SecurityPolicy {
     /// configured `[runtime].shell`, or the detected default, as the runtime
     /// factory chooses it. `None` when the runtime is not native or the
     /// policy was built without a config. POSIX command checks use it to
-    /// identify bash (see [`SecurityPolicy::posix_shell`]); otherwise they
+    /// identify bash (see `SecurityPolicy::posix_shell`); otherwise they
     /// keep the rules that are safe for any POSIX shell.
     pub native_shell: Option<String>,
     pub tracker: PerSenderTracker,
