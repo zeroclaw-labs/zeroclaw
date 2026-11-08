@@ -147,6 +147,10 @@ impl AuthDenied {
 /// registry, resolver, roster and flags consistent.
 pub struct AcceptedAuthState {
     registry: ProviderRegistry,
+    /// Each OIDC provider's issuer and client, by provider name, compiled
+    /// with `registry` so a bound credential is checked against the same
+    /// state that would send it.
+    oidc_bindings: std::collections::HashMap<String, OidcBinding>,
     resolver: PrincipalResolver,
     uid_roster: Arc<UidRoster>,
     local_roster_configured: bool,
@@ -156,6 +160,25 @@ pub struct AcceptedAuthState {
     /// The configuration this state was compiled from (see [`auth_inputs`]),
     /// or `None` for the deny-all state, which was compiled from nothing.
     auth_inputs: Option<serde_json::Value>,
+}
+
+/// The issuer and client an OIDC provider verifies tokens against. A token
+/// issued under one of them is bound to it: see
+/// [`RpcInboundAuth::authenticate_bound`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OidcBinding {
+    pub issuer: String,
+    pub client_id: String,
+}
+
+impl OidcBinding {
+    #[must_use]
+    pub fn of(entry: &zeroclaw_config::schema::OidcConfig) -> Self {
+        Self {
+            issuer: entry.issuer.clone(),
+            client_id: entry.effective_client_id().to_string(),
+        }
+    }
 }
 
 /// The parts of a configuration an accepted authorization state is compiled
@@ -194,8 +217,14 @@ impl AcceptedAuthState {
                 config.oidc[alias].clone(),
             )?))?;
         }
+        let oidc_bindings = config
+            .oidc
+            .iter()
+            .map(|(alias, entry)| (format!("oidc.{alias}"), OidcBinding::of(entry)))
+            .collect();
         Ok(Self {
             registry,
+            oidc_bindings,
             resolver: PrincipalResolver::with_generation(
                 ResolverPolicy::from_config(config)?,
                 generation,
@@ -228,6 +257,7 @@ impl AcceptedAuthState {
             .expect("unique peercred provider");
         Self {
             registry,
+            oidc_bindings: std::collections::HashMap::new(),
             resolver: PrincipalResolver::with_generation(ResolverPolicy::default(), generation),
             uid_roster,
             local_roster_configured: true,
@@ -672,6 +702,45 @@ impl RpcInboundAuth {
         auth_token: Option<&str>,
         auth_provider: Option<&str>,
     ) -> Result<ConnectionAuth, AuthDenied> {
+        self.authenticate_checked(
+            transport,
+            transport_credential,
+            auth_token,
+            auth_provider,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::authenticate`] for a bearer bound to one OIDC provider as it
+    /// was configured when the bearer was issued. Refused before the bearer
+    /// is sent anywhere when, in the accepted state this verification uses,
+    /// the provider by that name names another issuer or client, or is gone.
+    pub async fn authenticate_bound(
+        &self,
+        transport: TransportKind,
+        auth_token: &str,
+        auth_provider: &str,
+        binding: &OidcBinding,
+    ) -> Result<ConnectionAuth, AuthDenied> {
+        self.authenticate_checked(
+            transport,
+            Credential::None,
+            Some(auth_token),
+            Some(auth_provider),
+            Some(binding),
+        )
+        .await
+    }
+
+    async fn authenticate_checked(
+        &self,
+        transport: TransportKind,
+        transport_credential: Credential,
+        auth_token: Option<&str>,
+        auth_provider: Option<&str>,
+        binding: Option<&OidcBinding>,
+    ) -> Result<ConnectionAuth, AuthDenied> {
         #[cfg(test)]
         {
             let pause = self.authenticate_pause.lock().unwrap().take();
@@ -681,6 +750,14 @@ impl RpcInboundAuth {
             }
         }
         let state = self.state();
+        // Checked against the same state whose registry would send the
+        // bearer: a provider repointed or removed since it was issued never
+        // receives it.
+        if let Some(binding) = binding
+            && state.oidc_bindings.get(auth_provider.unwrap_or_default()) != Some(binding)
+        {
+            return Err(AuthDenied::from_deny_reason(DenyReason::UnknownProvider));
+        }
         // The generation the provider is about to verify against. Provider
         // verification below may await an IdP round trip; a trusted config
         // write can install a new generation during that await. Captured
@@ -1681,6 +1758,61 @@ mod tests {
             interactive_clients: vec!["daemon-client".into()],
             ..zeroclaw_config::schema::OidcConfig::default()
         }
+    }
+
+    /// A bearer bound to one OIDC provider is verified only by it: when the
+    /// accepted state's provider by that name names another issuer or
+    /// client, or there is none, the bearer is refused before it is sent
+    /// anywhere.
+    #[tokio::test]
+    async fn a_bound_bearer_never_reaches_another_provider() {
+        let corp = introspection_idp("alice", &["ops"]).await;
+        let mut config = base_config();
+        config.permission_profiles.insert(
+            "operator".into(),
+            PermissionProfileConfig {
+                grants: std::collections::HashMap::from([(Resource::Sessions, vec![Verb::Read])]),
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config
+            .oidc
+            .insert("corp".into(), oidc_entry(&corp.uri(), "ops", "operator"));
+        let auth = auth_for(&config, &[]);
+        let bound = OidcBinding::of(&config.oidc["corp"]);
+        let introspections = || async {
+            corp.received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|request| request.url.path() == "/introspect")
+                .count()
+        };
+        auth.authenticate_bound(TransportKind::Wss, "corp-at", "oidc.corp", &bound)
+            .await
+            .expect("the provider it is bound to verifies it");
+        let sent = introspections().await;
+        let elsewhere = OidcBinding {
+            issuer: "https://elsewhere.example".into(),
+            ..bound.clone()
+        };
+        let other_client = OidcBinding {
+            client_id: "another-client".into(),
+            ..bound.clone()
+        };
+        for (case, binding, provider) in [
+            ("another issuer", &elsewhere, "oidc.corp"),
+            ("another client", &other_client, "oidc.corp"),
+            ("no such provider", &bound, "oidc.gone"),
+        ] {
+            assert!(
+                auth.authenticate_bound(TransportKind::Wss, "corp-at", provider, binding)
+                    .await
+                    .is_err(),
+                "{case}: a bound bearer was admitted"
+            );
+        }
+        assert_eq!(introspections().await, sent, "a bound bearer was sent");
     }
 
     /// Two independent issuers verify side by side, resolve to distinct
