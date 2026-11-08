@@ -1,6 +1,8 @@
 //! Mid-turn steering: non-blocking drain of caller-pushed messages between
 //! loop iterations (and between wrapper rounds).
 
+use zeroclaw_api::ingress::IngressContext;
+
 /// Whether a steering message may still influence the turn when the agent
 /// consumes it, and under which tool posture.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +27,10 @@ pub struct SteeringPosture {
     /// Remove nested entry points that do not yet carry a principal's
     /// selectors (see `Agent::disable_principal_unaware_nested_tools`).
     pub disable_principal_unaware_nested_tools: bool,
+    /// Withhold every tool that requires an unrestricted principal, including
+    /// skill aliases and delegate children (see
+    /// `Agent::withhold_unrestricted_tools`).
+    pub withhold_unrestricted_tools: bool,
 }
 
 /// Re-resolves a steering sender's authority. Called when the message is
@@ -36,6 +42,7 @@ pub type SteeringAdmit = Box<dyn Fn() -> SteeringAdmission + Send + Sync>;
 pub struct SteeringInput {
     text: String,
     admit: Option<SteeringAdmit>,
+    ingress: Option<IngressContext>,
 }
 
 impl SteeringInput {
@@ -46,6 +53,7 @@ impl SteeringInput {
         Self {
             text: text.into(),
             admit: None,
+            ingress: None,
         }
     }
 
@@ -54,7 +62,20 @@ impl SteeringInput {
         Self {
             text: text.into(),
             admit: Some(admit),
+            ingress: None,
         }
+    }
+
+    /// Attach producer-stamped ingress facts independently of live
+    /// authorization. Absent facts never inherit the enclosing turn.
+    #[must_use]
+    pub fn with_ingress(mut self, ingress: IngressContext) -> Self {
+        self.ingress = Some(ingress);
+        self
+    }
+
+    pub fn ingress(&self) -> Option<&IngressContext> {
+        self.ingress.as_ref()
     }
 
     pub fn text(&self) -> &str {

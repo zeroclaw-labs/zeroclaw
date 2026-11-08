@@ -6,6 +6,8 @@ Every model provider lives at `[providers.models.<type>.<alias>]`. `<type>` is a
 
 The smallest config that loads clean has four section headers: a provider entry, an agent that references it, and a risk profile the agent gates against. Configure them through the gateway, zerocode, or `zeroclaw config set`; the [config reference](../reference/config.md#providers) has the full field index.
 
+If you write `config.toml` by hand, make `schema_version = 4` its first line. The tools above add it for you. Without it, ZeroClaw has to guess the file's version: it reads a file whose sections are plainly in the current shape as version 3, migrates it from there and warns you to add the key (`zeroclaw config migrate` writes it), but any other file is read as the oldest version and migrated.
+
 ## Field reference: provider entry
 
 Almost every family also takes the shared fields from `ModelProviderConfig`:
@@ -656,6 +658,18 @@ Agents reference a provider by dotted alias. Provider entries on their own do no
 `risk_profile` and `runtime_profile` reference independent alias maps, so their names need not match (`runtime_profile` is also optional). `Config::validate()` fails loud at startup if `model_provider` doesn't resolve to a configured `[providers.models.<type>.<alias>]` entry, or if `risk_profile` doesn't resolve to a configured `[risk_profiles.<alias>]` entry.
 
 For multiple agents pointing at different providers, see [Routing](./routing.md).
+
+## Single-tool-round support
+
+The agent runtime profile's `single_tool_rounds` setting is default-off. See [Single-tool rounds](../agents/internals.md#single-tool-rounds) for configuration, accounting, and rollback behavior. It requests one call per response only when the actual model route and every reachable fallback honor a native control.
+
+| Configured provider path | Native control | Support |
+| --- | --- | --- |
+| `openai`, API-key auth, official OpenAI endpoint, chat-completions or Responses wire | `parallel_tool_calls: false` | Supported |
+| `anthropic`, official Anthropic endpoint | `tool_choice.disable_parallel_tool_use: true` | Supported |
+| Custom or compatible endpoints, OVH, Codex subscription auth, and other adapters | No verified control | Batch with a visible limitation notice |
+
+Responses and Anthropic send the control in streaming and non-streaming requests. OpenAI chat-completions uses its existing non-streaming implementation, including when a router projects that response as stream events. Requests without tools keep their existing wire shape. Sharing an adapter with a supported provider does not establish support for another endpoint. A mixed fallback chain stays batch even if its primary provider supports the control.
 
 ## Fallback on failure
 

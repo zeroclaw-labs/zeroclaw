@@ -13,6 +13,8 @@ relates-to:
   - https://github.com/zeroclaw-labs/zeroclaw/pull/9137
   - https://github.com/zeroclaw-labs/zeroclaw/pull/9582
   - https://github.com/zeroclaw-labs/zeroclaw/pull/9584
+  - https://github.com/zeroclaw-labs/zeroclaw/pull/11098
+  - https://github.com/zeroclaw-labs/zeroclaw/issues/10996
   - https://github.com/zeroclaw-labs/zeroclaw/pull/9126
   - crates/zeroclaw-infra/src/net_guard.rs
   - crates/zeroclaw-plugins/src/egress.rs
@@ -31,7 +33,7 @@ The host-side sibling already fails closed. The `http_request` tool refuses ever
 
 Pressure on this boundary grows with ADR-006, which makes runtime plugins the target for optional channels, because every messaging channel is an egress consumer. Today `wit/v0/inbound.wit` states plainly that a channel plugin runs with no network and no sockets, and the official plugin repository contains a socket interface draft at `wit/unstable/sockets.wit` for a transport the host does not expose. Whichever transport arrives next needs an existing answer to "may this instance reach that address", not a third one.
 
-Part of this direction has shipped. [#9580](https://github.com/zeroclaw-labs/zeroclaw/pull/9580) moved the built-in HTTP egress onto a shared network guard, [#9137](https://github.com/zeroclaw-labs/zeroclaw/pull/9137) added the plugin-side egress policy foundation, [#9582](https://github.com/zeroclaw-labs/zeroclaw/pull/9582) enforced the policy at the `wasi:http` boundary, and [#9126](https://github.com/zeroclaw-labs/zeroclaw/pull/9126) added typed instance configuration. [#9584](https://github.com/zeroclaw-labs/zeroclaw/pull/9584), the operator grant ceremony, remains in review. This record states the decision those slices implement and complete. RFC [#8398](https://github.com/zeroclaw-labs/zeroclaw/issues/8398) is closed as an omnibus/superseded RFC; this ADR records the focused network-egress decision that survived that split: Q1 for network permissions, Q4 for user-extended destination grants.
+Part of this direction has shipped. [#9580](https://github.com/zeroclaw-labs/zeroclaw/pull/9580) moved the built-in HTTP egress onto a shared network guard, [#9137](https://github.com/zeroclaw-labs/zeroclaw/pull/9137) added the plugin-side egress policy foundation, [#9582](https://github.com/zeroclaw-labs/zeroclaw/pull/9582) enforced the policy at the `wasi:http` boundary, and [#9126](https://github.com/zeroclaw-labs/zeroclaw/pull/9126) added typed instance configuration. The operator grant ceremony landed for install and list in [#11098](https://github.com/zeroclaw-labs/zeroclaw/pull/11098), which superseded [#9584](https://github.com/zeroclaw-labs/zeroclaw/pull/9584), and for channel bindings through `zeroclaw plugin bind` under [#10996](https://github.com/zeroclaw-labs/zeroclaw/issues/10996). This record states the decision those slices implement and complete. RFC [#8398](https://github.com/zeroclaw-labs/zeroclaw/issues/8398) is closed as an omnibus/superseded RFC; this ADR records the focused network-egress decision that survived that split: Q1 for network permissions, Q4 for user-extended destination grants.
 
 The alternatives are to treat the manifest declaration itself as the grant, to keep one global allowlist for every installed plugin, or to give each transport its own destination policy. Manifest-as-grant preserves the #9395 self-grant path for unsigned packages, violates the default-closed doctrine, and makes the manifest a second source of truth for live authority. A global allowlist denies per-instance isolation, because any installed plugin could then reach every host any other plugin needs. Per-transport policies put three knobs on one question and invite drift, when the destination decision is transport-independent.
 
@@ -53,7 +55,7 @@ The host never follows redirects on a guest's behalf. A guest that chooses to ch
 
 A denial returns a masked error to the guest that names the policy rather than host internals, and emits a structured host-side log event attributing the attempt to the exact instance.
 
-This seam shipped in #9582 for `wasi:http`; the remaining gates cover the declaration, intersection, ceremony, fixture coverage, and fleet rollout.
+This seam shipped in #9582 for `wasi:http`; the remaining gates cover the intersection, fixture coverage, and fleet rollout.
 
 ### Let the manifest declare and the operator's configuration grant
 
@@ -68,7 +70,7 @@ The effective reach of an instance is the intersection of what its manifest requ
 
 Policy is read from canonical configuration on each request rather than snapshotted into instance state, so an operator's edit applies to the next connection instead of the next restart. ADR-012, still proposed, describes the related generation-scoped apply mode; it is context here, not authority.
 
-The operator fields and the per-request read are merged. The manifest `[egress]` declaration, and therefore the intersection, are not yet implemented; gate G1 covers them.
+The operator fields, the per-request read, and the manifest `[egress]` declaration are merged. The intersection is not yet implemented, so on this release the operator's grant alone governs; gate G1 covers it.
 
 ### Keep the destination grammar free of an allow-all form
 
@@ -92,7 +94,7 @@ Two rules follow, and both are stricter than the obvious implementation. First, 
 
 A package upgrade whose declaration adds destinations does not extend an existing entry. The CLI prints the difference and the operator applies it deliberately. Absent an entry, egress is denied.
 
-The ceremony is the subject of #9584 and is in review.
+Install-time seeding, the upgrade diff, and the matching `zeroclaw plugin list` report landed in #11098, which superseded #9584. Binding-time seeding landed with `zeroclaw plugin bind` under #10996, and `zeroclaw plugin install --channel-alias` runs the same ceremony during an install. Because the operator names the alias at that moment, the binding ceremony takes the grant as a stated choice: `--egress declared` seeds the declaration with the same printout install gives, `--egress none` creates the entry with an empty grant, and without either flag a binding that would create the entry from a non-empty declaration is refused. Neither command ever extends an existing entry.
 
 ### Bind future transports to the same policy object
 
@@ -117,7 +119,7 @@ This ADR remains proposed until all of these conditions are met:
 - the first channel plugin selected by [#8850](https://github.com/zeroclaw-labs/zeroclaw/issues/8850) runs under a seeded entry for its API host (G3); and
 - the rollout for the existing fleet is complete: official registry `http_client` packages carry `[egress]` declarations in republished versions before host enforcement turns on, an upgrade-time diagnostic lists each installed instance's denied destinations with the exact seeding command, and the release that enables enforcement names the break in its changelog, with #9395 already closed by the enforcement slice (G4).
 
-The shared guard, the plaintext operator fields, the per-request policy read, the strict destination grammar, the NAT64 boundary, and the connection budget are in place. The rest of G1, and G2 through G4, are not.
+The shared guard, the plaintext operator fields, the per-request policy read, the strict destination grammar, the NAT64 boundary, the connection budget, the manifest `[egress]` declaration, and install-time and binding-time seeding with the upgrade diff are in place. The rest of G1, the intersection of that declaration with the operator's entry, is not, and neither are G2 through G4.
 
 ## Consequences
 
@@ -145,7 +147,9 @@ Negative consequences:
 - [PR #9580: harden built-in HTTP egress on the shared network guard](https://github.com/zeroclaw-labs/zeroclaw/pull/9580) (merged)
 - [PR #9137: shared egress policy foundation](https://github.com/zeroclaw-labs/zeroclaw/pull/9137) (merged)
 - [PR #9582: enforce a host-owned egress policy on plugin `wasi:http`](https://github.com/zeroclaw-labs/zeroclaw/pull/9582) (merged)
-- [PR #9584: egress grant ceremony for plugin install and list](https://github.com/zeroclaw-labs/zeroclaw/pull/9584) (in review)
+- [PR #9584: egress grant ceremony for plugin install and list](https://github.com/zeroclaw-labs/zeroclaw/pull/9584) (closed, superseded by #11098)
+- [PR #11098: grant egress at install and report whether a plugin loads](https://github.com/zeroclaw-labs/zeroclaw/pull/11098) (merged)
+- [Issue #10996: seed channel instance configuration and grants](https://github.com/zeroclaw-labs/zeroclaw/issues/10996) (binding-time seeding)
 - [PR #9126: typed instance configuration validation](https://github.com/zeroclaw-labs/zeroclaw/pull/9126) (merged)
 - [ADR-006: Runtime channel plugins](./ADR-006-runtime-channel-plugins.md)
 - [ADR-009: WIT and wasmtime plugin execution](./ADR-009-wit-wasmtime-plugin-execution.md)

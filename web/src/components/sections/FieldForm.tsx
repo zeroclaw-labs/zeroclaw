@@ -26,6 +26,7 @@ import {
   useMemo,
   useState,
 } from "react";
+import type { KeyboardEvent, ReactNode } from "react";
 import { Link } from "react-router-dom";
 import {
   ExternalLink,
@@ -70,6 +71,12 @@ import {
 } from "../../lib/api";
 import { useConfigDraft } from "../../lib/draftStore";
 import { fuzzyFilter } from "../../lib/fuzzy";
+import {
+  SECRET_MAP_KIND,
+  groupSecretMapEntries,
+  secretMapEntryKey,
+  secretMapKeyError,
+} from "./secretMap.logic";
 import { isLocalModelProviderName, primeModelProviderCatalog } from "../../lib/modelProviders";
 import EntityEnabledToggle from "../EntityEnabledToggle";
 
@@ -1276,8 +1283,36 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
     // names, the grid has its own tool-name search over a different set of
     // things (individual tool rows), and conflating the two would make the
     // grid flicker in and out as the operator types.
+    // Secret key/value map containers (`kind === "secret-map"`) and their
+    // `<container>.<KEY>` entry rows. Entries render inside their container
+    // block (with its add-entry control), so they are pulled out of the flat
+    // alphabetical list via `groupedPaths` below.
+    const secretMapGroups = useMemo(
+      () => groupSecretMapEntries(entries),
+      [entries],
+    );
+
+    // Add one entry to a secret map. Committed immediately (not staged in the
+    // save bar): the new `<container>.<KEY>` path has no row to hold a draft
+    // until it exists. `reload` re-seeds drafts from the shared draft store,
+    // so other unsaved edits in this form survive.
+    const addSecretMapEntry = async (
+      containerPath: string,
+      key: string,
+      value: string,
+    ) => {
+      await patchConfig([
+        { op: "add", path: `${containerPath}.${key}`, value },
+      ]);
+      await reload();
+      onSaved?.();
+    };
+
     const groupedPaths = useMemo(() => {
       const s = new Set<string>();
+      for (const children of secretMapGroups.values()) {
+        for (const child of children) s.add(child.path);
+      }
       for (const g of permissionGroups) {
         s.add(g.fields.allowed_tools.path);
         s.add(g.fields.excluded_tools.path);
@@ -1286,7 +1321,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
         if (g.denyAll) s.add(g.denyAll.path);
       }
       return s;
-    }, [permissionGroups]);
+    }, [permissionGroups, secretMapGroups]);
 
     const sortedEntries = useMemo(() => {
       // Stable order: `enabled` first (drives whether anything below it
@@ -1397,6 +1432,40 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
       return null;
     }
 
+    const renderFieldRow = (f: ListResponseEntry, alwaysDeletable = false) => (
+      <FieldRow
+        key={f.path}
+        entry={f}
+        toolAgent={toolAgent}
+        mcpTransport={resolveMcpTransport(f.path, entries, draft)}
+        requiredByTransport={requiredByTransport}
+        value={draft[f.path] ?? ""}
+        onChange={(v) => applyFieldValue(f, v)}
+        comment={comments[f.path] ?? ""}
+        onCommentChange={(v) => {
+          setComments((c) => ({ ...c, [f.path]: v }));
+          if (v.length > 0) {
+            configDraft.setComment(f.path, v);
+          } else {
+            configDraft.clearComment(f.path);
+          }
+        }}
+        tombstoned={configDraft.tombstones.has(f.path)}
+        onUndoTombstone={() => configDraft.unstageTombstone(f.path)}
+        error={fieldErrors[f.path]}
+        onDelete={
+          showDelete || alwaysDeletable ? () => handleDelete(f.path) : undefined
+        }
+        description={descriptionForPath(schema, f.path)}
+        elementProps={
+          f.kind === "object-array"
+            ? objectArrayElementProps(schema, f.path)
+            : null
+        }
+        drift={drift?.find((d) => d.path === f.path) ?? null}
+      />
+    );
+
     return (
       <div
         className={
@@ -1487,37 +1556,25 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
                 )}
               </div>
             ) : null}
-            {visibleEntries.map((f) => (
-              <FieldRow
-                key={f.path}
-                entry={f}
-                toolAgent={toolAgent}
-                mcpTransport={resolveMcpTransport(f.path, entries, draft)}
-                requiredByTransport={requiredByTransport}
-                value={draft[f.path] ?? ""}
-                onChange={(v) => applyFieldValue(f, v)}
-                comment={comments[f.path] ?? ""}
-                onCommentChange={(v) => {
-                  setComments((c) => ({ ...c, [f.path]: v }));
-                  if (v.length > 0) {
-                    configDraft.setComment(f.path, v);
-                  } else {
-                    configDraft.clearComment(f.path);
-                  }
-                }}
-                tombstoned={configDraft.tombstones.has(f.path)}
-                onUndoTombstone={() => configDraft.unstageTombstone(f.path)}
-                error={fieldErrors[f.path]}
-                onDelete={showDelete ? () => handleDelete(f.path) : undefined}
-                description={descriptionForPath(schema, f.path)}
-                elementProps={
-                  f.kind === "object-array"
-                    ? objectArrayElementProps(schema, f.path)
-                    : null
-                }
-                drift={drift?.find((d) => d.path === f.path) ?? null}
-              />
-            ))}
+            {visibleEntries.map((f) => {
+              if (f.kind !== SECRET_MAP_KIND) return renderFieldRow(f);
+              const children = secretMapGroups.get(f.path) ?? [];
+              return (
+                <SecretMapBlock
+                  key={f.path}
+                  entry={f}
+                  description={descriptionForPath(schema, f.path)}
+                  existingKeys={children.map((c) =>
+                    secretMapEntryKey(f.path, c.path),
+                  )}
+                  onAdd={(key, value) => addSecretMapEntry(f.path, key, value)}
+                >
+                  {/* Removing an entry IS the map's delete operation, so it
+                      stays available even where field reset is hidden. */}
+                  {children.map((c) => renderFieldRow(c, true))}
+                </SecretMapBlock>
+              );
+            })}
           </form>
         )}
 
@@ -1634,6 +1691,145 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
 );
 
 export default FieldForm;
+
+/** Container block for a `kind === "secret-map"` field (MCP `env`/`headers`,
+ *  provider `extra_headers`, …). Shows the map's existing entries (passed in
+ *  as regular secret `FieldRow`s, so change/remove/undo behave like any other
+ *  secret) and an inline control to add a new entry. Rendered inside the
+ *  section's `<form>`, so it uses `type="button"` and intercepts Enter rather
+ *  than nesting a second form. */
+function SecretMapBlock({
+  entry,
+  description,
+  existingKeys,
+  onAdd,
+  children,
+}: {
+  entry: ListResponseEntry;
+  description: string | null;
+  existingKeys: string[];
+  onAdd: (key: string, value: string) => Promise<void>;
+  children: ReactNode;
+}) {
+  const [key, setKey] = useState("");
+  const [value, setValue] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const submit = async () => {
+    const trimmedKey = key.trim();
+    const keyError = secretMapKeyError(trimmedKey, existingKeys);
+    if (keyError) {
+      setError(t(keyError));
+      return;
+    }
+    if (value.length === 0) {
+      setError(t("fieldform.secret_map_value_required"));
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await onAdd(trimmedKey, value);
+      setKey("");
+      setValue("");
+    } catch (e) {
+      setError(
+        e instanceof ApiError
+          ? `[${e.envelope.code}] ${e.envelope.message}`
+          : e instanceof Error
+            ? e.message
+            : String(e),
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onEnter = (e: KeyboardEvent<HTMLInputElement>) => {
+    if (e.key !== "Enter") return;
+    e.preventDefault();
+    void submit();
+  };
+
+  return (
+    <div className="px-4 py-3">
+      <div
+        className="block text-sm font-medium font-sans break-words"
+        style={{ color: "var(--pc-text-primary)" }}
+        title={`${entry.path}${entry.type_hint ? ` — ${entry.type_hint}` : ""}`}
+      >
+        {humanizeFieldLabel(entry.path)}
+        <span className="ml-2 text-xs font-sans text-pc-text-muted">
+          🔒 {existingKeys.length}{" "}
+          {existingKeys.length === 1 ? t("fieldform.entry") : t("fieldform.entries")}
+        </span>
+      </div>
+      <code
+        className="block text-[11px] font-mono break-all mt-0.5"
+        style={{ color: "var(--pc-text-faint)" }}
+      >
+        {entry.path}
+      </code>
+      {description && (
+        <p className="text-xs mt-0.5" style={{ color: "var(--pc-text-secondary)" }}>
+          {description}
+        </p>
+      )}
+
+      <div
+        className="mt-2 border-l-2 divide-y"
+        style={{ borderColor: "var(--pc-border)" }}
+      >
+        {existingKeys.length === 0 ? (
+          <p className="px-4 py-2 text-xs" style={{ color: "var(--pc-text-muted)" }}>
+            {t("fieldform.secret_map_empty")}
+          </p>
+        ) : (
+          children
+        )}
+      </div>
+
+      <div className="mt-2 flex flex-wrap items-center gap-2">
+        <input
+          type="text"
+          value={key}
+          onChange={(e) => setKey(e.target.value)}
+          onKeyDown={onEnter}
+          placeholder={t("fieldform.secret_map_key_placeholder")}
+          aria-label={t("fieldform.secret_map_key_placeholder")}
+          className="input-electric flex-1 min-w-[10rem] px-3 py-1.5 text-sm font-mono"
+          autoComplete="off"
+          spellCheck={false}
+        />
+        <input
+          type="password"
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          onKeyDown={onEnter}
+          placeholder={t("fieldform.secret_map_value_placeholder")}
+          aria-label={t("fieldform.secret_map_value_placeholder")}
+          className="input-electric flex-1 min-w-[10rem] px-3 py-1.5 text-sm"
+          autoComplete="new-password"
+        />
+        <button
+          type="button"
+          onClick={() => void submit()}
+          disabled={busy}
+          className="btn-secondary text-sm px-3 py-1.5 inline-flex items-center gap-1"
+        >
+          <Plus className="h-3.5 w-3.5" />
+          {t("fieldform.secret_map_add")}
+        </button>
+      </div>
+      {error && (
+        <p className="mt-1 text-xs text-status-error" role="alert">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
 
 interface FieldRowProps {
   entry: ListResponseEntry;

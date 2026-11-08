@@ -9,5 +9,5 @@ Start here before opening issues, proposing architecture changes, or submitting 
 - [Privacy and PII discipline](./privacy.md)
 - [Testing](./testing.md)
 - [PR review protocol](./pr-review-protocol.md)
-- [Multi-agent setup](./multi-agent-setup.md)
+- [Multi-agent setup](../agents/multi-agent-setup.md)
 - [Contributor License Agreement](./cla.md)

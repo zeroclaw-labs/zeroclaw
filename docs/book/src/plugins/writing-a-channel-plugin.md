@@ -291,10 +291,16 @@ platform's API hosts under `plugins.entries.<key>.egress_hosts` for that
 channel instance before `send` has a network path; any destination outside
 that list is refused before a packet leaves, and a granted host that resolves
 to a loopback, private, or link-local address is refused too unless it is also
-listed under `egress_allow_private`. Install-time seeding of that grant for channel instances is
-still manual (the grant ceremony is
-[#9584](https://github.com/zeroclaw-labs/zeroclaw/pull/9584)), so document the
-hosts your plugin needs in its README.
+listed under `egress_allow_private`. Declare the platform's API hosts in your
+manifest's `[egress]` table. When an operator binds an instance with
+`zeroclaw plugin bind <package> --channel-alias <alias> --egress declared`,
+that declaration is seeded into the new instance's `egress_hosts` and printed;
+`--egress none` binds it with no network reach instead. For a channel instance
+the declaration counts with any governed transport, `http_client`,
+`websocket_client`, or `socket_client`, so a channel that speaks only over a
+socket is seeded the same way. A host that is deployment configuration, such as
+a self-hosted server, is not yours to declare: say in your README that the
+operator grants it.
 
 Pair `config_read` with the schema consumed by `ChannelConfig`:
 
@@ -328,9 +334,18 @@ before guest code runs instead of starting a channel without required config.
 Each channel instance selects the `plugins.entries` key derived from its full
 package, `channel` capability, and binding identity while reusing this one
 package-owned schema. Identical aliases in different packages therefore remain
-isolated. The install and info commands cannot create this key because they do
-not own the configured channel alias; their automatic print and seed behavior
-is tool-only, so a channel instance's entry is written by hand.
+isolated. The key exists once an operator binds an alias:
+`zeroclaw plugin bind` creates that instance's entry, and both it and
+`zeroclaw plugin info` list each of this schema's `required` keys as set or
+missing, with the `zeroclaw config set` command for a missing one. A secret
+key's command prompts for the value without echo, and no value is ever
+printed. The command is printed only for a property name in the portable key
+grammar (1 to 128 ASCII letters, digits, `_`, `-`, or `.`); any other name is
+reported with the config file row to edit instead, so keep required property
+names inside it. When the entry does not exist yet, as for a binding written
+by hand, `plugin info` prints the `plugin bind` command that creates it in
+place of the keys, once per egress decision when your manifest declares
+destinations, since `config set` resolves only an entry that exists.
 
 Call `config.get` and `secrets.get` inside each operation that uses them. The
 host resolves at most one canonical revision for that call and drops its view
@@ -352,7 +367,28 @@ that is absent or not marked `x-secret = true`.
 
 An installed package does nothing until an operator binds it to a logical
 channel instance. The binding names the package and nothing else; the alias
-is the instance's identity:
+is the instance's identity. The operator path is `zeroclaw plugin bind`, which
+writes the binding, seeds the instance's config entry, and reports what the
+instance still needs before it can start:
+
+```bash
+zeroclaw plugin bind acme.chat --channel-alias operations --egress declared
+```
+
+`--egress declared` grants the destinations the manifest declares, and
+`--egress none` binds with no network reach. The flag matters only when the
+command creates the instance's config entry, and it is required then if the
+manifest declares destinations and the package holds a transport that can
+reach them (`http_client`, `websocket_client`, or `socket_client`).
+`zeroclaw plugin install <source> --channel-alias operations` runs the same
+ceremony during installation; there the flag governs only the channel
+instance's entry, and a tool entry of the same package is seeded as install
+always seeds it.
+[Binding a channel instance](./index.md#binding-a-channel-instance) describes
+it in full.
+
+In `config.toml`, an instance that is bound and routed to an agent looks like
+this:
 
 ```toml
 [plugins]
@@ -365,6 +401,15 @@ enabled = true
 [agents.support]
 channels = ["plugin.operations"]
 ```
+
+`plugin bind` writes only the `[channels.plugin.operations]` table and the
+instance's `[[plugins.entries]]` row. A new binding is written with `package`
+and the default `enabled = true`. Two steps stay explicit operator
+decisions that the command never makes: turning the plugin system on
+(`plugins.enabled`), and ownership, adding `plugin.operations` to an enabled
+agent's `channels` list (`agents.<agent>.channels`). The readiness report the
+command prints, which `zeroclaw plugin info` repeats, names the first
+precondition still unmet and, where one exists, the command that meets it.
 
 The alias becomes an ordinary channel reference, so `plugin.operations` is
 routed, supervised, restarted, and addressed exactly like `telegram.main`.
@@ -392,6 +437,13 @@ plugin cannot stop the daemon from starting your other channels.
 across all capabilities. Explicit channel bindings rank ahead of
 auto-discovered tools and skills, so a full plugin directory cannot displace a
 channel the operator configured by hand.
+
+`zeroclaw plugin bind` and `zeroclaw plugin info` ask the activation plan for
+this verdict rather than restating its rules, so the first unmet gate they
+report, the ceiling included, is the one the daemon applies to the same config
+and installed packages. A ready verdict means the instance is admitted, not
+that its component loads; `plugin info` reports that separately with its load
+check.
 
 The same admitted set drives all three loaders: the channel loader, the tool
 registry, and the plugin-skill loader. The ceiling is therefore one shared

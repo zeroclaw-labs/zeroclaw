@@ -26,6 +26,7 @@ mod client_crypto;
 mod clipboard;
 mod color_depth;
 mod config;
+mod config_application;
 mod config_manager;
 mod dashboard;
 mod diff;
