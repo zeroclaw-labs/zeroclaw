@@ -94,6 +94,10 @@ pub(crate) fn conversation_limit_message() -> String {
     )
 }
 
+pub(crate) fn not_dispatchable_message(alias: &str) -> String {
+    format!("Agent `{alias}` is not enabled for dispatch")
+}
+
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1083,6 +1087,9 @@ pub(crate) enum CoreFailure {
     Lost(String),
     /// The dashboard session already has as many chats open as it may.
     ConversationLimit,
+    /// The chat's agent can't take a turn now: it is disabled, or lacks
+    /// what a turn runs on.
+    AgentNotDispatchable(String),
 }
 
 impl CoreFailure {
@@ -1128,6 +1135,13 @@ impl CoreFailure {
                 json!({
                     "error": conversation_limit_message(),
                     "reason": "conversation_limit",
+                }),
+            ),
+            Self::AgentNotDispatchable(alias) => (
+                StatusCode::CONFLICT,
+                json!({
+                    "error": not_dispatchable_message(&alias),
+                    "reason": "agent_not_dispatchable",
                 }),
             ),
             Self::Lost(detail) => {
@@ -1256,11 +1270,15 @@ impl CoreCaller {
     }
 
     /// Open a chat: a place among the session's chats, a connection of its
-    /// own, and a conversation the core creates on it.
+    /// own, and a conversation the core creates on it. `takes_turns` says
+    /// whether the agent can still take a turn; it is asked right before each
+    /// creation request, after the handshake, which can wait on the identity
+    /// provider.
     pub(crate) async fn open_chat(
         &self,
         agent_alias: &str,
         cwd: Option<&str>,
+        takes_turns: impl Fn() -> bool,
     ) -> Result<CoreChat, CoreFailure> {
         if self.session.ended.is_cancelled() {
             return Err(CoreFailure::SessionEnded);
@@ -1303,6 +1321,13 @@ impl CoreCaller {
         }
         let mut renewed = false;
         let (opened, closing) = loop {
+            // After the handshake and any reconnect below, with nothing
+            // awaited before the request goes: an agent disabled meanwhile
+            // gets no conversation.
+            if !takes_turns() {
+                client.shutdown();
+                return Err(CoreFailure::AgentNotDispatchable(agent_alias.to_string()));
+            }
             let created = create(
                 Arc::clone(&client),
                 params.clone(),
@@ -2925,6 +2950,7 @@ mod tests {
         let addr = serve(fixture.router()).await;
         let (alice, _) = fixture.sign_in("alice").await;
         let created = fixture.start_gate.seen();
+        let verified = introspections_of(&fixture._idp, "tok-alice").await;
 
         let (status, body) = refused_open(addr, &alice, "dormant").await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
@@ -2932,6 +2958,11 @@ mod tests {
         assert_eq!(
             body["error"], "Agent `dormant` is not enabled for dispatch",
             "{body}"
+        );
+        assert_eq!(
+            introspections_of(&fixture._idp, "tok-alice").await,
+            verified,
+            "refused before any connection to the core"
         );
         assert_eq!(
             fixture.start_gate.seen(),
@@ -2996,9 +3027,15 @@ mod tests {
 
         fixture.set_agent_enabled("support", false);
         let created = fixture.start_gate.seen();
+        let verified = introspections_of(&fixture._idp, "tok-alice").await;
         let (status, body) = refused_open(addr, &alice, "support").await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
         assert_eq!(body["reason"], "agent_not_dispatchable", "{body}");
+        assert_eq!(
+            introspections_of(&fixture._idp, "tok-alice").await,
+            verified,
+            "refused before any connection to the core"
+        );
         assert_eq!(
             fixture.start_gate.seen(),
             created,
@@ -3011,6 +3048,99 @@ mod tests {
             .expect("support is enabled again");
         await_frame(&mut socket, "session_start").await;
         let done = chat_once(&mut socket, "back again").await;
+        assert_eq!(done["type"], "done", "{done}");
+        assert_eq!(done["full_response"], "hello from support");
+    }
+
+    /// Open alice's chat with support while the core's verification of its
+    /// handshake is held at the identity provider, calling `meanwhile` once
+    /// the core is verifying it.
+    async fn open_while_verifying(
+        fixture: &Fixture,
+        addr: SocketAddr,
+        alice: &str,
+        meanwhile: impl FnOnce(),
+    ) -> Result<ChatSocket, tokio_tungstenite::tungstenite::Error> {
+        slow_introspections(fixture, "alice", "chatters", HELD_HANDSHAKE, (1, 1)).await;
+        let before = introspections_of(&fixture._idp, "tok-alice").await;
+        let (opened, ()) = tokio::join!(open_chat(addr, alice, "support", "held"), async {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while introspections_of(&fixture._idp, "tok-alice").await <= before {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the handshake reaches the identity provider");
+            meanwhile();
+        });
+        opened
+    }
+
+    /// The agent is read again once the chat's connection is verified: one
+    /// disabled while the core verifies the token gets no conversation, and
+    /// the open gives back what it took.
+    #[tokio::test]
+    async fn an_agent_disabled_during_the_open_handshake_gets_no_conversation() {
+        let fixture = Fixture::new().await;
+        let addr = serve(fixture.router()).await;
+        let (alice, alice_session) = fixture.sign_in("alice").await;
+        let created = fixture.start_gate.seen();
+        let started = std::time::Instant::now();
+
+        let refused = open_while_verifying(&fixture, addr, &alice, || {
+            fixture.set_agent_enabled("support", false);
+        })
+        .await;
+        let Err(tokio_tungstenite::tungstenite::Error::Http(response)) = refused else {
+            panic!("the chat must be refused before the upgrade");
+        };
+        assert!(
+            started.elapsed() > HELD_HANDSHAKE / 2,
+            "refused before the handshake was verified: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: Value =
+            serde_json::from_slice(response.body().as_deref().unwrap_or_default()).unwrap();
+        assert_eq!(body["reason"], "agent_not_dispatchable", "{body}");
+        assert_eq!(
+            body["error"], "Agent `support` is not enabled for dispatch",
+            "{body}"
+        );
+        assert_eq!(
+            fixture.start_gate.seen(),
+            created,
+            "the core created no conversation"
+        );
+        assert!(fixture.store.list_ids().await.is_empty());
+        assert_eq!(
+            fixture
+                ._model
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .len(),
+            0
+        );
+        // The session's place and the account's share are given back, and
+        // the agent, enabled again, takes the next chat.
+        assert_charge_returned(&fixture, &core_caller_for(&fixture, &alice_session)).await;
+        fixture.set_agent_enabled("support", true);
+        let (_socket, _) = chat_in(addr, &alice, "after").await;
+    }
+
+    /// The control: an agent still enabled once the slow handshake is
+    /// verified takes the chat.
+    #[tokio::test]
+    async fn an_agent_still_enabled_after_a_slow_open_handshake_takes_the_chat() {
+        let fixture = Fixture::new().await;
+        let addr = serve(fixture.router()).await;
+        let (alice, _) = fixture.sign_in("alice").await;
+        let mut socket = open_while_verifying(&fixture, addr, &alice, || {})
+            .await
+            .expect("the agent is still enabled");
+        await_frame(&mut socket, "session_start").await;
+        let done = chat_once(&mut socket, "after a slow handshake").await;
         assert_eq!(done["type"], "done", "{done}");
         assert_eq!(done["full_response"], "hello from support");
     }
@@ -3805,7 +3935,7 @@ mod tests {
         // The open itself goes away while the core creates: nobody takes
         // what the core creates, so its creation closes it.
         fixture.start_gate.arm();
-        give_up_mid_creation(&fixture, caller.open_chat("support", None)).await;
+        give_up_mid_creation(&fixture, caller.open_chat("support", None, || true)).await;
         assert_eq!(fixture.start_gate.held(), 1, "the core created the session");
         fixture.start_gate.release();
         fixture
@@ -3904,7 +4034,10 @@ mod tests {
                 .core_binding(&alice_session)
                 .expect("signed in"),
         };
-        let chat = caller.open_chat("support", None).await.expect("opens");
+        let chat = caller
+            .open_chat("support", None, || true)
+            .await
+            .expect("opens");
         assert!(fixture.store.list_ids().await.contains(&chat.core_id));
         drop(chat);
         fixture
@@ -4166,7 +4299,7 @@ mod tests {
             let caller = caller.clone();
             zeroclaw_spawn::spawn!(async move {
                 caller
-                    .open_chat("support", None)
+                    .open_chat("support", None, || true)
                     .await
                     .map(|chat| chat.core_id.clone())
             })
@@ -4185,7 +4318,7 @@ mod tests {
 
         // Sign-out lands before the handler: there is no token left to open
         // anything with.
-        let refused = caller.open_chat("support", None).await;
+        let refused = caller.open_chat("support", None, || true).await;
         assert!(
             matches!(refused, Err(CoreFailure::SessionEnded)),
             "{:?}",
@@ -4952,7 +5085,7 @@ mod tests {
         for _ in 0..MAX_LIVE_CONVERSATIONS {
             let cancelled = tokio::time::timeout(
                 Duration::from_millis(500),
-                caller.open_chat("support", None),
+                caller.open_chat("support", None, || true),
             )
             .await;
             assert!(cancelled.is_err(), "the open was still waiting on the core");
@@ -4962,8 +5095,11 @@ mod tests {
             MAX_LIVE_CONVERSATIONS,
             "the creations still under way keep their places"
         );
-        let fifth =
-            tokio::time::timeout(Duration::from_secs(1), caller.open_chat("support", None)).await;
+        let fifth = tokio::time::timeout(
+            Duration::from_secs(1),
+            caller.open_chat("support", None, || true),
+        )
+        .await;
         assert!(
             matches!(fifth, Ok(Err(CoreFailure::ConversationLimit))),
             "a fifth open is refused while the four are under way"
@@ -5046,7 +5182,7 @@ mod tests {
                 let caller = caller.clone();
                 opens.push(zeroclaw_spawn::spawn!(async move {
                     caller
-                        .open_chat("support", None)
+                        .open_chat("support", None, || true)
                         .await
                         .map(|chat| chat.core_id.clone())
                 }));
@@ -5058,8 +5194,11 @@ mod tests {
         // Every place the account may hold is taken by a creation under way.
         let (_, session) = fixture.sign_in("alice").await;
         let caller = core_caller_for(&fixture, &session);
-        let refused =
-            tokio::time::timeout(Duration::from_secs(1), caller.open_chat("support", None)).await;
+        let refused = tokio::time::timeout(
+            Duration::from_secs(1),
+            caller.open_chat("support", None, || true),
+        )
+        .await;
         assert!(
             matches!(refused, Ok(Err(CoreFailure::ConversationLimit))),
             "the account's budget holds across sign-outs"
@@ -5068,8 +5207,11 @@ mod tests {
         // waits on the core like the rest.
         let (_, bob_session) = fixture.sign_in("bob").await;
         let bob = core_caller_for(&fixture, &bob_session);
-        let admitted =
-            tokio::time::timeout(Duration::from_secs(1), bob.open_chat("support", None)).await;
+        let admitted = tokio::time::timeout(
+            Duration::from_secs(1),
+            bob.open_chat("support", None, || true),
+        )
+        .await;
         assert!(admitted.is_err(), "bob's open reached the core");
 
         fixture.start_gate.release();
@@ -5305,7 +5447,7 @@ mod tests {
         let router = fixture.router();
         let (cookie, session) = fixture.sign_in("alice").await;
         let chat = core_caller_for(&fixture, &session)
-            .open_chat("support", None)
+            .open_chat("support", None, || true)
             .await
             .expect("the account may open a chat");
         let (status, body) = call(
@@ -5374,7 +5516,7 @@ mod tests {
             .await;
         let before = introspections_of(&fixture._idp, "tok-alice").await;
         let refused = core_caller_for(&fixture, &alice_session)
-            .open_chat("support", None)
+            .open_chat("support", None, || true)
             .await;
         assert!(
             matches!(refused, Err(CoreFailure::SessionEnded)),
@@ -5409,7 +5551,7 @@ mod tests {
             let (_, session) = fixture.sign_in("alice").await;
             let caller = core_caller_for(&fixture, &session);
             for _ in 0..MAX_LIVE_CONVERSATIONS {
-                let opened = caller.open_chat("support", None).await;
+                let opened = caller.open_chat("support", None, || true).await;
                 assert!(
                     matches!(opened, Err(CoreFailure::Lost(_))),
                     "the creation outlived its ceiling: {:?}",
@@ -5424,7 +5566,7 @@ mod tests {
         let (_, session) = fixture.sign_in("alice").await;
         let refused = tokio::time::timeout(
             Duration::from_secs(1),
-            core_caller_for(&fixture, &session).open_chat("support", None),
+            core_caller_for(&fixture, &session).open_chat("support", None, || true),
         )
         .await;
         assert!(
@@ -5734,7 +5876,7 @@ mod tests {
         for _ in 0..attempts {
             let given_up = tokio::time::timeout(
                 Duration::from_millis(300),
-                caller.open_chat("support", None),
+                caller.open_chat("support", None, || true),
             )
             .await;
             assert!(
@@ -5821,7 +5963,7 @@ mod tests {
         let principal = session.principal().id.clone();
         let caller = core_caller_for(&fixture, &session);
         for _ in 0..MAX_LIVE_CONVERSATIONS {
-            let opened = caller.open_chat("support", None).await;
+            let opened = caller.open_chat("support", None, || true).await;
             assert!(
                 matches!(opened, Err(CoreFailure::Lost(_))),
                 "the creation outlived its ceiling: {:?}",
@@ -5869,7 +6011,7 @@ mod tests {
         let fixture = Fixture::new().await;
         let (_, session) = fixture.sign_in("alice").await;
         let mut chat = core_caller_for(&fixture, &session)
-            .open_chat("support", None)
+            .open_chat("support", None, || true)
             .await
             .expect("opens");
         let closing = chat.closing.take().expect("an open chat can be closed");
@@ -6159,7 +6301,10 @@ mod tests {
         // Approved while the session holds, the read runs and the model sees
         // what it read.
         std::fs::write(&note, "the first note's text").unwrap();
-        let mut first = caller.open_chat("support", None).await.expect("opens");
+        let mut first = caller
+            .open_chat("support", None, || true)
+            .await
+            .expect("opens");
         let request_id = ask_for_approval_on(&first).await;
         let params = approve(&first, &request_id);
         let _: Value = first
@@ -6179,7 +6324,10 @@ mod tests {
         // and the chat renews the connection before sending it again. That
         // handshake is held while the user signs out, then released.
         std::fs::write(&note, "the second note's text").unwrap();
-        let mut chat = caller.open_chat("support", None).await.expect("opens");
+        let mut chat = caller
+            .open_chat("support", None, || true)
+            .await
+            .expect("opens");
         let request_id = ask_for_approval_on(&chat).await;
         tokio::time::sleep(PAST_THE_REVALIDATION).await;
         slow_introspections(&fixture, "alice", "chatters", HELD_HANDSHAKE, (1, 1)).await;
@@ -6239,7 +6387,10 @@ mod tests {
         let (_, session) = fixture.sign_in("alice").await;
         let caller = core_caller_for(&fixture, &session);
         let charged = || charge_of(&fixture, &caller);
-        let mut chat = caller.open_chat("support", None).await.expect("opens");
+        let mut chat = caller
+            .open_chat("support", None, || true)
+            .await
+            .expect("opens");
         assert_eq!(charged(), (1, 1), "an open chat is charged");
 
         // The chat's connection drops, so its rebind renews it. That
@@ -6371,7 +6522,10 @@ mod tests {
         let fixture = Fixture::new().await;
         let (_, session) = fixture.sign_in("alice").await;
         let caller = core_caller_for(&fixture, &session);
-        let chat = caller.open_chat("support", None).await.expect("opens");
+        let chat = caller
+            .open_chat("support", None, || true)
+            .await
+            .expect("opens");
         assert_eq!(
             charge_of(&fixture, &caller),
             (1, 1),
@@ -6417,7 +6571,7 @@ mod tests {
         fixture.start_gate.arm();
         let (_, session) = fixture.sign_in("alice").await;
         let caller = core_caller_for(&fixture, &session);
-        let opened = caller.open_chat("support", None).await;
+        let opened = caller.open_chat("support", None, || true).await;
         assert!(
             matches!(opened, Err(CoreFailure::Lost(_))),
             "the creation outlived its ceiling: {:?}",

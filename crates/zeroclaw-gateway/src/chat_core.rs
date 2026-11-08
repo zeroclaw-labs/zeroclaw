@@ -16,7 +16,6 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::Json;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -34,6 +33,7 @@ use zeroclaw_rpc_proto::types::{SessionUpdateEvent, TurnCompletionOutcome, TurnU
 use crate::AppState;
 use crate::dashboard_core::{
     CoreCaller, CoreChat, CoreFailure, agent_not_allowed, chat_not_permitted,
+    not_dispatchable_message,
 };
 use crate::dashboard_session::{
     DashboardAuth, SessionWatch, WS_CLOSE_SESSION_ENDED, session_known_lost, session_lost,
@@ -147,8 +147,9 @@ pub(crate) async fn ws_chat_through_core(
         )
             .into_response();
     }
-    // Read live, as again before each prompt: an agent that is disabled, or
-    // lacks what a turn runs on, takes no new conversation.
+    // Read live, as again once the chat's connection is verified and before
+    // each prompt: an agent that is disabled, or lacks what a turn runs on,
+    // takes no new conversation.
     if !agent_takes_turns(&state, &agent_alias) {
         return agent_not_dispatchable(&agent_alias);
     }
@@ -175,7 +176,12 @@ pub(crate) async fn ws_chat_through_core(
     let ws = ws
         .max_frame_size(MAX_FRAME_BYTES as usize)
         .max_message_size(MAX_FRAME_BYTES as usize);
-    let mut core = match caller.open_chat(&agent_alias, cwd.as_deref()).await {
+    let mut core = match caller
+        .open_chat(&agent_alias, cwd.as_deref(), || {
+            agent_takes_turns(&state, &agent_alias)
+        })
+        .await
+    {
         Ok(core) => core,
         // Said on the socket: the browser would see only a dropped one.
         Err(CoreFailure::ConversationLimit) => {
@@ -1074,6 +1080,9 @@ fn failure_frame(failure: &CoreFailure) -> (String, &'static str) {
             crate::dashboard_core::conversation_limit_message(),
             "CONVERSATION_LIMIT",
         ),
+        CoreFailure::AgentNotDispatchable(alias) => {
+            (not_dispatchable_message(alias), "AGENT_NOT_DISPATCHABLE")
+        }
     }
 }
 
@@ -1093,21 +1102,10 @@ fn takes_turns(agent: &AliasedAgentConfig) -> bool {
         && !agent.risk_profile.trim().is_empty()
 }
 
-fn not_dispatchable_message(alias: &str) -> String {
-    format!("Agent `{alias}` is not enabled for dispatch")
-}
-
 /// 409 for a chat with an agent the account may use but that can't take a
-/// turn now: it is disabled, or lacks what a turn runs on.
+/// turn now, as [`CoreCaller::open_chat`] answers once the handshake is done.
 fn agent_not_dispatchable(alias: &str) -> Response {
-    (
-        StatusCode::CONFLICT,
-        Json(json!({
-            "error": not_dispatchable_message(alias),
-            "reason": "agent_not_dispatchable",
-        })),
-    )
-        .into_response()
+    CoreFailure::AgentNotDispatchable(alias.to_string()).into_response()
 }
 
 /// Report a failure before a turn ran: the socket closes when the session
