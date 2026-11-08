@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, params};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -170,8 +170,68 @@ impl CostLedger {
         Ok(())
     }
 
+    /// Return the creation source recorded by the canonical native session
+    /// stream. Legacy cost rows may carry a protocol wrapper (`gw_`/`rpc_`),
+    /// but that wrapper is removed only when the upgraded session exists and
+    /// its source agrees with the wrapper. User-chosen IDs that merely happen
+    /// to start with the same text therefore remain lossless.
+    fn canonical_session_sources(&self) -> Result<HashMap<String, String>> {
+        let workspace = self.workspace_dir()?;
+        let backend = match self.backend {
+            Backend::Sqlite => crate::session_events::installation::NativeBackend::Sqlite,
+            Backend::Jsonl => crate::session_events::installation::NativeBackend::Jsonl,
+        };
+        let streams = crate::session_events::installation::streams(&workspace, backend)
+            .map_err(|error| anyhow::Error::msg(error.to_string()))?;
+        let store: std::sync::Arc<dyn zeroclaw_api::session_events::SessionEventStore> =
+            match backend {
+                crate::session_events::installation::NativeBackend::Sqlite => std::sync::Arc::new(
+                    crate::session_events::SqliteEventStore::open(&workspace)
+                        .map_err(|error| anyhow::Error::msg(error.to_string()))?,
+                ),
+                crate::session_events::installation::NativeBackend::Jsonl => std::sync::Arc::new(
+                    crate::session_events::jsonl::JsonlEventStore::open(&workspace)
+                        .map_err(|error| anyhow::Error::msg(error.to_string()))?,
+                ),
+            };
+        let mut sources = HashMap::new();
+        for stream in streams {
+            let page = store
+                .read_page(
+                    &stream,
+                    &zeroclaw_api::session_events::EventCursor::beginning(stream.clone()),
+                    None,
+                    256,
+                )
+                .map_err(|error| anyhow::Error::msg(error.to_string()))?;
+            for event in page.events {
+                let zeroclaw_api::session_events::EventData::SessionMetadataChanged {
+                    field,
+                    new_value_ref,
+                } = event.body.data
+                else {
+                    continue;
+                };
+                if field != "creation_source" {
+                    continue;
+                }
+                let zeroclaw_api::session_events::PayloadRead::Present(payload) = store
+                    .read_payload(&new_value_ref.payload_id)
+                    .map_err(|error| anyhow::Error::msg(error.to_string()))?
+                else {
+                    continue;
+                };
+                if let Ok(source) = serde_json::from_slice::<String>(&payload.body) {
+                    sources.insert(stream.as_str().to_owned(), source);
+                }
+            }
+        }
+        Ok(sources)
+    }
+
     fn migrate_legacy(&self) -> Result<()> {
         let workspace = self.workspace_dir()?;
+        let canonical_sources = self.canonical_session_sources()?;
         let candidates = [
             workspace.join("state/costs.jsonl"),
             workspace.join(".zeroclaw/costs.db"),
@@ -205,10 +265,27 @@ impl CostLedger {
                             fields.remove("session_id");
                             if let Some(session) = fields.remove("conversation_id") {
                                 let session = match session {
-                                    serde_json::Value::String(id) => serde_json::Value::String(
-                                        crate::session_events::upgrade::session_id(&id)?
-                                            .to_string(),
-                                    ),
+                                    serde_json::Value::String(id) => {
+                                        let stripped =
+                                            crate::session_events::upgrade::session_id(&id)?;
+                                        let expected_source = if id.starts_with("gw_") {
+                                            Some("gateway")
+                                        } else if id.starts_with("rpc_") {
+                                            Some("rpc")
+                                        } else {
+                                            None
+                                        };
+                                        let resolved = expected_source
+                                            .filter(|source| {
+                                                !canonical_sources.contains_key(&id)
+                                                    && canonical_sources
+                                                        .get(stripped.as_str())
+                                                        .is_some_and(|actual| actual == source)
+                                            })
+                                            .map(|_| stripped.to_string())
+                                            .unwrap_or(id);
+                                        serde_json::Value::String(resolved)
+                                    }
                                     serde_json::Value::Null => serde_json::Value::Null,
                                     _ => {
                                         bail!("legacy cost conversation_id is not a string or null")
@@ -406,7 +483,47 @@ fn archive_legacy(path: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session_events::{installation, open_event_store};
     use tempfile::TempDir;
+    use zeroclaw_api::session_events::{
+        AppendRequest, BranchId, CaptureMode, EventActor, EventCursor, EventData, SessionEvent,
+        SessionId,
+    };
+
+    fn seed_native_session(dir: &Path, backend: Backend, id: &str, source: &str) {
+        let backend_name = match backend {
+            Backend::Sqlite => "sqlite",
+            Backend::Jsonl => "jsonl",
+        };
+        let stream = SessionId::parse(id.to_owned()).unwrap();
+        let store = open_event_store(dir, backend_name).unwrap();
+        let branch = BranchId::new();
+        let mut started = SessionEvent::typed(
+            stream.clone(),
+            EventData::SessionStarted {
+                owning_agent: "cost-test".into(),
+                capture_mode: CaptureMode::Native,
+            },
+            EventActor::System {
+                component: "cost-test".into(),
+            },
+        )
+        .unwrap();
+        started.branch_id = Some(branch.clone());
+        let (mut source_event, source_payload) =
+            installation::creation_source(stream.clone(), source).unwrap();
+        source_event.branch_id = Some(branch);
+        store
+            .append_batch(AppendRequest {
+                session_id: stream,
+                expected_head: EventCursor::beginning(SessionId::parse(id.to_owned()).unwrap()),
+                idempotency_key: format!("seed-{id}"),
+                events: vec![started, source_event],
+                payloads: vec![source_payload],
+                erasure_reference_commitment: None,
+            })
+            .unwrap();
+    }
 
     fn record(id: &str) -> Vec<u8> {
         serde_json::json!({
@@ -508,8 +625,9 @@ mod tests {
                 .collect();
             assert_eq!(values.len(), 3);
             assert_eq!(values[0]["id"], "a");
+            assert_eq!(values[0]["session_id"], "gw_session");
             assert_eq!(values[1]["id"], "b");
-            assert_eq!(values[1]["session_id"], "session");
+            assert_eq!(values[1]["session_id"], "rpc_session");
             assert_eq!(values[2]["id"], "c");
             assert!(values[2].get("session_id").is_none());
             assert!(!legacy.exists());
@@ -696,6 +814,10 @@ mod tests {
             ledger
                 .append(&serde_json::to_vec(&native).unwrap(), File::sync_all)
                 .unwrap();
+            seed_native_session(dir.path(), backend, "abc", "gateway");
+            seed_native_session(dir.path(), backend, "def", "rpc");
+            seed_native_session(dir.path(), backend, "rpc_literal", "gateway");
+            seed_native_session(dir.path(), backend, "rpc_debug", "rpc");
             drop(ledger);
             let legacy = dir.path().join("state/costs.jsonl");
             fs::create_dir_all(legacy.parent().unwrap()).unwrap();
@@ -705,16 +827,18 @@ mod tests {
                     legacy_record("a", Some("gw_abc")),
                     legacy_record("b", Some("rpc_def")),
                     legacy_record("c", Some("gw_rpc_literal")),
+                    legacy_record("d", Some("rpc_debug")),
                 ]
                 .join(&b'\n'),
             )
             .unwrap();
             let ledger = CostLedger::open(&path).unwrap();
             let records = ledger.read_records().unwrap();
-            assert_eq!(records.len(), 4);
-            for (raw, expected) in records
-                .iter()
-                .zip(["gw_opaque", "abc", "def", "rpc_literal"])
+            assert_eq!(records.len(), 5);
+            for (raw, expected) in
+                records
+                    .iter()
+                    .zip(["gw_opaque", "abc", "def", "rpc_literal", "rpc_debug"])
             {
                 let value: serde_json::Value = serde_json::from_slice(raw).unwrap();
                 assert_eq!(value["session_id"], expected);
