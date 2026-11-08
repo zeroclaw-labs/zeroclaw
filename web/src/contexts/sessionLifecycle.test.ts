@@ -120,6 +120,7 @@ const { DraftContext } = await import('../hooks/useDraft.ts');
 const { AgentChatInner } = await import('../pages/AgentChat.tsx');
 const { MemoryRouter } = await import('react-router-dom');
 const { setOidcSession } = await import('../lib/auth.ts');
+const { getLocale, setLocale } = await import('../lib/i18n.ts');
 const { loadChatHistory, saveChatHistory } = await import('../lib/chatHistoryStorage.ts');
 
 class Deferred<T> {
@@ -1716,6 +1717,39 @@ test('a lost turn result leaves the scoped conversation available', async () => 
     assert.deepEqual(runtime.messageCalls, []);
     await unmount(mounted.renderer);
   });
+});
+
+test('a disabled-agent refusal uses the dashboard locale and keeps the conversation', async () => {
+  const previousLocale = getLocale();
+  setLocale('es');
+  try {
+    await withSession(scopedSession, async () => {
+      const runtime = new FakeSessionRuntime();
+      const mounted = await mountChat(runtime, true);
+      try {
+        const socket = await startConversation(mounted, runtime, 'hello', 'chat-1');
+        await act(async () => {
+          socket.emitMessage({
+            type: 'error', code: 'AGENT_NOT_DISPATCHABLE',
+            message: 'Agent `ops` is not enabled for dispatch',
+          } as WsMessage);
+        });
+        assert.ok(mounted.context().messages.some((message) =>
+          message.content.includes('Este agente no puede recibir mensajes en este momento.')));
+        assert.equal(mounted.context().messages.some((message) =>
+          message.content.includes('not enabled for dispatch')), false);
+        assert.equal(mounted.context().typing, false);
+        await act(async () => { mounted.context().sendMessage('try again'); });
+        assert.equal(runtime.sockets.length, 1);
+        assert.deepEqual(socket.sent, ['hello', 'try again']);
+        assert.equal(mounted.context().error, null);
+      } finally {
+        await unmount(mounted.renderer);
+      }
+    });
+  } finally {
+    setLocale(previousLocale);
+  }
 });
 
 for (const [label, session] of [['a scoped account', scopedSession], ['an administrator on the core path', coreAdminSession]] as const) {

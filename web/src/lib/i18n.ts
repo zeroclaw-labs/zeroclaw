@@ -9,6 +9,7 @@ export type Locale = 'ar' | 'bn' | 'cs' | 'da' | 'de' | 'el' | 'en' | 'es' | 'fi
 
 const translations: Record<Locale, Record<string, string>> = {
   zh: {
+    'agent.not_dispatchable': "此智能体目前无法接收消息。",
     'sidebar.update_available': "有可用更新",
     'upgrade.title': "升级",
     'upgrade.current': "当前",
@@ -495,6 +496,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   en: {
+    'agent.not_dispatchable': "This agent cannot accept messages right now.",
     // Plugin package catalog
     'nav.plugins': "Plugins",
     'plugins.title': "Plugins",
@@ -2179,6 +2181,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   tr: {
+    'agent.not_dispatchable': "Bu aracı şu anda mesaj kabul edemiyor.",
     'sidebar.update_available': "Güncelleme mevcut",
     'upgrade.title': "Yükselt",
     'upgrade.current': "Geçerli",
@@ -2635,6 +2638,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   ar: {
+    'agent.not_dispatchable': "لا يمكن لهذا الوكيل استقبال الرسائل الآن.",
     'sidebar.update_available': "يتوفّر تحديث",
     'upgrade.title': "ترقية",
     'upgrade.current': "الحالي",
@@ -3079,6 +3083,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   bn: {
+    'agent.not_dispatchable': "এই এজেন্ট এখন বার্তা গ্রহণ করতে পারছে না।",
     'sidebar.update_available': "আপডেট উপলব্ধ",
     'upgrade.title': "আপগ্রেড",
     'upgrade.current': "বর্তমান",
@@ -3523,6 +3528,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   cs: {
+    'agent.not_dispatchable': "Tento agent nyní nemůže přijímat zprávy.",
     'sidebar.update_available': "Dostupná aktualizace",
     'upgrade.title': "Aktualizovat",
     'upgrade.current': "Aktuální",
@@ -3967,6 +3973,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   da: {
+    'agent.not_dispatchable': "Denne agent kan ikke modtage beskeder lige nu.",
     'sidebar.update_available': "Opdatering tilgængelig",
     'upgrade.title': "Opgrader",
     'upgrade.current': "Nuværende",
@@ -4411,6 +4418,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   de: {
+    'agent.not_dispatchable': "Dieser Agent kann derzeit keine Nachrichten empfangen.",
     'sidebar.update_available': "Update verfügbar",
     'upgrade.title': "Aktualisieren",
     'upgrade.current': "Aktuell",
@@ -4855,6 +4863,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   el: {
+    'agent.not_dispatchable': "Αυτός ο πράκτορας δεν μπορεί να δεχτεί μηνύματα αυτή τη στιγμή.",
     'sidebar.update_available': "Διαθέσιμη ενημέρωση",
     'upgrade.title': "Αναβάθμιση",
     'upgrade.current': "Τρέχουσα",
@@ -5299,6 +5308,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   es: {
+    'agent.not_dispatchable': "Este agente no puede recibir mensajes en este momento.",
     'sidebar.update_available': "Actualización disponible",
     'upgrade.title': "Actualizar",
     'upgrade.current': "Actual",
@@ -5743,6 +5753,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   fi: {
+    'agent.not_dispatchable': "Tämä agentti ei voi vastaanottaa viestejä juuri nyt.",
     'sidebar.update_available': "Päivitys saatavilla",
     'upgrade.title': "Päivitä",
     'upgrade.current': "Nykyinen",
@@ -6187,6 +6198,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   fr: {
+    'agent.not_dispatchable': "Cet agent ne peut pas recevoir de messages pour le moment.",
     'sidebar.update_available': "Mise à jour disponible",
     'upgrade.title': "Mettre à niveau",
     'upgrade.current': "Actuelle",
@@ -6645,6 +6657,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   he: {
+    'agent.not_dispatchable': "הסוכן הזה אינו יכול לקבל הודעות כרגע.",
     'sidebar.update_available': "עדכון זמין",
     'upgrade.title': "שדרוג",
     'upgrade.current': "נוכחית",
@@ -7089,6 +7102,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   hi: {
+    'agent.not_dispatchable': "यह एजेंट अभी संदेश प्राप्त नहीं कर सकता।",
     'sidebar.update_available': "अपडेट उपलब्ध",
     'upgrade.title': "अपग्रेड",
     'upgrade.current': "वर्तमान",
@@ -7533,6 +7547,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   hu: {
+    'agent.not_dispatchable': "Ez az ügynök jelenleg nem tud üzeneteket fogadni.",
     'sidebar.update_available': "Frissítés érhető el",
     'upgrade.title': "Frissítés",
     'upgrade.current': "Jelenlegi",
@@ -7977,6 +7992,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   id: {
+    'agent.not_dispatchable': "Agen ini belum dapat menerima pesan saat ini.",
     'sidebar.update_available': "Pembaruan tersedia",
     'upgrade.title': "Tingkatkan",
     'upgrade.current': "Saat ini",
@@ -8421,6 +8437,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   it: {
+    'agent.not_dispatchable': "Questo agente non può ricevere messaggi al momento.",
     'sidebar.update_available': "Aggiornamento disponibile",
     'upgrade.title': "Aggiorna",
     'upgrade.current': "Attuale",
@@ -8865,6 +8882,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   ja: {
+    'agent.not_dispatchable': "このエージェントは現在メッセージを受け取れません。",
     'sidebar.update_available': "アップデートがあります",
     'upgrade.title': "アップグレード",
     'upgrade.current': "現在",
@@ -9323,6 +9341,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   ko: {
+    'agent.not_dispatchable': "이 에이전트는 현재 메시지를 받을 수 없습니다.",
     'sidebar.update_available': "업데이트 사용 가능",
     'upgrade.title': "업그레이드",
     'upgrade.current': "현재",
@@ -9767,6 +9786,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   nb: {
+    'agent.not_dispatchable': "Denne agenten kan ikke motta meldinger akkurat nå.",
     'sidebar.update_available': "Oppdatering tilgjengelig",
     'upgrade.title': "Oppgrader",
     'upgrade.current': "Nåværende",
@@ -10211,6 +10231,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   nl: {
+    'agent.not_dispatchable': "Deze agent kan momenteel geen berichten ontvangen.",
     'sidebar.update_available': "Update beschikbaar",
     'upgrade.title': "Upgraden",
     'upgrade.current': "Huidige",
@@ -10655,6 +10676,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   pl: {
+    'agent.not_dispatchable': "Ten agent nie może teraz odbierać wiadomości.",
     'sidebar.update_available': "Dostępna aktualizacja",
     'upgrade.title': "Aktualizuj",
     'upgrade.current': "Bieżąca",
@@ -11099,6 +11121,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   pt: {
+    'agent.not_dispatchable': "Este agente não pode receber mensagens neste momento.",
     'sidebar.update_available': "Atualização disponível",
     'upgrade.title': "Atualizar",
     'upgrade.current': "Atual",
@@ -11543,6 +11566,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   ro: {
+    'agent.not_dispatchable': "Acest agent nu poate primi mesaje momentan.",
     'sidebar.update_available': "Actualizare disponibilă",
     'upgrade.title': "Actualizează",
     'upgrade.current': "Curentă",
@@ -11987,6 +12011,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   ru: {
+    'agent.not_dispatchable': "Этот агент сейчас не может принимать сообщения.",
     'sidebar.update_available': "Доступно обновление",
     'upgrade.title': "Обновить",
     'upgrade.current': "Текущая",
@@ -12445,6 +12470,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   sv: {
+    'agent.not_dispatchable': "Den här agenten kan inte ta emot meddelanden just nu.",
     'sidebar.update_available': "Uppdatering tillgänglig",
     'upgrade.title': "Uppgradera",
     'upgrade.current': "Nuvarande",
@@ -12889,6 +12915,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   th: {
+    'agent.not_dispatchable': "เอเจนต์นี้ไม่สามารถรับข้อความได้ในขณะนี้",
     'sidebar.update_available': "มีอัปเดต",
     'upgrade.title': "อัปเกรด",
     'upgrade.current': "ปัจจุบัน",
@@ -13333,6 +13360,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   tl: {
+    'agent.not_dispatchable': "Hindi makakatanggap ng mga mensahe ang ahenteng ito sa ngayon.",
     'sidebar.update_available': "May available na update",
     'upgrade.title': "I-upgrade",
     'upgrade.current': "Kasalukuyan",
@@ -13777,6 +13805,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   uk: {
+    'agent.not_dispatchable': "Цей агент зараз не може приймати повідомлення.",
     'sidebar.update_available': "Доступне оновлення",
     'upgrade.title': "Оновити",
     'upgrade.current': "Поточна",
@@ -14221,6 +14250,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   ur: {
+    'agent.not_dispatchable': "یہ ایجنٹ فی الحال پیغامات وصول نہیں کر سکتا۔",
     'sidebar.update_available': "اپ ڈیٹ دستیاب ہے",
     'upgrade.title': "اپ گریڈ",
     'upgrade.current': "موجودہ",
@@ -14665,6 +14695,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   vi: {
+    'agent.not_dispatchable': "Tác nhân này hiện không thể nhận tin nhắn.",
     'sidebar.update_available': "Có bản cập nhật",
     'upgrade.title': "Nâng cấp",
     'upgrade.current': "Hiện tại",

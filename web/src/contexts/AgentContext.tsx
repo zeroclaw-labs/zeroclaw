@@ -809,7 +809,9 @@ export function AgentProvider({
         if (perSocket && msg.code === 'CONVERSATION_LIMIT') break;
         const friendlyMessage = msg.code === 'TURN_RESULT_LOST'
           ? t('agent.turn_result_lost')
-          : friendlyAgentError(msg.message);
+          : msg.code === 'AGENT_NOT_DISPATCHABLE'
+            ? t('agent.not_dispatchable')
+            : friendlyAgentError(msg.message);
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => [
           ...prev,
