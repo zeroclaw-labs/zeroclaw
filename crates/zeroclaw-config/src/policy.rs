@@ -814,11 +814,19 @@ fn split_forbidden_depths(
     expanded: &Path,
     namespace: PathMatchNamespace,
     deny_read_is_canonical: bool,
+    workspace_dir: &Path,
 ) -> (Option<usize>, Option<usize>) {
     let mut operator: Option<usize> = None;
     let mut default: Option<usize> = None;
     for forbidden in forbidden_paths {
-        let forbidden_path = expand_user_path(forbidden);
+        // Resolve exactly like the read-side gate (`is_resolved_path_readable`
+        // → `resolve_policy_entry`): a relative entry such as `.secrets` is
+        // joined onto the workspace and best-effort canonicalized, so an
+        // absolute write target under `workspace/.secrets` meets its denial
+        // in the same namespace. Expanding only `~` here left relative
+        // entries unable to match any absolute target, and the write side
+        // silently dropped the denial the operator configured.
+        let forbidden_path = resolve_policy_entry(forbidden, workspace_dir);
         let Some(depth) = namespace_prefix_match_depth(&forbidden_path, expanded, namespace) else {
             continue;
         };
@@ -6067,6 +6075,7 @@ impl SecurityPolicy {
                 resolved,
                 PathMatchNamespace::Resolved,
                 self.sandbox_inputs.deny_read_is_canonical,
+                &self.workspace_dir,
             );
             if forbidden_overrides_allow(operator_depth, allow_depth) {
                 return false;
@@ -13381,6 +13390,38 @@ mod tests {
         assert!(
             !policy.is_resolved_path_allowed(Path::new("/tmp/file.txt")),
             "canonical deny_read tie against an allow_write grant must deny (operator provenance)"
+        );
+    }
+
+    #[test]
+    fn canonical_relative_deny_read_blocks_absolute_write_target() {
+        // A workspace-relative canonical denial (`deny_read = [".secrets"]`)
+        // must reach an ABSOLUTE write target under `workspace/.secrets`:
+        // `split_forbidden_depths` resolves the entry against the workspace
+        // exactly like the read-side gate, instead of expanding only `~` and
+        // missing every absolute target. Both the lexical spelling and the
+        // fully resolved path (a real directory, so canonicalization applies)
+        // must be denied.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        std::fs::create_dir_all(workspace.join(".secrets")).unwrap();
+
+        let mut profile = crate::schema::RiskProfileConfig::default();
+        profile.sandbox_policy.deny_read = Some(vec![".secrets".to_string()]);
+        let policy = SecurityPolicy::from_risk_profile(&profile, &workspace);
+
+        assert!(
+            !policy.is_resolved_path_allowed(&workspace.join(".secrets/credentials.txt")),
+            "a workspace-relative canonical deny_read entry must block the write-side target it names"
+        );
+        let resolved = crate::policy::canonicalize_best_effort(&workspace.join(".secrets"));
+        assert!(
+            !policy.is_resolved_path_allowed(&resolved.join("credentials.txt")),
+            "the denial must hold against the fully resolved spelling too"
+        );
+        assert!(
+            policy.is_resolved_path_allowed(&workspace.join("notes.txt")),
+            "targets outside the denied subtree keep the workspace's write grant"
         );
     }
 

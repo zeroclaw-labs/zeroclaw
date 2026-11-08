@@ -368,6 +368,14 @@ pub(crate) fn resolve_paths(paths: &[String], workspace: &Path) -> Vec<PathBuf> 
 /// No glob syntax in this slice. Nested repositories need no special case:
 /// a nested repo's own `.git/hooks/` is covered by the same run match as the
 /// top-level one.
+///
+/// Name equivalence follows the filesystem the policy runs on: on volumes
+/// where two spellings that differ only by case are the same file (Windows
+/// always; macOS default APFS/HFS+), a `.ENV` created to dodge the `.env`
+/// guardrail names the same file software reading `.env` opens, so the match
+/// is case-insensitive. On case-sensitive Unix volumes the spellings are
+/// genuinely different files and the comparison stays exact. The guardrail
+/// boundary must not be looser than the filesystem beneath it.
 pub(crate) fn guardrail_entry_matches(entry: &str, resolved: &Path, workspace: &Path) -> bool {
     let is_directory_entry = entry.ends_with('/');
     let expanded = shellexpand::tilde(entry);
@@ -375,7 +383,17 @@ pub(crate) fn guardrail_entry_matches(entry: &str, resolved: &Path, workspace: &
 
     if anchored {
         let resolved_entry = resolve_path(entry, workspace);
-        return resolved.starts_with(&resolved_entry);
+        // Compare both sides in the same namespace: the production caller
+        // passes a symlink-resolved target, while the entry spelling may
+        // name a symlinked directory (macOS `/tmp` → `/private/tmp`) or a
+        // symlinked dotfile. Best-effort canonicalization of BOTH sides puts
+        // entry and target in one namespace, so an exception spelled with
+        // the user-facing symlink still matches the canonical target, and a
+        // guardrail on a symlinked dotfile still covers the file it opens.
+        // Both are idempotent on already-canonical inputs.
+        let canonical_entry = crate::policy::canonicalize_best_effort(&resolved_entry);
+        let canonical_target = crate::policy::canonicalize_best_effort(resolved);
+        return path_starts_with_fs(&canonical_entry, &canonical_target);
     }
 
     let entry_components: Vec<String> = entry
@@ -400,13 +418,55 @@ pub(crate) fn guardrail_entry_matches(entry: &str, resolved: &Path, workspace: &
 
     if !is_directory_entry {
         // FILE entry: the run must be the final components of the target.
-        return target[target.len() - entry_components.len()..] == entry_components[..];
+        return target[target.len() - entry_components.len()..]
+            .iter()
+            .zip(&entry_components)
+            .all(|(t, e)| fs_name_eq(t, e));
     }
 
     // DIRECTORY entry: the run may appear at any component position — the
     // directory itself (run final) or any descendant (run followed by more).
-    (0..=target.len() - entry_components.len())
-        .any(|start| target[start..start + entry_components.len()] == entry_components[..])
+    (0..=target.len() - entry_components.len()).any(|start| {
+        target[start..start + entry_components.len()]
+            .iter()
+            .zip(&entry_components)
+            .all(|(t, e)| fs_name_eq(t, e))
+    })
+}
+
+/// Filesystem name equivalence for a single path component. See
+/// [`guardrail_entry_matches`] for why the class of case-insensitive
+/// volumes includes macOS's default filesystems alongside Windows.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn fs_name_eq(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
+/// Case-sensitive Unix volumes: distinct spellings are distinct files, so
+/// guardrail matching compares exactly.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn fs_name_eq(a: &str, b: &str) -> bool {
+    a == b
+}
+
+/// Component-wise `target` starts-with `prefix` using filesystem name
+/// equivalence ([`fs_name_eq`]) per component, so an anchored entry matches
+/// the resolved target under the same name semantics as run matching.
+fn path_starts_with_fs(prefix: &Path, target: &Path) -> bool {
+    let prefix_components: Vec<_> = prefix.components().collect();
+    let target_components: Vec<_> = target.components().collect();
+    if prefix_components.len() > target_components.len() {
+        return false;
+    }
+    prefix_components
+        .into_iter()
+        .zip(target_components)
+        .all(|(p, t)| match (p, t) {
+            (std::path::Component::Normal(pn), std::path::Component::Normal(tn)) => {
+                fs_name_eq(&pn.to_string_lossy(), &tn.to_string_lossy())
+            }
+            (a, b) => a == b,
+        })
 }
 
 pub(crate) fn resolve_path(p: &str, workspace: &Path) -> PathBuf {
@@ -757,6 +817,60 @@ mod tests {
             !guardrail_entry_matches("~/.bashrc", &ws().join(".bashrc"), ws()),
             "the anchored home entry does not cover the workspace copy"
         );
+    }
+
+    #[test]
+    fn guardrail_anchored_entry_matches_symlinked_spelling() {
+        // An exception spelled with the user-facing symlink must match the
+        // canonical target: on macOS `/tmp` is a symlink to `/private/tmp`,
+        // so the resolved target names `/private/tmp/...` while the operator
+        // wrote `/tmp/...`. Canonicalizing both sides closes that gap; on
+        // filesystems without the symlink both spellings already agree and
+        // the test passes unchanged.
+        let entry = "/tmp/zeroclaw-exception-test.txt";
+        let target =
+            crate::policy::canonicalize_best_effort(Path::new("/tmp/zeroclaw-exception-test.txt"));
+        assert!(
+            guardrail_entry_matches(entry, &target, ws()),
+            "the symlinked spelling must match its canonical target ({})",
+            target.display()
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn guardrail_entry_matches_case_equivalent_spelling() {
+        // On case-insensitive volumes (Windows always, macOS default
+        // APFS/HFS+), `.ENV` names the same file software reading `.env`
+        // opens, so the guardrail must catch the re-cased creation of a
+        // missing target too — canonicalization cannot help there because
+        // the file does not exist yet.
+        let target = ws().join(".env");
+        assert!(guardrail_entry_matches(".env", &target, ws()));
+        assert!(
+            guardrail_entry_matches(".env", &ws().join(".ENV"), ws()),
+            "a re-cased spelling of a guarded file is the same file on this volume"
+        );
+        assert!(guardrail_entry_matches(
+            ".git/",
+            &ws().join(".GIT/config"),
+            ws()
+        ));
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[test]
+    fn guardrail_entry_matches_case_equivalent_spelling() {
+        // Case-sensitive volumes: distinct spellings are distinct files;
+        // the guardrail compares exactly and does not over-deny.
+        let target = ws().join(".env");
+        assert!(guardrail_entry_matches(".env", &target, ws()));
+        assert!(!guardrail_entry_matches(".env", &ws().join(".ENV"), ws()));
+        assert!(!guardrail_entry_matches(
+            ".git/",
+            &ws().join(".GIT/config"),
+            ws()
+        ));
     }
 
     #[test]

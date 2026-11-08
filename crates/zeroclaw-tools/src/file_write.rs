@@ -1216,6 +1216,83 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[tokio::test]
+    async fn file_write_blocks_case_equivalent_guardrail_target() {
+        // On case-insensitive volumes, creating `.ENV` is creating `.env`:
+        // software reading `.env` opens the same file, so the guardrail
+        // must refuse the re-cased creation even though the target does
+        // not exist yet and cannot be canonicalized into equivalence.
+        let dir = tempfile::TempDir::new().unwrap();
+        let tool = deny_write_guardrail_tool(dir.path().to_path_buf());
+        let result = tool
+            .execute(json!({"path": ".ENV", "content": "SECRET=1"}))
+            .await
+            .unwrap();
+        assert!(
+            !result.success,
+            "a re-cased spelling of a guarded file is the same file on this volume"
+        );
+        assert!(!dir.path().join(".ENV").exists());
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[tokio::test]
+    async fn file_write_blocks_case_equivalent_guardrail_target() {
+        // Case-sensitive volumes: `.ENV` is a genuinely different file, and
+        // the guardrail must not over-deny it.
+        let dir = tempfile::TempDir::new().unwrap();
+        let tool = deny_write_guardrail_tool(dir.path().to_path_buf());
+        let result = tool
+            .execute(json!({"path": ".ENV", "content": "distinct-file"}))
+            .await
+            .unwrap();
+        assert!(
+            result.success,
+            "on a case-sensitive volume the re-cased spelling is a distinct file: {:?}",
+            result.error
+        );
+        assert!(dir.path().join(".ENV").exists());
+    }
+
+    #[tokio::test]
+    async fn file_write_blocks_relative_deny_read_subtree() {
+        // A workspace-relative canonical `deny_read = [".secrets"]` must
+        // block the write tool's own admission for an ABSOLUTE target under
+        // `workspace/.secrets` — the write boundary resolves the entry
+        // against the workspace instead of dropping it for not matching an
+        // absolute target lexically.
+        let dir = tempfile::TempDir::new().unwrap();
+        tokio::fs::create_dir_all(dir.path().join(".secrets"))
+            .await
+            .unwrap();
+
+        let mut profile = zeroclaw_config::schema::RiskProfileConfig::default();
+        profile.sandbox_policy.deny_read = Some(vec![".secrets".to_string()]);
+        let security = Arc::new(SecurityPolicy::from_risk_profile(&profile, dir.path()));
+        let tool = FileWriteTool::new(security);
+
+        let target = dir.path().join(".secrets/credentials.txt");
+        let result = tool
+            .execute(json!({
+                "path": target.to_string_lossy(),
+                "content": "must not land"
+            }))
+            .await
+            .unwrap();
+        assert!(
+            !result.success,
+            "the workspace-relative denial must cover the absolute write target"
+        );
+        assert!(!target.exists());
+
+        let allowed = tool
+            .execute(json!({"path": "notes.txt", "content": "still writable"}))
+            .await
+            .unwrap();
+        assert!(allowed.success, "{:?}", allowed.error);
+    }
+
     #[tokio::test]
     async fn file_write_keeps_git_metadata_guardrails() {
         // `git_operations` skips the built-in guardrails for Git's own
