@@ -180,6 +180,12 @@ tool-model-routing-config-error-risk-profile-collision = risk profile `{$profile
 tool-model-routing-config-error-missing-runtime-profile = agent `{$agent}` references missing runtime profile `{$profile}`
 tool-model-routing-config-error-shared-runtime-profile = runtime profile `{$profile}` is shared by another agent; refusing an agent-scoped mutation
 tool-model-routing-config-error-runtime-profile-collision = runtime profile `{$profile}` already exists; refusing to overwrite it while isolating agent `{$agent}`
+tool-model-routing-config-error-agent-rename-unfinished = agent '{ $name }' is part of an unfinished rename; run `zeroclaw agents rename { $from } { $to }` to finish it before removing this agent
+tool-model-routing-config-error-agent-recovery-unreadable = cannot remove agent '{ $name }': the agent lifecycle recovery journal could not be read: { $error }
+tool-model-routing-config-error-agent-alias-retired = agent '{ $name }' is retired by an unfinished rename to '{ $to }'; run `zeroclaw agents rename { $name } { $to }` to finish it before creating this agent
+tool-model-routing-config-error-agent-create-recovery-unreadable = cannot create agent '{ $name }': the agent lifecycle recovery journal could not be read: { $error }
+tool-model-routing-config-error-agent-alias-reserved = agent alias '{ $name }' is reserved and cannot be created
+tool-model-routing-config-error-agent-alias-invalid = invalid agent alias '{ $name }': { $error }
 
 tool-notion = Interact with Notion: query databases, read/create/update pages, and search the workspace.
 
