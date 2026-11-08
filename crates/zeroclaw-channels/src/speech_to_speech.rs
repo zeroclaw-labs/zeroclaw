@@ -14,13 +14,13 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use tokio::sync::{Notify, mpsc};
 
-use gemini_live::session::{
-    ClientTextSender, ControlOutcome, ControlReceipt, Event, Expiry, Session, SessionError,
-};
-use gemini_live::types::{FunctionDecl, Model, SetupConfig};
 use zeroclaw_api::channel::{Channel, ChannelConversationScope, ChannelMessage, SendMessage};
 use zeroclaw_config::paths::{normalize_lexical, resolve_under};
 use zeroclaw_config::schema::{ModelKind, SpeechToSpeechConfig};
+use zeroclaw_gemini_live::session::{
+    ClientTextSender, ControlOutcome, ControlReceipt, Event, Expiry, Session, SessionError,
+};
+use zeroclaw_gemini_live::types::{FunctionDecl, Model, SetupConfig};
 
 /// Build the Gemini Live `SetupConfig` for a broker session.
 ///
@@ -111,11 +111,11 @@ fn default_voice(model_kind: ModelKind) -> &'static str {
 
 /// The `setup.tools[].functionDeclarations[].name` list a built `SetupConfig`
 /// would expose on the wire, in declaration order. A thin test/audit helper
-/// around `gemini_live::wire::build_setup` — see
+/// around `zeroclaw_gemini_live::wire::build_setup` — see
 /// `setup_exposes_only_consult_and_end_session` for the invariant this
 /// exists to prove.
 pub fn broker_tool_names(setup: &SetupConfig) -> Vec<String> {
-    let v = gemini_live::wire::build_setup(setup);
+    let v = zeroclaw_gemini_live::wire::build_setup(setup);
     v["setup"]["tools"]
         .as_array()
         .unwrap_or(&Vec::new())
@@ -239,7 +239,7 @@ pub fn resolve_persona(cfg: &SpeechToSpeechConfig, workspace_dir: &Path) -> Resu
 /// Delivery of non-audio controls is settled per control, not guessed from a
 /// backlog: every `ClientText` and `ToolResponse` carries a receipt the
 /// transport driver resolves to written, discarded, or failed (see
-/// [`gemini_live::ControlOutcome`]). `send()` reports that verdict to its
+/// [`zeroclaw_gemini_live::ControlOutcome`]). `send()` reports that verdict to its
 /// caller, so a reply the connection swallowed is a visible delivery failure
 /// rather than a success the agent never learns to doubt. Nothing is replayed
 /// blindly: exactly-once across a broken connection is not on offer, and an
@@ -932,15 +932,15 @@ mod tests {
     #![allow(clippy::disallowed_methods)]
 
     use super::*;
-    use gemini_live::session::{ClientConfig, Reconnector, SessionError};
-    use gemini_live::transport::{FakeTransport, TransportError};
     use zeroclaw_api::channel::Channel;
+    use zeroclaw_gemini_live::session::{ClientConfig, Reconnector, SessionError};
+    use zeroclaw_gemini_live::transport::{FakeTransport, TransportError};
 
     fn cfg() -> SpeechToSpeechConfig {
         SpeechToSpeechConfig::default()
     }
 
-    /// Map a `SpeechToSpeechConfig` onto the `gemini-live` `ClientConfig`
+    /// Map a `SpeechToSpeechConfig` onto the `zeroclaw-gemini-live` `ClientConfig`
     /// this test drives `Session::connect_with_transport` with. Production
     /// wiring (real `api_key`/`proxy`, reconnect budget) lands with the
     /// `listen()` integration in a later task; this is test-only plumbing.
@@ -989,7 +989,7 @@ mod tests {
         // on the crate's test double) already records every outbound frame
         // byte-for-byte — no need for a dedicated recorder: clone the handle
         // before the transport moves into `connect_with_transport` and
-        // inspect it directly, the same way `gemini_live::session`'s own
+        // inspect it directly, the same way `zeroclaw_gemini_live::session`'s own
         // tests do (see `send_audio_is_byte_identical_to_kutsu`).
         let fake = FakeTransport::new(true);
         let sent = fake.sent.clone();
@@ -1006,7 +1006,7 @@ mod tests {
 
         // The driver task performs the transport write asynchronously after
         // the command is enqueued; poll briefly rather than assuming
-        // immediacy (mirrors `wait_for_sent` in `gemini_live::session`'s own
+        // immediacy (mirrors `wait_for_sent` in `zeroclaw_gemini_live::session`'s own
         // tests).
         let mut found = false;
         for _ in 0..1000 {
@@ -1659,7 +1659,7 @@ mod tests {
     #[test]
     fn setup_exposes_only_consult_and_end_session() {
         let setup = build_broker_setup(&cfg(), "you are a broker");
-        let v = gemini_live::wire::build_setup(&setup);
+        let v = zeroclaw_gemini_live::wire::build_setup(&setup);
         let tools: Vec<String> = v["setup"]["tools"]
             .as_array()
             .unwrap_or(&vec![])
@@ -1683,7 +1683,7 @@ mod tests {
 
     #[test]
     fn setup_emits_compression_resumption_and_transcription() {
-        let v = gemini_live::wire::build_setup(&build_broker_setup(&cfg(), "p"));
+        let v = zeroclaw_gemini_live::wire::build_setup(&build_broker_setup(&cfg(), "p"));
         assert!(v["setup"]["contextWindowCompression"]["slidingWindow"].is_object());
         assert!(v["setup"]["sessionResumption"].is_object());
         assert!(v["setup"]["inputAudioTranscription"].is_object());
@@ -1776,7 +1776,7 @@ mod tests {
         let mut native = cfg();
         native.model_kind = ModelKind::NativeAudio;
         native.voice = None;
-        let v = gemini_live::wire::build_setup(&build_broker_setup(&native, "p"));
+        let v = zeroclaw_gemini_live::wire::build_setup(&build_broker_setup(&native, "p"));
         assert_eq!(
             v["setup"]["generationConfig"]["speechConfig"]["voiceConfig"]["prebuiltVoiceConfig"]["voiceName"],
             "Autonoe"
@@ -1785,7 +1785,7 @@ mod tests {
         let mut half = cfg();
         half.model_kind = ModelKind::HalfCascade;
         half.voice = None;
-        let v = gemini_live::wire::build_setup(&build_broker_setup(&half, "p"));
+        let v = zeroclaw_gemini_live::wire::build_setup(&build_broker_setup(&half, "p"));
         assert_eq!(
             v["setup"]["generationConfig"]["speechConfig"]["voiceConfig"]["prebuiltVoiceConfig"]["voiceName"],
             "Kore"
@@ -1797,7 +1797,7 @@ mod tests {
         let mut c = cfg();
         c.model_kind = ModelKind::NativeAudio;
         c.voice = Some("Puck".into());
-        let v = gemini_live::wire::build_setup(&build_broker_setup(&c, "p"));
+        let v = zeroclaw_gemini_live::wire::build_setup(&build_broker_setup(&c, "p"));
         assert_eq!(
             v["setup"]["generationConfig"]["speechConfig"]["voiceConfig"]["prebuiltVoiceConfig"]["voiceName"],
             "Puck"

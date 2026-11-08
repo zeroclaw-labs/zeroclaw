@@ -1,4 +1,4 @@
-//! `gemini-live` — a focused Rust client for the Google Gemini Live API.
+//! `zeroclaw-gemini-live` — a focused Rust client for the Google Gemini Live API.
 //!
 //! Owns everything about talking to Gemini Live correctly: wire types, setup
 //! serialization, server-message parsing (including affective tokens), the

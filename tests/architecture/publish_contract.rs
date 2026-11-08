@@ -17,6 +17,9 @@
 //! * publish-order calculation hidden behind the dry-run return and fed the
 //!   full workspace metadata through argv, which exceeded Linux `ARG_MAX`
 //!   only after the irreversible job was approved
+//! * a path dependency on a member kept at its own version, which the
+//!   publisher skips: the requirement resolved to an unrelated crates.io crate
+//!   of the same name
 
 use proc_macro2::{TokenStream, TokenTree};
 use std::collections::{BTreeMap, BTreeSet};
@@ -128,16 +131,42 @@ fn release_crates(crates: &[Crate]) -> BTreeSet<&str> {
         .collect()
 }
 
+/// Every dependency table of one manifest that survives packaging, including
+/// the `[target.<cfg>]` ones. Dev-dependencies are left out: cargo strips them
+/// from a package.
+fn dependency_tables(manifest: &toml::Table) -> Vec<&toml::Table> {
+    let mut owners = vec![manifest];
+    if let Some(targets) = manifest.get("target").and_then(|v| v.as_table()) {
+        owners.extend(targets.values().filter_map(|v| v.as_table()));
+    }
+    owners
+        .into_iter()
+        .flat_map(|owner| {
+            ["dependencies", "build-dependencies"]
+                .into_iter()
+                .filter_map(move |section| owner.get(section).and_then(|v| v.as_table()))
+        })
+        .collect()
+}
+
+/// The package a dependency entry resolves to: its key, unless the entry
+/// renames it (`foo = { package = "bar" }`), in which case the package is what
+/// counts — a renamed workspace member is still that member.
+fn dependency_package<'a>(key: &'a str, spec: &'a toml::Value) -> &'a str {
+    spec.as_table()
+        .and_then(|s| s.get("package"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(key)
+}
+
 /// The root's normal/build dependency closure. Versioned dev-dependencies also
 /// affect publishing; scripts/release/publish_order.py owns that full graph.
 fn internal_deps(krate: &Crate, workspace_names: &BTreeSet<String>) -> BTreeSet<String> {
-    ["dependencies", "build-dependencies"]
-        .iter()
-        .filter_map(|section| krate.manifest.get(*section))
-        .filter_map(|v| v.as_table())
-        .flat_map(|t| t.keys())
-        .filter(|k| workspace_names.contains(*k))
-        .cloned()
+    dependency_tables(&krate.manifest)
+        .into_iter()
+        .flat_map(|table| table.iter())
+        .map(|(key, spec)| dependency_package(key, spec).to_owned())
+        .filter(|name| workspace_names.contains(name))
         .collect()
 }
 
@@ -484,36 +513,104 @@ fn publishable_crates_pin_git_dependencies_to_a_version() {
         .iter()
         .filter(|krate| release.contains(krate.name.as_str()))
     {
-        for section in ["dependencies", "build-dependencies", "target"] {
-            let Some(table) = krate.manifest.get(section).and_then(|v| v.as_table()) else {
+        for deps in dependency_tables(&krate.manifest) {
+            for (dep_name, spec) in deps {
+                let Some(spec) = spec.as_table() else {
+                    continue;
+                };
+                if spec.contains_key("git") && !spec.contains_key("version") {
+                    panic!(
+                        "{}: dependency `{dep_name}` has a `git` source but no `version`.\n\
+                         crates.io rejects git sources; cargo drops `git`/`rev` at publish \
+                         time and keeps only the version requirement, so one is required.",
+                        krate.name
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Cargo swaps a path for its version requirement at publish time, so every
+/// declaration of a sibling by `path` — the workspace table the members
+/// inherit from, and a member's own tables — is what the published manifests
+/// really ask the registry for: no `version` cannot be packaged at all, and a
+/// requirement the coordinated release never uploads resolves to whatever
+/// crates.io holds under that name.
+#[test]
+fn internal_path_dependencies_ship_in_the_release_that_requires_them() {
+    let root = repo_root();
+    let root_manifest: toml::Table = fs::read_to_string(root.join("Cargo.toml"))
+        .expect("read workspace Cargo.toml")
+        .parse()
+        .expect("workspace Cargo.toml is valid TOML");
+    let crates = workspace_crates();
+    let by_dir: BTreeMap<String, &Crate> = crates
+        .iter()
+        .map(|krate| (repo_relative_key(&krate.dir, &root), krate))
+        .collect();
+    let release = release_crates(&crates);
+    let closure = root_closure(&crates);
+
+    // Each table, with the directory its `path` entries are relative to: the
+    // workspace table resolves against the repo root, a member's own against
+    // that member's directory.
+    let mut declarations: Vec<(String, &Path, &toml::Table)> = vec![(
+        "[workspace.dependencies]".to_owned(),
+        root.as_path(),
+        root_manifest["workspace"]["dependencies"]
+            .as_table()
+            .expect("[workspace.dependencies] is a table"),
+    )];
+    // Only the crates cargo will ever package: a `publish = false` member (a
+    // test fixture) may declare a sibling by path alone. Publishable is the
+    // predicate rather than release membership — a member kept at its own
+    // version is still uploaded by whatever release owns that version, and
+    // `cargo publish` still refuses a path dependency with no requirement.
+    for krate in crates.iter().filter(|krate| krate.publishable) {
+        for table in dependency_tables(&krate.manifest) {
+            declarations.push((krate.name.clone(), krate.dir.as_path(), table));
+        }
+    }
+
+    for (owner, base, deps) in declarations {
+        for (key, spec) in deps {
+            let Some(table) = spec.as_table() else {
                 continue;
             };
-            // `[target.<cfg>.dependencies]` nests one level deeper.
-            let dep_tables: Vec<&toml::Table> = if section == "target" {
-                table
-                    .values()
-                    .filter_map(|v| v.as_table())
-                    .filter_map(|t| t.get("dependencies"))
-                    .filter_map(|v| v.as_table())
-                    .collect()
-            } else {
-                vec![table]
+            let Some(path) = table.get("path").and_then(|v| v.as_str()) else {
+                continue;
             };
-
-            for deps in dep_tables {
-                for (dep_name, spec) in deps {
-                    let Some(spec) = spec.as_table() else {
-                        continue;
-                    };
-                    if spec.contains_key("git") && !spec.contains_key("version") {
-                        panic!(
-                            "{}: dependency `{dep_name}` has a `git` source but no `version`.\n\
-                             crates.io rejects git sources; cargo drops `git`/`rev` at publish \
-                             time and keeps only the version requirement, so one is required.",
-                            krate.name
-                        );
-                    }
-                }
+            let requirement = table
+                .get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{owner}: `{key}` has a `path` but no `version`; nothing depending on \
+                         it can be packaged, optional or not"
+                    )
+                });
+            let dir = repo_relative_key(&normalize(base, path), &root);
+            let Some(krate) = by_dir.get(&dir) else {
+                // Someone else's directory: the version requirement above is
+                // all this gate can say about it.
+                continue;
+            };
+            assert_eq!(
+                requirement, krate.version,
+                "{owner}: `{key}` requires {requirement}, but `{}` is at {}: the published \
+                 manifests would ask for a version this repository never uploads",
+                krate.name, krate.version
+            );
+            if closure.contains(&krate.name) {
+                assert!(
+                    release.contains(krate.name.as_str()),
+                    "`{}` is in the root dependency closure but not in the coordinated \
+                     release: the publisher skips a member at its own version, leaving the \
+                     requirement above to resolve against whatever crates.io has under that \
+                     name",
+                    krate.name
+                );
             }
         }
     }

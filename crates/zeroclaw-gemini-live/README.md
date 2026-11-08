@@ -1,4 +1,4 @@
-# gemini-live
+# zeroclaw-gemini-live
 
 A focused Rust client for the Google Gemini Live API.
 
@@ -7,6 +7,9 @@ serialization, server-message parsing (including affective emotion tokens), the
 WebSocket transport (HTTP CONNECT proxy + TLS + close diagnostics), and a
 reconnect/resumption session driver — behind a small async event API. Callers
 handle their own application semantics on top.
+
+Published under the ZeroClaw name because the plain `gemini-live` name on
+crates.io belongs to an unrelated client; see PROVENANCE.md.
 
 Extracted from the [kutsu](https://github.com/metalmon/kutsu) outbound-calling
 server, where it is consumed as a git submodule.

@@ -3777,21 +3777,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gemini-live"
-version = "0.1.0"
-dependencies = [
- "async-http-proxy",
- "base64 0.22.1",
- "futures-util",
- "rustls",
- "serde",
- "serde_json",
- "tokio",
- "tokio-tungstenite 0.29.0",
- "tracing",
-]
-
-[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13968,7 +13953,6 @@ dependencies = [
  "directories",
  "ecb",
  "futures-util",
- "gemini-live",
  "glob",
  "hex",
  "hmac 0.12.1",
@@ -14028,6 +14012,7 @@ dependencies = [
  "wiremock",
  "zeroclaw-api",
  "zeroclaw-config",
+ "zeroclaw-gemini-live",
  "zeroclaw-infra",
  "zeroclaw-log",
  "zeroclaw-memory",
@@ -14197,6 +14182,21 @@ dependencies = [
  "zeroclaw-spawn",
  "zeroclaw-tls",
  "zeroclaw-tools",
+]
+
+[[package]]
+name = "zeroclaw-gemini-live"
+version = "0.8.7"
+dependencies = [
+ "async-http-proxy",
+ "base64 0.22.1",
+ "futures-util",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.29.0",
+ "tracing",
 ]
 
 [[package]]

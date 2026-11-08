@@ -1,10 +1,16 @@
 [package]
-name = "gemini-live"
-version = "0.1.0"
+name = "zeroclaw-gemini-live"
+version.workspace = true
+# Vendored from the `gemini-live` crate; see PROVENANCE.md. It keeps its own
+# edition and MIT license so the vendor stays diffable against the origin
+# commit, and takes the workspace version so the coordinated release publishes
+# it before the channel that depends on it.
 edition = "2021"
-description = "A focused Rust client for the Google Gemini Live API: wire serialization, message parsing, WebSocket transport, and a reconnect/resumption session driver."
 license = "MIT"
-repository = "https://github.com/metalmon/gemini-live"
+repository.workspace = true
+homepage.workspace = true
+description = "A focused Rust client for the Google Gemini Live API: wire serialization, message parsing, WebSocket transport, and a reconnect/resumption session driver."
+publish = true
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
