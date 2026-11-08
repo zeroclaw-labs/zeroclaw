@@ -380,12 +380,14 @@ pub struct SecurityPolicy {
     /// built-in default; carried here so status surfaces report the image the
     /// sandbox will actually run rather than assuming the default.
     pub sandbox_image: Option<String>,
-    /// The shell the native runtime runs this agent's commands with: the
-    /// configured `[runtime].shell`, or the detected default, as the runtime
-    /// factory chooses it. `None` when the runtime is not native or the
-    /// policy was built without a config. POSIX command checks use it to
-    /// identify bash (see `SecurityPolicy::posix_shell`); otherwise they
-    /// keep the rules that are safe for any POSIX shell.
+    /// The shell the native runtime runs this agent's commands with, from
+    /// `platform::native_runtime_shell`, the derivation the runtime factory
+    /// uses. Recorded from the same config the agent's runtime is built
+    /// from; it is not a live view of later config changes. `None` when the
+    /// runtime is not native or the policy was built without a config. POSIX
+    /// command checks use it to identify bash (see
+    /// `SecurityPolicy::posix_shell`); otherwise they keep the rules that are
+    /// safe for any POSIX shell.
     pub native_shell: Option<String>,
     pub tracker: PerSenderTracker,
 }
@@ -6036,20 +6038,14 @@ impl SecurityPolicy {
             policy.risk_profile_name = agent_cfg.risk_profile.trim().to_string();
         }
         policy.config_path = Some(config.config_path.clone());
-        // The shell the tools' native runtime runs, chosen the way
-        // `platform::create_runtime` chooses it. Android pins
-        // `/system/bin/sh` regardless, and other runtimes run a shell the
-        // host cannot inspect, so both keep the portable rules.
+        // The shell the tools' native runtime runs, from the same derivation
+        // `platform::create_runtime` uses. Android pins `/system/bin/sh`
+        // regardless, and other runtimes run a shell the host cannot
+        // inspect, so both keep the portable rules.
         if config.runtime.kind == crate::schema::RuntimeKind::Native
             && !zeroclaw_api::platform::is_android()
         {
-            policy.native_shell = Some(
-                config
-                    .runtime
-                    .shell
-                    .clone()
-                    .unwrap_or_else(crate::platform::native::default_shell),
-            );
+            policy.native_shell = Some(crate::platform::native_runtime_shell(&config.runtime));
         }
         // Runtime data dir: same predicate extends there so state files
         // that the gateway constructs with `&config.data_dir`
@@ -10518,6 +10514,42 @@ mod tests {
         let policy = SecurityPolicy::for_agent(&cfg, "agent_a").unwrap();
         assert_eq!(policy.native_shell, None);
         assert_eq!(policy.posix_shell(), PosixShell::Unknown);
+    }
+
+    /// The shell policy records and the program the runtime factory spawns
+    /// come from one derivation of `[runtime]`, for an explicit shell and for
+    /// the detected default alike.
+    #[cfg(all(unix, not(target_os = "android")))]
+    #[test]
+    fn for_agent_records_the_shell_the_runtime_factory_spawns() {
+        use crate::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config {
+            data_dir: dir.path().join("data"),
+            config_path: dir.path().join("config.toml"),
+            ..Config::default()
+        };
+        cfg.risk_profiles
+            .insert("default".into(), RiskProfileConfig::default());
+        cfg.agents.insert(
+            "agent_a".into(),
+            AliasedAgentConfig {
+                risk_profile: "default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        cfg.runtime.kind = crate::schema::RuntimeKind::Native;
+        for shell in [Some("/bin/sh".to_string()), None] {
+            cfg.runtime.shell = shell.clone();
+            let policy = SecurityPolicy::for_agent(&cfg, "agent_a").unwrap();
+            let runtime = crate::platform::create_runtime(&cfg.runtime).unwrap();
+            assert_eq!(
+                policy.native_shell.as_deref().map(std::ffi::OsStr::new),
+                runtime.shell_program(),
+                "{shell:?}"
+            );
+        }
     }
 
     /// The body of an unquoted heredoc is expanded, so a line ending in an odd
