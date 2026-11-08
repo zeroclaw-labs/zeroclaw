@@ -434,16 +434,21 @@ impl RuntimeAdapter for NativeRuntime {
             } else {
                 &self.shell
             };
-            let shell = if let Some(resolved_shell) = &self.resolved_shell {
-                resolved_shell.clone()
-            } else {
-                crate::platform::resolve_executable(std::ffi::OsStr::new(configured_shell))
+            // A bare name stays bound to the PATH it was resolved on. An
+            // absolute path is resolved again for every command, so the
+            // program that runs is the file the path names now: the one the
+            // command policy inspected when it chose the command's grammar.
+            let shell = match &self.resolved_shell {
+                Some(resolved_shell) if !Path::new(configured_shell).is_absolute() => {
+                    resolved_shell.clone()
+                }
+                _ => crate::platform::resolve_executable(std::ffi::OsStr::new(configured_shell))
                     .map_err(|error| {
                         let detail = error.to_string();
                         anyhow::Error::new(error).context(format!(
                             "native runtime shell {configured_shell:?} could not be resolved before setting workspace directory: {detail}"
                         ))
-                    })?
+                    })?,
             };
             let mut process = if self.shell_dialect() == ShellDialect::PowerShell {
                 tokio_powershell_command(shell.as_os_str(), command)
@@ -1140,6 +1145,39 @@ mod tests {
             cmd.as_std().get_program(),
             configured.canonicalize().unwrap().as_os_str(),
             "absolute path should be canonicalized before command construction"
+        );
+    }
+
+    /// The command policy reads a command in bash's grammar only when an
+    /// absolute configured shell canonicalizes to bash at check time. The
+    /// runtime must spawn the file that path names at build time too, not a
+    /// target resolved when a TUI session's runtime was constructed.
+    #[cfg(all(unix, not(target_os = "android")))]
+    #[test]
+    fn absolute_shell_is_resolved_again_for_each_command() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        for target in [&first, &second] {
+            std::fs::write(target, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let link = dir.path().join("sh");
+        std::os::unix::fs::symlink(&first, &link).unwrap();
+        let configured = link.to_str().unwrap().to_owned();
+        let runtime = NativeRuntime::with_shell_and_resolved_path(
+            configured,
+            Some(first.canonicalize().unwrap()),
+        );
+
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&second, &link).unwrap();
+        let cmd = runtime.build_shell_command("echo hi", dir.path()).unwrap();
+        assert_eq!(
+            cmd.as_std().get_program(),
+            second.canonicalize().unwrap().as_os_str()
         );
     }
 
