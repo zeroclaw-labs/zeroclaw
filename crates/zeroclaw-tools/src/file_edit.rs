@@ -158,17 +158,13 @@ impl FileEditTool {
         };
 
         // ── 6. Resolved path post-validation ───────────────────────
-        if !self.security.is_resolved_path_allowed(&resolved_parent) {
-            return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(
-                    self.security
-                        .resolved_path_violation_message(&resolved_parent),
-                ),
-            });
-        }
-
+        // The parent directory itself needs no separate write grant: an edit
+        // never mutates the directory entry, and requiring parent write
+        // permission would defeat a file-specific guardrail exception such
+        // as `.vscode/settings.json` — the guardrails keep `.vscode/` denied
+        // while the exception re-permits exactly that file. Admission is
+        // decided on the TARGET below; the parent is canonicalized only to
+        // place the target in resolved namespace.
         let Some(file_name) = full_path.file_name() else {
             return Ok(ToolResult {
                 success: false,
@@ -726,6 +722,65 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_edit_file_specific_guardrail_exception_enables_single_file() {
+        // Same contract as file_write: the exception names one file inside
+        // the guardrail-denied `.vscode/` directory, so the edit boundary
+        // must decide on the TARGET's effective permission instead of first
+        // demanding write access to the parent directory.
+        let dir = tempfile::TempDir::new().unwrap();
+        tokio::fs::create_dir_all(dir.path().join(".vscode"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            dir.path().join(".vscode/settings.json"),
+            "{\"editor.fontSize\": 12}",
+        )
+        .await
+        .unwrap();
+
+        let mut profile = zeroclaw_config::schema::RiskProfileConfig::default();
+        profile.sandbox_policy.guardrail_exceptions = vec![".vscode/settings.json".to_string()];
+        let security = Arc::new(SecurityPolicy::from_risk_profile(&profile, dir.path()));
+        let tool = FileEditTool::new(security);
+
+        let edited = tool
+            .execute(json!({
+                "path": ".vscode/settings.json",
+                "old_string": "12",
+                "new_string": "14"
+            }))
+            .await
+            .unwrap();
+        assert!(
+            edited.success,
+            "the named exception must enable editing the single file: {:?}",
+            edited.error
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(dir.path().join(".vscode/settings.json"))
+                .await
+                .unwrap(),
+            "{\"editor.fontSize\": 14}"
+        );
+
+        tokio::fs::write(dir.path().join(".vscode/tasks.json"), "legacy")
+            .await
+            .unwrap();
+        let refused = tool
+            .execute(json!({
+                "path": ".vscode/tasks.json",
+                "old_string": "legacy",
+                "new_string": "changed"
+            }))
+            .await
+            .unwrap();
+        assert!(
+            !refused.success,
+            "a sibling inside the denied directory stays denied"
+        );
     }
 
     #[tokio::test]

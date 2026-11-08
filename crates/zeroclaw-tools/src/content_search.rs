@@ -515,11 +515,11 @@ fn visit_internal_search_path(
     let Ok(resolved) = std::fs::canonicalize(path) else {
         return Ok(());
     };
-    if !security.is_resolved_path_readable(&resolved) {
-        return Ok(());
-    }
 
     if resolved.is_file() {
+        if !security.is_resolved_path_readable(&resolved) {
+            return Ok(());
+        }
         if internal_include_matches(&resolved, workspace_canon, include) {
             search_internal_file(
                 &resolved,
@@ -540,6 +540,12 @@ fn visit_internal_search_path(
         return Ok(());
     }
 
+    // A directory the policy denies for reads is NOT pruned from the
+    // traversal: a MORE SPECIFIC allow root can re-permit a subtree beneath
+    // it (RFC 6996 read specificity), and direct file admission already
+    // works there. Descend and admit each entry by its own effective
+    // permission — the denied directory's own entries are still filtered by
+    // their per-entry checks below, so nothing denied is ever read.
     let Ok(entries) = std::fs::read_dir(&resolved) else {
         return Ok(());
     };
@@ -1382,6 +1388,52 @@ mod tests {
             "absolute path under read-only root must search: {result:?}"
         );
         assert!(result.output.contains("shared"));
+    }
+
+    #[tokio::test]
+    async fn content_search_descends_denied_dir_to_more_specific_allowed_subtree() {
+        // Read specificity in traversal: the denied `secret/` directory
+        // contains a subtree a MORE SPECIFIC allow root re-permits. The
+        // walk used to prune the whole denied directory, so the allowed
+        // subtree was unreachable even though direct file admission works.
+        // Descent must continue; each entry is still admitted by its own
+        // effective permission.
+        let workspace = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let secret = root.path().join("secret");
+        let public = secret.join("public");
+        std::fs::create_dir_all(&public).unwrap();
+        std::fs::write(public.join("found.rs"), "fn needle() {}\n").unwrap();
+        std::fs::write(secret.join("hidden.rs"), "fn needle() {}\n").unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_roots: vec![root.path().to_path_buf(), public.clone()],
+            forbidden_paths: vec![secret.to_string_lossy().into_owned()],
+            ..SecurityPolicy::default()
+        });
+        let tool = ContentSearchTool::new(security);
+
+        let result = tool
+            .execute(json!({
+                "pattern": "fn needle",
+                "path": root.path().to_string_lossy().to_string(),
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(
+            result.output.contains("found.rs"),
+            "the more-specific allowed subtree under the denied directory must be reachable: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("hidden.rs"),
+            "the denied directory's own files stay filtered: {}",
+            result.output
+        );
     }
 
     #[tokio::test]

@@ -221,7 +221,16 @@ impl Tool for FileWriteTool {
             }
         };
         let prospective_parent = canonical_ancestor.join(missing_suffix);
-        if !self.security.is_resolved_path_allowed(&prospective_parent) {
+        // Directories that do not exist yet are a mutation of their own and
+        // need write admission BEFORE anything is created. An EXISTING parent
+        // (empty missing suffix) needs no separate write grant: a
+        // file-specific guardrail exception such as `.vscode/settings.json`
+        // must be able to re-permit one file inside a directory the
+        // guardrails keep denied, and the target check below governs the
+        // file itself.
+        if !missing_suffix.as_os_str().is_empty()
+            && !self.security.is_resolved_path_allowed(&prospective_parent)
+        {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -1291,6 +1300,53 @@ mod tests {
             .await
             .unwrap();
         assert!(allowed.success, "{:?}", allowed.error);
+    }
+
+    #[tokio::test]
+    async fn file_write_file_specific_guardrail_exception_enables_single_file() {
+        // The promised single-file exception: `guardrail_exceptions =
+        // [".vscode/settings.json"]` re-permits exactly that file inside the
+        // otherwise-denied `.vscode/` directory. Requiring write permission
+        // for the existing parent directory defeated it; admission now
+        // honors the requested target's own effective permission.
+        let dir = tempfile::TempDir::new().unwrap();
+        tokio::fs::create_dir_all(dir.path().join(".vscode"))
+            .await
+            .unwrap();
+
+        let mut profile = zeroclaw_config::schema::RiskProfileConfig::default();
+        profile.sandbox_policy.guardrail_exceptions = vec![".vscode/settings.json".to_string()];
+        let security = Arc::new(SecurityPolicy::from_risk_profile(&profile, dir.path()));
+        let tool = FileWriteTool::new(security);
+
+        let exception_target = dir.path().join(".vscode/settings.json");
+        let written = tool
+            .execute(json!({
+                "path": exception_target.to_string_lossy(),
+                "content": "{\"editor.formatOnSave\": true}"
+            }))
+            .await
+            .unwrap();
+        assert!(
+            written.success,
+            "the named exception must enable the single file: {:?}",
+            written.error
+        );
+        assert!(exception_target.exists());
+
+        let sibling = dir.path().join(".vscode/other.txt");
+        let refused = tool
+            .execute(json!({
+                "path": sibling.to_string_lossy(),
+                "content": "siblings stay denied"
+            }))
+            .await
+            .unwrap();
+        assert!(
+            !refused.success,
+            "a sibling inside the denied directory stays denied"
+        );
+        assert!(!sibling.exists());
     }
 
     #[tokio::test]

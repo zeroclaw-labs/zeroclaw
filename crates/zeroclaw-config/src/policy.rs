@@ -772,25 +772,8 @@ fn deepest_allow_depth(
     best
 }
 
-/// Deepest (most specific) forbidden match depth for `expanded`. `None` when no
-/// forbidden entry matches. Entries are compared in the same namespace as the
-/// target and any competing allow rules.
-fn deepest_forbidden_depth(
-    forbidden_paths: &[String],
-    expanded: &Path,
-    namespace: PathMatchNamespace,
-) -> Option<usize> {
-    let mut best: Option<usize> = None;
-    for forbidden in forbidden_paths {
-        let forbidden_path = expand_user_path(forbidden);
-        if let Some(depth) = namespace_prefix_match_depth(&forbidden_path, expanded, namespace) {
-            best = Some(best.map_or(depth, |b| b.max(depth)));
-        }
-    }
-    best
-}
-
-/// [`deepest_forbidden_depth`], split by entry provenance: the returned pair is
+/// Forbidden-match depths for `expanded`, split by entry provenance: the
+/// returned pair is
 /// `(operator_depth, default_depth)` — the deepest match among
 /// operator-authored entries and among built-in default safety roots
 /// (spelling test [`is_default_forbidden_entry`], suppressed entirely when the
@@ -819,14 +802,20 @@ fn split_forbidden_depths(
     let mut operator: Option<usize> = None;
     let mut default: Option<usize> = None;
     for forbidden in forbidden_paths {
-        // Resolve exactly like the read-side gate (`is_resolved_path_readable`
-        // → `resolve_policy_entry`): a relative entry such as `.secrets` is
+        // Resolution follows the comparison namespace. In the RESOLVED
+        // namespace every entry is resolved like the read-side gate
+        // (`resolve_policy_entry`): a relative entry such as `.secrets` is
         // joined onto the workspace and best-effort canonicalized, so an
         // absolute write target under `workspace/.secrets` meets its denial
-        // in the same namespace. Expanding only `~` here left relative
-        // entries unable to match any absolute target, and the write side
-        // silently dropped the denial the operator configured.
-        let forbidden_path = resolve_policy_entry(forbidden, workspace_dir);
+        // in the same namespace — expanding only `~` left relative entries
+        // unable to match any absolute target, silently dropping the denial.
+        // In the CONFIGURED (lexical) namespace both sides keep their
+        // spellings as written, so relative operator entries still match
+        // relative arguments.
+        let forbidden_path = match namespace {
+            PathMatchNamespace::Resolved => resolve_policy_entry(forbidden, workspace_dir),
+            PathMatchNamespace::Configured => expand_user_path(forbidden),
+        };
         let Some(depth) = namespace_prefix_match_depth(&forbidden_path, expanded, namespace) else {
             continue;
         };
@@ -5529,6 +5518,14 @@ impl SecurityPolicy {
                 // path nested under an allowed root (or the workspace) still
                 // blocks. A broad default forbidden root (e.g. `/home`) does
                 // not override a more specific operator allowlist entry.
+                //
+                // Provenance splits the tie exactly as the resolved write
+                // decision does (`split_forbidden_depths`): an OPERATOR entry
+                // at equal depth denies, while a BUILT-IN DEFAULT root that
+                // ties an operator grant loses — the default list and
+                // `DEFAULT_ALLOW_WRITE` both name `/tmp`, and denying the tie
+                // here would make the lexical gate reject what the resolved
+                // decision admits for an explicit `allow_write = ["/tmp"]`.
                 let allow_depth = deepest_allow_depth(
                     &self.workspace_dir,
                     &[
@@ -5539,12 +5536,17 @@ impl SecurityPolicy {
                     &expanded_path,
                     PathMatchNamespace::Configured,
                 );
-                let forbidden_depth = deepest_forbidden_depth(
+                let (operator_depth, default_depth) = split_forbidden_depths(
                     &self.forbidden_paths,
                     &expanded_path,
                     PathMatchNamespace::Configured,
+                    self.sandbox_inputs.deny_read_is_canonical,
+                    &self.workspace_dir,
                 );
-                if forbidden_overrides_allow(forbidden_depth, allow_depth) {
+                if forbidden_overrides_allow(operator_depth, allow_depth) {
+                    return false;
+                }
+                if matches!((default_depth, allow_depth), (Some(f), Some(a)) if f > a) {
                     return false;
                 }
                 return true;
@@ -5707,9 +5709,30 @@ impl SecurityPolicy {
                 forbidden_path == workspace_root && self.entry_is_builtin_default(forbidden);
             if !coincidental_default_root
                 && forbidden_path.starts_with(&workspace_root)
-                && resolved.starts_with(&forbidden_path)
+                && let Some(deny_depth) = namespace_prefix_match_depth(
+                    &forbidden_path,
+                    resolved,
+                    PathMatchNamespace::Resolved,
+                )
             {
-                return false;
+                // Read specificity (RFC 6996): `allow_read` overrides
+                // `deny_read` for a MORE SPECIFIC allowed path, inside the
+                // workspace exactly as the allow branch below applies it
+                // outside it. Without this comparison the early gate denied
+                // the whole subtree and a deeper `allow_read` entry (e.g.
+                // `.secrets/public` under `deny_read = [".secrets"]`) could
+                // never take effect for workspace reads.
+                let allow_depth = deepest_allow_depth(
+                    &workspace_root,
+                    &[&self.allowed_roots, &self.allowed_roots_read_only],
+                    resolved,
+                    PathMatchNamespace::Resolved,
+                );
+                if forbidden_overrides_allow(Some(deny_depth), allow_depth) {
+                    return false;
+                }
+                // A more-specific allow root covers the target: this entry
+                // does not deny it. Later entries still get their own check.
             }
         }
 
@@ -13279,6 +13302,55 @@ mod tests {
         assert!(
             policy.is_resolved_path_readable(Path::new("/secret/public/file.txt")),
             "paths under the allow root but outside the denied subtree stay readable"
+        );
+    }
+
+    #[test]
+    fn allow_read_more_specific_than_workspace_relative_deny_read_allows() {
+        // RFC read specificity INSIDE the workspace: a canonical
+        // `allow_read = [".secrets/public"]` must override the broader
+        // workspace-relative `deny_read = [".secrets"]`. The early
+        // workspace-denial gate used to return before ever comparing the
+        // allow depth, so the more-specific allow could never take effect
+        // for workspace reads even though direct admission honors it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".secrets/public")).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".secrets/private")).unwrap();
+
+        let mut profile = crate::schema::RiskProfileConfig::default();
+        profile.sandbox_policy.deny_read = Some(vec![".secrets".to_string()]);
+        profile.sandbox_policy.allow_read = Some(vec![".secrets/public".to_string()]);
+        let policy = SecurityPolicy::from_risk_profile(&profile, tmp.path());
+
+        assert!(
+            policy.is_resolved_path_readable(&tmp.path().join(".secrets/public/data.json")),
+            "a more-specific allow_read overrides the broader workspace-relative deny_read"
+        );
+        assert!(
+            !policy.is_resolved_path_readable(&tmp.path().join(".secrets/private/key.pem")),
+            "the denied subtree outside the more-specific allow stays denied"
+        );
+        assert!(
+            policy.is_resolved_path_readable(&tmp.path().join("readme.md")),
+            "the workspace grant outside the denied subtree is unchanged"
+        );
+    }
+
+    #[test]
+    fn is_path_allowed_default_root_tie_loses_to_explicit_allow_write() {
+        // The lexical preflight must apply the same provenance split as the
+        // resolved write decision: a BUILT-IN default forbidden root (`/tmp`)
+        // that ties an operator's explicit `allow_write = ["/tmp"]` loses.
+        // Denying the tie here made file_write reject what the resolved
+        // decision admits, so the least-privilege configuration never worked.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let mut profile = crate::schema::RiskProfileConfig::default();
+        profile.sandbox_policy.allow_write = Some(vec!["/tmp".to_string()]);
+        let policy = SecurityPolicy::from_risk_profile(&profile, workspace.path());
+
+        assert!(
+            policy.is_path_allowed("/tmp/zeroclaw-probe.txt"),
+            "an explicit allow_write root must survive the default-list tie in the lexical gate"
         );
     }
 
