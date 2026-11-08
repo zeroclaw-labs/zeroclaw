@@ -922,6 +922,17 @@ pub enum EscalationViolation {
         child_workspace: PathBuf,
         parent_workspace: PathBuf,
     },
+    /// The child's effective write grants cover its workspace while the
+    /// parent's do not. The implicit workspace grant never appears in a
+    /// write tier, so the tier-subset walks cannot see it: a parent with an
+    /// explicit `allow_write = []` (writes denied everywhere, per RFC 6996)
+    /// would otherwise accept an otherwise-identical child that merely
+    /// omits the field and regains workspace writes. Comparing EFFECTIVE
+    /// admission on both sides closes that representation gap.
+    WorkspaceWriteNotGrantedByParent {
+        child_workspace: PathBuf,
+        parent_workspace: PathBuf,
+    },
 }
 
 impl std::fmt::Display for EscalationViolation {
@@ -992,6 +1003,13 @@ impl std::fmt::Display for EscalationViolation {
             } => write!(
                 f,
                 "subagent workspace_dir {child_workspace:?} is not contained within the parent's workspace {parent_workspace:?} or any parent allowed_roots/allowed_roots_write_only entry"
+            ),
+            Self::WorkspaceWriteNotGrantedByParent {
+                child_workspace,
+                parent_workspace,
+            } => write!(
+                f,
+                "subagent workspace_dir {child_workspace:?} is writable by the child but denied by the parent's effective policy (parent workspace {parent_workspace:?}); an omitted allow_write cannot restore the implicit workspace grant a parent's explicit allow_write removed"
             ),
         }
     }
@@ -6364,9 +6382,10 @@ impl SecurityPolicy {
             });
         }
 
-        // Workspace containment: the child's workspace root is an implicit
-        // write grant (`is_resolved_path_allowed` always admits paths under
-        // `workspace_dir`), so a child cannot simply repoint `workspace_dir`
+        // Workspace containment: the child's workspace root is normally an
+        // implicit write grant (`is_resolved_path_allowed` admits paths under
+        // `workspace_dir` unless an explicit `allow_write` removed that
+        // grant), so a child cannot simply repoint `workspace_dir`
         // outside everywhere the parent could already write. Contained means
         // under the parent's own workspace, or under a parent
         // `allowed_roots`/`allowed_roots_write_only` entry.
@@ -6381,6 +6400,25 @@ impl SecurityPolicy {
                 .any(|p| path_contains(p, &self.workspace_dir));
         if !child_workspace_contained {
             return Err(EscalationViolation::WorkspaceEscalation {
+                child_workspace: self.workspace_dir.clone(),
+                parent_workspace: parent.workspace_dir.clone(),
+            });
+        }
+
+        // Effective write admission over the child's workspace (RFC 6996):
+        // the implicit workspace grant never appears in a write tier, so the
+        // tier-subset walks below cannot see it. A parent with an explicit
+        // `allow_write = []` denies writes everywhere, yet an
+        // otherwise-equivalent child that merely omits the field regains the
+        // implicit workspace grant with empty tier lists — containment above
+        // passes, every walk no-ops, and the child would write where the
+        // parent cannot. Comparing effective admission on both sides closes
+        // the representation gap; explicit grants are already covered by the
+        // `parent_grants_rw` fallbacks in the tier walks.
+        if self.is_resolved_path_allowed(&self.workspace_dir)
+            && !parent.is_resolved_path_allowed(&self.workspace_dir)
+        {
+            return Err(EscalationViolation::WorkspaceWriteNotGrantedByParent {
                 child_workspace: self.workspace_dir.clone(),
                 parent_workspace: parent.workspace_dir.clone(),
             });
@@ -12560,6 +12598,64 @@ mod tests {
         assert!(
             child.ensure_no_escalation_beyond(&parent).is_ok(),
             "a child confined to its parent's own workspace is not an escalation: {:?}",
+            child.ensure_no_escalation_beyond(&parent)
+        );
+    }
+
+    #[test]
+    fn ensure_no_escalation_rejects_omitted_allow_write_under_explicit_empty_parent() {
+        // Effective-grant comparison (RFC 6996 narrowing): a parent's
+        // explicit `allow_write = []` denies writes everywhere. A child that
+        // merely omits the field regains the implicit workspace grant —
+        // whether that grant is tiered (the `"."` spelling) or carried
+        // implicitly, the child would write where the parent cannot, so the
+        // containment check must refuse the override regardless of which
+        // representation the resolver materialized.
+        let workspace = Path::new("/workspace");
+        let mut parent_profile = crate::schema::RiskProfileConfig::default();
+        parent_profile.sandbox_policy.allow_write = Some(vec![]);
+        let parent = SecurityPolicy::from_risk_profile(&parent_profile, workspace);
+
+        let child_profile = crate::schema::RiskProfileConfig::default();
+        let child = SecurityPolicy::from_risk_profile(&child_profile, workspace);
+
+        assert!(
+            child.is_resolved_path_allowed(workspace),
+            "precondition: the omitted field restores the child's workspace write"
+        );
+        assert!(
+            !parent.is_resolved_path_allowed(workspace),
+            "precondition: the parent's explicit empty allow_write denies the workspace"
+        );
+        let err = child.ensure_no_escalation_beyond(&parent).expect_err(
+            "an omitted allow_write must not restore writes a parent's explicit [] removed",
+        );
+        assert!(
+            matches!(
+                err,
+                EscalationViolation::WorkspaceWriteNotGrantedByParent { .. }
+                    | EscalationViolation::WriteOnlyRootNotInParent { .. }
+            ),
+            "expected a workspace-write escalation violation, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn ensure_no_escalation_accepts_explicit_empty_child_under_explicit_empty_parent() {
+        // Both sides explicit `[]`: the child narrows exactly like the
+        // parent, writes nothing the parent denies, and must be accepted.
+        let workspace = Path::new("/workspace");
+        let mut parent_profile = crate::schema::RiskProfileConfig::default();
+        parent_profile.sandbox_policy.allow_write = Some(vec![]);
+        let parent = SecurityPolicy::from_risk_profile(&parent_profile, workspace);
+
+        let mut child_profile = crate::schema::RiskProfileConfig::default();
+        child_profile.sandbox_policy.allow_write = Some(vec![]);
+        let child = SecurityPolicy::from_risk_profile(&child_profile, workspace);
+
+        assert!(
+            child.ensure_no_escalation_beyond(&parent).is_ok(),
+            "matching explicit empty allow_write on both sides is not an escalation: {:?}",
             child.ensure_no_escalation_beyond(&parent)
         );
     }
