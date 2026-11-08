@@ -128,12 +128,18 @@ pub(crate) async fn resolve_vision_provider_with_allowed_refs(
     let vision_model_provider: Option<ResolvedVisionProvider> = if image_marker_count > 0
         && !model_provider.capabilities_for_model(dispatch_model).vision
     {
-        if current_turn_image_marker_count == 0 {
+        if current_turn_image_marker_count == 0 && vision_source.is_none() {
             // Only carried-over image markers remain (an image sent on an
             // earlier turn): nothing in THIS turn needs vision. Degrade to
             // the primary text provider with the stale markers stripped,
             // rather than pinning the whole conversation to the configured
             // vision fallback.
+            //
+            // Defer to `vision_source` when the turn is bound to a provider
+            // source (e.g. a skill-review fork): that binding answers the
+            // vision route itself and a refusal is final, so the
+            // current-turn heuristic must not bypass it. A bound turn routes
+            // vision through its source; only configuration-driven turns (no binding) get the marker-heuristic degrade.
             degrade_strip_images = true;
             None
         } else if let Some(ref vp) = multimodal_config.vision_model_provider {
