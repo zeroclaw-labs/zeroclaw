@@ -788,6 +788,36 @@ impl DashboardAuth {
             .map_err(|StoreFull| SignInRefusal::Full)
     }
 
+    /// Check a cookie at an operator mutation under the config writer. A stale
+    /// binding needs asynchronous verification outside that lock (None).
+    pub(crate) fn operator_at_write(
+        &self,
+        state: &AppState,
+        session: &SessionAuth,
+        _commit: &crate::ConfigWriteGuard,
+    ) -> Option<Result<(), (StatusCode, Json<serde_json::Value>)>> {
+        if let Some(rejection) = session.ended_now() {
+            return Some(Err(rejection.body()));
+        }
+        let offered = provider_for(&offered_providers(state), &session.alias);
+        if !self
+            .sessions
+            .sessions
+            .lock()
+            .get(&session.key)
+            .is_some_and(|stored| offered.as_ref() == Some(&stored.provider))
+        {
+            self.sessions.remove_key(&session.key);
+            return Some(Err(SessionRejection::Invalid.body()));
+        }
+        let grants = self.inbound.current_grants(&session.connection).ok()?;
+        Some(if grants.admin {
+            Ok(())
+        } else {
+            Err(operator_required())
+        })
+    }
+
     /// Check again, from a long-lived socket, the session a request admitted
     /// earlier: the same checks as for a request.
     pub(crate) async fn recheck(&self, state: &AppState, session: &SessionAuth) -> DashboardCaller {
@@ -1973,6 +2003,9 @@ mod tests {
         router: Router,
         auth: Arc<DashboardAuth>,
         state: AppState,
+        /// The config route group's bearer limits, held so a test can fill
+        /// the outbound cap and show a session is never behind it.
+        route_limits: Arc<crate::principal_gate::BearerVerificationLimits>,
     }
 
     /// The sign-in routes, the config route group and an operator route,
@@ -2037,8 +2070,10 @@ mod tests {
         };
         let auth =
             Arc::new(DashboardAuth::new(sessions, Arc::clone(&inbound)).for_generation(&state));
+        let route_auth = crate::principal_gate::ConfigRouteAuth::new(&inbound, &state.config);
+        let route_limits = Arc::clone(&route_auth.limits);
         let router = Router::new()
-            .merge(crate::config_admin_router(&inbound))
+            .merge(crate::config_admin_router(route_auth))
             .merge(crate::api_oidc::routes())
             .route(
                 "/api/operator-probe",
@@ -2059,6 +2094,7 @@ mod tests {
             router,
             auth,
             state,
+            route_limits,
         }
     }
 
@@ -2339,6 +2375,102 @@ mod tests {
     // ── The flow ─────────────────────────────────────────────────────
 
     #[tokio::test]
+    async fn enrollment_and_dashboard_callbacks_preserve_each_others_cookies() {
+        let server = idp(&["ops"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let dashboard = start(&fixture, "/auth/sign-in/corp?return=/chat").await;
+        let response = send(
+            &fixture.router,
+            request("GET", "/oidc/login/corp", loopback(), &[]),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        let enrollment_state = query_param(
+            response.headers()[header::LOCATION].to_str().unwrap(),
+            "state",
+        );
+        let enrollment_cookie = set_cookies(&response)
+            .into_iter()
+            .find(|cookie| cookie.starts_with("zc_oidc_"))
+            .expect("enrollment binding cookie")
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let enrollment_name = enrollment_cookie.split_once('=').unwrap().0;
+        let cookies = format!(
+            "{enrollment_cookie}; {}={}",
+            dashboard.binding_name, dashboard.binding
+        );
+
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "synthetic-enrollment-token",
+                "token_type": "Bearer",
+                "expires_in": 600,
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        let response = send(
+            &fixture.router,
+            request(
+                "GET",
+                &format!("/oidc/callback?state={enrollment_state}&code=enrollment"),
+                loopback(),
+                &[("cookie", &cookies)],
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let cleared = set_cookies(&response);
+        assert_eq!(cleared.len(), 1);
+        assert!(cleared[0].starts_with(&format!("{enrollment_name}=;")));
+        assert!(cleared[0].contains("Max-Age=0"));
+        assert!(cookie_from(&response, SESSION_COOKIE).is_none());
+
+        mount_token(&server, &dashboard.nonce, true).await;
+        let response = send(
+            &fixture.router,
+            request(
+                "GET",
+                &format!("/oidc/callback?state={}&code=dashboard", dashboard.state),
+                loopback(),
+                &[("cookie", &cookies)],
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers()[header::LOCATION], "/chat");
+        let set = set_cookies(&response);
+        assert!(set.iter().any(|cookie| {
+            cookie.starts_with(&format!("{}=;", dashboard.binding_name))
+                && cookie.contains("Max-Age=0")
+        }));
+        assert!(!set.iter().any(|cookie| cookie.starts_with(enrollment_name)));
+        let session_cookie = format!(
+            "{SESSION_COOKIE}={}",
+            cookie_from(&response, SESSION_COOKIE).expect("dashboard session cookie retained")
+        );
+        let response = send(
+            &fixture.router,
+            request(
+                "GET",
+                "/api/auth/session",
+                loopback(),
+                &[
+                    ("cookie", &session_cookie),
+                    ("sec-fetch-site", "same-origin"),
+                ],
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json(response).await["kind"], "oidc");
+    }
+
+    #[tokio::test]
     async fn an_administrator_signs_in_reaches_operator_routes_and_signs_out() {
         let server = idp(&["admins"], "gw").await;
         let fixture = fixture(sign_in_config(&server.uri()));
@@ -2412,6 +2544,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_session_is_never_behind_the_bearer_verification_cap() {
+        let server = idp(&["ops"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let signed_in = sign_in(&fixture, &server).await;
+        let cookie = signed_in.cookie_header();
+
+        // Every bearer-verification slot taken, as under a flood of junk
+        // bearers: a bearer is refused for capacity, while the session,
+        // classified by its own layer, reaches the config group untouched.
+        let _held = fixture
+            .route_limits
+            .outbound
+            .try_acquire_many(crate::principal_gate::OUTBOUND_BEARER_CAP as u32)
+            .expect("all permits free");
+        let response = send(
+            &fixture.router,
+            request(
+                "GET",
+                "/api/quickstart/state",
+                loopback(),
+                &[
+                    ("authorization", "Bearer opaque-token"),
+                    (crate::principal_gate::AUTH_PROVIDER_HEADER, "oidc.corp"),
+                ],
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let response = send(
+            &fixture.router,
+            request(
+                "GET",
+                "/api/quickstart/state",
+                loopback(),
+                &[("cookie", &cookie), ("sec-fetch-site", "same-origin")],
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn a_scoped_account_gets_config_but_not_operator_routes() {
         let server = idp(&["ops"], "gw").await;
         let fixture = fixture(sign_in_config(&server.uri()));
@@ -2451,6 +2625,61 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN, "Config:Read only");
+    }
+
+    /// The session tells the dashboard whether the account may read config,
+    /// and that answer is the config routes' own: an administrator and a
+    /// config reader get the pages, an account with other grants does not.
+    #[tokio::test]
+    async fn the_session_reports_config_access_as_the_config_routes_decide() {
+        for (groups, may_read) in [
+            (&["admins"][..], true),
+            (&["ops"][..], true),
+            (&["memory"][..], false),
+        ] {
+            let server = idp(groups, "gw").await;
+            let mut config = sign_in_config(&server.uri());
+            config
+                .oidc
+                .get_mut("corp")
+                .unwrap()
+                .profile_map
+                .insert("memory".into(), "memory-reader".into());
+            config.permission_profiles.insert(
+                "memory-reader".into(),
+                zeroclaw_config::schema::PermissionProfileConfig {
+                    grants: std::collections::HashMap::from([(
+                        zeroclaw_api::grants::Resource::Memory,
+                        vec![zeroclaw_api::grants::Verb::Read],
+                    )]),
+                    ..Default::default()
+                },
+            );
+            let fixture = fixture(config);
+            let signed_in = sign_in(&fixture, &server).await;
+            assert_eq!(
+                signed_in.session["features"]["config"], may_read,
+                "{groups:?}"
+            );
+
+            let cookie = signed_in.cookie_header();
+            let response = send(
+                &fixture.router,
+                request(
+                    "GET",
+                    "/api/quickstart/state",
+                    loopback(),
+                    &[("cookie", &cookie), ("sec-fetch-site", "same-origin")],
+                ),
+            )
+            .await;
+            let expected = if may_read {
+                StatusCode::OK
+            } else {
+                StatusCode::FORBIDDEN
+            };
+            assert_eq!(response.status(), expected, "{groups:?}");
+        }
     }
 
     #[tokio::test]
@@ -4110,6 +4339,125 @@ mod tests {
         let response = answer.await.unwrap();
         let status = response.status();
         (status, json(response).await)
+    }
+
+    async fn check_cookie_device_write_after_publication(rotate: bool) {
+        enum Change {
+            Demote,
+            Unoffer,
+            Unrelated,
+        }
+        for change in [Change::Demote, Change::Unoffer, Change::Unrelated] {
+            let server = idp(&["admins", "ops"], "gw").await;
+            let tmp = tempfile::tempdir().unwrap();
+            let mut config = sign_in_config(&server.uri());
+            config.config_path = tmp.path().join("config.toml");
+            config.data_dir = tmp.path().join("data");
+            let pairing = Arc::new(PairingGuard::new(
+                true,
+                &config.gateway.paired_tokens,
+                PairingCodePolicy::default(),
+            ));
+            let rpc = Arc::new(RpcInboundAuth::from_config(&config, Arc::clone(&pairing)).unwrap());
+            let fixture = fixture_with(
+                config.clone(),
+                Arc::clone(&pairing),
+                Arc::new(GatewayInboundAuth::from_shared(Arc::clone(&rpc))),
+                Arc::new(DashboardSessions::default()),
+            );
+            let signed = sign_in(&fixture, &server).await;
+            let registry = Arc::new(crate::api_pairing::DeviceRegistry::new(tmp.path()));
+            registry
+                .reconcile_from_token_hashes(&pairing.tokens())
+                .unwrap();
+            let device = registry.list().unwrap().pop().unwrap();
+            let state = AppState {
+                device_registry: Some(Arc::clone(&registry)),
+                ..fixture.state.clone()
+            };
+            let router = Router::new()
+                .route(
+                    "/api/devices/{id}",
+                    axum::routing::delete(crate::api_pairing::revoke_device),
+                )
+                .route(
+                    "/api/devices/{id}/token/rotate",
+                    axum::routing::post(crate::api_pairing::rotate_token),
+                )
+                .with_state(state.clone())
+                .layer(axum::middleware::from_fn_with_state(
+                    DashboardLayer {
+                        state: state.clone(),
+                        auth: Arc::clone(&fixture.auth),
+                    },
+                    layer,
+                ));
+            let (method, path) = if rotate {
+                ("POST", format!("/api/devices/{}/token/rotate", device.id))
+            } else {
+                ("DELETE", format!("/api/devices/{}", device.id))
+            };
+            let req = request(
+                method,
+                &path,
+                loopback(),
+                &[
+                    ("origin", OWN_ORIGIN),
+                    ("cookie", &signed.cookie_header()),
+                    ("x-zeroclaw-csrf", &signed.csrf),
+                ],
+            );
+            // Admission uses the just-verified admin session. Its first wait is the
+            // commit we hold. Publish a new policy before letting the route write.
+            let commit = state.begin_config_commit().await.unwrap();
+            let mut response = Box::pin(send(&router, req));
+            assert!(futures_util::poll!(&mut response).is_pending());
+            let mut next = config.clone();
+            match change {
+                Change::Demote => next = test_support::without_admin_mapping(&next),
+                Change::Unoffer => next.gateway.dashboard_sign_in.oidc.clear(),
+                Change::Unrelated => {
+                    next.permission_profiles
+                        .insert("unrelated".into(), Default::default());
+                }
+            }
+            commit
+                .publish(commit.next_revision().unwrap(), next.clone())
+                .unwrap();
+            rpc.publish_accepted(&next, rpc.accepted_revision() + 1)
+                .unwrap();
+            drop(commit);
+            let response = response.await;
+            let status = response.status();
+            let body = json(response).await;
+            if !matches!(change, Change::Unrelated) {
+                let (expected, reason) = match change {
+                    Change::Demote => (StatusCode::FORBIDDEN, "operator_required"),
+                    Change::Unoffer => (StatusCode::UNAUTHORIZED, "session_invalid"),
+                    Change::Unrelated => unreachable!(),
+                };
+                assert_eq!(status, expected, "{body}");
+                assert_eq!(body["reason"], reason);
+                assert_eq!(registry.list().unwrap()[0].id, device.id);
+                assert!(pairing.is_authenticated("zc_paired"));
+                assert!(pairing.pairing_code().is_none());
+            } else {
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert!(registry.list().unwrap().is_empty());
+                assert!(!pairing.is_authenticated("zc_paired"));
+                assert_eq!(body["pairing_code"].is_string(), rotate);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn device_delete_rechecks_cookie_operator_after_the_writer_wait() {
+        check_cookie_device_write_after_publication(false).await;
+    }
+
+    #[tokio::test]
+    async fn device_rotate_rechecks_cookie_operator_after_the_writer_wait() {
+        check_cookie_device_write_after_publication(true).await;
     }
 
     /// A config write admitted while its session was live, whose body was

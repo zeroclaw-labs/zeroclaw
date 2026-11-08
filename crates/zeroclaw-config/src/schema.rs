@@ -7,7 +7,10 @@ pub mod v2;
 use crate::autonomy::AutonomyLevel;
 use crate::autonomy::DelegationPolicy;
 use crate::domain_matcher::DomainMatcher;
-use crate::pairing::{PAIRING_CODE_MAX_LENGTH, PAIRING_CODE_MIN_LENGTH, PairingCodePolicy};
+use crate::pairing::{
+    PAIR_ATTEMPTS_RANGE, PAIR_LOCKOUT_SECS_RANGE, PAIRING_CODE_MAX_LENGTH, PAIRING_CODE_MIN_LENGTH,
+    PAIRING_CODE_TTL_MAX_SECS, PAIRING_CODE_TTL_MIN_SECS, PairingCodePolicy,
+};
 use crate::scattered_types::OutboundSmtp;
 use crate::traits::{ApplicationCapability, ChannelConfig, HasPropKind, PropKind};
 use crate::validation_bail;
@@ -889,11 +892,24 @@ impl WireApi {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ToolResultImagePolicy {
-    /// Send declared tool-result images as structured `image_url` parts.
-    #[default]
+    /// Send declared tool-result images as structured `image_url` parts, kept
+    /// inside the `role = "tool"` message. Several OpenAI-compatible endpoints
+    /// reject image parts in a tool result (HTTP 400), so this is opt-in.
     ImageUrl,
     /// Drop declared tool-result images and leave a fixed notice for the model.
     Omit,
+    /// Keep declared tool-result images but move each `image_url` part out of
+    /// the `role = "tool"` message into a following `role = "user"` message
+    /// (merged into an adjacent user message when present). Endpoints that
+    /// reject image parts in a tool result accept them in a user message, so
+    /// this delivers the image to the model without the tool-result 400 and
+    /// without discarding it the way `omit` does. The default, verified against
+    /// opencode zen (mimo-v2.5) and llama.cpp. Relocation does place a user
+    /// message directly after a tool message; if a backend's chat template
+    /// rejects that order, set `image_url` to keep the image in the tool
+    /// message, or `omit` to drop it.
+    #[default]
+    Relocate,
 }
 
 fn is_default_tool_result_image_policy(value: &ToolResultImagePolicy) -> bool {
@@ -1159,9 +1175,12 @@ pub struct ModelProviderConfig {
     pub vision: Option<bool>,
     /// How native compatible chat-completions providers handle images a
     /// role=`tool` result declared in its `attachments` array. `image_url`
-    /// sends them as structured image parts; `omit` drops them and appends a
-    /// fixed notice, keeping the result text verbatim. Legacy tool results
-    /// (no array key) pass verbatim under both settings: they declare
+    /// preserves them as structured image parts inside the tool message;
+    /// `omit` removes their payloads and appends a fixed notice, keeping the
+    /// result text verbatim; `relocate` preserves the image but moves it into
+    /// a following user message, so endpoints that reject images in a tool
+    /// result still receive the image without discarding it. Legacy tool
+    /// results (no array key) pass verbatim under all settings: they declare
     /// nothing and their bodies are text, so literal marker syntax in a
     /// tool's output never drives this policy. This does not affect direct
     /// user image content or OpenAI Responses providers.
@@ -7959,7 +7978,8 @@ pub struct GatewayConfig {
     #[nested]
     pub pairing_code: PairingCodePolicy,
 
-    /// Pairing dashboard configuration
+    /// Pairing-code lifetime and brute-force limits for the gateway's
+    /// pairing and enrollment codes (`[gateway.pairing_dashboard]`).
     #[serde(default)]
     #[nested]
     pub pairing_dashboard: PairingDashboardConfig,
@@ -8098,7 +8118,19 @@ impl Default for GatewayConfig {
     }
 }
 
-/// Pairing dashboard configuration (`[gateway.pairing_dashboard]`).
+/// Pairing-code lifetime and brute-force limits for the gateway
+/// (`[gateway.pairing_dashboard]`).
+///
+/// They govern the gateway's own pairing guard: its pairing code (`/pair`,
+/// the dashboard pairing flow, `zeroclaw gateway get-paircode`) and the
+/// daemon's certificate-enrollment code. The gateway reads them from live
+/// config on every code check and failed attempt, so an edit applies without
+/// a restart. Channel pairing (Telegram, LINE, WeChat) keeps its own fixed
+/// limits.
+///
+/// The gateway holds one pending pairing code at a time, and issuing a new one
+/// cancels the previous code, so there is no setting for how many codes may be
+/// pending.
 ///
 /// Code length and character family are **not** configured here. The
 /// dashboard pairing flow issues its codes through the same
@@ -8110,38 +8142,36 @@ impl Default for GatewayConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "gateway.pairing_dashboard"]
 pub struct PairingDashboardConfig {
-    /// Time-to-live for pending pairing codes in seconds (default: 3600)
+    /// Seconds a pairing code stays redeemable after it is issued: 30 to 600,
+    /// default 600 (10 minutes). 600 is also the cap: a saved value above it
+    /// is lowered to 600 when the config loads, with a notice, so no code
+    /// lives longer than 10 minutes.
     #[serde(default = "default_pairing_ttl")]
     pub code_ttl_secs: u64,
-    /// Maximum concurrent pending pairing codes (default: 3)
-    #[serde(default = "default_max_pending_codes")]
-    pub max_pending_codes: usize,
-    /// Maximum failed pairing attempts before lockout (default: 5)
+    /// Wrong codes one client may try before it is locked out: 1 to 100,
+    /// default 5.
     #[serde(default = "default_max_failed_attempts")]
     pub max_failed_attempts: u32,
-    /// Lockout duration in seconds after max attempts (default: 300)
+    /// Seconds a client stays locked out after too many wrong codes: 1 to
+    /// 86400 (one day), default 300. A change applies to the next lockout.
     #[serde(default = "default_pairing_lockout_secs")]
     pub lockout_secs: u64,
 }
 
 fn default_pairing_ttl() -> u64 {
-    3600
-}
-fn default_max_pending_codes() -> usize {
-    3
+    PAIRING_CODE_TTL_MAX_SECS
 }
 fn default_max_failed_attempts() -> u32 {
-    5
+    crate::pairing::MAX_PAIR_ATTEMPTS
 }
 fn default_pairing_lockout_secs() -> u64 {
-    300
+    crate::pairing::PAIR_LOCKOUT_SECS
 }
 
 impl Default for PairingDashboardConfig {
     fn default() -> Self {
         Self {
             code_ttl_secs: default_pairing_ttl(),
-            max_pending_codes: default_max_pending_codes(),
             max_failed_attempts: default_max_failed_attempts(),
             lockout_secs: default_pairing_lockout_secs(),
         }
@@ -8363,6 +8393,20 @@ pub struct WssConfig {
     /// it on slow links rather than disabling the bound.
     #[serde(default = "default_wss_incomplete_message_timeout_secs")]
     pub incomplete_message_timeout_secs: u64,
+    /// How long, in seconds, a remote client's sessions stay open after its
+    /// last connection ends (default: 1800). Past that, the daemon closes each
+    /// of them that has been idle as long, has no turn running and has no
+    /// approval pending, which frees its place among the daemon's live
+    /// sessions. The transcript is kept, and never written by this: a chat
+    /// session whose store doesn't already hold all of its history stays
+    /// open. A client
+    /// that reconnects with its identity in time keeps its sessions; one that
+    /// returns later can't reach the closed sessions over WSS. Sessions of local clients (the
+    /// RPC socket) are not affected. `0` keeps orphaned sessions open until
+    /// the daemon restarts. Read on every check, so a change applies without
+    /// a restart.
+    #[serde(default = "default_wss_orphaned_session_timeout_secs")]
+    pub orphaned_session_timeout_secs: u64,
 }
 
 impl Default for WssConfig {
@@ -8380,6 +8424,7 @@ impl Default for WssConfig {
             max_sessions: default_wss_max_sessions(),
             max_sessions_per_client: default_wss_max_sessions_per_client(),
             incomplete_message_timeout_secs: default_wss_incomplete_message_timeout_secs(),
+            orphaned_session_timeout_secs: default_wss_orphaned_session_timeout_secs(),
         }
     }
 }
@@ -8494,6 +8539,10 @@ fn default_wss_max_sessions_per_client() -> usize {
 
 fn default_wss_incomplete_message_timeout_secs() -> u64 {
     60
+}
+
+fn default_wss_orphaned_session_timeout_secs() -> u64 {
+    30 * 60
 }
 
 /// Local IPC endpoint limits (`[rpc]`).
@@ -19012,10 +19061,19 @@ pub struct FilesystemConfig {
     #[serde(default = "default_filesystem_max_content_bytes")]
     pub max_content_bytes: Option<usize>,
     /// Watch broad system roots (`/`, `/home`, `/etc`, `/var`, `/proc`,
-    /// `/sys`, `/dev`, `/tmp`) despite the deny-broad-roots default. The
-    /// pseudo-filesystems `/proc` and `/sys` would surface kernel object
-    /// paths in SOP payloads and flood the watcher with events. Off unless
-    /// explicitly enabled.
+    /// `/sys`, `/dev`, `/tmp`) despite the deny-broad-roots default. On macOS
+    /// this also covers `/Users` and each folder in it (its home directories
+    /// and `Shared`), `/Volumes` and each mounted volume in it, `/private`,
+    /// and `/private/etc`, `/private/tmp`, and `/private/var`. On Windows this
+    /// also covers every drive, volume, and network share root, any device
+    /// path that names something else, and, beneath a drive root, `Windows`,
+    /// `Windows\Temp`, `Users`, each profile in `Users`, `Program Files`,
+    /// `Program Files (x86)`, and `ProgramData`. A path is refused when it
+    /// names one of these as written, resolves to one on disk, or cannot be
+    /// resolved. A home directory elsewhere, such as root's `/var/root` on
+    /// macOS, is not recognized. The pseudo-filesystems `/proc` and `/sys`
+    /// would surface kernel object paths in SOP payloads and flood the
+    /// watcher with events. Off unless explicitly enabled.
     #[tab(Advanced)]
     #[serde(default)]
     pub allow_broad_roots: bool,
@@ -19049,16 +19107,194 @@ const FILESYSTEM_BROAD_ROOTS: [&str; 8] = [
     "/", "/home", "/etc", "/var", "/proc", "/sys", "/dev", "/tmp",
 ];
 
+/// macOS broad roots, refused along with the Unix roots and compared
+/// case-insensitively. `*` matches any one name, so `/Users/*` covers each
+/// home directory in `/Users` and `/Volumes/*` every mounted volume,
+/// including the startup disk's entry, which links to `/`. `/etc`, `/tmp`,
+/// and `/var` link to the directories in `/private`.
+const FILESYSTEM_MACOS_BROAD_ROOTS: [&str; 8] = [
+    "/Users",
+    "/Users/*",
+    "/Volumes",
+    "/Volumes/*",
+    "/private",
+    "/private/etc",
+    "/private/tmp",
+    "/private/var",
+];
+
+/// Windows broad roots, written relative to a drive or volume root and
+/// compared case-insensitively. The empty entry is the root itself, and `*`
+/// matches any one name, so `Users\*` covers every user profile root.
+const FILESYSTEM_WINDOWS_BROAD_ROOTS: [&str; 8] = [
+    "",
+    "Windows",
+    r"Windows\Temp",
+    "Users",
+    r"Users\*",
+    "Program Files",
+    "Program Files (x86)",
+    "ProgramData",
+];
+
+/// Whether the filesystem listener refuses to watch `path` unless
+/// `allow_broad_roots` is set. The Unix roots are checked on every platform
+/// exactly as they always were; macOS and Windows refuse their own roots as
+/// well.
+fn is_filesystem_broad_root(path: &str) -> bool {
+    let trimmed = path.trim_end_matches('/');
+    let normalized = if trimmed.is_empty() { "/" } else { trimmed };
+    FILESYSTEM_BROAD_ROOTS.contains(&normalized)
+        || (cfg!(target_os = "macos") && is_macos_filesystem_broad_root(path))
+        || (cfg!(windows) && is_windows_filesystem_broad_root(path))
+}
+
+/// Whether `path` names a Unix or macOS broad root, read the way a default
+/// macOS volume resolves it: repeated and trailing `/` are ignored and names
+/// compare case-insensitively, so `/TMP` and `//Users` match. Only an
+/// absolute path can match. The match is lexical, like the Unix check: `.`
+/// and `..` segments and links are not resolved. It is plain string logic, so
+/// tests on every platform cover it.
+fn is_macos_filesystem_broad_root(path: &str) -> bool {
+    if !path.starts_with('/') {
+        return false;
+    }
+    let names: Vec<&str> = macos_path_names(path).collect();
+    FILESYSTEM_BROAD_ROOTS
+        .iter()
+        .chain(&FILESYSTEM_MACOS_BROAD_ROOTS)
+        .any(|root| broad_root_names_match(macos_path_names(root), &names))
+}
+
+/// The non-empty names of a slash-separated macOS path.
+fn macos_path_names(path: &str) -> impl Iterator<Item = &str> {
+    path.split('/').filter(|name| !name.is_empty())
+}
+
+/// Whether `path` names a Windows broad root, read the way Windows resolves
+/// it. `/` and `\` both separate names, repeated and trailing separators are
+/// ignored, and names compare case-insensitively. Unless the path starts
+/// with `\\?\`, which turns Windows path normalization off, `.` and `..`
+/// segments resolve and trailing dots and spaces are trimmed, as Windows
+/// does. A `\\?\` or `\\.\` device prefix resolves to the drive, `Volume{…}`
+/// GUID, or `UNC` share it names; any other device name, such as
+/// `GLOBALROOT`, counts as a broad root because the check cannot tell what it
+/// opens. A drive-relative spelling (`C:`, `C:Windows`) is read from the
+/// drive's root, since the check cannot know that drive's current folder.
+/// The current drive's root (`\`) and a network share root (`\\server\share`)
+/// count as roots. This reads the path as written; the listener also checks
+/// where the path resolves on disk with
+/// [`FilesystemConfig::validate_resolved_path`]. It is plain string logic, so
+/// tests on every platform cover it.
+fn is_windows_filesystem_broad_root(path: &str) -> bool {
+    // Windows normalizes every path that does not start exactly with `\\?\`.
+    let normalize = !path.starts_with(r"\\?\");
+    let path = path.replace('/', "\\");
+    if let Some(device_path) = path.strip_prefix(r"\\?\").or(path.strip_prefix(r"\\.\")) {
+        let mut names = windows_path_names(device_path);
+        return match names.next() {
+            None => true,
+            Some(link) if link.eq_ignore_ascii_case("UNC") => {
+                is_windows_share_root(names, normalize)
+            }
+            Some(volume) if is_windows_volume_name(volume) => {
+                matches_windows_broad_root(names, normalize)
+            }
+            // `GLOBALROOT` and other device links can open a whole volume.
+            Some(_) => true,
+        };
+    }
+    if let Some(share_path) = path.strip_prefix(r"\\") {
+        return is_windows_share_root(windows_path_names(share_path), normalize);
+    }
+    let mut chars = path.chars();
+    if let (Some(letter), Some(':')) = (chars.next(), chars.next())
+        && letter.is_ascii_alphabetic()
+    {
+        return matches_windows_broad_root(windows_path_names(chars.as_str()), normalize);
+    }
+    // A leading `\` starts at the current drive's root; other paths are relative.
+    path.starts_with('\\') && matches_windows_broad_root(windows_path_names(&path), normalize)
+}
+
+/// Whether `name`, the first name after a device prefix, is a drive (`C:`) or
+/// a volume GUID (`Volume{…}`).
+fn is_windows_volume_name(name: &str) -> bool {
+    let is_drive =
+        name.len() == 2 && name.as_bytes()[0].is_ascii_alphabetic() && name.ends_with(':');
+    let is_volume_guid = name.ends_with('}')
+        && name
+            .get(..7)
+            .is_some_and(|start| start.eq_ignore_ascii_case("Volume{"));
+    is_drive || is_volume_guid
+}
+
+/// Whether a share path's `names`, starting at the server name, stop at the
+/// share's root. The server and share names together form that root, which
+/// `..` cannot climb above, and an incomplete `\\server` counts as one.
+fn is_windows_share_root<'a>(names: impl Iterator<Item = &'a str>, normalize: bool) -> bool {
+    windows_names_below_root(names.skip(2), normalize).is_empty()
+}
+
+/// Whether `names`, read down from a drive or volume root, match an entry of
+/// [`FILESYSTEM_WINDOWS_BROAD_ROOTS`].
+fn matches_windows_broad_root<'a>(names: impl Iterator<Item = &'a str>, normalize: bool) -> bool {
+    let names = windows_names_below_root(names, normalize);
+    FILESYSTEM_WINDOWS_BROAD_ROOTS
+        .iter()
+        .any(|root| broad_root_names_match(windows_path_names(root), &names))
+}
+
+/// `names` below a root as Windows resolves them when `normalize` is set: `.`
+/// drops out, `..` drops the name before it but never climbs above the root,
+/// and trailing dots and spaces are trimmed. Windows trims them from fewer
+/// names than this does, so the extra trimming can only refuse more.
+fn windows_names_below_root<'a>(
+    names: impl Iterator<Item = &'a str>,
+    normalize: bool,
+) -> Vec<&'a str> {
+    let mut resolved = Vec::new();
+    for name in names {
+        if !normalize {
+            resolved.push(name);
+        } else if name == ".." {
+            resolved.pop();
+        } else {
+            let trimmed = name.trim_end_matches(['.', ' ']);
+            if !trimmed.is_empty() {
+                resolved.push(trimmed);
+            }
+        }
+    }
+    resolved
+}
+
+/// The non-empty names of a backslash-separated Windows path.
+fn windows_path_names(path: &str) -> impl Iterator<Item = &str> {
+    path.split('\\').filter(|name| !name.is_empty())
+}
+
+/// Whether `names` match a broad root's `root_names` one for one, ignoring
+/// ASCII case, where a `*` root name matches any one name.
+fn broad_root_names_match<'a>(root_names: impl Iterator<Item = &'a str>, names: &[&str]) -> bool {
+    let root_names: Vec<&str> = root_names.collect();
+    root_names.len() == names.len()
+        && root_names
+            .iter()
+            .zip(names)
+            .all(|(root_name, name)| *root_name == "*" || root_name.eq_ignore_ascii_case(name))
+}
+
 impl FilesystemConfig {
-    /// Validate the filesystem listener configuration.
+    /// Validate the filesystem listener configuration. This reads each path
+    /// as written; [`Self::validate_resolved_path`] also checks where a path
+    /// resolves on disk.
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.paths.is_empty() {
             anyhow::bail!("at least one path must be configured");
         }
         for path in &self.paths {
-            let trimmed = path.trim_end_matches('/');
-            let normalized = if trimmed.is_empty() { "/" } else { trimmed };
-            if !self.allow_broad_roots && FILESYSTEM_BROAD_ROOTS.contains(&normalized) {
+            if !self.allow_broad_roots && is_filesystem_broad_root(path) {
                 anyhow::bail!(
                     "path '{path}' is a broad system root; set allow_broad_roots = true to watch it"
                 );
@@ -19073,6 +19309,29 @@ impl FilesystemConfig {
                     "event '{kind}' is invalid; expected created, modified, deleted, or renamed"
                 );
             }
+        }
+        Ok(())
+    }
+
+    /// Refuse `path` when it resolves on disk to a broad root, so `..`
+    /// segments, symlinks, junctions, substituted drives, and short names
+    /// cannot reach one without `allow_broad_roots`. A path that cannot be
+    /// resolved, such as one that does not exist, is refused too. The
+    /// listener calls this before it watches a path, and it keeps watching
+    /// the path as written.
+    pub fn validate_resolved_path(&self, path: &str) -> anyhow::Result<()> {
+        if self.allow_broad_roots {
+            return Ok(());
+        }
+        let resolved = match std::fs::canonicalize(path) {
+            Ok(resolved) => resolved,
+            Err(err) => anyhow::bail!("path '{path}' cannot be resolved: {err}"),
+        };
+        if is_filesystem_broad_root(&resolved.to_string_lossy()) {
+            anyhow::bail!(
+                "path '{path}' resolves to broad system root '{}'; set allow_broad_roots = true to watch it",
+                resolved.display()
+            );
         }
         Ok(())
     }
@@ -24300,6 +24559,39 @@ impl Config {
             );
         }
 
+        // Pairing limits. A saved code lifetime above the cap was already
+        // lowered on load (`migration::CAPPED_KEYS`), so a value out of range
+        // here was set explicitly, and is refused rather than changed. Startup
+        // only warns about it, so the guard also holds what it reads to these
+        // ranges (`PairingLimits::within_bounds`).
+        let dashboard = &self.gateway.pairing_dashboard;
+        for (path, value, range) in [
+            (
+                "gateway.pairing_dashboard.code_ttl_secs",
+                dashboard.code_ttl_secs,
+                PAIRING_CODE_TTL_MIN_SECS..=PAIRING_CODE_TTL_MAX_SECS,
+            ),
+            (
+                "gateway.pairing_dashboard.max_failed_attempts",
+                u64::from(dashboard.max_failed_attempts),
+                u64::from(*PAIR_ATTEMPTS_RANGE.start())..=u64::from(*PAIR_ATTEMPTS_RANGE.end()),
+            ),
+            (
+                "gateway.pairing_dashboard.lockout_secs",
+                dashboard.lockout_secs,
+                PAIR_LOCKOUT_SECS_RANGE,
+            ),
+        ] {
+            if !range.contains(&value) {
+                let (min, max) = (range.start(), range.end());
+                validation_bail!(
+                    InvalidNumericRange,
+                    path,
+                    "{path} = {value} is out of range; must be {min}..={max}"
+                );
+            }
+        }
+
         // Tunnel — OpenVPN
         if self.tunnel.tunnel_provider.trim() == "openvpn" {
             let openvpn = self.tunnel.openvpn.as_ref().ok_or_else(|| {
@@ -26540,7 +26832,12 @@ impl Config {
             // drop a retired key anyway, since the typed config has no field
             // for it, but silently: one written by another handle after this
             // config loaded would leave without the notice it is owed.
-            let retired = crate::migration::apply_retired_keys_to_doc(doc.as_table_mut());
+            let mut retired = crate::migration::apply_retired_keys_to_doc(doc.as_table_mut());
+            // Values above a `CAPPED_KEYS` maximum are lowered the same way,
+            // with the notice the load path gives.
+            retired.extend(crate::migration::lower_capped_keys_in_doc(
+                doc.as_table_mut(),
+            ));
             // Then sync onto the spelling the snapshot is written in, keeping
             // the comments of a section spelled another way; a current file
             // still holding two live spellings of one setting is refused. An
@@ -26680,7 +26977,13 @@ impl Config {
         // the file are preserved. It runs first, as on load, so a retired
         // table under one spelling of a section does not count as a second
         // spelling of the live one.
-        let retired = crate::migration::apply_retired_keys_to_doc(doc.as_table_mut());
+        let mut retired = crate::migration::apply_retired_keys_to_doc(doc.as_table_mut());
+        // A value above a `CAPPED_KEYS` maximum is lowered for the same
+        // reason: the load path lowers it, so it is never dirty, and it would
+        // otherwise stay in the file through every incremental save.
+        retired.extend(crate::migration::lower_capped_keys_in_doc(
+            doc.as_table_mut(),
+        ));
         // A setting the file spells another way the schema accepts
         // (`channels_config` for `channels`) is renamed to the spelling the
         // dirty paths use, so an edit lands on it rather than beside it.
@@ -26838,13 +27141,14 @@ fn log_migration_saved(notices: &[crate::migration::MigrationNotice]) {
     }
 }
 
-/// Log each retired key a save removed from `config.toml`. Called only once
-/// the file is durably replaced: a failed write leaves the retired keys on
-/// disk and must not claim otherwise.
+/// Log each retired key a save removed from `config.toml`, and each capped
+/// value it lowered. Called only once the file is durably replaced: a failed
+/// write leaves them on disk and must not claim otherwise.
 fn log_retirements_saved(retired: &[crate::migration::MigrationNotice]) {
     for notice in retired {
         let path = match notice {
-            crate::migration::MigrationNotice::Removed { path, .. } => path.as_str(),
+            crate::migration::MigrationNotice::Removed { path, .. }
+            | crate::migration::MigrationNotice::Lowered { path, .. } => path.as_str(),
             crate::migration::MigrationNotice::AssumedV1
             | crate::migration::MigrationNotice::InferredV3
             | crate::migration::MigrationNotice::IgnoredEnvOverride { .. } => continue,
@@ -30871,7 +31175,10 @@ zeroclaw-operators = "operator"
 
     #[test]
     async fn filesystem_validate_rejects_broad_root_by_default() {
-        for root in ["/etc", "/proc", "/sys", "/dev", "/tmp"] {
+        // The Unix roots are refused on every platform, Windows included.
+        for root in [
+            "/", "/home", "/etc", "/var", "/proc", "/sys", "/dev", "/tmp", "//", "/etc/", "/tmp//",
+        ] {
             let cfg = FilesystemConfig {
                 enabled: true,
                 paths: vec![root.into()],
@@ -30883,6 +31190,360 @@ zeroclaw-operators = "operator"
                 "root {root} must be rejected by default"
             );
         }
+    }
+
+    /// Spellings of Windows broad roots. Each one needs `allow_broad_roots`
+    /// on Windows.
+    const WINDOWS_BROAD_ROOT_SPELLINGS: &[&str] = &[
+        // Drive roots and the current drive's root.
+        r"C:\",
+        "C:/",
+        "d:/",
+        r"C:\\",
+        r"\",
+        // Drive-relative spellings, read from the drive's root because the
+        // check cannot know that drive's current folder.
+        "C:",
+        "d:",
+        "C:Windows",
+        // System, profile, program, and machine-wide data directories on any
+        // drive or the current one, in any case, with any separators.
+        r"C:\Windows",
+        r"c:\windows\",
+        "C:/WINDOWS/",
+        r"C:\\Windows",
+        r"C:\Windows\Temp",
+        r"C:\Users",
+        r"C:\Users\tester",
+        r"c:\users\TESTER\",
+        r"C:\Users\Public",
+        r"C:\Program Files",
+        r"C:\Program Files (x86)",
+        r"C:\ProgramData",
+        r"D:\Users\tester",
+        r"\Windows",
+        "/Users/tester",
+        // Trailing dots and spaces, and `.` and `..` segments, which Windows
+        // resolves away outside `\\?\` paths.
+        r"C:\Windows.",
+        r"C:\Windows ",
+        r"C:\Users\tester.",
+        r"C:\Program Files. ",
+        r"c:\windows\temp.\",
+        r"C:\Windows\.",
+        r"C:\inbox\..",
+        r"C:\Users\tester\Inbox\..",
+        r"\\.\C:\inbox\..\Windows",
+        r"\\server\share\inbox\..",
+        // Device-path and network-share spellings.
+        r"\\?\C:\",
+        r"\\?\C:",
+        r"\\?\C:\Windows\",
+        r"\\.\C:\Users",
+        r"\\?\Volume{00000000-0000-0000-0000-000000000000}\",
+        r"\\server\share",
+        r"\\server\share\",
+        "//server/share",
+        r"\\?\UNC\server\share",
+        r"\\.\unc\server\share\",
+        // Device names other than a drive, volume, or share, which can open
+        // a whole volume, at any depth.
+        r"\\?\GLOBALROOT\Device\HarddiskVolume3\",
+        r"\\.\GLOBALROOT\Device\HarddiskVolumeShadowCopy1\inbox",
+        r"\\?\BootPartition\",
+        r"\\?\",
+    ];
+
+    /// Windows paths scoped below the broad roots. None of them needs
+    /// `allow_broad_roots`.
+    const WINDOWS_SCOPED_PATHS: &[&str] = &[
+        r"C:\Users\tester\Inbox",
+        r"C:\ProgramData\ZeroClaw\inbox",
+        r"C:\Windows\Temp\inbox",
+        r"C:\Users\Public\..\tester\Inbox.",
+        r"D:\inbox",
+        r"\inbox",
+        r"\\?\C:\Users\tester\Inbox",
+        r"\\server\share\inbox",
+        r"\\?\UNC\server\share\inbox",
+        // `\\?\` turns Windows path normalization off, so this names a folder
+        // called `Windows.` rather than `C:\Windows`.
+        r"\\?\C:\Windows.",
+        "inbox",
+    ];
+
+    #[test]
+    async fn filesystem_windows_broad_root_matcher_classifies_spellings() {
+        // `validate` consults this matcher only on Windows; checking it
+        // directly keeps the Windows rules covered on every platform.
+        for root in WINDOWS_BROAD_ROOT_SPELLINGS.iter().copied() {
+            assert!(
+                is_windows_filesystem_broad_root(root),
+                "{root} must be a Windows broad root"
+            );
+        }
+        for path in WINDOWS_SCOPED_PATHS.iter().copied() {
+            assert!(
+                !is_windows_filesystem_broad_root(path),
+                "{path} must not be a Windows broad root"
+            );
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    async fn filesystem_validate_off_windows_accepts_windows_spellings() {
+        // Off Windows a backslash is an ordinary file name character, so these
+        // are ordinary paths, accepted as before.
+        for path in [
+            r"C:\",
+            "C:/",
+            r"C:\Windows",
+            r"\\?\C:\",
+            r"\\server\share",
+            "//server/share",
+            r"\etc",
+        ] {
+            let cfg = FilesystemConfig {
+                enabled: true,
+                paths: vec![path.into()],
+                ..FilesystemConfig::default()
+            };
+            assert!(
+                cfg.validate().is_ok(),
+                "path {path} must stay accepted off Windows"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    async fn filesystem_validate_rejects_windows_broad_roots_by_default() {
+        for root in WINDOWS_BROAD_ROOT_SPELLINGS.iter().copied() {
+            let mut cfg = FilesystemConfig {
+                enabled: true,
+                paths: vec![root.into()],
+                ..FilesystemConfig::default()
+            };
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("broad system root"),
+                "root {root} must be rejected by default"
+            );
+            cfg.allow_broad_roots = true;
+            assert!(
+                cfg.validate().is_ok(),
+                "root {root} must be allowed with allow_broad_roots"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    async fn filesystem_validate_accepts_scoped_windows_paths() {
+        for path in WINDOWS_SCOPED_PATHS.iter().copied() {
+            let cfg = FilesystemConfig {
+                enabled: true,
+                paths: vec![path.into()],
+                ..FilesystemConfig::default()
+            };
+            assert!(cfg.validate().is_ok(), "path {path} must be accepted");
+        }
+    }
+
+    /// Spellings of macOS broad roots that the exact Unix check accepts. Each
+    /// one needs `allow_broad_roots` on macOS.
+    const MACOS_BROAD_ROOT_SPELLINGS: &[&str] = &[
+        // Home directories in `/Users`, the shared folder, and their parent.
+        "/Users",
+        "/Users/",
+        "/Users/tester",
+        "/Users/tester/",
+        "/Users/Shared",
+        // Every mounted volume, including the startup disk's entry, which
+        // links to `/`, and their parent.
+        "/Volumes",
+        "/Volumes/Macintosh HD",
+        "/Volumes/Backup/",
+        // The directories `/etc`, `/tmp`, and `/var` link to, and their parent.
+        "/private",
+        "/private/etc",
+        "/private/tmp/",
+        "/private/var",
+        // Other cases and repeated separators, which a default macOS volume
+        // resolves to the same directories, the Unix roots included.
+        "/USERS/tester",
+        "//Users",
+        "/Private//Tmp",
+        "/TMP",
+        "/Etc/",
+        "//var",
+    ];
+
+    /// macOS paths scoped below the broad roots. None of them needs
+    /// `allow_broad_roots`.
+    const MACOS_SCOPED_PATHS: &[&str] = &[
+        "/Users/tester/Inbox",
+        "/Users/Shared/inbox",
+        "/Volumes/Backup/inbox",
+        "/private/tmp/inbox",
+        "/private/var/folders",
+        "Users",
+        "Users/tester",
+        "inbox",
+    ];
+
+    #[test]
+    async fn filesystem_macos_broad_root_matcher_classifies_spellings() {
+        // `validate` consults this matcher only on macOS; checking it
+        // directly keeps the macOS rules covered on every platform.
+        for root in MACOS_BROAD_ROOT_SPELLINGS.iter().copied() {
+            assert!(
+                is_macos_filesystem_broad_root(root),
+                "{root} must be a macOS broad root"
+            );
+        }
+        for path in MACOS_SCOPED_PATHS.iter().copied() {
+            assert!(
+                !is_macos_filesystem_broad_root(path),
+                "{path} must not be a macOS broad root"
+            );
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", windows)))]
+    #[test]
+    async fn filesystem_validate_off_macos_and_windows_accepts_macos_spellings() {
+        // Elsewhere these are ordinary paths, and the Unix roots match only
+        // exactly, so every macOS spelling stays accepted as before.
+        for path in MACOS_BROAD_ROOT_SPELLINGS.iter().copied() {
+            let cfg = FilesystemConfig {
+                enabled: true,
+                paths: vec![path.into()],
+                ..FilesystemConfig::default()
+            };
+            assert!(
+                cfg.validate().is_ok(),
+                "path {path} must stay accepted off macOS and Windows"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    async fn filesystem_validate_rejects_macos_broad_roots_by_default() {
+        for root in MACOS_BROAD_ROOT_SPELLINGS.iter().copied() {
+            let mut cfg = FilesystemConfig {
+                enabled: true,
+                paths: vec![root.into()],
+                ..FilesystemConfig::default()
+            };
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("broad system root"),
+                "root {root} must be rejected by default"
+            );
+            cfg.allow_broad_roots = true;
+            assert!(
+                cfg.validate().is_ok(),
+                "root {root} must be allowed with allow_broad_roots"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    async fn filesystem_validate_rejects_resolved_unix_roots_on_macos() {
+        // macOS links `/etc`, `/tmp`, and `/var` elsewhere, and the watcher
+        // follows a watched path's links, so the directories they resolve to
+        // must be refused like the links themselves.
+        for root in ["/etc", "/tmp", "/var"] {
+            let resolved = std::fs::canonicalize(root).expect("Unix root resolves on macOS");
+            let resolved = resolved.to_str().expect("resolved root is UTF-8");
+            assert_ne!(resolved, root, "{root} must be a link on macOS");
+            let cfg = FilesystemConfig {
+                enabled: true,
+                paths: vec![resolved.into()],
+                ..FilesystemConfig::default()
+            };
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("broad system root"),
+                "{resolved}, where {root} resolves, must be rejected by default"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    async fn filesystem_validate_accepts_scoped_macos_paths() {
+        for path in MACOS_SCOPED_PATHS.iter().copied() {
+            let cfg = FilesystemConfig {
+                enabled: true,
+                paths: vec![path.into()],
+                ..FilesystemConfig::default()
+            };
+            assert!(cfg.validate().is_ok(), "path {path} must be accepted");
+        }
+    }
+
+    #[test]
+    async fn filesystem_resolved_path_accepts_scoped_folder() {
+        let dir = TempDir::new().unwrap();
+        let cfg = FilesystemConfig::default();
+        assert!(
+            cfg.validate_resolved_path(&dir.path().to_string_lossy())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    async fn filesystem_resolved_path_refuses_unresolvable_path() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("missing").to_string_lossy().into_owned();
+        let mut cfg = FilesystemConfig::default();
+        let err = cfg.validate_resolved_path(&missing).unwrap_err();
+        assert!(err.to_string().contains("cannot be resolved"), "got: {err}");
+        // The opt-in skips resolution; the watcher reports a missing path.
+        cfg.allow_broad_roots = true;
+        assert!(cfg.validate_resolved_path(&missing).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    async fn filesystem_resolved_path_refuses_link_to_broad_root() {
+        let dir = TempDir::new().unwrap();
+        let link = dir.path().join("whole-disk");
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        let link = link.to_string_lossy().into_owned();
+        // As written the link is an ordinary path; on disk it resolves to `/`.
+        assert!(!is_filesystem_broad_root(&link));
+        let mut cfg = FilesystemConfig::default();
+        let err = cfg.validate_resolved_path(&link).unwrap_err();
+        assert!(
+            err.to_string().contains("resolves to broad system root"),
+            "got: {err}"
+        );
+        cfg.allow_broad_roots = true;
+        assert!(cfg.validate_resolved_path(&link).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    async fn filesystem_resolved_path_refuses_alias_of_drive_root() {
+        // `canonicalize` returns a `\\?\` path such as `\\?\C:\`, which the
+        // Windows matcher reads as the drive root.
+        let windows = std::env::var_os("SystemRoot")
+            .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+        let alias = windows.join("..").to_string_lossy().into_owned();
+        let mut cfg = FilesystemConfig::default();
+        let err = cfg.validate_resolved_path(&alias).unwrap_err();
+        assert!(
+            err.to_string().contains("resolves to broad system root"),
+            "got: {err}"
+        );
+        cfg.allow_broad_roots = true;
+        assert!(cfg.validate_resolved_path(&alias).is_ok());
     }
 
     #[test]
@@ -32191,6 +32852,98 @@ enabled = true
             config
                 .validate()
                 .unwrap_or_else(|e| panic!("documented bound {length} must validate: {e}"));
+        }
+    }
+
+    /// The gateway's pairing limits default to what channel pairing uses, and
+    /// each field's description states its range; the lifetime's states
+    /// the cap and what happens to a larger saved value.
+    #[test]
+    async fn pairing_dashboard_defaults_and_descriptions_state_the_limits() {
+        let defaults = PairingDashboardConfig::default();
+        assert_eq!(
+            (
+                defaults.code_ttl_secs,
+                defaults.max_failed_attempts,
+                defaults.lockout_secs
+            ),
+            (600, 5, 300)
+        );
+        assert_eq!(
+            crate::pairing::PairingLimits::from_dashboard(&defaults),
+            crate::pairing::PairingLimits::default(),
+            "the gateway's defaults are the fixed limits channel pairing keeps"
+        );
+
+        let props = Config::default().prop_fields();
+        let dashboard: Vec<_> = props
+            .iter()
+            .filter(|f| {
+                f.name
+                    .replace('-', "_")
+                    .starts_with("gateway.pairing_dashboard.")
+            })
+            .collect();
+        let description = |field: &str| {
+            dashboard
+                .iter()
+                .find(|f| f.name.replace('-', "_").ends_with(field))
+                .unwrap_or_else(|| panic!("no `{field}` property"))
+                .description
+        };
+        let ttl = description("code_ttl_secs");
+        assert!(
+            ttl.contains("30 to 600") && ttl.contains("lowered to 600"),
+            "{ttl}"
+        );
+        assert!(description("max_failed_attempts").contains("1 to 100"));
+        assert!(description("lockout_secs").contains("1 to 86400"));
+        assert!(
+            !dashboard
+                .iter()
+                .any(|f| f.name.replace('-', "_").ends_with("max_pending_codes")),
+            "the pending-code cap is retired, not settable"
+        );
+    }
+
+    /// Out-of-range pairing limits are refused at validation. The lifetime's
+    /// range starts at 30 seconds; a saved value above 600 never gets here,
+    /// because loading lowers it first.
+    #[test]
+    async fn pairing_dashboard_limits_are_validated() {
+        let validate = |edit: &dyn Fn(&mut PairingDashboardConfig)| {
+            let mut config = Config::default();
+            edit(&mut config.gateway.pairing_dashboard);
+            config.validate().map_err(|e| format!("{e:#}"))
+        };
+        validate(&|_| {}).expect("the defaults are valid");
+        for ttl in [30, 600] {
+            validate(&|d| d.code_ttl_secs = ttl).unwrap_or_else(|e| panic!("{ttl}: {e}"));
+        }
+        for attempts in [1, 100] {
+            validate(&|d| d.max_failed_attempts = attempts)
+                .unwrap_or_else(|e| panic!("{attempts}: {e}"));
+        }
+        for lockout in [1, 86_400] {
+            validate(&|d| d.lockout_secs = lockout).unwrap_or_else(|e| panic!("{lockout}: {e}"));
+        }
+        for (field, err) in [0, 29, 601, 3_600]
+            .map(|ttl| ("code_ttl_secs", validate(&|d| d.code_ttl_secs = ttl)))
+            .into_iter()
+            .chain([0, 101].map(|n| {
+                (
+                    "max_failed_attempts",
+                    validate(&|d| d.max_failed_attempts = n),
+                )
+            }))
+            .chain([0, 86_401].map(|secs| ("lockout_secs", validate(&|d| d.lockout_secs = secs))))
+        {
+            let err = err.expect_err(field);
+            assert!(
+                err.contains(&format!("gateway.pairing_dashboard.{field}"))
+                    && err.contains("out of range"),
+                "{err}"
+            );
         }
     }
 
@@ -33728,7 +34481,7 @@ auto_save = true
         let parsed: ModelProviderConfig = toml::from_str("").unwrap();
         assert_eq!(
             parsed.tool_result_image_policy,
-            ToolResultImagePolicy::ImageUrl
+            ToolResultImagePolicy::Relocate
         );
         let serialized = toml::to_string(&parsed).unwrap();
         assert!(
@@ -33741,6 +34494,15 @@ auto_save = true
         assert_eq!(parsed.tool_result_image_policy, ToolResultImagePolicy::Omit);
         let serialized = toml::to_string(&parsed).unwrap();
         assert!(serialized.contains("tool_result_image_policy = \"omit\""));
+
+        let parsed: ModelProviderConfig =
+            toml::from_str("tool_result_image_policy = \"image_url\"").unwrap();
+        assert_eq!(
+            parsed.tool_result_image_policy,
+            ToolResultImagePolicy::ImageUrl
+        );
+        let serialized = toml::to_string(&parsed).unwrap();
+        assert!(serialized.contains("tool_result_image_policy = \"image_url\""));
     }
 
     #[::core::prelude::v1::test]
@@ -46036,6 +46798,39 @@ channel = "notion"
         }
     }
 
+    /// An unrelated incremental save carries the pairing limits into
+    /// the file too: the lifetime lowered to the cap, the pending-code cap
+    /// retired, the other limits kept, and nothing left for a reload to fix.
+    #[test]
+    async fn save_dirty_applies_the_pairing_limits_to_the_file() {
+        for version in [3, crate::migration::CURRENT_SCHEMA_VERSION] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let written = save_dirty_after_unrelated_edit(
+                tmp.path(),
+                &format!(
+                    "schema_version = {version}\n\n\
+                     [gateway.pairing_dashboard]\ncode_ttl_secs = 3600\nmax_pending_codes = 3\n\
+                     lockout_secs = 120\n\n\
+                     [observability]\nbackend = \"none\"\n"
+                ),
+            )
+            .await;
+            assert!(
+                written.contains("code_ttl_secs = 600")
+                    && !written.contains("max_pending_codes")
+                    && written.contains("lockout_secs = 120"),
+                "V{version}; got:\n{written}"
+            );
+            let reloaded = crate::migration::migrate_to_current_salvaged(&written);
+            assert!(
+                reloaded.notices.is_empty(),
+                "V{version}: {:?}",
+                reloaded.notices
+            );
+            assert_eq!(reloaded.config.gateway.pairing_dashboard.lockout_secs, 120);
+        }
+    }
+
     #[test]
     async fn save_dirty_removes_retired_dashboard_code_length() {
         // An unrelated incremental save must drop the retired dashboard
@@ -46047,7 +46842,7 @@ channel = "notion"
                 tmp.path(),
                 &format!(
                     "schema_version = {version}\n\n\
-                     [gateway.pairing_dashboard]\ncode_length = 8\ncode_ttl_secs = 3600\n\n\
+                     [gateway.pairing_dashboard]\ncode_length = 8\ncode_ttl_secs = 300\n\n\
                      [gateway.pairing_code]\nlength = 20\ncharset = \"unambiguous\"\n\n\
                      [observability]\nbackend = \"none\"\n"
                 ),
@@ -46063,10 +46858,7 @@ channel = "notion"
                 "V{version}: {:?}",
                 reloaded.notices
             );
-            assert_eq!(
-                reloaded.config.gateway.pairing_dashboard.code_ttl_secs,
-                3600
-            );
+            assert_eq!(reloaded.config.gateway.pairing_dashboard.code_ttl_secs, 300);
             assert_eq!(reloaded.config.gateway.pairing_code.length, 20);
             assert_eq!(
                 reloaded.config.observability.backend,

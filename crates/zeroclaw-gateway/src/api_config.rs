@@ -3494,7 +3494,6 @@ mod tests {
             session_backend: None,
             session_queue: Arc::new(crate::session_queue::SessionActorQueue::new(8, 30, 600)),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
@@ -3693,7 +3692,11 @@ mod tests {
             )
             .unwrap(),
         );
-        let router = crate::config_admin_router(&auth).with_state(state.clone());
+        let router = crate::config_admin_router(crate::principal_gate::ConfigRouteAuth::new(
+            &auth,
+            &state.config,
+        ))
+        .with_state(state.clone());
         let read = || {
             axum::http::Request::builder()
                 .uri("/api/config/reload-status")
@@ -6335,7 +6338,11 @@ mod tests {
             )
             .unwrap(),
         );
-        let router = crate::config_admin_router(&auth).with_state(state.clone());
+        let router = crate::config_admin_router(crate::principal_gate::ConfigRouteAuth::new(
+            &auth,
+            &state.config,
+        ))
+        .with_state(state.clone());
         let response = router
             .oneshot(
                 axum::http::Request::builder()

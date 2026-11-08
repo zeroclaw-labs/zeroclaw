@@ -107,6 +107,10 @@ it is minted** - it is the only bearer credential for certificate issuance, and
 it lands in consoles and logs, so a copied code must stop working shortly after
 the operator has used it. An expired code is refused and cleared; mint a
 replacement with `zeroclaw security enroll-paircode --new`.
+`[gateway.pairing_dashboard]` can shorten the lifetime (`code_ttl_secs`, 30 to
+600 seconds) and sets how many wrong codes a client may try before it is locked
+out (`max_failed_attempts`) and for how long (`lockout_secs`). No setting makes
+a code live longer than 10 minutes.
 
 This **enrollment code** issues a certificate and nothing else: `POST /pair`
 refuses it, so a party that sees it cannot turn it into a bearer token. It is
@@ -554,7 +558,7 @@ URL does not carry the code.
 The browser can still record the link as it was first opened in its own history
 database (Chrome does, for both the `?` and `#` forms); no page can rewrite that.
 What makes that copy harmless is the code itself: it is consumed by the first
-successful enrollment and expires ten minutes after it is minted, so the stored
+successful enrollment and expires at most ten minutes after it is minted, so the stored
 link is spent or dead. Treat a link that carries an unused code like the code
 itself, and prefer enrolling promptly after minting.
 
