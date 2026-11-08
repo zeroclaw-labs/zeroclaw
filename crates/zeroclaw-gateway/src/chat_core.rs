@@ -16,6 +16,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::Json;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -24,6 +25,7 @@ use futures_util::{SinkExt as _, StreamExt as _};
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, watch};
 use zeroclaw_api::jsonrpc::error_codes::AUTH_REQUIRED;
+use zeroclaw_config::schema::AliasedAgentConfig;
 use zeroclaw_rpc_client::{ClientError, Method, Notification, RpcClient};
 use zeroclaw_rpc_proto::MAX_FRAME_BYTES;
 use zeroclaw_rpc_proto::notification::SESSION_UPDATE;
@@ -144,6 +146,11 @@ pub(crate) async fn ws_chat_through_core(
             format!("Unknown agent `{agent_alias}` — no [agents.{agent_alias}] entry configured."),
         )
             .into_response();
+    }
+    // Read live, as again before each prompt: an agent that is disabled, or
+    // lacks what a turn runs on, takes no new conversation.
+    if !is_dispatchable(&state, &agent_alias) {
+        return agent_not_dispatchable(&agent_alias);
     }
     // The socket closes once the session ends, or stops granting what was
     // just checked: the chat's session grants and its agent.
@@ -505,6 +512,21 @@ impl Chat {
         // first poll, so a session already known to be over sends no prompt.
         if let Some(code) = session_known_lost(&mut self.watch) {
             return TurnEnd::Stop(Stop::Close(code));
+        }
+        // The agent too, by the live config: one disabled since the chat
+        // opened gets no prompt, and the chat stays open for when it is
+        // enabled again.
+        let agent = self.core.agent_alias();
+        if !is_dispatchable(&self.state, agent) {
+            let error = json!({
+                "type": "error",
+                "message": not_dispatchable_message(agent),
+                "code": "AGENT_NOT_DISPATCHABLE",
+            });
+            return match refusal(sender, &error).await {
+                Some(stop) => TurnEnd::Stop(stop),
+                None => TurnEnd::Finished,
+            };
         }
         let client = self.core.bound();
         let session_id = self.core.core_id.clone();
@@ -1053,6 +1075,34 @@ fn failure_frame(failure: &CoreFailure) -> (String, &'static str) {
             "CONVERSATION_LIMIT",
         ),
     }
+}
+
+/// Whether the live config has `alias` able to take a turn: configured,
+/// enabled, and bound to what a turn runs on
+/// ([`AliasedAgentConfig::is_dispatchable`]).
+fn is_dispatchable(state: &AppState, alias: &str) -> bool {
+    state
+        .config
+        .read()
+        .agent(alias)
+        .is_some_and(AliasedAgentConfig::is_dispatchable)
+}
+
+fn not_dispatchable_message(alias: &str) -> String {
+    format!("Agent `{alias}` is not enabled for dispatch")
+}
+
+/// 409 for a chat with an agent the account may use but that can't take a
+/// turn now: it is disabled, or lacks what a turn runs on.
+fn agent_not_dispatchable(alias: &str) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": not_dispatchable_message(alias),
+            "reason": "agent_not_dispatchable",
+        })),
+    )
+        .into_response()
 }
 
 /// Report a failure before a turn ran: the socket closes when the session

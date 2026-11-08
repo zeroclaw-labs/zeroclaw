@@ -760,6 +760,11 @@ impl CoreChat {
         self.cwd.as_deref()
     }
 
+    /// The agent the conversation was created with.
+    pub(crate) fn agent_alias(&self) -> &str {
+        &self.agent_alias
+    }
+
     /// The connection the conversation's turns run on.
     pub(crate) fn bound(&self) -> Arc<RpcClient> {
         Arc::clone(&self.bound)
@@ -1770,7 +1775,7 @@ mod tests {
     use zeroclaw_config::pairing::{PairingCodePolicy, PairingGuard};
     use zeroclaw_config::schema::{
         AliasedAgentConfig, Config, OidcConfig, OidcValidation, PermissionProfileConfig,
-        RiskProfileConfig, WireApi,
+        RiskProfileConfig, RuntimeProfileConfig, WireApi,
     };
     use zeroclaw_infra::session_backend::SessionBackend as _;
     use zeroclaw_rpc_proto::MAX_FRAME_BYTES;
@@ -2000,6 +2005,7 @@ mod tests {
                     enabled: true,
                     model_provider: "openai.test-provider".into(),
                     risk_profile: "test-profile".into(),
+                    runtime_profile: "test-runtime".into(),
                     ..Default::default()
                 },
             );
@@ -2008,6 +2014,25 @@ mod tests {
             .risk_profiles
             .insert("test-profile".into(), RiskProfileConfig::default());
         config
+            .runtime_profiles
+            .insert("test-runtime".into(), RuntimeProfileConfig::default());
+        config
+    }
+
+    /// Adds `dormant`, configured as `support` is but disabled, and grants it
+    /// to chat users when `granted`.
+    fn with_dormant(config: &mut Config, granted: bool) {
+        let mut dormant = config.agents["support"].clone();
+        dormant.enabled = false;
+        config.agents.insert("dormant".into(), dormant);
+        if granted {
+            config
+                .permission_profiles
+                .get_mut("chat-user")
+                .expect("the fixture's profile")
+                .allowed_agents
+                .push("dormant".into());
+        }
     }
 
     /// One daemon generation's core: a context on `config` with durable
@@ -2268,6 +2293,20 @@ mod tests {
             self.rpc_auth
                 .publish_accepted(&narrowed, self.rpc_auth.accepted_revision() + 1)
                 .expect("the narrowed policy is accepted");
+        }
+
+        /// Publish the live config with `alias` enabled or disabled, to the
+        /// gateway only, as [`Self::revoke_group`] does with policy: the core
+        /// keeps its own config here and would still run the agent, so only
+        /// the gateway's own checks can refuse it.
+        fn set_agent_enabled(&self, alias: &str, enabled: bool) {
+            self.state.publish_test_config(|config| {
+                config
+                    .agents
+                    .get_mut(alias)
+                    .expect("a configured agent")
+                    .enabled = enabled;
+            });
         }
 
         /// Wait until the core holds no live conversation at all.
@@ -2866,6 +2905,147 @@ mod tests {
         let body: Value =
             serde_json::from_slice(response.body().as_deref().unwrap_or_default()).unwrap();
         assert_eq!(body["reason"], "agent_not_allowed", "{body}");
+    }
+
+    /// The HTTP answer to a chat upgrade the gateway refused.
+    async fn refused_open(addr: SocketAddr, cookie: &str, agent: &str) -> (StatusCode, Value) {
+        let Err(tokio_tungstenite::tungstenite::Error::Http(response)) =
+            open_chat(addr, cookie, agent, "refused").await
+        else {
+            panic!("the chat with `{agent}` must be refused before the upgrade");
+        };
+        let body = serde_json::from_slice(response.body().as_deref().unwrap_or_default())
+            .unwrap_or(Value::Null);
+        (response.status(), body)
+    }
+
+    #[tokio::test]
+    async fn a_disabled_agent_is_refused_before_a_conversation_is_created() {
+        let fixture = Fixture::with_config(|config| with_dormant(config, true)).await;
+        let addr = serve(fixture.router()).await;
+        let (alice, _) = fixture.sign_in("alice").await;
+        let created = fixture.start_gate.seen();
+
+        let (status, body) = refused_open(addr, &alice, "dormant").await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["reason"], "agent_not_dispatchable", "{body}");
+        assert_eq!(
+            body["error"], "Agent `dormant` is not enabled for dispatch",
+            "{body}"
+        );
+        assert_eq!(
+            fixture.start_gate.seen(),
+            created,
+            "the core created no conversation"
+        );
+        assert!(fixture.store.list_ids().await.is_empty());
+        assert_eq!(
+            fixture
+                ._model
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prompt_to_an_agent_disabled_since_the_chat_opened_never_reaches_the_model() {
+        let fixture = Fixture::new().await;
+        let addr = serve(fixture.router()).await;
+        let (alice, _) = fixture.sign_in("alice").await;
+        let mut socket = open_chat(addr, &alice, "support", "chat")
+            .await
+            .expect("support is enabled");
+        await_frame(&mut socket, "session_start").await;
+        let done = chat_once(&mut socket, "while enabled").await;
+        assert_eq!(done["type"], "done", "{done}");
+
+        fixture.set_agent_enabled("support", false);
+        let refused = chat_once(&mut socket, "while disabled").await;
+        assert_eq!(refused["type"], "error", "{refused}");
+        assert_eq!(refused["code"], "AGENT_NOT_DISPATCHABLE", "{refused}");
+        assert_eq!(
+            refused["message"], "Agent `support` is not enabled for dispatch",
+            "{refused}"
+        );
+
+        // The chat stays open, and takes the next prompt once the agent is
+        // enabled again. That turn runs after the refused one would have and
+        // sends the model the conversation so far, so a refused prompt that
+        // had reached the core would be in a request by now.
+        fixture.set_agent_enabled("support", true);
+        let done = chat_once(&mut socket, "enabled again").await;
+        assert_eq!(done["type"], "done", "{done}");
+        assert_eq!(done["full_response"], "hello from support");
+        assert_eq!(
+            model_requests_with(&fixture._model, "while disabled").await,
+            0,
+            "the refused prompt never reached the model"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_chat_with_a_disabled_agent_is_refused_until_it_is_enabled_again() {
+        let fixture = Fixture::new().await;
+        let addr = serve(fixture.router()).await;
+        let (alice, _) = fixture.sign_in("alice").await;
+        // The control: an enabled agent the account was granted chats.
+        let (_open, _) = chat_in(addr, &alice, "first").await;
+
+        fixture.set_agent_enabled("support", false);
+        let created = fixture.start_gate.seen();
+        let (status, body) = refused_open(addr, &alice, "support").await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["reason"], "agent_not_dispatchable", "{body}");
+        assert_eq!(
+            fixture.start_gate.seen(),
+            created,
+            "the core created no conversation for the refused chat"
+        );
+
+        fixture.set_agent_enabled("support", true);
+        let mut socket = open_chat(addr, &alice, "support", "again")
+            .await
+            .expect("support is enabled again");
+        await_frame(&mut socket, "session_start").await;
+        let done = chat_once(&mut socket, "back again").await;
+        assert_eq!(done["type"], "done", "{done}");
+        assert_eq!(done["full_response"], "hello from support");
+    }
+
+    /// Whether an agent the account was not granted is configured, or could
+    /// run, is not this account's to learn: each is refused alike, before
+    /// the core or the model sees anything.
+    #[tokio::test]
+    async fn an_ungranted_agent_is_refused_alike_whether_enabled_disabled_or_absent() {
+        let fixture = Fixture::with_config(|config| with_dormant(config, false)).await;
+        let addr = serve(fixture.router()).await;
+        let (alice, _) = fixture.sign_in("alice").await;
+        let created = fixture.start_gate.seen();
+
+        let mut answers = Vec::new();
+        for agent in ["other", "dormant", "ghost"] {
+            answers.push(refused_open(addr, &alice, agent).await);
+        }
+        let (status, body) = &answers[0];
+        assert_eq!(*status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["reason"], "agent_not_allowed", "{body}");
+        assert!(
+            answers.iter().all(|answer| answer == &answers[0]),
+            "the refusals tell the agents apart: {answers:?}"
+        );
+        assert_eq!(fixture.start_gate.seen(), created);
+        assert_eq!(
+            fixture
+                ._model
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .len(),
+            0
+        );
     }
 
     #[tokio::test]

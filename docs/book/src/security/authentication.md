@@ -739,7 +739,9 @@ What a signed-in account can do follows its permission profile:
   also chat in the dashboard, with the agents its grants allow, if its
   profile grants `sessions` create, read, execute and update. The agent
   uses only the tools the profile grants (`allowed_tools`, with
-  `tools = ["execute"]`). Its conversations are its own: the daemon runs
+  `tools = ["execute"]`). A disabled agent takes no new chat, and a chat
+  already open with it answers each message with an error until the agent
+  is enabled again. Its conversations are its own: the daemon runs
   them as that account, under its grants, and nobody else's dashboard
   lists them. Image upload is not offered. Each chat is one conversation,
   and the conversation lasts only as long as the chat:
