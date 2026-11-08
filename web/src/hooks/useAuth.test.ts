@@ -199,6 +199,10 @@ const rendered = (attr: string) =>
   renderer?.root.findAll((node) => typeof node.type === "string" && node.props[attr] !== undefined)
     .length ?? 0;
 const inputs = () => renderer?.root.findAll((node) => node.type === "input").length ?? 0;
+/** Requests that read or redeem a pairing code. */
+const pairingRequests = () =>
+  requests.filter((r) => /\/(api\/)?pair(\/|\?|$)/.test(new URL(r.url, "https://zc.example").pathname))
+    .length;
 
 async function retryMethods(): Promise<void> {
   const button = renderer?.root.find(
@@ -268,9 +272,11 @@ test("a failed sign-in methods request shows no pairing form, and a retry shows 
   // not offer it, and without the answer the page can't tell.
   for (const failure of ["network", 429, 500, 503] as const) {
     methodsFailure = failure;
+    requests = [];
     await mountScreen();
     assert.equal(state().isAuthenticated, false, `${failure}`);
     assert.equal(inputs(), 0, `${failure}: no pairing input`);
+    assert.equal(pairingRequests(), 0, `${failure}: no pairing request`);
     assert.equal(rendered("data-methods-retry"), 1, `${failure}: a retry`);
     // The retry is answered: through a relay, with a provider.
     methodsFailure = null;
@@ -280,17 +286,22 @@ test("a failed sign-in methods request shows no pairing form, and a retry shows 
     assert.equal(inputs(), 0, `${failure}: still no pairing input`);
     assert.equal(rendered("data-signin-provider"), 1, `${failure}: the provider`);
     assert.equal(rendered("data-relay-notice"), 1, `${failure}: the relay notice`);
+    assert.equal(pairingRequests(), 0, `${failure}: still no pairing request`);
     await unmount();
     viaRelay = false;
     providers = [];
   }
-  // A retry answered directly, with sign-in off: the pairing form.
+  // A retry answered directly, with sign-in off: the pairing form, which
+  // then asks for its code as it always has.
   methodsFailure = 503;
+  requests = [];
   await mountScreen();
   assert.equal(inputs(), 0);
+  assert.equal(pairingRequests(), 0);
   methodsFailure = null;
   await retryMethods();
   assert.equal(inputs(), 1, "the pairing form once the gateway says pairing is how to sign in");
+  assert.ok(pairingRequests() > 0, "the pairing form's own request, as a positive control");
   await unmount();
   // Answered first time: the pairing form, exactly as before.
   await mountScreen();
@@ -303,9 +314,11 @@ test("a paired browser whose token is refused while the methods request fails sh
   await mountScreen();
   assert.equal(state().isAuthenticated, true);
   methodsFailure = 429;
+  requests = [];
   await fire("unauthorized");
   assert.equal(state().isAuthenticated, false);
   assert.equal(inputs(), 0);
+  assert.equal(pairingRequests(), 0);
   assert.equal(rendered("data-methods-retry"), 1);
   methodsFailure = null;
   viaRelay = true;

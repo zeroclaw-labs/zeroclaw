@@ -618,18 +618,26 @@ mod tests {
         });
         let inner = Arc::clone(&server.inner);
         let tier = inner.dashboard.clone().expect("the dashboard tier");
-        // Browsers from as many addresses, each sending nothing: every
-        // refusal waits out its read budget holding a refusal permit.
+        // An address already at its connection cap: its refusals hold no slot.
+        let crowded: SocketAddr = "203.0.113.7:51000".parse().unwrap();
+        let _slots = [
+            tier.take_ip_slot(crowded.ip()).unwrap(),
+            tier.take_ip_slot(crowded.ip()).unwrap(),
+        ];
+        let label = DashboardHost::Label("a".repeat(26));
+        // Browsers that send nothing, half from that address and half to an
+        // unknown host from as many others: every refusal waits out its read
+        // budget holding a refusal permit.
         let mut silent = Vec::new();
         for n in 0..MAX_DASHBOARD_REFUSALS {
             let (browser, relay_side) = tokio::io::duplex(1024);
-            let peer = SocketAddr::from(([10, 0, (n / 250) as u8, (n % 250) as u8 + 1], 40000));
-            tokio::spawn(serve(
-                Arc::clone(&inner),
-                relay_side,
-                DashboardHost::Unknown,
-                peer,
-            ));
+            let (host, peer) = if n % 2 == 0 {
+                (label.clone(), crowded)
+            } else {
+                let peer = SocketAddr::from(([10, 0, (n / 250) as u8, (n % 250) as u8 + 1], 40000));
+                (DashboardHost::Unknown, peer)
+            };
+            tokio::spawn(serve(Arc::clone(&inner), relay_side, host, peer));
             silent.push(browser);
         }
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -642,21 +650,19 @@ mod tests {
 
         // Past the pool, both kinds of refusal are shed unanswered: an unknown
         // host, and an address already at its connection cap.
-        let crowded: SocketAddr = "203.0.113.7:51000".parse().unwrap();
-        let _slots = [
-            tier.take_ip_slot(crowded.ip()).unwrap(),
-            tier.take_ip_slot(crowded.ip()).unwrap(),
-        ];
         let other: SocketAddr = "203.0.113.8:51000".parse().unwrap();
-        let label = DashboardHost::Label("a".repeat(26));
         assert_eq!(served(&inner, DashboardHost::Unknown, other).await, "");
         assert_eq!(served(&inner, label.clone(), crowded).await, "");
-        // None of it holds a pre-admission permit: daemons and native clients
-        // are admitted as before.
+        // None of it holds a pre-admission permit: a native client or daemon
+        // still gets one, as the accept loop takes it.
         assert_eq!(
             inner.handshake_permits.available_permits(),
             crate::RelayConfig::default().max_pending_handshakes
         );
+        let native = Arc::clone(&inner.handshake_permits)
+            .try_acquire_owned()
+            .expect("a native client is admitted while the refusal pool is full");
+        drop(native);
 
         // Once the silent browsers go, refusals are answered again.
         drop(silent);
