@@ -300,6 +300,10 @@ pub struct SpeechToSpeechChannel {
     /// handle; there is no queuing or fan-out across multiple simultaneous
     /// sessions. `Mutex` (not `tokio::sync::Mutex`) because the critical
     /// section is a plain pointer swap/clone, never held across an `.await`.
+    /// Taken with poison recovery rather than `unwrap`: the guarded value is
+    /// one `Option` written by whole assignments, so a panic elsewhere cannot
+    /// leave it half-updated, and refusing the lock afterwards would take the
+    /// alias down for the rest of the process over nothing.
     ///
     /// The entry carries the call's own identity alongside the handle: a
     /// reply that names an earlier call must not be spoken into the one
@@ -355,7 +359,10 @@ impl SpeechToSpeechChannel {
     /// the caller keeps it (typically to drive [`Self::run_session`]
     /// immediately afterward).
     pub(crate) fn attach_session(&self, session: &Session) {
-        *self.active_session.lock().unwrap() = Some(ActiveSession {
+        *self
+            .active_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ActiveSession {
             id: uuid::Uuid::new_v4().to_string(),
             sender: session.text_sender(),
             lost_tool_acks: Vec::new(),
@@ -384,7 +391,10 @@ impl SpeechToSpeechChannel {
     /// so the loss is correlated to the model turn still waiting for it.
     fn note_lost_ack(&self, id: &str, reason: &str) {
         let session_id = {
-            let mut guard = self.active_session.lock().unwrap();
+            let mut guard = self
+                .active_session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             match guard.as_mut() {
                 Some(active) => {
                     active.lost_tool_acks.push(id.to_string());
@@ -749,7 +759,11 @@ impl SpeechToSpeechChannel {
         // unconditional clear is safe on every break path above. Replies have
         // already reported their own fate to the orchestrator through
         // `send()`; what needs saying here is which tool calls died unanswered.
-        let ended = self.active_session.lock().unwrap().take();
+        let ended = self
+            .active_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
         if let Some(active) = ended
             && !active.lost_tool_acks.is_empty()
         {
@@ -820,7 +834,10 @@ impl Channel for SpeechToSpeechChannel {
     /// line (see [`ActiveSession`]).
     async fn send(&self, message: &SendMessage) -> Result<()> {
         let sender = {
-            let mut guard = self.active_session.lock().unwrap();
+            let mut guard = self
+                .active_session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             match guard.as_mut() {
                 Some(active) => {
                     let expected = format!("{}:{}", self.alias, active.id);
