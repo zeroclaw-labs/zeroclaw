@@ -776,7 +776,7 @@ fn canonical_quickstart_channel_ref(reference: &str) -> Option<String> {
     Some(format!("{config_channel_type}.{alias}"))
 }
 
-fn default_whatsapp_web_session_path(config: &Config, alias: &str) -> String {
+pub(crate) fn default_whatsapp_web_session_path(config: &Config, alias: &str) -> String {
     config
         .config_path
         .parent()

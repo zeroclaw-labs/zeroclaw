@@ -16,5 +16,8 @@ pub async fn handle_command(command: crate::MigrateCommands, config: &Config) ->
             dry_run,
             reindex,
         } => migrate_openclaw_memory(config, source, dry_run, reindex).await,
+        crate::MigrateCommands::OpenclawConfig { source, dry_run } => {
+            Box::pin(migrate_openclaw_config(config, source, dry_run)).await
+        }
     }
 }

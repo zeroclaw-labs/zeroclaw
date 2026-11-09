@@ -7,6 +7,10 @@ use std::path::{Path, PathBuf};
 use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{self, Memory, MemoryCategory};
 
+mod openclaw_config;
+
+pub use openclaw_config::migrate_openclaw_config;
+
 #[derive(Debug, Clone)]
 struct SourceEntry {
     key: String,
