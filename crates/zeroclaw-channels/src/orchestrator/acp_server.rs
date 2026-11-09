@@ -6456,6 +6456,7 @@ mod tests {
             tool_call_id: "tc-replay".into(),
             content: " M acp_server.rs".into(),
             tool_name: "shell".into(),
+            session_prompt_tool_result: false,
         }]);
         let result_notes = history_notifications_for_message("sid", &result, &mut titles);
         assert_eq!(
