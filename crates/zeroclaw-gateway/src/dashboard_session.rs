@@ -620,6 +620,9 @@ pub struct DashboardAuth {
     /// cannot say whether this generation was stopped.
     stopping: Option<tokio::sync::watch::Receiver<bool>>,
     _sweeper: SweeperGuard,
+    /// A fixture owns its socket clock; production always uses SOCKET_RECHECK.
+    #[cfg(test)]
+    socket_recheck: std::time::Duration,
 }
 
 /// How often the store is swept when no request arrives: an expired
@@ -705,7 +708,15 @@ impl DashboardAuth {
             inbound,
             stopping: None,
             _sweeper: SweeperGuard(None),
+            #[cfg(test)]
+            socket_recheck: SOCKET_RECHECK,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_socket_recheck(mut self, interval: std::time::Duration) -> Self {
+        self.socket_recheck = interval;
+        self
     }
 
     /// Bind this state to the gateway generation `state` belongs to, before
@@ -1411,8 +1422,12 @@ impl SessionWatch {
         require_admin: bool,
         state: &AppState,
     ) -> Self {
-        let start = tokio::time::Instant::now() + SOCKET_RECHECK;
-        let mut recheck = tokio::time::interval_at(start, SOCKET_RECHECK);
+        #[cfg(not(test))]
+        let interval = SOCKET_RECHECK;
+        #[cfg(test)]
+        let interval = auth.socket_recheck;
+        let start = tokio::time::Instant::now() + interval;
+        let mut recheck = tokio::time::interval_at(start, interval);
         recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // The generation's own signal when the state is bound to one (every
         // served gateway); otherwise this state's, from now.

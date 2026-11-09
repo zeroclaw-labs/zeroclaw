@@ -294,14 +294,16 @@ impl Chat {
         let mut stopping = self.state.shutdown_tx.subscribe();
 
         // The first frame may be a `connect` handshake; anything else is the
-        // first message.
+        // first message. The session is polled before the socket, as between
+        // turns, so a client that keeps frames ready cannot hold off the
+        // recheck that sees a lost grant.
         let mut first_message = None;
         loop {
             let frame = tokio::select! {
                 biased;
-                frame = receiver.next() => frame,
-                _ = gateway_stop_signal(&mut stopping) => return Stop::Reconnect,
                 code = session_lost(&mut self.watch, &self.state) => return Stop::Close(code),
+                _ = gateway_stop_signal(&mut stopping) => return Stop::Reconnect,
+                frame = receiver.next() => frame,
                 _ = tick_websocket_ping(&mut ping) => {
                     if sender.write(Message::Ping(Vec::new().into())).await.is_err() {
                         return Stop::Gone;
@@ -343,7 +345,10 @@ impl Chat {
                     }
                 }
                 Some(Ok(Message::Close(_)) | Err(_)) | None => return Stop::Gone,
-                Some(Ok(_)) => {}
+                // Binary and Pong frames are ignored here, but each counts
+                // against the task's budget, so a stream of them still lets
+                // the session's recheck run.
+                Some(Ok(_)) => tokio::task::coop::consume_budget().await,
             }
         }
 

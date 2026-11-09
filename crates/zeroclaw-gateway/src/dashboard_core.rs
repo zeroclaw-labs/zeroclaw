@@ -3689,6 +3689,294 @@ mod tests {
             .await;
     }
 
+    /// Frames per write in [`flood_framed`]: enough that the chat always
+    /// finds the next one already read, never waiting on the socket.
+    const FLOOD_BATCH: usize = 1024;
+
+    /// Send Binary and Pong frames through a WebSocket client,
+    /// [`FLOOD_BATCH`] to a write, as fast as the socket takes them, until
+    /// `stop` is set or the socket closes. Returns how many frames went out.
+    async fn flood_framed(
+        mut sink: futures_util::stream::SplitSink<ChatSocket, ClientMessage>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+    ) -> usize {
+        let mut sent = 0;
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            for index in 0..FLOOD_BATCH {
+                let frame = if index % 2 == 0 {
+                    ClientMessage::Binary(vec![0u8; 16].into())
+                } else {
+                    ClientMessage::Pong(Vec::new().into())
+                };
+                if sink.feed(frame).await.is_err() {
+                    return sent;
+                }
+                sent += 1;
+            }
+            if sink.flush().await.is_err() {
+                return sent;
+            }
+        }
+        sent
+    }
+
+    /// A masked client Pong with no payload, then a masked client Binary
+    /// frame of 16 bytes, 28 bytes for the pair. The masking key is zero, so
+    /// the payload goes as it is.
+    const RAW_FRAME_PAIR: [u8; 28] = [
+        0x8a, 0x80, 0, 0, 0, 0, // Pong, masked, empty
+        0x82, 0x90, 0, 0, 0, 0, // Binary, masked, 16 bytes
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+
+    /// Write ready-made Binary and Pong frames straight to the socket, 256
+    /// KiB to a write, until `stop` is set or the socket fails: the cheapest
+    /// flood a client can send. Returns how many frames went out.
+    async fn flood_raw(
+        mut writer: tokio::net::tcp::OwnedWriteHalf,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+    ) -> usize {
+        use tokio::io::AsyncWriteExt as _;
+        let pairs = 256 * 1024 / RAW_FRAME_PAIR.len();
+        let buffer = RAW_FRAME_PAIR.repeat(pairs);
+        let mut sent = 0;
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            if writer.write_all(&buffer).await.is_err() {
+                break;
+            }
+            sent += 2 * pairs;
+        }
+        sent
+    }
+
+    /// One frame the server sent on a raw socket: its opcode and payload.
+    async fn read_raw_frame(reader: &mut tokio::net::tcp::OwnedReadHalf) -> Option<(u8, Vec<u8>)> {
+        use tokio::io::AsyncReadExt as _;
+        let mut head = [0u8; 2];
+        reader.read_exact(&mut head).await.ok()?;
+        let len = match head[1] & 0x7f {
+            126 => {
+                let mut len = [0u8; 2];
+                reader.read_exact(&mut len).await.ok()?;
+                usize::from(u16::from_be_bytes(len))
+            }
+            127 => {
+                let mut len = [0u8; 8];
+                reader.read_exact(&mut len).await.ok()?;
+                usize::try_from(u64::from_be_bytes(len)).ok()?
+            }
+            len => usize::from(len),
+        };
+        let mut payload = vec![0u8; len];
+        reader.read_exact(&mut payload).await.ok()?;
+        Some((head[0] & 0x0f, payload))
+    }
+
+    /// Open the chat socket as `cookie` with a handshake written by hand, so
+    /// the test owns the raw TCP stream; returns its halves after
+    /// `session_start`, with the core's id for the conversation.
+    async fn open_raw_chat(
+        addr: SocketAddr,
+        cookie: &str,
+    ) -> (
+        tokio::net::tcp::OwnedReadHalf,
+        tokio::net::tcp::OwnedWriteHalf,
+        String,
+    ) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!(
+            "GET /ws/chat?agent=support&session_id=web-1 HTTP/1.1\r\nHost: {addr}\r\n\
+             Upgrade: websocket\r\nConnection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\
+             Cookie: zc_session={cookie}\r\nOrigin: http://{addr}\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        while !response.ends_with(b"\r\n\r\n") {
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).await.unwrap();
+            response.push(byte[0]);
+        }
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 101"), "{response}");
+        let (mut reader, writer) = stream.into_split();
+        let (opcode, payload) = read_raw_frame(&mut reader).await.expect("session_start");
+        assert_eq!(opcode, 0x1, "a text frame first");
+        let start: Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(start["type"], "session_start", "{start}");
+        let core_id = start["session_id"]
+            .as_str()
+            .expect("the core's id")
+            .to_string();
+        (reader, writer, core_id)
+    }
+
+    /// Read a raw socket until the server's Close, and return its code.
+    async fn read_raw_close(mut reader: tokio::net::tcp::OwnedReadHalf) -> Option<u16> {
+        loop {
+            match read_raw_frame(&mut reader).await? {
+                (0x8, payload) => {
+                    return payload
+                        .get(..2)
+                        .map(|code| u16::from_be_bytes([code[0], code[1]]));
+                }
+                (0x1, payload) => {
+                    panic!(
+                        "the chat answered the flood: {}",
+                        String::from_utf8_lossy(&payload)
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Read a client socket until the server's Close, and return its code.
+    async fn read_framed_close(
+        mut stream: futures_util::stream::SplitStream<ChatSocket>,
+    ) -> Option<u16> {
+        loop {
+            match stream.next().await {
+                Some(Ok(ClientMessage::Close(close))) => {
+                    return close.map(|close| u16::from(close.code));
+                }
+                Some(Ok(ClientMessage::Text(text))) => {
+                    panic!("the chat answered the flood: {text}");
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected a close, got {other:?}"),
+            }
+        }
+    }
+
+    /// A gateway for a scoped chat whose socket recheck runs every `recheck`,
+    /// with server pings off, and alice signed in.
+    async fn flood_gateway(recheck: Duration) -> (Fixture, SocketAddr, String, Arc<SessionAuth>) {
+        let mut fixture = Fixture::with_config(|config| {
+            config.gateway.websocket_ping_interval_secs = 0;
+        })
+        .await;
+        fixture.auth = Arc::new(
+            DashboardAuth::new(
+                Arc::clone(&fixture.auth.sessions),
+                Arc::clone(&fixture.auth.inbound),
+            )
+            .with_socket_recheck(recheck)
+            .for_generation(&fixture.state),
+        );
+        let addr = serve(fixture.router()).await;
+        let (alice, session) = fixture.sign_in("alice").await;
+        (fixture, addr, alice, session)
+    }
+
+    /// Before its first text frame, a socket that keeps Binary and Pong
+    /// frames coming keeps the chat reading, through a WebSocket client or
+    /// as raw frames written straight to the socket. Losing the chat's agent
+    /// or a session verb, or signing out, must still close the socket with
+    /// its reason, and then the conversation, soon after the change, not once
+    /// the flood stops.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_first_frame_flood_cannot_hold_off_a_lost_grant_or_a_sign_out() {
+        use crate::dashboard_session::{WS_CLOSE_ACCESS_LOST, WS_CLOSE_SESSION_ENDED};
+        const RECHECK: Duration = Duration::from_millis(50);
+        for flood in ["framed", "raw"] {
+            for ending in ["agent", "read", "sign-out"] {
+                let case = format!("{flood} flood, {ending}");
+                let (fixture, addr, alice, session) = flood_gateway(RECHECK).await;
+                let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let flood_stop = Arc::clone(&stop);
+                let (core_id, flooding, closing) = if flood == "framed" {
+                    let mut socket = open_chat(addr, &alice, "support", "web-1")
+                        .await
+                        .expect("alice may chat");
+                    let start = await_frame(&mut socket, "session_start").await;
+                    let core_id = start["session_id"].as_str().unwrap().to_string();
+                    let (sink, stream) = socket.split();
+                    (
+                        core_id,
+                        zeroclaw_spawn::spawn!(async move { flood_framed(sink, flood_stop).await }),
+                        zeroclaw_spawn::spawn!(async move { read_framed_close(stream).await }),
+                    )
+                } else {
+                    let (reader, writer, core_id) = open_raw_chat(addr, &alice).await;
+                    (
+                        core_id,
+                        zeroclaw_spawn::spawn!(async move { flood_raw(writer, flood_stop).await }),
+                        zeroclaw_spawn::spawn!(async move { read_raw_close(reader).await }),
+                    )
+                };
+                // Several rechecks pass with access unchanged while the flood
+                // runs, and the conversation stays open.
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                assert!(fixture.store.list_ids().await.contains(&core_id), "{case}");
+                let changed = std::time::Instant::now();
+                let expected = match ending {
+                    "agent" => {
+                        fixture.narrow_profile("chat-user", |profile| {
+                            profile.allowed_agents = vec!["other".into()];
+                        });
+                        WS_CLOSE_ACCESS_LOST
+                    }
+                    "read" => {
+                        fixture.narrow_profile("chat-user", |profile| {
+                            without_session_verb(profile, Verb::Read);
+                        });
+                        WS_CLOSE_ACCESS_LOST
+                    }
+                    _ => {
+                        assert!(fixture.auth.end(&session), "sign-out");
+                        WS_CLOSE_SESSION_ENDED
+                    }
+                };
+                // The close frame: a raw reader sees it as soon as the gateway
+                // sends it; a client's read can wait behind its own writes.
+                let closed = tokio::time::timeout(Duration::from_secs(10), closing).await;
+                let close_after = changed.elapsed();
+                // The gateway's own act: the conversation it opened for the
+                // socket is closed on the core. Under a flood that can trail
+                // the close frame by the close handshake's 2 s grace, while
+                // the gateway waits for the client's own close.
+                let conversation = tokio::time::timeout(Duration::from_secs(10), async {
+                    while fixture.store.list_ids().await.contains(&core_id) {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .map(|()| changed.elapsed());
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                let frames = flooding.await.expect("the flood task");
+                eprintln!(
+                    "{case}: close frame after {close_after:?}, conversation closed after \
+                     {conversation:?}, {frames} frames sent"
+                );
+                let code = closed
+                    .unwrap_or_else(|_| {
+                        panic!("{case}: no close within 10 s of the change ({frames} frames)")
+                    })
+                    .expect("the close reader");
+                assert_eq!(code, Some(expected), "{case}");
+                if flood == "raw" {
+                    assert!(
+                        close_after < Duration::from_secs(2),
+                        "{case}: close frame {close_after:?} after the change ({frames} frames)"
+                    );
+                }
+                let conversation = conversation.unwrap_or_else(|_| {
+                    panic!("{case}: the conversation stayed open 10 s ({frames} frames)")
+                });
+                assert!(
+                    conversation < Duration::from_secs(5),
+                    "{case}: conversation closed {conversation:?} after the change ({frames} frames)"
+                );
+                assert!(
+                    frames > 20_000,
+                    "{case}: too light a flood to show anything ({frames} frames)"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn mid_turn_a_frame_after_a_lost_grant_closes_the_socket_unacted() {
         let fixture = Fixture::new().await;
