@@ -41026,43 +41026,81 @@ api_token = "tok"
             listener.set_nonblocking(true).unwrap();
             let server = std::thread::spawn(move || {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
-                let mut served = 0;
-                while served < 2 && std::time::Instant::now() < deadline {
-                    match listener.accept() {
-                        Ok((mut socket, _)) => {
-                            socket.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
-                            let mut request = [0u8; 4096];
-                            let received = socket.read(&mut request).unwrap();
-                            assert!(received > 0);
-                            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").unwrap();
-                            served += 1;
+                let mut connections: Vec<(std::net::TcpStream, Vec<u8>)> = Vec::new();
+                let mut served_on = Vec::new();
+                while served_on.len() < 4 && std::time::Instant::now() < deadline {
+                    loop {
+                        match listener.accept() {
+                            Ok((socket, _)) => {
+                                socket.set_nonblocking(true).unwrap();
+                                connections.push((socket, Vec::new()));
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(error) => panic!("fixture accept: {error}"),
                         }
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(std::time::Duration::from_millis(5)),
-                        Err(error) => panic!("fixture accept: {error}"),
                     }
+                    for (index, (socket, buffered)) in connections.iter_mut().enumerate() {
+                        let mut chunk = [0u8; 4096];
+                        match socket.read(&mut chunk) {
+                            Ok(count) => buffered.extend_from_slice(&chunk[..count]),
+                            Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::ConnectionReset) => {},
+                            Err(error) => panic!("fixture read: {error}"),
+                        }
+                        while let Some(end) = buffered.windows(4).position(|part| part == b"\r\n\r\n") {
+                            buffered.drain(..end + 4);
+                            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok").unwrap();
+                            served_on.push(index);
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
                 }
-                served
+                served_on
             });
             let service = format!("runtime-owner-{}", uuid::Uuid::new_v4());
-            let mut results = Vec::new();
-            for _ in 0..2 {
-                let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-                results.push(runtime.block_on(async {
-                    let client = build_runtime_proxy_client_with_timeouts(&service, 2, 2);
-                    client.get(&endpoint).send().await?.text().await
-                }));
-                // The first dispatcher is destroyed before the next request.
-                drop(runtime);
+            fn request_on(runtime: &tokio::runtime::Runtime, service: &str, endpoint: &str, count: usize) -> Vec<reqwest::Result<String>> {
+                runtime.block_on(async {
+                    let mut results = Vec::new();
+                    for _ in 0..count {
+                        let client = build_runtime_proxy_client_with_timeouts(service, 2, 2);
+                        results.push(async {client.get(endpoint).send().await?.text().await}.await);
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    results
+                })
             }
-            let served = server.join().unwrap();
-            (results, served)
+            let runtime = || tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let first_owner = runtime();
+            let mut results = request_on(&first_owner, &service, &endpoint, 2);
+            // Keep the first owner's live pool, but stop driving its reactor.
+            // A runtime-blind hit now dispatches into that paused owner and times out.
+            let second_owner = runtime();
+            results.extend(request_on(&second_owner, &service, &endpoint, 1));
+            drop(first_owner);
+            drop(second_owner);
+            // Also exercise cache lookup after its last owner has shut down.
+            let after_shutdown = runtime();
+            results.extend(request_on(&after_shutdown, &service, &endpoint, 1));
+            drop(after_shutdown);
+            (results, server.join().unwrap())
         }).await;
         set_runtime_proxy_config(previous);
-        let (results, served) = result.unwrap();
+        let (results, served_on) = result.unwrap();
         for result in results {
             assert_eq!(result.unwrap(), "ok");
         }
-        assert_eq!(served, 2);
+        assert_eq!(served_on.len(), 4);
+        assert_eq!(
+            served_on[0], served_on[1],
+            "warm requests must reuse a live pooled connection"
+        );
+        assert_ne!(
+            served_on[1], served_on[2],
+            "a new runtime needs its own connection"
+        );
+        assert_ne!(
+            served_on[2], served_on[3],
+            "a shut-down owner cannot supply the next pool"
+        );
     }
 
     fn runtime_proxy_cache_contains(cache_key: &str) -> bool {
