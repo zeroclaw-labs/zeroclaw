@@ -36,6 +36,10 @@ fn zeroclaw_with(dir: &Path, args: &[&str], stdin: Option<&str>, env: &[(&str, &
     command
         .env("RUST_LOG", "off")
         .env("LC_ALL", "C")
+        // A backtrace on an error would put source line numbers on stderr,
+        // whose refusals the assertions read for the numbers they report.
+        .env_remove("RUST_BACKTRACE")
+        .env_remove("RUST_LIB_BACKTRACE")
         .arg("--config-dir")
         .arg(dir)
         .args(args)
