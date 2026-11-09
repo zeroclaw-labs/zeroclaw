@@ -30,8 +30,9 @@ completes the TLS handshake and is then refused with `AUTH_REQUIRED`
 An administrator must first configure an `[oidc.<alias>]` relationship and
 permission mappings on the daemon, enable its device authorization grant at
 the identity provider, enable WSS, and expose the gateway over HTTPS. A human
-permission profile must grant `system:execute` for self-service device
-bootstrap (an existing administrator profile already grants it). This is an
+permission profile must grant `sessions:create` with at least one allowed
+agent for self-service device bootstrap; `system:execute` or admin also allows
+it. This is an
 issuer/group policy, not registration of an individual user or device. No local
 `[users]` entry, paired token, pending code, existing client certificate, or
 separate `[enroll]` listener is needed. The alias below is that daemon-side
@@ -50,6 +51,11 @@ port 9781 and the gateway at
 `https://daemon.example.com:42617`. The gateway itself does not supply HTTPS
 by default: use `--gateway-url` to name its TLS-terminating proxy. A gateway
 path prefix is supported. Plain HTTP is accepted only on loopback.
+
+Public clients that enforce PKCE are supported: zerocode sends an S256
+challenge on device authorization and the matching verifier only when polling
+for its token. The verifier lives only for the sign-in, is never persisted, and
+is not part of the gateway's device-start response.
 
 Login works from a completely empty client configuration directory:
 

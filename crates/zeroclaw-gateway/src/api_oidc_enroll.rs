@@ -144,12 +144,17 @@ async fn handle_certificate(
             );
         }
     };
-    // Device issuance is an execution on the daemon's handshake/system plane,
-    // not an administrator grant or a registration of a named client.
-    if !grants.permits(Resource::System, Verb::Execute) {
+    // A human already allowed to create agent sessions may bootstrap the
+    // transport needed to do so. This certificate grants no RPC permissions:
+    // every initialize still verifies the live OIDC bearer, and agent selectors
+    // still limit all session operations. Keep system:execute for deployments
+    // that explicitly authorize bootstrap independently of session creation.
+    let may_create_session =
+        grants.permits(Resource::Sessions, Verb::Create) && !grants.allowed_agents.is_empty();
+    if !grants.permits(Resource::System, Verb::Execute) && !may_create_session {
         return error_json(
             StatusCode::FORBIDDEN,
-            "OIDC device bootstrap requires system:execute",
+            "OIDC device bootstrap requires sessions:create with an allowed agent, or system:execute",
         );
     }
     let config = state.config.read();

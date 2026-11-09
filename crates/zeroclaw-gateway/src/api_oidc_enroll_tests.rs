@@ -56,8 +56,13 @@ impl Fixture {
             "desktop".into(),
             PermissionProfileConfig {
                 admin: false,
+                allowed_agents: vec!["*".into()],
+                allowed_tools: vec!["*".into()],
                 grants: if allow {
-                    HashMap::from([(Resource::System, vec![Verb::Execute])])
+                    HashMap::from([
+                        (Resource::Sessions, vec![Verb::Create, Verb::Read]),
+                        (Resource::Tools, vec![Verb::Execute]),
+                    ])
                 } else {
                     Default::default()
                 },
@@ -350,5 +355,26 @@ async fn remote_cleartext_cannot_obtain_a_device_even_with_a_valid_bearer() {
         f._idp.received_requests().await.unwrap().is_empty(),
         "must refuse before disclosing bearer to IdP"
     );
+    assert!(f.ledger().list_active().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn session_creator_needs_an_agent_selector_to_bootstrap() {
+    let f = Fixture::new(true, false).await;
+    let mut config = f.state.config.read().clone();
+    config
+        .permission_profiles
+        .get_mut("desktop")
+        .unwrap()
+        .allowed_agents
+        .clear();
+    f.inbound.publish_persisted(&config).unwrap();
+    let response = f
+        .router
+        .clone()
+        .oneshot(f.request(Some("synthetic-access-token")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert!(f.ledger().list_active().unwrap().is_empty());
 }

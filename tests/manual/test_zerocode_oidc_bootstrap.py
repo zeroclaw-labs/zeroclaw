@@ -11,6 +11,8 @@ stdin is closed. No existing instance is contacted, restarted, or reconfigured.
 """
 
 import argparse
+import base64
+import hashlib
 import http.server
 import json
 import os
@@ -23,6 +25,7 @@ import threading
 import time
 import tomllib
 import urllib.request
+import urllib.parse
 
 TOKEN = "synthetic-first-contact-access-token"
 
@@ -57,12 +60,21 @@ class IdentityProvider(http.server.BaseHTTPRequestHandler):
         })
 
     def do_POST(self):
-        self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        fields = urllib.parse.parse_qs(self.rfile.read(int(self.headers.get("Content-Length", "0"))).decode())
         if self.path == "/device":
+            if fields.get("code_challenge_method") != ["S256"] or len(fields.get("code_challenge", [""])[0]) != 43:
+                self.send_error(400, "S256 PKCE is required")
+                return
+            self.server.challenge = fields["code_challenge"][0]
             self.reply({"device_code": "synthetic-device-code", "user_code": "ABCD-EFGH",
                         "verification_uri": self.server.issuer + "/approve",
                         "expires_in": 600, "interval": 5})
         elif self.path == "/token":
+            verifier = fields.get("code_verifier", [""])[0]
+            challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+            if not verifier or challenge != self.server.challenge:
+                self.send_error(400, "PKCE verifier mismatch")
+                return
             self.reply({"access_token": TOKEN, "token_type": "Bearer", "expires_in": 3600})
         elif self.path == "/introspect":
             self.reply({"active": True, "token_type": "Bearer", "iss": self.server.issuer,
@@ -120,7 +132,9 @@ port = {wss_port}
 [enroll]
 enabled = false
 [permission_profiles.desktop]
-grants = {{ system = ["read", "execute"] }}
+allowed_agents = ["*"]
+allowed_tools = ["*"]
+grants = {{ sessions = ["create", "read"], tools = ["execute"] }}
 [oidc.corp]
 issuer = "{idp.issuer}"
 audience = "zeroclaw"

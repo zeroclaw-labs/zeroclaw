@@ -14689,6 +14689,7 @@ name = "zerocode"
 version = "0.8.7"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "crossterm",

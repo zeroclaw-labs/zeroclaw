@@ -92,7 +92,8 @@ For a configured OIDC deployment, start with
 `zerocode login <alias> wss://<host>:9781 --gateway-url https://<gateway>`.
 The client can have an empty config directory, and the daemon need not know
 its user or device or have any pairing code pending. After OIDC approval,
-the gateway verifies the bearer and `system:execute` grant and signs the
+the gateway verifies the bearer and session-creation authority (or
+`system:execute`) and signs the
 client's locally generated CSR. The returned CA bootstraps WSS trust, while
 WSS remains mandatory mTLS plus per-connection bearer authentication. This
 path does not use `[enroll]`, port 9782, or a SAS prompt. See

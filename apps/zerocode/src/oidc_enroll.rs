@@ -22,7 +22,10 @@
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
+use base64::Engine as _;
 use serde::Deserialize;
+use sha2::{Digest as _, Sha256};
+use zeroize::Zeroize as _;
 
 /// Longest device-code lifetime this client will wait out. RFC 8628 sets no
 /// ceiling on `expires_in`, so an IdP or gateway advertising hours would
@@ -230,10 +233,16 @@ impl GatewayEnrollment {
         }
     }
 
+    #[cfg(test)]
     pub async fn device_start(&self, alias: &str) -> Result<DeviceStart> {
+        self.device_start_s256(alias, None).await
+    }
+
+    async fn device_start_s256(&self, alias: &str, challenge: Option<&str>) -> Result<DeviceStart> {
         let response = self
             .http
             .post(format!("{}/api/oidc/{alias}/device/start", self.base))
+            .json(&serde_json::json!({ "code_challenge": challenge }))
             .send()
             .await
             .context("cannot reach the gateway enrollment API")?;
@@ -265,11 +274,21 @@ impl GatewayEnrollment {
     /// would throw away an approval that is about to land. Only an answer that
     /// says something about *this* grant, or a body that cannot be read at
     /// all, ends the flow.
+    #[cfg(test)]
     pub async fn device_poll(&self, alias: &str, device_code: &str) -> Result<DevicePoll> {
+        self.device_poll_s256(alias, device_code, None).await
+    }
+
+    async fn device_poll_s256(
+        &self,
+        alias: &str,
+        device_code: &str,
+        verifier: Option<&str>,
+    ) -> Result<DevicePoll> {
         let response = match self
             .http
             .post(format!("{}/api/oidc/{alias}/device/poll", self.base))
-            .json(&serde_json::json!({ "device_code": device_code }))
+            .json(&serde_json::json!({ "device_code": device_code, "code_verifier": verifier }))
             .send()
             .await
         {
@@ -561,13 +580,24 @@ pub(crate) async fn run_device_flow(
     if verification_is_disabled(&gateway.base, tls) {
         consent(&gateway.base)?;
     }
-    let start = gateway.device_start(alias).await?;
+    // Keep the verifier only on this client. A public IdP client enforcing
+    // PKCE must not require a secret or weaker IdP policy to use device login.
+    let mut random = [0u8; 32];
+    rustls::crypto::ring::default_provider()
+        .secure_random
+        .fill(&mut random)
+        .map_err(|_| anyhow::Error::msg("system randomness unavailable for PKCE"))?;
+    let verifier = zeroize::Zeroizing::new(hex::encode(random));
+    random.zeroize();
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(Sha256::digest(verifier.as_bytes()));
+    let start = gateway.device_start_s256(alias, Some(&challenge)).await?;
     // Bounds first: an unusable lifetime or interval must not reach the user
     // as a prompt they would wait on for nothing.
     validate_device_start(&start)?;
     on_prompt(&start);
     poll_until_granted(&start, async |code: &str| {
-        gateway.device_poll(alias, code).await
+        gateway.device_poll_s256(alias, code, Some(&verifier)).await
     })
     .await
 }
@@ -1632,5 +1662,40 @@ mod tests {
             .expect("request recording is on");
         assert_eq!(seen.len(), 1, "the redirect target was called");
         assert_eq!(seen[0].url.path(), "/api/oidc/corp/device/start");
+    }
+    #[tokio::test]
+    async fn device_flow_keeps_verifier_on_client_and_relays_s256_challenge() {
+        let server = granted_gateway().await;
+        run_device_flow(
+            &server.uri(),
+            &ClientTls::default(),
+            "corp",
+            |_| {},
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let start: serde_json::Value = requests
+            .iter()
+            .find(|r| r.url.path().ends_with("/start"))
+            .unwrap()
+            .body_json()
+            .unwrap();
+        let poll: serde_json::Value = requests
+            .iter()
+            .find(|r| r.url.path().ends_with("/poll"))
+            .unwrap()
+            .body_json()
+            .unwrap();
+        let verifier = poll["code_verifier"].as_str().unwrap();
+        assert!((43..=128).contains(&verifier.len()));
+        assert!(start.get("code_verifier").is_none());
+        assert_eq!(
+            start["code_challenge"].as_str().unwrap(),
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(Sha256::digest(verifier.as_bytes()))
+        );
+        assert_ne!(start["code_challenge"].as_str().unwrap(), verifier);
     }
 }

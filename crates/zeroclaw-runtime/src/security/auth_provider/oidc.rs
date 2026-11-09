@@ -866,16 +866,29 @@ impl OidcAuthProvider {
             return deny(DenyReason::MfaRequired);
         }
 
-        // A verified client_id is mandatory (RFC 9068 §2.2; the introspection
-        // contract). It keys the operator's actor declarations; the
-        // `sub`/`client_id` relationship is never consulted because
-        // service-token subjects are provider-specific (`<client>@clients`,
-        // a service-account user id, or the client id itself).
-        let Some(client_id) = claims
+        // RFC 9068 uses client_id; Keycloak also issues typed access tokens
+        // identifying the OAuth client only by signed azp. Accept that narrow
+        // JWKS interoperability spelling after signature/purpose/audience checks,
+        // never from unverified headers or subject shape. Introspection keeps
+        // its required client_id contract. Two contradictory labels fail closed.
+        let named_client = claims
             .client_id
             .as_deref()
-            .filter(|client_id| !client_id.trim().is_empty())
-        else {
+            .filter(|id| !id.trim().is_empty());
+        let party = claims.azp.as_deref().filter(|id| !id.trim().is_empty());
+        if named_client
+            .zip(party)
+            .is_some_and(|(client, party)| client != party)
+        {
+            return deny(DenyReason::BadCredential);
+        }
+        let Some(client_id) = named_client.or_else(|| {
+            if via == VerifiedVia::Jwks && claims.client_id.is_none() {
+                party
+            } else {
+                None
+            }
+        }) else {
             return deny(DenyReason::BadCredential);
         };
         let actor = match (self.declared_actor(client_id), self.actor_evidence(&raw)) {
@@ -3125,5 +3138,61 @@ mod tests {
             PrincipalResolver::new(human_only_policy).resolve(&service_identity),
             Err(DenyReason::NotEntitled)
         ));
+    }
+    #[tokio::test]
+    async fn signed_keycloak_azp_identifies_the_declared_client_without_client_id() {
+        let idp = start_idp().await;
+        let provider = idp.provider(OidcValidation::Jwks);
+        let mut claims = idp.good_claims();
+        claims.as_object_mut().unwrap().remove("client_id");
+        claims["azp"] = serde_json::json!("zerocode-cli");
+        assert!(
+            provider
+                .verify(&bearer(idp.mint(claims.clone())))
+                .await
+                .is_allowed()
+        );
+        for client in ["undeclared-client", ""] {
+            claims["azp"] = serde_json::json!(client);
+            assert!(
+                !provider
+                    .verify(&bearer(idp.mint(claims.clone())))
+                    .await
+                    .is_allowed()
+            );
+        }
+        claims["azp"] = serde_json::json!("zerocode-cli");
+        claims["client_id"] = serde_json::json!("another-client");
+        assert!(
+            !provider
+                .verify(&bearer(idp.mint(claims.clone())))
+                .await
+                .is_allowed()
+        );
+        claims["client_id"] = serde_json::json!("");
+        assert!(
+            !provider
+                .verify(&bearer(idp.mint(claims)))
+                .await
+                .is_allowed()
+        );
+    }
+    #[tokio::test]
+    async fn azp_does_not_replace_the_introspection_client_id_contract() {
+        let idp = start_idp().await;
+        let provider = idp.provider(OidcValidation::Introspection);
+        let mut raw = idp.good_claims();
+        raw.as_object_mut().unwrap().remove("client_id");
+        raw["azp"] = serde_json::json!("zerocode-cli");
+        let claims: Claims = serde_json::from_value(raw.clone()).unwrap();
+        assert!(
+            !provider
+                .claims_to_identity(
+                    &claims,
+                    raw.as_object().unwrap().clone(),
+                    VerifiedVia::Introspection
+                )
+                .is_allowed()
+        );
     }
 }

@@ -559,12 +559,19 @@ async fn handle_providers(
     Json(serde_json::json!({ "providers": providers })).into_response()
 }
 
+#[derive(Default, Deserialize)]
+struct DeviceStartBody {
+    #[serde(default)]
+    code_challenge: Option<String>,
+}
+
 async fn handle_device_start(
     State(state): State<AppState>,
     Extension(relay): Extension<Arc<OidcEnrollmentState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(alias): Path<String>,
     headers: HeaderMap,
+    body: Option<Json<DeviceStartBody>>,
 ) -> Response {
     let key = client_key(&state, peer, &headers);
     if let Err(denied) = auth_gate(&relay, &key, true) {
@@ -577,7 +584,11 @@ async fn handle_device_start(
     let Some(_permit) = outbound_permit(&relay) else {
         return relay_busy();
     };
-    match enrollment.device_grant_start().await {
+    let body = body.map(|Json(body)| body).unwrap_or_default();
+    match enrollment
+        .device_grant_start_s256(body.code_challenge.as_deref())
+        .await
+    {
         Ok(start) => Json(start).into_response(),
         Err(e) => {
             ::zeroclaw_log::record!(
@@ -598,6 +609,8 @@ async fn handle_device_start(
 #[derive(Deserialize)]
 struct DevicePollBody {
     device_code: String,
+    #[serde(default)]
+    code_verifier: Option<String>,
 }
 
 async fn handle_device_poll(
@@ -622,7 +635,10 @@ async fn handle_device_poll(
     let Some(_permit) = outbound_permit(&relay) else {
         return relay_busy();
     };
-    match enrollment.device_grant_poll(&body.device_code).await {
+    match enrollment
+        .device_grant_poll_s256(&body.device_code, body.code_verifier.as_deref())
+        .await
+    {
         Ok(DevicePollOutcome::Pending) => {
             Json(serde_json::json!({ "status": "pending" })).into_response()
         }
@@ -3979,5 +3995,42 @@ mod tests {
             0,
             "nothing reached the identity provider"
         );
+    }
+    #[tokio::test]
+    async fn device_proxy_relays_s256_without_returning_the_verifier() {
+        let server = idp().await;
+        Mock::given(http_method("POST")).and(http_path("/device"))
+            .and(body_string_contains("code_challenge_method=S256"))
+            .and(body_string_contains("code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"device_code":"dev-s256","user_code":"ABCD","verification_uri":"https://idp.example/activate","expires_in":600})))
+            .expect(1).mount(&server).await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .and(body_string_contains(
+                "code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"access_token":"synthetic-token","token_type":"Bearer"}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let router = router_for(config_with_alias(&server.uri(), "corp"));
+        let response = send(
+            &router,
+            "POST",
+            "/api/oidc/corp/device/start",
+            "gw.local",
+            Some(
+                serde_json::json!({"code_challenge":"E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"}),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_text(response).await;
+        assert!(!body.contains("code_verifier"));
+        let response = send(&router,"POST","/api/oidc/corp/device/poll","gw.local",Some(serde_json::json!({"device_code":"dev-s256","code_verifier":"dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"}))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(body_text(response).await.contains("synthetic-token"));
     }
 }
