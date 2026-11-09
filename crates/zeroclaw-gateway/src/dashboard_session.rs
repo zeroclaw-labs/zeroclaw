@@ -4542,7 +4542,7 @@ mod tests {
                 Arc::new(DashboardSessions::default()),
             );
             let signed = sign_in(&fixture, &server).await;
-            let registry = Arc::new(crate::api_pairing::DeviceRegistry::new(tmp.path()));
+            let registry = Arc::new(crate::api_pairing::DeviceRegistry::new(tmp.path()).unwrap());
             registry
                 .reconcile_from_token_hashes(&pairing.tokens())
                 .unwrap();

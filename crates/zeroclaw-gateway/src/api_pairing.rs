@@ -1287,7 +1287,7 @@ mod tests {
     #[test]
     fn device_revoke_checks_authority_while_holding_the_sqlite_writer() {
         let tmp = tempfile::tempdir().unwrap();
-        let registry = DeviceRegistry::new(tmp.path());
+        let registry = DeviceRegistry::new(tmp.path()).unwrap();
         registry
             .reconcile_from_token_hashes(&["synthetic-token-hash".into()])
             .unwrap();
