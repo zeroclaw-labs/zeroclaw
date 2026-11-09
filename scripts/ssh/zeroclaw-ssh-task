@@ -316,7 +316,7 @@ def client(args):
                                 '-o', 'ControlMaster=no', '-o', 'ControlPersist=no',
                                 '-o', 'ProxyCommand=/usr/bin/false',
                                 '-o', 'BatchMode=yes', '-o', 'ForwardAgent=no',
-                                *options, host, *commands])
+                                *options, '--', host, *commands])
 
 
 if __name__ == '__main__':

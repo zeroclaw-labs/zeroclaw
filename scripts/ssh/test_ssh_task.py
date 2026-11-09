@@ -48,6 +48,19 @@ class TaskTransportTests(unittest.TestCase):
         self.mock.stop()
         self.temp.cleanup()
 
+    def test_command_options_cannot_control_the_shared_transport(self):
+        from unittest.mock import MagicMock
+        for command in [['-O', 'exit'], ['-o', 'ControlMaster=yes']]:
+            peer = MagicMock()
+            with patch.dict(module.os.environ, {'ZEROCLAW_SSH_TASK': 'a' * 32}), \
+                 patch.object(module.socket, 'socket', return_value=peer), \
+                 patch.object(module, 'read_message', return_value={'path': '/synthetic/mux'}), \
+                 patch.object(module.subprocess, 'call', return_value=0) as execute:
+                self.assertEqual(module.client(['alias', *command]), 0)
+                argv = execute.call_args.args[0]
+                delimiter = argv.index('--')
+                self.assertEqual(argv[delimiter + 1:], ['alias', *command])
+
     def test_one_master_per_host_even_with_overlapping_commands(self):
         first = self.pool.acquire('same', [], 'host-a')
         self.assertEqual(self.pool.acquire('same', [], 'host-a'), first)
