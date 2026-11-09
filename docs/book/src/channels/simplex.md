@@ -221,8 +221,10 @@ audio cannot be withdrawn; a rewrite of spoken content stops that speech worker
 instead of replaying it. Text replies are also delivered to the SimpleX chat.
 
 Group chats, generic file attachments, and agent-initiated calls are not handled.
-Android screen-off, Bluetooth routing, TURN reachability, and battery restrictions
-must be verified on the actual phone.
+The SimpleX client owns phone screen locking, Bluetooth routing, and background
+execution. Adapter verification covers encrypted transport, playable voice-note
+encoding, streamed call audio, interruption, and reply delivery through the
+agent's SimpleX profile.
 
 Cancellation stops future synthesis and playback. An already admitted bridge
 request settles its acknowledgement before its owner exits. Lost final-delivery
@@ -270,9 +272,12 @@ interruption. It does not contact phone users or invoke model providers.
 
 For an end-to-end check, send text and a voice note from Android. Confirm
 transcription and text-plus-voice delivery with `output_modality = "voice"`.
-Then start an audio call from Android. Confirm the encryption indicator, speak, hear the reply, interrupt it,
-and repeat with headphones and the screen locked. Confirm that the same
-contact's text chat retains the call's conversation context.
+Then start an audio call from Android. Confirm the encryption indicator, speak,
+hear the streamed reply, and interrupt it. Check that playback stops and stale
+queued audio does not resume. Confirm that the next reply accounts for the
+interruption and the same contact's text chat retains the call's conversation
+context. Screen locking and Bluetooth routing remain client-owned behavior;
+this adapter does not modify the phone application's lifecycle or audio routes.
 
 Disable `calls_enabled` to stop admitting calls, or disable this channel and
 reload the daemon to disconnect the helper. Stop the CLI service if desired.
