@@ -1159,7 +1159,7 @@ impl CryptoStore for SqliteCryptoStore {
         // Serialize calls to `save_pending_changes`; there are multiple await points
         // below, and we're pickling data as we go, so we don't want to
         // invalidate data we've previously read and overwrite it in the store.
-        // TODO: #2000 should make this lock go away, or change its shape.
+        // TODO: The upstream lock refactor should remove or reshape this lock.
         let _guard = self.save_changes_lock.lock().await;
 
         let pickled_account = if let Some(account) = changes.account {
@@ -1189,7 +1189,7 @@ impl CryptoStore for SqliteCryptoStore {
         // Serialize calls to `save_changes`; there are multiple await points below, and
         // we're pickling data as we go, so we don't want to invalidate data
         // we've previously read and overwrite it in the store.
-        // TODO: #2000 should make this lock go away, or change its shape.
+        // TODO: The upstream lock refactor should remove or reshape this lock.
         let _guard = self.save_changes_lock.lock().await;
 
         let pickled_private_identity =
