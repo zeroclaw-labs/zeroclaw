@@ -615,3 +615,90 @@ async fn refused_rotated_ca_preserves_the_saved_trust_anchor() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[tokio::test]
+async fn startup_renewal_honors_current_tls_flags_without_persisting_them() {
+    let f = Fixture::new(false).await;
+    let out = f.run().await;
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let saved = f.saved_login();
+    let mut changed = saved.clone();
+    changed["tls"]["ca_cert_path"] = toml::Value::String(
+        f.dir
+            .path()
+            .join("missing-old-ca.pem")
+            .display()
+            .to_string(),
+    );
+    changed["tls"]["client_cert_path"] = toml::Value::String(
+        f.dir
+            .path()
+            .join("missing-old-cert.pem")
+            .display()
+            .to_string(),
+    );
+    changed["tls"]["client_key_path"] = toml::Value::String(
+        f.dir
+            .path()
+            .join("missing-old-key.pem")
+            .display()
+            .to_string(),
+    );
+    for expired in [true, false] {
+        let before = f.initializes.load(Ordering::SeqCst);
+        let mut doc: toml::Value =
+            toml::from_str(&std::fs::read_to_string(f.config()).unwrap()).unwrap();
+        doc["connection"]["logins"][&f.target] = changed.clone();
+        doc["connection"]["logins"][&f.target]["expires_at"] = toml::Value::Integer(if expired {
+            1
+        } else {
+            chrono::Utc::now().timestamp() + 3600
+        });
+        std::fs::write(f.config(), toml::to_string(&doc).unwrap()).unwrap();
+        if !expired {
+            f.auth_rejections.store(1, Ordering::SeqCst);
+        }
+        let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_zerocode"));
+        cmd.arg("--config-dir")
+            .arg(f.dir.path())
+            .arg("--tls-ca-cert")
+            .arg(f.dir.path().join("ca.pem"))
+            .arg("--tls-client-cert")
+            .arg(f.dir.path().join("client.pem"))
+            .arg("--tls-client-key")
+            .arg(f.dir.path().join("client.key"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        for (key, _) in std::env::vars()
+            .filter(|(key, _)| key.starts_with("ZEROCODE_") || key == "ZEROCLAW_AUTH_TOKEN")
+        {
+            cmd.env_remove(key);
+        }
+        let mut child = cmd.spawn().unwrap();
+        let expected = before + if expired { 2 } else { 3 };
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while f.initializes.load(Ordering::SeqCst) < expected {
+                if let Some(status) = child.try_wait().unwrap() {
+                    panic!("startup failed to use TLS overrides during renewal: {status}");
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("effective overrides must survive renewal and rejected-token retry");
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        let after = f.saved_login();
+        assert_eq!(
+            after["tls"], changed["tls"],
+            "transient TLS flags must not become persistent settings"
+        );
+        assert!(after["expires_at"].as_integer().unwrap() > chrono::Utc::now().timestamp());
+    }
+}

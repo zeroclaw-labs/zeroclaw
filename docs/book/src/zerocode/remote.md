@@ -116,6 +116,11 @@ if a token expires during an active TUI session, restart zerocode to sign in
 again. You can also rerun `zerocode login corp <url>` explicitly. A saved
 custom gateway URL is reused when omitted on a subsequent login.
 
+Startup renewal and a rejected-token retry honor the current `--tls-ca-cert`,
+`--tls-client-cert`, `--tls-client-key`, and `--tls-skip-verify` choices. Those
+one-run flags are not copied into the saved login during automatic renewal;
+use an explicit `zerocode login` invocation to save replacement TLS settings.
+
 `ZEROCLAW_AUTH_TOKEN` still overrides the selected token for a one-off run;
 login warns if that environment variable would shadow the token it just
 saved. Existing manually configured `[connection.wss]` credentials continue to

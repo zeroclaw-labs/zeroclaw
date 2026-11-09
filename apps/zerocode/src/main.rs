@@ -936,7 +936,7 @@ async fn run() -> anyhow::Result<()> {
         .logins
         .contains_key(selected_uri.as_deref().unwrap_or(""))
     {
-        login::renew_expired(&local_config_dir, &mut loaded_config, false).await?;
+        login::renew_expired(&local_config_dir, &mut loaded_config, false, &cli).await?;
     }
     let credential_config_dir = selected_uri
         .as_deref()
@@ -1268,7 +1268,7 @@ async fn run() -> anyhow::Result<()> {
                     // The issuer can revoke before expires_in, or omit it. A
                     // structured auth refusal permits one interactive sign-in,
                     // not a retry loop and never a TLS/transport downgrade.
-                    login::renew_expired(&local_config_dir, &mut loaded_config, true).await?;
+                    login::renew_expired(&local_config_dir, &mut loaded_config, true, &cli).await?;
                     route.auth_token = loaded_config.connection.wss.auth_token.clone();
                     route.auth_provider = loaded_config.connection.wss.auth_provider.clone();
                     route.tls = login::tls_from(&loaded_config.connection.wss.tls);

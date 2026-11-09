@@ -178,6 +178,22 @@ fn new_generation(config_dir: &Path, uri: &str) -> Result<tempfile::TempDir> {
         .context(i18n::t("zc-login-stage-credentials"))
 }
 
+/// Apply this invocation's TLS flags without making them config authority.
+fn apply_tls_overrides(section: &mut config::WssTlsSection, cli: &Cli) -> Result<()> {
+    section.skip_verify |= cli.tls_skip_verify;
+    if let Some(path) = &cli.tls_ca_cert {
+        section.ca_cert_path = absolute(path)?;
+        section.skip_verify = cli.tls_skip_verify;
+    }
+    if let Some(path) = &cli.tls_client_cert {
+        section.client_cert_path = absolute(path)?;
+    }
+    if let Some(path) = &cli.tls_client_key {
+        section.client_key_path = absolute(path)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn tls_from(section: &config::WssTlsSection) -> client::ClientTls {
     client::ClientTls {
         skip_verify: section.skip_verify,
@@ -438,17 +454,7 @@ pub(crate) async fn run(args: &LoginArgs, cli: &Cli, config_dir: &Path) -> Resul
     }
     let credentials = active_credential_dir(config_dir, &uri, &section)?;
     enroll::recover_and_validate(&credentials)?;
-    section.skip_verify |= cli.tls_skip_verify;
-    if let Some(path) = &cli.tls_ca_cert {
-        section.ca_cert_path = absolute(path)?;
-        section.skip_verify = cli.tls_skip_verify;
-    }
-    if let Some(path) = &cli.tls_client_cert {
-        section.client_cert_path = absolute(path)?;
-    }
-    if let Some(path) = &cli.tls_client_key {
-        section.client_key_path = absolute(path)?;
-    }
+    apply_tls_overrides(&mut section, cli)?;
     for (value, name) in [
         (&mut section.ca_cert_path, "ca.crt"),
         (&mut section.client_cert_path, "client.crt"),
@@ -495,6 +501,7 @@ pub(crate) async fn renew_expired(
     config_dir: &Path,
     loaded: &mut config::ZerocodeConfig,
     force: bool,
+    cli: &Cli,
 ) -> Result<()> {
     let Some(uri) = loaded.connection.wss.uri.clone() else {
         return Ok(());
@@ -507,19 +514,21 @@ pub(crate) async fn renew_expired(
         return Ok(());
     }
     enroll::recover_and_validate(&active_credential_dir(config_dir, &uri, &login.tls)?)?;
+    let mut section = login.tls.clone();
+    apply_tls_overrides(&mut section, cli)?;
     if !force
-        && certificate_usable(&login.tls)
+        && certificate_usable(&section)
         && login
             .expires_at
             .is_none_or(|expiry| expiry > chrono::Utc::now().timestamp().saturating_add(30))
     {
+        loaded.connection.wss.tls = section;
         return Ok(());
     }
     let alias = provider_alias(&login.auth_provider)?;
-    let mut section = login.tls.clone();
     let mut gateway_section = login.gateway_tls.clone();
     eprintln!("{}", i18n::t("zc-login-expired"));
-    let renewed = authenticate(
+    let mut renewed = authenticate(
         &uri,
         &login.enroll_url,
         alias,
@@ -529,9 +538,36 @@ pub(crate) async fn renew_expired(
         false,
     )
     .await?;
+    let effective_tls = renewed.login.tls.clone();
+    // Validate and use this run's overrides, but renew only persistent facts:
+    // the token and any newly bootstrapped generation. Ordinary startup must
+    // never turn a transient CA, key path or skip flag into saved trust.
+    if cli.tls_skip_verify || cli.tls_ca_cert.is_some() {
+        renewed.login.tls.skip_verify = login.tls.skip_verify;
+    }
+    if cli.tls_ca_cert.is_some() {
+        let old_credentials = active_credential_dir(config_dir, &uri, &login.tls)?;
+        renewed.login.tls.ca_cert_path = if let Some(generation) = renewed.generation.as_ref()
+            && (login.tls.ca_cert_path.is_empty()
+                || Path::new(&login.tls.ca_cert_path) == old_credentials.join("tls/ca.crt"))
+        {
+            absolute(&generation.path().join("tls/ca.crt").to_string_lossy())?
+        } else {
+            login.tls.ca_cert_path.clone()
+        };
+    }
+    if renewed.generation.is_none() {
+        if cli.tls_client_cert.is_some() {
+            renewed.login.tls.client_cert_path = login.tls.client_cert_path.clone();
+        }
+        if cli.tls_client_key.is_some() {
+            renewed.login.tls.client_key_path = login.tls.client_key_path.clone();
+        }
+    }
     let renewed = renewed.persist(config_dir, &uri, false)?;
     loaded.connection.logins.insert(uri.clone(), renewed);
     loaded.connection.wss = loaded.connection.wss_for(Some(&uri));
+    loaded.connection.wss.tls = effective_tls;
     Ok(())
 }
 

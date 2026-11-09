@@ -1397,7 +1397,19 @@ impl ZerocodePane {
             self.set_ui_save_error(&error);
             return;
         }
-        self.conn = candidate;
+        self.conn = if field == ConnField::Uri {
+            // The selected URL owns its credentials and TLS choices. Do not
+            // keep the previous URL's editable projection after switching it.
+            match config::load_persisted(&self.config_dir) {
+                Ok(config) => config.connection.wss_for(None),
+                Err(error) => {
+                    self.set_ui_save_error(&error);
+                    return;
+                }
+            }
+        } else {
+            candidate
+        };
         self.conn_edit = None;
         self.status = Some(crate::i18n::t("zc-zerocode-conn-saved"));
     }
@@ -3118,5 +3130,66 @@ mod tests {
             "Down in Sections moves to the next section"
         );
         assert_eq!(pane.cursor, PaneCursor::Sections);
+    }
+    #[test]
+    fn switching_saved_connection_reloads_visible_tls_and_edits_only_that_url() {
+        let _guard = crate::test_support::env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let make_login = |skip_verify, route: &str| config::OidcLogin {
+            auth_provider: "oidc.corp".into(),
+            auth_token: "synthetic-token".into(),
+            enroll_url: "https://gateway.example".into(),
+            expires_at: None,
+            tls: config::WssTlsSection {
+                skip_verify,
+                skip_verify_routes: vec![route.into()],
+                ..Default::default()
+            },
+            gateway_tls: config::WssTlsSection::default(),
+        };
+        let a = "wss://first.example/";
+        let b = "wss://second.example/";
+        config::persist_oidc_login(dir.path(), b, &make_login(true, b), false).unwrap();
+        config::persist_oidc_login(dir.path(), a, &make_login(false, a), true).unwrap();
+        let mut pane = ZerocodePane::new(dir.path());
+        pane.focus = Focus::Connection;
+        pane.conn_cursor = CONN_FIELDS
+            .iter()
+            .position(|f| *f == ConnField::Uri)
+            .unwrap();
+        pane.activate_connection();
+        pane.conn_edit.as_mut().unwrap().buf = b.into();
+        pane.handle_conn_edit_key(key(KeyCode::Enter));
+        assert!(pane.conn_edit.is_none());
+        assert_eq!(pane.conn.uri.as_deref(), Some(b));
+        assert_eq!(pane.conn_field_value(ConnField::SkipVerify), "true");
+        assert_eq!(pane.conn_field_value(ConnField::SkipVerifyRoutes), b);
+        let output = render_rows(&mut pane, 120, 16).join("\n");
+        assert!(output.contains(b), "{output}");
+        assert!(
+            !output.contains(a),
+            "previous destination remains visible: {output}"
+        );
+        pane.conn_cursor = CONN_FIELDS
+            .iter()
+            .position(|f| *f == ConnField::SkipVerify)
+            .unwrap();
+        pane.activate_connection();
+        pane.conn_cursor = CONN_FIELDS
+            .iter()
+            .position(|f| *f == ConnField::SkipVerifyRoutes)
+            .unwrap();
+        pane.activate_connection();
+        pane.conn_edit.as_mut().unwrap().buf = "wss://second.example/new-route".into();
+        pane.handle_conn_edit_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(pane.conn_edit.is_none());
+        let saved = config::load_persisted(dir.path()).unwrap();
+        assert!(!saved.connection.logins[b].tls.skip_verify);
+        assert_eq!(
+            saved.connection.logins[b].tls.skip_verify_routes,
+            ["wss://second.example/new-route"]
+        );
+        assert!(!saved.connection.logins[a].tls.skip_verify);
+        assert_eq!(saved.connection.logins[a].tls.skip_verify_routes, [a]);
     }
 }
