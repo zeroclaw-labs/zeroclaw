@@ -453,9 +453,9 @@ pub(crate) async fn prepare_tool_calls(
                 excluded_tools,
                 model_switch_callback: None,
             },
-        )
-        .unwrap_or_else(|| tool_name.clone());
-        if let Some(preview) = &mut detector_preview
+        );
+        if let Some(detector_tool_name) = detector_tool_name
+            && let Some(preview) = &mut detector_preview
             && !ctx
                 .pacing
                 .loop_ignore_tools
@@ -1460,7 +1460,7 @@ mod tests {
         let detector = crate::agent::loop_detector::LoopDetector::new(Default::default());
         let prepared = prepare_tool_calls(
             &ctx,
-            &[],
+            &stub_tools(&["shell"]),
             None,
             &[],
             &calls,
@@ -1484,6 +1484,63 @@ mod tests {
             1
         );
         assert!(!events.iter().any(|event| event.starts_with("after:")));
+    }
+
+    #[tokio::test]
+    async fn loop_preflight_unavailable_calls_do_not_reset_executable_repeats() {
+        for dedup_enabled in [false, true] {
+            let observer = NoopObserver;
+            let pacing = PacingConfig::default();
+            let (tx, _rx) = mpsc::channel(32);
+            let mut ctx = test_ctx(&observer, &pacing, &tx);
+            let exempt = vec!["shell".to_string()];
+            ctx.dedup_exempt_tools = &exempt;
+            let registry = stub_tools(&["shell", "excluded"]);
+            let excluded = vec!["excluded".to_string()];
+            let mut calls = Vec::new();
+            for index in 0..4 {
+                calls.push(parsed_call(
+                    "shell",
+                    serde_json::json!({"command":"same"}),
+                    &format!("s{index}"),
+                ));
+                calls.push(parsed_call(
+                    "unknown",
+                    serde_json::json!({"index":index}),
+                    &format!("u{index}"),
+                ));
+                calls.push(parsed_call(
+                    "excluded",
+                    serde_json::json!({"index":index}),
+                    &format!("e{index}"),
+                ));
+            }
+            let detector = crate::agent::loop_detector::LoopDetector::new(Default::default());
+            let prepared = prepare_tool_calls(
+                &ctx,
+                &registry,
+                None,
+                &excluded,
+                &calls,
+                &mut HashSet::new(),
+                &mut HashSet::new(),
+                0,
+                dedup_enabled,
+                Some(&detector),
+            )
+            .await
+            .unwrap();
+            assert!(prepared.preflight_loop_stopped);
+            assert_eq!(
+                prepared
+                    .executable_calls
+                    .iter()
+                    .filter(|call| call.name == "shell")
+                    .count(),
+                3
+            );
+            assert!(!prepared.ordered_results[9].as_ref().unwrap().2.success);
+        }
     }
 
     struct ArgumentRewriteHook {
@@ -1577,7 +1634,7 @@ mod tests {
             let detector = crate::agent::loop_detector::LoopDetector::new(Default::default());
             let prepared = prepare_tool_calls(
                 &ctx,
-                &[],
+                &stub_tools(&["shell"]),
                 None,
                 &[],
                 &calls,
