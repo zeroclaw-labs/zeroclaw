@@ -13,6 +13,7 @@ ignore = [
     # transitive dep, upstream migration tracked
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; transitive dep awaiting upstream migration to rustls-pki-types" },
     { id = "RUSTSEC-2026-0319", reason = "anymap2 unmaintained; matrix-sdk 0.19.1 still depends on it with no replacement release; remove after upstream migration, tracked in #11429" },
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils unmaintained; async-imap 0.11.3 (and 0.12.0) still depend on it with no release without it; remove after upstream migration, tracked in #12252" },
 ]
 
 [licenses]

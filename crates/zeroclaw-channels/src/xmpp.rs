@@ -118,10 +118,13 @@ pub struct XmppChannel {
 }
 // Prefer challenge-response authentication even if the server advertises
 // PLAIN first. PLAIN remains available for TLS-only servers without SCRAM.
-fn prefer_authenticated_mechanisms(mechanisms: &mut Vec<String>) {
-    let scram = mechanisms.iter().any(|m| matches!(m.as_str(), "SCRAM-SHA-256" | "SCRAM-SHA-1"));
-    mechanisms.retain(|m| matches!(m.as_str(), "SCRAM-SHA-256" | "SCRAM-SHA-1") || (!scram && m == "PLAIN"));
-    mechanisms.sort_by_key(|m| match m.as_str() { "SCRAM-SHA-256" => 0, "SCRAM-SHA-1" => 1, _ => 2 });
+fn prefer_authenticated_mechanisms(mechanisms: &mut std::collections::BTreeSet<String>) {
+    // The library accepts a set, so select the strongest supported mechanism
+    // explicitly instead of depending on its iteration/negotiation order.
+    let preferred = ["SCRAM-SHA-256", "SCRAM-SHA-1", "PLAIN"]
+        .into_iter()
+        .find(|mechanism| mechanisms.contains(*mechanism));
+    mechanisms.retain(|mechanism| Some(mechanism.as_str()) == preferred);
 }
 
 impl XmppChannel {
@@ -1496,14 +1499,14 @@ mod sasl_preference_tests {
     use super::prefer_authenticated_mechanisms;
     #[test]
     fn server_order_cannot_downgrade_scram_to_plain() {
-        let mut mechanisms=vec!["PLAIN".into(),"SCRAM-SHA-1".into(),"SCRAM-SHA-256".into()];
+        let mut mechanisms = ["PLAIN", "SCRAM-SHA-1", "SCRAM-SHA-256"].into_iter().map(str::to_owned).collect();
         prefer_authenticated_mechanisms(&mut mechanisms);
-        assert_eq!(mechanisms,["SCRAM-SHA-256","SCRAM-SHA-1"]);
+        assert_eq!(mechanisms, ["SCRAM-SHA-256".to_owned()].into());
     }
     #[test]
     fn tls_plain_only_servers_remain_supported() {
-        let mut mechanisms=vec!["ANONYMOUS".into(),"PLAIN".into()];
+        let mut mechanisms = ["ANONYMOUS", "PLAIN"].into_iter().map(str::to_owned).collect();
         prefer_authenticated_mechanisms(&mut mechanisms);
-        assert_eq!(mechanisms,["PLAIN"]);
+        assert_eq!(mechanisms, ["PLAIN".to_owned()].into());
     }
 }
