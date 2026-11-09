@@ -18,7 +18,7 @@ zeroclaw-memory.workspace = true
 zeroclaw-providers.workspace = true
 zeroclaw-runtime.workspace = true
 zeroclaw-tool-call-parser.workspace = true
-zeroclaw-tools = { workspace = true, optional = true }
+zeroclaw-tools.workspace = true
 anyhow = "1.0"
 lru = "0.18.2"
 rumqttc = { package = "rumqttc-v4-next", version = "0.34", optional = true }
@@ -222,7 +222,6 @@ channel-email = [
   "dep:mail-parser",
   "dep:rustls",
   "dep:rustls-pki-types",
-  "dep:zeroclaw-tools",
   "tls-client",
 ]
 tls-client = ["dep:tokio-rustls", "dep:webpki-roots"]
@@ -283,8 +282,8 @@ channel-clawdtalk = []
 channel-webhook = ["dep:axum"]
 channel-whatsapp-cloud = []
 channel-voice-call = ["dep:axum"]
-channel-acp-server = ["dep:zeroclaw-tools"]
-channel-matrix = ["dep:matrix-sdk", "dep:mime_guess", "dep:zeroclaw-tools"]
+channel-acp-server = []
+channel-matrix = ["dep:matrix-sdk", "dep:mime_guess"]
 voice-wake = ["dep:cpal"]
 
 [target.'cfg(unix)'.dependencies]
