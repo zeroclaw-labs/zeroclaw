@@ -392,9 +392,12 @@ for a password, the command compares the two: `add` of a name the daemon
 holds, and `passwd` or `disable-password` of an entry the daemon has not
 loaded, are refused until the daemon is restarted. It compares again just
 before it commits, and refuses, to be run again, an edit whose entry another
-writer added or removed through the daemon while the prompt was open. A
-daemon that identifies the caller but will not show it the roster refuses
-the edit too, since it could take the commit unseen.
+writer added or removed through the daemon while the prompt was open. That
+comparison and the commit are separate requests, so a change landing between
+them is not caught: two `add` commands for one name that both pass it can
+combine into one entry. A daemon that identifies the caller but will not
+show it the roster refuses the edit too, since it could take the commit
+unseen.
 `remove` of an entry the daemon never loaded leaves the daemon nothing to
 delete, so the command removes it from the file itself. `remove` of an entry
 `config.toml` no longer has but the daemon still holds, such as one removed

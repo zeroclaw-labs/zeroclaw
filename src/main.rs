@@ -16255,10 +16255,12 @@ impl RosterEdit {
 
     /// Check the edited roster, and the daemon's roster again against what
     /// the edit assumed of it, then commit it as `write` through the daemon
-    /// serving this configuration, when one runs and takes it. Otherwise
+    /// serving this configuration, when one runs and takes it; otherwise
     /// refuse if the file changed since the edit began, and write only the
     /// changed paths. Prints `done`, then how the running daemon took the
-    /// edit, if one runs.
+    /// edit, if one runs. The second roster check and the commit are separate
+    /// requests, so another writer's change landing between them is not
+    /// caught.
     async fn save(mut self, write: RosterWrite, done: &str, sets_password: bool) -> Result<()> {
         check_roster(&self.config)?;
         Box::pin(self.check_daemon_premise(true)).await?;
