@@ -830,7 +830,7 @@ pub(crate) async fn execute_tools_sequential(
                 outcome,
                 executed_tool_name: None,
             }));
-            break;
+            continue;
         }
         let outcome = match execute_one_tool_with_provenance(
             &call.name,
@@ -1083,6 +1083,7 @@ mod tests {
         })];
         let mut calls = vec![parsed_tool_call("activator")];
         calls.extend((0..4).map(|_| parsed_tool_call("deferred")));
+        calls.push(parsed_tool_call("unknown_after_refusal"));
         let meta = TurnMeta {
             parent_agent_alias: None,
             agent_alias: None,
@@ -1113,6 +1114,10 @@ mod tests {
         .unwrap();
         assert_eq!(count.load(Ordering::SeqCst), 3);
         assert!(guard.refused);
+        assert!(
+            outcomes.iter().all(Option::is_some),
+            "policy refusals are not cancellation"
+        );
         assert!(outcomes[4].as_ref().unwrap().executed_tool_name.is_none());
         assert!(!outcomes[4].as_ref().unwrap().outcome.success);
     }
