@@ -1,3 +1,4 @@
+import { nextXmppPolicyKey } from "../lib/xmppPolicy";
 // Schema-driven config editor (#6175). Curated section explorer
 // but lands on a per-section overview: pick a section in the sidebar, see
 // what's currently configured under it, click an item to edit, click +Add
@@ -1091,9 +1092,7 @@ function XmppAllowedUsers({ channelAlias, onSaved }: { channelAlias: string; onS
     setError(null);
     try {
       const { keys } = await getMapKeys("peer_groups");
-      const base = `xmpp_${channelAlias.replace(/[^a-zA-Z0-9_-]/g, "_")}`;
-      let key = base;
-      for (let suffix = 2; keys.includes(key); suffix += 1) key = `${base}_${suffix}`;
+      const key = nextXmppPolicyKey(channelAlias, keys);
       await createMapKey("peer_groups", key);
       // An empty group grants nobody if this second request fails.
       await patchConfig([{ op: "replace", path: `peer_groups.${key}.channel`, value: `xmpp.${channelAlias}` }]);

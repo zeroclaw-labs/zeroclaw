@@ -118,13 +118,35 @@ pub struct XmppChannel {
 }
 // Prefer challenge-response authentication even if the server advertises
 // PLAIN first. PLAIN remains available for TLS-only servers without SCRAM.
-fn prefer_authenticated_mechanisms(mechanisms: &mut std::collections::BTreeSet<String>) {
-    // The library accepts a set, so select the strongest supported mechanism
-    // explicitly instead of depending on its iteration/negotiation order.
-    let preferred = ["SCRAM-SHA-256", "SCRAM-SHA-1", "PLAIN"]
-        .into_iter()
-        .find(|mechanism| mechanisms.contains(*mechanism));
+fn prefer_authenticated_mechanisms(
+    mechanisms: &mut std::collections::BTreeSet<String>,
+    binding: sasl::common::ChannelBinding,
+) -> sasl::common::ChannelBinding {
+    use sasl::common::ChannelBinding;
+    let can_bind = matches!(
+        binding,
+        ChannelBinding::TlsUnique(_) | ChannelBinding::TlsExporter(_)
+    );
+    let preferred = [
+        "SCRAM-SHA-256-PLUS",
+        "SCRAM-SHA-1-PLUS",
+        "SCRAM-SHA-256",
+        "SCRAM-SHA-1",
+        "PLAIN",
+    ]
+    .into_iter()
+    .find(|mechanism| {
+        (can_bind || !mechanism.ends_with("-PLUS")) && mechanisms.contains(*mechanism)
+    });
     mechanisms.retain(|mechanism| Some(mechanism.as_str()) == preferred);
+    if can_bind && !preferred.is_some_and(|mechanism| mechanism.ends_with("-PLUS")) {
+        // Tell SCRAM that binding is supported locally but not advertised by
+        // this server. Otherwise sasl names the mechanism *-PLUS even though
+        // the server only offered the non-PLUS variant.
+        ChannelBinding::Unsupported
+    } else {
+        binding
+    }
 }
 
 impl XmppChannel {
@@ -458,7 +480,7 @@ impl XmppChannel {
             .connect(&jid, ns::JABBER_CLIENT, Timeouts::default())
             .await?;
         let (mut features, stream) = pending.recv_features().await?;
-        prefer_authenticated_mechanisms(&mut features.sasl_mechanisms);
+        let binding = prefer_authenticated_mechanisms(&mut features.sasl_mechanisms, binding);
         ensure!(
             !features.sasl_mechanisms.is_empty(),
             "No supported authenticated XMPP SASL mechanism"
@@ -1498,12 +1520,42 @@ pub mod inbox_admin;
 mod sasl_preference_tests {
     use super::prefer_authenticated_mechanisms;
     #[test]
+    fn advertised_scram_matches_the_actual_client_mechanism() {
+        use sasl::{
+            client::{Mechanism, mechanisms::Scram},
+            common::{ChannelBinding, Credentials, scram::Sha256},
+        };
+        for plus in [false, true] {
+            let mut mechanisms = ["PLAIN", "SCRAM-SHA-256"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<std::collections::BTreeSet<_>>();
+            if plus {
+                mechanisms.insert("SCRAM-SHA-256-PLUS".into());
+            }
+            let binding = prefer_authenticated_mechanisms(
+                &mut mechanisms,
+                ChannelBinding::TlsExporter(vec![7; 32]),
+            );
+            let client = Scram::<Sha256>::from_credentials(
+                Credentials::default()
+                    .with_username("synthetic-user")
+                    .with_password("synthetic-password")
+                    .with_channel_binding(binding),
+            )
+            .unwrap();
+            assert!(mechanisms.contains(client.name()));
+            assert_eq!(client.name().ends_with("-PLUS"), plus);
+            assert!(!mechanisms.contains("PLAIN"));
+        }
+    }
+    #[test]
     fn server_order_cannot_downgrade_scram_to_plain() {
         let mut mechanisms = ["PLAIN", "SCRAM-SHA-1", "SCRAM-SHA-256"]
             .into_iter()
             .map(str::to_owned)
             .collect();
-        prefer_authenticated_mechanisms(&mut mechanisms);
+        prefer_authenticated_mechanisms(&mut mechanisms, sasl::common::ChannelBinding::None);
         assert_eq!(mechanisms, ["SCRAM-SHA-256".to_owned()].into());
     }
     #[test]
@@ -1512,7 +1564,7 @@ mod sasl_preference_tests {
             .into_iter()
             .map(str::to_owned)
             .collect();
-        prefer_authenticated_mechanisms(&mut mechanisms);
+        prefer_authenticated_mechanisms(&mut mechanisms, sasl::common::ChannelBinding::None);
         assert_eq!(mechanisms, ["PLAIN".to_owned()].into());
     }
 }
