@@ -328,7 +328,7 @@ fresh_config() {
     config_dir="$work/config-$case_index"
     mkdir -p "$config_dir"
     cat >"$config_dir/config.toml" <<EOF
-schema_version = 3
+schema_version = 4
 locale = "en"
 
 [reliability]

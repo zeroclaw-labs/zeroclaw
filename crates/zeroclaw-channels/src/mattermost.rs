@@ -3092,6 +3092,12 @@ mod tests {
             "mybot",
             &post
         ));
+        assert!(contains_bot_mention_mm(
+            "你好 @mybot，请处理",
+            "bot123",
+            "mybot",
+            &post
+        ));
     }
 
     #[test]

@@ -16,6 +16,58 @@ pub struct SopAuditLogger {
     memory: Arc<dyn Memory>,
 }
 
+/// The audit logger a session's SOP tool writes through. An unowned
+/// session keeps the logger its tools were built with. Once its session is
+/// pinned to an owner, the logger is one over the owner's routed memory, so
+/// the run payloads and step outputs an audit row carries stay on that
+/// owner's plane rather than the shared one the daemon's logger writes. A
+/// tool built without an audit logger stays without one.
+/// The audit logger that may record a run with `owner`. An unowned run
+/// keeps `audit`. An owned run keeps a logger already on its owner's plane,
+/// gets the shared logger re-scoped to its owner, and gets no logger when
+/// `audit` belongs to another owner, since that owner's plane is the wrong
+/// place for its rows and the rows cannot be moved from there.
+///
+/// Every driver resolves a run's logger through this, from the owner stored
+/// on the run, so the session or surface that happens to resume a run (an
+/// approval on the daemon, another principal's session) cannot move its
+/// payload and step outputs off the owner's plane.
+pub(crate) fn audit_for_run(
+    audit: Option<Arc<SopAuditLogger>>,
+    owner: Option<&zeroclaw_api::memory_traits::PrincipalScope>,
+) -> Option<Arc<SopAuditLogger>> {
+    let audit = audit?;
+    let Some(owner) = owner else {
+        return Some(audit);
+    };
+    match audit.memory.principal_scope() {
+        Some(scope) if scope == *owner => Some(audit),
+        None => Some(Arc::new(SopAuditLogger::new(Arc::new(
+            zeroclaw_memory::PrincipalPlaneMemory::new(Arc::clone(&audit.memory), owner.clone()),
+        )))),
+        Some(_) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "SOP audit: this run belongs to another owner's memory plane; not auditing it here"
+            );
+            None
+        }
+    }
+}
+
+pub(crate) fn session_audit(
+    captured: Option<&Arc<SopAuditLogger>>,
+    session_memory: Option<&Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>>,
+) -> Option<Arc<SopAuditLogger>> {
+    let captured = captured?;
+    match session_memory.and_then(|route| route.routed()) {
+        Some(routed) => Some(Arc::new(SopAuditLogger::new(Arc::clone(&routed.memory)))),
+        None => Some(Arc::clone(captured)),
+    }
+}
+
 impl SopAuditLogger {
     pub fn new(memory: Arc<dyn Memory>) -> Self {
         Self { memory }
@@ -240,6 +292,72 @@ fn category() -> MemoryCategory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_runs_audit_is_resolved_from_its_owner() {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        let shared: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("shared"));
+        let shared_audit = Arc::new(SopAuditLogger::new(Arc::clone(&shared)));
+        let alice = PrincipalScope::new("user:alice").with_agent(Some("a".into()));
+        let bob = PrincipalScope::new("user:bob").with_agent(Some("a".into()));
+
+        let unowned = audit_for_run(Some(Arc::clone(&shared_audit)), None).unwrap();
+        assert!(
+            Arc::ptr_eq(&unowned, &shared_audit),
+            "an unowned run keeps the logger"
+        );
+
+        let rescoped = audit_for_run(Some(Arc::clone(&shared_audit)), Some(&alice)).unwrap();
+        assert_eq!(
+            rescoped.memory.principal_scope(),
+            Some(alice.clone()),
+            "the shared logger is re-scoped to the run's owner"
+        );
+
+        let alices: Arc<dyn Memory> = Arc::new(zeroclaw_memory::PrincipalPlaneMemory::new(
+            Arc::clone(&shared),
+            alice.clone(),
+        ));
+        let alices_audit = Arc::new(SopAuditLogger::new(alices));
+        let kept = audit_for_run(Some(Arc::clone(&alices_audit)), Some(&alice)).unwrap();
+        assert!(
+            Arc::ptr_eq(&kept, &alices_audit),
+            "the owner's own logger is kept"
+        );
+        assert!(
+            audit_for_run(Some(alices_audit), Some(&bob)).is_none(),
+            "another owner's logger may not record the run"
+        );
+        assert!(audit_for_run(None, Some(&alice)).is_none());
+    }
+
+    #[test]
+    fn a_session_audit_follows_its_pinned_route() {
+        let shared: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("shared"));
+        let captured = Arc::new(SopAuditLogger::new(Arc::clone(&shared)));
+        let route = Arc::new(zeroclaw_tools::session_memory::SessionMemoryRoute::default());
+        let unpinned = session_audit(Some(&captured), Some(&route)).unwrap();
+        assert!(
+            Arc::ptr_eq(&unpinned, &captured),
+            "unowned: the captured logger"
+        );
+        let owner: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("owner"));
+        route
+            .pin(
+                Arc::clone(&owner),
+                Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+            )
+            .unwrap();
+        let pinned = session_audit(Some(&captured), Some(&route)).unwrap();
+        assert!(
+            Arc::ptr_eq(&pinned.memory, &owner),
+            "pinned: a logger over the owner's memory"
+        );
+        assert!(
+            session_audit(None, Some(&route)).is_none(),
+            "no captured logger, no audit"
+        );
+    }
     use crate::sop::types::{SopEvent, SopRunStatus, SopStepStatus, SopTriggerSource};
 
     fn test_run() -> SopRun {
@@ -247,6 +365,7 @@ mod tests {
             run_id: "run-test-001".into(),
             sop_name: "test-sop".into(),
             initiating_agent: None,
+            memory_owner: None,
             trigger_event: SopEvent {
                 source: SopTriggerSource::Manual,
                 topic: None,

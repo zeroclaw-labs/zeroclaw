@@ -109,6 +109,39 @@ where
     F: Fn(TurnEvent) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send,
 {
+    execute_turn_prepared(
+        agent,
+        prompt,
+        cancel,
+        attribution,
+        cost_context,
+        connection_activity,
+        steering_rx,
+        admission,
+        (|guard| async { Ok(guard) }, on_event),
+    )
+    .await
+}
+
+pub async fn execute_turn_prepared<F, Fut, P, Prep>(
+    agent: Arc<Mutex<Agent>>,
+    prompt: String,
+    cancel: CancellationToken,
+    attribution: TurnAttribution,
+    cost_context: Option<ToolLoopCostTrackingContext>,
+    connection_activity: Option<crate::rpc::ConnectionActivity>,
+    steering_rx: Option<mpsc::Receiver<crate::agent::SteeringInput>>,
+    admission: Option<TurnAdmission>,
+    callbacks: (P, F),
+) -> Result<TurnOutcome, TurnError>
+where
+    F: Fn(TurnEvent) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+    P: FnOnce(tokio::sync::OwnedMutexGuard<Agent>) -> Prep + Send + 'static,
+    Prep: std::future::Future<Output = Result<tokio::sync::OwnedMutexGuard<Agent>, StreamedTurnError>>
+        + Send,
+{
+    let (prepare, on_event) = callbacks;
     let (event_tx, mut event_rx) = mpsc::channel::<TurnEvent>(64);
     let cancel_clone = cancel.clone();
     let session_key = attribution.session_key.clone();
@@ -120,7 +153,8 @@ where
         // it, and the reload drain must not read zero while it does.
         let _connection_activity = connection_activity;
         let mut steering_rx = steering_rx;
-        let mut guard = agent.lock().await;
+        let guard = agent.lock_owned().await;
+        let mut guard = prepare(guard).await?;
         // Judged on this guard, with no await before the turn starts under
         // it: every earlier check predates at least this lock wait.
         if let Some(admit) = admission
