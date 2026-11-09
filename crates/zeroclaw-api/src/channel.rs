@@ -538,7 +538,10 @@ pub enum RoomVisibility {
 pub enum ProgressEvent {
     Received,
     Planning,
+    /// A request is in flight; no generated reasoning has been observed yet.
     WaitingOnModel,
+    /// Nonempty provider reasoning was observed. Contains no reasoning text.
+    Reasoning,
     RunningTool,
     CompactingContext,
     FinalizingResponse,

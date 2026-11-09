@@ -78,8 +78,10 @@ reload the daemon after changing the bridge executable or CLI endpoint.
 ## Live text replies
 
 Live messages are the default for SimpleX. An admitted turn starts with
-`Processing…`, then shows `Thinking…` while waiting for the model. Safe response
-text replaces that label in the same message as it streams. Updates are
+`Processing…` and keeps it while awaiting provider output, including prompt
+prefill. It shows `Thinking…` only after the provider emits reasoning progress.
+Providers that do not expose reasoning stay at `Processing…` until response
+text arrives. Safe response text replaces the label in the same message as it streams. Updates are
 coalesced to at most two per second, and the message leaves live mode when the
 response completes. Completed narration before tools becomes a finished message;
 the next response phase starts another live message. `channels.show_tool_calls`

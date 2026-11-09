@@ -1107,11 +1107,13 @@ impl Channel for SimplexChannel {
             if let Some(live) = &draft.text {
                 live.update(
                     &simplex_progress(match event {
-                        ProgressEvent::WaitingOnModel => "thinking",
+                        ProgressEvent::Reasoning => "thinking",
                         ProgressEvent::RunningTool
                         | ProgressEvent::CompactingContext
                         | ProgressEvent::FinalizingResponse => "working",
-                        ProgressEvent::Received | ProgressEvent::Planning => "processing",
+                        ProgressEvent::Received
+                        | ProgressEvent::Planning
+                        | ProgressEvent::WaitingOnModel => "processing",
                     }),
                     true,
                 );
@@ -1645,6 +1647,41 @@ mod tests {
         .await
         .unwrap();
     }
+    #[tokio::test]
+    async fn live_text_waits_in_processing_until_reasoning_is_observed() {
+        let (channel, _) = fixture();
+        let (values, worker) = record_bridge(&channel);
+        let id = channel
+            .send_draft(&SendMessage::new("", "17"))
+            .await
+            .unwrap()
+            .unwrap();
+        for (event, state) in [
+            (ProgressEvent::WaitingOnModel, "processing"),
+            (ProgressEvent::Reasoning, "thinking"),
+            (ProgressEvent::WaitingOnModel, "processing"),
+        ] {
+            channel
+                .update_draft_lifecycle("17", &id, event)
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if values.lock().last().is_some_and(|value| {
+                        value["type"] == "live_status" && value["text"] == simplex_progress(state)
+                    }) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        channel.cancel_draft("17", &id).await.unwrap();
+        worker.abort();
+    }
+
     #[tokio::test]
     async fn live_text_coalesces_updates_and_finalizes_without_a_duplicate_send() {
         let (channel, _) = fixture();
