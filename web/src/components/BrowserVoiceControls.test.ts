@@ -225,7 +225,7 @@ test('the language download explicitly requests local recognition', async () => 
 test('configuration includes the usage guide and server-side device persistence explanation', async () => {
   const { default: Settings } = await import('./BrowserVoiceSettings.tsx');
   const html = renderToStaticMarkup(createElement(Settings));
-  for (const text of ['How to use dictation and reading', 'click the microphone', 'press and hold', 'Shift+Enter', 'paired-device ID', 'never switches to an online service']) {
+  for (const text of ['How to use dictation and reading', 'Click the microphone', '15 seconds of silence', 'automatically', '0 for manual-only sending', 'press and hold', 'Shift+Enter', 'paired-device ID', 'never switches to an online service']) {
     assert.ok(html.includes(text), `missing help: ${text}`);
   }
 });

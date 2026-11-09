@@ -177,17 +177,24 @@ impl DeviceRegistry {
         .transpose()
     }
 
-    fn save_voice_preferences(
+    fn save_voice_preferences_authorized<R>(
         &self,
         key: VoiceDeviceKey<'_>,
         preferences: &VoicePreferences,
-    ) -> anyhow::Result<bool> {
+        authorize: impl FnOnce() -> Result<(), R>,
+    ) -> anyhow::Result<Result<bool, R>> {
         let (column, value) = key.column_and_value();
-        let conn = self.open_db()?;
-        Ok(conn.execute(
+        let mut conn = self.open_db()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Err(refusal) = authorize() {
+            return Ok(Err(refusal));
+        }
+        let updated = tx.execute(
             &format!("UPDATE devices SET voice_preferences = ?1 WHERE {column} = ?2"),
             rusqlite::params![serde_json::to_string(preferences)?, value],
-        )? == 1)
+        )? == 1;
+        tx.commit()?;
+        Ok(Ok(updated))
     }
 
     pub fn register(&self, token_hash: String, info: DeviceInfo) -> Result<(), rusqlite::Error> {
@@ -949,13 +956,23 @@ fn registry_voice_preferences(
     key: VoiceDeviceKey<'_>,
     preferences: Option<VoicePreferences>,
 ) -> axum::response::Response {
+    registry_voice_preferences_authorized(registry, key, preferences, || Ok(()))
+}
+
+fn registry_voice_preferences_authorized(
+    registry: &DeviceRegistry,
+    key: VoiceDeviceKey<'_>,
+    preferences: Option<VoicePreferences>,
+    authorize: impl FnOnce() -> Result<(), axum::response::Response>,
+) -> axum::response::Response {
     if let Some(preferences) = preferences {
         if !preferences.valid() {
             return (StatusCode::BAD_REQUEST, "Invalid voice preferences").into_response();
         }
-        match registry.save_voice_preferences(key, &preferences) {
-            Ok(true) => {}
-            Ok(false) => {
+        match registry.save_voice_preferences_authorized(key, &preferences, authorize) {
+            Ok(Err(refusal)) => return refusal,
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => {
                 return (StatusCode::NOT_FOUND, "Paired device not registered").into_response();
             }
             Err(error) => {
@@ -1022,6 +1039,16 @@ fn managed_voice_preferences(
     device_id: &str,
     preferences: Option<VoicePreferences>,
 ) -> axum::response::Response {
+    managed_voice_preferences_authorized(state, headers, device_id, preferences, || Ok(()))
+}
+
+fn managed_voice_preferences_authorized(
+    state: &AppState,
+    headers: &HeaderMap,
+    device_id: &str,
+    preferences: Option<VoicePreferences>,
+    authorize: impl FnOnce() -> Result<(), axum::response::Response>,
+) -> axum::response::Response {
     if let Err(error) = require_auth(state, headers) {
         return error.into_response();
     }
@@ -1044,24 +1071,106 @@ fn managed_voice_preferences(
         )
             .into_response();
     };
-    registry_voice_preferences(registry, VoiceDeviceKey::DeviceId(device_id), preferences)
+    registry_voice_preferences_authorized(
+        registry,
+        VoiceDeviceKey::DeviceId(device_id),
+        preferences,
+        authorize,
+    )
+}
+
+async fn current_operator_voice_preferences(
+    state: &AppState,
+    headers: &HeaderMap,
+    device_id: &str,
+    preferences: Option<VoicePreferences>,
+    dashboard: Option<&DashboardAuth>,
+) -> axum::response::Response {
+    let Some(DashboardCaller::Session(mut session)) = crate::dashboard_session::current_caller()
+    else {
+        return managed_voice_preferences(state, headers, device_id, preferences);
+    };
+    if !state.pairing.require_pairing() {
+        return managed_voice_preferences(state, headers, device_id, preferences);
+    }
+    let Some(dashboard) = dashboard else {
+        return SessionRejection::Invalid.body().into_response();
+    };
+    let mut commit = match state.begin_config_commit().await {
+        Ok(commit) => commit,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Voice preferences write not admitted",
+            )
+                .into_response();
+        }
+    };
+    if dashboard
+        .operator_at_write(state, &session, &commit)
+        .is_none()
+    {
+        drop(commit);
+        session = match dashboard.recheck(state, &session).await {
+            DashboardCaller::Session(fresh) => fresh,
+            DashboardCaller::Rejected(rejection) => return rejection.body().into_response(),
+        };
+        commit = match state.begin_config_commit().await {
+            Ok(commit) => commit,
+            Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Voice preferences write not admitted",
+                )
+                    .into_response();
+            }
+        };
+    }
+    let authorize = || {
+        dashboard
+            .operator_at_write(state, &session, &commit)
+            .unwrap_or_else(|| Err(SessionRejection::Expired.body()))
+            .map_err(IntoResponse::into_response)
+    };
+    if let Err(refusal) = authorize() {
+        return refusal;
+    }
+    // The callback runs again after SQLite acquires its writer. The config
+    // commit fences mapping changes until the effect finishes.
+    managed_voice_preferences_authorized(state, headers, device_id, preferences, authorize)
 }
 
 pub async fn get_device_voice_preferences(
     State(state): State<AppState>,
+    dashboard: Option<Extension<Arc<DashboardAuth>>>,
     headers: HeaderMap,
     axum::extract::Path(device_id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    managed_voice_preferences(&state, &headers, &device_id, None)
+    current_operator_voice_preferences(
+        &state,
+        &headers,
+        &device_id,
+        None,
+        dashboard.as_ref().map(|Extension(auth)| auth.as_ref()),
+    )
+    .await
 }
 
 pub async fn put_device_voice_preferences(
     State(state): State<AppState>,
+    dashboard: Option<Extension<Arc<DashboardAuth>>>,
     headers: HeaderMap,
     axum::extract::Path(device_id): axum::extract::Path<String>,
     Json(preferences): Json<VoicePreferences>,
 ) -> impl IntoResponse {
-    managed_voice_preferences(&state, &headers, &device_id, Some(preferences))
+    current_operator_voice_preferences(
+        &state,
+        &headers,
+        &device_id,
+        Some(preferences),
+        dashboard.as_ref().map(|Extension(auth)| auth.as_ref()),
+    )
+    .await
 }
 
 #[cfg(test)]
