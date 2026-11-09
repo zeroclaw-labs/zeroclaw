@@ -68,13 +68,19 @@ importantly, what changes for existing remote connections.
    narrowed or its credential expired is refused when its turn comes.
 
 Authorization is **live** for edits made through the daemon's RPC config
-methods, which is what zerocode's config editor uses: editing
-`[permission_profiles]`, `[users]`, `[oidc]`, or `security.trust_daemon_uid`
-that way re-compiles the policy at save time. Established native-token and
+methods (used by zerocode's config editor) and its supervised gateway's
+configuration API (used by the web dashboard). Both share the daemon
+generation's live configuration, config write lock, and accepted authorization
+authority. Editing `[permission_profiles]`, `[users]`, `[oidc]`, or
+`security.trust_daemon_uid` through either surface compiles and publishes the
+policy at save time, before the write returns success. Established native-token and
 local connections re-resolve at their next operation, with no reconnect or
-restart, and an OIDC connection must initialize again. Edits made
-outside the daemon, directly in `config.toml`, through the web dashboard, or
-with `zeroclaw config set`, apply at the next daemon reload or restart.
+restart, and an OIDC connection must initialize again. The dashboard's
+pending-reload flag still covers daemon-owned subsystems that need rebuilding;
+it does not delay this authorization publication. Edits made outside the
+daemon, directly in `config.toml` or with `zeroclaw config set`, still apply
+at the next daemon reload or restart. These authorization CLI writes save to disk without
+publishing to the running daemon or triggering its reload.
 Revoking a gateway pairing token through the gateway's pairing controls
 invalidates connections authenticated with it before their next operation.
 Removing a token from `gateway.paired_tokens` by editing config, over RPC
@@ -650,9 +656,11 @@ against the accepted snapshot as it stands. Nothing on the request
 path recompiles policy, so a request that read the configuration
 before a concurrent persist can never reinstall the older policy over
 the newer one; a persisted change to a provider's verification
-settings, a roster or a profile takes effect on the next request. The
-daemon's own RPC surface holds a separate live configuration and
-reaches the same state through the reload the gateway write flags.
+settings, a roster or a profile takes effect on the next request. In a
+supervised run, the gateway and RPC surface share the live configuration,
+write lock, and accepted policy authority, so a save through either surface
+publishes to both. A standalone gateway has its own authority; it does not
+publish changes to a separately running daemon.
 Other gateway surfaces keep the pairing check per handler and adopt the
 layer in follow-ups; a [dashboard sign-in](#dashboard-sign-in) session
 also satisfies that check when its account is an administrator.
@@ -680,9 +688,16 @@ Turning it on needs:
   The official Docker image writes `require_pairing = false` into its
   default config; set it to `true` there, or with
   `ZEROCLAW_gateway__require_pairing=true`.
-- HTTPS (`[gateway.tls]`, or a reverse proxy with
-  `trust_forwarded_headers`). Sign-in is refused over plain HTTP unless
-  the browser runs on the gateway's own machine.
+- HTTPS (`[gateway.tls]`, a reverse proxy with
+  `trust_forwarded_headers`, or a relay-served dashboard with
+  `[relay.dashboard]`, which is relay-terminated: see
+  [secure transport, 3e](../zerocode/secure-transport.md)). Sign-in is
+  refused over plain HTTP unless the browser runs on the gateway's own
+  machine. A relay-served dashboard offers sign-in alone: the relay would
+  see a pairing code or token, so pairing and paired tokens are refused
+  there. An administrator signed in through the relay gives the relay
+  administrator power, including lasting changes, so administer the daemon
+  over a direct connection or with `zerocode`.
 - Behind a reverse proxy, the browser's `Host` passed through unchanged
   (for example `proxy_set_header Host $host;` in nginx). The callback URI
   and the dashboard's own origin are both taken from it, so a proxy that
@@ -695,6 +710,8 @@ Turning it on needs:
   gateway checks the URI against a configured dashboard origin (#12048),
   it builds it from the request's `Host`, and the identity provider's
   exact match is what keeps a sign-in code from going to another address.
+  Through a relay-served dashboard it is always that dashboard's own
+  address, which the daemon logs at startup.
   Its client must be listed in `interactive_clients` (or classified by
   `actor_claim`), and its access tokens must carry the configured
   `audience`.
