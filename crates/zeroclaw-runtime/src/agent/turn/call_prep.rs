@@ -445,15 +445,25 @@ pub(crate) async fn prepare_tool_calls(
             continue;
         }
 
+        let detector_tool_name = crate::agent::tool_execution::dispatch_tool_name(
+            &tool_name,
+            crate::agent::tool_execution::ToolDispatchContext {
+                tools_registry,
+                activated_tools,
+                excluded_tools,
+                model_switch_callback: None,
+            },
+        )
+        .unwrap_or_else(|| tool_name.clone());
         if let Some(preview) = &mut detector_preview
             && !ctx
                 .pacing
                 .loop_ignore_tools
                 .iter()
-                .any(|name| name == &tool_name)
+                .any(|name| name == &detector_tool_name)
         {
             if let crate::agent::loop_detector::LoopDetectionResult::Block(message) =
-                preview.check_before_call(&tool_name, &tool_args)
+                preview.check_before_call(&detector_tool_name, &tool_args)
             {
                 preflight_loop_stopped = true;
                 abandon_prepared_context(ctx, &hook_context, &tool_name).await;
@@ -472,7 +482,7 @@ pub(crate) async fn prepare_tool_calls(
                 ordered_results[idx] = Some((tool_name, call.tool_call_id.clone(), outcome));
                 continue;
             }
-            preview.record(&tool_name, &tool_args, "pending execution");
+            preview.record(&detector_tool_name, &tool_args, "pending execution");
         }
 
         ::zeroclaw_log::record!(
@@ -1503,6 +1513,54 @@ mod tests {
             ))
         }
     }
+    #[tokio::test]
+    async fn loop_preflight_resolves_mcp_aliases_before_admission() {
+        for previous_executions in [0, 3] {
+            let observer = NoopObserver;
+            let pacing = PacingConfig::default();
+            let (tx, _rx) = mpsc::channel(32);
+            let ctx = test_ctx(&observer, &pacing, &tx);
+            let mut activated = crate::tools::ActivatedToolSet::new();
+            activated.activate(
+                "server__action".into(),
+                Arc::new(AttributedTool {
+                    name: "server__action".into(),
+                    provenance: ToolProvenance::Native,
+                }),
+            );
+            let activated = Arc::new(std::sync::Mutex::new(activated));
+            let args = serde_json::json!({"value":1});
+            let mut detector = crate::agent::loop_detector::LoopDetector::new(Default::default());
+            for n in 0..previous_executions {
+                detector.record("server__action", &args, &format!("executed {n}"));
+            }
+            let calls: Vec<_> = ["action", "server__action", "action", "server__action"]
+                .iter()
+                .enumerate()
+                .map(|(i, name)| parsed_call(name, args.clone(), &i.to_string()))
+                .collect();
+            let prepared = prepare_tool_calls(
+                &ctx,
+                &[],
+                Some(&activated),
+                &[],
+                &calls,
+                &mut HashSet::new(),
+                &mut HashSet::new(),
+                0,
+                false,
+                Some(&detector),
+            )
+            .await
+            .unwrap();
+            assert!(prepared.preflight_loop_stopped);
+            assert_eq!(
+                prepared.executable_calls.len(),
+                if previous_executions == 0 { 3 } else { 0 }
+            );
+        }
+    }
+
     #[tokio::test]
     async fn loop_preflight_uses_post_hook_arguments_in_both_directions() {
         for varying in [false, true] {
