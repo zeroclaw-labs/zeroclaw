@@ -22,6 +22,7 @@ class FakeRecognition {
   };
   lang = ''; continuous = false; interimResults = false; processLocally = false;
   onresult: Function | null = null; onerror: Function | null = null; onend: Function | null = null;
+  onspeechstart: Function | null = null; onspeechend: Function | null = null;
   constructor() { capture = this; }
   start() {}
   stop() {
@@ -53,10 +54,15 @@ const preferences = { dictation: true, reading: true, automatic: false, language
 const otherPreferences = { ...preferences, dictation: false, reading: false, voice: 'other-device-voice', language: 'pt-BR', rate: 1.3 };
 const silentPreferences = { ...preferences, dictation: false, reading: false, voice: '' };
 const perDevice = new Map([['synthetic-device', preferences], ['other-device', otherPreferences], ['silent-device', silentPreferences]]);
+let globalSilenceSeconds = 15;
 const requests: { path: string; method: string; body: string | null }[] = [];
 globalThis.fetch = async (input, init) => {
   const path = String(input);
   requests.push({ path, method: init?.method ?? 'GET', body: typeof init?.body === 'string' ? init.body : null });
+  if (path.startsWith('/api/config/prop')) {
+    if (init?.method === 'PUT') { const body = JSON.parse(String(init.body)); assert.equal(body.path, 'gateway.voice_silence_timeout_secs'); globalSilenceSeconds = body.value; }
+    return new Response(JSON.stringify({ path: 'gateway.voice_silence_timeout_secs', value: globalSilenceSeconds }), { headers: { 'Content-Type': 'application/json' } });
+  }
   if (path === '/api/devices') return new Response(JSON.stringify({
     current_device_id: 'synthetic-device',
     devices: [
@@ -434,4 +440,121 @@ test('speaker reads rendered Markdown while preserving literal shell punctuation
   assert.match(spoken[0]!, /apt-get --yes/);
   assert.match(spoken[0]!, /a\*b/);
   await act(async () => { renderer.unmount(); });
+});
+
+
+test('narration omits only the trailing crab signature', async () => {
+  const { speechText } = await import('../lib/speechText.ts');
+  assert.equal(speechText('**Concluído.** 🦀'), 'Concluído.');
+  assert.equal(speechText('Concluído.\n\n🦀 🦀'), 'Concluído.');
+  assert.equal(speechText('🦀'), '');
+  assert.equal(speechText('O 🦀 continua no texto.'), 'O 🦀 continua no texto.');
+});
+
+
+test('silence waits for speech activity, stops capture and submits once after final results', async (context) => {
+  let submitted = 0;
+  let renderer!: ReactTestRenderer;
+  await act(async () => { renderer = create(createElement(Controls, { messages: [], hydrated: true, typing: false, onTranscript() {}, onSilence() { submitted++; } }), options); });
+  context.mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    await act(async () => { await renderer.root.findAllByType('button')[0]!.props.onClick(); });
+    capture.onresult!({ resultIndex: 0, results: [{ isFinal: true, 0: { transcript: 'Ready to send' } }] });
+    capture.onspeechstart?.();
+    await act(async () => { context.mock.timers.tick(30000); });
+    assert.equal(submitted, 0, 'ongoing speech is not silence');
+    capture.onspeechend?.();
+    await act(async () => { context.mock.timers.tick(14999); });
+    assert.equal(submitted, 0);
+    await act(async () => { context.mock.timers.tick(1); });
+    assert.equal(submitted, 1);
+    await act(async () => { context.mock.timers.tick(30000); });
+    assert.equal(submitted, 1);
+  } finally { context.mock.timers.reset(); await act(async () => { renderer.unmount(); }); }
+});
+
+test('empty capture and a cancelled capture never auto-submit', async (context) => {
+  let submitted = 0;
+  let renderer!: ReactTestRenderer;
+  await act(async () => { renderer = create(createElement(Controls, { messages: [], hydrated: true, typing: false, onTranscript() {}, onSilence() { submitted++; } }), options); });
+  context.mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    await act(async () => { await renderer.root.findAllByType('button')[0]!.props.onClick(); });
+    capture.stop = () => { capture.onend?.(); };
+    await act(async () => { context.mock.timers.tick(15000); });
+    assert.equal(submitted, 0);
+    await act(async () => { await renderer.root.findAllByType('button')[0]!.props.onClick(); });
+    capture.onresult!({ resultIndex: 0, results: [{ isFinal: true, 0: { transcript: 'Unsent draft' } }] });
+    await act(async () => { renderer.unmount(); });
+    await act(async () => { context.mock.timers.tick(15000); });
+    assert.equal(submitted, 0);
+  } finally { context.mock.timers.reset(); }
+});
+
+test('formatting-only and signature-only replies do not block continuous narration', async () => {
+  const previous = preferences.automatic; preferences.automatic = true;
+  const renderer = await mount();
+  try {
+    await act(async () => { renderer.update(createElement(Controls, { messages: [reply('old', 'Historical reply'), reply('empty', '---'), reply('signature', '🦀'), reply('next', '**Done** 🦀')], hydrated: true, typing: false, onTranscript() {} })); });
+    assert.deepEqual(spoken, ['Done']);
+  } finally { preferences.automatic = previous; await act(async () => { renderer.unmount(); }); }
+});
+
+
+test('the voice screen edits the global silence property rather than a device record', async () => {
+  const { default: Settings } = await import('./BrowserVoiceSettings.tsx');
+  let renderer!: ReactTestRenderer;
+  await act(async () => { renderer = create(createElement(Settings)); });
+  try {
+    const field = renderer.root.findByProps({ 'aria-label': 'Silence before sending (seconds)' });
+    assert.equal(field.props.value, '15');
+    await act(async () => { field.props.onChange({ target: { value: '35' } }); });
+    const before = requests.length;
+    await act(async () => { renderer.root.findAllByType('button').find(button => button.children.includes('Save global voice settings'))!.props.onClick(); });
+    assert.equal(globalSilenceSeconds, 35);
+    const writes = requests.slice(before).filter(request => request.method === 'PUT');
+    assert.equal(writes.length, 1);
+    assert.equal(writes[0]!.path, '/api/config/prop');
+    assert.deepEqual(JSON.parse(writes[0]!.body!), { path: 'gateway.voice_silence_timeout_secs', value: 35 });
+  } finally { globalSilenceSeconds = 15; await act(async () => { renderer.unmount(); }); }
+});
+
+test('global zero disables automatic sending and hidden chats cancel pending sends', async (context) => {
+  globalSilenceSeconds = 0;
+  let submitted = 0;
+  let renderer!: ReactTestRenderer;
+  const mountControl = async () => { await act(async () => { renderer = create(createElement(Controls, { messages: [], hydrated: true, typing: false, onTranscript() {}, onSilence() { submitted++; } }), options); }); };
+  await mountControl();
+  context.mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    await act(async () => { await renderer.root.findAllByType('button')[0]!.props.onClick(); });
+    capture.onresult!({ resultIndex: 0, results: [{ isFinal: true, 0: { transcript: 'Manual only' } }] });
+    await act(async () => { context.mock.timers.tick(60000); });
+    assert.equal(submitted, 0);
+    await act(async () => { renderer.unmount(); });
+    globalSilenceSeconds = 15;
+    await mountControl();
+    await act(async () => { await renderer.root.findAllByType('button')[0]!.props.onClick(); });
+    capture.onresult!({ resultIndex: 0, results: [{ isFinal: true, 0: { transcript: 'Cancel on hiding' } }] });
+    await act(async () => { fakeDocument.visibilityState = 'hidden'; fakeDocument.dispatchEvent(new Event('visibilitychange')); });
+    await act(async () => { context.mock.timers.tick(15000); });
+    assert.equal(submitted, 0);
+  } finally { globalSilenceSeconds = 15; fakeDocument.visibilityState = 'visible'; context.mock.timers.reset(); await act(async () => { renderer.unmount(); }); }
+});
+
+
+test('a browser ending recognition early still waits out the configured silence', async (context) => {
+  let submitted = 0;
+  let renderer!: ReactTestRenderer;
+  await act(async () => { renderer = create(createElement(Controls, { messages: [], hydrated: true, typing: false, onTranscript() {}, onSilence() { submitted++; } }), options); });
+  context.mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    await act(async () => { await renderer.root.findAllByType('button')[0]!.props.onClick(); });
+    capture.onresult!({ resultIndex: 0, results: [{ isFinal: true, 0: { transcript: 'Completed dictation' } }] });
+    await act(async () => { context.mock.timers.tick(5000); capture.onend?.(); });
+    await act(async () => { context.mock.timers.tick(9999); });
+    assert.equal(submitted, 0);
+    await act(async () => { context.mock.timers.tick(1); });
+    assert.equal(submitted, 1);
+  } finally { context.mock.timers.reset(); await act(async () => { renderer.unmount(); }); }
 });

@@ -17,5 +17,5 @@ export function speechText(markdown: string): string {
     const content = Array.from(node.childNodes, text).join('');
     return blocks.has(element.tagName) ? `\n${content}\n` : content;
   };
-  return Array.from(doc.body.childNodes, text).join('').replace(/[ \t]+/g, ' ').replace(/ *\n */g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+  return Array.from(doc.body.childNodes, text).join('').replace(/[ \t]+/g, ' ').replace(/ *\n */g, '\n').replace(/\n{3,}/g, '\n\n').trim().replace(/(?:\s*🦀\uFE0F?)+\s*$/u, '').trim();
 }

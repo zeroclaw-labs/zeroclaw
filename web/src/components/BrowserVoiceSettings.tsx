@@ -2,12 +2,25 @@ import { useEffect, useRef, useState } from 'react';
 import { t } from '@/lib/i18n';
 import { apiFetch } from '@/lib/api';
 import { Button } from '@/components/ui';
-import { localRecognitionStatus, recognitionConstructor, saveVoicePreferences, useBrowserVoices, useVoicePreferences, type VoicePreferences } from '@/lib/browserVoice';
+import { useGlobalVoiceTimeout, saveGlobalVoiceTimeout, localRecognitionStatus, recognitionConstructor, saveVoicePreferences, useBrowserVoices, useVoicePreferences, type VoicePreferences } from '@/lib/browserVoice';
 
 interface PairedDevice { id: string; name: string | null; device_type: string | null }
 interface DeviceInventory { devices: PairedDevice[]; current_device_id: string | null }
 
 export default function BrowserVoiceSettings() {
+  const globalTimeout = useGlobalVoiceTimeout();
+  const [timeoutDraft, setTimeoutDraft] = useState('');
+  const [globalSaving, setGlobalSaving] = useState(false);
+  const [globalError, setGlobalError] = useState('');
+  useEffect(() => { if (globalTimeout.seconds !== null) setTimeoutDraft(String(globalTimeout.seconds)); }, [globalTimeout.seconds]);
+  const saveTimeout = async () => {
+    const seconds = Number(timeoutDraft);
+    if (!timeoutDraft.trim() || !Number.isInteger(seconds) || seconds < 0 || seconds > 300) { setGlobalError(t('voice.silence_invalid')); return; }
+    setGlobalSaving(true);
+    try { await saveGlobalVoiceTimeout(seconds); setGlobalError(''); }
+    catch { setGlobalError(t('voice.storage_error')); }
+    finally { setGlobalSaving(false); }
+  };
   const [inventory, setInventory] = useState<DeviceInventory>({ devices: [], current_device_id: null });
   const [selectedDeviceId, setSelectedDeviceId] = useState<string>();
   const [inventoryLoading, setInventoryLoading] = useState(true);
@@ -76,6 +89,15 @@ export default function BrowserVoiceSettings() {
   return (
     <div className="text-pc-text">
       <p className="mt-3 max-w-2xl text-sm text-pc-text-muted">{t('voice.help_intro')}</p>
+      <fieldset className="mt-3 max-w-2xl border border-pc-border rounded p-3" disabled={globalTimeout.seconds === null || globalSaving}>
+        <legend>{t('voice.global_settings')}</legend>
+        <label>{t('voice.silence_seconds')}
+          <input aria-label={t('voice.silence_seconds')} type="number" min="0" max="300" step="1" value={timeoutDraft} onChange={e => setTimeoutDraft(e.target.value)} />
+        </label>
+        <p>{t('voice.silence_help')}</p>
+        <Button size="sm" onClick={() => void saveTimeout()}>{t('voice.save_global')}</Button>
+      </fieldset>
+      {(globalTimeout.error || globalError) && <p role="alert">{globalError || t('voice.global_load_error')}</p>}
       <label className="grid gap-1 mt-3 max-w-2xl text-sm">{t('voice.device')}
         <select aria-label={t('voice.device')} size={Math.min(5, Math.max(2, inventory.devices.length))}
           className="border border-pc-border rounded p-2 bg-pc-base w-full"

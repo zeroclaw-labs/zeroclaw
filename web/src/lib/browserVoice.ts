@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { apiFetch } from './api';
+import { apiFetch, getProp, putProp } from './api';
 import { getToken } from './auth';
 
 export interface VoicePreferences {
@@ -115,6 +115,8 @@ export interface Recognition {
   onresult: ((event: { resultIndex: number; results: ArrayLike<{ isFinal: boolean; 0: { transcript: string } }> }) => void) | null;
   onerror: ((event: { error: string }) => void) | null;
   onend: (() => void) | null;
+  onspeechstart?: (() => void) | null;
+  onspeechend?: (() => void) | null;
   start(): void;
   stop(): void;
   abort(): void;
@@ -147,4 +149,35 @@ export function useBrowserVoices() {
 }
 export function shortPressAction(continuous: boolean, speaking: boolean): 'off' | 'once' {
   return continuous || speaking ? 'off' : 'once';
+}
+
+
+export function useGlobalVoiceTimeout() {
+  const [seconds, setSeconds] = useState<number | null>(null);
+  const [error, setError] = useState(false);
+  useEffect(() => {
+    let active = true;
+    let version = 0;
+    const refresh = async () => {
+      const current = ++version;
+      setSeconds(null);
+      try {
+        const result = await getProp('gateway.voice_silence_timeout_secs');
+        if (typeof result.value !== 'number' || !Number.isInteger(result.value) || result.value < 0 || result.value > 300) throw new Error('Invalid global voice timeout');
+        if (active && current === version) { setSeconds(result.value); setError(false); }
+      } catch { if (active && current === version) { setSeconds(null); setError(true); } }
+    };
+    const visible = () => { if (document.visibilityState === 'visible') void refresh(); };
+    window.addEventListener('focus', refresh);
+    window.addEventListener('zeroclaw-config-mutated', refresh);
+    document.addEventListener('visibilitychange', visible);
+    void refresh();
+    return () => { active = false; window.removeEventListener('focus', refresh); window.removeEventListener('zeroclaw-config-mutated', refresh); document.removeEventListener('visibilitychange', visible); };
+  }, []);
+  return { seconds, error };
+}
+
+export async function saveGlobalVoiceTimeout(seconds: number) {
+  await putProp('gateway.voice_silence_timeout_secs', seconds);
+  window.dispatchEvent(new Event('zeroclaw-config-mutated'));
 }

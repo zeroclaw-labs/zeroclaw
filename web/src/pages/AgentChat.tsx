@@ -309,6 +309,7 @@ export function AgentChatInner({
     }
   }, [addLocalMessage, clearAllMessages, startNewSession, currentModel, availableModels, switchModel, modelLoading]);
 
+  const [voiceSubmitRequested, setVoiceSubmitRequested] = useState<string | null>(null);
   const cancelVoiceCapture = useRef<(() => void) | null>(null);
   const handleSend = () => {
     const trimmed = input.trim();
@@ -336,6 +337,13 @@ export function AgentChatInner({
       inputRef.current.focus();
     }
   };
+
+  useEffect(() => {
+    if (!voiceSubmitRequested) return;
+    setVoiceSubmitRequested(null);
+    // A voice timeout submits a normal ready draft, never a local slash command.
+    if (voiceSubmitRequested === draftKey && connected && hydrated && !typing && input.trim() && !isSlashCommand(input.trim())) handleSend();
+  });
 
   const isComposingRef = useRef(false);
 
@@ -764,7 +772,7 @@ export function AgentChatInner({
           </div>
         )}
         <div className="flex items-end gap-3 max-w-4xl mx-auto">
-          <BrowserVoiceControls key={draftKey} captureRef={cancelVoiceCapture} messages={messages} hydrated={hydrated} typing={typing} onTranscript={text => applyInput(prev => `${prev}${prev && !/\s$/.test(prev) ? ' ' : ''}${text}`)} />
+          <BrowserVoiceControls key={draftKey} captureRef={cancelVoiceCapture} onSilence={() => setVoiceSubmitRequested(draftKey)} messages={messages} hydrated={hydrated} typing={typing} onTranscript={text => applyInput(prev => `${prev}${prev && !/\s$/.test(prev) ? ' ' : ''}${text}`)} />
           <input
             ref={fileInputRef}
             type="file"

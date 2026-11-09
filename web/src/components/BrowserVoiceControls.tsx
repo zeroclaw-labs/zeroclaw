@@ -3,14 +3,19 @@ import { Mic, MicOff, Volume2, VolumeX } from 'lucide-react';
 import type { ChatMessage } from '@/contexts/AgentContext';
 import { t } from '@/lib/i18n';
 import { speechText } from '@/lib/speechText';
-import { localRecognitionStatus, recognitionConstructor, shortPressAction, useBrowserVoices, useVoicePreferences, type Recognition } from '@/lib/browserVoice';
+import { useGlobalVoiceTimeout, localRecognitionStatus, recognitionConstructor, shortPressAction, useBrowserVoices, useVoicePreferences, type Recognition } from '@/lib/browserVoice';
 
-export default function BrowserVoiceControls({ messages, hydrated, typing, onTranscript, captureRef }: {
+export default function BrowserVoiceControls({ messages, hydrated, typing, onTranscript, onSilence, captureRef }: {
   messages: ChatMessage[]; hydrated: boolean; typing: boolean; onTranscript: (text: string) => void;
   captureRef?: Ref<() => void>;
+  onSilence?: () => void;
 }) {
   const { preferences: prefs, ready } = useVoicePreferences();
   const voices = useBrowserVoices();
+  const { seconds: silenceSeconds } = useGlobalVoiceTimeout();
+  const silenceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autoSubmit = useRef(false);
+  const clearSilence = () => { if (silenceTimer.current) clearTimeout(silenceTimer.current); silenceTimer.current = null; };
   const [override, setOverride] = useState<boolean | null>(null);
   const continuous = override ?? prefs.automatic;
   const [listening, setListening] = useState(false);
@@ -33,10 +38,12 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
     setSpeaking(false);
   };
   const stopCapture = () => {
+    clearSilence(); autoSubmit.current = false;
     generation.current++;
     finishing.current = false;
     if (recognition.current) {
       recognition.current.onresult = null; recognition.current.onerror = null;
+      recognition.current.onspeechstart = null; recognition.current.onspeechend = null;
       recognition.current.onend = null; recognition.current.abort(); recognition.current = null;
     }
     setListening(false);
@@ -68,7 +75,12 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
     }
     if (typing) return;
     const unseen = replies.filter(m => !m.fromHistory && !baseline.current!.has(m.id));
-    const next = unseen[0];
+    // Formatting-only replies and a signature are not queue barriers.
+    const next = unseen.find(reply => {
+      if (speechText(reply.content)) return true;
+      baseline.current!.add(reply.id);
+      return false;
+    });
     // Only consume the reply whose playback actually started. Later replies
     // stay pending until the current utterance ends.
     if (next) {
@@ -90,7 +102,7 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
       if (timer.current) clearTimeout(timer.current);
       stopAll();
     };
-  }, [ready, prefs.dictation, prefs.reading]);
+  }, [ready, prefs.dictation, prefs.reading, silenceSeconds]);
   useEffect(() => {
     if (!prefs.dictation) stopCapture();
     if (!prefs.reading) stopSpeech();
@@ -128,11 +140,26 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
     if (prefs.recognition === 'local' && !('processLocally' in capture)) {
       setListening(false); setError(t('voice.local_unavailable')); return;
     }
-    capture.lang = prefs.language; capture.continuous = true; capture.interimResults = false;
+    capture.lang = prefs.language; capture.continuous = true; capture.interimResults = true;
+    let captureEnded = false;
+    const armSilence = () => {
+      clearSilence();
+      if (!silenceSeconds) return;
+      silenceTimer.current = setTimeout(() => {
+        if (generation.current !== version) return;
+        if (!visible()) { stopCapture(); return; }
+        if (captureEnded) { clearSilence(); if (receivedText) onSilence?.(); return; }
+        autoSubmit.current = true; finishing.current = true;
+        try { capture.stop(); } catch { stopCapture(); setError(t('voice.capture_error')); }
+      }, silenceSeconds * 1000);
+    };
+    capture.onspeechstart = clearSilence;
+    capture.onspeechend = armSilence;
     if (prefs.recognition === 'local') capture.processLocally = true;
     let receivedText = false;
     capture.onresult = event => {
       if (generation.current !== version || !visible()) return;
+      armSilence();
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const result = event.results[i];
         const text = result?.isFinal ? result[0].transcript.trim() : '';
@@ -149,13 +176,20 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
     };
     capture.onend = () => {
       if (generation.current !== version) return;
+      captureEnded = true;
+      const manualStop = finishing.current && !autoSubmit.current;
+      const shouldSubmit = autoSubmit.current && receivedText && visible();
+      if (manualStop || autoSubmit.current || !receivedText || !visible()) clearSilence();
+      else if (!silenceTimer.current) armSilence();
+      autoSubmit.current = false;
       recognition.current = null;
       finishing.current = false;
       setListening(false);
       if (!receivedText && visible()) setError(t('voice.no_transcript'));
+      if (shouldSubmit) onSilence?.();
     };
     recognition.current = capture;
-    try { capture.start(); } catch { stopCapture(); setError(t('voice.capture_error')); }
+    try { capture.start(); armSilence(); } catch { stopCapture(); setError(t('voice.capture_error')); }
   };
   const shortPress = () => {
     if (longPressed.current) { longPressed.current = false; return; }
