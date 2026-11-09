@@ -17849,19 +17849,45 @@ options = { extract_text_tool_calls = true }
 
     #[tokio::test]
     async fn before_llm_hook_uses_selected_route_for_complete_tool_protocol() {
+        assert_hook_selected_tool_protocol(false).await;
+    }
+
+    #[tokio::test]
+    async fn before_llm_hook_can_replace_a_mixed_default_with_a_valid_tool_route() {
+        assert_hook_selected_tool_protocol(true).await;
+    }
+
+    async fn assert_hook_selected_tool_protocol(mixed_default: bool) {
         let tmp = tempfile::tempdir().expect("temp workspace");
         let default_requests: CapturedToolProtocolRequests = Arc::new(Mutex::new(Vec::new()));
         let text_requests: CapturedToolProtocolRequests = Arc::new(Mutex::new(Vec::new()));
+        let default_provider: Box<dyn ModelProvider> = Box::new(HookProtocolCaptureProvider {
+            supports_native: true,
+            requests: Arc::clone(&default_requests),
+        });
+        let default_provider: Box<dyn ModelProvider> = if mixed_default {
+            Box::new(zeroclaw_providers::reliable::ReliableModelProvider::new(
+                "mixed-default",
+                vec![
+                    ("native".into(), default_provider),
+                    (
+                        "text-backup".into(),
+                        Box::new(HookProtocolCaptureProvider {
+                            supports_native: false,
+                            requests: Arc::clone(&default_requests),
+                        }),
+                    ),
+                ],
+                0,
+                0,
+            ))
+        } else {
+            default_provider
+        };
         let router = zeroclaw_providers::router::RouterModelProvider::new(
             "hook-router",
             vec![
-                (
-                    "default".into(),
-                    Box::new(HookProtocolCaptureProvider {
-                        supports_native: true,
-                        requests: Arc::clone(&default_requests),
-                    }) as Box<dyn ModelProvider>,
-                ),
+                ("default".into(), default_provider),
                 (
                     "text".into(),
                     Box::new(HookProtocolCaptureProvider {

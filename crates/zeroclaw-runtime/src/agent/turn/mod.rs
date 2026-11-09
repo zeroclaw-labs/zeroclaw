@@ -2356,7 +2356,9 @@ async fn run_tool_call_loop_impl<'a>(
                 context_limits: active_context_limits,
             });
         }
-        iteration_tool_specs.refresh_native_tool_mode(active_model_provider, protocol_model)?;
+        iteration_tool_specs
+            .validate_tool_protocol(active_model_provider, provider_dispatch_model)?;
+        iteration_tool_specs.refresh_native_tool_mode(active_model_provider, protocol_model);
         let tool_specs = iteration_tool_specs.request_tool_specs();
         let use_native_tools = iteration_tool_specs.use_native_tools;
         let builtin_prompt_section = activated_tools.and_then(|state| {
