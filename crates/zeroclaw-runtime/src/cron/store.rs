@@ -2203,6 +2203,12 @@ fn with_existing_initialized_connection<T>(
         )
     })?;
     initialize_schema(&conn, config)?;
+    #[cfg(test)]
+    let conn = {
+        let mut conn = conn;
+        install_patch_writer_wait_handler(&mut conn)?;
+        conn
+    };
 
     f(&conn).map(Some)
 }
@@ -2234,6 +2240,12 @@ pub(super) fn with_initialized_connection<T>(
     let conn = Connection::open(&db_path)
         .with_context(|| format!("Failed to open cron DB: {}", db_path.display().to_string()))?;
     initialize_schema(&conn, config)?;
+    #[cfg(test)]
+    let conn = {
+        let mut conn = conn;
+        install_patch_writer_wait_handler(&mut conn)?;
+        conn
+    };
 
     f(&conn)
 }
@@ -2492,13 +2504,9 @@ const MIGRATION_CONTENTION_CONTEXT: &str = concat!(
     "incomplete; the operation was not started and can be retried"
 );
 
-/// Begin an IMMEDIATE transaction for a recovery or migration write: the
-/// write lock is taken up front, so the busy timeout applies to acquiring
-/// it — unlike a deferred transaction's read-to-write upgrade, which SQLite
-/// fails immediately without consulting the busy handler.
-fn begin_immediate<'c>(conn: &'c Connection, phase: &str) -> Result<Transaction<'c>> {
-    #[cfg(test)]
-    if phase == "job patch" && PATCH_WRITER_WAIT.with(|sender| sender.borrow().is_some()) {
+#[cfg(test)]
+fn install_patch_writer_wait_handler(conn: &mut Connection) -> Result<()> {
+    if PATCH_WRITER_WAIT.with(|sender| sender.borrow().is_some()) {
         conn.busy_handler(Some(|attempt| {
             PATCH_WRITER_WAIT.with(|sender| {
                 if let Some(sender) = sender.borrow_mut().take() {
@@ -2509,6 +2517,14 @@ fn begin_immediate<'c>(conn: &'c Connection, phase: &str) -> Result<Transaction<
             attempt < 500
         }))?;
     }
+    Ok(())
+}
+
+/// Begin an IMMEDIATE transaction for a recovery or migration write: the
+/// write lock is taken up front, so the busy timeout applies to acquiring
+/// it — unlike a deferred transaction's read-to-write upgrade, which SQLite
+/// fails immediately without consulting the busy handler.
+fn begin_immediate<'c>(conn: &'c Connection, phase: &str) -> Result<Transaction<'c>> {
     Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .with_context(|| format!("Failed to begin cron {phase} transaction"))
 }
