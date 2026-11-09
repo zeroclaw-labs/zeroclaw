@@ -277,17 +277,18 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
         <ChevronDown className="h-3 w-3 shrink-0" />
       </button>
 
-      {/* `@xl` and `100cqw` resolve against the AgentChat header's
-          `@container`. Below 36rem of header content width the trigger starts
-          its own line at the inline start, so the panel opens from there; the
-          model panel stays end-anchored because that picker is always last in
-          the row. */}
+      {/* Breakpoint: see the AgentChat header comment. Below it the trigger
+          starts its own line, so the panel opens from the inline start; the
+          model panel stays end-anchored because that picker is always last.
+          `100cqw` can't name a container, so it uses the nearest size
+          container, which is the header as long as nothing in between becomes
+          one. */}
       {open && (
         <div
           id={panelId}
           role="group"
           aria-label={t('agent.sessions')}
-          className="absolute start-0 @xl:start-auto @xl:end-0 mt-1.5 rounded-[var(--radius-md)] border border-pc-border bg-pc-elevated shadow-[var(--pc-shadow-md)] z-50 py-1 w-[300px] max-w-[100cqw] max-h-80 overflow-y-auto"
+          className="absolute start-0 @xl/chat-header:start-auto @xl/chat-header:end-0 mt-1.5 rounded-[var(--radius-md)] border border-pc-border bg-pc-elevated shadow-[var(--pc-shadow-md)] z-50 py-1 w-[300px] max-w-[100cqw] max-h-80 overflow-y-auto"
         >
           {storesConversations ? (
             <button
