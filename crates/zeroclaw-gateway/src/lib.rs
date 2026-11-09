@@ -7570,7 +7570,12 @@ path = "{trigger_path}"
             let (status, paired) = pair_with(&state, code).await;
             assert_eq!(status, StatusCode::OK, "{paired}");
             let token = paired["token"].as_str().unwrap();
-            let saved = config_on_disk(&tmp);
+            let mut saved = config_on_disk(&tmp);
+            // Match load_or_init: shared-operator hashes are secret fields,
+            // while roster-bound hashes are stored in the separate plain map.
+            let secrets =
+                zeroclaw_config::secrets::SecretStore::new(tmp.path(), saved.secrets.encrypt);
+            saved.decrypt_secrets(&secrets).unwrap();
             let restarted = PairingGuard::from_gateway_config(&saved.gateway);
             assert_eq!(restarted.subject_for_token(token), Some(alice()));
             assert!(!restarted.is_authenticated(token));
