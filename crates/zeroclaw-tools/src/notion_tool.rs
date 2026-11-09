@@ -9,6 +9,8 @@ const NOTION_VERSION: &str = "2022-06-28";
 const NOTION_REQUEST_TIMEOUT_SECS: u64 = 30;
 /// Maximum number of characters to include from an error response body.
 const MAX_ERROR_BODY_CHARS: usize = 500;
+/// Maximum size of a Notion API response body in bytes (2 MiB).
+const NOTION_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Tool for interacting with the Notion API — query databases, read/create/update pages,
 /// and search the workspace. Each action is gated by the appropriate security operation
@@ -50,6 +52,24 @@ impl NotionTool {
         Ok(headers)
     }
 
+    /// Parse and validate a JSON response from the Notion API with a bounded body reader.
+    async fn parse_json_response(resp: reqwest::Response, op: &str) -> anyhow::Result<serde_json::Value> {
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            let truncated =
+                crate::util_helpers::truncate_with_ellipsis(&text, MAX_ERROR_BODY_CHARS);
+            anyhow::bail!("Notion {op} failed ({status}): {truncated}");
+        }
+        let body =
+            crate::helpers::response_body::read_bounded(resp, Some(NOTION_MAX_RESPONSE_BYTES))
+                .await?;
+        if body.overflowed {
+            anyhow::bail!("Notion {op} response exceeded {NOTION_MAX_RESPONSE_BYTES} bytes limit");
+        }
+        serde_json::from_slice(&body.bytes).map_err(Into::into)
+    }
+
     /// Query a Notion database with an optional filter.
     async fn query_database(
         &self,
@@ -69,14 +89,7 @@ impl NotionTool {
             .timeout(std::time::Duration::from_secs(NOTION_REQUEST_TIMEOUT_SECS))
             .send()
             .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            let truncated =
-                crate::util_helpers::truncate_with_ellipsis(&text, MAX_ERROR_BODY_CHARS);
-            anyhow::bail!("Notion query_database failed ({status}): {truncated}");
-        }
-        resp.json().await.map_err(Into::into)
+        Self::parse_json_response(resp, "query_database").await
     }
 
     /// Read a single Notion page by ID.
@@ -89,14 +102,7 @@ impl NotionTool {
             .timeout(std::time::Duration::from_secs(NOTION_REQUEST_TIMEOUT_SECS))
             .send()
             .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            let truncated =
-                crate::util_helpers::truncate_with_ellipsis(&text, MAX_ERROR_BODY_CHARS);
-            anyhow::bail!("Notion read_page failed ({status}): {truncated}");
-        }
-        resp.json().await.map_err(Into::into)
+        Self::parse_json_response(resp, "read_page").await
     }
 
     /// Create a new Notion page, optionally within a database.
@@ -118,14 +124,7 @@ impl NotionTool {
             .timeout(std::time::Duration::from_secs(NOTION_REQUEST_TIMEOUT_SECS))
             .send()
             .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            let truncated =
-                crate::util_helpers::truncate_with_ellipsis(&text, MAX_ERROR_BODY_CHARS);
-            anyhow::bail!("Notion create_page failed ({status}): {truncated}");
-        }
-        resp.json().await.map_err(Into::into)
+        Self::parse_json_response(resp, "create_page").await
     }
 
     /// Update an existing Notion page's properties.
@@ -144,14 +143,7 @@ impl NotionTool {
             .timeout(std::time::Duration::from_secs(NOTION_REQUEST_TIMEOUT_SECS))
             .send()
             .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            let truncated =
-                crate::util_helpers::truncate_with_ellipsis(&text, MAX_ERROR_BODY_CHARS);
-            anyhow::bail!("Notion update_page failed ({status}): {truncated}");
-        }
-        resp.json().await.map_err(Into::into)
+        Self::parse_json_response(resp, "update_page").await
     }
 
     /// Search the Notion workspace by query string.
@@ -166,14 +158,7 @@ impl NotionTool {
             .timeout(std::time::Duration::from_secs(NOTION_REQUEST_TIMEOUT_SECS))
             .send()
             .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            let truncated =
-                crate::util_helpers::truncate_with_ellipsis(&text, MAX_ERROR_BODY_CHARS);
-            anyhow::bail!("Notion search failed ({status}): {truncated}");
-        }
-        resp.json().await.map_err(Into::into)
+        Self::parse_json_response(resp, "search").await
     }
 }
 
@@ -329,13 +314,20 @@ impl Tool for NotionTool {
         };
 
         match result {
-            Ok(value) => Ok(ToolResult {
-                success: true,
-                output: serde_json::to_string_pretty(&value)
-                    .unwrap_or_else(|_| value.to_string())
-                    .into(),
-                error: None,
-            }),
+            Ok(value) => {
+                let pretty = serde_json::to_string_pretty(&value)
+                    .unwrap_or_else(|_| value.to_string());
+                let output = if pretty.len() > NOTION_MAX_RESPONSE_BYTES {
+                    crate::util_helpers::truncate_with_ellipsis(&pretty, NOTION_MAX_RESPONSE_BYTES)
+                } else {
+                    pretty
+                };
+                Ok(ToolResult {
+                    success: true,
+                    output: output.into(),
+                    error: None,
+                })
+            }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -448,5 +440,48 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap().contains("properties"));
+    }
+
+    #[tokio::test]
+    async fn parse_json_response_rejects_oversized_payload() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let mut buffer = [0_u8; 1024];
+                let read = stream.read(&mut buffer).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            // Send chunk exceeding 2 MiB limit
+            let chunk = vec![b' '; NOTION_MAX_RESPONSE_BYTES + 1024];
+            let _ = stream
+                .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                .await;
+            let _ = stream.write_all(&chunk).await;
+            let _ = stream.write_all(b"\r\n0\r\n\r\n").await;
+        });
+
+        let resp = reqwest::get(format!("http://{addr}")).await.unwrap();
+        let err = NotionTool::parse_json_response(resp, "test")
+            .await
+            .expect_err("oversized response must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("response exceeded"),
+            "expected size limit error, got: {msg}"
+        );
     }
 }
