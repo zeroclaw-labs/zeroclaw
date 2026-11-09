@@ -46,6 +46,11 @@ struct RunView {
 
 #[async_trait]
 impl Tool for CronRunsTool {
+    fn requires_unrestricted_principal(&self) -> bool {
+        // This path uses agent authority without carrying the session owner.
+        true
+    }
+
     fn name(&self) -> &str {
         "cron_runs"
     }
