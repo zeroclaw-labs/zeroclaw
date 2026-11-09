@@ -5283,6 +5283,11 @@ data: {\"type\":\"message_stop\"}\n\n",
         config.gateway.websocket_ping_interval_secs = 1;
         let mut agent = AliasedAgentConfig::default();
         agent.memory.backend = MemoryBackendKind::None;
+        // The upgrade now refuses agents that cannot take a turn; this test
+        // is about idle pings and onboarding, so keep the fixture dispatchable
+        // without configuring a real provider (NEEDS_ONBOARDING still applies).
+        agent.model_provider = "dummy".into();
+        agent.risk_profile = "fixture".into();
         config.agents.insert("web".to_string(), agent);
 
         let app = Router::new()

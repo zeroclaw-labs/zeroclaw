@@ -16883,6 +16883,7 @@ mod tests {
                 alias.into(),
                 AliasedAgentConfig {
                     enabled: true,
+                    model_provider: "dummy".into(),
                     risk_profile: "cron-profile".into(),
                     ..AliasedAgentConfig::default()
                 },
@@ -37560,7 +37561,12 @@ mod tests {
             let mut config = roster_config_in(&tmp, 4242);
             config.agents.insert(
                 "alpha".into(),
-                zeroclaw_config::schema::AliasedAgentConfig::default(),
+                zeroclaw_config::schema::AliasedAgentConfig {
+                    enabled: true,
+                    model_provider: "dummy".into(),
+                    risk_profile: "fixture".into(),
+                    ..zeroclaw_config::schema::AliasedAgentConfig::default()
+                },
             );
             let reader = config
                 .permission_profiles
@@ -37643,8 +37649,24 @@ mod tests {
         use zeroclaw_config::schema::PermissionProfileConfig;
 
         let mut config = roster_config_in(tmp, 4243);
-        config.agents.insert("alpha".into(), Default::default());
-        config.agents.insert("gamma".into(), Default::default());
+        config.agents.insert(
+            "alpha".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                model_provider: "dummy".into(),
+                risk_profile: "fixture".into(),
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "gamma".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                model_provider: "dummy".into(),
+                risk_profile: "fixture".into(),
+                ..Default::default()
+            },
+        );
         let reader = config.permission_profiles.get_mut("reader").unwrap();
         reader.allowed_agents = vec![if referenced { "alpha" } else { "*" }.into()];
         reader
