@@ -37,7 +37,7 @@ defaults such as `/home` override a narrower operator-configured allow.
 
 For shell invocations:
 
-- `allowed_commands`: if non-empty, shell only runs commands whose basename is in this list
+- `allowed_commands`: if non-empty, shell only runs commands whose basename is in this list. Under the Windows shells a bare name never matches an executable written as a path, and `cmd.exe` refuses a bare name that a file in its working directory would run instead; see [Sandboxing](./sandboxing.md#shell-binary)
 - `forbidden_commands`: explicit denylist (`rm -rf /`, `shutdown`, kernel operations)
 - `validate_command_execution`: a pattern-matching pass that looks for dangerous flags, pipelines, and argument shapes
 

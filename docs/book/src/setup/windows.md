@@ -102,6 +102,12 @@ shell = "cmd"
 An explicit `pwsh` or `powershell` value is never replaced by an automatic
 fallback if that interpreter is unavailable.
 
+Under either Windows shell, an `allowed_commands` entry such as `git` means
+the program found through `PATH`. Invoke a workspace script by path
+(`.\build.cmd`) and allowlist that same path. Under `cmd.exe`, a bare command
+is refused while a same-named script sits in the shell's working directory.
+See [Sandboxing](../security/sandboxing.md#shell-binary) for the full rules.
+
 ### Option 4: Scoop
 
 ```cmd
