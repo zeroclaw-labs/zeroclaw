@@ -17035,6 +17035,16 @@ pub async fn start_channels_with_authority(
     .await
 }
 
+fn channel_hook_runner(config: &Config) -> Option<Arc<zeroclaw_runtime::hooks::HookRunner>> {
+    if !config.hooks.enabled {
+        return None;
+    }
+    let runner = zeroclaw_runtime::hooks::HookRunner::from_root_config(config);
+    // The runner owns installed handlers; the default enabled flag alone
+    // does not mean outbound content has a hook decision to await.
+    (!runner.is_empty()).then(|| Arc::new(runner))
+}
+
 /// Start supervised channels with an owned config snapshot and the daemon
 /// generation's plugin-webhook route registry.
 #[allow(clippy::too_many_lines)]
@@ -17714,13 +17724,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
             media_pipeline: config.media_pipeline.clone(),
             transcription_config: config.transcription.clone(),
             agent_transcription_provider: agent.transcription_provider.as_str().to_string(),
-            hooks: if config.hooks.enabled {
-                Some(Arc::new(
-                    zeroclaw_runtime::hooks::HookRunner::from_root_config(&config),
-                ))
-            } else {
-                None
-            },
+            hooks: channel_hook_runner(&config),
             non_cli_excluded_tools: Arc::new(risk_profile.excluded_tools.clone()),
             autonomy_level: risk_profile.level,
             tool_call_dedup_exempt: Arc::new(agent.resolved.tool_call_dedup_exempt.clone()),
@@ -55856,13 +55860,18 @@ Done."#;
             .with_tts(&config),
         );
         let continue_reply = Arc::new(tokio::sync::Notify::new());
-        let ctx = telegram_voice_delivery_ctx(
+        let mut ctx = telegram_voice_delivery_ctx(
             telegram.clone(),
             Arc::new(SpeechReplyModelProvider {
                 continue_reply: continue_reply.clone(),
             }),
             Vec::new(),
         );
+        assert!(
+            config.hooks.enabled,
+            "exercise the default enabled hook configuration"
+        );
+        Arc::get_mut(&mut ctx).unwrap().hooks = channel_hook_runner(&config);
         let process = zeroclaw_spawn::spawn!(process_channel_message(
             ctx,
             telegram_group_message("@alice", "111"),
@@ -55991,7 +56000,7 @@ Done."#;
     }
 
     #[tokio::test]
-    async fn speech_preparation_uses_only_safe_current_phase_and_waits_for_hooks() {
+    async fn speech_preparation_uses_default_hook_configuration_and_waits_for_handlers() {
         use zeroclaw_runtime::agent::loop_::StreamDelta;
         for hooks_enabled in [false, true] {
             let recording = Arc::new(DraftRecordingChannel::new(false, false));
@@ -56008,7 +56017,10 @@ Done."#;
                 tx.send(event).await.unwrap();
             }
             drop(tx);
-            let hooks = hooks_enabled.then(|| Arc::new(zeroclaw_runtime::hooks::HookRunner::new()));
+            let mut config = Config::default();
+            assert!(config.hooks.enabled);
+            config.hooks.builtin.command_logger = hooks_enabled;
+            let hooks = channel_hook_runner(&config);
             run_draft_updater(
                 channel,
                 "peer".into(),

@@ -97,6 +97,11 @@ If a PR changes one of those responsibilities for only one channel, reviewers
 should ask whether it belongs in the shared lifecycle or in typed channel
 capability metadata.
 
+Speculative text previews and speech wait when outbound hook handlers are
+installed. An enabled but empty hook runner does not defer streaming. Actual
+handlers retain their existing opportunity to rewrite or cancel outbound content
+before speculative delivery.
+
 ## Gateway webhooks
 
 Gateway webhooks have one legitimate special requirement: the HTTP request may
