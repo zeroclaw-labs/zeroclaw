@@ -41,6 +41,10 @@ async function withForm(
     button: (text: string) => HTMLButtonElement;
     editField: (path: string, value: string) => Promise<void>;
     fieldValue: (path: string) => string;
+    holdListResponses: () => void;
+    releaseListResponses: (order: "oldest-first" | "newest-first") => Promise<void>;
+    pendingListResponses: () => number;
+    setFormMounted: (mounted: boolean) => Promise<void>;
   }) => Promise<void>,
 ) {
   const domWindow = new Window();
@@ -85,6 +89,8 @@ async function withForm(
     "browser.session_name": "discard-saved",
     "browser.native_webdriver_url": "http://127.0.0.1:9515",
   };
+  let holdList = false;
+  let heldList: Array<() => void> = [];
   globalThis.fetch = async (input, init) => {
     const url = String(input);
     if (url === "/api/config" && init?.method === "OPTIONS") {
@@ -96,6 +102,9 @@ async function withForm(
       });
     }
     if (url === "/api/config/list?prefix=browser") {
+      if (holdList) {
+        await new Promise<void>((resolve) => heldList.push(resolve));
+      }
       return Response.json({
         entries: Object.entries(values).map(([path, value]) => ({
           path,
@@ -134,26 +143,53 @@ async function withForm(
       typeof import("../../lib/draftStore.tsx")
     >("../../lib/draftStore.tsx");
     root = createRoot(container as unknown as HTMLElement);
-    await act(async () => {
+    const renderTree = (showForm: boolean) =>
       root?.render(
         React.createElement(
           ConfigDraftProvider,
           null,
           React.createElement(UnsavedChangesBanner),
-          React.createElement(FieldForm, {
-            prefix: "browser",
-            title: "Browser",
-          }),
+          showForm
+            ? React.createElement(FieldForm, {
+                prefix: "browser",
+                title: "Browser",
+              })
+            : null,
         ),
       );
+    await act(async () => {
+      renderTree(true);
       await flushEffects();
     });
+    const setFormMounted = async (mounted: boolean) => {
+      await act(async () => {
+        renderTree(mounted);
+        await flushEffects();
+      });
+    };
+    const holdListResponses = () => {
+      holdList = true;
+    };
+    const pendingListResponses = () => heldList.length;
+    const releaseListResponses = async (
+      order: "oldest-first" | "newest-first",
+    ) => {
+      holdList = false;
+      const pending = order === "oldest-first" ? heldList : [...heldList].reverse();
+      heldList = [];
+      for (const resolve of pending) {
+        await act(async () => {
+          resolve();
+          await flushEffects();
+        });
+      }
+    };
     const button = (text: string) => {
       const result = Array.from(container.querySelectorAll("button")).find(
         (b) => b.textContent?.trim() === text,
       );
       assert.ok(result, `expected button ${text}: ${container.textContent}`);
-      return result as HTMLButtonElement;
+      return result as unknown as HTMLButtonElement;
     };
     const editField = async (path: string, value: string) => {
       await act(async () => {
@@ -185,6 +221,10 @@ async function withForm(
       button,
       editField,
       fieldValue,
+      holdListResponses,
+      releaseListResponses,
+      pendingListResponses,
+      setFormMounted,
     });
   } finally {
     await act(async () => {
@@ -308,3 +348,88 @@ test("unsaved edits stay until Discard all", async () => {
     ]);
   });
 });
+
+test("Discard all after Save all restores the saved values, not the earlier ones", async () => {
+  await withForm(async ({ container, patches, button, editField, fieldValue }) => {
+    await editField("browser.session_name", "saved-by-save-all");
+    await act(async () => {
+      button("Save all").click();
+      await flushEffects();
+    });
+    assert.deepEqual(patches, [
+      [
+        {
+          op: "replace",
+          path: "browser.session_name",
+          value: "saved-by-save-all",
+        },
+      ],
+    ]);
+
+    await editField("browser.native_webdriver_url", "http://127.0.0.1:9516");
+    await act(async () => {
+      button("Discard all").click();
+      await flushEffects();
+    });
+    assert.equal(fieldValue("browser.session_name"), "saved-by-save-all");
+    assert.equal(
+      fieldValue("browser.native_webdriver_url"),
+      "http://127.0.0.1:9515",
+    );
+    assert.equal(button("Save").disabled, true);
+    assert.match(container.textContent ?? "", /No unsaved changes/);
+    assert.equal(patches.length, 1);
+  });
+});
+
+for (const order of ["oldest-first", "newest-first"] as const) {
+  test(`Discard all while the section loads keeps staged edits discarded (${order})`, async () => {
+    await withForm(
+      async ({
+        container,
+        patches,
+        button,
+        editField,
+        fieldValue,
+        holdListResponses,
+        releaseListResponses,
+        pendingListResponses,
+        setFormMounted,
+      }) => {
+        await editField("browser.session_name", "staged-then-discarded");
+        await setFormMounted(false);
+        holdListResponses();
+        await setFormMounted(true);
+        assert.equal(pendingListResponses(), 1);
+
+        await act(async () => {
+          button("Discard all").click();
+          await flushEffects();
+        });
+        await releaseListResponses(order);
+
+        assert.equal(fieldValue("browser.session_name"), "discard-saved");
+        assert.equal(button("Save").disabled, true);
+        assert.match(container.textContent ?? "", /No unsaved changes/);
+
+        await editField(
+          "browser.native_webdriver_url",
+          "http://127.0.0.1:9516",
+        );
+        await act(async () => {
+          button("Save").click();
+          await flushEffects();
+        });
+        assert.deepEqual(patches, [
+          [
+            {
+              op: "replace",
+              path: "browser.native_webdriver_url",
+              value: "http://127.0.0.1:9516",
+            },
+          ],
+        ]);
+      },
+    );
+  });
+}

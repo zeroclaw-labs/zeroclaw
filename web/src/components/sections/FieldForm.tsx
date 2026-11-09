@@ -1034,23 +1034,36 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
       [schema],
     );
 
+    // `reload` awaits the list request, so read the draft store through a ref
+    // to seed from its state when the response arrives, not when the request
+    // started. Only the newest request may seed the form: a Discard all while
+    // a load is pending starts another load, and the older response must not
+    // restore the discarded drafts (#12288).
+    const latestConfigDraft = useRef(configDraft);
+    latestConfigDraft.current = configDraft;
+    const loadGeneration = useRef(0);
+
     const reload = async () => {
+      const generation = ++loadGeneration.current;
       setLoading(true);
       setTopError(null);
       try {
         const resp = await listProps(prefix);
+        if (generation !== loadGeneration.current) return;
+        const store = latestConfigDraft.current;
         setEntries(resp.entries);
         const seed: Record<string, string> = {};
         const commentSeed: Record<string, string> = {};
         for (const e of resp.entries) {
-          const staged = configDraft.drafts[e.path];
+          const staged = store.drafts[e.path];
           seed[e.path] = staged?.input ?? defaultInputValue(e);
-          const stagedComment = configDraft.comments[e.path];
+          const stagedComment = store.comments[e.path];
           if (stagedComment) commentSeed[e.path] = stagedComment;
         }
         setDraft(seed);
         setComments(commentSeed);
       } catch (e) {
+        if (generation !== loadGeneration.current) return;
         if (e instanceof ApiError) {
           setTopError(`[${e.envelope.code}] ${e.envelope.message}`);
         } else {
@@ -1059,7 +1072,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
           );
         }
       } finally {
-        setLoading(false);
+        if (generation === loadGeneration.current) setLoading(false);
       }
     };
 
@@ -1070,20 +1083,18 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
 
     // Discard-all clears the shared store but leaves this form's local draft
     // and comment maps untouched. Without a reset, the inputs stay dirty and a
-    // later section Save would persist the discarded values (#12288).
+    // later section Save would persist the discarded values (#12288). Reload
+    // from the server instead of resetting to `entries`: those can predate a
+    // Save all, and a load may still be in flight.
     const seenDiscardGeneration = useRef(configDraft.discardGeneration);
     useEffect(() => {
       if (configDraft.discardGeneration === seenDiscardGeneration.current) {
         return;
       }
       seenDiscardGeneration.current = configDraft.discardGeneration;
-      const seed: Record<string, string> = {};
-      for (const e of entries) {
-        seed[e.path] = defaultInputValue(e);
-      }
-      setDraft(seed);
-      setComments({});
-    }, [configDraft.discardGeneration, entries]);
+      void reload();
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [configDraft.discardGeneration]);
 
     const actionableEntries = useMemo(() => {
       if (!scopeActionsToIncludedPaths || !includePath) return entries;
