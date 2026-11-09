@@ -2276,6 +2276,7 @@ impl SopEngine {
             return err;
         }
         self.active_runs.remove(run_id);
+        self.forget_run_revision(run_id);
         self.release_claim_best_effort(claim);
         err
     }
@@ -2299,6 +2300,7 @@ impl SopEngine {
             return;
         };
         if holds_exec_claim(run.status) {
+            self.forget_run_revision(run_id);
             self.release_claim_best_effort(&Self::claim_handle_for_run(&run));
             return;
         }
@@ -2317,6 +2319,9 @@ impl SopEngine {
                 "SOP dispatch: could not durably cancel a rolled-back parked AMQP sibling; a stale parked row may be reconstructed on restart"
             );
         }
+        // `persist_terminal` stamps its write from this entry and clears the entry only
+        // on success. Nothing retries a failed write and the run is already gone.
+        self.forget_run_revision(run_id);
     }
 
     pub fn start_run(&mut self, sop_name: &str, event: SopEvent) -> Result<SopRunAction> {
@@ -13781,6 +13786,121 @@ mod tests {
         assert!(
             restored.is_none() || restored == Some(SopRunStatus::Cancelled),
             "restart must not resurrect the rolled-back sibling as a live parked run (got {restored:?})"
+        );
+    }
+
+    /// An executing sibling saved its first snapshot before the rollback, so the
+    /// engine noted a revision for it. The run is gone afterwards and nothing
+    /// else would clear that entry; a run the engine still holds keeps its own.
+    #[test]
+    fn rollback_activated_run_forgets_an_executing_siblings_revision() {
+        let mut engine = engine_with_sops(vec![
+            test_sop("rolled-back", SopExecutionMode::Auto, SopPriority::Normal),
+            test_sop("still-held", SopExecutionMode::Auto, SopPriority::Normal),
+        ]);
+        let action = engine.start_run("rolled-back", manual_event()).unwrap();
+        assert!(matches!(action, SopRunAction::ExecuteStep { .. }));
+        let run_id = extract_run_id(&action).to_string();
+        let action = engine.start_run("still-held", manual_event()).unwrap();
+        let held_run_id = extract_run_id(&action).to_string();
+        assert!(
+            engine.run_revisions.lock().contains_key(&run_id),
+            "the sibling's first dispatch noted a revision"
+        );
+
+        engine.rollback_activated_run(&run_id);
+
+        assert!(engine.get_run(&run_id).is_none());
+        assert_eq!(
+            engine.run_revisions.lock().keys().collect::<Vec<_>>(),
+            vec![&held_run_id],
+            "only the run the engine still holds may keep a revision"
+        );
+    }
+
+    /// A parked sibling's cancel write can fail, and nothing retries it. The run
+    /// is gone afterwards, so its entry must go too; a run the engine still holds
+    /// keeps its own.
+    #[test]
+    fn rollback_activated_run_forgets_a_parked_siblings_revision_on_a_failed_cancel() {
+        let store = Arc::new(FailFirstFinishStore::new());
+        let mut engine = engine_with_sops(vec![
+            test_sop(
+                "rolled-back",
+                SopExecutionMode::Supervised,
+                SopPriority::Normal,
+            ),
+            test_sop(
+                "still-held",
+                SopExecutionMode::Supervised,
+                SopPriority::Normal,
+            ),
+        ])
+        .with_store(store.clone());
+        let action = engine.start_run("rolled-back", manual_event()).unwrap();
+        assert!(matches!(action, SopRunAction::WaitApproval { .. }));
+        let run_id = extract_run_id(&action).to_string();
+        let action = engine.start_run("still-held", manual_event()).unwrap();
+        let held_run_id = extract_run_id(&action).to_string();
+        assert!(
+            engine.run_revisions.lock().contains_key(&run_id),
+            "the sibling's park snapshot noted a revision"
+        );
+
+        engine.rollback_activated_run(&run_id);
+
+        assert!(engine.get_run(&run_id).is_none());
+        assert!(
+            store
+                .load_active_runs()
+                .unwrap()
+                .iter()
+                .any(|r| r.run.run_id == run_id),
+            "the injected failure kept the cancel write out of the store"
+        );
+        assert_eq!(
+            engine.run_revisions.lock().keys().collect::<Vec<_>>(),
+            vec![&held_run_id],
+            "only the run the engine still holds may keep a revision"
+        );
+    }
+
+    /// The first write of a start is refused because the store holds a newer
+    /// record of the run. Adopting that record notes its revision, and the
+    /// rollback that follows must not leave the entry behind.
+    #[test]
+    fn failed_start_forgets_the_revision_its_refused_write_adopted() {
+        let inner: Arc<dyn SopRunStore> = Arc::new(InMemoryRunStore::new());
+        let lagging = Arc::new(LaggingLoadStore {
+            inner: inner.clone(),
+            lagged: parking_lot::Mutex::new(None),
+        });
+        let sop = test_sop("refused", SopExecutionMode::Auto, SopPriority::Normal);
+        let mut engine = engine_with_sops(vec![sop.clone()]).with_store(lagging.clone());
+        let reservation = engine.reserve_run_slot("refused").unwrap();
+        let run_id = reservation.run_id.clone();
+
+        // The store holds revision 5, but the read that stamps the first write
+        // reports revision 0, so the store's revision guard refuses that write.
+        let mut other_writer = engine_with_sops(vec![sop]);
+        let action = other_writer.start_run("refused", manual_event()).unwrap();
+        let mut run = other_writer.active_runs()[extract_run_id(&action)].clone();
+        run.run_id = run_id.clone();
+        let mut record = PersistedRun::new(run, now_iso8601(), SopTriggerSource::Manual);
+        record.revision = 5;
+        inner.save_run(&record).unwrap();
+        record.revision = 0;
+        *lagging.lagged.lock() = Some(record);
+
+        let err = engine
+            .activate_reserved_run(reservation, manual_event(), None, None)
+            .unwrap_err();
+
+        assert!(err_is_stale_run_copy(&err), "got {err}");
+        assert!(engine.get_run(&run_id).is_none());
+        assert!(
+            engine.run_revisions.lock().is_empty(),
+            "a run dropped by a failed start must leave no revision entry"
         );
     }
 
