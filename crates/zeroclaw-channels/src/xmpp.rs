@@ -150,7 +150,17 @@ fn prefer_authenticated_mechanisms(
 }
 
 impl XmppChannel {
-    pub fn new(config: XmppConfig, alias: String, data_dir: PathBuf, peers: PeerResolver) -> Self {
+    pub fn new(
+        mut config: XmppConfig,
+        alias: String,
+        data_dir: PathBuf,
+        peers: PeerResolver,
+    ) -> Self {
+        // JID parsing normalizes domains; connection and durable identity must
+        // use the same account before any private store can be created.
+        if let Ok(account) = config.username.parse::<jid::BareJid>() {
+            config.username = account.to_string();
+        }
         Self {
             config,
             storage: data_dir.join("channels").join("xmpp").join(&alias),
@@ -544,6 +554,7 @@ impl XmppChannel {
         if !self.config.omemo_enabled {
             return Ok(None);
         }
+        self.validate()?;
         let mut owner = self
             .encrypted
             .lock()
@@ -1107,10 +1118,10 @@ mod tests {
         vault.encrypt("synthetic initialization")?;
         let channel = XmppChannel::new(
             XmppConfig {
-                username: "bob@example.test".into(),
+                username: "bob@EXAMPLE.TEST".into(),
                 password: "synthetic".into(),
                 server: "127.0.0.1".into(),
-                port: 0,
+                port: 9,
                 omemo_enabled: true,
                 connect_timeout_secs: 1,
                 ..Default::default()
@@ -1121,6 +1132,7 @@ mod tests {
         )
         .with_pin_resolver(Arc::new(Vec::new))
         .with_inbox_vault(Some(directory.path().into()));
+        assert_eq!(channel.config.username, "bob@example.test");
         let owner = channel.crypto_owner()?.unwrap();
         for id in ["runtime", "queued", "interrupted"] {
             owner
