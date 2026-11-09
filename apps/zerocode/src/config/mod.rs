@@ -28,6 +28,37 @@ const CONFIG_LOCK_FILE: &str = ".zerocode-config.lock";
 const CONFIG_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 const CONFIG_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(25);
 
+#[cfg(test)]
+std::thread_local! {
+    static MIGRATION_LOCK_WAIT_OVERRIDE: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn migration_lock_wait() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(wait) = MIGRATION_LOCK_WAIT_OVERRIDE.get() {
+        return wait;
+    }
+    CONFIG_LOCK_WAIT
+}
+
+#[cfg(test)]
+pub(crate) fn set_migration_lock_wait_for_test(wait: Option<std::time::Duration>) {
+    MIGRATION_LOCK_WAIT_OVERRIDE.set(wait);
+}
+
+#[cfg(test)]
+pub(crate) struct TestConfigLock {
+    _inner: ConfigWriteLock,
+}
+
+#[cfg(test)]
+pub(crate) fn hold_config_lock_for_test(config_dir: &Path) -> Result<TestConfigLock> {
+    Ok(TestConfigLock {
+        _inner: ConfigWriteLock::acquire(config_dir)?,
+    })
+}
+
 /// One or more chords bound to an action. Accepts a bare string (one
 /// chord) or an array on the wire; always serialized back as an array.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -1030,10 +1061,28 @@ pub(crate) fn load_persisted(config_dir: &Path) -> Result<ZerocodeConfig> {
                 // The first read ran without the lock. Do not publish that
                 // snapshot: a login saved after it would be discarded. Re-read
                 // under the same lock every other writer holds.
-                None => {
-                    write_lock = Some(ConfigWriteLock::acquire(config_dir)?);
-                    continue;
-                }
+                None => match ConfigWriteLock::acquire_within(config_dir, migration_lock_wait()) {
+                    Ok(lock) => {
+                        write_lock = Some(lock);
+                        continue;
+                    }
+                    // Contention and a filesystem that refuses locks take the
+                    // same path. The snapshot already parsed is the saved
+                    // config, including its remote target. Rewriting is
+                    // optional; failing the load would make startup drop that
+                    // target and dial the local socket.
+                    Err(error) => {
+                        let path_label = path.display().to_string();
+                        eprintln!(
+                            "{}",
+                            crate::i18n::t_args(
+                                "zc-config-migration-lock-skipped",
+                                &[("path", &path_label), ("error", &format!("{error:#}"))],
+                            )
+                        );
+                        return Ok(config);
+                    }
+                },
                 Some(lock) => write_document(&path, &doc, lock)?,
             }
         }
@@ -1078,14 +1127,30 @@ impl ConfigWriteLock {
         {
             use std::os::unix::fs::OpenOptionsExt as _;
             options.mode(0o600);
+            // Do not follow a symlink planted at the lock path. After an atomic
+            // replace the followed target is a different inode, so two writers
+            // would each believe they held the lock.
+            options.custom_flags(libc::O_NOFOLLOW);
         }
         let file = options
             .open(&path)
             .with_context(|| format!("opening {}", path.display()))?;
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("reading metadata for {}", path.display()))?;
+        if !metadata.is_file() {
+            let path_label = path.display().to_string();
+            bail!(crate::i18n::t_args(
+                "zc-config-lock-not-regular",
+                &[("path", &path_label)],
+            ));
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            // fchmod the opened handle. A path-based chmod would follow a
+            // symlink and change whatever file it points at.
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
                 .with_context(|| format!("restricting {}", path.display()))?;
         }
         let deadline = std::time::Instant::now() + wait;
@@ -3588,6 +3653,35 @@ enroll_url = \"https://gateway.example/zeroclaw\"
         assert!(
             err.contains(&expected),
             "the timeout must use the catalogue message, got: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_lock_file_is_rejected_without_changing_its_target() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_path(dir.path());
+        std::fs::write(&config, "[theme]\nname = \"nord\"\n").unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&config, dir.path().join(CONFIG_LOCK_FILE)).unwrap();
+        let before = std::fs::read(&config).unwrap();
+
+        let err = persist_theme(dir.path(), "gruvbox").unwrap_err();
+        let err = format!("{err:#}");
+        assert!(
+            err.contains(CONFIG_LOCK_FILE) || err.contains("not a regular file"),
+            "got: {err}"
+        );
+        assert_eq!(std::fs::read(&config).unwrap(), before);
+        assert_eq!(
+            std::fs::metadata(&config).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "rejecting the symlink must not chmod the config file"
+        );
+        assert_ne!(
+            crate::i18n::t_args("zc-config-lock-not-regular", &[("path", "lock")]),
+            "{zc-config-lock-not-regular}"
         );
     }
 }

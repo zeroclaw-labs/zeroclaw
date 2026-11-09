@@ -2512,6 +2512,76 @@ mod connection_tests {
         assert!(cfg.relay_url.is_some() && cfg.relay_node.is_some());
     }
 
+    /// A keybinding migration that cannot take the config lock must keep the
+    /// saved remote target. Falling back to defaults is what selects the local
+    /// socket and then spawns a daemon. That arm is `ConnectTarget::LocalSocket`
+    /// and is taken only when this direct URL is absent.
+    #[test]
+    fn migration_lock_failure_keeps_the_saved_wss_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = "wss://daemon.example:9781/";
+        std::fs::write(
+            crate::config::config_path(dir.path()),
+            format!(
+                "[connection.wss]\nuri = \"{uri}\"\n\n[connection.logins.\"{uri}\"]\nauth_provider = \"oidc.corp\"\nauth_token = \"saved-token\"\nenroll_url = \"https://gateway.example\"\n\n[keybindings]\n\"input_bar.clear_input\" = \"ctrl+u\"\n"
+            ),
+        )
+        .unwrap();
+        let before = std::fs::read(crate::config::config_path(dir.path())).unwrap();
+        let _held = crate::config::hold_config_lock_for_test(dir.path()).unwrap();
+        struct ResetWait;
+        impl Drop for ResetWait {
+            fn drop(&mut self) {
+                crate::config::set_migration_lock_wait_for_test(None);
+            }
+        }
+        let _reset = ResetWait;
+        crate::config::set_migration_lock_wait_for_test(Some(std::time::Duration::from_millis(80)));
+
+        assert_ne!(
+            crate::i18n::t_args(
+                "zc-config-migration-lock-skipped",
+                &[("path", "config"), ("error", "busy")],
+            ),
+            "{zc-config-migration-lock-skipped}"
+        );
+        let loaded = crate::config::ensure_and_load(dir.path())
+            .expect("a lock failure must not fail the load");
+        assert_eq!(loaded.connection.wss.uri.as_deref(), Some(uri));
+        assert_eq!(
+            loaded.connection.logins[uri].auth_token.as_str(),
+            "saved-token"
+        );
+        assert_eq!(
+            resolve_direct_url(None, &loaded.connection.wss).as_deref(),
+            Some(uri),
+            "startup must select the saved WSS target, not the local socket or a spawned daemon"
+        );
+        assert_eq!(
+            std::fs::read(crate::config::config_path(dir.path())).unwrap(),
+            before,
+            "the migration rewrite must be skipped"
+        );
+
+        // A filesystem that refuses the lock file fails at once, not after the wait.
+        drop(_held);
+        let lock_path = dir.path().join(".zerocode-config.lock");
+        std::fs::remove_file(&lock_path).unwrap();
+        std::fs::create_dir(&lock_path).unwrap();
+        let started = std::time::Instant::now();
+        let loaded = crate::config::ensure_and_load(dir.path())
+            .expect("a refused lock must not fail the load");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(
+            resolve_direct_url(None, &loaded.connection.wss).as_deref(),
+            Some(uri)
+        );
+        assert_eq!(
+            std::fs::read(crate::config::config_path(dir.path())).unwrap(),
+            before
+        );
+    }
+
     #[test]
     fn explicit_relay_enroll_uses_relay_route() {
         let cli = Cli::parse_from([
