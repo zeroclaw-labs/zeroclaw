@@ -11,6 +11,11 @@
 //! It announces that with a startup warning. The data plane stays blind in
 //! every mode.
 //!
+//! `[dashboard]` (default off) serves allowlisted daemons' web dashboards at
+//! per-node hosts `https://<label>.<domain>/`, with the operator's wildcard
+//! certificate. That route is relay-terminated too: the relay forwards those
+//! dashboards' plaintext HTTP, and warns at startup.
+//!
 //! `zerorelay` is a standalone networking app (not daemon-path code), so bare
 //! `tokio::spawn` is the right primitive here; the `zeroclaw_spawn::spawn!` rule
 //! is for in-daemon tasks. Mirrors the `apps/zerocode` exemption (and lib.rs).
@@ -30,7 +35,8 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::Deserialize;
 use tokio_rustls::TlsAcceptor;
 use zerorelay::{
-    Admission, AdmissionPolicy, PublicOpenGuard, RelayConfig, RelayServer, RelayStatus,
+    Admission, AdmissionPolicy, DashboardConfig, PublicOpenGuard, RelayConfig, RelayServer,
+    RelayStatus, check_dashboard_startup,
 };
 
 /// Package version and `git describe` build id stamped by `build.rs`.
@@ -155,6 +161,103 @@ struct FileConfig {
     limits: LimitsFile,
     #[serde(default)]
     frontdoor: FrontdoorFile,
+    #[serde(default)]
+    dashboard: DashboardFile,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DashboardFile {
+    /// Serve allowlisted daemons' dashboards at `https://<label>.<domain>/`.
+    /// OFF by default; see relay.example.toml [dashboard] for the trust
+    /// implications.
+    enabled: Option<bool>,
+    /// The dashboard domain; `*.<domain>` must resolve to this relay.
+    domain: Option<String>,
+    /// A publicly trusted certificate (chain) and key covering `*.<domain>`.
+    cert: Option<String>,
+    key: Option<String>,
+    /// Registration-key fingerprints (sha256 hex) of the daemons whose
+    /// dashboards this relay serves. Required.
+    #[serde(default)]
+    allow: Vec<String>,
+    /// Concurrent dashboard connections to one daemon. [default: 64]
+    max_conns_per_node: Option<usize>,
+    /// Concurrent dashboard connections from one browser address. [default: 16]
+    max_conns_per_ip: Option<usize>,
+}
+
+/// The dashboard's TLS identity, served for server names under its domain.
+struct DashboardTls {
+    domain: String,
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+}
+
+// By hand, so the private key can never reach a log or a panic message.
+impl std::fmt::Debug for DashboardTls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DashboardTls")
+            .field("domain", &self.domain)
+            .field("certs", &self.certs.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Resolve `[dashboard]`: its routing settings and its certificate, or `None`
+/// when it is off. Refuses what [`check_dashboard_startup`] refuses, and a
+/// dashboard without its own certificate: browsers must get a publicly
+/// trusted one, which a self-provisioned relay certificate is not.
+fn resolve_dashboard(file: &DashboardFile) -> Result<Option<(DashboardConfig, DashboardTls)>> {
+    if !file.enabled.unwrap_or(false) {
+        return Ok(None);
+    }
+    let cfg = DashboardConfig {
+        domain: file.domain.clone().unwrap_or_default(),
+        allow: normalize_admission_fingerprints(&file.allow)?,
+        max_conns_per_node: file.max_conns_per_node.unwrap_or(64),
+        max_conns_per_ip: file.max_conns_per_ip.unwrap_or(16),
+    };
+    check_dashboard_startup(&cfg)?;
+    let (Some(cert), Some(key)) = (&file.cert, &file.key) else {
+        anyhow::bail!(
+            "refusing to start: [dashboard] needs cert and key, a publicly trusted certificate \
+             for *.{} (browsers do not trust a self-provisioned one)",
+            cfg.domain
+        );
+    };
+    let tls = DashboardTls {
+        domain: cfg.domain.clone(),
+        certs: load_certs(cert).with_context(|| format!("loading [dashboard] cert {cert}"))?,
+        key: load_key(key).with_context(|| format!("loading [dashboard] key {key}"))?,
+    };
+    Ok(Some((cfg, tls)))
+}
+
+/// Present the dashboard certificate for server names under its domain and
+/// the relay's own everywhere else.
+#[derive(Debug)]
+struct DashboardSni {
+    relay: Arc<rustls::sign::CertifiedKey>,
+    dashboard: Arc<rustls::sign::CertifiedKey>,
+    /// `.<domain>`
+    suffix: String,
+}
+
+impl rustls::server::ResolvesServerCert for DashboardSni {
+    fn resolve(
+        &self,
+        hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        let under_domain = hello
+            .server_name()
+            .is_some_and(|name| name.to_ascii_lowercase().ends_with(&self.suffix));
+        Some(Arc::clone(if under_domain {
+            &self.dashboard
+        } else {
+            &self.relay
+        }))
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -364,14 +467,23 @@ async fn main() -> Result<()> {
     let tls_dir = cli.tls_dir.clone().or_else(|| file.tls.dir.clone());
     let mut tls_sans = file.tls.sans.clone();
     tls_sans.extend(cli.tls_san.iter().cloned());
+    // `[dashboard]` is resolved, and refused if it must be, before any TLS
+    // material or socket is set up.
+    let dashboard = resolve_dashboard(&file.dashboard)?;
+    let dashboard_tls = dashboard.as_ref().map(|(_, tls)| tls);
     let acceptor = match (tls_cert, tls_key) {
         // Bring-your-own (e.g. a public-CA cert for the relay's hostname).
-        (Some(cert), Some(key)) => build_tls_acceptor(&cert, &key, outer_verifier.clone())
-            .with_context(|| format!("loading relay TLS material from {cert} / {key}"))?,
-        // Self-provision a cert on first run - no openssl needed.
-        (None, None) => {
-            provision_tls_acceptor(tls_dir.as_deref(), &tls_sans, outer_verifier.clone())?
+        (Some(cert), Some(key)) => {
+            build_tls_acceptor(&cert, &key, outer_verifier.clone(), dashboard_tls)
+                .with_context(|| format!("loading relay TLS material from {cert} / {key}"))?
         }
+        // Self-provision a cert on first run - no openssl needed.
+        (None, None) => provision_tls_acceptor(
+            tls_dir.as_deref(),
+            &tls_sans,
+            outer_verifier.clone(),
+            dashboard_tls,
+        )?,
         _ => {
             anyhow::bail!("tls cert and key must be given together (or neither, to self-provision)")
         }
@@ -420,6 +532,7 @@ async fn main() -> Result<()> {
             .or(file.limits.max_registered_nodes)
             .unwrap_or(1024),
         frontdoor_enabled: cli.frontdoor || file.frontdoor.enabled.unwrap_or(false),
+        dashboard: dashboard.map(|(cfg, _)| cfg),
     };
 
     // Fail closed (AGENTS.md: new external surfaces default closed): an OPEN,
@@ -459,6 +572,20 @@ async fn main() -> Result<()> {
              sessions - and the blind-forwarder guarantee still holds for the RPC \
              plane and for zerocode/native enrollment. Disable [frontdoor] to \
              withdraw that trust."
+        );
+    }
+    if let Some(dashboard) = &cfg.dashboard {
+        eprintln!(
+            "zerorelay WARNING: [dashboard] is enabled. This relay serves the web dashboards \
+             of {} allowlisted daemon(s) at https://<label>.{}/ and ENDS THOSE BROWSERS' TLS: \
+             it forwards their dashboard traffic to the daemon in plaintext over the daemon's \
+             relay link. Anyone who can modify this relay can read and change that traffic, \
+             including session cookies, and act as a signed-in user, with an \
+             administrator's session as an administrator. The blind-forwarder guarantee \
+             still holds for the RPC plane and for zerocode/native clients. Disable \
+             [dashboard] to withdraw that trust.",
+            dashboard.allow.len(),
+            dashboard.domain
         );
     }
 
@@ -631,24 +758,56 @@ fn build_outer_client_verifier(
 /// Build the outer TLS acceptor from the relay's own server cert + key. Outer TLS
 /// is server-authenticated; `client_verifier` adds the optional outer-mTLS variant
 /// (additive admission), but the inner mTLS stays the real RPC security boundary.
+///
+/// With `[dashboard]`, server names under its domain get the dashboard
+/// certificate, and the listener offers HTTP/1.1 alone by ALPN: over HTTP/2 a
+/// browser may reuse one connection for every host a certificate covers,
+/// which would carry one dashboard's requests to another's daemon. The relay
+/// plane's own clients offer no ALPN, so they are unaffected.
 fn build_tls_acceptor(
     cert_path: &str,
     key_path: &str,
     client_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+    dashboard: Option<&DashboardTls>,
 ) -> Result<TlsAcceptor> {
     let certs = load_certs(cert_path)?;
     let key = load_key(key_path)?;
-    let builder = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .context("ring provider supports the default protocol versions")?;
-    let config = match client_verifier {
+    let provider = rustls::crypto::ring::default_provider();
+    let key_provider = provider.key_provider;
+    let builder = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()
+        .context("ring provider supports the default protocol versions")?;
+    let builder = match client_verifier {
         Some(v) => builder.with_client_cert_verifier(v),
         None => builder.with_no_client_auth(),
-    }
-    .with_single_cert(certs, key)
-    .context("relay cert/key are not a valid pair")?;
+    };
+    let config = match dashboard {
+        None => builder
+            .with_single_cert(certs, key)
+            .context("relay cert/key are not a valid pair")?,
+        Some(dashboard) => {
+            let certified = |certs: Vec<CertificateDer<'static>>,
+                             key: PrivateKeyDer<'static>,
+                             what: &str|
+             -> Result<Arc<rustls::sign::CertifiedKey>> {
+                let signing = key_provider
+                    .load_private_key(key)
+                    .with_context(|| format!("{what} key is not a usable private key"))?;
+                Ok(Arc::new(rustls::sign::CertifiedKey::new(certs, signing)))
+            };
+            let mut config = builder.with_cert_resolver(Arc::new(DashboardSni {
+                relay: certified(certs, key, "relay")?,
+                dashboard: certified(
+                    dashboard.certs.clone(),
+                    dashboard.key.clone_key(),
+                    "[dashboard]",
+                )?,
+                suffix: format!(".{}", dashboard.domain),
+            }));
+            config.alpn_protocols = vec![b"http/1.1".to_vec()];
+            config
+        }
+    };
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
@@ -659,6 +818,7 @@ fn provision_tls_acceptor(
     tls_dir: Option<&str>,
     extra_sans: &[String],
     client_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+    dashboard: Option<&DashboardTls>,
 ) -> Result<TlsAcceptor> {
     let dir = tls_dir.map(PathBuf::from).unwrap_or_else(default_tls_dir);
     let mut sans = vec!["localhost".to_string(), "127.0.0.1".to_string()];
@@ -673,6 +833,7 @@ fn provision_tls_acceptor(
         &mats.server_cert_path.to_string_lossy(),
         &mats.server_key_path.to_string_lossy(),
         client_verifier,
+        dashboard,
     )?;
     eprintln!("zerorelay: self-provisioned outer TLS in {}", dir.display());
     eprintln!("  SANs: {}", sans.join(", "));
@@ -711,6 +872,177 @@ fn load_key(path: &str) -> Result<PrivateKeyDer<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dashboard_file() -> DashboardFile {
+        DashboardFile {
+            enabled: Some(true),
+            domain: Some("relay.example.com".into()),
+            allow: vec!["ab".repeat(32)],
+            ..DashboardFile::default()
+        }
+    }
+
+    #[test]
+    fn the_dashboard_is_off_unless_enabled() {
+        assert!(
+            resolve_dashboard(&DashboardFile::default())
+                .unwrap()
+                .is_none()
+        );
+        let file: FileConfig = toml::from_str(
+            "[dashboard]\nenabled = false\ndomain = \"relay.example.com\"\n\
+             allow = []\nmax_conns_per_node = 8\nmax_conns_per_ip = 4\n",
+        )
+        .unwrap();
+        assert!(resolve_dashboard(&file.dashboard).unwrap().is_none());
+        assert!(
+            toml::from_str::<FileConfig>("[dashboard]\nhosts = []\n").is_err(),
+            "an unknown [dashboard] key is refused"
+        );
+    }
+
+    #[test]
+    fn an_enabled_dashboard_needs_an_allowlist_and_its_own_certificate() {
+        // Open admission is the default; without the list any registering
+        // daemon would get a host under this relay's domain.
+        let mut unlisted = dashboard_file();
+        unlisted.allow.clear();
+        let err = resolve_dashboard(&unlisted).unwrap_err().to_string();
+        assert!(err.contains("allow is empty"), "{err}");
+
+        let err = resolve_dashboard(&dashboard_file())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("needs cert and key"), "{err}");
+
+        let mut garbled = dashboard_file();
+        garbled.allow = vec!["not-a-fingerprint".into()];
+        assert!(resolve_dashboard(&garbled).is_err());
+
+        let mut no_domain = dashboard_file();
+        no_domain.domain = None;
+        assert!(resolve_dashboard(&no_domain).is_err());
+    }
+
+    /// Accept any server certificate: the test asserts WHICH certificate the
+    /// relay presents, not the PKI.
+    #[derive(Debug)]
+    struct AnyServerCert;
+    impl rustls::client::danger::ServerCertVerifier for AnyServerCert {
+        fn verify_server_cert(
+            &self,
+            _e: &CertificateDer<'_>,
+            _i: &[CertificateDer<'_>],
+            _n: &rustls::pki_types::ServerName<'_>,
+            _o: &[u8],
+            _t: rustls::pki_types::UnixTime,
+        ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error>
+        {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            _m: &[u8],
+            _c: &CertificateDer<'_>,
+            _d: &rustls::DigitallySignedStruct,
+        ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+        {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _m: &[u8],
+            _c: &CertificateDer<'_>,
+            _d: &rustls::DigitallySignedStruct,
+        ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+        {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
+    /// Handshake with `server_name`, offering `alpn`: the leaf the relay
+    /// presented and the protocol it chose.
+    async fn handshake(
+        acceptor: TlsAcceptor,
+        server_name: &str,
+        alpn: &[&[u8]],
+    ) -> (Vec<u8>, Option<Vec<u8>>) {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move { acceptor.accept(server_io).await.map(drop) });
+        let mut cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AnyServerCert))
+        .with_no_client_auth();
+        cfg.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+        let name = rustls::pki_types::ServerName::try_from(server_name.to_string()).unwrap();
+        let tls = tokio_rustls::TlsConnector::from(Arc::new(cfg))
+            .connect(name, client_io)
+            .await
+            .expect("the handshake completes");
+        let (_, session) = tls.get_ref();
+        let leaf = session.peer_certificates().unwrap()[0].as_ref().to_vec();
+        let alpn = session.alpn_protocol().map(<[u8]>::to_vec);
+        server.await.unwrap().unwrap();
+        (leaf, alpn)
+    }
+
+    #[tokio::test]
+    async fn dashboard_names_get_the_dashboard_certificate_over_http_1_1_only() {
+        let relay_dir = tempfile::tempdir().unwrap();
+        let relay = zeroclaw_tls::ensure_server_materials(relay_dir.path(), &["relay.test".into()])
+            .unwrap();
+        let dash_dir = tempfile::tempdir().unwrap();
+        let dash = zeroclaw_tls::ensure_server_materials(dash_dir.path(), &["*.relay.test".into()])
+            .unwrap();
+        let dashboard = DashboardTls {
+            domain: "relay.test".into(),
+            certs: load_certs(&dash.server_cert_path.to_string_lossy()).unwrap(),
+            key: load_key(&dash.server_key_path.to_string_lossy()).unwrap(),
+        };
+        let relay_leaf = load_certs(&relay.server_cert_path.to_string_lossy()).unwrap()[0]
+            .as_ref()
+            .to_vec();
+        let dash_leaf = dashboard.certs[0].as_ref().to_vec();
+        let acceptor = build_tls_acceptor(
+            &relay.server_cert_path.to_string_lossy(),
+            &relay.server_key_path.to_string_lossy(),
+            None,
+            Some(&dashboard),
+        )
+        .unwrap();
+
+        let label = "a".repeat(26);
+        let browser: &[&[u8]] = &[b"h2", b"http/1.1"];
+        let (leaf, alpn) =
+            handshake(acceptor.clone(), &format!("{label}.relay.test"), browser).await;
+        assert_eq!(
+            leaf, dash_leaf,
+            "a dashboard name gets the dashboard certificate"
+        );
+        assert_eq!(
+            alpn.as_deref(),
+            Some(&b"http/1.1"[..]),
+            "never HTTP/2, which would share a connection across dashboard hosts"
+        );
+        let (leaf, _) = handshake(acceptor.clone(), "relay.test", browser).await;
+        assert_eq!(
+            leaf, relay_leaf,
+            "the relay's own name keeps its certificate"
+        );
+        // The relay plane's clients offer no ALPN and are unaffected.
+        let (leaf, alpn) = handshake(acceptor, "relay.test", &[]).await;
+        assert_eq!(leaf, relay_leaf);
+        assert_eq!(alpn, None);
+    }
 
     fn overlay(
         mode: Option<&str>,
