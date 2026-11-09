@@ -1,25 +1,31 @@
-import { lazy } from 'react';
+import { lazy, type ComponentType } from 'react';
+import { loadPageOrReload } from '../lib/chunkReload';
 
-export const Dashboard = lazy(() => import('../pages/Dashboard'));
-export const AgentChat = lazy(() => import('../pages/AgentChat'));
-export const AgentsList = lazy(() => import('../pages/AgentsList'));
-export const AgentWorkspaceExplorer = lazy(() => import('../pages/AgentWorkspaceExplorer'));
-export const Tools = lazy(() => import('../pages/Tools'));
-export const Cron = lazy(() => import('../pages/Cron'));
-export const Integrations = lazy(() => import('../pages/Integrations'));
-export const Plugins = lazy(() => import('../pages/Plugins'));
-export const Config = lazy(() => import('../pages/Config'));
-export const Logs = lazy(() => import('../pages/Logs'));
-export const Doctor = lazy(() => import('../pages/Doctor'));
-export const Pairing = lazy(() => import('../pages/Pairing'));
-export const Canvas = lazy(() => import('../pages/Canvas'));
-export const AcpConsole = lazy(() => import('../pages/AcpConsole'));
-export const Quickstart = lazy(() => import('../pages/quickstart/Quickstart'));
-export const Skills = lazy(() => import('../pages/Skills'));
-export const SopsList = lazy(() => import('../pages/Sops').then((m) => ({ default: m.SopsList })));
-export const SopView = lazy(() => import('../pages/Sops').then((m) => ({ default: m.SopView })));
-export const SopEditor = lazy(() =>
+/** A page loaded on first visit; see `loadPageOrReload` for a failed load. */
+function lazyPage<T extends ComponentType<any>>(load: () => Promise<{ default: T }>) {
+  return lazy(() => loadPageOrReload(load));
+}
+
+export const Dashboard = lazyPage(() => import('../pages/Dashboard'));
+export const AgentChat = lazyPage(() => import('../pages/AgentChat'));
+export const AgentsList = lazyPage(() => import('../pages/AgentsList'));
+export const AgentWorkspaceExplorer = lazyPage(() => import('../pages/AgentWorkspaceExplorer'));
+export const Tools = lazyPage(() => import('../pages/Tools'));
+export const Cron = lazyPage(() => import('../pages/Cron'));
+export const Integrations = lazyPage(() => import('../pages/Integrations'));
+export const Plugins = lazyPage(() => import('../pages/Plugins'));
+export const Config = lazyPage(() => import('../pages/Config'));
+export const Logs = lazyPage(() => import('../pages/Logs'));
+export const Doctor = lazyPage(() => import('../pages/Doctor'));
+export const Pairing = lazyPage(() => import('../pages/Pairing'));
+export const Canvas = lazyPage(() => import('../pages/Canvas'));
+export const AcpConsole = lazyPage(() => import('../pages/AcpConsole'));
+export const Quickstart = lazyPage(() => import('../pages/quickstart/Quickstart'));
+export const Skills = lazyPage(() => import('../pages/Skills'));
+export const SopsList = lazyPage(() => import('../pages/Sops').then((m) => ({ default: m.SopsList })));
+export const SopView = lazyPage(() => import('../pages/Sops').then((m) => ({ default: m.SopView })));
+export const SopEditor = lazyPage(() =>
   import('../pages/Sops').then((m) => ({ default: m.SopEditor })),
 );
-export const Runs = lazy(() => import('../pages/Runs'));
-export const RunDetail = lazy(() => import('../pages/RunDetail'));
+export const Runs = lazyPage(() => import('../pages/Runs'));
+export const RunDetail = lazyPage(() => import('../pages/RunDetail'));

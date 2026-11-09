@@ -22,7 +22,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use zeroclaw_config::schema::OidcConfig;
 
-use super::oidc::{read_response_limited, validate_discovered_endpoint};
+use super::oidc::{form_urlencode_component, read_response_limited, validate_discovered_endpoint};
 
 #[derive(Debug, Clone, Deserialize)]
 struct EnrollmentDiscovery {
@@ -195,7 +195,10 @@ impl Enrollment {
         form: &mut Vec<(&'static str, String)>,
     ) -> reqwest::RequestBuilder {
         match self.config.client_secret.as_deref() {
-            Some(secret) => request.basic_auth(self.config.effective_client_id(), Some(secret)),
+            Some(secret) => request.basic_auth(
+                form_urlencode_component(self.config.effective_client_id()),
+                Some(form_urlencode_component(secret)),
+            ),
             None => {
                 form.push(("client_id", self.config.effective_client_id().to_string()));
                 request
@@ -208,8 +211,9 @@ impl Enrollment {
     /// The document must assert exactly the configured issuer, or the
     /// metadata is somebody else's (or a spoofed or misrouted endpoint) and
     /// none of its endpoints may be used. Every endpoint that will receive
-    /// a credential is then held to the canonical URL policy before any
-    /// request is built. Re-run on every operation, so a poll after a
+    /// a credential, and the authorization endpoint a browser is sent to,
+    /// is then held to the canonical URL policy before any request or
+    /// authorize URL is built. Re-run on every operation, so a poll after a
     /// changed document is re-bound too.
     async fn discovery(&self) -> Result<EnrollmentDiscovery> {
         let url = format!(
@@ -249,6 +253,9 @@ impl Enrollment {
         validate_discovered_endpoint(&discovery.token_endpoint, "token_endpoint")?;
         if let Some(endpoint) = discovery.device_authorization_endpoint.as_deref() {
             validate_discovered_endpoint(endpoint, "device_authorization_endpoint")?;
+        }
+        if let Some(endpoint) = discovery.authorization_endpoint.as_deref() {
+            validate_discovered_endpoint(endpoint, "authorization_endpoint")?;
         }
         Ok(discovery)
     }
@@ -527,9 +534,10 @@ fn validate_id_token(id_token: &str, flow: &PkceFlow, now: u64) -> Result<()> {
 impl Enrollment {
     /// Begin an Authorization Code + PKCE flow (S256 only): returns the
     /// authorize URL to open in a browser plus the client-held secrets
-    /// for the exchange. Refuses issuers that do not advertise S256
-    /// (RFC 8414 defaults the advertisement to `plain` when the field is
-    /// absent): there is no downgrade path.
+    /// for the exchange. Refuses issuers that do not advertise S256,
+    /// including those that omit `code_challenge_methods_supported` (RFC 8414
+    /// section 2: omitted means PKCE is not supported): there is no
+    /// downgrade path.
     pub async fn pkce_start(&self, redirect_uri: &str) -> Result<PkceFlow> {
         let discovery = self.discovery().await?;
         // `discovery` already refused any document whose asserted issuer is not
@@ -590,6 +598,27 @@ impl Enrollment {
     /// (issuer, audience, expiry, nonce) before anything is returned; a
     /// present but malformed id_token fails the exchange.
     pub async fn pkce_exchange(&self, flow: &PkceFlow, code: &str) -> Result<EnrolledToken> {
+        self.exchange_code(flow, code, false).await
+    }
+
+    /// [`Self::pkce_exchange`] for a browser sign-in, where the id_token is
+    /// the evidence of the authentication event (ADR-017): a token response
+    /// without one is refused rather than accepted on the access token
+    /// alone. The id_token is validated exactly as above and then discarded.
+    pub async fn pkce_exchange_requiring_id_token(
+        &self,
+        flow: &PkceFlow,
+        code: &str,
+    ) -> Result<EnrolledToken> {
+        self.exchange_code(flow, code, true).await
+    }
+
+    async fn exchange_code(
+        &self,
+        flow: &PkceFlow,
+        code: &str,
+        require_id_token: bool,
+    ) -> Result<EnrolledToken> {
         // The exchange posts this client's credentials to the token endpoint
         // pinned when the flow started. If the alias was repointed to another
         // issuer or client while the flow was pending, refuse before any
@@ -646,6 +675,9 @@ impl Enrollment {
         let raw: serde_json::Map<String, serde_json::Value> =
             serde_json::from_slice(&body).context("token response is not valid JSON")?;
         match raw.get("id_token") {
+            None if require_id_token => {
+                bail!("token response carries no id_token; this sign-in requires one")
+            }
             None => {}
             Some(serde_json::Value::String(id_token)) => {
                 validate_id_token(id_token, flow, now_unix())?;
@@ -1059,6 +1091,91 @@ mod tests {
             enrollment.device_grant_poll("dev-1").await.unwrap(),
             DevicePollOutcome::Pending
         ));
+    }
+
+    #[tokio::test]
+    async fn enrollment_basic_credentials_round_trip_on_every_endpoint() {
+        use base64::engine::general_purpose::STANDARD;
+
+        fn decode_form(body: &[u8]) -> HashMap<String, String> {
+            let mut url = reqwest::Url::parse("http://localhost/").unwrap();
+            url.set_query(Some(std::str::from_utf8(body).unwrap()));
+            url.query_pairs().into_owned().collect()
+        }
+
+        for (client_id, secret) in [
+            ("daemon-client", Some("plainsecret123")),
+            ("daemon: +/%&=", Some("s: +/%&=cret")),
+            ("public: +/%&=", None),
+        ] {
+            let server = idp_with_device_endpoint().await;
+            Mock::given(method("POST"))
+                .and(path("/device"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "device_code": "dev-1",
+                    "user_code": "AAAA-BBBB",
+                    "verification_uri": "https://sso.example.com/activate",
+                    "expires_in": 600,
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "synthetic-access-token", "token_type": "Bearer",
+                })))
+                .expect(if secret.is_some() { 2 } else { 1 })
+                .mount(&server)
+                .await;
+            let mut entry = config(&server.uri(), secret);
+            entry.client_id = client_id.to_string();
+            let enrollment = Enrollment::new("corp", entry).unwrap();
+            enrollment.device_grant_start().await.unwrap();
+            assert!(matches!(
+                enrollment.device_grant_poll("dev-1").await.unwrap(),
+                DevicePollOutcome::Token(_)
+            ));
+            if secret.is_some() {
+                enrollment.client_credentials().await.unwrap();
+            }
+            let requests = server.received_requests().await.unwrap();
+            let posts: Vec<_> = requests.iter().filter(|r| r.method == "POST").collect();
+            assert_eq!(posts.len(), if secret.is_some() { 3 } else { 2 });
+            for request in posts {
+                let form = decode_form(&request.body);
+                assert!(!form.contains_key("client_secret"));
+                match secret {
+                    Some(secret) => {
+                        assert!(!form.contains_key("client_id"));
+                        let header = request
+                            .headers
+                            .get("authorization")
+                            .unwrap()
+                            .to_str()
+                            .unwrap();
+                        let decoded = STANDARD
+                            .decode(header.strip_prefix("Basic ").unwrap())
+                            .unwrap();
+                        let pair = String::from_utf8(decoded).unwrap();
+                        let (id, password) = pair.split_once(':').unwrap();
+                        assert!(
+                            !password.contains(':'),
+                            "literal credential separator reached the wire"
+                        );
+                        let encoded = format!("id={id}&secret={password}");
+                        let credentials = decode_form(encoded.as_bytes());
+                        assert_eq!(credentials.len(), 2);
+                        assert_eq!(credentials["id"], client_id);
+                        assert_eq!(credentials["secret"], secret);
+                    }
+                    None => {
+                        assert!(!request.headers.contains_key("authorization"));
+                        assert_eq!(form["client_id"], client_id);
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -1503,6 +1620,103 @@ mod tests {
         }
     }
 
+    /// An issuer advertising `authorization_endpoint` next to valid device
+    /// and token endpoints, which must never receive a request.
+    async fn idp_with_authorization_endpoint(endpoint: &str) -> MockServer {
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": issuer,
+                "authorization_endpoint": endpoint,
+                "device_authorization_endpoint": format!("{issuer}/device"),
+                "token_endpoint": format!("{issuer}/token"),
+                "code_challenge_methods_supported": ["S256"],
+            })))
+            .mount(&server)
+            .await;
+        for endpoint_path in ["/device", "/token"] {
+            Mock::given(method("POST"))
+                .and(path(endpoint_path))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&server)
+                .await;
+        }
+        server
+    }
+
+    #[tokio::test]
+    async fn the_authorization_endpoint_is_held_to_the_canonical_url_policy() {
+        // The browser is sent to this URL (the gateway redirects to it and the
+        // CLI hands it to the system opener), so it gets the transport rule the
+        // credential-receiving endpoints get. Plain http to a remote host, a
+        // lookalike loopback host, userinfo and any non-http scheme are
+        // refused, and the document's other endpoints go unused as well.
+        for (bad, reason) in [
+            ("http://sso.example.com/authorize", "must use https"),
+            ("http://localhost.evil.example/authorize", "must use https"),
+            ("https://user:pass@sso.example.com/authorize", "userinfo"),
+            ("file:///tmp/authorize", "must be an http(s) URL"),
+            ("ftp://sso.example.com/authorize", "must be an http(s) URL"),
+            (
+                "custom-handler://sso.example.com/authorize",
+                "must be an http(s) URL",
+            ),
+        ] {
+            let server = idp_with_authorization_endpoint(bad).await;
+            let enrollment =
+                Enrollment::new("corp", config(&server.uri(), Some("s3cr3t"))).unwrap();
+            let err = enrollment
+                .pkce_start("http://127.0.0.1:7777/callback")
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("authorization_endpoint") && err.contains(reason),
+                "{bad}: {err}"
+            );
+            let err = enrollment
+                .client_credentials()
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("authorization_endpoint"), "{bad}: {err}");
+            let err = enrollment
+                .device_grant_start()
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("authorization_endpoint"), "{bad}: {err}");
+            // Dropping the server verifies the `.expect(0)` on both endpoints.
+            drop(server);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_authorization_endpoint_may_be_https_or_http_on_exact_loopback() {
+        for good in [
+            "https://sso.example.com/authorize",
+            "http://127.0.0.1:8080/authorize",
+            "http://localhost/authorize",
+            "http://[::1]:8080/authorize",
+        ] {
+            let server = idp_with_authorization_endpoint(good).await;
+            let enrollment = Enrollment::new("corp", config(&server.uri(), None)).unwrap();
+            let flow = enrollment
+                .pkce_start("http://127.0.0.1:7777/callback")
+                .await
+                .unwrap_or_else(|e| panic!("{good}: {e}"));
+            assert!(
+                flow.authorize_url.starts_with(&format!("{good}?")),
+                "{good}: {}",
+                flow.authorize_url
+            );
+            drop(server);
+        }
+    }
+
     fn flow_for(state: &str, issuer: &str) -> PkceFlow {
         PkceFlow {
             authorize_url: String::new(),
@@ -1695,6 +1909,91 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(token.access_token, "at-pkce");
+    }
+
+    /// The CLI and the enrollment relay accept a token response without an
+    /// id_token; a browser sign-in does not, because the id_token is its
+    /// evidence of the authentication event.
+    #[tokio::test]
+    async fn a_sign_in_exchange_refuses_a_response_without_an_id_token() {
+        let server = idp_with_pkce(Some(serde_json::json!(["S256"]))).await;
+        let enrollment = Enrollment::new("corp", config(&server.uri(), None)).unwrap();
+        let flow = enrollment
+            .pkce_start("http://127.0.0.1:7777/callback")
+            .await
+            .unwrap();
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "at-no-id-token",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+            })))
+            .mount(&server)
+            .await;
+        let err = enrollment
+            .pkce_exchange_requiring_id_token(&flow, "auth-code-1")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no id_token"), "{err}");
+
+        let token = enrollment
+            .pkce_exchange(&flow, "auth-code-1")
+            .await
+            .expect("enrollment keeps accepting a response without an id_token");
+        assert_eq!(token.access_token, "at-no-id-token");
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_exchange_validates_the_id_token_it_requires() {
+        let server = idp_with_pkce(Some(serde_json::json!(["S256"]))).await;
+        let enrollment = Enrollment::new("corp", config(&server.uri(), None)).unwrap();
+        let flow = enrollment
+            .pkce_start("http://127.0.0.1:7777/callback")
+            .await
+            .unwrap();
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains(format!(
+                "code_verifier={}",
+                flow.verifier
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "at-signed-in",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "id_token": id_token_with(valid_claims(&flow)),
+            })))
+            .mount(&server)
+            .await;
+        let token = enrollment
+            .pkce_exchange_requiring_id_token(&flow, "auth-code-1")
+            .await
+            .unwrap();
+        assert_eq!(token.access_token, "at-signed-in");
+
+        let server = idp_with_pkce(Some(serde_json::json!(["S256"]))).await;
+        let enrollment = Enrollment::new("corp", config(&server.uri(), None)).unwrap();
+        let flow = enrollment
+            .pkce_start("http://127.0.0.1:7777/callback")
+            .await
+            .unwrap();
+        let mut claims = valid_claims(&flow);
+        claims["nonce"] = serde_json::json!("some-other-flows-nonce");
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "at-substituted",
+                "token_type": "Bearer",
+                "id_token": id_token_with(claims),
+            })))
+            .mount(&server)
+            .await;
+        let err = enrollment
+            .pkce_exchange_requiring_id_token(&flow, "auth-code-1")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("nonce"), "{err}");
     }
 
     #[tokio::test]

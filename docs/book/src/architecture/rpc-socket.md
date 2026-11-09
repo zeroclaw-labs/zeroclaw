@@ -45,7 +45,7 @@ named pipes carry the same byte stream as Unix sockets.
 
 ```
 {"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":1},"id":1}\n
-{"jsonrpc":"2.0","result":{"protocolVersion":1,"serverVersion":"0.8.6"},"id":1}\n
+{"jsonrpc":"2.0","result":{"protocolVersion":1,"serverVersion":"0.8.7"},"id":1}\n
 ```
 
 ## Connection limits
@@ -62,6 +62,36 @@ The local endpoint bounds what one client can hold:
 
 Payloads larger than a frame travel as a chunked upload rather than in one
 line. See [Chunked uploads](#chunked-uploads).
+
+## Live sessions
+
+The daemon keeps at most 64 sessions live at once, across all clients. Past
+that, `session/new` is refused with `-32001` ("Session limit reached").
+
+A session stays live when its client disconnects, so the client can reconnect
+with its identity and carry on. A remote client (WSS) that stays away
+releases its sessions. Once the client has had no live connection for
+`wss.orphaned_session_timeout_secs` (default 1800), the daemon closes each of
+its sessions that:
+
+- has also been idle that long (a turn counts as activity when it finishes);
+- has no turn running;
+- has no approval pending.
+
+Closing one works as `session/close` does: the session leaves the live map,
+and its transcript is kept. Retirement never writes a transcript: a chat
+session is closed only when its store already holds all of its history. A
+session whose store lacks part of it (a failed save, say), differs from it, or
+can't be read stays live. The daemon logs each one it closes.
+
+After that, the transcript is in the store but out of a remote client's reach.
+Over WSS a client reaches only live sessions its own identity owns, so it
+can't list, read or resume a closed one. A local client can resume it.
+
+Sessions of local clients are not closed this way. Setting
+`wss.orphaned_session_timeout_secs` to `0` keeps every orphaned session live
+until the daemon restarts. A change takes effect within a minute, without a
+restart.
 
 ## Handshake
 
