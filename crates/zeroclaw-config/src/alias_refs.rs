@@ -761,6 +761,20 @@ fn rewrite_agent_refs(cfg: &mut Config, old: &str, new: &str) -> Vec<String> {
             dirty.push(format!("peer_groups.{gname}"));
         }
     }
+    // permission_profiles.<p>.allowed_agents[] — written trimmed, as resolve
+    // compiles it; wildcards and unrelated selectors are left as they are.
+    for (pname, profile) in cfg.permission_profiles.iter_mut() {
+        let mut touched = false;
+        for selector in profile.allowed_agents.iter_mut() {
+            if profile_selector_names_agent(selector, old) {
+                *selector = new.to_string();
+                touched = true;
+            }
+        }
+        if touched {
+            dirty.push(format!("permission_profiles.{pname}"));
+        }
+    }
     dirty
 }
 
@@ -978,8 +992,9 @@ pub fn rewrite_bundle_refs(cfg: &mut Config, old: &str, new: &str) -> Vec<String
 }
 
 // ── deterministic iteration over the alias-keyed maps ───────────────────────
-// `Config::agents` / `peer_groups` are HashMaps; sort by key so RefSite order
-// is stable across runs (tests + dashboard binding depend on it).
+// `Config::agents` / `peer_groups` / `permission_profiles` are HashMaps; sort by
+// key so RefSite order is stable across runs (tests + dashboard binding depend
+// on it).
 
 fn sorted_agents(cfg: &Config) -> Vec<(&String, &crate::schema::AliasedAgentConfig)> {
     let mut v: Vec<_> = cfg.agents.iter().collect();
@@ -989,6 +1004,14 @@ fn sorted_agents(cfg: &Config) -> Vec<(&String, &crate::schema::AliasedAgentConf
 
 fn sorted_peer_groups(cfg: &Config) -> Vec<(&String, &crate::multi_agent::PeerGroupConfig)> {
     let mut v: Vec<_> = cfg.peer_groups.iter().collect();
+    v.sort_by(|a, b| a.0.cmp(b.0));
+    v
+}
+
+fn sorted_permission_profiles(
+    cfg: &Config,
+) -> Vec<(&String, &crate::schema::PermissionProfileConfig)> {
+    let mut v: Vec<_> = cfg.permission_profiles.iter().collect();
     v.sort_by(|a, b| a.0.cmp(b.0));
     v
 }
@@ -1192,6 +1215,15 @@ fn collect_channel_refs(cfg: &Config, channel_type: &str, alias: &str, sites: &m
     }
 }
 
+/// Whether a `permission_profiles.<p>.allowed_agents` selector names agent
+/// `alias`, by the rule `Config::validate_auth` and
+/// `PermissionProfileConfig::resolve` share: the selector is trimmed, and a
+/// blank selector or the `"*"` wildcard names no particular agent.
+fn profile_selector_names_agent(selector: &str, alias: &str) -> bool {
+    let trimmed = selector.trim();
+    !trimmed.is_empty() && trimmed != zeroclaw_api::grants::WILDCARD && trimmed == alias
+}
+
 fn collect_agent_refs(cfg: &Config, alias: &str, sites: &mut Vec<RefSite>) {
     if cfg.heartbeat.agent.trim() == alias {
         let raw = cfg.heartbeat.agent.as_str();
@@ -1262,6 +1294,20 @@ fn collect_agent_refs(cfg: &Config, alias: &str, sites: &mut Vec<RefSite>) {
             }
         }
     }
+    // permission_profiles.<p>.allowed_agents[] — validate_auth rejects a
+    // selector naming a missing agent, so deletion is refused rather than
+    // silently narrowing the grant.
+    for (pname, profile) in sorted_permission_profiles(cfg) {
+        for (i, selector) in profile.allowed_agents.iter().enumerate() {
+            if profile_selector_names_agent(selector, alias) {
+                sites.push(RefSite::hard(
+                    format!("permission_profiles.{pname}.allowed_agents[{i}]"),
+                    ScrubAction::Refuse,
+                    selector,
+                ));
+            }
+        }
+    }
     if let Some(target) = cfg.agents.get(alias)
         && target.enabled
     {
@@ -1303,6 +1349,7 @@ mod tests {
     use crate::multi_agent::{AccessMode, AgentAlias, PeerGroupConfig};
     use crate::schema::{
         AliasedAgentConfig, Config, DelegateTargetConfig, EmbeddingRouteConfig, ModelRouteConfig,
+        PermissionProfileConfig,
     };
 
     /// Empty config with the alias-keyed containers cleared so Config::default
@@ -2070,6 +2117,82 @@ mod tests {
     }
 
     #[test]
+    fn agent_delete_is_refused_while_a_permission_profile_selects_it() {
+        // `validate_auth` rejects a selector naming a missing agent, so an
+        // explicit selector is a HARD reference: the delete is refused up front,
+        // naming the selector, rather than silently narrowing the grant.
+        let mut cfg = empty_config();
+        cfg.agents
+            .insert("bot".to_string(), AliasedAgentConfig::default());
+        cfg.permission_profiles.insert(
+            "everyone".to_string(),
+            PermissionProfileConfig {
+                allowed_agents: vec!["*".to_string()],
+                ..Default::default()
+            },
+        );
+        assert!(
+            plan_delete(&cfg, &AliasKind::Agent, "bot").allowed,
+            "a wildcard-only profile names no particular agent and must not block"
+        );
+
+        // Selectors match after trimming (validate_auth and resolve both trim),
+        // and blockers come back in profile-name order.
+        for (name, selectors) in [
+            ("ops", vec!["bot"]),
+            ("audit", vec!["*", " bot "]),
+            ("crew", vec!["other", "bot"]),
+        ] {
+            cfg.permission_profiles.insert(
+                name.to_string(),
+                PermissionProfileConfig {
+                    allowed_agents: selectors.into_iter().map(String::from).collect(),
+                    ..Default::default()
+                },
+            );
+        }
+        let err = delete_with_cascade(
+            &mut cfg,
+            &AliasKind::Agent,
+            "bot",
+            CascadePolicy::RefuseOnHard,
+        )
+        .unwrap_err();
+        match err {
+            CascadeError::Refused(report) => {
+                let paths: Vec<_> = report.blockers.iter().map(|b| b.path.as_str()).collect();
+                assert_eq!(
+                    paths,
+                    vec![
+                        "permission_profiles.audit.allowed_agents[1]",
+                        "permission_profiles.crew.allowed_agents[1]",
+                        "permission_profiles.ops.allowed_agents[0]",
+                    ]
+                );
+                assert!(
+                    report
+                        .blockers
+                        .iter()
+                        .all(|b| b.action == ScrubAction::Refuse)
+                );
+                assert_eq!(report.blockers[0].raw_value, " bot ");
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        // Refuse-before-mutate: the agent and every selector survive intact.
+        assert!(cfg.agents.contains_key("bot"));
+        assert_eq!(cfg.permission_profiles["ops"].allowed_agents, vec!["bot"]);
+        assert_eq!(
+            cfg.permission_profiles["audit"].allowed_agents,
+            vec!["*", " bot "]
+        );
+        assert_eq!(
+            cfg.permission_profiles["crew"].allowed_agents,
+            vec!["other", "bot"]
+        );
+    }
+
+    #[test]
     fn cascade_agent_scrubs_all_soft_refs_and_removes() {
         let mut cfg = empty_config();
         cfg.agents
@@ -2515,6 +2638,67 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted, report.dirty_paths);
+    }
+
+    #[test]
+    fn rename_agent_rewrites_permission_profile_selectors_and_keeps_wildcards() {
+        let mut cfg = empty_config();
+        cfg.agents
+            .insert("bot".to_string(), AliasedAgentConfig::default());
+        cfg.agents
+            .insert("other".to_string(), AliasedAgentConfig::default());
+        cfg.permission_profiles.insert(
+            "ops".to_string(),
+            PermissionProfileConfig {
+                // The padded selector names `bot` too: validate_auth and resolve trim.
+                allowed_agents: vec![
+                    "bot".to_string(),
+                    " bot ".to_string(),
+                    "*".to_string(),
+                    "other".to_string(),
+                ],
+                ..Default::default()
+            },
+        );
+        cfg.permission_profiles.insert(
+            "viewer".to_string(),
+            PermissionProfileConfig {
+                allowed_agents: vec!["other".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let report = rename_with_cascade(&mut cfg, &AliasKind::Agent, "bot", "bot2")
+            .expect("renaming a profile-selected agent succeeds");
+        // Exact selectors follow the rename; the wildcard and the unrelated
+        // selector keep their text and position.
+        assert_eq!(
+            cfg.permission_profiles["ops"].allowed_agents,
+            vec!["bot2", "bot2", "*", "other"]
+        );
+        assert_eq!(
+            cfg.permission_profiles["viewer"].allowed_agents,
+            vec!["other"]
+        );
+        assert!(
+            report
+                .dirty_paths
+                .iter()
+                .any(|p| p == "permission_profiles.ops"),
+            "{:?}",
+            report.dirty_paths
+        );
+        assert!(
+            !report
+                .dirty_paths
+                .iter()
+                .any(|p| p == "permission_profiles.viewer"),
+            "an untouched profile is not rewritten: {:?}",
+            report.dirty_paths
+        );
+        assert!(find_all_references(&cfg, &AliasKind::Agent, "bot").is_empty());
+        cfg.validate_auth()
+            .expect("no selector names the old alias, so auth validation accepts the result");
     }
 
     #[test]
