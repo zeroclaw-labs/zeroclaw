@@ -383,7 +383,12 @@ impl Chat {
                     continue;
                 }
                 Some(Ok(Message::Close(_)) | Err(_)) | None => return Stop::Gone,
-                Some(Ok(_)) => continue,
+                // Ignored, but charged to the task's budget as before the
+                // first frame, so the session's recheck still runs.
+                Some(Ok(_)) => {
+                    tokio::task::coop::consume_budget().await;
+                    continue;
+                }
             };
             let stop = self
                 .on_frame(sender, receiver, &mut ping, &mut stopping, &text)

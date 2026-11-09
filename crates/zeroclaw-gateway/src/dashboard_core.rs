@@ -3878,11 +3878,40 @@ mod tests {
     /// the flood stops.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_first_frame_flood_cannot_hold_off_a_lost_grant_or_a_sign_out() {
+        flood_then_lose_access(false).await;
+    }
+
+    /// The same once the socket's `connect` was acknowledged: the flood then
+    /// reaches the loop between turns, which must let the recheck run too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_flood_after_connect_cannot_hold_off_a_lost_grant_or_a_sign_out() {
+        flood_then_lose_access(true).await;
+    }
+
+    /// Send a masked client text frame (key zero) on a raw socket.
+    async fn write_raw_text(writer: &mut tokio::net::tcp::OwnedWriteHalf, text: &str) {
+        use tokio::io::AsyncWriteExt as _;
+        let len = u8::try_from(text.len()).expect("a short frame");
+        assert!(len < 126, "a short frame");
+        let mut frame = vec![0x81, 0x80 | len, 0, 0, 0, 0];
+        frame.extend_from_slice(text.as_bytes());
+        writer.write_all(&frame).await.unwrap();
+    }
+
+    /// Open a scoped chat, optionally complete its `connect`, flood it with
+    /// Binary and Pong frames, then take away its access (the agent, a
+    /// session verb, or the session itself) and check how soon it closes.
+    async fn flood_then_lose_access(after_connect: bool) {
         use crate::dashboard_session::{WS_CLOSE_ACCESS_LOST, WS_CLOSE_SESSION_ENDED};
         const RECHECK: Duration = Duration::from_millis(50);
+        let phase = if after_connect {
+            "after connect"
+        } else {
+            "first frame"
+        };
         for flood in ["framed", "raw"] {
             for ending in ["agent", "read", "sign-out"] {
-                let case = format!("{flood} flood, {ending}");
+                let case = format!("{phase}, {flood} flood, {ending}");
                 let (fixture, addr, alice, session) = flood_gateway(RECHECK).await;
                 let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let flood_stop = Arc::clone(&stop);
@@ -3892,6 +3921,14 @@ mod tests {
                         .expect("alice may chat");
                     let start = await_frame(&mut socket, "session_start").await;
                     let core_id = start["session_id"].as_str().unwrap().to_string();
+                    if after_connect {
+                        let connect = json!({ "type": "connect" });
+                        socket
+                            .send(ClientMessage::Text(connect.to_string().into()))
+                            .await
+                            .unwrap();
+                        await_frame(&mut socket, "connected").await;
+                    }
                     let (sink, stream) = socket.split();
                     (
                         core_id,
@@ -3899,7 +3936,16 @@ mod tests {
                         zeroclaw_spawn::spawn!(async move { read_framed_close(stream).await }),
                     )
                 } else {
-                    let (reader, writer, core_id) = open_raw_chat(addr, &alice).await;
+                    let (mut reader, mut writer, core_id) = open_raw_chat(addr, &alice).await;
+                    if after_connect {
+                        write_raw_text(&mut writer, r#"{"type":"connect"}"#).await;
+                        let (opcode, payload) = read_raw_frame(&mut reader)
+                            .await
+                            .expect("the acknowledgement");
+                        assert_eq!(opcode, 0x1, "{case}: a text frame");
+                        let ack: Value = serde_json::from_slice(&payload).unwrap();
+                        assert_eq!(ack["type"], "connected", "{case}: {ack}");
+                    }
                     (
                         core_id,
                         zeroclaw_spawn::spawn!(async move { flood_raw(writer, flood_stop).await }),
@@ -3946,6 +3992,7 @@ mod tests {
                 .map(|()| changed.elapsed());
                 stop.store(true, std::sync::atomic::Ordering::Relaxed);
                 let frames = flooding.await.expect("the flood task");
+                // i18n-exempt: test timing diagnostic, shown with --nocapture
                 eprintln!(
                     "{case}: close frame after {close_after:?}, conversation closed after \
                      {conversation:?}, {frames} frames sent"
