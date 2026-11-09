@@ -1,0 +1,86 @@
+{
+  "fixture": "Synthetic API data, actual Vite app route",
+  "requests": [
+    [
+      "GET",
+      "/api/auth/methods"
+    ],
+    [
+      "GET",
+      "/api/auth/methods"
+    ],
+    [
+      "GET",
+      "/api/status"
+    ],
+    [
+      "GET",
+      "/api/version/check"
+    ],
+    [
+      "GET",
+      "/api/config/reload-status"
+    ],
+    [
+      "GET",
+      "/api/config/drift"
+    ],
+    [
+      "GET",
+      "/api/config/sections"
+    ],
+    [
+      "GET",
+      "/api/config/provider-registry"
+    ],
+    [
+      "GET",
+      "/api/config/drift"
+    ],
+    [
+      "GET",
+      "/api/config/reload-status"
+    ],
+    [
+      "GET",
+      "/api/config/drift"
+    ],
+    [
+      "PUT",
+      "/api/config/provider-registry"
+    ],
+    [
+      "GET",
+      "/api/config/provider-registry"
+    ],
+    [
+      "GET",
+      "/api/config/drift"
+    ],
+    [
+      "GET",
+      "/api/config/provider-registry"
+    ]
+  ],
+  "saves": 1,
+  "page_errors": [],
+  "actions": [
+    "open exact dotted model reference",
+    "save full registry",
+    "reject invalid JSON without write",
+    "reload admitted state",
+    "resize to 390x844"
+  ],
+  "revision": "cf0b95137119d751cff75c682079daaf8d3fa67b",
+  "web_tree": "4f8b8a4c133996c6a76a805833382142b0994d64",
+  "locale": "en-US",
+  "desktop_viewport": {
+    "width": 1440,
+    "height": 1000
+  },
+  "mobile_viewport": {
+    "width": 390,
+    "height": 844
+  },
+  "captured_at": "2026-11-09T14:06:39Z"
+}
