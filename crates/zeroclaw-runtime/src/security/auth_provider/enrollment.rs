@@ -211,8 +211,9 @@ impl Enrollment {
     /// The document must assert exactly the configured issuer, or the
     /// metadata is somebody else's (or a spoofed or misrouted endpoint) and
     /// none of its endpoints may be used. Every endpoint that will receive
-    /// a credential is then held to the canonical URL policy before any
-    /// request is built. Re-run on every operation, so a poll after a
+    /// a credential, and the authorization endpoint a browser is sent to,
+    /// is then held to the canonical URL policy before any request or
+    /// authorize URL is built. Re-run on every operation, so a poll after a
     /// changed document is re-bound too.
     async fn discovery(&self) -> Result<EnrollmentDiscovery> {
         let url = format!(
@@ -252,6 +253,9 @@ impl Enrollment {
         validate_discovered_endpoint(&discovery.token_endpoint, "token_endpoint")?;
         if let Some(endpoint) = discovery.device_authorization_endpoint.as_deref() {
             validate_discovered_endpoint(endpoint, "device_authorization_endpoint")?;
+        }
+        if let Some(endpoint) = discovery.authorization_endpoint.as_deref() {
+            validate_discovered_endpoint(endpoint, "authorization_endpoint")?;
         }
         Ok(discovery)
     }
@@ -530,9 +534,10 @@ fn validate_id_token(id_token: &str, flow: &PkceFlow, now: u64) -> Result<()> {
 impl Enrollment {
     /// Begin an Authorization Code + PKCE flow (S256 only): returns the
     /// authorize URL to open in a browser plus the client-held secrets
-    /// for the exchange. Refuses issuers that do not advertise S256
-    /// (RFC 8414 defaults the advertisement to `plain` when the field is
-    /// absent): there is no downgrade path.
+    /// for the exchange. Refuses issuers that do not advertise S256,
+    /// including those that omit `code_challenge_methods_supported` (RFC 8414
+    /// section 2: omitted means PKCE is not supported): there is no
+    /// downgrade path.
     pub async fn pkce_start(&self, redirect_uri: &str) -> Result<PkceFlow> {
         let discovery = self.discovery().await?;
         // `discovery` already refused any document whose asserted issuer is not
@@ -1612,6 +1617,103 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(err.to_string().contains("S256"), "{err}");
+        }
+    }
+
+    /// An issuer advertising `authorization_endpoint` next to valid device
+    /// and token endpoints, which must never receive a request.
+    async fn idp_with_authorization_endpoint(endpoint: &str) -> MockServer {
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": issuer,
+                "authorization_endpoint": endpoint,
+                "device_authorization_endpoint": format!("{issuer}/device"),
+                "token_endpoint": format!("{issuer}/token"),
+                "code_challenge_methods_supported": ["S256"],
+            })))
+            .mount(&server)
+            .await;
+        for endpoint_path in ["/device", "/token"] {
+            Mock::given(method("POST"))
+                .and(path(endpoint_path))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&server)
+                .await;
+        }
+        server
+    }
+
+    #[tokio::test]
+    async fn the_authorization_endpoint_is_held_to_the_canonical_url_policy() {
+        // The browser is sent to this URL (the gateway redirects to it and the
+        // CLI hands it to the system opener), so it gets the transport rule the
+        // credential-receiving endpoints get. Plain http to a remote host, a
+        // lookalike loopback host, userinfo and any non-http scheme are
+        // refused, and the document's other endpoints go unused as well.
+        for (bad, reason) in [
+            ("http://sso.example.com/authorize", "must use https"),
+            ("http://localhost.evil.example/authorize", "must use https"),
+            ("https://user:pass@sso.example.com/authorize", "userinfo"),
+            ("file:///tmp/authorize", "must be an http(s) URL"),
+            ("ftp://sso.example.com/authorize", "must be an http(s) URL"),
+            (
+                "custom-handler://sso.example.com/authorize",
+                "must be an http(s) URL",
+            ),
+        ] {
+            let server = idp_with_authorization_endpoint(bad).await;
+            let enrollment =
+                Enrollment::new("corp", config(&server.uri(), Some("s3cr3t"))).unwrap();
+            let err = enrollment
+                .pkce_start("http://127.0.0.1:7777/callback")
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("authorization_endpoint") && err.contains(reason),
+                "{bad}: {err}"
+            );
+            let err = enrollment
+                .client_credentials()
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("authorization_endpoint"), "{bad}: {err}");
+            let err = enrollment
+                .device_grant_start()
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("authorization_endpoint"), "{bad}: {err}");
+            // Dropping the server verifies the `.expect(0)` on both endpoints.
+            drop(server);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_authorization_endpoint_may_be_https_or_http_on_exact_loopback() {
+        for good in [
+            "https://sso.example.com/authorize",
+            "http://127.0.0.1:8080/authorize",
+            "http://localhost/authorize",
+            "http://[::1]:8080/authorize",
+        ] {
+            let server = idp_with_authorization_endpoint(good).await;
+            let enrollment = Enrollment::new("corp", config(&server.uri(), None)).unwrap();
+            let flow = enrollment
+                .pkce_start("http://127.0.0.1:7777/callback")
+                .await
+                .unwrap_or_else(|e| panic!("{good}: {e}"));
+            assert!(
+                flow.authorize_url.starts_with(&format!("{good}?")),
+                "{good}: {}",
+                flow.authorize_url
+            );
+            drop(server);
         }
     }
 
