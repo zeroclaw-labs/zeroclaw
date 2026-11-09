@@ -2,6 +2,7 @@ import { useEffect, useImperativeHandle, useLayoutEffect, useRef, useState, type
 import { Mic, MicOff, Volume2, VolumeX } from 'lucide-react';
 import type { ChatMessage } from '@/contexts/AgentContext';
 import { t } from '@/lib/i18n';
+import { speechText } from '@/lib/speechText';
 import { localRecognitionStatus, recognitionConstructor, shortPressAction, useBrowserVoices, useVoicePreferences, type Recognition } from '@/lib/browserVoice';
 
 export default function BrowserVoiceControls({ messages, hydrated, typing, onTranscript, captureRef }: {
@@ -47,7 +48,9 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
     const voice = voices.find(v => v.voiceURI === prefs.voice);
     if (!voice || !('speechSynthesis' in window)) { setError(t('voice.select_voice')); return false; }
     stopSpeech();
-    const next = new SpeechSynthesisUtterance(text);
+    const readable = speechText(text);
+    if (!readable) return false;
+    const next = new SpeechSynthesisUtterance(readable);
     next.voice = voice; next.lang = prefs.language; next.rate = prefs.rate;
     next.onend = () => { utterance.current = null; setSpeaking(false); };
     next.onerror = () => { utterance.current = null; setSpeaking(false); setError(t('voice.speech_error')); };

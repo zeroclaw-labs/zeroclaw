@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { Window } from 'happy-dom';
 import React, { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import type { ChatMessage } from '@/contexts/AgentContext';
@@ -44,7 +45,7 @@ const fakeWindow = Object.assign(new EventTarget(), {
 });
 const fakeDocument = Object.assign(new EventTarget(), { visibilityState: 'visible' });
 Object.assign(globalThis, { React, window: fakeWindow, document: fakeDocument, localStorage: storage,
-  SpeechSynthesisUtterance: FakeUtterance,
+  SpeechSynthesisUtterance: FakeUtterance, DOMParser: new Window().DOMParser,
   MutationObserver: class { observe() {} disconnect() {} },
   IS_REACT_ACT_ENVIRONMENT: true,
 });
@@ -417,4 +418,20 @@ test('a late selected-device response cannot repaint a different device configur
     if (renderer) await act(async () => { renderer.unmount(); });
     globalThis.fetch = originalFetch;
   }
+});
+
+
+test('speaker reads rendered Markdown while preserving literal shell punctuation', async () => {
+  const renderer = await mount();
+  const markdown = '## **Status**\n\n- *Atualizado*\n- [Painel](https://example.com/private)\n\n---\n\n`apt-get --yes` e `a*b`.';
+  await act(async () => { renderer.update(createElement(Controls, { messages: [reply('markdown', markdown)], hydrated: true, typing: false, onTranscript() {} })); });
+  await act(async () => { renderer.root.findAllByType('button')[1]!.props.onClick(); });
+  assert.equal(spoken.length, 1);
+  assert.match(spoken[0]!, /Status/);
+  assert.match(spoken[0]!, /Atualizado/);
+  assert.match(spoken[0]!, /Painel/);
+  assert.doesNotMatch(spoken[0]!, /https:|\*\*|---|##/);
+  assert.match(spoken[0]!, /apt-get --yes/);
+  assert.match(spoken[0]!, /a\*b/);
+  await act(async () => { renderer.unmount(); });
 });
