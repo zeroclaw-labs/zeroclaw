@@ -1499,13 +1499,19 @@ mod sasl_preference_tests {
     use super::prefer_authenticated_mechanisms;
     #[test]
     fn server_order_cannot_downgrade_scram_to_plain() {
-        let mut mechanisms = ["PLAIN", "SCRAM-SHA-1", "SCRAM-SHA-256"].into_iter().map(str::to_owned).collect();
+        let mut mechanisms = ["PLAIN", "SCRAM-SHA-1", "SCRAM-SHA-256"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
         prefer_authenticated_mechanisms(&mut mechanisms);
         assert_eq!(mechanisms, ["SCRAM-SHA-256".to_owned()].into());
     }
     #[test]
     fn tls_plain_only_servers_remain_supported() {
-        let mut mechanisms = ["ANONYMOUS", "PLAIN"].into_iter().map(str::to_owned).collect();
+        let mut mechanisms = ["ANONYMOUS", "PLAIN"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
         prefer_authenticated_mechanisms(&mut mechanisms);
         assert_eq!(mechanisms, ["PLAIN".to_owned()].into());
     }
