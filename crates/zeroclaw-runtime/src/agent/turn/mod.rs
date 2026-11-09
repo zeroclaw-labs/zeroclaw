@@ -3449,6 +3449,11 @@ async fn run_tool_call_loop_impl<'a>(
         let allow_parallel_execution =
             parallel_tools && should_execute_tools_in_parallel(&executable_calls, approval);
 
+        let mut sequential_loop_guard = crate::agent::tool_execution::SequentialLoopGuard {
+            detector: loop_detector.clone(),
+            ignore_tools: pacing.loop_ignore_tools.clone(),
+            refused: false,
+        };
         let live_sop_queue = crate::sop::executor::new_live_action_queue();
         let execution =
             crate::sop::executor::scope_live_action_queue(live_sop_queue.clone(), async {
@@ -3486,6 +3491,7 @@ async fn run_tool_call_loop_impl<'a>(
                         cancellation_token.as_ref(),
                         receipt_generator,
                         ctx.event_tx,
+                        Some(&mut sequential_loop_guard),
                     )
                     .await
                 }
@@ -3498,6 +3504,7 @@ async fn run_tool_call_loop_impl<'a>(
             Some(budget) => ExecutionTreeBudget::scope(budget, Box::pin(execution)).await,
             None => execution.await,
         };
+        let preflight_loop_stopped = preflight_loop_stopped || sequential_loop_guard.refused;
         let executed_slots = match execution_result {
             Ok(slots) => slots,
             Err(e) if is_tool_loop_cancelled(&e) => {
