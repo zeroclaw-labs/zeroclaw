@@ -301,8 +301,10 @@ jobs:
               fi
             fi
 
-            # No stable/ tree: Stable is a pointer to a real version dir, never a
-            # duplicate copy. The committed pointer (docs/book/stable-version.txt)
+            # Stable is a pointer to a real version dir. The only copy is the
+            # stable/ alias that gen-stable-alias rebuilds from it below, which
+            # is byte-identical to that dir, so git stores it once. The
+            # committed pointer (docs/book/stable-version.txt)
             # is published to the gh-pages root as stable-version.txt; gen-versions,
             # gen-root-index, and prune-versions read it. The pointer is GLOBAL
             # state for the whole site, so only master writes it. An old release
@@ -352,8 +354,8 @@ jobs:
             echo "docs.zeroclaw.com" > CNAME
             touch .nojekyll
 
-            # Drop pre-versioned orphan dirs (including any legacy stable/), then
-            # enforce retention (master, the stable-pointer target, and the newest
+            # Drop pre-versioned orphan dirs (including last deploy's stable/
+            # alias, rebuilt by gen-stable-alias below), then enforce retention (master, the stable-pointer target, and the newest
             # DOCS_KEEP_VERSIONS finals). gen-versions runs AFTER pruning so
             # versions.json never lists a dropped version; gen-root-index points /
             # at the stable pointer target (or master when none resolves).
@@ -376,6 +378,12 @@ jobs:
             # above) for the site host and stable-version.txt for the copy
             # that counts; idempotent across deploys.
             $MDBOOK_XTASK gen-seo
+            # stable/ is the version-less URL every canonical, hreflang and
+            # sitemap entry names, so a release updates those pages in place
+            # instead of moving each of them to a new /vX.Y.Z/ path. It is a
+            # copy of the pointer target taken after gen-seo, so the two
+            # trees are byte-identical.
+            $MDBOOK_XTASK gen-stable-alias
 
             # Guard: a published pointer must always name a present version dir,
             # or the root would silently redirect to a missing path. The flip is
@@ -393,6 +401,10 @@ jobs:
               WANT="$(tr -d '[:space:]' < stable-version.txt)"
               if [ -n "$WANT" ] && [ ! -d "$WANT" ]; then
                 echo "::error::stable pointer '${WANT}' has no version dir on gh-pages. Deploy ${WANT} (push its tag) before it can be Stable."
+                exit 1
+              fi
+              if [ -n "$WANT" ] && [ ! -f stable/en/index.html ]; then
+                echo "::error::the stable/ alias of '${WANT}' is missing; the root redirect would point at a missing path."
                 exit 1
               fi
             fi

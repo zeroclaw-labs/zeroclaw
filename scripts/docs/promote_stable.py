@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Promote an existing release by updating root metadata and the llms pair.
+"""Promote an existing release by updating root metadata, the llms pair and the
+version-less stable/ alias.
 
 Master's committed pointer is policy; GitHub Latest and the deployed source
 receipt prove eligibility. No builds, pruning, tag writes, or publication here.
@@ -11,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -18,6 +20,9 @@ import tomllib
 
 # Root pair agents fetch by fixed URL; promoted as one unit with the metadata.
 LLMS_FILES = ("llms.txt", "llms-full.txt")
+# Version-less copy of the stable release; STABLE_ALIAS in
+# xtask/src/cmd/mdbook/versions.rs. Canonical and sitemap URLs name it.
+STABLE_ALIAS = "stable"
 
 
 def require(condition, message):
@@ -60,6 +65,27 @@ def root_llms(pages, tag):
     if not all((source / name).is_file() for name in LLMS_FILES):
         return dict.fromkeys(LLMS_FILES)
     return {name: read_file(source / name) for name in LLMS_FILES}
+
+
+def contains_symlink(root):
+    for directory, dirs, files in os.walk(root):
+        if any(os.path.islink(os.path.join(directory, name)) for name in dirs + files):
+            return True
+    return False
+
+
+def replace_alias(target, alias):
+    """Make the stable alias a copy of the release dir, as xtask's
+    gen-stable-alias does on every build deploy. The copied pages keep the SEO
+    tags they were deployed with; pages new in this release get their
+    stable-alias canonical on the next build deploy, which reruns gen-seo.
+    """
+    staged = alias.with_name(f"{alias.name}.tmp")
+    shutil.rmtree(staged, ignore_errors=True)
+    shutil.copytree(target, staged, symlinks=True)
+    if alias.exists():
+        shutil.rmtree(alias)
+    staged.replace(alias)
 
 
 def promote(*, pages, repo, master_sha, tag, workflow_ref, minimum, check_only=False):
@@ -113,6 +139,9 @@ def promote(*, pages, repo, master_sha, tag, workflow_ref, minimum, check_only=F
     require(tag in tags and current in tags and len(set(tags)) == len(tags),
             "Missing or duplicate version entries; run a normal docs deploy first")
     read_file(pages / "index.html")  # Check every output before writing any.
+    alias = pages / STABLE_ALIAS
+    require(not alias.is_symlink(), "The stable alias must not be a symlink")
+    require(not contains_symlink(target), "Release directory must not contain symlinks")
     llms = root_llms(pages, tag)
     for entry in entries:
         if entry["tag"] == current:
@@ -120,7 +149,7 @@ def promote(*, pages, repo, master_sha, tag, workflow_ref, minimum, check_only=F
         if entry["tag"] == tag:
             entry["label"] = "Stable (latest release)"
     metadata["stable"] = tag
-    destination = f"./{tag}/en/"
+    destination = f"./{STABLE_ALIAS}/en/"
     # Same root redirect shape as xtask's gen-root-index; keep the existing
     # version inventory/order instead of copying its discovery/retention logic.
     index = ('<!doctype html>\n<meta charset="utf-8">\n'
@@ -138,6 +167,7 @@ def promote(*, pages, repo, master_sha, tag, workflow_ref, minimum, check_only=F
             staged = pages / f"{name}.tmp"
             staged.write_text(text, encoding="utf-8")
             staged.replace(published)
+        replace_alias(target, alias)
     print(f"{'Validated' if check_only else 'Promoted'} {tag} ({tag_sha}) from master {master_sha}")
 
 
