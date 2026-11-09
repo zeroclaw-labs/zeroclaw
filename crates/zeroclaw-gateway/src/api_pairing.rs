@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use zeroclaw_config::pairing::PairedTokenSubject;
 
 /// Metadata about a paired device.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,11 +198,22 @@ impl DeviceRegistry {
     }
 
     pub fn list(&self) -> Result<Vec<DeviceInfo>, rusqlite::Error> {
+        Ok(self
+            .list_with_token_hashes()?
+            .into_iter()
+            .map(|(_, info)| info)
+            .collect())
+    }
+
+    /// Every device with the hash of the token it was paired with, so a
+    /// caller can ask the pairing guard what that token authenticates as.
+    pub fn list_with_token_hashes(&self) -> Result<Vec<(String, DeviceInfo)>, rusqlite::Error> {
         let conn = self.open_db()?;
         let mut stmt = conn.prepare(
             "SELECT token_hash, id, name, device_type, paired_at, last_seen, ip_address, capabilities FROM devices",
         )?;
         let rows = stmt.query_map([], |row| {
+            let token_hash: String = row.get(0)?;
             let id: String = row.get(1)?;
             let name: Option<String> = row.get(2)?;
             let device_type: Option<String> = row.get(3)?;
@@ -218,15 +230,18 @@ impl DeviceRegistry {
             let capabilities = capabilities_json
                 .as_deref()
                 .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok());
-            Ok(DeviceInfo {
-                id,
-                name,
-                device_type,
-                paired_at,
-                last_seen,
-                ip_address,
-                capabilities,
-            })
+            Ok((
+                token_hash,
+                DeviceInfo {
+                    id,
+                    name,
+                    device_type,
+                    paired_at,
+                    last_seen,
+                    ip_address,
+                    capabilities,
+                },
+            ))
         })?;
         rows.collect()
     }
@@ -392,8 +407,12 @@ pub async fn submit_pairing_enhanced(
             .into_response();
     }
 
-    match state.pairing.try_pair(code, &client_id).await {
-        Ok(Some(token)) => {
+    match state.pairing.reserve_pair(code, &client_id).await {
+        Ok(Some(reservation)) => {
+            // The subject comes from the code the operator minted; the
+            // client redeeming it cannot choose or drop it.
+            let principal_id = super::paired_principal_id(reservation.subject());
+            let token = reservation.commit();
             let token_hash = {
                 use sha2::{Digest, Sha256};
                 let hash = Sha256::digest(token.as_bytes());
@@ -457,6 +476,7 @@ pub async fn submit_pairing_enhanced(
                 "paired": true,
                 "persisted": true,
                 "token": token,
+                "principal_id": principal_id,
                 "message": "Pairing successful"
             }))
             .into_response()
@@ -486,15 +506,35 @@ pub async fn submit_pairing_enhanced(
     }
 }
 
+/// A device as `GET /api/devices` reports it.
+#[derive(Debug, Serialize)]
+struct ListedDevice {
+    #[serde(flatten)]
+    info: DeviceInfo,
+    /// The principal the device's token authenticates as, read from the
+    /// pairing guard when the list is built, so the registry stores nothing
+    /// about bindings. `None` once that token is no longer paired.
+    principal_id: Option<String>,
+}
+
 /// GET /api/devices — list paired devices
 pub async fn list_devices(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
 
-    let devices = match state.device_registry.as_ref() {
-        Some(r) => match r.list() {
-            Ok(devices) => devices,
+    let devices: Vec<ListedDevice> = match state.device_registry.as_ref() {
+        Some(r) => match r.list_with_token_hashes() {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|(token_hash, info)| ListedDevice {
+                    info,
+                    principal_id: state
+                        .pairing
+                        .subject_for_hash(&token_hash)
+                        .map(|subject| super::paired_principal_id(&subject)),
+                })
+                .collect(),
             Err(e) => {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -521,6 +561,12 @@ pub async fn list_devices(State(state): State<AppState>, headers: HeaderMap) -> 
     .into_response()
 }
 
+/// The subject removed from the canonical pairing map with a device row.
+/// A stale device row can have a token that was already revoked.
+pub(crate) struct RevokedDevice {
+    pub(crate) subject: Option<PairedTokenSubject>,
+}
+
 /// Delete `device_id` and invalidate its bearer token as one revocation.
 ///
 /// An admitted config commit serializes this synchronous removal of both the
@@ -531,13 +577,12 @@ pub(crate) fn revoke_device_credential<R>(
     device_id: &str,
     _commit: &ConfigWriteGuard,
     authorize: impl FnOnce() -> Result<(), R>,
-) -> Result<Result<bool, rusqlite::Error>, R> {
+) -> Result<Result<Option<RevokedDevice>, rusqlite::Error>, R> {
     match registry.revoke_authorized(device_id, authorize) {
-        Ok(Ok(Some(hash))) => {
-            state.pairing.revoke_token_hash(&hash);
-            Ok(Ok(true))
-        }
-        Ok(Ok(None)) => Ok(Ok(false)),
+        Ok(Ok(Some(hash))) => Ok(Ok(Some(RevokedDevice {
+            subject: state.pairing.revoke_token_hash_subject(&hash),
+        }))),
+        Ok(Ok(None)) => Ok(Ok(None)),
         Ok(Err(refusal)) => Err(refusal),
         Err(error) => Ok(Err(error)),
     }
@@ -562,7 +607,7 @@ async fn revoke_operator_device(
     headers: &HeaderMap,
     device_id: &str,
     dashboard: Option<&DashboardAuth>,
-) -> Result<(ConfigWriteGuard, Option<Arc<SessionAuth>>), axum::response::Response> {
+) -> Result<(ConfigWriteGuard, Option<Arc<SessionAuth>>, RevokedDevice), axum::response::Response> {
     require_auth(state, headers).map_err(IntoResponse::into_response)?;
     let registry = state.device_registry.as_ref().ok_or_else(|| {
         (
@@ -617,8 +662,8 @@ async fn revoke_operator_device(
     })
     .map_err(IntoResponse::into_response)?;
     match revoked {
-        Ok(true) => Ok((commit, cookie)),
-        Ok(false) => Err((StatusCode::NOT_FOUND, "Device not found").into_response()),
+        Ok(Some(revoked)) => Ok((commit, cookie, revoked)),
+        Ok(None) => Err((StatusCode::NOT_FOUND, "Device not found").into_response()),
         Err(error) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Device registry error: {error}"),
@@ -634,7 +679,7 @@ pub async fn revoke_device(
     headers: HeaderMap,
     axum::extract::Path(device_id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    let (config_write_guard, _) = match revoke_operator_device(
+    let (config_write_guard, _, _) = match revoke_operator_device(
         &state,
         &headers,
         &device_id,
@@ -722,7 +767,7 @@ pub async fn rotate_token(
     axum::extract::Path(device_id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
     let dashboard = dashboard.as_ref().map(|Extension(auth)| auth.as_ref());
-    let (config_write_guard, cookie) =
+    let (config_write_guard, cookie, revoked) =
         match revoke_operator_device(&state, &headers, &device_id, dashboard).await {
             Ok(revoked) => revoked,
             Err(response) => return response,
@@ -753,24 +798,77 @@ pub async fn rotate_token(
         return denied.into_response();
     }
 
-    // Issue the new pairing code while the config commit is still held,
-    // so a revocation of this caller queued behind it cannot land between the
-    // check above and the code. The code is issued atomically against the
-    // slot. If another flow holds the slot, the revoke still stands — return 200 with
+    // The replacement pairs as the revoked token did, or not at all: an
+    // unbound code would hand a roster user's device operator authority.
+    let replacement =
+        super::rotation_replacement_subject(&state.config.read().users, revoked.subject);
+    let subject = match replacement {
+        Ok(subject) => subject,
+        Err(withheld) => {
+            let outcome = match withheld {
+                super::ReplacementWithheld::TokenNotPaired => {
+                    "Device removed; its token was already revoked."
+                }
+                super::ReplacementWithheld::RosterEntryRemoved { .. } => "Old token revoked.",
+            };
+            return Json(serde_json::json!({
+                "device_id": device_id,
+                "pairing_code": null,
+                "message": format!("{outcome} {}", withheld.message()),
+            }))
+            .into_response();
+        }
+    };
+    let principal_id = super::paired_principal_id(&subject);
+
+    // Keep the config writer through the replacement mint, so revocation
+    // queued behind it cannot remove this caller between the check and mint.
+    // If another flow holds the code slot, return 200 with
     // `pairing_code: null` and a message that tells the operator what
     // happened so they do not assume rotation failed.
-    match state.pairing.generate_pairing_code_if_vacant(crate::live_pairing_code_policy(&state)) {
+    match state.pairing.generate_pairing_code_if_vacant_as(
+        crate::live_pairing_code_policy(&state),
+        subject.clone(),
+    ) {
         Ok(code) => Json(serde_json::json!({
             "device_id": device_id,
             "pairing_code": code,
+            "principal_id": principal_id,
             "message": "Old token revoked. Use this code to re-pair the device.",
         }))
         .into_response(),
         Err(zeroclaw_config::pairing::GeneratePairingCodeError::Pending) => {
+            // Reusing the pending code is right only when it pairs as this
+            // device did; otherwise it would re-pair the device as someone
+            // else, possibly as the shared operator. Calling this route again
+            // cannot help either: the device row is already gone.
+            let pending = state
+                .pairing
+                .pending_pairing_code()
+                .map(|(_, pending)| pending);
+            let mint = super::mint_command_for(&state.config.read().users, &subject);
+            let message = match &pending {
+                Some(pending) if *pending == subject => format!(
+                    "Old token revoked. A pairing code that pairs as {principal_id} is already \
+                     pending; use it, or on the gateway host run `{mint}` for a fresh one."
+                ),
+                Some(pending) => format!(
+                    "Old token revoked. The pending pairing code pairs as {}, not as this \
+                     device's {principal_id}, so it cannot re-pair this device. On the gateway \
+                     host, run `{mint}` to replace it with one that does.",
+                    super::paired_principal_id(pending)
+                ),
+                None => format!(
+                    "Old token revoked. A pending pairing code has just cleared. On the gateway \
+                     host, run `{mint}` to mint a replacement."
+                ),
+            };
             Json(serde_json::json!({
                 "device_id": device_id,
                 "pairing_code": null,
-                "message": "Old token revoked. A pairing code is already pending; use it or call again after it clears.",
+                "principal_id": principal_id,
+                "pending_principal_id": pending.as_ref().map(super::paired_principal_id),
+                "message": message,
             }))
             .into_response()
         }

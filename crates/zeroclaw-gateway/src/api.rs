@@ -40,6 +40,10 @@ pub(crate) fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// Verify bearer token against PairingGuard. Returns error response if unauthorized.
+///
+/// Only a shared-operator token passes. The routes behind this check act with
+/// the operator's full authority, so a token bound to a roster user is
+/// refused here; it works on the principal-aware surfaces instead.
 pub(crate) fn require_auth(
     state: &AppState,
     headers: &HeaderMap,
