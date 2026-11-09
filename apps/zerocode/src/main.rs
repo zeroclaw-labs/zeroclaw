@@ -887,7 +887,7 @@ async fn run() -> anyhow::Result<()> {
     // have no saved remote connection, so the next step would talk to (or
     // spawn) a local daemon instead of the operator's chosen target (#12330).
     let loaded_config = config::ensure_and_load(&local_config_dir)
-        .map_err(|e| anyhow::anyhow!("config load failed ({e:#})"))?;
+        .map_err(|e| anyhow::Error::msg(format!("config load failed ({e:#})")))?;
     let active_theme = loaded_config.resolve_theme().unwrap_or_else(|e| {
         let path = config::config_path(&local_config_dir);
         eprintln!("zerocode: {e:#}");
