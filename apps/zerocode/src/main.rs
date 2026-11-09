@@ -924,11 +924,9 @@ async fn run() -> anyhow::Result<()> {
             }
         })
         .transpose()?;
-    let scoped_credentials = selected_uri.as_deref().is_some_and(|uri| {
-        loaded_config.connection.logins.contains_key(uri)
-            || (!loaded_config.connection.logins.is_empty()
-                && selected_uri != loaded_config.connection.wss.uri)
-    });
+    let scoped_credentials = loaded_config
+        .connection
+        .uses_scoped_credentials(selected_uri.as_deref());
     let mut loaded_config = loaded_config;
     loaded_config.connection.wss = loaded_config.connection.wss_for(selected_uri.as_deref());
     if loaded_config

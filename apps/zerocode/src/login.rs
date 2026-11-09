@@ -27,36 +27,7 @@ pub(crate) struct LoginArgs {
 }
 
 pub(crate) fn normalize_target(target: &str) -> Result<String> {
-    let target = if target.contains("://") {
-        target.to_string()
-    } else {
-        // Remember an explicit :443 before URL normalization removes it.
-        let url = url::Url::parse(&format!("wss://{target}"))
-            .context(i18n::t("zc-login-invalid-target"))?;
-        let authority = target.split('/').next().unwrap_or(target);
-        let explicit_port = authority
-            .rsplit_once(':')
-            .is_some_and(|(_, tail)| tail.parse::<u16>().is_ok());
-        if explicit_port {
-            url.to_string()
-        } else {
-            let mut url = url;
-            url.set_port(Some(9781))
-                .map_err(|()| anyhow::Error::msg(i18n::t("zc-login-invalid-target")))?;
-            url.to_string()
-        }
-    };
-    let url = url::Url::parse(&target).context(i18n::t("zc-login-invalid-target"))?;
-    if url.scheme() != "wss"
-        || url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        bail!(i18n::t("zc-login-invalid-target"));
-    }
-    Ok(url.to_string())
+    config::canonical_wss_target(target).context(i18n::t("zc-login-invalid-target"))
 }
 
 fn provider_alias(provider: &str) -> Result<&str> {

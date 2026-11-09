@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::keymap::{ChatTabAction, Chord, GlobalAction, overrides::OverrideTable};
@@ -201,6 +201,68 @@ impl ConnectionSection {
     fn is_empty(&self) -> bool {
         self.wss.is_empty() && self.logins.is_empty()
     }
+
+    /// A saved login, or any other destination once logins exist, owns its own
+    /// credential files. The legacy manual connection does not.
+    pub(crate) fn uses_scoped_credentials(&self, selected: Option<&str>) -> bool {
+        selected.is_some_and(|uri| {
+            self.logins.contains_key(uri)
+                || (!self.logins.is_empty()
+                    && !same_wss_destination(Some(uri), self.wss.uri.as_deref()))
+        })
+    }
+}
+
+/// The canonical WSS destination, shared with login so a stored spelling and a
+/// startup spelling of the same daemon compare equal. Not a user-facing error:
+/// callers add their own message.
+pub(crate) fn canonical_wss_target(target: &str) -> Result<String> {
+    let target = if target.contains("://") {
+        target.to_string()
+    } else {
+        // Remember an explicit :443 before URL normalization removes it.
+        let url = url::Url::parse(&format!("wss://{target}")).context("invalid WSS target")?;
+        let authority = target.split('/').next().unwrap_or(target);
+        let explicit_port = authority
+            .rsplit_once(':')
+            .is_some_and(|(_, tail)| tail.parse::<u16>().is_ok());
+        if explicit_port {
+            url.to_string()
+        } else {
+            let mut url = url;
+            url.set_port(Some(9781))
+                .map_err(|()| anyhow::Error::msg("invalid WSS target"))?;
+            url.to_string()
+        }
+    };
+    let url = url::Url::parse(&target).context("invalid WSS target")?;
+    if url.scheme() != "wss"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        bail!("invalid WSS target");
+    }
+    Ok(url.to_string())
+}
+
+/// True when both sides name the same daemon, including equivalent spellings
+/// such as a missing trailing slash. An unparseable side falls back to an
+/// exact compare so two different invalid strings are not treated as one
+/// destination.
+fn same_wss_destination(left: Option<&str>, right: Option<&str>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            match (canonical_wss_target(left), canonical_wss_target(right)) {
+                (Ok(canonical_left), Ok(canonical_right)) => canonical_left == canonical_right,
+                _ => left == right,
+            }
+        }
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 #[derive(Debug)]
@@ -258,7 +320,14 @@ impl ConnectionSection {
             // A direct URL login must not inherit another daemon's relay.
             wss.relay_url = None;
             wss.relay_node = None;
-        } else if !self.logins.is_empty() && uri != self.wss.uri {
+        } else if !self.logins.is_empty()
+            && !same_wss_destination(uri.as_deref(), self.wss.uri.as_deref())
+        {
+            // Compare canonical destinations. Startup normalizes the selected
+            // URL, while a manual connection may still be stored as
+            // `wss://host:9781` rather than `wss://host:9781/`. A spelling
+            // difference is not a different daemon and must not drop the
+            // manual token, provider, or TLS files.
             wss.auth_token = None;
             wss.auth_token_file = None;
             wss.auth_provider = None;
@@ -3101,6 +3170,61 @@ mod login_tests {
         let cfg = load_persisted(dir.path()).unwrap();
         assert!(cfg.connection.wss_for(None).tls.skip_verify);
         assert!(!cfg.connection.wss.tls.skip_verify);
+    }
+
+    #[test]
+    fn equivalent_manual_url_keeps_credentials_when_other_logins_exist() {
+        let mut cfg = ZerocodeConfig::default();
+        cfg.connection.wss.uri = Some("wss://legacy.example:9781".into());
+        cfg.connection.wss.auth_token = Some("manual-token".into());
+        cfg.connection.wss.auth_token_file = Some("manual-token-file".into());
+        cfg.connection.wss.auth_provider = Some("native".into());
+        cfg.connection.wss.enroll_url = Some("https://legacy.example:42617".into());
+        cfg.connection.wss.tls.ca_cert_path = "legacy-ca.pem".into();
+        cfg.connection.wss.tls.client_cert_path = "legacy-client.pem".into();
+        cfg.connection.wss.tls.client_key_path = "legacy-key.pem".into();
+        cfg.connection
+            .logins
+            .insert("wss://other.example:9781/".into(), login("other-token"));
+
+        let kept = cfg.connection.wss_for(Some("wss://legacy.example:9781/"));
+        assert_eq!(kept.auth_token.as_deref(), Some("manual-token"));
+        assert_eq!(kept.auth_token_file.as_deref(), Some("manual-token-file"));
+        assert_eq!(kept.auth_provider.as_deref(), Some("native"));
+        assert_eq!(
+            kept.enroll_url.as_deref(),
+            Some("https://legacy.example:42617")
+        );
+        assert_eq!(kept.tls.ca_cert_path, "legacy-ca.pem");
+        assert_eq!(kept.tls.client_cert_path, "legacy-client.pem");
+        assert_eq!(kept.tls.client_key_path, "legacy-key.pem");
+        assert!(
+            !cfg.connection
+                .uses_scoped_credentials(Some("wss://legacy.example:9781/")),
+            "an equivalent spelling is still the manual connection"
+        );
+
+        let other_path = cfg
+            .connection
+            .wss_for(Some("wss://legacy.example:9781/rpc"));
+        assert!(
+            other_path.auth_token.is_none(),
+            "a different path is a different destination"
+        );
+        assert!(other_path.tls.ca_cert_path.is_empty());
+
+        let other = cfg
+            .connection
+            .wss_for(Some("wss://elsewhere.example:9781/"));
+        assert!(other.auth_token.is_none());
+        assert!(other.auth_provider.is_none());
+        assert!(other.tls.ca_cert_path.is_empty());
+        assert!(other.tls.client_cert_path.is_empty());
+        assert!(
+            cfg.connection
+                .uses_scoped_credentials(Some("wss://elsewhere.example:9781/")),
+            "a different daemon must not reuse the manual credential files"
+        );
     }
 
     #[test]
