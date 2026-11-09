@@ -1443,6 +1443,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_queued_acknowledgement_outlives_the_caller_releasing_the_session() {
+        // How a call normally ends: the caller acknowledges the model's closing
+        // tool call, then releases the session — which closes the event
+        // receiver while the driver is mid-delivery on an event nobody will
+        // read now. That failed delivery must not end the task before the
+        // queued acknowledgement reaches the wire, or the model's last turn is
+        // logged as unanswered on a perfectly healthy connection.
+        let mut fake = FakeTransport::new(true);
+        fake.push_data(br#"{"setupComplete":{}}"#.to_vec());
+        for _ in 0..EVENT_CAPACITY + 8 {
+            fake.push_data(br#"{"serverContent":{"turnComplete":true}}"#.to_vec());
+        }
+        let scripted = fake.incoming.len();
+        let sent = fake.sent.clone();
+        let taken = Arc::clone(&fake.taken);
+        let s = Session::connect_with_transport(cfg(), fake, no_reconnect())
+            .await
+            .unwrap();
+
+        // Nothing reads events here, so the driver fills the event channel and
+        // then parks inside the delivery. Frames are left over in the script,
+        // so the count going still with the channel full means the driver is
+        // pinned in that delivery rather than racing the acknowledgement below.
+        let frames = || taken.load(std::sync::atomic::Ordering::Relaxed);
+        let mut parked = 0;
+        for _ in 0..200 {
+            let before = frames();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if before == frames() && before >= EVENT_CAPACITY {
+                parked = before;
+                break;
+            }
+        }
+        assert!(
+            parked >= EVENT_CAPACITY,
+            "the driver never parked delivering events, it took {} frames",
+            frames()
+        );
+        // The other way the count can go still is a driver that read the whole
+        // script and parked in `recv` instead — free to take the command below
+        // and write it with or without the drain, which would pass this test
+        // without testing anything.
+        assert!(
+            parked < scripted,
+            "the script ran out ({parked} of {scripted} frames), so the driver \
+             parked waiting for a frame rather than delivering one"
+        );
+
+        let ack = s.send_tool_response("last-turn").await.unwrap();
+        drop(s);
+
+        assert_eq!(
+            ack.outcome().await.unwrap(),
+            ControlOutcome::Written,
+            "the acknowledgement queued before the caller left must still be written"
+        );
+        let sent = sent.lock().unwrap();
+        assert!(
+            sent.iter().any(|f| f.contains("last-turn")),
+            "the queued acknowledgement never reached the transport, got {} frames",
+            sent.len()
+        );
+    }
+
+    #[tokio::test]
     async fn send_audio_is_byte_identical_to_kutsu() {
         let fake = FakeTransport::new(true);
         let sent = fake.sent.clone();

@@ -15,6 +15,7 @@
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::net::TcpStream;
@@ -318,6 +319,11 @@ pub struct FakeTransport {
     /// never started and one whose outcome is unknown.
     pub stall_writes_after: Option<usize>,
     pub stall: Arc<tokio::sync::Semaphore>,
+    /// Scripted frames handed out so far. A test that must know the driver is
+    /// blocked somewhere past `recv()` has no other window into it: the count
+    /// running past what the event channel holds is what says the driver is
+    /// parked delivering an event rather than still reading frames.
+    pub taken: Arc<AtomicUsize>,
 }
 
 impl FakeTransport {
@@ -331,6 +337,7 @@ impl FakeTransport {
             fail_writes_after: None,
             stall_writes_after: None,
             stall: Arc::new(tokio::sync::Semaphore::new(0)),
+            taken: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -402,9 +409,16 @@ impl Transport for FakeTransport {
     fn recv(
         &mut self,
     ) -> impl std::future::Future<Output = Option<Result<Vec<u8>, TransportError>>> + Send {
-        let next = self.incoming.pop_front();
         let pending = self.pending_when_empty;
         async move {
+            // Taking the frame inside the future, not while building it, is
+            // what keeps a cancelled `recv()` — the losing branch of a
+            // `select!` — from swallowing a scripted frame and counting it as
+            // handed out.
+            let next = self.incoming.pop_front();
+            if next.is_some() {
+                self.taken.fetch_add(1, Ordering::Relaxed);
+            }
             match next {
                 Some(FakeFrame::Data(b)) => Some(Ok(b)),
                 Some(FakeFrame::Close(reason)) => {
