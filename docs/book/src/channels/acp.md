@@ -110,7 +110,7 @@ Parts are joined with double newlines in the order they appear. Blob intake is s
   }}
 ← {"jsonrpc":"2.0","method":"session/update","params":{
     "sessionId": "s-ab12cd",
-    "update": {"sessionUpdate": "tool_call", "toolCallId": "tc-1", "title": "shell",
+    "update": {"sessionUpdate": "tool_call", "toolCallId": "tc-1", "title": "git log -1 --oneline",
                "kind": "execute", "status": "pending", "rawInput": {...}}
   }}
 ← {"jsonrpc":"2.0","method":"session/update","params":{

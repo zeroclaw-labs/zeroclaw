@@ -81,6 +81,12 @@ impl FilesystemChannel {
     ) -> anyhow::Result<()> {
         let config = &self.config;
         config.validate()?;
+        // `validate` reads each path as written. Also refuse one that resolves
+        // on disk to a broad root, but keep watching the path as written so
+        // event paths and trigger matching stay the same.
+        for path in &config.paths {
+            config.validate_resolved_path(path)?;
+        }
         let include = self.compile_globs_or_log(&config.include, "include")?;
         let exclude = self.compile_globs_or_log(&config.exclude, "exclude")?;
 
@@ -904,6 +910,33 @@ mod tests {
             audit: Arc::new(SopAuditLogger::new(memory)),
             driver_sink: None,
         })
+    }
+
+    /// A configured path that reads as an ordinary folder but resolves on
+    /// disk to a broad root must stop the listener before it watches anything.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn listener_refuses_path_that_resolves_to_broad_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("whole-disk");
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        let channel = test_channel(
+            FilesystemConfig {
+                paths: vec![link.to_string_lossy().to_string()],
+                ..FilesystemConfig::default()
+            },
+            "fs-resolved-root",
+        );
+
+        let (probe_tx, _probe_rx) = mpsc::channel(1);
+        let err = channel
+            .watch_and_dispatch(&probe_tx)
+            .await
+            .expect_err("a path that resolves to `/` must fail the listener closed");
+        assert!(
+            err.to_string().contains("resolves to broad system root"),
+            "got: {err}"
+        );
     }
 
     /// Regression for the blocking `std::sync::mpsc::Receiver::recv()` in the
