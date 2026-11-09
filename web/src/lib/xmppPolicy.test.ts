@@ -17,7 +17,7 @@ test("collision suffixes stay within the limit across digit boundaries", () => {
     assert.ok(!keys.includes(key));
     keys.push(key);
   }
-  assert.ok(keys[10].endsWith("_11"));
+  assert.ok(keys[10]?.endsWith("_11"));
 });
 test("short aliases retain their existing names and collision behavior", () => {
   assert.equal(nextXmppPolicyKey("synthetic-bot", []), "xmpp_synthetic-bot");
