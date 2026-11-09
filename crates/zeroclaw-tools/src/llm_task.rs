@@ -223,13 +223,8 @@ impl Tool for LlmTaskTool {
                     ))
                 })?
                 .model_provider;
-            let selection = config.resolve_model_selection(reference).ok_or_else(|| {
-                anyhow::Error::msg(crate::i18n::get_required_tool_string_with_args(
-                    "tool-llm-task-provider-invalid",
-                    &[("provider", reference.as_str())],
-                ))
-            })?;
-            let temperature = temperature_override.or_else(|| selection.temperature());
+            let temperature =
+                temperature_override.or_else(|| config.resolve_model_temperature(reference));
             let resolved = zeroclaw_providers::model::build_raw_provider(
                 &config,
                 reference,
@@ -623,6 +618,88 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap().contains("model_provider"));
+    }
+
+    #[tokio::test]
+    async fn canonical_llm_task_resolves_exact_ref_presets_and_invocation_overrides() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::schema::AliasedAgentConfig;
+
+        let server = MockServer::start().await;
+        let mut config: Config = toml::from_str(&format!(
+            r#"
+schema_version = 4
+[providers.connections."gateway.prod"]
+kind = "custom"
+uri = "{}/v1"
+capabilities = ["chat"]
+auth = {{ mode = "api_key", api_key = "canonical-test-key" }}
+[providers.model_presets."chat.shared"]
+capability = "chat"
+options.temperature = 0.35
+[providers.models."chat.fast.us"]
+capability = "chat"
+provider = "gateway.prod"
+model = "canonical-upstream"
+preset = "chat.shared"
+[providers.models."chat.omit.us"]
+capability = "chat"
+provider = "gateway.prod"
+model = "canonical-upstream"
+preset = "chat.shared"
+options.temperature = "null"
+"#,
+            server.uri()
+        ))
+        .unwrap();
+        config
+            .agents
+            .insert("test".into(), AliasedAgentConfig::default());
+        for (reference, args, expected_model, expected_temperature) in [
+            (
+                "chat.fast.us",
+                json!({"prompt": "test"}),
+                "canonical-upstream",
+                Some(0.35),
+            ),
+            (
+                "chat.fast.us",
+                json!({"prompt": "test", "model": "explicit", "temperature": 0.0}),
+                "explicit",
+                Some(0.0),
+            ),
+            (
+                "chat.omit.us",
+                json!({"prompt": "test"}),
+                "canonical-upstream",
+                None,
+            ),
+        ] {
+            config.agents.get_mut("test").unwrap().model_provider = reference.into();
+            let tool = LlmTaskTool::new(
+                Arc::new(SecurityPolicy::default()),
+                Arc::new(config.clone()),
+                "test",
+            );
+            let guard = Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .and(header("authorization", "Bearer canonical-test-key"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]
+                })))
+                .expect(1)
+                .mount_as_scoped(&server).await;
+            let result = tool.execute(args).await.unwrap();
+            assert!(result.success, "{:?}", result.error);
+            let requests = guard.received_requests().await;
+            let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+            assert_eq!(body["model"], expected_model);
+            assert_eq!(
+                body.get("temperature").and_then(serde_json::Value::as_f64),
+                expected_temperature
+            );
+        }
     }
 
     #[tokio::test]

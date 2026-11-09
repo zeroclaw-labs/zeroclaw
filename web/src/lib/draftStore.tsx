@@ -15,11 +15,13 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from 'react';
 import {
   ApiError,
+  getProviderRegistry,
   patchConfig,
   saveProviderRegistry,
   type PatchOp,
@@ -42,6 +44,7 @@ type ConfigDraftState = {
   comments: Record<string, string>;
   tombstones: Set<string>;
   providerRegistryDraft?: ProviderRegistryDraft;
+  providerRegistrySaveState: 'idle' | 'saving' | 'refresh-required';
 };
 
 /**
@@ -70,6 +73,7 @@ type ConfigDraftCtx = ConfigDraftState & {
   discardAll: () => void;
   setProviderRegistryDraft: (draft: ProviderRegistryDraft) => void;
   clearProviderRegistryDraft: () => void;
+  saveProviderRegistryDraft: () => Promise<void>;
   /** Commit every staged draft + tombstone as a single PATCH and clear on success. */
   saveAll: () => Promise<PatchResponse>;
 };
@@ -82,6 +86,11 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
   const [tombstones, setTombstones] = useState<Set<string>>(() => new Set());
   const [providerRegistryDraft, setProviderRegistryDraftState] =
     useState<ProviderRegistryDraft>();
+  // One save lifecycle is shared by the editor and the banner, including
+  // navigation/remounts and the masked CAS baseline refresh after a write.
+  const [providerRegistrySaveState, setProviderRegistrySaveState] =
+    useState<ConfigDraftState['providerRegistrySaveState']>('idle');
+  const providerRegistrySave = useRef<Promise<void> | undefined>(undefined);
 
   const setDraft = useCallback((path: string, input: string, value?: unknown) => {
     setDrafts((prev) => ({ ...prev, [path]: { input, value } }));
@@ -216,19 +225,61 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const discardAll = useCallback(() => {
+    if (providerRegistrySave.current) return;
     setDrafts({});
     setComments({});
     setTombstones(new Set());
     setProviderRegistryDraftState(undefined);
+    setProviderRegistrySaveState('idle');
   }, []);
 
   const setProviderRegistryDraft = useCallback((draft: ProviderRegistryDraft) => {
+    if (providerRegistrySave.current) return;
     setProviderRegistryDraftState(draft);
+    if (!draft.dirty) setProviderRegistrySaveState('idle');
   }, []);
 
   const clearProviderRegistryDraft = useCallback(() => {
+    if (providerRegistrySave.current) return;
     setProviderRegistryDraftState(undefined);
+    setProviderRegistrySaveState('idle');
   }, []);
+
+  const saveProviderRegistryDraft = useCallback((): Promise<void> => {
+    if (providerRegistrySave.current) return providerRegistrySave.current;
+    if (providerRegistrySaveState === 'refresh-required') {
+      return Promise.reject(new Error(t('config.registry_refresh_required')));
+    }
+    if (!providerRegistryDraft?.dirty) return Promise.resolve();
+    const submitted = providerRegistryDraft;
+    setProviderRegistrySaveState('saving');
+    const pending = Promise.resolve().then(async () => {
+      let written = false;
+      try {
+        const registry = Object.fromEntries(
+          Object.entries(submitted.sections).map(([key, input]) => [key, JSON.parse(input)]),
+        ) as ProviderRegistryDocument;
+        await saveProviderRegistry(submitted.expected, registry);
+        written = true;
+        // The server preserves and masks credentials. Only its projection
+        // can be the expected document for the next compare-and-swap.
+        const document = await getProviderRegistry();
+        setProviderRegistryDraftState({
+          expected: document,
+          sections: Object.fromEntries(
+            Object.entries(document).map(([key, value]) => [key, JSON.stringify(value, null, 2)]),
+          ),
+          dirty: false,
+        });
+        setProviderRegistrySaveState('idle');
+      } catch (error) {
+        setProviderRegistrySaveState(written ? 'refresh-required' : 'idle');
+        throw error;
+      }
+    }).finally(() => { providerRegistrySave.current = undefined; });
+    providerRegistrySave.current = pending;
+    return pending;
+  }, [providerRegistryDraft, providerRegistrySaveState]);
 
   const saveAll = useCallback(async (): Promise<PatchResponse> => {
     const ops: PatchOp[] = [];
@@ -255,19 +306,7 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
       throw new Error(t('unsaved_banner.registry_save_separately'));
     }
     if (providerRegistryDraft?.dirty) {
-      const registry: Record<string, unknown> = {};
-      for (const [section, input] of Object.entries(providerRegistryDraft.sections)) {
-        try {
-          registry[section] = JSON.parse(input);
-        } catch (error) {
-          throw error instanceof Error ? error : new Error(String(error));
-        }
-      }
-      await saveProviderRegistry(
-        providerRegistryDraft.expected,
-        registry as ProviderRegistryDocument,
-      );
-      setProviderRegistryDraftState(undefined);
+      await saveProviderRegistryDraft();
     }
     if (ops.length === 0) {
       return { saved: true, results: [], warnings: [] };
@@ -284,7 +323,7 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
       if (e instanceof ApiError) throw e;
       throw e;
     }
-  }, [drafts, comments, tombstones, providerRegistryDraft]);
+  }, [drafts, comments, tombstones, providerRegistryDraft, saveProviderRegistryDraft]);
 
   // The drafts outlive the config form, so the warning before leaving the
   // page lives here: a reload or a closed tab asks first while anything is
@@ -310,6 +349,7 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
       comments,
       tombstones,
       providerRegistryDraft,
+      providerRegistrySaveState,
       setDraft,
       clearDraft,
       setComment,
@@ -321,6 +361,7 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
       discardAll,
       setProviderRegistryDraft,
       clearProviderRegistryDraft,
+      saveProviderRegistryDraft,
       saveAll,
     }),
     [
@@ -328,6 +369,7 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
       comments,
       tombstones,
       providerRegistryDraft,
+      providerRegistrySaveState,
       setDraft,
       clearDraft,
       setComment,
@@ -339,6 +381,7 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
       discardAll,
       setProviderRegistryDraft,
       clearProviderRegistryDraft,
+      saveProviderRegistryDraft,
       saveAll,
     ],
   );

@@ -3972,7 +3972,6 @@ mod tests {
                     model_provider: Some("denied-provider".into()),
                     model: Some("denied-model".into()),
                     temperature: Some(0.9),
-                    ..Default::default()
                 },
                 true,
                 Some(crate::agent::agent::PreparedModelUpdate::for_test(

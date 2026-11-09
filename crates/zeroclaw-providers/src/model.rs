@@ -318,6 +318,11 @@ fn build_provider(
                 &registry,
                 &candidate_ref,
                 &options,
+                if candidate_ref == canonical_ref {
+                    overrides.api_key
+                } else {
+                    None
+                },
             )?;
             let configured_model = registry
                 .resolve_chat(&candidate_ref)?
@@ -458,8 +463,16 @@ pub(crate) fn build_canonical_provider_with_options(
     let mut refs = vec![model_ref.clone()];
     refs.extend(registry.fallback_chain(model_ref)?);
     for candidate_ref in refs {
-        let provider =
-            crate::factory::dispatch_model_ref_with_registry(&registry, &candidate_ref, options)?;
+        let provider = crate::factory::dispatch_model_ref_with_registry(
+            &registry,
+            &candidate_ref,
+            options,
+            if candidate_ref == *model_ref {
+                overrides.api_key
+            } else {
+                None
+            },
+        )?;
         let configured_model = registry
             .resolve_chat(&candidate_ref)?
             .upstream_model()
@@ -975,6 +988,96 @@ model = "backup"
             "chat.backup.v2",
             "chat.prod.v1"
         ));
+    }
+
+    #[tokio::test]
+    async fn canonical_route_key_override_applies_only_to_primary() {
+        use serde_json::json;
+        use wiremock::matchers::{body_partial_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let config: Config = toml::from_str(&format!(
+            r#"
+schema_version = 4
+[reliability]
+provider_retries = 0
+provider_backoff_ms = 0
+[providers.connections."primary.prod"]
+kind = "custom"
+uri = "{0}/primary/v1"
+capabilities = ["chat"]
+auth = {{ mode = "api_key", api_key = "connection-test-key" }}
+[providers.connections."backup.prod"]
+kind = "custom"
+uri = "{0}/backup/v1"
+capabilities = ["chat"]
+auth = {{ mode = "api_key", api_key = "backup-test-key" }}
+[providers.models."chat.primary"]
+capability = "chat"
+provider = "primary.prod"
+model = "primary-model"
+[providers.models."chat.backup"]
+capability = "chat"
+provider = "backup.prod"
+model = "backup-model"
+[providers.fallback]
+"chat.primary" = ["chat.backup"]
+"#,
+            server.uri()
+        ))
+        .unwrap();
+        for mode in 0..3 {
+            let overrides = ProviderOverrides {
+                api_key: Some("route-test-key"),
+                model: Some("route-model"),
+            };
+            let resolved = match mode {
+                0 => build_raw_provider(&config, "chat.primary", overrides),
+                1 => build_reliable_provider(&config, "chat.primary", overrides),
+                _ => build_canonical_provider_with_options(
+                    &config,
+                    &"chat.primary".into(),
+                    overrides,
+                    &crate::provider_runtime_options_for_bare_family(&config),
+                    true,
+                ),
+            }
+            .unwrap();
+            let success = ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]
+            }));
+            let primary = Mock::given(method("POST"))
+                .and(path("/primary/v1/chat/completions"))
+                .and(header("authorization", "Bearer route-test-key"))
+                .and(body_partial_json(json!({"model": "route-model"})))
+                .respond_with(if mode == 0 {
+                    success.clone()
+                } else {
+                    ResponseTemplate::new(500)
+                })
+                .expect(1)
+                .mount_as_scoped(&server)
+                .await;
+            let backup = Mock::given(method("POST"))
+                .and(path("/backup/v1/chat/completions"))
+                .and(header("authorization", "Bearer backup-test-key"))
+                .and(body_partial_json(json!({"model": "backup-model"})))
+                .respond_with(success)
+                .expect(if mode == 0 { 0 } else { 1 })
+                .mount_as_scoped(&server)
+                .await;
+            let result = crate::ProviderDispatch::from_ref(resolved.provider.as_ref())
+                .simple_chat("test", resolved.model.as_deref().unwrap(), None)
+                .await
+                .unwrap();
+            assert_eq!(result, "ok");
+            assert_eq!(primary.received_requests().await.len(), 1);
+            assert_eq!(
+                backup.received_requests().await.len(),
+                usize::from(mode != 0)
+            );
+        }
     }
 
     #[test]

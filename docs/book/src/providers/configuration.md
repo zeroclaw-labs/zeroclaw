@@ -169,6 +169,12 @@ connection defaults in `api.chat.options`, and overridden in each chat model's
 `options`. They accept `true` or `false`; the `"null"` sentinel is not supported.
 The former runtime-profile `strict_tool_parsing` setting has been removed.
 
+A tool-bearing turn requires the same tool protocol across its fallback
+chain. Mixing native-tool and text-only candidates is rejected before a
+provider request is sent, because one turn builds a shared prompt and tool
+request before selecting a fallback. Configure all candidates for native
+tools or all for text tools. Scalar calls without tools are unaffected.
+
 ## Hosting multiple models on one provider entry
 
 A connection owns the endpoint and credentials. Independently named chat models

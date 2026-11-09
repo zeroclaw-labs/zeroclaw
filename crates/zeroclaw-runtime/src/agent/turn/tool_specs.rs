@@ -47,11 +47,22 @@ impl IterationToolSpecs {
         &mut self,
         model_provider: &dyn ModelProvider,
         model: &str,
-    ) {
+    ) -> Result<()> {
+        // Reliable selects its candidate after the runtime builds one prompt
+        // and one tool request. Until that boundary can rebuild both for each
+        // candidate, mixed transports cannot safely serve a tool-bearing turn.
+        if !self.request_tool_specs().is_empty()
+            && model_provider.has_mixed_native_tool_support_for_model(model)
+        {
+            return Err(anyhow::Error::msg(crate::i18n::get_required_cli_string(
+                "turn-mixed-tool-protocols-unsupported",
+            )));
+        }
         self.use_native_tools = model_provider
             .capabilities_for_model(model)
             .native_tool_calling
             && !self.request_tool_specs().is_empty();
+        Ok(())
     }
 }
 
@@ -132,20 +143,14 @@ pub(crate) fn build_iteration_tool_specs(
             .cloned()
             .collect::<Vec<_>>()
     });
-    let use_native_tools = model_provider
-        .capabilities_for_model(model)
-        .native_tool_calling
-        && !exposed_tool_specs
-            .as_deref()
-            .unwrap_or(&tool_specs)
-            .is_empty();
-
-    Ok(IterationToolSpecs {
+    let mut specs = IterationToolSpecs {
         tool_specs,
         exposed_tool_specs,
         known_tool_names,
-        use_native_tools,
-    })
+        use_native_tools: false,
+    };
+    specs.refresh_native_tool_mode(model_provider, model)?;
+    Ok(specs)
 }
 
 #[cfg(test)]
@@ -390,11 +395,59 @@ mod tests {
                 .expect("native provider with tools should build specs");
         assert!(specs.use_native_tools);
 
-        specs.refresh_native_tool_mode(&PromptToolsProvider, "test-model");
+        specs
+            .refresh_native_tool_mode(&PromptToolsProvider, "test-model")
+            .unwrap();
 
         assert!(
             !specs.use_native_tools,
             "active provider must decide whether this turn uses native tool transport"
+        );
+    }
+
+    #[test]
+    fn mixed_fallback_rejects_tools_before_dispatch_but_allows_scalar_calls() {
+        let mixed = zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "mixed",
+            vec![
+                (
+                    "native".into(),
+                    Box::new(NativeToolsProvider) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "text".into(),
+                    Box::new(PromptToolsProvider) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            0,
+        );
+        let tool = Box::new(CountingTool::new(
+            "read_file",
+            Arc::new(AtomicUsize::new(0)),
+        ));
+        let result = build_iteration_tool_specs(&mixed, "test-model", &[tool], &[], None);
+        let Err(error) = result else {
+            panic!("mixed tool protocols must fail before a request");
+        };
+        assert_eq!(
+            error.to_string(),
+            crate::i18n::get_required_cli_string("turn-mixed-tool-protocols-unsupported")
+        );
+        assert!(build_iteration_tool_specs(&mixed, "test-model", &[], &[], None).is_ok());
+
+        // Recheck after hooks or vision routing change the selected provider.
+        let tool = Box::new(CountingTool::new(
+            "read_file",
+            Arc::new(AtomicUsize::new(0)),
+        ));
+        let mut specs =
+            build_iteration_tool_specs(&NativeToolsProvider, "test-model", &[tool], &[], None)
+                .unwrap();
+        assert!(
+            specs
+                .refresh_native_tool_mode(&mixed, "test-model")
+                .is_err()
         );
     }
 }

@@ -1335,6 +1335,7 @@ turn-cancelled-client-rpc = [turn cancelled via client]
 turn-stream-interrupted = [stream interrupted]
 turn-single-tool-rounds-prompt = Use at most one tool call in each response. Wait for its result before choosing another tool call.
 turn-single-tool-rounds-unsupported = [Single-tool rounds are unavailable on the current provider route. Continuing with batch tool calls.]
+turn-mixed-tool-protocols-unsupported = This tool request cannot use a fallback chain that mixes native and text tool protocols. Configure every candidate to use the same tool protocol.
 turn-single-tool-rounds-violation = The provider returned multiple tool calls under single-tool policy. No tools from this response were executed.
 turn-provider-images-quarantined =
     { $count_plural ->

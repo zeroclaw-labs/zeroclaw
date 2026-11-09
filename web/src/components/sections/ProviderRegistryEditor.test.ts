@@ -161,6 +161,87 @@ test('banner discard reloads the mounted editor from the server', async () => {
   } finally { await act(async () => renderer?.unmount()); }
 });
 
+test('banner save freezes registry editing through PUT and masked baseline refresh', async () => {
+  let current = structuredClone(original);
+  let finishWrite!: () => void;
+  let finishRefresh!: () => void;
+  let writes = 0;
+  let reads = 0;
+  globalThis.fetch = async (_input, init) => {
+    if (init?.method === 'PUT') {
+      writes++;
+      current = JSON.parse(init.body as string).registry;
+      await new Promise<void>((resolve) => { finishWrite = resolve; });
+      return new Response(JSON.stringify({ saved: true }));
+    }
+    if (++reads > 1) await new Promise<void>((resolve) => { finishRefresh = resolve; });
+    return new Response(JSON.stringify(current), { headers: { 'Content-Type': 'application/json' } });
+  };
+  let draft!: ReturnType<typeof useConfigDraft>;
+  function Harness() {
+    draft = useConfigDraft();
+    return createElement(Editor, { onSaved: () => undefined });
+  }
+  let renderer: ReactTestRenderer | undefined;
+  try {
+    await act(async () => { renderer = renderEditor(createElement(Harness)); });
+    await act(async () => renderer!.root.findAllByType('button').find((button) => String(button.props.children).includes('Models'))!.props.onClick());
+    const edited = JSON.stringify({ 'chat.fast.us': { ...original.models['chat.fast.us'], model: 'saved' } });
+    await act(async () => renderer!.root.findByType('textarea').props.onChange({ target: { value: edited } }));
+    let pending!: ReturnType<typeof draft.saveAll>;
+    await act(async () => { pending = draft.saveAll(); });
+    assert.equal(renderer!.root.findByType('textarea').props.disabled, true);
+    assert.equal(draft.providerRegistrySaveState, 'saving');
+    await act(async () => renderer!.root.findByType('textarea').props.onChange({ target: { value: '{newer}' } }));
+    assert.equal(renderer!.root.findByType('textarea').props.value, edited);
+    let repeated!: ReturnType<typeof draft.saveAll>;
+    await act(async () => { repeated = draft.saveAll(); });
+    assert.equal(writes, 1);
+    await act(async () => finishWrite());
+    assert.equal(renderer!.root.findByType('textarea').props.disabled, true);
+    await act(async () => { finishRefresh(); await Promise.all([pending, repeated]); });
+    assert.equal(renderer!.root.findByType('textarea').props.disabled, false);
+    assert.equal(draft.providerRegistryDraft?.dirty, false);
+    assert.equal(draft.providerRegistryDraft?.expected.models['chat.fast.us']?.model, 'saved');
+  } finally { await act(async () => renderer?.unmount()); }
+});
+
+test('a failed post-save refresh requires reload even after the editor remounts', async () => {
+  let reads = 0;
+  let writes = 0;
+  globalThis.fetch = async (_input, init) => {
+    if (init?.method === 'PUT') {
+      writes++;
+      return new Response(JSON.stringify({ saved: true }));
+    }
+    if (++reads === 2) return new Response('refresh failed', { status: 500 });
+    return new Response(JSON.stringify(original), { headers: { 'Content-Type': 'application/json' } });
+  };
+  let draft!: ReturnType<typeof useConfigDraft>;
+  let showEditor!: React.Dispatch<React.SetStateAction<boolean>>;
+  function Harness() {
+    draft = useConfigDraft();
+    const [visible, setVisible] = useState(true);
+    showEditor = setVisible;
+    return visible ? createElement(Editor, { onSaved: () => undefined }) : null;
+  }
+  let renderer: ReactTestRenderer | undefined;
+  try {
+    await act(async () => { renderer = renderEditor(createElement(Harness)); });
+    await act(async () => renderer!.root.findByType('textarea').props.onChange({ target: { value: '{}' } }));
+    await act(async () => { await assert.rejects(draft.saveAll()); });
+    assert.equal(draft.providerRegistrySaveState, 'refresh-required');
+    await act(async () => showEditor(false));
+    await act(async () => showEditor(true));
+    assert.equal(renderer!.root.findByType('textarea').props.disabled, true);
+    await act(async () => { await assert.rejects(draft.saveAll()); });
+    assert.equal(writes, 1);
+    await act(async () => renderer!.root.findAllByType('button').find((button) => String(button.props.children).includes('Reload'))!.props.onClick());
+    assert.equal(renderer!.root.findByType('textarea').props.disabled, false);
+    assert.equal(draft.providerRegistrySaveState, 'idle');
+  } finally { await act(async () => renderer?.unmount()); }
+});
+
 test('canonical references take precedence over legacy family aliases', async () => {
   const requests: string[] = [];
   let registry = original as { models: Record<string, unknown> };

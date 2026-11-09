@@ -27,7 +27,7 @@ function humanize(key: string): string {
 export default function UnsavedChangesBanner() {
   const dirtyCount = useConfigDirtyCount();
   const dirtySections = useConfigDirtySections();
-  const { saveAll, discardAll } = useConfigDraft();
+  const { saveAll, discardAll, providerRegistrySaveState } = useConfigDraft();
 
   const [labels, setLabels] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
@@ -104,7 +104,7 @@ export default function UnsavedChangesBanner() {
               setError(null);
               setWarnings([]);
             }}
-            disabled={saving}
+            disabled={saving || providerRegistrySaveState === 'saving'}
           >
             <X className="h-3.5 w-3.5" />
             {t('unsaved_banner.discard_all')}
@@ -113,7 +113,7 @@ export default function UnsavedChangesBanner() {
             size="sm"
             variant="primary"
             onClick={() => void onSave()}
-            disabled={saving}
+            disabled={saving || providerRegistrySaveState !== 'idle'}
           >
             <Save className="h-3.5 w-3.5" />
             {saving ? t('unsaved_banner.saving') : t('unsaved_banner.save_all')}

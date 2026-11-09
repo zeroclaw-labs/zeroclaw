@@ -2138,7 +2138,7 @@ pub fn dispatch_model_ref(
     let registry = config
         .provider_registry()
         .map_err(|error| anyhow::Error::msg(error.to_string()))?;
-    dispatch_model_ref_with_registry(&registry, model_ref, options)
+    dispatch_model_ref_with_registry(&registry, model_ref, options, None)
 }
 
 /// Construct one fresh provider adapter from an already validated immutable
@@ -2150,6 +2150,7 @@ pub(crate) fn dispatch_model_ref_with_registry(
     registry: &zeroclaw_config::provider_registry::ProviderRegistry,
     model_ref: &zeroclaw_config::provider_registry::ModelRef,
     options: &ModelProviderRuntimeOptions,
+    api_key_override: Option<&str>,
 ) -> Result<Box<dyn ModelProvider>> {
     use zeroclaw_config::provider_registry::{ModelDefinition, Override, ProviderConnection};
 
@@ -2245,6 +2246,7 @@ pub(crate) fn dispatch_model_ref_with_registry(
         .tls_ca_cert_path()
         .map(str::to_owned);
 
+    let api_key = api_key_override.or_else(|| resolved.selection.connection.api_key());
     let provider_kind = resolved.selection.connection.kind();
     let supported = matches!(
         resolved.selection.connection,
@@ -2277,7 +2279,7 @@ pub(crate) fn dispatch_model_ref_with_registry(
         };
         return provider_config.create_provider(
             model_ref.as_str(),
-            resolved.selection.connection.api_key(),
+            api_key,
             resolved.selection.connection.uri(),
             &runtime,
         );
@@ -2293,7 +2295,7 @@ pub(crate) fn dispatch_model_ref_with_registry(
         };
         return provider_config.create_provider(
             model_ref.as_str(),
-            resolved.selection.connection.api_key(),
+            api_key,
             resolved.selection.connection.uri(),
             &runtime,
         );
@@ -2302,7 +2304,7 @@ pub(crate) fn dispatch_model_ref_with_registry(
         None,
         provider_kind,
         model_ref.as_str(),
-        resolved.selection.connection.api_key(),
+        api_key,
         resolved.selection.connection.uri(),
         &runtime,
     )

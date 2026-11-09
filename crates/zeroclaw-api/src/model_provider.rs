@@ -955,7 +955,7 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
     ///
     /// Ordinary providers are homogeneous and inherit `false`. Composite
     /// providers override this so callers that must select one tool protocol
-    /// before dispatch can reject an incompatible strict configuration.
+    /// before dispatch can reject an incompatible fallback chain.
     fn has_mixed_native_tool_support_for_model(&self, _model: &str) -> bool {
         false
     }

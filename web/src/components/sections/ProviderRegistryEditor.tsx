@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { getProviderRegistry, saveProviderRegistry, type ProviderRegistryDocument } from '@/lib/api';
+import { getProviderRegistry, type ProviderRegistryDocument } from '@/lib/api';
 import { t } from '@/lib/i18n';
 import { useConfigDraft } from '@/lib/draftStore';
 import { Button } from '@/components/ui';
@@ -24,17 +24,17 @@ export default function ProviderRegistryEditor({ onSaved }: { onSaved: () => voi
   const selectedModel = params.get('model');
   const [section, setSection] = useState<Section>(selectedModel ? 'models' : 'connections');
   const [error, setError] = useState('');
-  const [saving, setSaving] = useState(false);
   const [loading, setLoading] = useState(false);
-  // A successful PUT followed by a failed GET leaves the old CAS baseline in
-  // the draft store. Require a successful refresh before another write.
-  const [refreshRequired, setRefreshRequired] = useState(false);
   const editVersion = useRef(0);
   const loadedThisMount = useRef(false);
   const {
     providerRegistryDraft,
+    providerRegistrySaveState,
+    saveProviderRegistryDraft,
     setProviderRegistryDraft,
   } = useConfigDraft();
+  const saving = providerRegistrySaveState === 'saving';
+  const refreshRequired = providerRegistrySaveState === 'refresh-required';
 
   const load = useCallback(async () => {
     const versionAtStart = editVersion.current;
@@ -49,12 +49,10 @@ export default function ProviderRegistryEditor({ onSaved }: { onSaved: () => voi
         sections: sectionDraft(document),
         dirty: false,
       });
-      setRefreshRequired(false);
       setError('');
       return true;
     } catch (cause) {
       setError(String(cause));
-      setRefreshRequired(true);
       throw cause;
     } finally {
       setLoading(false);
@@ -68,31 +66,18 @@ export default function ProviderRegistryEditor({ onSaved }: { onSaved: () => voi
       if (!providerRegistryDraft?.dirty) void load().catch(() => undefined);
       return;
     }
-    // Save all and discard all clear the shared draft while this editor stays
-    // mounted. Re-read the masked server document so the editor remains usable.
+    // Discard all clears the shared draft while this editor stays mounted.
+    // Re-read the masked server document so the editor remains usable.
     if (!providerRegistryDraft) void load().catch(() => undefined);
   }, [load, providerRegistryDraft]);
   useEffect(() => { if (selectedModel) setSection('models'); }, [selectedModel]);
 
   const save = async () => {
-    if (!providerRegistryDraft) return;
-    setSaving(true);
     try {
-      const registrySections = providerRegistryDraft.sections as RegistrySections;
-      const candidate = Object.fromEntries(
-        sections.map((key) => [key, JSON.parse(registrySections[key])]),
-      ) as ProviderRegistryDocument;
-      await saveProviderRegistry(providerRegistryDraft.expected, candidate);
-      // The PUT accepts masked credentials and the server restores/re-masks
-      // them. Refresh the canonical snapshot instead of using the submitted
-      // candidate as the next CAS baseline.
-      setRefreshRequired(true);
-      const refreshed = await load();
-      if (!refreshed) throw new Error(t('config.registry_refresh_required'));
+      await saveProviderRegistryDraft();
       setError('');
       onSaved();
     } catch (cause) { setError(String(cause)); }
-    finally { setSaving(false); }
   };
 
   const reload = () => {
@@ -117,6 +102,7 @@ export default function ProviderRegistryEditor({ onSaved }: { onSaved: () => voi
       disabled={saving || loading || refreshRequired}
       spellCheck={false}
       onChange={(event) => {
+        if (saving || loading || refreshRequired) return;
         editVersion.current += 1;
         setProviderRegistryDraft({
           expected: registry.expected,
