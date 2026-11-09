@@ -58,6 +58,14 @@ const CMD_CAPACITY: usize = 64;
 /// Bounded capacity of the inbound event channel.
 const EVENT_CAPACITY: usize = 256;
 
+/// How long the driver keeps writing a departed caller's queue before it stops
+/// and closes the connection. The driver task is detached and never aborted,
+/// so an unbounded write on a backpressured socket would leak the task and its
+/// connection for the life of the process — one per call on a bad link. Short
+/// on purpose: the queue it has left is an acknowledgement or two, and a socket
+/// that cannot take those in this long is not going to.
+const CALLER_GONE_DRAIN: Duration = Duration::from_secs(2);
+
 /// A produced-on-demand transport factory: each call establishes a *fresh*
 /// connection (a new [`WsTransport`] in production; a scripted double in
 /// tests). Used by the reconnect loop; the initial connection is established
@@ -173,6 +181,14 @@ pub enum ControlOutcome {
     Discarded,
     /// The transport refused the write. Carries the transport's own message.
     Failed(String),
+    /// The write was claimed and attempted, and the driver stopped before it
+    /// reported back. A sink that parked on a full write buffer may never have
+    /// taken the frame at all, and nothing the transport exposes can tell that
+    /// apart from a frame already on its way — so this is the same answer
+    /// [`Expiry::InFlight`] gives a caller that stops waiting on a write in
+    /// progress: unknown, and specifically neither a loss to report nor a
+    /// delivery to claim.
+    Unknown,
 }
 
 /// What [`ControlReceipt::expire`] found when the caller stopped waiting.
@@ -201,7 +217,7 @@ const CONTROL_EXPIRED: u8 = 2;
 /// The driver's half of one control's receipt: where the verdict goes, and
 /// the claim it must win before writing.
 struct Ack {
-    verdict: oneshot::Sender<ControlOutcome>,
+    verdict: Option<oneshot::Sender<ControlOutcome>>,
     state: Arc<AtomicU8>,
 }
 
@@ -217,6 +233,36 @@ impl Ack {
                 Ordering::Acquire,
             )
             .is_ok()
+    }
+}
+
+/// Every receipt gets exactly one verdict, and the type is what guarantees it.
+///
+/// A driver that stops between claiming a control and reporting its write — a
+/// cancelled write future, a task that ends mid-send — would otherwise drop
+/// the verdict channel, and the caller reads a dropped channel as
+/// [`SessionError::Closed`]: a receipt with no verdict at all, which the
+/// caller then has to guess at. For an attempted write that guess is wrong in
+/// both directions: reported as lost when it may have landed, or as delivered
+/// when it may not have.
+///
+/// `Discarded` on an expired control is unobservable rather than contradictory:
+/// the state can only read `CONTROL_EXPIRED` once the [`ControlReceipt`] is
+/// gone, because [`ControlReceipt::expire`] consumes it and its `Drop` is the
+/// only other writer of that state — so the caller already holds its
+/// [`Expiry`] answer and nothing is listening for this one.
+impl Drop for Ack {
+    fn drop(&mut self) {
+        if let Some(verdict) = self.verdict.take() {
+            let unreported = match self.state.load(Ordering::Acquire) {
+                // Claimed for writing, and no verdict followed: the frame may
+                // or may not have reached the model.
+                CONTROL_WRITING => ControlOutcome::Unknown,
+                // Never claimed, so never written.
+                _ => ControlOutcome::Discarded,
+            };
+            let _ = verdict.send(unreported);
+        }
     }
 }
 
@@ -238,15 +284,18 @@ impl ControlReceipt {
         let state = Arc::new(AtomicU8::new(CONTROL_PENDING));
         (
             Ack {
-                verdict: tx,
+                verdict: Some(tx),
                 state: Arc::clone(&state),
             },
             Self { verdict: rx, state },
         )
     }
 
-    /// Wait for the driver's verdict. [`SessionError::Closed`] means the
-    /// driver died without reporting one — treat it as undelivered.
+    /// Wait for the driver's verdict. One always arrives: `Ack`'s own `Drop`
+    /// answers for a driver that stopped before reporting, so
+    /// [`SessionError::Closed`] here is the unreachable fallback rather than
+    /// the hangup case — that one resolves to [`ControlOutcome::Discarded`] or
+    /// [`ControlOutcome::Unknown`] on its merits.
     ///
     /// Takes the receipt by value but borrows the channel: moving the
     /// receiver out would conflict with this type's `Drop`, and the drop is
@@ -351,8 +400,10 @@ enum Command {
 
 /// Tell the enqueuing caller what became of one control. A dropped receiver
 /// (caller gone) is not an error here.
-fn report(outcome: ControlOutcome, ack: Ack) {
-    let _ = ack.verdict.send(outcome);
+fn report(outcome: ControlOutcome, mut ack: Ack) {
+    if let Some(verdict) = ack.verdict.take() {
+        let _ = verdict.send(outcome);
+    }
 }
 
 /// Report a control the driver is about to drop without writing it. Silence
@@ -591,6 +642,7 @@ async fn driver_task<T: Transport>(
                         reason: synth_reason("setup failed"),
                     })
                     .await;
+                discard_queued(&mut cmd_rx);
                 return;
             }
         }
@@ -602,7 +654,10 @@ async fn driver_task<T: Transport>(
         .await
         .is_err()
     {
-        return; // caller gone
+        // Caller gone before it read the open; anything it queued first still
+        // goes out.
+        drain_queued_controls(&mut transport, &mut cmd_rx).await;
+        return;
     }
 
     'outer: loop {
@@ -648,7 +703,14 @@ async fn driver_task<T: Transport>(
                                 match absorb(se, &mut handle, &mut progressed) {
                                     Absorbed::Emit(ev) => {
                                         if events.send(ev).await.is_err() {
-                                            return; // caller gone
+                                            // Caller gone: its queued controls
+                                            // still go out before the task ends.
+                                            drain_queued_controls(
+                                                &mut transport,
+                                                &mut cmd_rx,
+                                            )
+                                            .await;
+                                            return;
                                         }
                                     }
                                     Absorbed::GoAway => goaway = true,
@@ -675,6 +737,7 @@ async fn driver_task<T: Transport>(
         // on a session that already reached setupComplete stays retryable.
         if !progressed && is_permanent_close(reason.code) {
             let _ = events.send(Event::SessionClosed { reason }).await;
+            discard_queued(&mut cmd_rx);
             return;
         }
 
@@ -699,6 +762,7 @@ async fn driver_task<T: Transport>(
             }
             Err(()) => {
                 let _ = events.send(Event::SessionClosed { reason }).await;
+                discard_queued(&mut cmd_rx);
                 return;
             }
         }
@@ -917,6 +981,67 @@ async fn drain_backoff(cmd_rx: &mut mpsc::Receiver<Command>, delay: Duration) ->
                 }
             }
         }
+    }
+}
+
+/// Write what the caller already queued, now that it is gone.
+///
+/// The event receiver closing is how the driver learns the caller left, and a
+/// caller normally leaves right after enqueuing its last control: it
+/// acknowledges the model's closing tool call and then releases the session.
+/// Those controls have receipts waiting on them, so ending the task on the
+/// closed receiver alone would strand an acknowledgement the connection was
+/// perfectly able to carry, and the model's last turn would go unanswered.
+///
+/// Closing the command channel first is what makes the backlog finite: a
+/// `ClientTextSender` the caller handed to another task outlives the session
+/// handle, and a reply enqueued now has to be refused rather than written to a
+/// connection that is already going — and then reported as delivered.
+async fn drain_queued_controls<T: Transport>(
+    transport: &mut T,
+    cmd_rx: &mut mpsc::Receiver<Command>,
+) {
+    cmd_rx.close();
+    let backlog = async {
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            // Queued audio carries no receipt and has no listener left, and on
+            // the backpressured link that let the backlog build, writing it
+            // first can spend the caller's whole deadline before reaching the
+            // acknowledgement this drain exists for. Settling it by `discard`
+            // rather than skipping the variant keeps the decision exhaustive:
+            // a later command that does carry a receipt cannot slip through
+            // into the write unexamined.
+            if matches!(cmd, Command::Audio(_)) {
+                discard(cmd);
+                continue;
+            }
+            if write_cmd(transport, cmd).await.is_err() {
+                break;
+            }
+        }
+    };
+    // The budget cuts off a write that never completes. The control it was
+    // writing keeps its claim and its `Ack` goes down with the cancelled
+    // future, which reports `Unknown` — the honest answer for a frame that may
+    // or may not have been taken by the socket.
+    let _ = tokio::time::timeout(CALLER_GONE_DRAIN, backlog).await;
+    // A refused write, or one that outran the budget, leaves the rest of the
+    // queue unreached: settle it here, at the exit that knows none of it was
+    // written, rather than leave it to the `Ack` drops at task teardown.
+    discard_queued(cmd_rx);
+}
+
+/// Settle the caller's queue without writing any of it.
+///
+/// `Ack`'s own `Drop` would answer `Discarded` for every buffered command once
+/// the channel goes, so this is not what keeps a verdict from being lost. It
+/// settles them at the exit that knows they were never written, while that is
+/// still obvious, instead of leaving the answer to be inferred from a claim
+/// flag at teardown.
+fn discard_queued(cmd_rx: &mut mpsc::Receiver<Command>) {
+    cmd_rx.close();
+    while let Ok(cmd) = cmd_rx.try_recv() {
+        discard(cmd);
     }
 }
 
@@ -1504,6 +1629,60 @@ mod tests {
             sent.iter().any(|f| f.contains("last-turn")),
             "the queued acknowledgement never reached the transport, got {} frames",
             sent.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_drain_write_cut_off_by_its_budget_reports_unknown_not_lost() {
+        // Same hangup, on a socket that has stopped taking frames: the drain's
+        // budget cuts the write off so the task cannot be leaked on it. The
+        // acknowledgement was already handed to the transport by then, so the
+        // only honest verdict is that nobody knows — reporting it lost would
+        // name a model turn unanswered that may well have been answered, and
+        // reporting it written would claim a delivery that may not exist.
+        tokio::time::pause();
+        let mut fake = FakeTransport::stalling_writes_after(1, true);
+        fake.push_data(br#"{"setupComplete":{}}"#.to_vec());
+        for _ in 0..EVENT_CAPACITY + 8 {
+            fake.push_data(br#"{"serverContent":{"turnComplete":true}}"#.to_vec());
+        }
+        let scripted = fake.incoming.len();
+        let sent = fake.sent.clone();
+        let taken = Arc::clone(&fake.taken);
+        let s = Session::connect_with_transport(cfg(), fake, no_reconnect())
+            .await
+            .unwrap();
+
+        let frames = || taken.load(std::sync::atomic::Ordering::Relaxed);
+        let mut parked = 0;
+        for _ in 0..200 {
+            let before = frames();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if before == frames() && before >= EVENT_CAPACITY {
+                parked = before;
+                break;
+            }
+        }
+        assert!(
+            (EVENT_CAPACITY..scripted).contains(&parked),
+            "the driver never parked delivering events, it took {} of {scripted} frames",
+            frames()
+        );
+
+        let ack = s.send_tool_response("last-turn").await.unwrap();
+        drop(s);
+
+        // No permit is ever granted, so the write parks and the budget expires.
+        // Time is paused: it expires as soon as nothing else can run.
+        assert_eq!(
+            ack.outcome().await.unwrap(),
+            ControlOutcome::Unknown,
+            "a write the drain could not finish is unknown, not lost"
+        );
+        let sent = sent.lock().unwrap();
+        assert!(
+            sent.iter().any(|f| f.contains("last-turn")),
+            "the acknowledgement's write should have been attempted before the cut-off"
         );
     }
 

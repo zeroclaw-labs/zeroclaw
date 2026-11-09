@@ -407,6 +407,24 @@ impl SpeechToSpeechChannel {
         );
     }
 
+    /// Record an acknowledgement whose write began and never reported back.
+    /// Not a loss: the frame may have reached the model, so it does not join
+    /// `lost_tool_acks` and the call is not reported as leaving that turn
+    /// unanswered — but it is not a delivery to assume either.
+    fn note_unknown_ack(&self, id: &str) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "alias": self.alias,
+                    "tool_call": id,
+                })
+            ),
+            "speech_to_speech: an acknowledgement write was still in progress when the \
+             provider connection ended; its outcome is unknown"
+        );
+    }
+
     /// Record the driver's verdict on one acknowledgement: a written one needs
     /// nothing more, anything else is a model turn left waiting.
     fn settle_ack(&self, id: &str, outcome: Result<ControlOutcome, SessionError>) {
@@ -418,6 +436,10 @@ impl SpeechToSpeechChannel {
             Ok(ControlOutcome::Failed(reason)) => {
                 self.note_lost_ack(id, &format!("write failed: {reason}"));
             }
+            Ok(ControlOutcome::Unknown) => self.note_unknown_ack(id),
+            // Reachable only if the verdict channel breaks for a reason the
+            // driver does not answer for; a driver that simply ends reports
+            // the queued acknowledgement as discarded above.
             Err(e) => self.note_lost_ack(id, &e.to_string()),
         }
     }
@@ -436,8 +458,17 @@ impl SpeechToSpeechChannel {
                 "speech_to_speech.{}: the provider refused the reply: {reason}",
                 self.alias
             ))),
-            // The driver ended without deciding: a reply arriving after
-            // hangup is a race, not a failure.
+            Ok(ControlOutcome::Unknown) => Err(anyhow::Error::msg(format!(
+                "speech_to_speech.{}: the reply's write to the provider did not complete \
+                 before the connection ended; whether it was delivered is unknown",
+                self.alias
+            ))),
+            // The driver answers every receipt from the control's own drop
+            // now, so a reply still queued at hangup arrives above as
+            // `Discarded` — a reported non-delivery, which is what the agent
+            // needs to hear. This stays as the fallback for a verdict channel
+            // that broke for some other reason, where there is nothing to
+            // report but the race.
             Err(SessionError::Closed) => {
                 ::zeroclaw_log::record!(
                     DEBUG,
@@ -710,18 +741,7 @@ impl SpeechToSpeechChannel {
                 Expiry::Unwritten => {
                     self.note_lost_ack(&id, "call ended before the write started");
                 }
-                Expiry::InFlight => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({
-                                "alias": self.alias,
-                                "tool_call": id,
-                            })),
-                        "speech_to_speech: call ended with an acknowledgement write still in \
-                         progress; its outcome is unknown"
-                    );
-                }
+                Expiry::InFlight => self.note_unknown_ack(&id),
             }
         }
         // Per the single-active-session assumption (see `active_session`'s
