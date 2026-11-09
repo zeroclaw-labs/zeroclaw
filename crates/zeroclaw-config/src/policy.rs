@@ -3454,6 +3454,23 @@ fn cmd_cwd_shadowing_executable(
     Ok(None)
 }
 
+/// Commands `cmd.exe` implements itself. It runs one of these for a bare name
+/// before it looks for any file, so a same-named file in the working directory
+/// does not shadow it. Only the shadow refusal reads this list; the spawn-time
+/// hardening does not depend on it.
+const CMD_INTERNAL_COMMANDS: &[&str] = &[
+    "assoc", "break", "call", "cd", "chdir", "cls", "color", "copy", "date", "del", "dir", "dpath",
+    "echo", "endlocal", "erase", "exit", "for", "ftype", "goto", "if", "keys", "md", "mkdir",
+    "mklink", "move", "path", "pause", "popd", "prompt", "pushd", "rd", "rem", "ren", "rename",
+    "rmdir", "set", "setlocal", "shift", "start", "time", "title", "type", "ver", "verify", "vol",
+];
+
+fn is_cmd_internal_command(word: &str) -> bool {
+    CMD_INTERNAL_COMMANDS
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(word))
+}
+
 /// Under `cmd.exe`, the refusal for the first bare command in `command` that a
 /// file in `cwd` would run in place of.
 fn cmd_cwd_shadow_refusal(command: &str, cwd: &Path) -> Option<String> {
@@ -3468,8 +3485,12 @@ fn cmd_cwd_shadow_refusal(command: &str, cwd: &Path) -> Option<String> {
             continue;
         };
         let word = strip_wrapping_quotes(word).trim();
-        // A path-shaped executable is decided by the allowlist match instead.
-        if word.is_empty() || looks_like_path_for_shell(word, dialect) {
+        // A path-shaped executable is decided by the allowlist match instead,
+        // and no file shadows a command `cmd.exe` implements itself.
+        if word.is_empty()
+            || looks_like_path_for_shell(word, dialect)
+            || is_cmd_internal_command(word)
+        {
             continue;
         }
         match cmd_cwd_shadowing_executable(cwd, word, &pathext) {
@@ -7310,6 +7331,85 @@ mod tests {
             .validate_command_execution_for_shell("git status", true, ShellDialect::WindowsCmd)
             .expect_err("the workspace is the default working directory");
         assert!(error.contains(REFUSAL), "{error}");
+    }
+
+    #[test]
+    fn windows_cmd_shadow_refusal_skips_cmd_internal_commands() {
+        let workspace = tempfile::tempdir().unwrap();
+        for name in ["echo.bat", "git.bat"] {
+            std::fs::write(workspace.path().join(name), "@echo off\r\n").unwrap();
+        }
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_commands: vec!["echo".into(), "git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        // cmd.exe runs its own `echo` before it looks for any file, so the
+        // same-named script beside it changes nothing.
+        for command in ["echo hello", "ECHO hello"] {
+            assert!(
+                p.validate_command_execution_for_shell(command, true, ShellDialect::WindowsCmd)
+                    .is_ok(),
+                "{command:?} is an internal command and must not be refused"
+            );
+        }
+
+        // An external command in the same line is still checked.
+        let error = p
+            .validate_command_execution_for_shell(
+                "echo hello && git status",
+                true,
+                ShellDialect::WindowsCmd,
+            )
+            .expect_err("an external command must still be checked for a shadow");
+        assert!(
+            error.contains("Command blocked: working directory shadows command 'git'"),
+            "{error}"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn cmd_internal_commands_are_not_shadowed_by_working_directory_files() {
+        use crate::platform::native::NO_DEFAULT_CURRENT_DIRECTORY_IN_EXE_PATH;
+
+        let dir = tempfile::tempdir().unwrap();
+        // `<name> /?` only prints help when cmd.exe implements the command
+        // itself. For any other name cmd.exe runs the planted script, which
+        // leaves a marker file.
+        let planted_script_ran = |name: &str| {
+            let marker = format!("ran-{name}.txt");
+            std::fs::write(
+                dir.path().join(format!("{name}.cmd")),
+                format!("@echo ran>{marker}\r\n"),
+            )
+            .unwrap();
+            std::process::Command::new("cmd.exe")
+                .args(["/d", "/c", &format!("{name} /?")])
+                .current_dir(dir.path())
+                // The premise under test is cmd.exe's own lookup order, so the
+                // spawn-time hardening stays off.
+                .env_remove(NO_DEFAULT_CURRENT_DIRECTORY_IN_EXE_PATH)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            dir.path().join(marker).exists()
+        };
+
+        assert!(
+            planted_script_ran("zc-not-a-cmd-command"),
+            "the probe must detect a name cmd.exe resolves to a file"
+        );
+        for name in CMD_INTERNAL_COMMANDS {
+            assert!(
+                !planted_script_ran(name),
+                "cmd.exe ran a working-directory file for `{name}`, so it is not internal"
+            );
+        }
     }
 
     #[test]
