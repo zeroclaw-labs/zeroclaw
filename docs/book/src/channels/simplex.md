@@ -187,8 +187,9 @@ from end-of-speech silence and processing/network latency.
 With this endpoint selected, microphone frames stream continuously in bounded,
 memory-only queues. Partials stay ephemeral; only the finalized utterance enters
 the existing conversation and model loop. Speech-start stops queued playback,
-pending decoding, and synthesis, and, with `interrupt_on_new_message`, cancels the
-preceding model turn immediately without waiting for final transcription. A
+pending decoding, and synthesis, and cancels the preceding call's model turn
+immediately without waiting for final transcription. This explicit call control
+does not depend on the ordinary-message `interrupt_on_new_message` setting. A
 stream failure ends the call rather than silently dropping PCM or switching to
 batch recognition. Only one companion connection is owned by an admitted call;
 ending it releases recognition resources. Peer grants, speech activation, and
@@ -202,9 +203,10 @@ Model cancellation in that fallback still waits for a recognized utterance.
 Playback receipts outlive model generation. Interrupting a clip records completed
 segments, the partly played segment's text and elapsed/duration milliseconds, and
 discarded queued audio. A passive delivery observation precedes the next spoken
-user turn in shared history, including when generation had already finished.
-The complete assistant reply remains in the append-only archive and context;
-no historical text is rewritten and synthetic output is not transcribed again.
+user turn in the contact's conversation, including when generation had already
+finished. The observation does not rewrite the stored assistant reply or change
+the existing session backend's retention policy. Synthetic output is not
+transcribed again.
 The elapsed time is measured at the sender, so network and phone buffering make
 it an estimate of playout, not an exact word boundary or proof of what was heard.
 The agent is explicitly told that only part of the current segment was played.
