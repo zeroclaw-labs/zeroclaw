@@ -89,13 +89,18 @@ export default function BrowserVoiceSettings() {
   return (
     <div className="text-pc-text">
       <p className="mt-3 max-w-2xl text-sm text-pc-text-muted">{t('voice.help_intro')}</p>
-      <fieldset className="mt-3 max-w-2xl border border-pc-border rounded p-3" disabled={globalTimeout.seconds === null || globalSaving}>
-        <legend>{t('voice.global_settings')}</legend>
-        <label>{t('voice.silence_seconds')}
-          <input aria-label={t('voice.silence_seconds')} type="number" min="0" max="300" step="1" value={timeoutDraft} onChange={e => setTimeoutDraft(e.target.value)} />
-        </label>
-        <p>{t('voice.silence_help')}</p>
-        <Button size="sm" onClick={() => void saveTimeout()}>{t('voice.save_global')}</Button>
+      <fieldset className="mt-5 max-w-2xl rounded-xl border border-pc-border px-4 pb-4 pt-3 text-sm sm:px-5 sm:pb-5" disabled={globalTimeout.seconds === null || globalSaving}>
+        <legend className="px-2 font-medium">{t('voice.global_settings')}</legend>
+        <div className="flex flex-col gap-4">
+          <label className="flex flex-col items-start gap-2">
+            <span>{t('voice.silence_seconds')}</span>
+            <input aria-label={t('voice.silence_seconds')} className="w-full max-w-40 rounded-lg border border-pc-border bg-pc-base px-3 py-2 text-sm focus-visible:outline-2 focus-visible:outline-pc-accent disabled:opacity-50" type="number" min="0" max="300" step="1" value={timeoutDraft} onChange={e => setTimeoutDraft(e.target.value)} />
+          </label>
+          <p className="leading-relaxed text-pc-text-muted">{t('voice.silence_help')}</p>
+          <div className="flex justify-start">
+            <Button size="sm" onClick={() => void saveTimeout()}>{t('voice.save_global')}</Button>
+          </div>
+        </div>
       </fieldset>
       {(globalTimeout.error || globalError) && <p role="alert">{globalError || t('voice.global_load_error')}</p>}
       <label className="grid gap-1 mt-3 max-w-2xl text-sm">{t('voice.device')}
