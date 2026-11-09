@@ -219,7 +219,12 @@ fn shared_prefix(file: &Path) -> Option<String> {
 }
 
 pub(super) fn resolve_stable(present: &[String]) -> Option<String> {
-    let raw = fs::read_to_string("stable-version.txt").ok()?;
+    resolve_stable_in(Path::new("."), present)
+}
+
+/// [`resolve_stable`] against an explicit gh-pages root.
+pub(super) fn resolve_stable_in(root: &Path, present: &[String]) -> Option<String> {
+    let raw = fs::read_to_string(root.join("stable-version.txt")).ok()?;
     let tag = raw.trim().to_string();
     if tag.is_empty() {
         return None;
