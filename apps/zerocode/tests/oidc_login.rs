@@ -30,14 +30,11 @@ struct Fixture {
     tls_task: tokio::task::JoinHandle<()>,
     initializes: Arc<AtomicUsize>,
     auth_rejections: Arc<AtomicUsize>,
-    enroll_port: u16,
-    enroll_task: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.tls_task.abort();
-        self.enroll_task.abort();
     }
 }
 
@@ -122,53 +119,6 @@ impl Fixture {
                 });
             }
         });
-        let enroll_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let enroll_port = enroll_listener.local_addr().unwrap().port();
-        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
-            rustls::pki_types::PrivatePkcs8KeyDer::from(server_key.serialize_der()),
-        );
-        let cfg = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![server.der().clone()], key)
-            .unwrap();
-        let enroll_acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(cfg));
-        let enroll_task = tokio::spawn(async move {
-            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-            loop {
-                let (stream, _) = enroll_listener.accept().await.unwrap();
-                let Ok(mut tls) = enroll_acceptor.accept(stream).await else {
-                    continue;
-                };
-                let mut raw = Vec::new();
-                let end = loop {
-                    let mut byte = [0u8; 1];
-                    if tls.read_exact(&mut byte).await.is_err() {
-                        return;
-                    }
-                    raw.push(byte[0]);
-                    if raw.ends_with(b"\r\n\r\n") {
-                        break raw.len();
-                    }
-                };
-                let header = String::from_utf8_lossy(&raw).to_string();
-                let response = if header.starts_with("GET /enroll/ca ") {
-                    json!({"ca_chain_pem": ca.pem()})
-                } else {
-                    assert!(header.starts_with("POST /enroll "));
-                    let length: usize = header.lines().find_map(|line| line.strip_prefix("Content-Length: ")).unwrap().trim().parse().unwrap();
-                    raw.resize(end + length, 0);
-                    tls.read_exact(&mut raw[end..]).await.unwrap();
-                    let request: Value = serde_json::from_slice(&raw[end..]).unwrap();
-                    assert_eq!(request["pairing_code"], "test-enrollment-code");
-                    let mut csr = rcgen::CertificateSigningRequestParams::from_pem(request["csr_pem"].as_str().unwrap()).unwrap();
-                    csr.params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-                    let cert = csr.signed_by(&ca, &ca_key).unwrap();
-                    json!({"cert_pem":cert.pem(),"ca_chain_pem":ca.pem(),"device_id":"test-device", "not_after":chrono::Utc::now().timestamp()+2592000})
-                }.to_string();
-                tls.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).as_bytes()).await.unwrap();
-                tls.shutdown().await.unwrap();
-            }
-        });
         let gateway = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/oidc/corp/device/start"))
@@ -185,6 +135,20 @@ impl Fixture {
             ))
             .mount(&gateway)
             .await;
+        Mock::given(method("POST"))
+            .and(path("/api/oidc/corp/certificate"))
+            .respond_with(move |request: &wiremock::Request| {
+                assert_eq!(request.headers.get("authorization").unwrap(), &format!("Bearer {TOKEN}"));
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                assert!(body.get("pairing_code").is_none());
+                let mut csr = rcgen::CertificateSigningRequestParams::from_pem(body["csr_pem"].as_str().unwrap()).unwrap();
+                csr.params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+                let cert = csr.signed_by(&ca, &ca_key).unwrap();
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "cert_pem": cert.pem(), "ca_chain_pem": ca.pem(),
+                    "device_id": "first-contact-device", "not_after": chrono::Utc::now().timestamp()+2592000
+                }))
+            }).mount(&gateway).await;
         Self {
             dir,
             target,
@@ -192,8 +156,6 @@ impl Fixture {
             tls_task,
             initializes,
             auth_rejections,
-            enroll_port,
-            enroll_task,
         }
     }
 
@@ -297,7 +259,7 @@ async fn untrusted_certificate_and_eof_abort_before_device_start() {
         "corp",
         &f.target,
         "--gateway-url",
-        &f.gateway.uri(),
+        &f.target.replace("wss://", "https://"),
     ])
     .arg("--config-dir")
     .arg(f.dir.path())
@@ -320,8 +282,11 @@ async fn untrusted_certificate_and_eof_abort_before_device_start() {
 
 #[tokio::test]
 async fn first_login_enrolls_device_and_plain_zerocode_reuses_saved_credentials() {
-    use tokio::io::AsyncWriteExt as _;
     let f = Fixture::new(false).await;
+    // The client starts with literally no files and neither peer has an
+    // enrollment listener or pairing code. Only gateway OIDC approval exists.
+    let fresh = tempfile::tempdir().unwrap();
+    assert!(std::fs::read_dir(fresh.path()).unwrap().next().is_none());
     let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_zerocode"));
     cmd.args([
         "login",
@@ -330,28 +295,16 @@ async fn first_login_enrolls_device_and_plain_zerocode_reuses_saved_credentials(
         "--gateway-url",
         &f.gateway.uri(),
     ])
-    .arg("--enroll-port")
-    .arg(f.enroll_port.to_string())
     .arg("--config-dir")
-    .arg(f.dir.path())
-    .stdin(Stdio::piped())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
+    .arg(fresh.path())
+    .stdin(Stdio::null())
     .kill_on_drop(true);
     for (key, _) in std::env::vars()
         .filter(|(key, _)| key.starts_with("ZEROCODE_") || key == "ZEROCLAW_AUTH_TOKEN")
     {
         cmd.env_remove(key);
     }
-    let mut child = cmd.spawn().unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(b"test-enrollment-code\ny\n")
-        .await
-        .unwrap();
-    let out = tokio::time::timeout(Duration::from_secs(25), child.wait_with_output())
+    let out = tokio::time::timeout(Duration::from_secs(25), cmd.output())
         .await
         .unwrap()
         .unwrap();
@@ -360,10 +313,15 @@ async fn first_login_enrolls_device_and_plain_zerocode_reuses_saved_credentials(
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(!String::from_utf8_lossy(&out.stderr).contains(TOKEN));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains(TOKEN));
+    assert!(!stderr.contains("pairing code"));
+    assert!(!stderr.contains("SAS"));
     assert_eq!(f.initializes.load(Ordering::SeqCst), 1);
-    let config: toml::Value =
-        toml::from_str(&std::fs::read_to_string(f.config()).unwrap()).unwrap();
+    let config: toml::Value = toml::from_str(
+        &std::fs::read_to_string(fresh.path().join("zerocode-config.toml")).unwrap(),
+    )
+    .unwrap();
     let cert = config["connection"]["logins"][&f.target]["tls"]["client_cert_path"]
         .as_str()
         .unwrap();
@@ -375,7 +333,7 @@ async fn first_login_enrolls_device_and_plain_zerocode_reuses_saved_credentials(
     let mut plain = tokio::process::Command::new(env!("CARGO_BIN_EXE_zerocode"));
     plain
         .arg("--config-dir")
-        .arg(f.dir.path())
+        .arg(fresh.path())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

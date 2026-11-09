@@ -197,6 +197,31 @@ impl GatewayEnrollment {
         Ok(())
     }
 
+    /// Issue a transport certificate for this previously unknown device. The
+    /// daemon independently verifies the bearer and its current grants.
+    pub async fn certificate<T: serde::de::DeserializeOwned>(
+        &self,
+        alias: &str,
+        token: &str,
+        csr: &str,
+    ) -> Result<T> {
+        let response = self
+            .http
+            .post(format!("{}/api/oidc/{alias}/certificate", self.base))
+            .bearer_auth(token)
+            .json(&serde_json::json!({"csr_pem": csr}))
+            .send()
+            .await
+            .context("OIDC device bootstrap failed")?;
+        if !response.status().is_success() {
+            return Err(Self::gateway_error(response).await);
+        }
+        response
+            .json()
+            .await
+            .context("invalid certificate bootstrap response")
+    }
+
     async fn gateway_error(response: reqwest::Response) -> anyhow::Error {
         let status = response.status();
         match response.json::<GatewayError>().await {

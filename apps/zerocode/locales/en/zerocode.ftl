@@ -912,3 +912,5 @@ zc-login-saved = Signed in to { $url }. Saved the login in { $path }. Run zeroco
 zc-login-env-shadow = ZEROCLAW_AUTH_TOKEN is set and will override this saved login. Unset it to use the saved token.
 zc-login-expired = Your saved OIDC login has expired. Sign in again to continue; the replacement token will be saved automatically.
 zc-login-conflicting-route = Login takes its destination as a positional URL; do not combine it with --connect or --relay.
+
+zc-login-no-pairing-endpoint = OIDC login bootstraps the device through the gateway after sign-in; --enroll-host and --enroll-port are not used. No pairing code or SAS is needed.

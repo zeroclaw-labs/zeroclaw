@@ -379,8 +379,16 @@ poll the per-client budget would only refuse. The legacy automatic enrollment
 path holds the token in memory for that session only. For URL-scoped persistent login, use
 `zerocode login <alias> <wss-url> --gateway-url <https-origin>`; see
 [Remote setup](../zerocode/remote.md#sign-in-with-oidc-recommended-for-oidc-deployments).
-That command saves the accepted access token in the owner-only local
-`zerocode-config.toml` and re-enrolls when a later startup needs a fresh token.
+That command starts from an empty client directory: OIDC sign-in authorizes
+issuance of its first device certificate through the gateway, with no pre-created
+device, local user, daemon pairing code, SAS, or separate enrollment listener.
+The daemon verifies the bearer through the same accepted OIDC policy as RPC,
+requires a human with `system:execute`, signs only the CSR's public key, and
+records the new device in the existing certificate ledger and audit trail.
+Static client-certificate pins still require out-of-band provisioning. WSS still
+requires both mTLS and a valid OIDC access token on every initialize.
+The command saves the accepted access token in the owner-only local
+`zerocode-config.toml` and re-authenticates when startup needs a fresh token.
 
 ## Permission profiles
 

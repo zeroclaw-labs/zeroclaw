@@ -1,5 +1,6 @@
-//! URL-scoped OIDC login orchestration. Reuses device enrollment, gateway
-//! enrollment and RPC initialize; the local connection config owns credentials.
+//! First-contact URL-scoped OIDC login. Gateway sign-in authorizes automatic
+//! device certificate bootstrap; no pairing flow is involved. The local
+//! connection config owns credentials, and WSS still requires mTLS + a bearer.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -154,39 +155,32 @@ async fn probe_wss(uri: &str, tls: &client::ClientTls) -> Result<()> {
     Ok(())
 }
 
-async fn verify_transports(
-    uri: &str,
-    gateway: &str,
-    section: &mut config::WssTlsSection,
-    gateway_section: &mut config::WssTlsSection,
-) -> Result<()> {
+async fn verify_peer(address: &str, wss: bool, section: &mut config::WssTlsSection) -> Result<()> {
     // Preflight carries no token or device code. Each TLS peer owns its trust:
     // accepting a self-signed WSS certificate must not weaken a public gateway.
-    for (address, wss, section) in [(uri, true, section), (gateway, false, gateway_section)] {
-        if section.skip_verify && (wss || address.starts_with("https://")) {
-            consent(section, address)?;
+    if section.skip_verify && (wss || address.starts_with("https://")) {
+        consent(section, address)?;
+    }
+    let probe = async |tls: &client::ClientTls| {
+        if wss {
+            probe_wss(address, tls).await
+        } else {
+            oidc_enroll::GatewayEnrollment::new(address, tls)?
+                .probe()
+                .await
         }
-        let probe = async |tls: &client::ClientTls| {
-            if wss {
-                probe_wss(address, tls).await
-            } else {
-                oidc_enroll::GatewayEnrollment::new(address, tls)?
-                    .probe()
-                    .await
-            }
-        };
-        if let Err(error) = probe(&tls_from(section)).await {
-            if section.skip_verify || !certificate_error(&error) {
-                return Err(error);
-            }
-            eprintln!(
-                "{}",
-                i18n::t_args("zc-login-untrusted", &[("url", address)])
-            );
-            consent(section, address)?;
-            section.skip_verify = true;
-            probe(&tls_from(section)).await?;
+    };
+    if let Err(error) = probe(&tls_from(section)).await {
+        if section.skip_verify || !certificate_error(&error) {
+            return Err(error);
         }
+        eprintln!(
+            "{}",
+            i18n::t_args("zc-login-untrusted", &[("url", address)])
+        );
+        consent(section, address)?;
+        section.skip_verify = true;
+        probe(&tls_from(section)).await?;
     }
     Ok(())
 }
@@ -195,11 +189,15 @@ async fn authenticate(
     uri: &str,
     gateway: &str,
     alias: &str,
-    section: &config::WssTlsSection,
-    gateway_section: &config::WssTlsSection,
+    section: &mut config::WssTlsSection,
+    gateway_section: &mut config::WssTlsSection,
+    config_dir: &Path,
+    force_enroll: bool,
 ) -> Result<config::OidcLogin> {
-    let tls = tls_from(section);
-    // verify_transports owns consent for both legs before this flow starts.
+    // First contact starts with gateway TLS, not the client-authenticated WSS
+    // plane and not the pairing-only enrollment listener.
+    verify_peer(gateway, false, gateway_section).await?;
+    // Gateway consent was obtained before device code or bearer exchange.
     let token = oidc_enroll::run_device_flow(
         gateway,
         &tls_from(gateway_section),
@@ -232,6 +230,27 @@ async fn authenticate(
             .timestamp()
             .saturating_add(i64::try_from(seconds).unwrap_or(i64::MAX))
     });
+    let credentials = credential_dir(config_dir, uri);
+    enroll::recover_and_validate(&credentials)?;
+    if force_enroll
+        || section.client_cert_path.is_empty()
+        || !Path::new(&section.client_cert_path).exists()
+    {
+        let gateway_client =
+            oidc_enroll::GatewayEnrollment::new(gateway, &tls_from(gateway_section))?;
+        enroll::enroll_with_oidc(&gateway_client, alias, &token.access_token, &credentials).await?;
+        for (path, name) in [
+            (&mut section.client_cert_path, "client.crt"),
+            (&mut section.client_key_path, "client.key"),
+        ] {
+            *path = absolute(&credentials.join("tls").join(name).to_string_lossy())?;
+        }
+        if section.ca_cert_path.is_empty() {
+            section.ca_cert_path = absolute(&credentials.join("tls/ca.crt").to_string_lossy())?;
+        }
+    }
+    verify_peer(uri, true, section).await?;
+    let tls = tls_from(section);
     let provider = format!("oidc.{alias}");
     let rpc = tokio::time::timeout(
         Duration::from_secs(30),
@@ -262,6 +281,9 @@ async fn authenticate(
 pub(crate) async fn run(args: &LoginArgs, cli: &Cli, config_dir: &Path) -> Result<()> {
     if cli.connect.is_some() || cli.relay.is_some() {
         bail!(i18n::t("zc-login-conflicting-route"));
+    }
+    if cli.enroll_host.is_some() || cli.enroll_port.is_some() {
+        bail!(i18n::t("zc-login-no-pairing-endpoint"));
     }
     let alias = provider_alias(&args.provider)?;
     let uri = normalize_target(&args.target)?;
@@ -322,26 +344,6 @@ pub(crate) async fn run(args: &LoginArgs, cli: &Cli, config_dir: &Path) -> Resul
     if let Some(path) = &cli.tls_client_key {
         section.client_key_path = absolute(path)?;
     }
-    let certless =
-        section.client_cert_path.is_empty() && !credentials.join("tls/client.crt").exists();
-    if cli.enroll || certless {
-        let host = cli
-            .enroll_host
-            .as_deref()
-            .unwrap_or(url.host_str().context("WSS host missing")?)
-            .trim_matches(['[', ']']);
-        enroll::enroll(
-            host,
-            cli.enroll_port.unwrap_or(enroll::DEFAULT_ENROLL_PORT),
-            &credentials,
-        )
-        .await?;
-        section.client_cert_path.clear();
-        section.client_key_path.clear();
-        if cli.tls_ca_cert.is_none() {
-            section.ca_cert_path.clear();
-        }
-    }
     for (value, name) in [
         (&mut section.ca_cert_path, "ca.crt"),
         (&mut section.client_cert_path, "client.crt"),
@@ -351,8 +353,16 @@ pub(crate) async fn run(args: &LoginArgs, cli: &Cli, config_dir: &Path) -> Resul
             *value = absolute(&credentials.join("tls").join(name).to_string_lossy())?;
         }
     }
-    verify_transports(&uri, &gateway, &mut section, &mut gateway_section).await?;
-    let login = authenticate(&uri, &gateway, alias, &section, &gateway_section).await?;
+    let login = authenticate(
+        &uri,
+        &gateway,
+        alias,
+        &mut section,
+        &mut gateway_section,
+        config_dir,
+        cli.enroll,
+    )
+    .await?;
     config::persist_oidc_login(config_dir, &uri, &login, true)?;
     eprintln!(
         "{}",
@@ -401,8 +411,16 @@ pub(crate) async fn renew_expired(
     let mut section = login.tls.clone();
     let mut gateway_section = login.gateway_tls.clone();
     eprintln!("{}", i18n::t("zc-login-expired"));
-    verify_transports(&uri, &login.enroll_url, &mut section, &mut gateway_section).await?;
-    let renewed = authenticate(&uri, &login.enroll_url, alias, &section, &gateway_section).await?;
+    let renewed = authenticate(
+        &uri,
+        &login.enroll_url,
+        alias,
+        &mut section,
+        &mut gateway_section,
+        config_dir,
+        false,
+    )
+    .await?;
     config::persist_oidc_login(config_dir, &uri, &renewed, false)?;
     loaded.connection.logins.insert(uri.clone(), renewed);
     loaded.connection.wss = loaded.connection.wss_for(Some(&uri));

@@ -307,7 +307,7 @@ pub(crate) struct OidcEnrollmentState {
     /// This surface's own attempt counter, deliberately separate from
     /// `AppState::auth_limiter`: a lockout earned here must not reach
     /// pairing or webhook auth, nor theirs reach enrollment.
-    attempts: crate::auth_rate_limit::AuthRateLimiter,
+    pub(crate) attempts: crate::auth_rate_limit::AuthRateLimiter,
     poll_budget: SlidingWindowRateLimiter,
     pub(crate) outbound: Semaphore,
 }
@@ -367,7 +367,7 @@ pub(crate) fn routes_with(enrollment_state: Arc<OidcEnrollmentState>) -> Router<
 /// Attached inside [`routes_with`] so the production router gets it by
 /// merging these routes, next to (not instead of) the gateway-wide
 /// security headers, which set `no-referrer` and COOP but no cache policy.
-async fn no_store(request: Request, next: Next) -> Response {
+pub(crate) async fn no_store(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -378,7 +378,7 @@ async fn no_store(request: Request, next: Next) -> Response {
 /// The client this request is billed to: the forwarded address only where
 /// the deployment trusts its proxy, the peer address otherwise. Same
 /// derivation as every other rate-limited gateway surface.
-fn client_key(state: &AppState, peer: SocketAddr, headers: &HeaderMap) -> String {
+pub(crate) fn client_key(state: &AppState, peer: SocketAddr, headers: &HeaderMap) -> String {
     crate::client_key_from_request(Some(peer), headers, state.trust_forwarded_headers)
 }
 
@@ -408,7 +408,7 @@ fn too_many_requests(message: &str, retry_after_secs: u64) -> Response {
 /// answer shows the caller is polling too fast or feeding the relay
 /// invalid device codes, and a callback once it turns out not to have
 /// finished a sign-in.
-fn auth_gate(
+pub(crate) fn auth_gate(
     enrollment_state: &OidcEnrollmentState,
     key: &str,
     record: bool,
@@ -432,7 +432,10 @@ fn auth_gate(
 /// outbound work. Loopback is exempt on exactly the terms the auth limiter
 /// exempts it on, so a local dashboard and a local zerocode keep working
 /// while a remote caller stays bounded.
-fn budget_gate(enrollment_state: &OidcEnrollmentState, key: &str) -> Result<(), Box<Response>> {
+pub(crate) fn budget_gate(
+    enrollment_state: &OidcEnrollmentState,
+    key: &str,
+) -> Result<(), Box<Response>> {
     if crate::auth_rate_limit::is_loopback_key(key) {
         return Ok(());
     }
@@ -449,12 +452,14 @@ fn budget_gate(enrollment_state: &OidcEnrollmentState, key: &str) -> Result<(), 
 
 /// Reserve one of the outbound slots. The permit is held for the whole IdP
 /// round trip, so the cap counts requests in flight rather than started.
-fn outbound_permit(enrollment_state: &OidcEnrollmentState) -> Option<SemaphorePermit<'_>> {
+pub(crate) fn outbound_permit(
+    enrollment_state: &OidcEnrollmentState,
+) -> Option<SemaphorePermit<'_>> {
     enrollment_state.outbound.try_acquire().ok()
 }
 
 /// Refusal when the outbound cap is reached: nothing is sent to the IdP.
-fn relay_busy() -> Response {
+pub(crate) fn relay_busy() -> Response {
     let mut response = error_json(
         StatusCode::SERVICE_UNAVAILABLE,
         "enrollment relay is busy; retry shortly",
@@ -470,7 +475,7 @@ fn relay_busy_page() -> Response {
     response
 }
 
-fn error_json(status: StatusCode, message: &str) -> Response {
+pub(crate) fn error_json(status: StatusCode, message: &str) -> Response {
     (status, Json(serde_json::json!({ "error": message }))).into_response()
 }
 
@@ -940,7 +945,7 @@ fn has_dot_segment(path: &str) -> bool {
 
 /// Whether the request reached this gateway on the machine it runs on: a
 /// loopback peer that also named a loopback host.
-fn is_loopback_request(peer: SocketAddr, headers: &HeaderMap) -> bool {
+pub(crate) fn is_loopback_request(peer: SocketAddr, headers: &HeaderMap) -> bool {
     if !peer.ip().is_loopback() {
         return false;
     }

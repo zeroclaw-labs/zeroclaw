@@ -29,8 +29,15 @@ completes the TLS handshake and is then refused with `AUTH_REQUIRED`
 
 An administrator must first configure an `[oidc.<alias>]` relationship and
 permission mappings on the daemon, enable its device authorization grant at
-the identity provider, and expose the gateway over HTTPS. The alias below is
-that daemon-side alias, not an identity-provider brand or issuer URL.
+the identity provider, enable WSS, and expose the gateway over HTTPS. A human
+permission profile must grant `system:execute` for self-service device
+bootstrap (an existing administrator profile already grants it). This is an
+issuer/group policy, not registration of an individual user or device. No local
+`[users]` entry, paired token, pending code, existing client certificate, or
+separate `[enroll]` listener is needed. The alias below is that daemon-side
+alias, not an identity-provider brand or issuer URL. Run the gateway as part
+of `zeroclaw daemon`, which owns the certificate CA and shared audit authority;
+a separately started gateway does not issue device certificates.
 
 ```sh
 zerocode login corp wss://daemon.example.com:9781 \
@@ -39,28 +46,37 @@ zerocode
 ```
 
 For the standard ports, `zerocode login corp daemon.example.com` uses WSS
-port 9781, device-certificate enrollment port 9782, and the gateway at
+port 9781 and the gateway at
 `https://daemon.example.com:42617`. The gateway itself does not supply HTTPS
 by default: use `--gateway-url` to name its TLS-terminating proxy. A gateway
 path prefix is supported. Plain HTTP is accepted only on loopback.
 
-Login handles the steps in order:
+Login works from a completely empty client configuration directory:
 
-1. Obtain a device certificate when one is missing. Enter the enrollment
-   pairing code and confirm the SAS against the daemon console, just as in
-   the enrollment flow below. OIDC does not bypass device admission.
-2. Verify both the WSS daemon and gateway TLS connections before sending a
-   device code or access token. The two peers keep separate trust settings.
-   Provide `--tls-ca-cert <pem>` for a private WSS CA and
-   `--gateway-ca-cert <pem>` for a private gateway CA. An untrusted certificate
-   offers an explicit skip-verification confirmation; declining or EOF aborts.
-   `--tls-skip-verify` still requires confirmation for each peer. Choosing
-   **always** remembers only that exact URL, not every URL on the host.
-3. Show the identity provider's verification URL and code. Approve the sign-in
-   in your browser. No identity-provider client secret is needed on the client.
-4. Initialize a real RPC connection with the returned access token. Only after
-   the daemon accepts it, save the login and select that URL as the default.
-   A failed login never replaces a previously saved login.
+1. Verify the gateway's HTTPS certificate. A public certificate needs no prompt;
+   use `--gateway-ca-cert <pem>` for a private gateway CA. An untrusted
+   certificate offers an explicit skip-verification confirmation; declining or
+   EOF aborts before OIDC credentials are exchanged.
+2. Show the identity provider's verification URL and code. Approve the sign-in
+   in your browser. This is the IdP's device-authorization code, **not a daemon
+   pairing or enrollment code**. No client secret is needed on your workstation.
+3. Generate a new key and CSR locally. The daemon verifies the OIDC access token
+   and current permission mapping, creates the previously unknown device, and
+   signs its CSR through `POST /api/oidc/<alias>/certificate` on that same
+   authenticated gateway connection. The private key never leaves the client.
+   The gateway returns the daemon CA, so no SAS or out-of-band code is needed.
+   The separate port-9782 enrollment service is never contacted.
+4. Verify WSS using the returned CA (or `--tls-ca-cert <pem>` if explicitly
+   configured) and initialize with the new certificate and OIDC access token.
+   WSS stays mutually authenticated. Its TLS trust remains separate from the
+   gateway's: a deliberate skip on one peer never implicitly skips the other.
+5. Save the working login and select that URL as the default only after the
+   daemon accepts the RPC handshake. Failure does not replace a saved login.
+
+`--tls-skip-verify` still requires confirmation for each TLS peer. Choosing
+**always** remembers only that exact URL, not every URL on the host. Prefer
+verified HTTPS: a certificate obtained through an explicitly unverified gateway
+inherits the trust risk you accepted for that gateway.
 
 Later, plain `zerocode` uses the selected login. To select a different saved
 login for one run, use `zerocode --connect wss://other.example.com:9781`.
@@ -91,12 +107,13 @@ saved. Existing manually configured `[connection.wss]` credentials continue to
 work for connections without a saved URL login.
 
 Use `--config-dir` to select a separate client configuration directory.
-`--enroll` forces fresh device enrollment; `--enroll-host` and `--enroll-port`
-override its endpoint. If a device certificate was provisioned out of band,
+`--enroll` forces a fresh OIDC-authorized device certificate, without any
+pairing prompt. `--enroll-host` and `--enroll-port` belong to the separate
+pairing-based flow, not OIDC login. If a certificate was provisioned out of band,
 pass `--tls-client-cert` and `--tls-client-key` instead. Login currently targets
 a direct WSS URL; it does not log in through a relay-served dashboard.
 
-## Enrollment (recommended)
+## Pairing-based enrollment (non-OIDC clients)
 
 The first time you connect a certless client interactively, zerocode enrolls
 automatically:
