@@ -624,11 +624,32 @@ fn auto_detect_web_dist_dir() -> Option<std::path::PathBuf> {
 }
 
 fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
-    if let Some(xff) = headers.get("X-Forwarded-For").and_then(|v| v.to_str().ok()) {
-        for candidate in xff.split(',') {
-            if let Some(ip) = parse_client_ip(candidate) {
+    // Appending proxies add the connecting peer at the right-hand end. Prefer
+    // that hop so a client-supplied leading entry cannot pick the rate-limit key.
+    // Skip loopback hops: a real client never arrives as loopback through a
+    // proxy, and a same-host proxy chain can append 127.0.0.1 while the real
+    // caller sits further left.
+    if let Some(xff) = headers.get("X-Forwarded-For") {
+        let mut rightmost_loopback = None;
+        // A proxy can append a valid address to a caller's opaque header
+        // bytes. Decode each hop separately so that prefix cannot hide the
+        // proxy's suffix and restore the loopback peer's limiter exemption.
+        for candidate in xff.as_bytes().rsplit(|byte| *byte == b',') {
+            if let Some(ip) = std::str::from_utf8(candidate)
+                .ok()
+                .and_then(parse_client_ip)
+            {
+                if ip.is_loopback() {
+                    if rightmost_loopback.is_none() {
+                        rightmost_loopback = Some(ip);
+                    }
+                    continue;
+                }
                 return Some(ip);
             }
+        }
+        if rightmost_loopback.is_some() {
+            return rightmost_loopback;
         }
     }
 
@@ -644,7 +665,20 @@ pub(crate) fn client_key_from_request(
     trust_forwarded_headers: bool,
 ) -> String {
     if trust_forwarded_headers && let Some(ip) = forwarded_client_ip(headers) {
-        return ip.to_string();
+        // A real loopback caller never arrives through a proxy with a
+        // forwarded header. Treat a loopback-only forwarded value as spoofed.
+        if !ip.is_loopback() {
+            return ip.to_string();
+        }
+        // Do not inherit a loopback peer exemption from a proxied path — that
+        // would let a remote caller behind a same-host proxy skip per-client
+        // limits. Prefer a non-loopback peer; otherwise a non-exempt sentinel.
+        if let Some(addr) = peer_addr {
+            if !addr.ip().is_loopback() {
+                return addr.ip().to_string();
+            }
+        }
+        return "unknown".to_string();
     }
 
     peer_addr
@@ -850,7 +884,7 @@ impl GatewaySupervision {
 /// never per handler: every route whose handler lives in `api_config`,
 /// `api_quickstart`, or `api_sections` MUST be registered on THIS router,
 /// whatever its URL prefix.
-fn config_admin_router(inbound_auth: &Arc<principal_gate::GatewayInboundAuth>) -> Router<AppState> {
+fn config_admin_router(route_auth: principal_gate::ConfigRouteAuth) -> Router<AppState> {
     Router::new()
         .route(
             "/api/config",
@@ -936,7 +970,7 @@ fn config_admin_router(inbound_auth: &Arc<principal_gate::GatewayInboundAuth>) -
             post(api_config::handle_api_channel_bind),
         )
         .route_layer(axum::middleware::from_fn_with_state(
-            Arc::clone(inbound_auth),
+            route_auth,
             principal_gate::config_route_auth,
         ))
 }
@@ -2458,7 +2492,10 @@ pub async fn run_gateway_with_plugin_webhooks(
 
     // Build router with middleware
     let inner = Router::new()
-        .merge(config_admin_router(&inbound_auth))
+        .merge(config_admin_router(principal_gate::ConfigRouteAuth::new(
+            &inbound_auth,
+            &state.config,
+        )))
         .merge(api_oidc::routes())
         // ── Admin routes (for CLI management) ──
         .route("/admin/shutdown", post(handle_admin_shutdown))
@@ -3308,12 +3345,26 @@ async fn handle_pair(
 
 pub(crate) async fn persist_pairing_tokens(state: &AppState) -> Result<()> {
     // Self-contained: no caller pre-reads config for modify, so this
-    // admits its own commit rather than taking one as a param. The
-    // admitted commit (writer guard + config-work lease) is held across
-    // the whole read-modify-save-publish below and runs the irreversible
-    // phase retained, so a cancelled request cannot strand a committed
-    // token write without its publication.
+    // admits its own commit rather than taking one as a param.
     let commit = state.begin_config_commit().await?;
+    persist_pairing_tokens_under(state, commit).await.map(drop)
+}
+
+/// [`persist_pairing_tokens`] for a caller that already holds an admitted
+/// commit: a revocation that removed a live token under it, through
+/// [`PairingGuard::revoke_under_config_write_lock`], persists under the same
+/// commit.
+///
+/// The commit (writer guard + config-work lease) is held across the whole
+/// read-modify-save-publish below and runs the irreversible phase retained,
+/// so a cancelled request cannot strand a committed token write without its
+/// publication. It is handed back once the publication lands, so a caller
+/// that must stay serialized past the persist (a rotation issuing its new
+/// pairing code) keeps the writer gate until it is done.
+pub(crate) async fn persist_pairing_tokens_under(
+    state: &AppState,
+    commit: ConfigWriteGuard,
+) -> Result<ConfigWriteGuard> {
     let persisted = state.pairing.persisted_tokens();
     let mut updated_cfg = commit.current_config();
     updated_cfg.gateway.paired_tokens = persisted.paired_tokens;
@@ -3338,11 +3389,9 @@ pub(crate) async fn persist_pairing_tokens(state: &AppState) -> Result<()> {
             commit
                 .publish(revision, config)
                 .context("Failed to publish paired tokens to the live config")?;
-            Ok::<(), anyhow::Error>(())
+            Ok::<ConfigWriteGuard, anyhow::Error>(commit)
         }));
-    task.await
-        .context("Paired-token persistence task failed")??;
-    Ok(())
+    task.await.context("Paired-token persistence task failed")?
 }
 
 /// Result of a gateway chat turn.
@@ -5519,6 +5568,20 @@ pub(crate) fn rotation_replacement_subject(
     }
 }
 
+/// The admin rotate response when its config commit is refused before
+/// anything changed: the daemon generation is closing.
+fn admin_revocation_not_admitted(
+    error: zeroclaw_runtime::live_config_authority::ConfigCommitError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let body = serde_json::json!({
+        "success": false,
+        "pairing_required": true,
+        "pairing_code": null,
+        "message": format!("Revocation refused without any change: {error}"),
+    });
+    (StatusCode::SERVICE_UNAVAILABLE, Json(body))
+}
+
 #[derive(Debug, serde::Deserialize, Default)]
 pub struct AdminPaircodeQuery {
     #[serde(default)]
@@ -5608,19 +5671,33 @@ async fn handle_admin_paircode_new(
 
     let (revocation_message, subject) = match rotate {
         Some("all") => {
-            let revoked = state.pairing.revoke_all_tokens();
-            if let Some(registry) = state.device_registry.as_ref() {
-                if let Err(e) = registry.clear() {
-                    let body = serde_json::json!({
-                        "success": false,
-                        "pairing_required": true,
-                        "pairing_code": null,
-                        "message": format!("Tokens revoked in memory but device registry clear failed: {e}"),
-                    });
-                    return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
-                }
+            // Every live token and every device row go in one step under
+            // the lock, so a dropped request leaves neither half behind.
+            let ((revoked, cleared), config_write_guard) = match state
+                .pairing
+                .revoke_under_config_write_lock(state.begin_config_commit(), |pairing| {
+                    let revoked = pairing.revoke_all_tokens();
+                    let cleared = state
+                        .device_registry
+                        .as_ref()
+                        .map(|registry| registry.clear());
+                    (revoked, cleared)
+                })
+                .await
+            {
+                Ok(revoked) => revoked,
+                Err(e) => return Ok(admin_revocation_not_admitted(e)),
+            };
+            if let Some(Err(e)) = cleared {
+                let body = serde_json::json!({
+                    "success": false,
+                    "pairing_required": true,
+                    "pairing_code": null,
+                    "message": format!("Tokens revoked in memory but device registry clear failed: {e}"),
+                });
+                return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
             }
-            if let Err(e) = persist_pairing_tokens(&state).await {
+            if let Err(e) = persist_pairing_tokens_under(&state, config_write_guard).await {
                 let body = serde_json::json!({
                     "success": false,
                     "pairing_required": true,
@@ -5653,8 +5730,19 @@ async fn handle_admin_paircode_new(
                 });
                 return Ok((StatusCode::SERVICE_UNAVAILABLE, Json(body)));
             };
-            let token_hash = match registry.revoke(device_id) {
-                Ok(Some(hash)) => hash,
+            let config_write_guard = match state.begin_config_commit().await {
+                Ok(commit) => commit,
+                Err(e) => return Ok(admin_revocation_not_admitted(e)),
+            };
+            let revoked = api_pairing::revoke_device_credential(
+                &state,
+                registry,
+                device_id,
+                &config_write_guard,
+                || require_gateway_admin_token(&state, &headers),
+            )?;
+            let revoked = match revoked {
+                Ok(Some(revoked)) => revoked.subject,
                 Ok(None) => {
                     let body = serde_json::json!({
                         "success": false,
@@ -5674,8 +5762,7 @@ async fn handle_admin_paircode_new(
                     return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
                 }
             };
-            let revoked = state.pairing.revoke_token_hash_subject(&token_hash);
-            if let Err(e) = persist_pairing_tokens(&state).await {
+            if let Err(e) = persist_pairing_tokens_under(&state, config_write_guard).await {
                 let body = serde_json::json!({
                     "success": false,
                     "pairing_required": true,
@@ -6741,6 +6828,68 @@ path = "{trigger_path}"
         );
     }
 
+    /// The admin rotate paths dropped while they wait for the config write
+    /// lock, as the gateway's request timeout drops them, must leave every
+    /// device row and token in place, and the retried request revokes them.
+    #[tokio::test]
+    async fn admin_paircode_rotate_dropped_while_waiting_can_be_retried() {
+        for target in ["dev-a", "all"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let state = admin_paircode_state(&tmp, true, true);
+            let token_a = pair_device(&state, "dev-a").await;
+            let token_b = pair_device(&state, "dev-b").await;
+            let listed = |state: &AppState| -> Vec<String> {
+                let mut ids: Vec<String> = state
+                    .device_registry
+                    .as_ref()
+                    .unwrap()
+                    .list()
+                    .expect("test device registry list")
+                    .into_iter()
+                    .map(|device| device.id)
+                    .collect();
+                ids.sort();
+                ids
+            };
+            let call = |state: AppState| {
+                handle_admin_paircode_new(
+                    State(state.clone()),
+                    test_connect_info(),
+                    admin_headers(&state),
+                    Query(AdminPaircodeQuery {
+                        rotate: Some(target.into()),
+                        user: None,
+                    }),
+                )
+            };
+
+            let in_flight = state.config_authority.lock_config_writer().await;
+            let mut waiting = Box::pin(call(state.clone()));
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(
+                std::future::Future::poll(waiting.as_mut(), &mut cx).is_pending(),
+                "{target}: the rotation must wait for the config write lock"
+            );
+            drop(waiting);
+            drop(in_flight);
+
+            assert_eq!(listed(&state), vec!["dev-a", "dev-b"], "{target}");
+            assert!(state.pairing.is_authenticated(&token_a), "{target}");
+            assert!(state.pairing.is_authenticated(&token_b), "{target}");
+
+            let (status, _) = admin_paircode_response_json(call(state.clone()).await).await;
+            assert_eq!(status, StatusCode::OK, "{target}: the retry");
+            assert!(!state.pairing.is_authenticated(&token_a), "{target}");
+            if target == "all" {
+                assert!(listed(&state).is_empty());
+                assert!(!state.pairing.is_authenticated(&token_b));
+            } else {
+                assert_eq!(listed(&state), vec!["dev-b"]);
+                assert!(state.pairing.is_authenticated(&token_b));
+            }
+        }
+    }
+
     #[tokio::test]
     async fn admin_paircode_new_rotate_device_revokes_one() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -7360,6 +7509,84 @@ path = "{trigger_path}"
     }
 
     #[tokio::test]
+    async fn roster_device_rotation_waits_for_writer_and_survives_restart() {
+        for dashboard in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let state = roster_paircode_state(&tmp);
+            let operator = pair_device(&state, "laptop").await;
+            let old = pair_bound_device(&state, "phone").await;
+            let old_hash = PairingGuard::token_hash(&old);
+            let router = Router::new()
+                .route("/admin/paircode/new", post(handle_admin_paircode_new))
+                .route(
+                    "/api/devices/{id}/token/rotate",
+                    post(api_pairing::rotate_token),
+                )
+                .with_state(state.clone());
+            let path = if dashboard {
+                "/api/devices/phone/token/rotate"
+            } else {
+                "/admin/paircode/new?rotate=phone"
+            };
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .body(Body::empty())
+                .unwrap();
+            *request.headers_mut() = if dashboard {
+                bearer(&operator)
+            } else {
+                admin_headers(&state)
+            };
+            request.extensions_mut().insert(test_connect_info());
+
+            let writer = state.begin_config_commit().await.unwrap();
+            let mut response = Box::pin(router.oneshot(request));
+            assert!(futures_util::poll!(&mut response).is_pending());
+            assert_eq!(state.pairing.subject_for_token(&old), Some(alice()));
+            assert!(
+                state
+                    .device_registry
+                    .as_ref()
+                    .unwrap()
+                    .list()
+                    .unwrap()
+                    .iter()
+                    .any(|device| device.id == "phone")
+            );
+            assert_eq!(
+                config_on_disk(&tmp)
+                    .gateway
+                    .paired_token_users
+                    .get(&old_hash),
+                Some(&"alice".to_string())
+            );
+            drop(writer);
+
+            let (status, body) = json_of(response.await.unwrap()).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+            assert_eq!(body["principal_id"], "user:alice", "{path}: {body}");
+            let code = body["pairing_code"].as_str().unwrap();
+            let (status, paired) = pair_with(&state, code).await;
+            assert_eq!(status, StatusCode::OK, "{paired}");
+            let token = paired["token"].as_str().unwrap();
+            let saved = config_on_disk(&tmp);
+            let restarted = PairingGuard::from_gateway_config(&saved.gateway);
+            assert_eq!(restarted.subject_for_token(token), Some(alice()));
+            assert!(!restarted.is_authenticated(token));
+            assert!(!restarted.token_is_paired(&old));
+            assert!(restarted.is_authenticated(&operator));
+            assert!(
+                !saved
+                    .gateway
+                    .paired_tokens
+                    .contains(&PairingGuard::token_hash(token))
+            );
+            assert!(!saved.gateway.paired_token_users.contains_key(&old_hash));
+        }
+    }
+
+    #[tokio::test]
     async fn dashboard_rotation_keeps_the_binding_too() {
         let tmp = tempfile::TempDir::new().unwrap();
         let state = roster_paircode_state(&tmp);
@@ -7369,6 +7596,7 @@ path = "{trigger_path}"
         let (status, json) = json_of(
             api_pairing::rotate_token(
                 State(state.clone()),
+                None,
                 bearer(&operator),
                 axum::extract::Path("phone".to_string()),
             )
@@ -7403,6 +7631,7 @@ path = "{trigger_path}"
         let (status, json) = json_of(
             api_pairing::rotate_token(
                 State(state.clone()),
+                None,
                 bearer(&operator),
                 axum::extract::Path("phone".to_string()),
             )
@@ -7439,6 +7668,7 @@ path = "{trigger_path}"
         let (_, json) = json_of(
             api_pairing::rotate_token(
                 State(state.clone()),
+                None,
                 bearer(&operator),
                 axum::extract::Path("tablet".to_string()),
             )
@@ -10190,11 +10420,69 @@ path = "{trigger_path}"
         let mut headers = HeaderMap::new();
         headers.insert(
             "X-Forwarded-For",
+            // Client-supplied leftmost entry, then the address the immediate
+            // proxy appended (rightmost).
             HeaderValue::from_static("198.51.100.10, 203.0.113.11"),
         );
 
         let key = client_key_from_request(Some(peer), &headers, true);
+        assert_eq!(key, "203.0.113.11");
+    }
+
+    #[test]
+    fn client_key_preserves_proxy_suffix_after_opaque_xff_prefix() {
+        let peer = SocketAddr::from(([127, 0, 0, 1], 42617));
+        for value in [
+            &b"\x80, 198.51.100.10"[..],
+            &b"\x80, 198.51.100.10, 127.0.0.1"[..],
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("X-Forwarded-For", HeaderValue::from_bytes(value).unwrap());
+            assert_eq!(
+                client_key_from_request(Some(peer), &headers, true),
+                "198.51.100.10"
+            );
+            assert_eq!(
+                client_key_from_request(Some(peer), &headers, false),
+                "127.0.0.1"
+            );
+        }
+    }
+
+    #[test]
+    fn client_key_ignores_spoofed_loopback_forwarded_header() {
+        let peer = SocketAddr::from(([203, 0, 113, 50], 42617));
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Forwarded-For", HeaderValue::from_static("127.0.0.1"));
+
+        let key = client_key_from_request(Some(peer), &headers, true);
+        assert_eq!(key, "203.0.113.50");
+    }
+
+    #[test]
+    fn client_key_skips_rightmost_loopback_for_earlier_xff_hop() {
+        // Same-host proxy chain: immediate hop appended loopback; the real
+        // caller remains further left. Must not fall back to a loopback peer
+        // (that would grant the local-only limiter exemption).
+        let peer = SocketAddr::from(([127, 0, 0, 1], 42617));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Forwarded-For",
+            HeaderValue::from_static("198.51.100.10, 127.0.0.1"),
+        );
+
+        let key = client_key_from_request(Some(peer), &headers, true);
         assert_eq!(key, "198.51.100.10");
+    }
+
+    #[test]
+    fn client_key_loopback_only_xff_with_loopback_peer_is_non_exempt() {
+        let peer = SocketAddr::from(([127, 0, 0, 1], 42617));
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Forwarded-For", HeaderValue::from_static("127.0.0.1"));
+
+        let key = client_key_from_request(Some(peer), &headers, true);
+        assert_eq!(key, "unknown");
     }
 
     #[test]

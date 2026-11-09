@@ -33,10 +33,9 @@ importantly, what changes for existing remote connections.
      live session held under such an alias is refused. The other
      session methods do not check the agent yet, as described under
      [What this layer does not do (yet)](#what-this-layer-does-not-do-yet);
-   - running or approving an SOP requires every agent it runs as, with the
-     same tool-selector rule as a session, and creating, saving, or deleting
-     one requires the agents it runs as. A step that names no agent, on the
-     step or on the procedure, counts as the first configured agent alias in
+   - running or approving an SOP requires administrator grants. Creating,
+     saving, or deleting one requires the agents it runs as. A step that names
+     no agent, on the step or on the procedure, counts as the first configured agent alias in
      sort order, which is the agent the headless executor falls back to.
      Every step counts, including the steps of a deterministic procedure;
    - attachments, personality files, cost queries that name an agent, and
@@ -69,13 +68,19 @@ importantly, what changes for existing remote connections.
    narrowed or its credential expired is refused when its turn comes.
 
 Authorization is **live** for edits made through the daemon's RPC config
-methods, which is what zerocode's config editor uses: editing
-`[permission_profiles]`, `[users]`, `[oidc]`, or `security.trust_daemon_uid`
-that way re-compiles the policy at save time. Established native-token and
+methods (used by zerocode's config editor) and its supervised gateway's
+configuration API (used by the web dashboard). Both share the daemon
+generation's live configuration, config write lock, and accepted authorization
+authority. Editing `[permission_profiles]`, `[users]`, `[oidc]`, or
+`security.trust_daemon_uid` through either surface compiles and publishes the
+policy at save time, before the write returns success. Established native-token and
 local connections re-resolve at their next operation, with no reconnect or
-restart, and an OIDC connection must initialize again. Edits made
-outside the daemon, directly in `config.toml`, through the web dashboard, or
-with `zeroclaw config set`, apply at the next daemon reload or restart.
+restart, and an OIDC connection must initialize again. The dashboard's
+pending-reload flag still covers daemon-owned subsystems that need rebuilding;
+it does not delay this authorization publication. Edits made outside the
+daemon, directly in `config.toml` or with `zeroclaw config set`, still apply
+at the next daemon reload or restart. These authorization CLI writes save to disk without
+publishing to the running daemon or triggering its reload.
 Revoking a gateway pairing token through the gateway's pairing controls
 invalidates connections authenticated with it before their next operation.
 Removing a token from `gateway.paired_tokens` or
@@ -345,6 +350,22 @@ they only relay what the IdP grants after the user approves. Design
 rationale and failure-mode table:
 `docs/security/oidc-browser-pkce-design-8289.md` in the repository.
 
+The gateway browser flow also requires a short-lived `HttpOnly` binding
+cookie from the browser that started it. The cookie grants no session or
+API access. A callback with no matching cookie is refused before code
+exchange and consumes the pending flow; open a new login in the intended
+browser instead of forwarding a callback URL between browsers. Each tab
+has its own flow cookie. A relay-capacity refusal retains a valid flow and
+cookie for retry within the original ten-minute deadline.
+
+Binding cookies use `SameSite=Lax` for the identity provider's top-level
+GET redirect. They have no `Domain` attribute and use `Path=/`, including
+behind a gateway path prefix; HTTPS also uses `Secure` and the `__Host-`
+name prefix. Serve remote enrollment over HTTPS. Plain-HTTP cookie scope
+still spans ports on the same host; this is not isolation from another
+application running on that host. Cookie blocking prevents browser
+enrollment; the device flow remains available.
+
 The rate limiting works in layers. Requests that start a flow
 (`POST /api/oidc/{alias}/device/start`, `GET /oidc/login/{alias}`, and
 `GET /oidc/callback`) count against an enrollment-specific instance of
@@ -383,7 +404,18 @@ the store away from everyone else for the ten minutes those flows live. Loopback
 exempt from the per-client budgets, as they are from every other gateway
 auth limit, so a reverse proxy sitting on the same host must enable
 `trust_forwarded_headers` for the per-client limits to apply to the real
-callers behind it. Every enrollment response carries
+callers behind it. When that setting is on, the gateway takes the
+rightmost address from `X-Forwarded-For` (the hop the immediate proxy
+added) or else `X-Real-IP`. Configure the proxy to append or overwrite
+rather than forward a client-supplied list unchanged, for example nginx
+`proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`.
+If you set only `X-Real-IP`, also clear the higher-priority list with
+`proxy_set_header X-Forwarded-For "";` together with
+`proxy_set_header X-Real-IP $remote_addr;`; otherwise a client-supplied
+`X-Forwarded-For` still wins. A forwarded loopback address is skipped so
+it cannot claim the local-only limiter exemption; when the chain is
+loopback-only the gateway uses a non-exempt key rather than the loopback
+peer. Every enrollment response carries
 `Cache-Control: no-store` and `Pragma: no-cache` on top of the gateway's
 `no-referrer` policy, because device codes and access tokens travel in
 those bodies.
@@ -452,8 +484,76 @@ If either the principal's tool selector or agent selector is constrained,
 `delegate` (bounded and independent), `spawn_subagent`, and `execute_pipeline`
 are unavailable, including skill aliases wrapping those tools. These nested
 paths do not yet carry both current principal ceilings; the ordinary parent
-turn remains usable. Admin principals and principals with both selectors set
-to `"*"` keep their agent's configured nested capabilities.
+turn remains usable.
+
+Some tools do work that does not carry the caller's principal, so no
+principal without `admin` holds them in its sessions, whatever its selectors
+name, `"*"` included:
+
+- `sessions_list`, `sessions_history`, and `sessions_send` list, read, and
+  append to other sessions without checking who owns them, and so would
+  `sessions_reset` and `sessions_delete` if an agent registered them.
+  `sessions_current`, which reports only the caller's own session, stays.
+- `cron_add`, `cron_update`, `cron_run`, `cron_list`, `cron_runs`,
+  `cron_remove`, and `schedule`: scheduled turns do not carry the caller's
+  restrictions, and cron rows and run output are shared by agent rather than
+  owned by the calling principal.
+- `send_message_to_peer`, whose turns run on another agent.
+- `sop_execute`, `sop_advance`, `sop_approve`, and `sop_workshop`: SOP steps
+  run headlessly as the procedure's agents, and an applied workshop proposal
+  becomes a shared procedure that later runs the same way. Read-only SOP
+  tools follow the ordinary tool selector.
+- `model_routing_config` and `proxy_config`, which save daemon config that
+  every agent's later runs use. Over RPC the same change needs
+  `config:update`.
+- `spawn_subagent` and `execute_pipeline`, whose nested runs would hold the
+  tools above again.
+
+Each of these tools reports `requires_unrestricted_principal`, so a skill
+alias of one goes with it. The direct `delegate` tool stays when both
+selectors are `"*"`, because the session holds its handle: every bounded,
+independent, background, parallel, and nested child it builds withholds the
+same tools. It also resolves the originating credential's current authority
+when it builds each child, so a child built after that credential loses
+`admin` withholds them too. Its skill aliases are withheld, because their
+captured targets cannot be identified as the bound handle.
+
+The withholding is applied at session creation, at rehydration, before every
+prompt, and when accepted steering is consumed, including its recheck after
+memory writes. An administrator demoted mid-session loses the tools at the
+next prompt or accepted steering. Like selector narrowing, it never gives
+them back to a live session. Admin principals and the shared operator keep
+their agent's configured tools, and existing cron jobs keep running.
+
+A queued prompt resolves authority again on the exact Agent that will execute
+the turn, after provider reconciliation and Agent/task waits. The same admission
+applies withholding and protects prompt checkpoint or running-state writes
+after storage contention. A refused admission does not call the provider or
+persist a terminal turn. This is a turn-admission boundary, not continuous
+revocation of a turn that is already running.
+
+RPC `cron/patch` and `cron/trigger` also refuse agent jobs for non-admins,
+including wildcard selectors. These jobs cannot carry the caller's session
+restrictions; the check uses current authority after looking up the job.
+Shell jobs retain their existing grant and command-policy checks. Cron reads,
+deletion, and jobs already scheduled by an operator are unchanged.
+
+RPC `sops/run` and `sops/decide` require administrator grants, including
+when a non-admin has wildcard tool and agent selectors. Headless steps do
+not carry the caller's principal restrictions. This includes deny, amend,
+and revise decisions. After decision-model and engine waits, the RPC holds
+current authority through its synchronous store effects. A busy SOP store
+refuses the request immediately; retry once contention clears. Background
+SOP processing keeps its normal storage timeout. SOP authoring retains its
+separate agent-selector checks.
+
+Until the session-data tools check ownership, scheduled agent jobs, SOP runs,
+and peer turns started by an administrator or a trigger can still call them.
+To remove them from those runs too, list `sessions_list`, `sessions_history`,
+and `sessions_send`, plus any skill tool that targets them, in
+`excluded_tools` of the risk profile of each agent those runs use. That
+removes them from every run of those agents, administrators' sessions
+included.
 
 The existing eight-argument Rust `Agent::from_live_config_with_tui_env`
 constructor remains available. RPC uses the additive
@@ -462,10 +562,22 @@ the shared resolver's grants at prompt admission.
 
 That composition does not cover every route to an agent's tools. Cron jobs
 and SOP authoring check only the agent selector. A constrained principal
-holding cron grants can create a shell job for its agent, or give an
-existing agent job a new prompt and trigger it, and one holding SOP create
-or update grants can save a procedure whose trigger runs it later. Treat
-cron and SOP authoring grants as grants of the agent's tools.
+holding cron grants can create or edit a shell job for its agent with RPC
+`cron/add` and `cron/patch`. The command meets the agent's approval policy
+there, as it does from the CLI and the dashboard, so under supervised
+autonomy a command that needs approval is refused rather than stored. Agent
+jobs are refused to it as described above. One holding SOP create or update
+grants can save a procedure whose trigger runs it later. Treat cron and SOP
+authoring grants as grants of the agent's tools.
+
+These checks run again when the job is written, not only when the request
+arrives. A grant withdrawn, or a paired device revoked, while a cron write
+waits for the database either stops that write or waits for it to finish.
+
+A tool called from a `pipeline` step or through a skill alias never inherits
+an approval. The runtime approves only the call it dispatched, so under
+supervised autonomy a command that needs approval is refused there; call the
+tool directly to be asked.
 
 Principal-owned sessions may use synchronous and parallel delegation when
 their grants allow it. Background delegation and its `check_result`,
@@ -558,6 +670,29 @@ provider registry and resolver:
   always has. Any other method outside GET, HEAD, POST, PUT, PATCH and
   DELETE is refused.
 
+Verifying an OIDC bearer is work an unauthenticated caller makes the
+gateway do, and with `validation = "introspection"` each verification
+is one authenticated round trip to the identity provider under the
+daemon's own client credentials. Two limits bound it. A refused
+credential counts against a per-client ledger with the same thresholds
+as a bad pairing token (10 in a minute, then a 5-minute lockout, with
+loopback exempt), kept on its own ledger, so a client replaying a token
+past its expiry never locks its operator out of pairing, and a pairing
+lockout never blocks a bearer. The bearer ledger reads
+`gateway.trust_forwarded_headers` from the live configuration for each
+request, so a saved proxy-trust change applies without rebuilding the
+router. A transport failure on the gateway's own
+leg to the identity provider, and a verified identity the policy grants
+nothing, say nothing about the caller and are not billed to it. At most
+16 bearer verifications are in flight at once across all clients,
+loopback included, which bounds what the gateway will do to the
+identity provider on everyone's behalf; the slot is held for the
+verification alone, never across the request it admits. A locked-out
+client gets HTTP 429 and a verification refused for capacity gets HTTP
+503, each with a `Retry-After` naming the delay in seconds. Dashboard
+sessions are verified by their own layer and never compete for these
+limits.
+
 A scoped principal's `Config` grants are enforced in two steps. The
 route layer applies a coarse floor per HTTP method: a read needs
 `read`, anything else needs at least one of `create`, `update` or
@@ -587,9 +722,11 @@ against the accepted snapshot as it stands. Nothing on the request
 path recompiles policy, so a request that read the configuration
 before a concurrent persist can never reinstall the older policy over
 the newer one; a persisted change to a provider's verification
-settings, a roster or a profile takes effect on the next request. The
-daemon's own RPC surface holds a separate live configuration and
-reaches the same state through the reload the gateway write flags.
+settings, a roster or a profile takes effect on the next request. In a
+supervised run, the gateway and RPC surface share the live configuration,
+write lock, and accepted policy authority, so a save through either surface
+publishes to both. A standalone gateway has its own authority; it does not
+publish changes to a separately running daemon.
 Other gateway surfaces keep the pairing check per handler and adopt the
 layer in follow-ups; a [dashboard sign-in](#dashboard-sign-in) session
 also satisfies that check when its account is an administrator.
@@ -884,6 +1021,11 @@ the restored file without a migration step.
 Consolidation and governance derive shared-plane rows and do not run for
 private sessions, and administrative access into another principal's
 private memory has no surfaced pathway yet (deny-by-default).
+The session-data tools have no principal-aware view yet, so they are
+withheld from principals without `admin` (see
+[Permission profiles](#permission-profiles)) instead of being scoped to the
+caller's own sessions, and scheduled agent jobs, SOP runs, and peer turns can
+still call them unless the agent's risk profile excludes them.
 `sops/runs` and `sops/run-detail` return the run history of every
 procedure to a principal holding `Sops:Read`, whichever agents it ran as,
 unlike cron history. Gateway HTTP routes outside the configuration group

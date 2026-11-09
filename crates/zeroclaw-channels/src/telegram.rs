@@ -18104,6 +18104,10 @@ mod tests {
     fn telegram_contains_bot_mention_finds_mention() {
         assert!(TelegramChannel::contains_bot_mention(
             "Hello @mybot",
+            "@mybot"
+        ));
+        assert!(TelegramChannel::contains_bot_mention(
+            "Hello @mybot",
             "mybot"
         ));
         assert!(TelegramChannel::contains_bot_mention(
@@ -18116,6 +18120,10 @@ mod tests {
         ));
         assert!(TelegramChannel::contains_bot_mention(
             "Hello @MyBot, can you help?",
+            "mybot"
+        ));
+        assert!(TelegramChannel::contains_bot_mention(
+            "你好 @mybot，请处理",
             "mybot"
         ));
     }
