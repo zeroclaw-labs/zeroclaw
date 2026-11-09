@@ -32,7 +32,7 @@ use zeroclaw_rpc_proto::types::{SessionUpdateEvent, TurnCompletionOutcome, TurnU
 
 use crate::AppState;
 use crate::dashboard_core::{
-    CoreCaller, CoreChat, CoreFailure, agent_not_allowed, chat_not_permitted,
+    CoreCaller, CoreChat, CoreFailure, Sent, agent_not_allowed, chat_not_permitted,
     not_dispatchable_message,
 };
 use crate::dashboard_session::{
@@ -441,8 +441,10 @@ impl Chat {
                     });
                     return refusal(sender, &error).await;
                 };
-                self.approve(request_id, decision).await;
-                None
+                self.approve(request_id, decision)
+                    .await
+                    .err()
+                    .map(Stop::Close)
             }
             "message" => {
                 let content = parsed["content"].as_str().unwrap_or("");
@@ -704,8 +706,16 @@ impl Chat {
                                     turn.disconnect().await;
                                 }
                             } else if let Some((request_id, decision)) = approval_decision(&parsed) {
-                                turn.approval_receipts.remove(request_id);
-                                self.approve(request_id, decision).await;
+                                let shown = turn.approval_receipts.remove(request_id);
+                                if let Err(code) = self.approve(request_id, decision).await {
+                                    // Not sent: refused with the chat's
+                                    // other approvals as it closes.
+                                    if shown {
+                                        turn.approval_receipts.insert(request_id.to_string());
+                                    }
+                                    turn.stop = Some(Stop::Close(code));
+                                    turn.disconnect().await;
+                                }
                             }
                         }
                         Some("message") => {
@@ -730,20 +740,37 @@ impl Chat {
         }
     }
 
+    /// Answer an approval request on the core. An answer the core refuses
+    /// for its connection's binding is sent again after the renewal only if
+    /// the session still admits the chat, checked as before acting on a
+    /// frame: the renewal can wait on the identity provider, and the core
+    /// takes an answer on `sessions:update` alone. `Err` is the close code
+    /// when it no longer does; the answer was not sent.
     // `&mut self`: a shared borrow held across the call would need `Chat:
     // Sync`, which the session watch's pending recheck is not.
-    async fn approve(&mut self, request_id: &str, decision: &str) {
+    async fn approve(&mut self, request_id: &str, decision: &str) -> Result<(), u16> {
         let session_id = self.core.core_id.clone();
         let answer = json!({
             "session_id": session_id,
             "request_id": request_id,
             "decision": decision,
         });
-        if let Err(failure) = self
+        let delivered = match self
             .core
-            .call::<Value>(Method::SessionApprove, answer)
+            .send::<Value>(Method::SessionApprove, answer.clone())
             .await
         {
+            Ok(Sent::Answered(_)) => Ok(()),
+            Ok(Sent::Renewed) => {
+                crate::dashboard_session::session_admits_now(&mut self.watch, &self.state).await?;
+                self.core
+                    .resend::<Value>(Method::SessionApprove, answer)
+                    .await
+                    .map(drop)
+            }
+            Err(failure) => Err(failure),
+        };
+        if let Err(failure) = delivered {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -756,6 +783,7 @@ impl Chat {
                 "dashboard chat approval was not delivered to the core"
             );
         }
+        Ok(())
     }
 }
 

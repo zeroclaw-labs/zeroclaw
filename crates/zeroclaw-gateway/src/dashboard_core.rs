@@ -840,24 +840,49 @@ impl CoreChat {
         method: Method,
         params: Value,
     ) -> Result<T, CoreFailure> {
-        let ended = self.ended();
-        if ended.is_cancelled() {
+        match self.send(method, params.clone()).await? {
+            Sent::Answered(result) => Ok(result),
+            Sent::Renewed => self.resend(method, params).await,
+        }
+    }
+
+    /// [`Self::call`] up to the renewal: a connection whose binding lapsed
+    /// is replaced with the chat's identity, and the call is not sent again
+    /// here. The renewal can wait on the identity provider, so a caller
+    /// that must still be allowed to make the call checks that first, then
+    /// sends it with [`Self::resend`].
+    pub(crate) async fn send<T: DeserializeOwned>(
+        &mut self,
+        method: Method,
+        params: Value,
+    ) -> Result<Sent<T>, CoreFailure> {
+        if self.ended().is_cancelled() {
             return Err(CoreFailure::SessionEnded);
         }
-        match self.client.call::<T>(method, params.clone()).await {
-            Ok(result) => Ok(result),
+        match self.client.call::<T>(method, params).await {
+            Ok(result) => Ok(Sent::Answered(result)),
             Err(ClientError::Rpc(error)) if error.code == AUTH_REQUIRED => {
                 self.renew().await?;
-                if ended.is_cancelled() {
-                    return Err(CoreFailure::SessionEnded);
-                }
-                self.client
-                    .call::<T>(method, params)
-                    .await
-                    .map_err(|error| self.caller.failure(error))
+                Ok(Sent::Renewed)
             }
             Err(error) => Err(self.caller.failure(error)),
         }
+    }
+
+    /// Send a call again after [`Sent::Renewed`], once: not once the session
+    /// has ended, and a second refusal ends the session.
+    pub(crate) async fn resend<T: DeserializeOwned>(
+        &mut self,
+        method: Method,
+        params: Value,
+    ) -> Result<T, CoreFailure> {
+        if self.ended().is_cancelled() {
+            return Err(CoreFailure::SessionEnded);
+        }
+        self.client
+            .call::<T>(method, params)
+            .await
+            .map_err(|error| self.caller.failure(error))
     }
 
     pub(crate) fn failure(&self, error: ClientError) -> CoreFailure {
@@ -876,6 +901,15 @@ impl Drop for CoreChat {
             zeroclaw_spawn::spawn!(closing.run(clients));
         }
     }
+}
+
+/// How [`CoreChat::send`] came out.
+pub(crate) enum Sent<T> {
+    /// The core answered the call.
+    Answered(T),
+    /// The core refused the connection's binding and the chat's connection
+    /// was renewed. The call was not sent again.
+    Renewed,
 }
 
 /// How the core's creation of a chat's conversation came out.
@@ -2318,6 +2352,26 @@ mod tests {
             self.rpc_auth
                 .publish_accepted(&narrowed, self.rpc_auth.accepted_revision() + 1)
                 .expect("the narrowed policy is accepted");
+        }
+
+        /// [`Self::narrow_profile`] for the core's authority too, as a
+        /// profile edit reaches both in a daemon.
+        fn narrow_profile_everywhere(
+            &self,
+            profile: &str,
+            change: impl Fn(&mut PermissionProfileConfig),
+        ) {
+            self.narrow_profile(profile, &change);
+            let mut narrowed = self.config.clone();
+            change(
+                narrowed
+                    .permission_profiles
+                    .get_mut(profile)
+                    .expect("the fixture's profile"),
+            );
+            self.core_auth
+                .publish_accepted(&narrowed, self.core_auth.accepted_revision() + 1)
+                .expect("the narrowed policy is accepted by the core");
         }
 
         /// Publish the live config with `alias` enabled or disabled, to the
@@ -6701,6 +6755,91 @@ mod tests {
         fixture
             .assert_nothing_live("a chat closed after sign-out still closes its conversation")
             .await;
+    }
+
+    /// Alice approves a read on her chat past its connection's deadline, so
+    /// the core refuses the answer and the chat renews the connection before
+    /// sending it again. That handshake is held at the identity provider
+    /// while her profile is narrowed by `change`, for the gateway and the
+    /// core alike, then released. The core takes an approval on
+    /// `sessions:update` alone, so only the chat's own check can stop it:
+    /// the chat must close with `4403`, and the read must never run.
+    async fn an_approval_renewed_across_a_narrowed_grant_is_not_sent(
+        change: impl Fn(&mut PermissionProfileConfig),
+    ) {
+        let fixture = revalidating_fixture(asking_file_read).await;
+        let note = fixture
+            .config
+            .agent_workspace_dir("support")
+            .join("note.txt");
+        std::fs::create_dir_all(note.parent().expect("a workspace")).unwrap();
+        std::fs::write(&note, "the narrowed account's note").unwrap();
+        let addr = serve(fixture.router()).await;
+        let (alice, _) = fixture.sign_in("alice").await;
+        let mut socket = open_chat(addr, &alice, "support", "web-1")
+            .await
+            .expect("alice may chat");
+        let _ = socket.next().await;
+        let request_id = ask_for_approval(&mut socket).await;
+
+        tokio::time::sleep(PAST_THE_REVALIDATION).await;
+        slow_introspections(&fixture, "alice", "chatters", HELD_HANDSHAKE, (1, 1)).await;
+        let before = introspections_of(&fixture._idp, "tok-alice").await;
+        let approve =
+            json!({ "type": "approval_response", "request_id": request_id, "decision": "approve" });
+        socket
+            .send(ClientMessage::Text(approve.to_string().into()))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while introspections_of(&fixture._idp, "tok-alice").await <= before {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the renewal reaches the identity provider");
+        fixture.narrow_profile_everywhere("chat-user", change);
+
+        // Past the held handshake's end, the read never ran.
+        tokio::time::sleep(HELD_HANDSHAKE + Duration::from_secs(1)).await;
+        assert_eq!(
+            model_requests_with(&fixture._model, "the narrowed account's note").await,
+            0,
+            "the approval reached the core after the account lost the chat"
+        );
+        let (frames, code) = read_to_close(&mut socket).await;
+        assert_eq!(
+            code,
+            Some(crate::dashboard_session::WS_CLOSE_ACCESS_LOST),
+            "{frames:?}"
+        );
+        fixture
+            .assert_nothing_live("the chat closed when its account lost it")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn an_approval_renewed_after_its_account_loses_sessions_execute_is_not_sent() {
+        an_approval_renewed_across_a_narrowed_grant_is_not_sent(|profile| {
+            without_session_verb(profile, Verb::Execute);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_approval_renewed_after_its_account_loses_sessions_read_is_not_sent() {
+        an_approval_renewed_across_a_narrowed_grant_is_not_sent(|profile| {
+            without_session_verb(profile, Verb::Read);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_approval_renewed_after_its_account_loses_its_agent_is_not_sent() {
+        an_approval_renewed_across_a_narrowed_grant_is_not_sent(|profile| {
+            profile.allowed_agents = vec!["other".into()];
+        })
+        .await;
     }
 
     /// What `caller`'s session holds: its places among the session's chats,
