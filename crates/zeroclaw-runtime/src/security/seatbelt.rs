@@ -96,11 +96,24 @@ impl SeatbeltSandbox {
         let read_write = resolve_roots(read_write)?;
         let read_only = resolve_roots(read_only)?;
         let write_only = resolve_roots(write_only)?;
-        let mut forbidden = resolve_roots(forbidden)?;
-        let home = home
+        let configured_forbidden = forbidden
+            .iter()
+            .map(|path| configured_location(path))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let resolved_forbidden = resolve_roots(forbidden)?;
+        let configured_home = home
             .filter(|home| home.is_absolute())
+            .map(Path::to_path_buf);
+        let home = configured_home
+            .as_deref()
             .map(|home| resolve_policy_root(home, &mut symlinks))
             .transpose()?;
+        let mut forbidden = retain_configured_forbidden_locations(
+            &configured_forbidden,
+            resolved_forbidden,
+            configured_home.as_deref(),
+            home.as_deref(),
+        );
         if let Some(home) = home.as_deref() {
             for name in HOME_CREDENTIAL_PATHS {
                 forbidden.push(resolve_policy_root(&home.join(name), &mut symlinks)?);
@@ -214,6 +227,43 @@ impl Sandbox for SeatbeltSandbox {
     }
 }
 
+/// Absolute form of a configured root without following its final symlink.
+fn configured_location(path: &Path) -> std::io::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+/// Keep each configured forbidden spelling alongside its resolved target so a
+/// later replacement of a hidden alias remains denied. When HOME itself is an
+/// alias, also map the configured relative name onto the resolved HOME.
+fn retain_configured_forbidden_locations(
+    configured: &[PathBuf],
+    resolved: Vec<PathBuf>,
+    configured_home: Option<&Path>,
+    resolved_home: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut out = resolved;
+    let mut push_unique = |path: PathBuf| {
+        if !out.iter().any(|existing| existing == &path) {
+            out.push(path);
+        }
+    };
+    for path in configured {
+        push_unique(path.clone());
+        if let (Some(configured_home), Some(resolved_home)) = (configured_home, resolved_home) {
+            if configured_home != resolved_home {
+                if let Ok(rel) = path.strip_prefix(configured_home) {
+                    push_unique(resolved_home.join(rel));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Resolve existing symlinks while retaining absent suffixes for future writes.
 fn resolve_policy_root(path: &Path, symlinks: &mut BTreeSet<PathBuf>) -> std::io::Result<PathBuf> {
     let absolute = if path.is_absolute() {
@@ -320,6 +370,13 @@ const HOME_CREDENTIAL_PATHS: &[&str] = &[
     ".git-credentials",
 ];
 
+fn path_has_hidden_component(path: &Path) -> bool {
+    path.components().any(|component| match component {
+        std::path::Component::Normal(name) => name.to_string_lossy().starts_with('.'),
+        _ => false,
+    })
+}
+
 /// Read grant for the given account's home dotfiles (tool configs such as
 /// `~/.cargo` or `~/.gitconfig`), followed by deny rules for the credential
 /// paths that grant would otherwise open. Seatbelt last-match wins, so the
@@ -359,14 +416,22 @@ fn home_dotfile_rules(home: Option<&Path>, forbidden: &[PathBuf]) -> String {
     // Path::starts_with("/home/.") does not match "/home/.private" because
     // "." and ".private" are distinct components, so compare components.
     for path in forbidden {
-        let Ok(rel) = path.strip_prefix(home) else {
-            continue;
-        };
-        let Some(std::path::Component::Normal(name)) = rel.components().next() else {
-            continue;
-        };
-        if name.to_string_lossy().starts_with('.') {
-            denied.insert(path.to_path_buf());
+        match path.strip_prefix(home) {
+            Ok(rel) => {
+                let Some(std::path::Component::Normal(name)) = rel.components().next() else {
+                    continue;
+                };
+                if name.to_string_lossy().starts_with('.') {
+                    denied.insert(path.to_path_buf());
+                }
+            }
+            Err(_) => {
+                // Configured spelling under an unresolved HOME alias must stay
+                // denied after that name is replaced with a regular file.
+                if path_has_hidden_component(path) {
+                    denied.insert(path.to_path_buf());
+                }
+            }
         }
     }
     for path in denied {
@@ -791,6 +856,57 @@ mod tests {
             .find(r#"(deny file-read* (subpath "/Users/alice/.private-secrets"))"#)
             .unwrap();
         assert!(grant < deny, "configured deny must follow the grant");
+    }
+
+    #[test]
+    fn retain_configured_forbidden_keeps_name_target_and_resolved_home_mapping() {
+        let configured = vec![PathBuf::from("/alias/.private-secrets")];
+        let resolved = vec![PathBuf::from("/real/.cargo/secrets")];
+        let out = retain_configured_forbidden_locations(
+            &configured,
+            resolved,
+            Some(Path::new("/alias")),
+            Some(Path::new("/real")),
+        );
+        assert!(out.contains(&PathBuf::from("/alias/.private-secrets")));
+        assert!(out.contains(&PathBuf::from("/real/.cargo/secrets")));
+        assert!(out.contains(&PathBuf::from("/real/.private-secrets")));
+    }
+
+    #[test]
+    fn generate_policy_denies_configured_hidden_name_outside_resolved_home() {
+        let home = Path::new("/real");
+        let forbidden = vec![
+            PathBuf::from("/alias/.private-secrets"),
+            PathBuf::from("/real/.cargo/secrets"),
+            PathBuf::from("/real/.private-secrets"),
+        ];
+        let policy = generate_policy_for_home(
+            &PathBuf::from("/tmp/workspace-outside"),
+            &[],
+            &[],
+            &[],
+            &forbidden,
+            Some(home),
+        );
+        assert!(
+            policy.contains(r#"(allow file-read* (prefix "/real/."))"#),
+            "grant must remain; policy={policy}"
+        );
+        for path in [
+            "/alias/.private-secrets",
+            "/real/.cargo/secrets",
+            "/real/.private-secrets",
+        ] {
+            assert!(
+                policy.contains(&format!(r#"(deny file-read* (subpath "{path}"))"#)),
+                "must deny reads of {path}; policy={policy}"
+            );
+        }
+        assert!(
+            !policy.contains(r#"(deny file-read* (subpath "/real/.cargo"))"#),
+            "permitted .cargo control must not be broadly denied; policy={policy}"
+        );
     }
 
     #[test]
@@ -1595,6 +1711,69 @@ mod tests {
             !deny.status.success(),
             "configured forbidden hidden path must stay denied"
         );
+    }
+
+    #[test]
+    fn seatbelt_production_constructor_denies_replaced_configured_hidden_alias() {
+        if !SeatbeltSandbox::is_installed() {
+            return;
+        }
+        let fixture = HomeFixture::new("replaced-configured-hidden");
+        let real_home = fixture.child("alice");
+        let workspace = fixture.child("workspace");
+        let home_alias = fixture.path.join("home-alias");
+        std::os::unix::fs::symlink(&real_home, &home_alias).unwrap();
+        std::fs::create_dir_all(real_home.join(".cargo")).unwrap();
+        std::fs::write(real_home.join(".cargo/config.toml"), "tool-config-ok").unwrap();
+        std::fs::write(real_home.join(".cargo/secrets"), "target-secret").unwrap();
+        std::os::unix::fs::symlink(".cargo/secrets", real_home.join(".private-secrets")).unwrap();
+
+        let sandbox = SeatbeltSandbox::with_roots_for_home(
+            Some(&workspace),
+            &[],
+            &[],
+            &[],
+            &[home_alias.join(".private-secrets")],
+            Some(&home_alias),
+        )
+        .unwrap();
+
+        std::fs::remove_file(real_home.join(".private-secrets")).unwrap();
+        std::fs::create_dir(real_home.join(".private-secrets")).unwrap();
+        std::fs::write(
+            real_home.join(".private-secrets/token"),
+            "replacement-secret",
+        )
+        .unwrap();
+
+        let allow = sandboxed_sh(
+            &sandbox,
+            &workspace,
+            r#"cat "$0""#,
+            &real_home.join(".cargo/config.toml"),
+        );
+        assert!(
+            allow.status.success(),
+            "permitted .cargo control must stay readable: {}",
+            String::from_utf8_lossy(&allow.stderr)
+        );
+        assert_eq!(allow.stdout, b"tool-config-ok");
+
+        let script = workspace.join("denied-replaced.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "cat \"{}\"\n",
+                real_home.join(".private-secrets/token").display()
+            ),
+        )
+        .unwrap();
+        let deny = sandboxed_sh(&sandbox, &workspace, r#"exec /bin/sh "$0""#, &script);
+        assert!(
+            !deny.status.success(),
+            "replaced configured hidden alias must stay denied"
+        );
+        assert!(deny.stdout.is_empty(), "protected contents must not escape");
     }
 
     #[test]
