@@ -2387,7 +2387,7 @@ mod tests {
             "precondition: outcome.output must already be scrubbed"
         );
 
-        let tool_calls = vec![ParsedToolCall {
+        let tool_calls = [ParsedToolCall {
             name: "configurable_failing_tool".to_string(),
             arguments: serde_json::json!({}),
             tool_call_id: Some("call-1".to_string()),

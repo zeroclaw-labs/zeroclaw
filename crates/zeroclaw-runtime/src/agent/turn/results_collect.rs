@@ -423,7 +423,7 @@ mod tests {
         let ignore: HashSet<&str> = HashSet::new();
         for iteration in 0..n {
             let mut history: Vec<ChatMessage> = Vec::new();
-            let tool_calls = vec![ParsedToolCall {
+            let tool_calls = [ParsedToolCall {
                 name: "file_read".to_string(),
                 arguments: serde_json::json!({ "path": format!("file_{iteration}.rs") }),
                 tool_call_id: None,
@@ -478,7 +478,7 @@ mod tests {
         let mut detector = LoopDetector::new(LoopDetectorConfig::default());
         let ignore: HashSet<&str> = HashSet::new();
         let mut history: Vec<ChatMessage> = Vec::new();
-        let tool_calls = vec![ParsedToolCall {
+        let tool_calls = [ParsedToolCall {
             name: "shell".to_string(),
             arguments: serde_json::json!({ "command": "cat source.txt" }),
             tool_call_id: None,
