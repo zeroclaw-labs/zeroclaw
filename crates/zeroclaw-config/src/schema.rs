@@ -8511,6 +8511,85 @@ pub struct RelayConfig {
     /// applies when `node_id` is empty (an operator-pinned id is never rotated).
     #[serde(default)]
     pub node_id_rotation_days: u64,
+    /// Serve this daemon's web dashboard through the relay at a per-daemon
+    /// HTTPS host (`[relay.dashboard]`). Off by default.
+    #[serde(default)]
+    #[nested]
+    pub dashboard: RelayDashboardConfig,
+}
+
+/// The web dashboard through the relay (`[relay.dashboard]`).
+///
+/// When enabled, the relay serves this daemon's dashboard at
+/// `https://<label>.<domain>/`, where `<label>` is derived from the daemon's
+/// relay registration key (the daemon logs the full address at startup).
+///
+/// TRUST: unlike every other relay route, this one is NOT end-to-end. The
+/// relay ends the browser's TLS, so its operator can read and change the
+/// dashboard traffic of everyone who uses this address - pages, session
+/// cookies and CSRF tokens - and act as a signed-in user for that session,
+/// with an administrator's session as an administrator. Native clients
+/// through the same relay stay end-to-end encrypted. Use zerocode, or a
+/// direct HTTPS connection, when the relay must not be trusted, and to
+/// administer the daemon.
+///
+/// The gateway serves these connections as the browser's, never as a local
+/// peer, and builds every URL it hands them from this origin. It refuses
+/// pairing and paired tokens on them, which the relay would see, so people
+/// sign in through `[gateway.dashboard_sign_in]`. Requires `[relay]` enabled
+/// with a verified relay certificate, `gateway.require_pairing = true`,
+/// dashboard sign-in with at least one provider, and no `gateway.path_prefix`.
+/// The relay must list this daemon in its own `[dashboard] allow`.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "relay.dashboard"]
+pub struct RelayDashboardConfig {
+    /// Serve the dashboard through the relay (default: false).
+    #[serde(default)]
+    pub enabled: bool,
+    /// The relay's dashboard domain: the dashboard is served at
+    /// `https://<label>.<domain>/`. Must match the relay's `[dashboard] domain`.
+    #[serde(default)]
+    pub domain: String,
+    /// The HTTPS port browsers use to reach the relay (default 443).
+    #[serde(default = "default_relay_dashboard_port")]
+    pub port: u16,
+}
+
+fn default_relay_dashboard_port() -> u16 {
+    443
+}
+
+impl Default for RelayDashboardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            domain: String::new(),
+            port: default_relay_dashboard_port(),
+        }
+    }
+}
+
+/// Whether `name` is a DNS host name of at least two labels: each 1 to 63
+/// lower-case letters, digits or interior hyphens, at most 253 bytes in all,
+/// and not ending in a numeric label (so an IPv4 address is not taken for a
+/// name). The one rule for relay dashboard domains and hosts.
+pub fn is_dns_host_name(name: &str) -> bool {
+    let labels: Vec<&str> = name.split('.').collect();
+    name.len() <= 253
+        && labels.len() >= 2
+        && !labels
+            .last()
+            .is_some_and(|tld| tld.bytes().all(|b| b.is_ascii_digit()))
+        && labels.iter().all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
 }
 
 fn default_wss_bind() -> String {
@@ -14532,6 +14611,79 @@ impl Config {
                 ValidationFailed,
                 "gateway.require_pairing",
                 "[gateway.dashboard_sign_in] needs gateway.require_pairing = true, but it is false. Set require_pairing = true under [gateway] (or ZEROCLAW_gateway__require_pairing=true); the official Docker image's default config sets it to false",
+            );
+        }
+        Ok(())
+    }
+
+    /// `[relay.dashboard]`: the dashboard is put on the internet through the
+    /// relay, so it is refused wherever that would expose more than the
+    /// dashboard's own sign-in, or weaken the one link that protects it.
+    fn validate_relay_dashboard(&self) -> Result<()> {
+        let dashboard = &self.relay.dashboard;
+        if !dashboard.enabled {
+            return Ok(());
+        }
+        if !self.relay.enabled {
+            validation_bail!(
+                ValidationFailed,
+                "relay.dashboard.enabled",
+                "[relay.dashboard] needs [relay] enabled = true: the dashboard is served through the relay link",
+            );
+        }
+        if !is_dns_host_name(&dashboard.domain) {
+            validation_bail!(
+                ValidationFailed,
+                "relay.dashboard.domain",
+                "relay.dashboard.domain must be the relay's dashboard domain, a lower-case DNS name such as relay.example.com, got {:?}",
+                dashboard.domain
+            );
+        }
+        if dashboard.port == 0 {
+            validation_bail!(
+                InvalidNumericRange,
+                "relay.dashboard.port",
+                "relay.dashboard.port must be the HTTPS port browsers reach the relay on (default 443), not 0",
+            );
+        }
+        // With pairing off every dashboard route is open to whoever reaches
+        // the gateway, and through the relay that is the internet.
+        if !self.gateway.require_pairing {
+            validation_bail!(
+                ValidationFailed,
+                "gateway.require_pairing",
+                "[relay.dashboard] needs gateway.require_pairing = true: with pairing off the dashboard would be open to anyone who reaches the relay address",
+            );
+        }
+        // Pairing and paired tokens are refused through the relay, which
+        // would see the code or token, so sign-in is the only way in.
+        if !self.gateway.dashboard_sign_in.enabled() {
+            validation_bail!(
+                ValidationFailed,
+                "gateway.dashboard_sign_in.oidc",
+                "[relay.dashboard] needs [gateway.dashboard_sign_in] with at least one provider: pairing and paired tokens are refused through the relay, which would see them, so dashboard sign-in is the only way in",
+            );
+        }
+        // `__Host-` cookies need the root path.
+        if self
+            .gateway
+            .path_prefix
+            .as_deref()
+            .is_some_and(|prefix| !prefix.is_empty())
+        {
+            validation_bail!(
+                ValidationFailed,
+                "gateway.path_prefix",
+                "[relay.dashboard] serves the dashboard at the root of its own host; unset gateway.path_prefix",
+            );
+        }
+        // For native clients the inner mTLS protects the traffic past the
+        // relay; dashboard traffic has only the daemon's link to the relay.
+        if self.relay.relay_insecure {
+            validation_bail!(
+                ValidationFailed,
+                "relay.relay_insecure",
+                "[relay.dashboard] needs a verified relay certificate: dashboard traffic between the relay and this daemon is protected only by that link. Unset relay.relay_insecure and use public roots, relay_ca_path or tofu",
             );
         }
         Ok(())
@@ -25088,6 +25240,7 @@ impl Config {
         }
 
         self.validate_dashboard_sign_in()?;
+        self.validate_relay_dashboard()?;
 
         // Security OTP / estop
         if self.security.otp.challenge_max_attempts == 0 {
@@ -30938,6 +31091,102 @@ zeroclaw-operators = "operator"
             toml::from_str("[gateway.dashboard_sign_in]\noidc = [\"corp\"]\n").unwrap();
         assert!(parsed.gateway.dashboard_sign_in.offers("corp"));
         assert!(!parsed.gateway.dashboard_sign_in.offers("other"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn relay_dashboard_is_off_by_default_and_parses() {
+        let config = Config::default();
+        assert!(!config.relay.dashboard.enabled);
+        assert_eq!(config.relay.dashboard.port, 443);
+        let parsed: Config = toml::from_str(
+            "[relay]\nenabled = true\nurl = \"relay.example.com:443\"\n\
+             [relay.dashboard]\nenabled = true\ndomain = \"relay.example.com\"\n",
+        )
+        .unwrap();
+        assert!(parsed.relay.dashboard.enabled);
+        assert_eq!(parsed.relay.dashboard.domain, "relay.example.com");
+        assert_eq!(parsed.relay.dashboard.port, 443);
+    }
+
+    #[::core::prelude::v1::test]
+    fn relay_dashboard_refuses_what_would_expose_or_weaken_it() {
+        let ready = || {
+            let mut config = auth_config();
+            config.relay.enabled = true;
+            config.relay.url = "relay.example.com:443".into();
+            config.relay.dashboard.enabled = true;
+            config.relay.dashboard.domain = "relay.example.com".into();
+            config.gateway.dashboard_sign_in.oidc = vec!["corp".into()];
+            config
+        };
+        ready()
+            .validate()
+            .expect("a complete [relay.dashboard] validates");
+
+        let refused = |change: fn(&mut Config), expected: &str| {
+            let mut config = ready();
+            change(&mut config);
+            let err = config.validate().unwrap_err().to_string();
+            assert!(err.contains(expected), "expected {expected:?}, got: {err}");
+        };
+        refused(|c| c.relay.enabled = false, "needs [relay] enabled");
+        refused(
+            |c| c.relay.dashboard.domain = String::new(),
+            "relay.dashboard.domain",
+        );
+        refused(
+            |c| c.relay.dashboard.domain = "Relay.Example.com".into(),
+            "relay.dashboard.domain",
+        );
+        refused(
+            |c| c.relay.dashboard.domain = "localhost".into(),
+            "relay.dashboard.domain",
+        );
+        refused(
+            |c| c.relay.dashboard.domain = "203.0.113.7".into(),
+            "relay.dashboard.domain",
+        );
+        refused(|c| c.relay.dashboard.port = 0, "relay.dashboard.port");
+        refused(
+            |c| c.gateway.require_pairing = false,
+            "require_pairing = true",
+        );
+        // Without a sign-in provider nobody could use it: pairing is
+        // refused through the relay.
+        refused(
+            |c| c.gateway.dashboard_sign_in.oidc.clear(),
+            "needs [gateway.dashboard_sign_in] with at least one provider",
+        );
+        refused(
+            |c| c.gateway.path_prefix = Some("/zc".into()),
+            "unset gateway.path_prefix",
+        );
+        refused(
+            |c| c.relay.relay_insecure = true,
+            "verified relay certificate",
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn dns_host_names_are_lower_case_multi_label_names() {
+        for name in ["relay.example.com", "a.b", "abc-1.relay.example", "x2.y3"] {
+            assert!(is_dns_host_name(name), "{name}");
+        }
+        for name in [
+            "",
+            "localhost",
+            "Relay.example.com",
+            "relay..example",
+            "-relay.example",
+            "relay-.example",
+            "relay.example.",
+            "relay_x.example",
+            "relay.example:443",
+            "203.0.113.7",
+        ] {
+            assert!(!is_dns_host_name(name), "{name}");
+        }
+        assert!(!is_dns_host_name(&format!("{}.example", "a".repeat(64))));
     }
 
     #[::core::prelude::v1::test]

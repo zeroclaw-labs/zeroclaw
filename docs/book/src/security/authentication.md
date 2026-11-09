@@ -688,9 +688,16 @@ Turning it on needs:
   The official Docker image writes `require_pairing = false` into its
   default config; set it to `true` there, or with
   `ZEROCLAW_gateway__require_pairing=true`.
-- HTTPS (`[gateway.tls]`, or a reverse proxy with
-  `trust_forwarded_headers`). Sign-in is refused over plain HTTP unless
-  the browser runs on the gateway's own machine.
+- HTTPS (`[gateway.tls]`, a reverse proxy with
+  `trust_forwarded_headers`, or a relay-served dashboard with
+  `[relay.dashboard]`, which is relay-terminated: see
+  [secure transport, 3e](../zerocode/secure-transport.md)). Sign-in is
+  refused over plain HTTP unless the browser runs on the gateway's own
+  machine. A relay-served dashboard offers sign-in alone: the relay would
+  see a pairing code or token, so pairing and paired tokens are refused
+  there. An administrator signed in through the relay gives the relay
+  administrator power, including lasting changes, so administer the daemon
+  over a direct connection or with `zerocode`.
 - Behind a reverse proxy, the browser's `Host` passed through unchanged
   (for example `proxy_set_header Host $host;` in nginx). The callback URI
   and the dashboard's own origin are both taken from it, so a proxy that
@@ -703,6 +710,8 @@ Turning it on needs:
   gateway checks the URI against a configured dashboard origin (#12048),
   it builds it from the request's `Host`, and the identity provider's
   exact match is what keeps a sign-in code from going to another address.
+  Through a relay-served dashboard it is always that dashboard's own
+  address, which the daemon logs at startup.
   Its client must be listed in `interactive_clients` (or classified by
   `actor_claim`), and its access tokens must carry the configured
   `audience`.
