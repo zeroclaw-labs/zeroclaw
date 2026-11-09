@@ -79,22 +79,25 @@ test("sign-in off: today's pairing screen, and the session cookie is never consu
   assert.deepEqual(await authSession.resolveInitialAuth(d), {
     kind: "signed-out",
     providers: [],
+    methodsKnown: true,
   });
   assert.deepEqual(d.calls.sort(), ["health", "methods"]);
 });
 
-test("a gateway that doesn't answer /api/auth/methods is treated as sign-in off", async () => {
-  for (const getMethods of [async () => null, async () => Promise.reject(new Error("404"))]) {
+test("a gateway that doesn't answer /api/auth/methods leaves them unknown, not sign-in off", async () => {
+  // Only that answer says whether pairing is allowed: through a relay it isn't.
+  for (const getMethods of [async () => null, async () => Promise.reject(new Error("429"))]) {
     const d = deps({ getMethods });
     assert.deepEqual(await authSession.resolveInitialAuth(d), {
       kind: "signed-out",
       providers: [],
+      methodsKnown: false,
     });
     assert.ok(!d.calls.includes("session"));
   }
 });
 
-test("an unreachable gateway falls back to the pairing screen", async () => {
+test("an unreachable gateway leaves the sign-in methods unknown", async () => {
   const d = deps({
     getHealth: async () => Promise.reject(new Error("offline")),
     getMethods: async () => Promise.reject(new Error("offline")),
@@ -102,6 +105,7 @@ test("an unreachable gateway falls back to the pairing screen", async () => {
   assert.deepEqual(await authSession.resolveInitialAuth(d), {
     kind: "signed-out",
     providers: [],
+    methodsKnown: false,
   });
 });
 
@@ -113,6 +117,7 @@ test("the desktop app never asks for sign-in providers", async () => {
   assert.deepEqual(await authSession.resolveInitialAuth(d), {
     kind: "signed-out",
     providers: [],
+    methodsKnown: true,
   });
 });
 
@@ -141,6 +146,7 @@ test("providers configured and no session: the sign-in screen offers them", asyn
       { alias: "corp", provider: "oidc.corp" },
       { alias: "okta", provider: "oidc.okta" },
     ],
+    methodsKnown: true,
   });
 });
 
@@ -169,6 +175,18 @@ test("parseAuthMethods drops malformed providers", () => {
   );
   assert.deepEqual(authSession.parseAuthMethods({ oidc: "nope" }), methods([]));
   assert.equal(authSession.parseAuthMethods(null), null);
+});
+
+test("parseAuthMethods keeps the relay notice only when the gateway says so", () => {
+  assert.equal(
+    authSession.parseAuthMethods({ pairing_required: true, oidc: [], via_relay: true })?.via_relay,
+    true,
+  );
+  for (const via_relay of [false, "true", 1, null, undefined]) {
+    const parsed = authSession.parseAuthMethods({ pairing_required: true, oidc: [], via_relay });
+    assert.equal(parsed?.via_relay, undefined, String(via_relay));
+    assert.ok(parsed && !("via_relay" in parsed));
+  }
 });
 
 test("parseOidcSession requires the credential fields and denies missing features", () => {
