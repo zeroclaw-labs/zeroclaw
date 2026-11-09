@@ -52,39 +52,16 @@ fn has_turn_routing() -> bool {
 }
 
 fn description_for_routing(routing_available: bool) -> &'static str {
-    if !routing_available {
-        return "Send a message immediately to a configured channel peer. Both `target` \
-                    and a non-empty `body` are required: this task has no active channel \
-                    reply to redirect. Sending starts or resumes the recipient's conversation; \
-                    no inbound message is required. The target must be a channel alias or \
-                    a peer group the active agent belongs to. `modality` defaults to the \
-                    peer group's output modality.";
-    }
-    "Control where and how this turn's reply is delivered, or send an extra message \
-         to another channel.\n\
-         \n\
-         WHEN TO USE: call this tool at the start of your response whenever the user requests \
-         a specific reply format or destination — e.g. \"reply by text\", \"send as voice\", \
-         \"text only\", \"send to my email\", \"redirect to Discord\". Do not wait for the user \
-         to name the tool; infer intent from natural language just as you would use a weather \
-         tool when asked for the weather.\n\
-         \n\
-         Without `body` (routing instruction — affects this turn's main reply):\n\
-         - `send_via(modality: \"text\")` — reply by text even on a voice-only peer\n\
-         - `send_via(modality: \"voice\")` — reply by voice even on a text-only peer\n\
-         - `send_via(target: \"discord.main\")` — redirect reply to another channel\n\
-         - `send_via(target: \"discord.main\", modality: \"voice\")` — redirect + force modality\n\
-         At least one of `target` or `modality` is required when `body` is absent.\n\
-         Modality applies to this turn's final reply. Progress already streamed \
-         earlier in the turn (e.g. Telegram multi_message narration) keeps its \
-         streamed modality and is not retracted.\n\
-         \n\
-         With `body` (immediate fanout — main reply still goes to originating channel):\n\
-         - `send_via(target: \"email.default\", body: \"...\")` — send separate content elsewhere\n\
-         `target` is required when `body` is present.\n\
-         \n\
-         `target` must be a channel alias (e.g. `telegram.default`) or a peer group name \
-         the active agent belongs to. `modality` defaults to the peer group's output_modality."
+    static ROUTING: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    static BACKGROUND: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let (cache, key) = if routing_available {
+        (&ROUTING, "tool-send-via-description-routing")
+    } else {
+        (&BACKGROUND, "tool-send-via-description-background")
+    };
+    cache
+        .get_or_init(|| crate::i18n::get_required_tool_string(key))
+        .as_str()
 }
 
 fn schema_for_routing(routing_available: bool) -> serde_json::Value {
@@ -93,27 +70,27 @@ fn schema_for_routing(routing_available: bool) -> serde_json::Value {
         "properties": {
             "target": {
                 "type": "string",
-                "description": "Channel alias (e.g. telegram.default) or peer group name. \
-                                Required when body is present. Optional otherwise (omit = same channel)."
+                "description": crate::i18n::get_required_tool_string("tool-send-via-param-target")
             },
             "modality": {
                 "type": "string",
                 "enum": ["text", "voice"],
-                "description": "Delivery modality. Omit to inherit from the peer group's output_modality."
+                "description": crate::i18n::get_required_tool_string("tool-send-via-param-modality")
             },
             "body": {
                 "type": "string",
-                "description": "Message content for an immediate fanout send. \
-                                Omit to set a routing instruction for the current reply instead."
+                "description": crate::i18n::get_required_tool_string("tool-send-via-param-body")
             }
         }
     });
     if !routing_available {
         schema["required"] = json!(["target", "body"]);
-        schema["properties"]["target"]["description"] =
-            json!("Required destination: a configured channel alias or authorized peer group.");
-        schema["properties"]["body"]["description"] =
-            json!("Required non-empty message content to send immediately.");
+        schema["properties"]["target"]["description"] = json!(
+            crate::i18n::get_required_tool_string("tool-send-via-param-background-target")
+        );
+        schema["properties"]["body"]["description"] = json!(crate::i18n::get_required_tool_string(
+            "tool-send-via-param-background-body"
+        ));
         schema["properties"]["body"]["minLength"] = json!(1);
     }
     schema
