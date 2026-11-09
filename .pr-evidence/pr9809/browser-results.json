@@ -38,14 +38,6 @@
       "/api/config/drift"
     ],
     [
-      "GET",
-      "/api/config/reload-status"
-    ],
-    [
-      "GET",
-      "/api/config/drift"
-    ],
-    [
       "PUT",
       "/api/config/provider-registry"
     ],
@@ -60,19 +52,36 @@
     [
       "GET",
       "/api/config/provider-registry"
+    ],
+    [
+      "GET",
+      "/api/config/reload-status"
+    ],
+    [
+      "GET",
+      "/api/config/drift"
+    ],
+    [
+      "PUT",
+      "/api/config/provider-registry"
+    ],
+    [
+      "GET",
+      "/api/config/provider-registry"
     ]
   ],
-  "saves": 1,
+  "saves": 2,
   "page_errors": [],
   "actions": [
     "open exact dotted model reference",
     "save full registry",
     "reject invalid JSON without write",
     "reload admitted state",
+    "banner save disables editing and both editor actions until refresh",
     "resize to 390x844"
   ],
-  "revision": "cf0b95137119d751cff75c682079daaf8d3fa67b",
-  "web_tree": "4f8b8a4c133996c6a76a805833382142b0994d64",
+  "revision": "32fc34b4e0601f9e08f53c217479d08ec2214b1e",
+  "web_tree": "c51bec55ddf873f04cb2c8c2863bff7813482601",
   "locale": "en-US",
   "desktop_viewport": {
     "width": 1440,
@@ -82,5 +91,5 @@
     "width": 390,
     "height": 844
   },
-  "captured_at": "2026-11-09T14:06:39Z"
+  "captured_at": "2026-11-09T14:42:28+00:00"
 }
