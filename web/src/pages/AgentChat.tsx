@@ -569,11 +569,20 @@ export function AgentChatInner({
           </span>
         </div>
       )}
-      {/* Header with model selector */}
-      <div className="flex items-center justify-between px-4 py-2 border-b border-pc-border bg-pc-surface">
-        <div className="flex items-center gap-2">
-          <Bot className="h-4 w-4 text-pc-accent" />
-          <span className="text-sm font-medium text-pc-text">{agentAlias}</span>
+      {/* Header. A container query rather than a viewport breakpoint, so a
+          narrow split pane counts too: below 36rem of header content width
+          (@xl) the pickers take their own full-width line, and SessionPicker
+          anchors its panel to match. Named so the pickers' `@xl/chat-header`
+          variants can't bind to a nearer container. `relative z-10`: older
+          engines in our browserslist treat `container-type` as layout
+          containment (a stacking context), so later messages would otherwise
+          paint over the `z-50` menus. While a picker is open the header rises
+          to `z-20`, so in a stacked split view its menu stays above the next
+          pane's header. */}
+      <div className="@container/chat-header relative z-10 has-[[aria-expanded=true]]:z-20 flex flex-wrap items-center gap-x-4 gap-y-2 px-4 py-2 border-b border-pc-border bg-pc-surface">
+        <div className="flex items-center gap-2 min-w-0">
+          <Bot className="h-4 w-4 shrink-0 text-pc-accent" />
+          <span className="text-sm font-medium text-pc-text truncate">{agentAlias}</span>
           <Link
             to={`/agent/${encodeURIComponent(agentAlias)}/workspace`}
             className="inline-flex items-center gap-1 px-2 h-6 rounded-[var(--radius-md)] text-xs font-medium text-pc-text-secondary transition-colors hover:text-pc-text hover:bg-[var(--pc-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
@@ -584,26 +593,27 @@ export function AgentChatInner({
           </Link>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex items-center justify-between gap-2 min-w-0 w-full @xl/chat-header:w-auto ms-auto">
           <SessionPicker agentAlias={agentAlias} />
 
-          <div className="relative" ref={modelDropdownRef}>
+          <div className="relative min-w-0" ref={modelDropdownRef}>
             <button
               type="button"
               onClick={() => setShowModelDropdown((v) => !v)}
+              aria-expanded={showModelDropdown && availableModels.length > 0}
               disabled={modelLoading || typing || (availableModels.length === 0 && currentModel === null)}
-              className="flex items-center gap-2 px-3 h-7 rounded-[var(--radius-md)] text-xs font-medium border border-pc-border bg-pc-elevated text-pc-text-secondary transition-colors hover:text-pc-text hover:border-pc-border-strong disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
+              className="flex items-center gap-2 px-3 h-7 max-w-full rounded-[var(--radius-md)] text-xs font-medium border border-pc-border bg-pc-elevated text-pc-text-secondary transition-colors hover:text-pc-text hover:border-pc-border-strong disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
             >
               <span className="max-w-[180px] truncate">
                 {modelLoading
                   ? t('agent.model_switching')
                   : (currentModel ?? (availableModels.length === 0 ? t('agent.model_loading') : t('agent.select_model')))}
               </span>
-              <ChevronDown className="h-3 w-3" />
+              <ChevronDown className="h-3 w-3 shrink-0" />
             </button>
 
             {showModelDropdown && availableModels.length > 0 && (
-              <div className="absolute right-0 mt-1.5 rounded-[var(--radius-md)] border border-pc-border bg-pc-elevated shadow-[var(--pc-shadow-md)] z-50 py-1 min-w-[200px] max-h-60 overflow-y-auto">
+              <div className="absolute end-0 mt-1.5 rounded-[var(--radius-md)] border border-pc-border bg-pc-elevated shadow-[var(--pc-shadow-md)] z-50 py-1 min-w-[200px] max-h-60 overflow-y-auto">
                 {availableModels.map((model) => {
                   const isActive = model === currentModel;
                   return (
