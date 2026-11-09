@@ -61,7 +61,7 @@ globalThis.fetch = async (input, init) => {
   requests.push({ path, method: init?.method ?? 'GET', body: typeof init?.body === 'string' ? init.body : null });
   if (path.startsWith('/api/config/prop')) {
     if (init?.method === 'PUT') { const body = JSON.parse(String(init.body)); assert.equal(body.path, 'gateway.voice_silence_timeout_secs'); globalSilenceSeconds = body.value; }
-    return new Response(JSON.stringify({ path: 'gateway.voice_silence_timeout_secs', value: globalSilenceSeconds }), { headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({ path: 'gateway.voice_silence_timeout_secs', value: String(globalSilenceSeconds) }), { headers: { 'Content-Type': 'application/json' } });
   }
   if (path === '/api/devices') return new Response(JSON.stringify({
     current_device_id: 'synthetic-device',

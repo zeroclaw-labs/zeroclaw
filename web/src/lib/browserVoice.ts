@@ -163,8 +163,9 @@ export function useGlobalVoiceTimeout() {
       setSeconds(null);
       try {
         const result = await getProp('gateway.voice_silence_timeout_secs');
-        if (typeof result.value !== 'number' || !Number.isInteger(result.value) || result.value < 0 || result.value > 300) throw new Error('Invalid global voice timeout');
-        if (active && current === version) { setSeconds(result.value); setError(false); }
+        const value = typeof result.value === 'string' && /^\d+$/.test(result.value.trim()) ? Number(result.value) : result.value;
+        if (typeof value !== 'number' || !Number.isInteger(value) || value < 0 || value > 300) throw new Error('Invalid global voice timeout');
+        if (active && current === version) { setSeconds(value); setError(false); }
       } catch { if (active && current === version) { setSeconds(null); setError(true); } }
     };
     const visible = () => { if (document.visibilityState === 'visible') void refresh(); };
