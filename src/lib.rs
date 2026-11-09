@@ -630,6 +630,16 @@ pub enum MigrateCommands {
         #[arg(long)]
         reindex: bool,
     },
+    /// Import agents, model providers, MCP servers, channels, and workspace files from an `OpenClaw` install
+    OpenclawConfig {
+        /// Optional path to the `OpenClaw` home directory (defaults to ~/.openclaw)
+        #[arg(long)]
+        source: Option<std::path::PathBuf>,
+
+        /// Preview the import without writing any config or files
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// Reject a `--to` value that is shaped like a flag.
