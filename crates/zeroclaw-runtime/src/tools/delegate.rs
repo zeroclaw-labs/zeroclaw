@@ -21986,21 +21986,22 @@ command = "rm independent-delegate-marker"
         };
         config.reliability.provider_retries = 0;
         config.reliability.provider_backoff_ms = 1;
-        let primary_options = primary_native_tools
-            .map(|value| format!("native_tools = {value}"))
-            .unwrap_or_default();
-        let backup_options = backup_native_tools
-            .map(|value| {
-                if value {
-                    "native_tools = true".to_string()
-                } else {
-                    // Text-only canonical models opt into the shared parser
-                    // explicitly; custom providers no longer enable it by
-                    // default.
-                    "native_tools = false, extract_text_tool_calls = true".to_string()
-                }
-            })
-            .unwrap_or_default();
+        let tool_options = |native_tools: Option<bool>| {
+            native_tools
+                .map(|value| {
+                    if value {
+                        "native_tools = true".to_string()
+                    } else {
+                        // Text-only canonical models opt into the shared parser
+                        // explicitly; custom providers no longer enable it by
+                        // default.
+                        "native_tools = false, extract_text_tool_calls = true".to_string()
+                    }
+                })
+                .unwrap_or_default()
+        };
+        let primary_options = tool_options(primary_native_tools);
+        let backup_options = tool_options(backup_native_tools);
         config.providers = toml::from_str(&format!(
             r#"
 [connections."delegate.primary"]
@@ -22194,10 +22195,9 @@ options = {{ {backup_options} }}
     }
 
     #[tokio::test]
-    async fn agentic_delegate_uses_text_tools_when_only_its_fallback_supports_them() {
-        // The primary advertises native tools but fails. The text-only fallback
-        // must receive the XML protocol and execute its tool, rather than a
-        // native request that it cannot reliably interpret.
+    async fn agentic_delegate_uses_text_tools_across_text_only_fallbacks() {
+        // Both candidates opt into text tools. The fallback must receive the
+        // XML protocol and execute its tool after the primary fails.
         let (primary, primary_requests) = start_failing_chat_server(503).await;
         let (backup, backup_requests, backup_bodies) =
             start_text_tool_then_final_chat_server().await;
@@ -22205,7 +22205,7 @@ options = {{ {backup_options} }}
             primary.uri.clone(),
             backup.uri.clone(),
             true,
-            Some(true),
+            Some(false),
             Some(false),
         );
         let mut config = (*config).clone();
@@ -22260,6 +22260,44 @@ options = {{ {backup_options} }}
             "the second fallback request must contain the executed tool result: {bodies:?}"
         );
         assert!(result.error.is_none(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn agentic_delegate_rejects_mixed_tool_protocols_before_requesting_either_candidate() {
+        let (primary, primary_requests) = start_failing_chat_server(503).await;
+        let (backup, backup_requests) = start_failing_chat_server(503).await;
+        let (config, _fixture_dir) = fallback_delegate_config_with_native_tools(
+            primary.uri.clone(),
+            backup.uri.clone(),
+            true,
+            Some(true),
+            Some(false),
+        );
+        let mut config = (*config).clone();
+        config
+            .risk_profiles
+            .get_mut("delegating")
+            .expect("delegating risk profile")
+            .auto_approve
+            .push("echo_tool".to_string());
+        let tool = fallback_delegate_tool(Arc::new(config), None)
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+        let result = tool
+            .execute(json!({"agent": "target", "prompt": "use the echo tool"}))
+            .await
+            .expect("delegate returns a controlled tool-protocol error");
+        assert!(!result.success, "{result:?}");
+        assert!(
+            result.error.as_deref().is_some_and(|error| error.contains(
+                &crate::i18n::get_required_cli_string("turn-mixed-tool-protocols-unsupported")
+            )),
+            "{result:?}"
+        );
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(backup_requests.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
