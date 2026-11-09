@@ -1,6 +1,6 @@
 import { memo, useState, useEffect, useRef, useCallback } from 'react';
 import { Link, Navigate, useParams } from 'react-router-dom';
-import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench, BarChart2, FolderOpen, ImagePlus, Loader2 } from 'lucide-react';
+import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench, Brain, BarChart2, FolderOpen, ImagePlus, Loader2 } from 'lucide-react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useAgent, type ChatMessage } from '@/contexts/AgentContext';
@@ -186,6 +186,11 @@ export function AgentChatInner({
   // tool activity.
   const [showToolActivity, setShowToolActivity] = useState(() => {
     try { return localStorage.getItem('zeroclaw_show_tool_activity') === '1'; } catch { return false; }
+  });
+  // When set, the live Thinking box starts collapsed and is left to the user
+  // to open; by default it is open until the answer starts.
+  const [keepThinkingCollapsed, setKeepThinkingCollapsed] = useState(() => {
+    try { return localStorage.getItem('zeroclaw_keep_thinking_collapsed') === '1'; } catch { return false; }
   });
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -489,6 +494,14 @@ export function AgentChatInner({
     });
   }, []);
 
+  const toggleKeepThinkingCollapsed = useCallback(() => {
+    setKeepThinkingCollapsed((prev) => {
+      const next = !prev;
+      try { localStorage.setItem('zeroclaw_keep_thinking_collapsed', next ? '1' : '0'); } catch { /* noop */ }
+      return next;
+    });
+  }, []);
+
   /**
    * Fallback copy using a temporary textarea for HTTP contexts
    * where navigator.clipboard is unavailable.
@@ -624,7 +637,7 @@ export function AgentChatInner({
 
       {/* Chat toolbar */}
       {messages.length > 0 && (
-        <div className="flex items-center justify-end gap-2 px-4 py-2 border-b border-pc-border bg-pc-surface">
+        <div className="flex flex-wrap items-center justify-end gap-2 px-4 py-2 border-b border-pc-border bg-pc-surface">
           <Button
             variant="ghost"
             size="sm"
@@ -643,6 +656,16 @@ export function AgentChatInner({
           >
             <Wrench className="h-3 w-3" />
             {showToolActivity ? t('agent.tool_activity_hide') : t('agent.tool_activity_show')}
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={toggleKeepThinkingCollapsed}
+            aria-pressed={keepThinkingCollapsed}
+            className="aria-pressed:border-pc-accent aria-pressed:bg-pc-accent/10"
+          >
+            <Brain className="h-3 w-3" />
+            {t('agent.thinking_keep_collapsed')}
           </Button>
           <Button
             variant="danger"
@@ -702,7 +725,7 @@ export function AgentChatInner({
             {streamingContent || streamingThinking ? (
               <div className="rounded-[var(--radius-lg)] px-4 py-3 border border-pc-border bg-pc-elevated text-pc-text max-w-[75%]">
                 {streamingThinking && (
-                  <details className="mb-2" open={!streamingContent}>
+                  <details className="mb-2" open={keepThinkingCollapsed ? undefined : !streamingContent}>
                     <summary className="text-xs cursor-pointer select-none text-pc-text-muted">{t('agentchat.thinking')}{!streamingContent && '...'}</summary>
                     <pre className="text-xs mt-1 whitespace-pre-wrap break-words leading-relaxed overflow-auto max-h-60 p-2 rounded-[var(--radius-sm)] text-pc-text-muted bg-pc-code">{streamingThinking}</pre>
                   </details>
