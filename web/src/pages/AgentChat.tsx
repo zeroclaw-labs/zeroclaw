@@ -1,3 +1,4 @@
+import { displayMessageText } from '@/lib/chatMessageText';
 import BrowserVoiceControls from '@/components/BrowserVoiceControls';
 import { memo, useState, useEffect, useRef, useCallback } from 'react';
 import { Link, Navigate, useParams } from 'react-router-dom';
@@ -867,18 +868,6 @@ export function AgentChatInner({
   );
 }
 
-// Channel-user (and some agent) messages arrive with a leading
-// `[YYYY-MM-DD HH:MM:SS TZ] ` prefix the gateway prepends. The zone is a chrono
-// `%Z` abbreviation (e.g. CEST) that JS `Date` can't reliably parse, so we
-// don't try — we just strip the prefix for display and copy; the bubble shows
-// its own wall-clock caption separately. Anchored to the start so a bracketed
-// datetime appearing mid-message (a log line, an error report) is left intact.
-const SERVER_TIMESTAMP_RE = /^\s*\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [^\]]+\]\s*/;
-
-function stripServerTimestamp(content: string): string {
-  return content.replace(SERVER_TIMESTAMP_RE, '');
-}
-
 // Each chat message is rendered through this memoized component so that
 // typing into the input does not re-render every existing message (and
 // re-run ReactMarkdown on each one). Keep the prop surface small and pass
@@ -905,7 +894,7 @@ const MessageItem = memo(function MessageItem({
   // verbatim and never carry the gateway's `[timestamp]` prefix, so don't strip
   // them (that would clip a message starting with a bracketed datetime). Only
   // server-sourced messages can be prefixed.
-  const cleanContent = msg.local || msg.ephemeral ? msg.content : stripServerTimestamp(msg.content);
+  const cleanContent = displayMessageText(msg);
 
   return (
     <div

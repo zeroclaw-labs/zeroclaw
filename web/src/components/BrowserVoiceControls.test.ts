@@ -559,3 +559,41 @@ test('a browser ending recognition early still waits out the configured silence'
     assert.equal(submitted, 1);
   } finally { context.mock.timers.reset(); await act(async () => { renderer.unmount(); }); }
 });
+
+
+test('manual stop cancels an imminent send and late results cannot rearm it', async (context) => {
+  let submitted = 0;
+  const transcripts: string[] = [];
+  let renderer!: ReactTestRenderer;
+  await act(async () => { renderer = create(createElement(Controls, { messages: [], hydrated: true, typing: false, onTranscript(text) { transcripts.push(text); }, onSilence() { submitted++; } }), options); });
+  context.mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    await act(async () => { await renderer.root.findAllByType('button')[0]!.props.onClick(); });
+    capture.stop = () => {};
+    capture.onresult!({ resultIndex: 0, results: [{ isFinal: true, 0: { transcript: 'Draft' } }] });
+    await act(async () => { context.mock.timers.tick(14999); });
+    await act(async () => { await renderer.root.findAllByType('button')[0]!.props.onClick(); });
+    capture.onresult!({ resultIndex: 0, results: [{ isFinal: true, 0: { transcript: 'Late final words' } }] });
+    capture.onspeechend?.();
+    await act(async () => { context.mock.timers.tick(30000); });
+    assert.equal(submitted, 0);
+    await act(async () => { capture.onend?.(); context.mock.timers.tick(30000); });
+    assert.equal(submitted, 0);
+    assert.deepEqual(transcripts, ['Draft', 'Late final words']);
+  } finally { context.mock.timers.reset(); await act(async () => { renderer.unmount(); }); }
+});
+
+test('narration shares displayed timestamp cleanup and preserves literal timestamps', async () => {
+  const renderer = await mount();
+  const text = '[2026-11-09 12:00:00 UTC] Reply. [2025-01-01 08:00:00 UTC] is a log entry.';
+  try {
+    await act(async () => { renderer.update(createElement(Controls, { messages: [reply('server-prefix', text)], hydrated: true, typing: false, onTranscript() {} })); });
+    await act(async () => { renderer.root.findAllByType('button')[1]!.props.onClick(); });
+    assert.doesNotMatch(spoken.at(-1)!, /2026-11-09/);
+    assert.match(spoken.at(-1)!, /2025-01-01/);
+    await act(async () => { spokenUtterance?.onend?.(); });
+    await act(async () => { renderer.update(createElement(Controls, { messages: [{...reply('literal-prefix', text), local:true}], hydrated: true, typing: false, onTranscript() {} })); });
+    await act(async () => { renderer.root.findAllByType('button')[1]!.props.onClick(); });
+    assert.match(spoken.at(-1)!, /2026-11-09/);
+  } finally { await act(async () => { renderer.unmount(); }); }
+});

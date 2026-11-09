@@ -1,9 +1,12 @@
+import { displayMessageText } from '@/lib/chatMessageText';
 import { useEffect, useImperativeHandle, useLayoutEffect, useRef, useState, type Ref } from 'react';
 import { Mic, MicOff, Volume2, VolumeX } from 'lucide-react';
 import type { ChatMessage } from '@/contexts/AgentContext';
 import { t } from '@/lib/i18n';
 import { speechText } from '@/lib/speechText';
 import { useGlobalVoiceTimeout, localRecognitionStatus, recognitionConstructor, shortPressAction, useBrowserVoices, useVoicePreferences, type Recognition } from '@/lib/browserVoice';
+
+const readableMessage = (message: ChatMessage) => speechText(displayMessageText(message));
 
 export default function BrowserVoiceControls({ messages, hydrated, typing, onTranscript, onSilence, captureRef }: {
   messages: ChatMessage[]; hydrated: boolean; typing: boolean; onTranscript: (text: string) => void;
@@ -50,12 +53,12 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
   };
   useImperativeHandle(captureRef, () => stopCapture);
   const stopAll = () => { stopCapture(); stopSpeech(); };
-  const speak = (text: string) => {
+  const speak = (message: ChatMessage) => {
     if (!ready || !prefs.reading || !visible() || recognition.current) return false;
     const voice = voices.find(v => v.voiceURI === prefs.voice);
     if (!voice || !('speechSynthesis' in window)) { setError(t('voice.select_voice')); return false; }
     stopSpeech();
-    const readable = speechText(text);
+    const readable = readableMessage(message);
     if (!readable) return false;
     const next = new SpeechSynthesisUtterance(readable);
     next.voice = voice; next.lang = prefs.language; next.rate = prefs.rate;
@@ -77,14 +80,14 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
     const unseen = replies.filter(m => !m.fromHistory && !baseline.current!.has(m.id));
     // Formatting-only replies and a signature are not queue barriers.
     const next = unseen.find(reply => {
-      if (speechText(reply.content)) return true;
+      if (readableMessage(reply)) return true;
       baseline.current!.add(reply.id);
       return false;
     });
     // Only consume the reply whose playback actually started. Later replies
     // stay pending until the current utterance ends.
     if (next) {
-      if (!ready || listening || speaking || !speak(next.content)) return;
+      if (!ready || listening || speaking || !speak(next)) return;
       baseline.current.add(next.id);
     }
   });
@@ -110,6 +113,7 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
   const toggleMicrophone = async () => {
     if (recognition.current) {
       if (finishing.current) return;
+      clearSilence(); autoSubmit.current = false;
       finishing.current = true;
       // End capture and let the recognizer deliver the final utterance.
       try { recognition.current.stop(); }
@@ -145,7 +149,7 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
     let speechActive = false;
     const armSilence = () => {
       clearSilence();
-      if (!silenceSeconds) return;
+      if (!silenceSeconds || finishing.current) return;
       silenceTimer.current = setTimeout(() => {
         if (generation.current !== version) return;
         if (!visible()) { stopCapture(); return; }
@@ -196,7 +200,7 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
   const shortPress = () => {
     if (longPressed.current) { longPressed.current = false; return; }
     if (shortPressAction(continuous, speaking) === 'off') { setOverride(false); stopSpeech(); }
-    else if (latest) { stopCapture(); speak(latest.content); }
+    else if (latest) { stopCapture(); speak(latest); }
   };
   const release = () => { if (timer.current) clearTimeout(timer.current); timer.current = null; };
   const css = 'inline-flex h-10 w-10 shrink-0 items-center justify-center touch-manipulation select-none p-2 rounded-lg border border-pc-border hover:bg-pc-hover text-pc-text-secondary disabled:opacity-40';
