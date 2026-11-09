@@ -919,3 +919,6 @@ zc-login-pkce-randomness-unavailable = system randomness unavailable for PKCE
 zc-login-no-pairing-endpoint = OIDC login bootstraps the device through the gateway after sign-in; --enroll-host and --enroll-port are not used. No pairing code or SAS is needed.
 
 zc-login-stage-credentials = Could not stage replacement device credentials; the previous saved login was not replaced.
+
+# apps/zerocode/src/config/mod.rs. Shared by login, startup renewal, and every other config save.
+zc-config-save-lock-timeout = Another process is saving { $config } and still holds { $lock } after { $seconds }s. Let the other zerocode finish saving, then try again.

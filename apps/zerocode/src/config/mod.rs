@@ -1094,13 +1094,13 @@ impl ConfigWriteLock {
                 Ok(()) => return Ok(Self { file }),
                 Err(std::fs::TryLockError::WouldBlock) => {
                     if std::time::Instant::now() >= deadline {
-                        anyhow::bail!(
-                            "another process is saving {} and still holds {} after {}s. \
-                             Let the other zerocode finish saving, then try again.",
-                            config_path(config_dir).display(),
-                            path.display(),
-                            wait.as_secs()
-                        );
+                        let config = config_path(config_dir).display().to_string();
+                        let lock = path.display().to_string();
+                        let seconds = wait.as_secs().to_string();
+                        bail!(crate::i18n::t_args(
+                            "zc-config-save-lock-timeout",
+                            &[("config", &config), ("lock", &lock), ("seconds", &seconds),],
+                        ));
                     }
                     std::thread::sleep(CONFIG_LOCK_POLL);
                 }
@@ -3572,11 +3572,19 @@ enroll_url = \"https://gateway.example/zeroclaw\"
             started.elapsed() < std::time::Duration::from_secs(2),
             "the wait must be bounded"
         );
-        assert!(err.contains(CONFIG_LOCK_FILE), "got: {err}");
-        assert!(err.contains("another process"), "got: {err}");
+        let config = config_path(dir.path()).display().to_string();
+        let lock = dir.path().join(CONFIG_LOCK_FILE).display().to_string();
+        let expected = crate::i18n::t_args(
+            "zc-config-save-lock-timeout",
+            &[("config", &config), ("lock", &lock), ("seconds", "0")],
+        );
+        assert_ne!(
+            expected, "{zc-config-save-lock-timeout}",
+            "the timeout key must resolve from the English catalogue"
+        );
         assert!(
-            err.contains(&config_path(dir.path()).display().to_string()),
-            "got: {err}"
+            err.contains(&expected),
+            "the timeout must use the catalogue message, got: {err}"
         );
     }
 }
