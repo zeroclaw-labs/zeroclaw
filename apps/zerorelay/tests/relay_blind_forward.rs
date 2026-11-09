@@ -154,6 +154,7 @@ async fn handshake(
             daemon_pubkey: B64.encode(&pubkey),
             node_id: node_id.to_string(),
             relay_token: token.map(|s| s.to_string()),
+            dashboard: false,
         }
         .to_json(),
     ))
@@ -199,6 +200,7 @@ async fn hello_only(relay_addr: std::net::SocketAddr, node_id: &str, pkcs8: &[u8
             daemon_pubkey: B64.encode(kp.public_key().as_ref()),
             node_id: node_id.to_string(),
             relay_token: None,
+            dashboard: false,
         }
         .to_json(),
     ))
@@ -218,6 +220,7 @@ async fn register_then_vanish(relay_addr: std::net::SocketAddr, node_id: &str, p
             daemon_pubkey: B64.encode(kp.public_key().as_ref()),
             node_id: node_id.to_string(),
             relay_token: None,
+            dashboard: false,
         }
         .to_json(),
     ))
@@ -364,7 +367,9 @@ async fn enrollment_client_opens_daemon_with_enroll_hint() {
         .unwrap();
 
     let conn_id = match next_wire(&mut daemon).await {
-        Some(Wire::Ctrl(Control::Open { conn_id, peer_hint })) => {
+        Some(Wire::Ctrl(Control::Open {
+            conn_id, peer_hint, ..
+        })) => {
             assert_eq!(peer_hint.as_deref(), Some(PEER_HINT_ENROLL));
             conn_id
         }
@@ -584,6 +589,7 @@ async fn replayed_register_over_a_stale_nonce_is_rejected() {
             daemon_pubkey: B64.encode(&pubkey),
             node_id: "node-replay".into(),
             relay_token: None,
+            dashboard: false,
         }
         .to_json(),
     ))
