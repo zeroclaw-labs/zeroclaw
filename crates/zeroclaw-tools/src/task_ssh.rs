@@ -180,4 +180,35 @@ mod tests {
         .await
         .unwrap();
     }
+
+    #[tokio::test]
+    async fn logical_turn_keeps_one_broker_across_engine_reentry() {
+        let directory = tempfile::tempdir().unwrap();
+        let command = helper(directory.path());
+        let marker = directory.path().join("closed");
+        let check = marker.clone();
+        scope_with_helper(
+            Some(command.into_os_string()),
+            Box::pin(async move {
+                let owner = current().unwrap().id;
+                for _ in 0..2 {
+                    let expected = owner.clone();
+                    scope(Box::pin(async move {
+                        assert_eq!(current().unwrap().id, expected);
+                        Ok(())
+                    }))
+                    .await?;
+                    assert!(
+                        !check.exists(),
+                        "inner engine invocation closed the logical-turn broker"
+                    );
+                }
+                Ok(())
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(marker.exists());
+        assert!(current().is_none());
+    }
 }

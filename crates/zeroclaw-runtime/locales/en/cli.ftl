@@ -1766,3 +1766,5 @@ turn-repeated-failure-exhausted = The recovery retry failed with the same result
 turn-repeated-failure-retry-skipped = Skipped an additional identical call in this recovery batch. Only one recovery retry is available.
 channel-runtime-still-working = Still working on your request ({ $seconds } seconds elapsed). No final result yet.
 
+
+tool-shell-ssh-broker-sandbox-unsupported = Sandboxed shell execution is unavailable while a host SSH broker owns this turn. Use a separate isolated runtime without host-broker access.

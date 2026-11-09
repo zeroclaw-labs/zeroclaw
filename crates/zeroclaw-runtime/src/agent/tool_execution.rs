@@ -2402,7 +2402,7 @@ mod tests {
         let ignore: HashSet<&str> = HashSet::new();
         let collected = collect_tool_results(
             ordered,
-            &tool_calls,
+            &tool_calls.iter().cloned().map(Some).collect::<Vec<_>>(),
             &mut history,
             &mut detector,
             &ignore,

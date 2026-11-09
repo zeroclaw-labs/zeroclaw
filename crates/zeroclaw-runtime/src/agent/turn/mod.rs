@@ -3575,6 +3575,21 @@ async fn run_tool_call_loop_impl<'a>(
             repetition::RepetitionDisposition::default()
         };
 
+        // Executor provenance distinguishes actual dispatches from approval,
+        // deduplication and recovery skips. Keep the prepared arguments.
+        let mut detection_calls = vec![None; tool_calls.len()];
+        for ((index, call), completed) in executed_completed_indices
+            .iter()
+            .zip(&executed_completed_calls)
+            .zip(&executed_completed_outcomes)
+        {
+            if let Some(name) = &completed.executed_tool_name {
+                let mut actual = call.clone();
+                actual.name = name.clone();
+                detection_calls[*index] = Some(actual);
+            }
+        }
+
         record_executed_outcomes(
             &ctx,
             &executed_completed_indices,
@@ -3654,7 +3669,7 @@ async fn run_tool_call_loop_impl<'a>(
             loop_stopped,
         } = collect_tool_results(
             ordered_results,
-            &tool_calls,
+            &detection_calls,
             turn_state.history,
             &mut loop_detector,
             &loop_ignore_tools,

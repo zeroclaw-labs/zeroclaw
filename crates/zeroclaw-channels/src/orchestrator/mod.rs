@@ -10473,7 +10473,7 @@ async fn process_channel_message_body(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_budget_secs);
     let mut completed_turn_messages = Vec::new();
     let recovery = zeroclaw_runtime::agent::loop_::ToolLoopRecovery::default();
-    let scoped_turn = scope_provider_fallback(Box::pin(async {
+    let ssh_owned_turn = zeroclaw_tools::task_ssh::scope(Box::pin(async {
         let llm_result = loop {
             // TurnState owns synchronization for one invocation. Reusing the
             // logical-turn aggregate would replay prior results into history.
@@ -10747,7 +10747,13 @@ async fn process_channel_message_body(
         };
         let fb = take_last_provider_fallback();
         let safeguard = take_last_safeguard_fallback();
-        (llm_result, fb, safeguard)
+        Ok((llm_result, fb, safeguard))
+    }));
+    let scoped_turn = scope_provider_fallback(Box::pin(async {
+        match ssh_owned_turn.await {
+            Ok(result) => result,
+            Err(error) => (turn_deadline::Outcome::Completed(Err(error)), None, None),
+        }
     }));
     let progress_secs = ctx
         .live_config

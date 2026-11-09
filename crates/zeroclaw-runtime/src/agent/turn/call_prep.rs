@@ -453,7 +453,7 @@ pub(crate) async fn prepare_tool_calls(
                 .any(|name| name == &tool_name)
         {
             if let crate::agent::loop_detector::LoopDetectionResult::Block(message) =
-                preview.check_before_call(&tool_name, &call.arguments)
+                preview.check_before_call(&tool_name, &tool_args)
             {
                 preflight_loop_stopped = true;
                 abandon_prepared_context(ctx, &hook_context, &tool_name).await;
@@ -472,7 +472,7 @@ pub(crate) async fn prepare_tool_calls(
                 ordered_results[idx] = Some((tool_name, call.tool_call_id.clone(), outcome));
                 continue;
             }
-            preview.record(&tool_name, &call.arguments, "pending execution");
+            preview.record(&tool_name, &tool_args, "pending execution");
         }
 
         ::zeroclaw_log::record!(
@@ -1474,6 +1474,66 @@ mod tests {
             1
         );
         assert!(!events.iter().any(|event| event.starts_with("after:")));
+    }
+
+    struct ArgumentRewriteHook {
+        varying: bool,
+        counter: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl crate::hooks::HookHandler for ArgumentRewriteHook {
+        fn name(&self) -> &str {
+            "argument-rewrite-test"
+        }
+        async fn before_tool_call_with_context(
+            &self,
+            _: &zeroclaw_api::hook::ToolCallHookContext,
+            name: String,
+            _: serde_json::Value,
+        ) -> crate::hooks::HookResult<(String, serde_json::Value)> {
+            let value = if self.varying {
+                self.counter
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            } else {
+                0
+            };
+            crate::hooks::HookResult::Continue((
+                name,
+                serde_json::json!({"command":format!("echo prepared-{value}")}),
+            ))
+        }
+    }
+    #[tokio::test]
+    async fn loop_preflight_uses_post_hook_arguments_in_both_directions() {
+        for varying in [false, true] {
+            let observer = NoopObserver;
+            let pacing = PacingConfig::default();
+            let (tx, _rx) = mpsc::channel(32);
+            let mut runner = crate::hooks::HookRunner::new();
+            runner.register(Box::new(ArgumentRewriteHook {
+                varying,
+                counter: std::sync::atomic::AtomicUsize::new(0),
+            }));
+            let ctx = lifecycle_ctx(&observer, &pacing, &tx, None, Some(&runner));
+            let calls:Vec<_>=(0..4).map(|i| parsed_call("shell",serde_json::json!({"command":format!("echo raw-{}",if varying { 0 } else { i })}),&i.to_string())).collect();
+            let detector = crate::agent::loop_detector::LoopDetector::new(Default::default());
+            let prepared = prepare_tool_calls(
+                &ctx,
+                &[],
+                None,
+                &[],
+                &calls,
+                &mut HashSet::new(),
+                &mut HashSet::new(),
+                0,
+                false,
+                Some(&detector),
+            )
+            .await
+            .unwrap();
+            assert_eq!(prepared.preflight_loop_stopped, !varying);
+            assert_eq!(prepared.executable_calls.len(), if varying { 4 } else { 3 });
+        }
     }
 
     // ── Calls that cannot run are not put to the operator ────────────────
