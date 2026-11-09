@@ -188,6 +188,7 @@ async fn zerocode_to_relay_to_daemon_full_path() {
             data_dir: std::path::PathBuf::from("/nonexistent-rotation-off"),
             node_id_rotation_days: 0,
             rotation_allowed: false,
+            dashboard: None,
         },
         cancel.clone(),
     ));
@@ -307,6 +308,7 @@ async fn enrollment_post_round_trips_through_relay_route() {
             data_dir: std::path::PathBuf::from("/nonexistent-rotation-off"),
             node_id_rotation_days: 0,
             rotation_allowed: false,
+            dashboard: None,
         },
         bridge_cancel.clone(),
     ));
