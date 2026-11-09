@@ -1184,6 +1184,22 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(())
     }
 
+    /// Prepare audio for the current assistant text phase without delivering it.
+    /// The caller supplies sanitized, leak-checked text and skips this hook when
+    /// outbound hooks still need to approve or rewrite the completed response.
+    /// Finalization remains authoritative: adapters must discard speculative
+    /// audio that does not match the approved final text. Draft cancellation
+    /// must also cancel preparation. Status, reasoning and tool events never
+    /// enter this method. Default: no audio preparation.
+    async fn prepare_voice_draft(
+        &self,
+        _recipient: &str,
+        _message_id: &str,
+        _text: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Show a progress/status update (e.g. tool execution status).
     async fn update_draft_progress(
         &self,
@@ -1285,6 +1301,25 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         _suppress_voice: bool,
     ) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// Whether force-voice routing can retain this adapter's prepared draft.
+    fn supports_voice_draft_finalization(&self) -> bool {
+        false
+    }
+
+    /// Finalize with an explicit voice request, retaining speculative audio.
+    /// Adapters opting in must honor both flags; suppression takes precedence.
+    async fn finalize_draft_with_modality(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+        suppress_voice: bool,
+        _force_voice: bool,
+    ) -> anyhow::Result<()> {
+        self.finalize_draft(recipient, message_id, text, suppress_voice)
+            .await
     }
 
     /// Cancel and remove a previously sent draft message if the channel supports it.
