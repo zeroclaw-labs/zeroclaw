@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::keymap::{ChatTabAction, Chord, GlobalAction, overrides::OverrideTable};
+use crate::keymap::{overrides::OverrideTable, ChatTabAction, Chord, GlobalAction};
 use crate::theme::{self, Theme};
 
 const FILE_NAME: &str = "zerocode-config.toml";
@@ -907,6 +907,102 @@ fn write_document(path: &Path, doc: &toml::Table) -> Result<()> {
     crate::secure_file::write_private_atomic(path, body.as_bytes())
 }
 
+const CONFIG_LOCK_FILE_NAME: &str = "zerocode-config.toml.lock";
+const CONFIG_LOCK_WAIT_SECS: u64 = 5;
+const CONFIG_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Exclusive inter-process lock over one config directory's
+/// `zerocode-config.toml` writers.
+///
+/// Every persist path here is a read-modify-write that publishes the whole
+/// file by rename. The rename prevents a torn file, not a lost update: two
+/// zerocode processes sharing a config directory can each load, change a
+/// different section, and write, and the later rename drops the earlier
+/// change. The lock covers load through write so the second writer re-reads
+/// under the lock and keeps the first writer's update.
+///
+/// `std::fs::File::try_lock` is the same primitive as the enrollment publish
+/// lock: `flock(LOCK_EX)` on Unix, `LockFileEx` with `LOCKFILE_EXCLUSIVE_LOCK`
+/// on Windows. The lock is advisory, so it binds every zerocode that takes it
+/// and leaves an operator's own edits to the file unaffected. The sidecar file
+/// is the lock's identity and is left in place when released; removing it
+/// would let a later process lock a different inode while this one is held.
+#[derive(Debug)]
+struct ConfigWriteLock {
+    file: std::fs::File,
+}
+
+impl ConfigWriteLock {
+    /// Take the lock, waiting up to `wait` for a concurrent writer to finish.
+    /// Bounded so a lock held by a wedged process surfaces as an error naming
+    /// the file, never as a persist that hangs.
+    fn acquire_within(config_dir: &Path, wait: std::time::Duration) -> Result<Self> {
+        std::fs::create_dir_all(config_dir)
+            .with_context(|| format!("creating config dir {}", config_dir.display()))?;
+        let path = config_dir.join(CONFIG_LOCK_FILE_NAME);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { file }),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    if std::time::Instant::now() >= deadline {
+                        anyhow::bail!(
+                            "another process is updating {FILE_NAME} and still holds {} \
+                             after {}s. Let the other zerocode finish writing the config, \
+                             then try again.",
+                            path.display(),
+                            wait.as_secs()
+                        );
+                    }
+                    std::thread::sleep(CONFIG_LOCK_POLL);
+                }
+                Err(std::fs::TryLockError::Error(e)) => {
+                    return Err(anyhow::Error::new(e))
+                        .with_context(|| format!("locking {}", path.display()));
+                }
+            }
+        }
+    }
+
+    fn acquire(config_dir: &Path) -> Result<Self> {
+        Self::acquire_within(
+            config_dir,
+            std::time::Duration::from_secs(CONFIG_LOCK_WAIT_SECS),
+        )
+    }
+}
+
+impl Drop for ConfigWriteLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+fn with_config_write_lock<T>(config_dir: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    let _guard = ConfigWriteLock::acquire(config_dir)?;
+    #[cfg(test)]
+    maybe_delay_after_config_lock();
+    f()
+}
+
+#[cfg(test)]
+fn maybe_delay_after_config_lock() {
+    if TEST_DELAY_AFTER_CONFIG_LOCK.load(std::sync::atomic::Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+}
+
+#[cfg(test)]
+static TEST_DELAY_AFTER_CONFIG_LOCK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Mutable borrow of `key`'s sub-table, inserting an empty one when absent.
 fn section_mut<'a>(doc: &'a mut toml::Table, key: &str) -> Result<&'a mut toml::Table> {
     doc.entry(key)
@@ -924,58 +1020,60 @@ fn persist_sidebar_leaf(
     replacement: toml_edit::Item,
     shadowed: bool,
 ) -> Result<bool> {
-    std::fs::create_dir_all(config_dir)
-        .with_context(|| format!("creating config dir {}", config_dir.display()))?;
-    let path = config_path(config_dir);
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(raw) => raw,
-        Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
-        Err(error) => {
-            return Err(error).with_context(|| format!("reading {}", path.display()));
+    with_config_write_lock(config_dir, || {
+        std::fs::create_dir_all(config_dir)
+            .with_context(|| format!("creating config dir {}", config_dir.display()))?;
+        let path = config_path(config_dir);
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading {}", path.display()));
+            }
+        };
+        let semantic: toml::Table = if raw.trim().is_empty() {
+            toml::Table::new()
+        } else {
+            toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?
+        };
+        if let Some(value) = semantic.get("sidebar") {
+            value
+                .clone()
+                .try_into::<SidebarSection>()
+                .with_context(|| {
+                    format!(
+                        "refusing to update {leaf} in malformed [sidebar] section in {}",
+                        path.display()
+                    )
+                })?;
         }
-    };
-    let semantic: toml::Table = if raw.trim().is_empty() {
-        toml::Table::new()
-    } else {
-        toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?
-    };
-    if let Some(value) = semantic.get("sidebar") {
-        value
-            .clone()
-            .try_into::<SidebarSection>()
-            .with_context(|| {
-                format!(
-                    "refusing to update {leaf} in malformed [sidebar] section in {}",
-                    path.display()
-                )
-            })?;
-    }
 
-    let mut doc = raw
-        .parse::<toml_edit::DocumentMut>()
-        .with_context(|| format!("parsing {} for an in-place edit", path.display()))?;
-    let sidebar = doc
-        .entry("sidebar")
-        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
-    let sidebar = sidebar.as_table_like_mut().ok_or_else(|| {
-        anyhow::Error::msg(format!(
-            "refusing to update non-table [sidebar] in {}",
-            path.display()
-        ))
-    })?;
-    let mut replacement = replacement;
-    if let Some(existing) = sidebar.get_mut(leaf) {
-        if let (Some(existing), Some(replacement)) =
-            (existing.as_value(), replacement.as_value_mut())
-        {
-            *replacement.decor_mut() = existing.decor().clone();
+        let mut doc = raw
+            .parse::<toml_edit::DocumentMut>()
+            .with_context(|| format!("parsing {} for an in-place edit", path.display()))?;
+        let sidebar = doc
+            .entry("sidebar")
+            .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+        let sidebar = sidebar.as_table_like_mut().ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "refusing to update non-table [sidebar] in {}",
+                path.display()
+            ))
+        })?;
+        let mut replacement = replacement;
+        if let Some(existing) = sidebar.get_mut(leaf) {
+            if let (Some(existing), Some(replacement)) =
+                (existing.as_value(), replacement.as_value_mut())
+            {
+                *replacement.decor_mut() = existing.decor().clone();
+            }
+            *existing = replacement;
+        } else {
+            sidebar.insert(leaf, replacement);
         }
-        *existing = replacement;
-    } else {
-        sidebar.insert(leaf, replacement);
-    }
-    crate::secure_file::write_private_atomic(&path, doc.to_string().as_bytes())?;
-    Ok(shadowed)
+        crate::secure_file::write_private_atomic(&path, doc.to_string().as_bytes())?;
+        Ok(shadowed)
+    })
 }
 
 /// Persist the sidebar visibility toggle, writing only `[sidebar].visible`.
@@ -1077,26 +1175,30 @@ pub(crate) fn persist_sidebar_queue_percent(config_dir: &Path, queue_percent: u1
 
 /// Persist the selected theme name, editing only the `[theme]` section.
 pub(crate) fn persist_theme(config_dir: &Path, theme_name: &str) -> Result<()> {
-    let path = config_path(config_dir);
-    let mut doc = load_document(&path)?;
-    section_mut(&mut doc, "theme")?.insert(
-        "name".to_string(),
-        toml::Value::String(theme_name.to_string()),
-    );
-    write_document(&path, &doc)
+    with_config_write_lock(config_dir, || {
+        let path = config_path(config_dir);
+        let mut doc = load_document(&path)?;
+        section_mut(&mut doc, "theme")?.insert(
+            "name".to_string(),
+            toml::Value::String(theme_name.to_string()),
+        );
+        write_document(&path, &doc)
+    })
 }
 
 /// Persist a per-agent theme override, writing only
 /// `[theme.agent_override.<alias>].name`. Other agents' overrides and every
 /// other section are preserved.
 pub(crate) fn persist_agent_theme(config_dir: &Path, alias: &str, theme_name: &str) -> Result<()> {
-    let path = config_path(config_dir);
-    let mut doc = load_document(&path)?;
-    section_mut_path(&mut doc, &["theme", "agent_override", alias])?.insert(
-        "name".to_string(),
-        toml::Value::String(theme_name.to_string()),
-    );
-    write_document(&path, &doc)
+    with_config_write_lock(config_dir, || {
+        let path = config_path(config_dir);
+        let mut doc = load_document(&path)?;
+        section_mut_path(&mut doc, &["theme", "agent_override", alias])?.insert(
+            "name".to_string(),
+            toml::Value::String(theme_name.to_string()),
+        );
+        write_document(&path, &doc)
+    })
 }
 
 /// Remove a per-agent theme override, dropping the whole
@@ -1104,22 +1206,24 @@ pub(crate) fn persist_agent_theme(config_dir: &Path, alias: &str, theme_name: &s
 /// becomes empty). A no-op when the agent has no override. Other sections are
 /// preserved.
 pub(crate) fn persist_agent_theme_clear(config_dir: &Path, alias: &str) -> Result<()> {
-    let path = config_path(config_dir);
-    let mut doc = load_document(&path)?;
-    let Some(theme_tbl) = doc.get_mut("theme").and_then(toml::Value::as_table_mut) else {
-        return write_document(&path, &doc);
-    };
-    let Some(over_tbl) = theme_tbl
-        .get_mut("agent_override")
-        .and_then(toml::Value::as_table_mut)
-    else {
-        return write_document(&path, &doc);
-    };
-    over_tbl.remove(alias);
-    if over_tbl.is_empty() {
-        theme_tbl.remove("agent_override");
-    }
-    write_document(&path, &doc)
+    with_config_write_lock(config_dir, || {
+        let path = config_path(config_dir);
+        let mut doc = load_document(&path)?;
+        let Some(theme_tbl) = doc.get_mut("theme").and_then(toml::Value::as_table_mut) else {
+            return write_document(&path, &doc);
+        };
+        let Some(over_tbl) = theme_tbl
+            .get_mut("agent_override")
+            .and_then(toml::Value::as_table_mut)
+        else {
+            return write_document(&path, &doc);
+        };
+        over_tbl.remove(alias);
+        if over_tbl.is_empty() {
+            theme_tbl.remove("agent_override");
+        }
+        write_document(&path, &doc)
+    })
 }
 
 fn section_mut_path<'a>(doc: &'a mut toml::Table, keys: &[&str]) -> Result<&'a mut toml::Table> {
@@ -1131,19 +1235,21 @@ fn section_mut_path<'a>(doc: &'a mut toml::Table, keys: &[&str]) -> Result<&'a m
 }
 
 pub(crate) fn persist_wss_route_ack(config_dir: &Path, uri: &str) -> Result<()> {
-    let path = config_path(config_dir);
-    let mut doc = load_document(&path)?;
-    let tls = section_mut_path(&mut doc, &["connection", "wss", "tls"])?;
-    let routes = tls
-        .entry("skip_verify_routes")
-        .or_insert_with(|| toml::Value::Array(Vec::new()))
-        .as_array_mut()
-        .ok_or_else(|| anyhow::Error::msg("skip_verify_routes is not an array"))?;
-    let already = routes.iter().any(|v| v.as_str().is_some_and(|s| s == uri));
-    if !already {
-        routes.push(toml::Value::String(uri.to_string()));
-    }
-    write_document(&path, &doc)
+    with_config_write_lock(config_dir, || {
+        let path = config_path(config_dir);
+        let mut doc = load_document(&path)?;
+        let tls = section_mut_path(&mut doc, &["connection", "wss", "tls"])?;
+        let routes = tls
+            .entry("skip_verify_routes")
+            .or_insert_with(|| toml::Value::Array(Vec::new()))
+            .as_array_mut()
+            .ok_or_else(|| anyhow::Error::msg("skip_verify_routes is not an array"))?;
+        let already = routes.iter().any(|v| v.as_str().is_some_and(|s| s == uri));
+        if !already {
+            routes.push(toml::Value::String(uri.to_string()));
+        }
+        write_document(&path, &doc)
+    })
 }
 
 /// Persist the entire `[todotracker]` section, editing only that section.
@@ -1153,26 +1259,28 @@ pub(crate) fn persist_wss_route_ack(config_dir: &Path, uri: &str) -> Result<()> 
 /// section that is unparseable, even if the caller's older snapshot
 /// and proposed section are valid.
 pub(crate) fn persist_todotracker(config_dir: &Path, section: &TodoTrackerSection) -> Result<()> {
-    let path = config_path(config_dir);
-    let mut doc = load_document(&path)?;
-    if let Some(value) = doc.get("todotracker") {
-        value
-            .clone()
-            .try_into::<TodoTrackerSection>()
-            .with_context(|| {
-                format!(
-                    "refusing to overwrite the malformed [todotracker] section in {}",
-                    path.display()
-                )
-            })?;
-    }
-    let serialized = toml::Value::try_from(section)
-        .context("serializing todotracker section")?
-        .as_table()
-        .cloned()
-        .unwrap_or_default();
-    doc.insert("todotracker".to_string(), toml::Value::Table(serialized));
-    write_document(&path, &doc)
+    with_config_write_lock(config_dir, || {
+        let path = config_path(config_dir);
+        let mut doc = load_document(&path)?;
+        if let Some(value) = doc.get("todotracker") {
+            value
+                .clone()
+                .try_into::<TodoTrackerSection>()
+                .with_context(|| {
+                    format!(
+                        "refusing to overwrite the malformed [todotracker] section in {}",
+                        path.display()
+                    )
+                })?;
+        }
+        let serialized = toml::Value::try_from(section)
+            .context("serializing todotracker section")?
+            .as_table()
+            .cloned()
+            .unwrap_or_default();
+        doc.insert("todotracker".to_string(), toml::Value::Table(serialized));
+        write_document(&path, &doc)
+    })
 }
 
 pub(crate) fn persist_connection_field(
@@ -1180,26 +1288,30 @@ pub(crate) fn persist_connection_field(
     leaf_path: &str,
     value: toml::Value,
 ) -> Result<()> {
-    let path = config_path(config_dir);
-    let mut doc = load_document(&path)?;
-    let mut segments: Vec<&str> = leaf_path.split('.').collect();
-    let leaf = segments
-        .pop()
-        .ok_or_else(|| anyhow::Error::msg("empty connection field path"))?;
-    let mut prefix = vec!["connection", "wss"];
-    prefix.extend(segments);
-    section_mut_path(&mut doc, &prefix)?.insert(leaf.to_string(), value);
-    write_document(&path, &doc)
+    with_config_write_lock(config_dir, || {
+        let path = config_path(config_dir);
+        let mut doc = load_document(&path)?;
+        let mut segments: Vec<&str> = leaf_path.split('.').collect();
+        let leaf = segments
+            .pop()
+            .ok_or_else(|| anyhow::Error::msg("empty connection field path"))?;
+        let mut prefix = vec!["connection", "wss"];
+        prefix.extend(segments);
+        section_mut_path(&mut doc, &prefix)?.insert(leaf.to_string(), value);
+        write_document(&path, &doc)
+    })
 }
 
 pub(crate) fn persist_locale(config_dir: &Path, locale: &str) -> Result<()> {
-    let path = config_path(config_dir);
-    let mut doc = load_document(&path)?;
-    doc.insert(
-        "locale".to_string(),
-        toml::Value::String(locale.to_string()),
-    );
-    write_document(&path, &doc)
+    with_config_write_lock(config_dir, || {
+        let path = config_path(config_dir);
+        let mut doc = load_document(&path)?;
+        doc.insert(
+            "locale".to_string(),
+            toml::Value::String(locale.to_string()),
+        );
+        write_document(&path, &doc)
+    })
 }
 
 /// Overwrite the `[keybindings]` section from a resolved override table
@@ -1207,16 +1319,18 @@ pub(crate) fn persist_locale(config_dir: &Path, locale: &str) -> Result<()> {
 /// else falls back to compile-time defaults on next load. Only the
 /// `[keybindings]` section is touched; other sections are preserved.
 pub(crate) fn persist_keybindings(config_dir: &Path, table: &OverrideTable) -> Result<()> {
-    let path = config_path(config_dir);
-    let mut doc = load_document(&path)?;
-    let rows = flatten_table(table);
-    let serialized = toml::Value::try_from(&rows)
-        .context("serializing keybindings")?
-        .as_table()
-        .cloned()
-        .unwrap_or_default();
-    doc.insert("keybindings".to_string(), toml::Value::Table(serialized));
-    write_document(&path, &doc)
+    with_config_write_lock(config_dir, || {
+        let path = config_path(config_dir);
+        let mut doc = load_document(&path)?;
+        let rows = flatten_table(table);
+        let serialized = toml::Value::try_from(&rows)
+            .context("serializing keybindings")?
+            .as_table()
+            .cloned()
+            .unwrap_or_default();
+        doc.insert("keybindings".to_string(), toml::Value::Table(serialized));
+        write_document(&path, &doc)
+    })
 }
 
 /// Insert or replace a single `"<tag>.<variant>"` row (capture-modal
@@ -1226,11 +1340,13 @@ pub(crate) fn persist_keybind_row(
     action_key: &str,
     chords: Vec<Chord>,
 ) -> Result<()> {
-    let path = config_path(config_dir);
-    let mut doc = load_document(&path)?;
-    let value = toml::Value::try_from(ChordSpec::Many(chords)).context("serializing chords")?;
-    section_mut(&mut doc, "keybindings")?.insert(action_key.to_string(), value);
-    write_document(&path, &doc)
+    with_config_write_lock(config_dir, || {
+        let path = config_path(config_dir);
+        let mut doc = load_document(&path)?;
+        let value = toml::Value::try_from(ChordSpec::Many(chords)).context("serializing chords")?;
+        section_mut(&mut doc, "keybindings")?.insert(action_key.to_string(), value);
+        write_document(&path, &doc)
+    })
 }
 
 /// Collapse a nested `tag -> variant -> chords` table into the flat
@@ -1407,6 +1523,96 @@ mod tests {
         assert_eq!(doc["locale"].as_str(), Some("fr"));
         assert_eq!(doc["theme"]["name"].as_str(), Some("nord"));
         assert_eq!(doc["future"]["keep"].as_bool(), Some(true));
+    }
+
+    struct DelayAfterLockGuard;
+
+    impl Drop for DelayAfterLockGuard {
+        fn drop(&mut self) {
+            TEST_DELAY_AFTER_CONFIG_LOCK.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn enable_test_delay_after_lock() -> DelayAfterLockGuard {
+        TEST_DELAY_AFTER_CONFIG_LOCK.store(true, std::sync::atomic::Ordering::SeqCst);
+        DelayAfterLockGuard
+    }
+
+    #[test]
+    fn concurrent_persists_keep_both_section_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[theme]\nname = \"default\"\n\n[future]\nkeep = true\n",
+        );
+        let _delay = enable_test_delay_after_lock();
+        let theme_dir = dir.path().to_path_buf();
+        let locale_dir = dir.path().to_path_buf();
+        let start = std::sync::Barrier::new(2);
+        let theme = std::thread::scope(|scope| {
+            let theme = scope.spawn(|| {
+                start.wait();
+                persist_theme(&theme_dir, "nord")
+            });
+            let locale = scope.spawn(|| {
+                start.wait();
+                persist_locale(&locale_dir, "fr")
+            });
+            (
+                theme.join().expect("theme persist thread"),
+                locale.join().expect("locale persist thread"),
+            )
+        });
+        theme.0.unwrap();
+        theme.1.unwrap();
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(doc["theme"]["name"].as_str(), Some("nord"));
+        assert_eq!(doc["locale"].as_str(), Some("fr"));
+        assert_eq!(doc["future"]["keep"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn persist_waits_for_the_config_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), "locale = \"en\"\n");
+        let _guard = ConfigWriteLock::acquire(dir.path()).unwrap();
+        let persist_dir = dir.path().to_path_buf();
+        let handle = std::thread::spawn(move || persist_locale(&persist_dir, "fr"));
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(
+            !handle.is_finished(),
+            "persist_locale should wait on {CONFIG_LOCK_FILE_NAME}"
+        );
+        drop(_guard);
+        handle.join().expect("persist thread").unwrap();
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(doc["locale"].as_str(), Some("fr"));
+    }
+
+    #[test]
+    fn sidebar_and_theme_persists_keep_both_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[theme]\nname = \"default\"\n\n[sidebar]\nvisible = true\n",
+        );
+        let _delay = enable_test_delay_after_lock();
+        let theme_dir = dir.path().to_path_buf();
+        let sidebar_dir = dir.path().to_path_buf();
+        let start = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                start.wait();
+                persist_theme(&theme_dir, "nord").unwrap();
+            });
+            scope.spawn(|| {
+                start.wait();
+                persist_sidebar_visible(&sidebar_dir, false).unwrap();
+            });
+        });
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(doc["theme"]["name"].as_str(), Some("nord"));
+        assert_eq!(doc["sidebar"]["visible"].as_bool(), Some(false));
     }
 
     #[test]
@@ -1631,12 +1837,10 @@ mod tests {
         let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
         assert_eq!(doc["theme"]["name"].as_str(), Some("nord"));
         assert_eq!(doc["future"]["keep"].as_bool(), Some(true));
-        assert!(
-            doc["keybindings"]
-                .as_table()
-                .unwrap()
-                .contains_key("dashboard.up")
-        );
+        assert!(doc["keybindings"]
+            .as_table()
+            .unwrap()
+            .contains_key("dashboard.up"));
     }
 
     #[test]
@@ -2040,9 +2244,14 @@ mod tests {
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(
-            entries,
-            vec![FILE_NAME.to_string()],
+        assert!(
+            entries.iter().any(|name| name == FILE_NAME),
+            "the published config file must remain: {entries:?}"
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|name| { name == FILE_NAME || name == CONFIG_LOCK_FILE_NAME }),
             "the publish must leave no staging file behind: {entries:?}"
         );
         let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
@@ -2768,7 +2977,7 @@ mod tests {
     // variables through `ensure_and_load` rather than calling `set_prop`
     // directly, so the public spelling stays covered.
 
-    use crate::test_support::{EnvVarGuard, env_test_lock};
+    use crate::test_support::{env_test_lock, EnvVarGuard};
 
     #[test]
     fn canonical_env_spelling_overrides_tracker_field() {
