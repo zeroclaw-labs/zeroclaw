@@ -1704,6 +1704,24 @@ impl RpcDispatcher {
             );
             return Err(denied);
         }
+        self.require_agent_takes_turns(alias)
+    }
+
+    /// Live-config check that a named agent can take a turn: enabled, with a
+    /// model provider and a risk profile. A runtime profile is optional.
+    /// Unknown aliases are left to existing not-found paths so a grant for a
+    /// name that is not configured stays a grant question, not a dispatch one.
+    fn require_agent_takes_turns(&self, alias: &str) -> Result<(), JsonRpcError> {
+        let config = self.ctx.config.read();
+        if config
+            .agent(alias)
+            .is_some_and(|agent| !agent.is_dispatchable())
+        {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                format!("Agent `{alias}` is not enabled for dispatch"),
+            ));
+        }
         Ok(())
     }
 
@@ -47300,6 +47318,7 @@ mod tests {
             "alpha".into(),
             AliasedAgentConfig {
                 enabled: true,
+                model_provider: "dummy".into(),
                 risk_profile: "session-profile".into(),
                 ..AliasedAgentConfig::default()
             },
@@ -47430,6 +47449,124 @@ mod tests {
                 );
             }
         });
+    }
+
+    #[test]
+    fn session_new_refuses_a_disabled_granted_agent() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = session_new_roster_config(&tmp, 4242);
+            {
+                let agent = config
+                    .agents
+                    .get_mut("alpha")
+                    .expect("the fixture agent exists");
+                agent.model_provider = "dummy".into();
+                agent.enabled = false;
+            }
+            let ctx = enforcement_ctx(config);
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+            let session_id = "sess-disabled-agent".to_string();
+            let params = json!({
+                "agent_alias": "alpha",
+                "chat_mode": "chat",
+                "session_id": session_id,
+                "cwd": tmp.path().join("workspace"),
+            });
+
+            let err = alice
+                .handle_session_new_for_test(&params)
+                .await
+                .expect_err("a granted but disabled agent must not start a session");
+            assert_eq!(err.code, INVALID_PARAMS, "{err:?}");
+            assert!(err.message.contains("not enabled for dispatch"), "{err:?}");
+            assert!(
+                !ctx.sessions.list_ids().await.contains(&session_id),
+                "the refused session/new must not publish a live session"
+            );
+        });
+    }
+
+    #[test]
+    fn session_new_refuses_a_granted_agent_without_a_model_provider() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = session_new_roster_config(&tmp, 4242);
+            config
+                .agents
+                .get_mut("alpha")
+                .expect("the fixture agent exists")
+                .model_provider = Default::default();
+            let ctx = enforcement_ctx(config);
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+            let session_id = "sess-unbound-agent".to_string();
+            let params = json!({
+                "agent_alias": "alpha",
+                "chat_mode": "chat",
+                "session_id": session_id,
+                "cwd": tmp.path().join("workspace"),
+            });
+
+            let err = alice
+                .handle_session_new_for_test(&params)
+                .await
+                .expect_err("an agent without a model provider must not start a session");
+            assert_eq!(err.code, INVALID_PARAMS, "{err:?}");
+            assert!(err.message.contains("not enabled for dispatch"), "{err:?}");
+            assert!(
+                !ctx.sessions.list_ids().await.contains(&session_id),
+                "the refused session/new must not publish a live session"
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn session_prompt_refuses_after_admission_when_the_agent_is_disabled() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = session_cwd_config(&tmp, 4242, None);
+        let agent_workspace = config.agent_workspace_dir("test-agent");
+        let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
+        let (provider, mut started_rx, _release_tx) = gated_provider();
+        let sid = "s-prompt-disabled-agent";
+        install_state_test_session_owned_at(
+            &ctx.sessions,
+            &chat_backend,
+            sid,
+            provider,
+            None,
+            Some("user:alice"),
+            &agent_workspace,
+        )
+        .await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let mut disabled = ctx.config.snapshot();
+        disabled
+            .agents
+            .get_mut("test-agent")
+            .expect("the fixture agent exists")
+            .enabled = false;
+        ctx.config_authority.publish_for_test(disabled);
+
+        send_prompt(&mut alice, 7, sid, 3).await;
+        let (response, notifications) = response_and_notifications(&mut rx, 7).await;
+        assert_eq!(
+            response["error"]["code"],
+            json!(INVALID_PARAMS),
+            "{response}"
+        );
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not enabled for dispatch"),
+            "{response}"
+        );
+        assert_turn_refused(&notifications, sid, 3);
+        assert!(
+            started_rx.try_recv().is_err(),
+            "a refused prompt must never reach the provider"
+        );
     }
 
     #[test]

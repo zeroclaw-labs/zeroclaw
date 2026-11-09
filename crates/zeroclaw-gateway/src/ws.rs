@@ -209,14 +209,24 @@ pub async fn handle_ws_chat(
     };
     {
         let cfg = state.config.read();
-        if cfg.agent(&agent_alias).is_none() {
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                format!(
-                    "Unknown agent `{agent_alias}` — no [agents.{agent_alias}] entry configured."
-                ),
-            )
-                .into_response();
+        match cfg.agent(&agent_alias) {
+            None => {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    format!(
+                        "Unknown agent `{agent_alias}` — no [agents.{agent_alias}] entry configured."
+                    ),
+                )
+                    .into_response();
+            }
+            Some(agent) if !agent.is_dispatchable() => {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    format!("Agent `{agent_alias}` is not enabled for dispatch"),
+                )
+                    .into_response();
+            }
+            Some(_) => {}
         }
     }
 
@@ -251,6 +261,22 @@ pub async fn handle_ws_chat(
         )
     })
     .into_response()
+}
+
+fn live_agent_takes_turns(state: &AppState, alias: &str) -> bool {
+    state
+        .config
+        .read()
+        .agent(alias)
+        .is_some_and(zeroclaw_config::schema::AliasedAgentConfig::is_dispatchable)
+}
+
+fn agent_not_dispatchable_frame(alias: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "error",
+        "message": format!("Agent `{alias}` is not enabled for dispatch"),
+        "code": "AGENT_NOT_DISPATCHABLE",
+    })
 }
 
 fn websocket_ping_interval(
@@ -921,66 +947,78 @@ async fn handle_socket(
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
             if parsed["type"].as_str() == Some("message") {
                 if let Some(content) = first_chat_message_content(text) {
-                    let turn_lease = match state
-                        .reserve_agent_turn_at(agent_alias.clone(), turn_generation)
-                    {
-                        Ok(lease) => Some(lease),
-                        Err(error) => {
-                            if refuse_unadmitted_turn(&mut sender, &mut receiver, &error).await {
-                                return;
+                    if !live_agent_takes_turns(&state, &agent_alias) {
+                        let _ = sender
+                            .send(Message::Text(
+                                agent_not_dispatchable_frame(&agent_alias)
+                                    .to_string()
+                                    .into(),
+                            ))
+                            .await;
+                    } else {
+                        let turn_lease = match state
+                            .reserve_agent_turn_at(agent_alias.clone(), turn_generation)
+                        {
+                            Ok(lease) => Some(lease),
+                            Err(error) => {
+                                if refuse_unadmitted_turn(&mut sender, &mut receiver, &error).await
+                                {
+                                    return;
+                                }
+                                // Refused, but the socket stays for a retry.
+                                None
                             }
-                            // Refused, but the socket stays for a retry.
-                            None
-                        }
-                    };
-                    if let Some(_turn_lease) = turn_lease {
-                        let acquired =
-                            match acquire_turn_permit(&state, &session_key, &mut session_watch)
-                                .await
-                            {
-                                Ok(acquired) => acquired,
-                                Err(code) => {
-                                    close_with(
-                                        &mut sender,
-                                        &mut receiver,
-                                        code,
-                                        "dashboard session ended",
-                                    )
-                                    .await;
+                        };
+                        if let Some(_turn_lease) = turn_lease {
+                            let acquired =
+                                match acquire_turn_permit(&state, &session_key, &mut session_watch)
+                                    .await
+                                {
+                                    Ok(acquired) => acquired,
+                                    Err(code) => {
+                                        close_with(
+                                            &mut sender,
+                                            &mut receiver,
+                                            code,
+                                            "dashboard session ended",
+                                        )
+                                        .await;
+                                        return;
+                                    }
+                                };
+                            let _session_guard = match acquired {
+                                Ok(guard) => guard,
+                                Err(e) => {
+                                    let err = serde_json::json!({
+                                        "type": "error",
+                                        "message": e.to_string(),
+                                        "code": session_queue_ws_error_code(&e)
+                                    });
+                                    let _ =
+                                        sender.send(Message::Text(err.to_string().into())).await;
                                     return;
                                 }
                             };
-                        let _session_guard = match acquired {
-                            Ok(guard) => guard,
-                            Err(e) => {
-                                let err = serde_json::json!({
-                                    "type": "error",
-                                    "message": e.to_string(),
-                                    "code": session_queue_ws_error_code(&e)
-                                });
-                                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                            let client_gone = process_chat_message(
+                                &state,
+                                &mut agent,
+                                &mut sender,
+                                &mut receiver,
+                                &mut approval_event_rx,
+                                &pending_approvals,
+                                &mut ping_interval,
+                                &ws_memory,
+                                &mut persisted_watermark,
+                                &content,
+                                &session_key,
+                                &session_id,
+                                auth_subject.as_deref(),
+                                &mut session_watch,
+                            )
+                            .await;
+                            if client_gone {
                                 return;
                             }
-                        };
-                        let client_gone = process_chat_message(
-                            &state,
-                            &mut agent,
-                            &mut sender,
-                            &mut receiver,
-                            &mut approval_event_rx,
-                            &pending_approvals,
-                            &mut ping_interval,
-                            &ws_memory,
-                            &mut persisted_watermark,
-                            &content,
-                            &session_key,
-                            &session_id,
-                            auth_subject.as_deref(),
-                            &mut session_watch,
-                        )
-                        .await;
-                        if client_gone {
-                            return;
                         }
                     }
                 }
@@ -1144,6 +1182,15 @@ async fn handle_socket(
                         "code": "EMPTY_CONTENT"
                     });
                     let _ = sender.send(Message::Text(err.to_string().into())).await;
+                    continue;
+                }
+
+                if !live_agent_takes_turns(&state, &agent_alias) {
+                    let _ = sender
+                        .send(Message::Text(
+                            agent_not_dispatchable_frame(&agent_alias).to_string().into(),
+                        ))
+                        .await;
                     continue;
                 }
 
@@ -3846,6 +3893,133 @@ data: {\"type\":\"message_stop\"}\n\n",
         })
         .await
         .expect("gateway frame deadline")
+    }
+
+    fn operator_chat_config(
+        tmp: &tempfile::TempDir,
+        adjust: impl FnOnce(&mut zeroclaw_config::schema::AliasedAgentConfig),
+    ) -> zeroclaw_config::schema::Config {
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("gateway workspace");
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: workspace.clone(),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".to_string();
+        config.risk_profiles.insert(
+            "fixture".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        let mut agent = zeroclaw_config::schema::AliasedAgentConfig {
+            enabled: true,
+            model_provider: "anthropic.fixture".into(),
+            risk_profile: "fixture".into(),
+            workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                path: Some(workspace),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        adjust(&mut agent);
+        config.agents.insert("web".to_string(), agent);
+        config
+    }
+
+    async fn refuse_operator_chat_upgrade(config: zeroclaw_config::schema::Config) -> String {
+        let state = crate::api::tests::test_state(config);
+        let gateway_app = Router::new()
+            .route("/ws/chat", get(handle_ws_chat))
+            .with_state(state);
+        let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local WebSocket gateway");
+        let gateway_addr = gateway_listener.local_addr().expect("gateway address");
+        let gateway_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(gateway_listener, gateway_app)
+                .await
+                .expect("local WebSocket gateway serves");
+        });
+        let result = connect_async(format!("ws://{gateway_addr}/ws/chat?agent=web")) // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
+            .await;
+        gateway_server.abort();
+        match result {
+            Ok(_) => panic!("the upgrade must be refused"),
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+                response
+                    .body()
+                    .as_ref()
+                    .map(|body| String::from_utf8_lossy(body).into_owned())
+                    .unwrap_or_default()
+            }
+            Err(error) => panic!("expected an HTTP refusal, got {error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn operator_chat_refuses_upgrade_when_the_agent_is_disabled() {
+        let tmp = tempfile::tempdir().expect("temporary gateway workspace");
+        let config = operator_chat_config(&tmp, |agent| agent.enabled = false);
+        let body = refuse_operator_chat_upgrade(config).await;
+        assert!(
+            body.contains("not enabled for dispatch"),
+            "disabled-agent refusal, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_chat_refuses_upgrade_when_the_agent_has_no_model_provider() {
+        let tmp = tempfile::tempdir().expect("temporary gateway workspace");
+        let config = operator_chat_config(&tmp, |agent| agent.model_provider = Default::default());
+        let body = refuse_operator_chat_upgrade(config).await;
+        assert!(
+            body.contains("not enabled for dispatch"),
+            "unbound-agent refusal, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_chat_refuses_a_prompt_after_the_agent_is_disabled() {
+        let mut fixture = ParkedTurnFixture::spawn().await;
+        let (mut client, _) = fixture.connect("ws-disabled-after-open").await;
+
+        let mut disabled = fixture.state.config.snapshot();
+        disabled
+            .agents
+            .get_mut("web")
+            .expect("the fixture agent")
+            .enabled = false;
+        fixture.state.config_authority.publish_for_test(disabled);
+
+        send_chat(&mut client, "this turn must not run").await;
+        let err = next_text_frame(&mut client).await;
+        assert_eq!(err["type"], "error", "{err}");
+        assert_eq!(err["code"], "AGENT_NOT_DISPATCHABLE", "{err}");
+        assert!(
+            err["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not enabled for dispatch"),
+            "{err}"
+        );
+        assert!(
+            fixture.request_seen.try_recv().is_err(),
+            "a refused prompt must never reach the provider"
+        );
+
+        let mut enabled = fixture.state.config.snapshot();
+        enabled
+            .agents
+            .get_mut("web")
+            .expect("the fixture agent")
+            .enabled = true;
+        fixture.state.config_authority.publish_for_test(enabled);
+
+        let _ = fixture
+            .start_parked_turn(&mut client, "runs once the agent is enabled again")
+            .await;
+        fixture.shutdown();
     }
 
     /// Detach the viewer mid-turn: close handshake, drop the socket, then give
