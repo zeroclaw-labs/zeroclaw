@@ -230,7 +230,11 @@ no trusted local route. A paired gateway token still authenticates as the
 shared operator while the policy compiles, so a client that sends one, over
 WSS or over the pipe, can repair the roster live. zerocode's local pipe
 connection sends no token, so without such a client a lockout is repaired
-by editing `config.toml` and restarting.
+by editing `config.toml` and restarting. The CLI does not yet verify which
+process serves a named pipe, so on Windows it commits no authorization edit
+through a running daemon: `zeroclaw config set` and `zeroclaw config patch`
+save the edit themselves and report it pending (`unverified_endpoint`)
+until the next reload or restart.
 
 A client may forward its shell environment in `initialize` so the
 daemon's subprocesses see its `PATH` and credential sockets (see
@@ -274,9 +278,11 @@ with an RPC `config/set` of `users.alice.uid`, or with
 daemon; the change is compiled and published at save time. Editing
 `config.toml` by hand also repairs it, but only once the daemon reloads or
 restarts, and so does a `zeroclaw config set` that the CLI reports as
-pending. A roster principal without the config-write grant cannot repair
-it with `zeroclaw config set`: the daemon identifies it and refuses the
-edit, so the command fails and nothing is saved.
+pending. When a roster principal without the config-write grant runs
+`zeroclaw config set`, the daemon identifies it and refuses the edit, so
+the command fails and saves nothing. The refusal does not guard the file:
+the file's owner can still change `config.toml` directly, and that takes
+effect at the next reload or restart.
 
 **Locked out by a deny-all accepted state.** The policy did not compile,
 so the accepted state refuses every principal before resolution runs, the

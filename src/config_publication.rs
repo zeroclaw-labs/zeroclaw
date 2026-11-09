@@ -656,10 +656,7 @@ enum DaemonPresence {
 ///
 /// Every daemon takes the ownership lock before it loads its configuration
 /// and holds it for as long as it runs, so a lock another process holds while
-/// no heartbeat shows a daemon may be a daemon that is still starting. The
-/// probe holds the lock only for the instant of the check. A daemon starting
-/// at that same instant fails its own acquire, as it does against any
-/// offline CLI mutation that holds the lock.
+/// no heartbeat shows a daemon may be a daemon that is still starting.
 ///
 /// `holds_config_ownership` is set when this command already holds the lock
 /// itself. No daemon can run meanwhile, and a second acquire in this process
@@ -671,6 +668,10 @@ fn daemon_presence(config: &Config, holds_config_ownership: bool) -> DaemonPrese
     if holds_config_ownership {
         return DaemonPresence::Absent;
     }
+    // The probe holds the lock only for the instant of the check. Its side
+    // effects, the same ones an offline alias mutation has, are accepted: a
+    // daemon launched in that instant fails to start, and a missing lock file,
+    // or directory above it, is created.
     match ConfigOwnershipGuard::acquire(&config.data_dir) {
         Ok(guard) => {
             drop(guard);
