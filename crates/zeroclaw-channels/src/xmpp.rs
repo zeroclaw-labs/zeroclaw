@@ -116,6 +116,14 @@ pub struct XmppChannel {
     // Presence of this sender is the connection's single online-state fact.
     outbound: Mutex<Option<mpsc::Sender<Outbound>>>,
 }
+// Prefer challenge-response authentication even if the server advertises
+// PLAIN first. PLAIN remains available for TLS-only servers without SCRAM.
+fn prefer_authenticated_mechanisms(mechanisms: &mut Vec<String>) {
+    let scram = mechanisms.iter().any(|m| matches!(m.as_str(), "SCRAM-SHA-256" | "SCRAM-SHA-1"));
+    mechanisms.retain(|m| matches!(m.as_str(), "SCRAM-SHA-256" | "SCRAM-SHA-1") || (!scram && m == "PLAIN"));
+    mechanisms.sort_by_key(|m| match m.as_str() { "SCRAM-SHA-256" => 0, "SCRAM-SHA-1" => 1, _ => 2 });
+}
+
 impl XmppChannel {
     pub fn new(config: XmppConfig, alias: String, data_dir: PathBuf, peers: PeerResolver) -> Self {
         Self {
@@ -447,9 +455,7 @@ impl XmppChannel {
             .connect(&jid, ns::JABBER_CLIENT, Timeouts::default())
             .await?;
         let (mut features, stream) = pending.recv_features().await?;
-        features
-            .sasl_mechanisms
-            .retain(|m| matches!(m.as_str(), "SCRAM-SHA-256" | "SCRAM-SHA-1" | "PLAIN"));
+        prefer_authenticated_mechanisms(&mut features.sasl_mechanisms);
         ensure!(
             !features.sasl_mechanisms.is_empty(),
             "No supported authenticated XMPP SASL mechanism"
@@ -1484,3 +1490,20 @@ mod inbox_fault_probe;
 #[cfg(target_os = "linux")]
 #[path = "xmpp_native_inbox_admin.rs"]
 pub mod inbox_admin;
+
+#[cfg(test)]
+mod sasl_preference_tests {
+    use super::prefer_authenticated_mechanisms;
+    #[test]
+    fn server_order_cannot_downgrade_scram_to_plain() {
+        let mut mechanisms=vec!["PLAIN".into(),"SCRAM-SHA-1".into(),"SCRAM-SHA-256".into()];
+        prefer_authenticated_mechanisms(&mut mechanisms);
+        assert_eq!(mechanisms,["SCRAM-SHA-256","SCRAM-SHA-1"]);
+    }
+    #[test]
+    fn tls_plain_only_servers_remain_supported() {
+        let mut mechanisms=vec!["ANONYMOUS".into(),"PLAIN".into()];
+        prefer_authenticated_mechanisms(&mut mechanisms);
+        assert_eq!(mechanisms,["PLAIN"]);
+    }
+}
