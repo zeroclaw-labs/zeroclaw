@@ -24,6 +24,7 @@ import {
   useEffect,
   useImperativeHandle,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import type { KeyboardEvent, ReactNode } from "react";
@@ -1066,6 +1067,23 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
       void reload();
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [prefix]);
+
+    // Discard-all clears the shared store but leaves this form's local draft
+    // and comment maps untouched. Without a reset, the inputs stay dirty and a
+    // later section Save would persist the discarded values (#12288).
+    const seenDiscardGeneration = useRef(configDraft.discardGeneration);
+    useEffect(() => {
+      if (configDraft.discardGeneration === seenDiscardGeneration.current) {
+        return;
+      }
+      seenDiscardGeneration.current = configDraft.discardGeneration;
+      const seed: Record<string, string> = {};
+      for (const e of entries) {
+        seed[e.path] = defaultInputValue(e);
+      }
+      setDraft(seed);
+      setComments({});
+    }, [configDraft.discardGeneration, entries]);
 
     const actionableEntries = useMemo(() => {
       if (!scopeActionsToIncludedPaths || !includePath) return entries;
