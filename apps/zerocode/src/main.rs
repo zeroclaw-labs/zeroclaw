@@ -14,7 +14,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 mod acp;
 mod agent_sidebar;
@@ -40,6 +40,7 @@ mod i18n;
 mod input_bar;
 mod jsonrpc;
 mod keymap;
+mod login;
 mod logs;
 mod mouse;
 mod oidc_enroll;
@@ -113,8 +114,10 @@ impl ShutdownSignals {
     )
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
     /// Path to the ZeroClaw config directory
-    #[arg(long)]
+    #[arg(long, global = true)]
     config_dir: Option<PathBuf>,
 
     /// Start in chat mode with this agent alias.
@@ -127,21 +130,21 @@ struct Cli {
     #[arg(long)]
     connect: Option<String>,
 
-    /// Skip TLS certificate verification for WSS connections.
-    /// Required for self-signed certificates. Only used with --connect.
-    #[arg(long)]
+    /// Skip TLS certificate verification (explicit confirmation required).
+    /// Applies to --connect, or both transports of login.
+    #[arg(long, global = true)]
     tls_skip_verify: bool,
 
-    /// PEM CA certificate to verify the daemon (mutual TLS). Only used with --connect.
-    #[arg(long)]
+    /// PEM CA certificate to verify the daemon for --connect or login.
+    #[arg(long, global = true)]
     tls_ca_cert: Option<String>,
 
     /// PEM client certificate to present to the daemon (mutual TLS).
-    #[arg(long, requires = "tls_client_key")]
+    #[arg(long, global = true, requires = "tls_client_key")]
     tls_client_cert: Option<String>,
 
     /// PEM client private key for --tls-client-cert.
-    #[arg(long, requires = "tls_client_cert")]
+    #[arg(long, global = true, requires = "tls_client_cert")]
     tls_client_key: Option<String>,
 
     /// Reach the daemon through a nominated relay at this `host:port`
@@ -190,18 +193,24 @@ struct Cli {
 
     /// Enroll for a client certificate before connecting: prompt for the daemon
     /// pairing code, generate a key + CSR locally, fetch the signed cert, and
-    /// cache it under <config-dir>/tls. The host defaults to --connect's host; the
-    /// port defaults to the daemon's enrollment port (9782).
-    #[arg(long)]
+    /// cache it under <config-dir>/tls (URL-scoped for login). The host defaults
+    /// to the connection target; the port defaults to 9782.
+    #[arg(long, global = true)]
     enroll: bool,
 
-    /// Host of the daemon enrollment endpoint (defaults to --connect's host).
-    #[arg(long)]
+    /// Host of the daemon enrollment endpoint (defaults to the connection target).
+    #[arg(long, global = true)]
     enroll_host: Option<String>,
 
     /// Port of the daemon enrollment endpoint (default 9782).
-    #[arg(long)]
+    #[arg(long, global = true)]
     enroll_port: Option<u16>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Sign in through the remote gateway and save a URL-scoped OIDC login.
+    Login(login::LoginArgs),
 }
 
 /// Map an empty path string to `None`.
@@ -285,6 +294,9 @@ impl WssRoute {
                 .await
                 {
                     Ok(Ok(client)) => return Ok((client, ActiveLeg::WssDirect)),
+                    Ok(Err(e)) if e.downcast_ref::<client::AuthenticationRequired>().is_some() => {
+                        return Err(e);
+                    }
                     Ok(Err(e)) => last_err = Some(e),
                     Err(_) => {
                         last_err = Some(anyhow::Error::msg(format!(
@@ -884,11 +896,53 @@ async fn run() -> anyhow::Result<()> {
     let local_config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
     let loaded_config = match config::ensure_and_load(&local_config_dir) {
         Ok(cfg) => cfg,
+        Err(e) if e.downcast_ref::<config::InvalidSavedLogin>().is_some() => return Err(e),
         Err(e) => {
             eprintln!("zerocode: config load failed ({e:#}); starting with defaults");
             config::ZerocodeConfig::default()
         }
     };
+    let resolved_locale = loaded_config
+        .resolve_locale()
+        .unwrap_or_else(i18n::detect_locale);
+    i18n::init(&resolved_locale, &local_config_dir);
+    if let Some(Command::Login(args)) = &cli.command {
+        return login::run(args, &cli, &local_config_dir).await;
+    }
+    // Resolve credentials by the exact canonical URL, not by hostname. An
+    // explicit --connect never picks up another saved login's bearer or CA.
+    let selected_uri = cli
+        .connect
+        .as_deref()
+        .or(loaded_config.connection.wss.uri.as_deref());
+    let selected_uri = selected_uri
+        .map(|uri| {
+            if loaded_config.connection.logins.is_empty() {
+                Ok(uri.to_string())
+            } else {
+                login::normalize_target(uri)
+            }
+        })
+        .transpose()?;
+    let scoped_credentials = selected_uri.as_deref().is_some_and(|uri| {
+        loaded_config.connection.logins.contains_key(uri)
+            || (!loaded_config.connection.logins.is_empty()
+                && selected_uri != loaded_config.connection.wss.uri)
+    });
+    let mut loaded_config = loaded_config;
+    loaded_config.connection.wss = loaded_config.connection.wss_for(selected_uri.as_deref());
+    if loaded_config
+        .connection
+        .logins
+        .contains_key(selected_uri.as_deref().unwrap_or(""))
+    {
+        login::renew_expired(&local_config_dir, &mut loaded_config, false).await?;
+    }
+    let credential_config_dir = selected_uri
+        .as_deref()
+        .filter(|_| scoped_credentials)
+        .map(|uri| login::credential_dir(&local_config_dir, uri))
+        .unwrap_or_else(|| local_config_dir.clone());
     let active_theme = loaded_config.resolve_theme().unwrap_or_else(|e| {
         let path = config::config_path(&local_config_dir);
         eprintln!("zerocode: {e:#}");
@@ -899,11 +953,6 @@ async fn run() -> anyhow::Result<()> {
         std::process::exit(1);
     });
     theme::set_active(active_theme);
-
-    let resolved_locale = loaded_config
-        .resolve_locale()
-        .unwrap_or_else(i18n::detect_locale);
-    i18n::init(&resolved_locale, &local_config_dir);
 
     // Apply persisted keybinding overrides into the keymap. A bad table
     // fails loud (same posture as an unknown theme) rather than silently
@@ -928,7 +977,7 @@ async fn run() -> anyhow::Result<()> {
     // target block below picks it up with no --tls-* flags.
     {
         use std::io::IsTerminal as _;
-        let config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
+        let config_dir = credential_config_dir.clone();
         let cfg_wss = &loaded_config.connection.wss;
         // Recovery runs before the first credential read of the process, so no
         // decision below observes a half-published generation.
@@ -937,7 +986,12 @@ async fn run() -> anyhow::Result<()> {
             cli.tls_client_cert.as_deref(),
             &cfg_wss.tls.client_cert_path,
         )?;
-        let cached_relay = credentials.profile.as_ref().map(|p| &p.relay);
+        let cached_relay = credentials.profile.as_ref().map(|p| &p.relay).filter(|_| {
+            !loaded_config
+                .connection
+                .logins
+                .contains_key(selected_uri.as_deref().unwrap_or(""))
+        });
         let relay = resolve_relay_dial(&cli, cfg_wss, cached_relay, &config_dir).await?;
         let wss_intended = cli.connect.is_some()
             || cfg_wss.uri.is_some()
@@ -971,9 +1025,9 @@ async fn run() -> anyhow::Result<()> {
         }
     }
 
-    let target = {
+    let mut target = {
         let cfg_wss = &loaded_config.connection.wss;
-        let config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
+        let config_dir = credential_config_dir.clone();
         // The cached enrollment profile supplies the relay coordinates so a bare
         // `zerocode` after enrollment still reaches the daemon through its relay.
         // Enrollment above may have published a new generation, so recover and
@@ -985,10 +1039,15 @@ async fn run() -> anyhow::Result<()> {
             cli.tls_client_cert.as_deref(),
             &cfg_wss.tls.client_cert_path,
         )?;
-        let cached_relay = credentials.profile.as_ref().map(|p| &p.relay);
+        let cached_relay = credentials.profile.as_ref().map(|p| &p.relay).filter(|_| {
+            !loaded_config
+                .connection
+                .logins
+                .contains_key(selected_uri.as_deref().unwrap_or(""))
+        });
 
         // Direct daemon address (CLI overrides config). `None` => relay-only.
-        let direct_url = resolve_direct_url(cli.connect.clone(), cfg_wss);
+        let direct_url = resolve_direct_url(selected_uri.clone(), cfg_wss);
         let skip_verify = resolve_skip_verify(cli.tls_skip_verify, cfg_wss);
 
         let relay = resolve_relay_dial(&cli, cfg_wss, cached_relay, &config_dir).await?;
@@ -1070,14 +1129,14 @@ async fn run() -> anyhow::Result<()> {
                         }
                         apply_insecure_tls_choice(
                             confirm_insecure_tls(origin)?,
-                            &config_dir,
+                            &local_config_dir,
                             origin,
                         )
                     },
                 )
                 .await?;
                 eprintln!("{}", i18n::t("zc-oidc-enroll-done"));
-                auth_token = Some(token);
+                auth_token = Some(token.access_token);
             }
             ConnectTarget::Wss(Box::new(WssRoute {
                 direct_url,
@@ -1107,7 +1166,7 @@ async fn run() -> anyhow::Result<()> {
     // ephemeral daemon may be respawned on disconnect, and then exactly once,
     // gated on the liveness/grace check in app.rs.
     let mut owned_daemon_pid: Option<u32> = None;
-    let (rpc, initial_leg) = match &target {
+    let (rpc, initial_leg) = match &mut target {
         ConnectTarget::LocalSocket(socket) => {
             #[cfg(unix)]
             let shutdown_signals = shutdown_signals.insert(ShutdownSignals::new()?);
@@ -1157,6 +1216,9 @@ async fn run() -> anyhow::Result<()> {
             let ack_key = route.ack_key();
             let requires_confirmation =
                 route.tls.skip_verify && !loaded_config.connection.wss.tls.route_acked(&ack_key);
+            let saved_login = selected_uri
+                .as_deref()
+                .is_some_and(|uri| loaded_config.connection.logins.contains_key(uri));
             #[cfg(not(unix))]
             if requires_confirmation {
                 apply_insecure_tls_choice(
@@ -1165,25 +1227,50 @@ async fn run() -> anyhow::Result<()> {
                     &ack_key,
                 )?;
             }
+            // A saved login may need another browser sign-in and synchronous
+            // TLS consent. Keep the default signals until those prompts finish,
+            // as on first login, instead of swallowing Ctrl+C while blocked.
             #[cfg(unix)]
-            let shutdown_signals = shutdown_signals.insert(prepare_wss_shutdown_signals(
-                requires_confirmation,
-                &local_config_dir,
-                &ack_key,
-            )?);
-            // Signal-aware like the local leg: `connect_preferred` can spend the
-            // full direct-attempt budget before falling back to the relay, so a
-            // SIGTERM during that window must still exit cleanly.
-            #[cfg(unix)]
-            let connect_result = tokio::select! {
-                result = route.connect_preferred(None, None) => result,
-                _ = shutdown_signals.recv() => return Ok(()),
+            let connect_result = if saved_login {
+                if requires_confirmation {
+                    apply_insecure_tls_choice(
+                        confirm_insecure_tls(&ack_key)?,
+                        &local_config_dir,
+                        &ack_key,
+                    )?;
+                }
+                route.connect_preferred(None, None).await
+            } else {
+                let signals = shutdown_signals.insert(prepare_wss_shutdown_signals(
+                    requires_confirmation,
+                    &local_config_dir,
+                    &ack_key,
+                )?);
+                tokio::select! {
+                    result = route.connect_preferred(None, None) => result,
+                    _ = signals.recv() => return Ok(()),
+                }
             };
             #[cfg(not(unix))]
             let connect_result = route.connect_preferred(None, None).await;
 
             match connect_result {
                 Ok(pair) => pair,
+                Err(e)
+                    if e.downcast_ref::<client::AuthenticationRequired>().is_some()
+                        && saved_login
+                        && !std::env::var("ZEROCLAW_AUTH_TOKEN")
+                            .is_ok_and(|token| !token.is_empty()) =>
+                {
+                    // The issuer can revoke before expires_in, or omit it. A
+                    // structured auth refusal permits one interactive sign-in,
+                    // not a retry loop and never a TLS/transport downgrade.
+                    login::renew_expired(&local_config_dir, &mut loaded_config, true).await?;
+                    route.auth_token = loaded_config.connection.wss.auth_token.clone();
+                    route.auth_provider = loaded_config.connection.wss.auth_provider.clone();
+                    route.tls = login::tls_from(&loaded_config.connection.wss.tls);
+                    route.connect_preferred(None, None).await?
+                }
                 // A certless client cannot complete the mutually-authenticated WSS
                 // handshake. Give an actionable enroll hint instead of a bare TLS
                 // error (no silent failure for an un-migrated client).
@@ -1200,11 +1287,16 @@ async fn run() -> anyhow::Result<()> {
         }
     };
 
+    #[cfg(unix)]
+    if shutdown_signals.is_none() {
+        shutdown_signals = Some(ShutdownSignals::new()?);
+    }
+
     // On the mTLS plane, renew the cached client cert if it is past ~50% of its
     // TTL (before the terminal is taken over, so any output is visible). No-op
     // when the client never enrolled here.
     if matches!(target, ConnectTarget::Wss(_)) {
-        enroll::maybe_renew(&rpc, &local_config_dir).await;
+        enroll::maybe_renew(&rpc, &credential_config_dir).await;
     }
 
     let mut term = config_manager::init_terminal()?;

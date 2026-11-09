@@ -191,11 +191,84 @@ impl Default for ThemeSection {
 pub(crate) struct ConnectionSection {
     #[serde(default, skip_serializing_if = "WssSection::is_empty")]
     pub wss: WssSection,
+    /// OIDC logins keyed by normalized WSS URL. Credentials never follow a
+    /// different --connect destination, even on the same hostname.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub logins: HashMap<String, OidcLogin>,
 }
 
 impl ConnectionSection {
     fn is_empty(&self) -> bool {
-        self.wss.is_empty()
+        self.wss.is_empty() && self.logins.is_empty()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct InvalidSavedLogin(anyhow::Error);
+
+impl std::fmt::Display for InvalidSavedLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid saved login configuration; refusing credential fallback")
+    }
+}
+impl std::error::Error for InvalidSavedLogin {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+/// The persisted login is the credential authority for this exact URL. The
+/// active `wss.uri` selects it; no copy of its token is written to `wss`.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct OidcLogin {
+    pub auth_provider: String,
+    pub auth_token: String,
+    pub enroll_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+    #[serde(default)]
+    pub tls: WssTlsSection,
+    #[serde(default)]
+    pub gateway_tls: WssTlsSection,
+}
+
+impl std::fmt::Debug for OidcLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OidcLogin")
+            .field("auth_provider", &self.auth_provider)
+            .field("auth_token", &"[REDACTED]")
+            .field("enroll_url", &self.enroll_url)
+            .field("expires_at", &self.expires_at)
+            .field("tls", &self.tls)
+            .field("gateway_tls", &self.gateway_tls)
+            .finish()
+    }
+}
+
+impl ConnectionSection {
+    pub fn wss_for(&self, uri: Option<&str>) -> WssSection {
+        let mut wss = self.wss.clone();
+        let uri = uri.or(wss.uri.as_deref()).map(str::to_owned);
+        if let Some(login) = uri.as_ref().and_then(|uri| self.logins.get(uri)) {
+            wss.auth_token = Some(login.auth_token.clone());
+            wss.auth_token_file = None;
+            wss.auth_provider = Some(login.auth_provider.clone());
+            wss.enroll_url = Some(login.enroll_url.clone());
+            wss.tls = login.tls.clone();
+            // A direct URL login must not inherit another daemon's relay.
+            wss.relay_url = None;
+            wss.relay_node = None;
+        } else if !self.logins.is_empty() && uri != self.wss.uri {
+            wss.auth_token = None;
+            wss.auth_token_file = None;
+            wss.auth_provider = None;
+            wss.enroll_url = None;
+            wss.tls = WssTlsSection::default();
+            wss.relay_url = None;
+            wss.relay_node = None;
+        }
+        wss.uri = uri;
+        wss
     }
 }
 
@@ -773,6 +846,9 @@ pub(crate) fn load_persisted(config_dir: &Path) -> Result<ZerocodeConfig> {
     if let Some(v) = doc.get("connection") {
         match v.clone().try_into::<ConnectionSection>() {
             Ok(section) => config.connection = section,
+            Err(e) if v.get("logins").is_some() => {
+                return Err(InvalidSavedLogin(e.into()).into());
+            }
             Err(e) => eprintln!(
                 "zerocode: ignoring [connection] in {} ({e}); using default",
                 path.display()
@@ -1133,7 +1209,16 @@ fn section_mut_path<'a>(doc: &'a mut toml::Table, keys: &[&str]) -> Result<&'a m
 pub(crate) fn persist_wss_route_ack(config_dir: &Path, uri: &str) -> Result<()> {
     let path = config_path(config_dir);
     let mut doc = load_document(&path)?;
-    let tls = section_mut_path(&mut doc, &["connection", "wss", "tls"])?;
+    let scoped = doc
+        .get("connection")
+        .and_then(|v| v.get("logins"))
+        .and_then(|v| v.get(uri))
+        .is_some();
+    let tls = if scoped {
+        section_mut_path(&mut doc, &["connection", "logins", uri, "tls"])?
+    } else {
+        section_mut_path(&mut doc, &["connection", "wss", "tls"])?
+    };
     let routes = tls
         .entry("skip_verify_routes")
         .or_insert_with(|| toml::Value::Array(Vec::new()))
@@ -1175,6 +1260,30 @@ pub(crate) fn persist_todotracker(config_dir: &Path, section: &TodoTrackerSectio
     write_document(&path, &doc)
 }
 
+/// Save one URL's accepted login, optionally selecting it, in one owner-only,
+/// atomic write. Re-read the persisted document so transient env overrides and other
+/// URLs' credentials are never copied or lost.
+pub(crate) fn persist_oidc_login(
+    config_dir: &Path,
+    uri: &str,
+    login: &OidcLogin,
+    select: bool,
+) -> Result<()> {
+    let path = config_path(config_dir);
+    let mut doc = load_document(&path)?;
+    let connection = section_mut(&mut doc, "connection")?;
+    if !connection.is_empty() {
+        toml::Value::Table(connection.clone())
+            .try_into::<ConnectionSection>()
+            .context("refusing to overwrite malformed connection settings")?;
+    }
+    section_mut(connection, "logins")?.insert(uri.to_string(), toml::Value::try_from(login)?);
+    if select {
+        section_mut(connection, "wss")?.insert("uri".into(), toml::Value::String(uri.into()));
+    }
+    write_document(&path, &doc)
+}
+
 pub(crate) fn persist_connection_field(
     config_dir: &Path,
     leaf_path: &str,
@@ -1186,7 +1295,27 @@ pub(crate) fn persist_connection_field(
     let leaf = segments
         .pop()
         .ok_or_else(|| anyhow::Error::msg("empty connection field path"))?;
-    let mut prefix = vec!["connection", "wss"];
+    let selected_login = doc
+        .get("connection")
+        .and_then(|c| c.get("wss"))
+        .and_then(|w| w.get("uri"))
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned)
+        .filter(|uri| {
+            doc.get("connection")
+                .and_then(|c| c.get("logins"))
+                .and_then(|l| l.get(uri))
+                .is_some()
+        });
+    let mut prefix = if leaf_path.starts_with("tls.") {
+        if let Some(uri) = selected_login.as_deref() {
+            vec!["connection", "logins", uri]
+        } else {
+            vec!["connection", "wss"]
+        }
+    } else {
+        vec!["connection", "wss"]
+    };
     prefix.extend(segments);
     section_mut_path(&mut doc, &prefix)?.insert(leaf.to_string(), value);
     write_document(&path, &doc)
@@ -2863,5 +2992,126 @@ mod tests {
             reloaded.width, 30,
             "the env-injected width must not be written to disk"
         );
+    }
+}
+
+#[cfg(test)]
+mod login_tests {
+    use super::*;
+
+    fn login(token: &str) -> OidcLogin {
+        OidcLogin {
+            auth_provider: "oidc.corp".into(),
+            auth_token: token.into(),
+            enroll_url: "https://gateway.example/zeroclaw".into(),
+            expires_at: Some(2000000000),
+            tls: WssTlsSection {
+                ca_cert_path: "ca.pem".into(),
+                ..Default::default()
+            },
+            gateway_tls: WssTlsSection::default(),
+        }
+    }
+
+    #[test]
+    fn save_login_is_url_scoped_preserves_other_settings_and_redacts_debug() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = "wss://host:9781/a";
+        let b = "wss://host:9781/b";
+        std::fs::write(config_path(dir.path()), "[future]\nkeep = 'unchanged'\n").unwrap();
+        persist_oidc_login(dir.path(), a, &login("sentinel-a"), true).unwrap();
+        persist_oidc_login(dir.path(), b, &login("sentinel-b"), true).unwrap();
+        let cfg = load_persisted(dir.path()).unwrap();
+        assert_eq!(cfg.connection.wss.uri.as_deref(), Some(b));
+        assert_eq!(cfg.connection.logins.len(), 2);
+        assert_eq!(
+            cfg.connection.wss_for(Some(a)).auth_token.as_deref(),
+            Some("sentinel-a")
+        );
+        assert_eq!(
+            cfg.connection.wss_for(None).auth_token.as_deref(),
+            Some("sentinel-b")
+        );
+        let other = cfg.connection.wss_for(Some("wss://other:9781/"));
+        assert!(other.auth_token.is_none());
+        assert!(other.auth_provider.is_none());
+        assert!(other.tls.ca_cert_path.is_empty());
+        assert!(!format!("{:?}", cfg).contains("sentinel"));
+        let doc: toml::Table =
+            toml::from_str(&std::fs::read_to_string(config_path(dir.path())).unwrap()).unwrap();
+        assert_eq!(doc["future"]["keep"].as_str(), Some("unchanged"));
+        assert!(doc["connection"]["wss"].get("auth_token").is_none());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(config_path(dir.path()))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_connection_refuses_save_without_losing_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = "[connection]\nlogins = 7\n";
+        std::fs::write(config_path(dir.path()), original).unwrap();
+        assert!(persist_oidc_login(dir.path(), "wss://host/", &login("new-token"), true).is_err());
+        assert_eq!(
+            std::fs::read_to_string(config_path(dir.path())).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn route_ack_updates_login_not_legacy_wss() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = "wss://host:9781/";
+        persist_oidc_login(dir.path(), uri, &login("test-token"), true).unwrap();
+        persist_wss_route_ack(dir.path(), uri).unwrap();
+        let cfg = load_persisted(dir.path()).unwrap();
+        assert!(cfg.connection.wss_for(Some(uri)).tls.route_acked(uri));
+        assert!(cfg.connection.wss.tls.skip_verify_routes.is_empty());
+    }
+    #[test]
+    fn renewing_one_url_does_not_change_the_default_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = "wss://host:9781/a";
+        let b = "wss://host:9781/b";
+        persist_oidc_login(dir.path(), a, &login("old-a"), true).unwrap();
+        persist_oidc_login(dir.path(), b, &login("b-token"), true).unwrap();
+        persist_oidc_login(dir.path(), a, &login("new-a"), false).unwrap();
+        let cfg = load_persisted(dir.path()).unwrap();
+        assert_eq!(cfg.connection.wss.uri.as_deref(), Some(b));
+        assert_eq!(cfg.connection.logins[a].auth_token, "new-a");
+        assert_eq!(cfg.connection.logins[b].auth_token, "b-token");
+    }
+
+    #[test]
+    fn connection_editor_changes_the_selected_logins_tls() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = "wss://host:9781/";
+        persist_oidc_login(dir.path(), uri, &login("test-token"), true).unwrap();
+        persist_connection_field(dir.path(), "tls.skip_verify", toml::Value::Boolean(true))
+            .unwrap();
+        let cfg = load_persisted(dir.path()).unwrap();
+        assert!(cfg.connection.wss_for(None).tls.skip_verify);
+        assert!(!cfg.connection.wss.tls.skip_verify);
+    }
+
+    #[test]
+    fn invalid_saved_login_never_falls_back_to_another_principal() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config_path(dir.path()),
+            "[connection.logins.\"wss://host/\"]\nauth_token = 'token-without-provider'\n",
+        )
+        .unwrap();
+        let error = load_persisted(dir.path()).unwrap_err();
+        assert!(error.downcast_ref::<InvalidSavedLogin>().is_some());
     }
 }

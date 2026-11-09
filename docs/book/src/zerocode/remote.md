@@ -25,6 +25,77 @@ gives you only the certificate. A client with a certificate but no token
 completes the TLS handshake and is then refused with `AUTH_REQUIRED`
 (`-32010`).
 
+## Sign in with OIDC (recommended for OIDC deployments)
+
+An administrator must first configure an `[oidc.<alias>]` relationship and
+permission mappings on the daemon, enable its device authorization grant at
+the identity provider, and expose the gateway over HTTPS. The alias below is
+that daemon-side alias, not an identity-provider brand or issuer URL.
+
+```sh
+zerocode login corp wss://daemon.example.com:9781 \
+  --gateway-url https://gateway.example.com
+zerocode
+```
+
+For the standard ports, `zerocode login corp daemon.example.com` uses WSS
+port 9781, device-certificate enrollment port 9782, and the gateway at
+`https://daemon.example.com:42617`. The gateway itself does not supply HTTPS
+by default: use `--gateway-url` to name its TLS-terminating proxy. A gateway
+path prefix is supported. Plain HTTP is accepted only on loopback.
+
+Login handles the steps in order:
+
+1. Obtain a device certificate when one is missing. Enter the enrollment
+   pairing code and confirm the SAS against the daemon console, just as in
+   the enrollment flow below. OIDC does not bypass device admission.
+2. Verify both the WSS daemon and gateway TLS connections before sending a
+   device code or access token. The two peers keep separate trust settings.
+   Provide `--tls-ca-cert <pem>` for a private WSS CA and
+   `--gateway-ca-cert <pem>` for a private gateway CA. An untrusted certificate
+   offers an explicit skip-verification confirmation; declining or EOF aborts.
+   `--tls-skip-verify` still requires confirmation for each peer. Choosing
+   **always** remembers only that exact URL, not every URL on the host.
+3. Show the identity provider's verification URL and code. Approve the sign-in
+   in your browser. No identity-provider client secret is needed on the client.
+4. Initialize a real RPC connection with the returned access token. Only after
+   the daemon accepts it, save the login and select that URL as the default.
+   A failed login never replaces a previously saved login.
+
+Later, plain `zerocode` uses the selected login. To select a different saved
+login for one run, use `zerocode --connect wss://other.example.com:9781`.
+Each normalized **WSS URL**, including its port and path, has its own login;
+logging into a second URL does not overwrite the first URL's credentials.
+A complete `wss://` URL without an explicit port means standard WSS port 443;
+a bare hostname without a port means ZeroClaw's WSS port 9781.
+
+Tokens and expiry metadata live in
+`[connection.logins."wss://daemon.example.com:9781/"]` in the local
+`zerocode-config.toml`. They are stored **in plaintext**, never printed by
+login, and written atomically with owner-only permissions (`0600`, directory
+`0700` on Unix; protect the directory ACL on other platforms). Treat this file
+as a credential: do not commit or share it. Device certificates and private
+keys are isolated under `<config-dir>/connections/<url-sha256>/tls/` and use
+the existing crash-recoverable credential writer.
+
+Before starting the TUI, zerocode asks you to sign in again if the saved token
+is expired or the daemon rejects its authentication. It saves the replacement
+automatically. There is no refresh-token cache or silent background refresh;
+if a token expires during an active TUI session, restart zerocode to sign in
+again. You can also rerun `zerocode login corp <url>` explicitly. A saved
+custom gateway URL is reused when omitted on a subsequent login.
+
+`ZEROCLAW_AUTH_TOKEN` still overrides the selected token for a one-off run;
+login warns if that environment variable would shadow the token it just
+saved. Existing manually configured `[connection.wss]` credentials continue to
+work for connections without a saved URL login.
+
+Use `--config-dir` to select a separate client configuration directory.
+`--enroll` forces fresh device enrollment; `--enroll-host` and `--enroll-port`
+override its endpoint. If a device certificate was provisioned out of band,
+pass `--tls-client-cert` and `--tls-client-key` instead. Login currently targets
+a direct WSS URL; it does not log in through a relay-served dashboard.
+
 ## Enrollment (recommended)
 
 The first time you connect a certless client interactively, zerocode enrolls

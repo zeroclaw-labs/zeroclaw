@@ -322,7 +322,7 @@ impl ZerocodePane {
             double_click: crate::mouse::DoubleClickTracker::new(),
             conn: config::ensure_and_load(config_dir)
                 .ok()
-                .map(|c| c.connection.wss)
+                .map(|c| c.connection.wss_for(None))
                 .unwrap_or_default(),
             conn_cursor: 0,
             conn_edit: None,

@@ -4,9 +4,8 @@
 //! crate dependencies, so it enrolls through the gateway's cross-surface
 //! enrollment API (`/api/oidc/{alias}/device/*`), which proxies the
 //! RFC 8628 device grant with the `[oidc.<alias>]` entry's credentials.
-//! The resulting access token is held in memory for this session only
-//! and presented as `auth_token` in the RPC handshake; nothing is
-//! stored.
+//! The resulting access token is presented in the RPC handshake. The caller
+//! owns persistence: explicit `login` saves it, legacy enrollment does not.
 //!
 //! A device code travels out on this leg and a bearer token comes back, so
 //! it is held to the same transport rules as the WSS leg it precedes:
@@ -88,9 +87,30 @@ struct PollResponse {
     token: Option<PollToken>,
 }
 
-#[derive(Deserialize)]
-struct PollToken {
-    access_token: String,
+#[derive(Deserialize, PartialEq, Eq)]
+pub(crate) struct PollToken {
+    pub access_token: String,
+    #[serde(default)]
+    pub expires_in: Option<u64>,
+}
+
+impl std::fmt::Debug for PollToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PollToken")
+            .field("access_token", &"<redacted>")
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+impl From<&str> for PollToken {
+    fn from(token: &str) -> Self {
+        Self {
+            access_token: token.into(),
+            expires_in: None,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -106,7 +126,7 @@ struct GatewayError {
 /// token on the wire in the clear, or in a place they can be logged: a
 /// non-`https` scheme (except to a loopback gateway), embedded credentials,
 /// a query string, or a fragment.
-fn validate_enroll_url(base: &str) -> Result<String> {
+pub(crate) fn validate_enroll_url(base: &str) -> Result<String> {
     let url = url::Url::parse(base)
         .with_context(|| format!("the enrollment URL is not a valid URL: {base}"))?;
     let Some(host) = url.host() else {
@@ -164,6 +184,17 @@ impl GatewayEnrollment {
             base,
             http: builder.build()?,
         })
+    }
+
+    /// Credential-free TLS preflight. The enrollment routes still perform
+    /// their own validation; even a 404 suffices to prove this transport.
+    pub async fn probe(&self) -> Result<()> {
+        self.http
+            .get(format!("{}/api/oidc/providers", self.base))
+            .send()
+            .await
+            .context("cannot reach the gateway enrollment API")?;
+        Ok(())
     }
 
     async fn gateway_error(response: reqwest::Response) -> anyhow::Error {
@@ -252,7 +283,10 @@ impl GatewayEnrollment {
             .context("device poll response is not valid JSON")?;
         match poll.status.as_str() {
             "granted" => match poll.token {
-                Some(token) => Ok(DevicePoll::Granted(token.access_token)),
+                Some(token) if !token.access_token.trim().is_empty() => {
+                    Ok(DevicePoll::Granted(token))
+                }
+                Some(_) => bail!("gateway reported a grant with an empty token"),
                 None => bail!("gateway reported a grant without a token"),
             },
             "pending" => Ok(DevicePoll::Pending),
@@ -306,7 +340,7 @@ fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<u64> {
 /// `authorization_pending` differently, so the two must stay distinct.
 #[derive(PartialEq, Eq)]
 pub(crate) enum DevicePoll {
-    Granted(String),
+    Granted(PollToken),
     Pending,
     /// `retry_after` is the gateway's `Retry-After` in seconds when the
     /// throttling came from the gateway's own budget or lockout, and `None`
@@ -409,7 +443,7 @@ fn validate_device_start(start: &DeviceStart) -> Result<()> {
 async fn poll_until_granted(
     start: &DeviceStart,
     mut poll: impl AsyncFnMut(&str) -> Result<DevicePoll>,
-) -> Result<String> {
+) -> Result<PollToken> {
     validate_device_start(start)?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(start.expires_in);
     // RFC 8628's default interval is the floor, not one second: an advertised
@@ -490,7 +524,7 @@ pub(crate) async fn run_device_flow(
     alias: &str,
     on_prompt: impl Fn(&DeviceStart),
     consent: impl FnOnce(&str) -> Result<()>,
-) -> Result<String> {
+) -> Result<PollToken> {
     let gateway = GatewayEnrollment::new(base, tls)?;
     // The device code goes out on this leg and the access token comes back
     // on it. If nothing checks the certificate, the operator decides that
@@ -591,7 +625,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(token, "at-enrolled");
+        assert_eq!(token.access_token, "at-enrolled");
         assert!(!asked, "a verified leg presents nothing to confirm");
     }
 
@@ -620,7 +654,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(token, "at-enrolled");
+        assert_eq!(token.access_token, "at-enrolled");
         assert!(!asked, "plain http on loopback carries no certificate");
     }
 
@@ -714,7 +748,10 @@ mod tests {
         );
         assert_eq!(
             gateway.device_poll("corp", "done").await.unwrap(),
-            DevicePoll::Granted("at-tui".into())
+            DevicePoll::Granted(PollToken {
+                access_token: "at-tui".into(),
+                expires_in: Some(3600)
+            })
         );
     }
 
@@ -1034,7 +1071,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(token, "tok");
+        assert_eq!(token.access_token, "tok");
         assert_eq!(calls.get(), 2);
         assert_eq!(began.elapsed(), Duration::from_secs(15));
     }
@@ -1061,7 +1098,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(token, "tok");
+        assert_eq!(token.access_token, "tok");
         assert_eq!(calls.get(), 2);
         // 5s to the throttled poll, then the gateway's own 300s.
         assert_eq!(began.elapsed(), Duration::from_secs(305));
@@ -1109,7 +1146,7 @@ mod tests {
             })
             .await
             .unwrap();
-            assert_eq!(token, "tok");
+            assert_eq!(token.access_token, "tok");
             assert_eq!(calls.get(), 2);
             assert_eq!(
                 began.elapsed(),
@@ -1145,7 +1182,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(token, "tok");
+        assert_eq!(token.access_token, "tok");
         assert_eq!(calls.get(), 3);
         // 5s to each of the two refusals and 5s to the grant.
         assert_eq!(began.elapsed(), Duration::from_secs(15));
@@ -1172,7 +1209,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(token, "tok");
+        assert_eq!(token.access_token, "tok");
         assert_eq!(calls.get(), 4);
         // 5 to the slow_down, 10 to the refusal, the gateway's own 30 to the
         // pending poll, then back to the 10s cadence rather than 30.
@@ -1197,7 +1234,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(token, "tok");
+        assert_eq!(token.access_token, "tok");
         assert_eq!(began.elapsed(), Duration::from_secs(60));
     }
 
@@ -1246,7 +1283,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(token, "tok");
+        assert_eq!(token.access_token, "tok");
         assert_eq!(calls.get(), 2 * MAX_CONSECUTIVE_UNAVAILABLE - 1);
     }
 

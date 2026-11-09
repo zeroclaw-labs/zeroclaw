@@ -375,8 +375,12 @@ it refuses an advertised lifetime above one hour or a polling interval
 above five minutes rather than sleeping on a hostile answer. An
 advertised interval of `0` or `1` is floored at RFC 8628's five-second
 default, so a gateway answer cannot put zerocode on a once-a-second
-poll the per-client budget would only refuse. The token it receives is
-held in memory for that session only.
+poll the per-client budget would only refuse. The legacy automatic enrollment
+path holds the token in memory for that session only. For URL-scoped persistent login, use
+`zerocode login <alias> <wss-url> --gateway-url <https-origin>`; see
+[Remote setup](../zerocode/remote.md#sign-in-with-oidc-recommended-for-oidc-deployments).
+That command saves the accepted access token in the owner-only local
+`zerocode-config.toml` and re-enrolls when a later startup needs a fresh token.
 
 ## Permission profiles
 

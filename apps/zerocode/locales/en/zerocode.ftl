@@ -900,3 +900,15 @@ zc-config-setup-required-missing = missing
 zc-config-setup-no-filter-matches = No matches. Clear filter.
 
 zc-chat-tool-question = question
+
+# URL-scoped remote OIDC login
+zc-login-invalid-target = Expected a WSS URL without credentials, query, or fragment, or a hostname (default port 9781).
+zc-login-invalid-provider = Expected an OIDC alias of 1–64 letters, digits, underscores or hyphens, starting with a letter or digit.
+zc-login-tls-aborted = Login aborted: unverified TLS was not accepted. No login was saved.
+zc-login-connect-timeout = The remote connection did not complete within 30 seconds.
+zc-login-untrusted = Certificate verification failed for { $url }. Provide --tls-ca-cert to verify it, or explicitly accept an unverified connection below.
+zc-login-rejected = The daemon did not accept this OIDC login; the previous saved login was not replaced.
+zc-login-saved = Signed in to { $url }. Saved the login in { $path }. Run zerocode to connect; no auth token flags are needed.
+zc-login-env-shadow = ZEROCLAW_AUTH_TOKEN is set and will override this saved login. Unset it to use the saved token.
+zc-login-expired = Your saved OIDC login has expired. Sign in again to continue; the replacement token will be saved automatically.
+zc-login-conflicting-route = Login takes its destination as a positional URL; do not combine it with --connect or --relay.
