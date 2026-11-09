@@ -60,7 +60,7 @@ class Fixture:
                         self.reply(fixture.patch_status, {"value": fixture.token})
                 elif self.path == "/api/config/reload-status":
                     self.reply(503 if fixture.fail_status else 200, {"pending_reload": True})
-                elif self.path == "/api/sessions/running":
+                elif self.path == "/api/sessions/running?activity_only=true":
                     data = ({"sessions": [], "busy": True} if fixture.active
                             else fixture.running.pop(0) if fixture.running else {"sessions": [], "busy": False})
                     if "message" not in data and "busy" not in data:
@@ -239,7 +239,7 @@ class ConfigControlTest(unittest.TestCase):
         bridge.write_job(job, {"requested_at": time.time(), "state": "waiting_for_idle"})
         with patch.object(bridge, "pending_writes", side_effect=[True, False, False]), patch.object(bridge.time, "sleep"):
             bridge.run_reload(self.gateway, job, idle_seconds=0)
-        self.assertEqual([call[1] for call in self.fixture.calls], ["/api/sessions/running"] * 3 + ["/admin/reload"])
+        self.assertEqual([call[1] for call in self.fixture.calls], ["/api/sessions/running?activity_only=true"] * 3 + ["/admin/reload"])
 
     def test_write_worker_retries_read_probe_but_not_the_mutation(self):
         job = self.root / "write-fixture.json"
@@ -373,6 +373,15 @@ class ConfigControlTest(unittest.TestCase):
                 with self.assertRaises(bridge.BridgeError):
                     self.control.call("set", {"path": "fixture.limit", "value": 200})
         self.assertEqual(self.fixture.patches, [])
+
+    def test_activity_probe_ignores_stale_persisted_running_sessions(self):
+        # Old daemons may ignore the projection query and include a stale list.
+        # Only the live coordinator's typed busy signal decides idle.
+        self.fixture.running = [{"sessions": [{"session_id": "stale"}], "busy": False}]
+        self.assertFalse(bridge.sessions_busy(self.gateway))
+        self.assertEqual(self.fixture.calls[-1][1], "/api/sessions/running?activity_only=true")
+        self.fixture.active = True
+        self.assertTrue(bridge.sessions_busy(self.gateway))
 
     def test_completed_retention_is_bounded_and_preserves_all_active_jobs(self):
         directory = self.root / "jobs"

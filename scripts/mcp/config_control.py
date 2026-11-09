@@ -116,7 +116,7 @@ TOOLS = [
          {"path": {"type": "string", "minLength": 1}}, ["path"], True),
     tool("create_alias", "Create a named configuration entry. During an active conversation the request is queued, not saved yet; finish your reply so the worker can apply it after idle. Check status in a later turn before setting fields on a queued new alias.",
          {"path": {"type": "string", "minLength": 1}, "key": {"type": "string", "minLength": 1}}, ["path", "key"]),
-    tool("set", "Set one typed configuration value. If any native conversation is running, this returns queued=true, saved=false and a job id: finish your reply so the change can run after idle. Do not wait or poll for it inside the same turn. Check status/read back in a later turn. Request reload separately if needed. Never blindly repeat an uncertain write.",
+    tool("set", "Set one typed leaf configuration property discovered with list. For named entries such as MCP servers, use create_alias first, then set individual fields; do not assign a whole server object or JSON string to its alias path. If any native conversation is running, this returns queued=true, saved=false and a job id: finish your reply so the change can run after idle. Do not wait or poll for it inside the same turn. Check status/read back in a later turn. Request reload separately if needed. Never blindly repeat an uncertain write.",
          {"path": {"type": "string", "minLength": 1}, "value": {}}, ["path", "value"]),
     tool("patch", "Submit an atomic configuration patch. Paths may be dotted or JSON Pointer; use test operations for concurrency protection. During an active conversation this returns queued=true, saved=false: finish your reply and inspect status in a later turn. Do not poll inside the requesting turn. Validation occurs when the queued patch runs; rejected batches change nothing. Never blindly retry an uncertain write.",
          {"operations": {"type": "array", "minItems": 1, "maxItems": 256, "items": {
@@ -143,7 +143,7 @@ def write_job(path, body):
 
 
 def sessions_busy(gateway):
-    running = gateway.request("GET", "/api/sessions/running")
+    running = gateway.request("GET", "/api/sessions/running?activity_only=true")
     # Missing on older daemons: their session list only covers WebSocket
     # persistence and cannot establish idle for channel or RPC callers.
     if not isinstance(running, dict) or type(running.get("busy")) is not bool:

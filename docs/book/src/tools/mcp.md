@@ -49,6 +49,8 @@ argument if the gateway's address or path prefix changes.
 The script uses Python's standard library and needs no pip packages. It is
 separate from the Cargo binary: copy it to a stable local application directory,
 or keep its checkout path available, before configuring the MCP command.
+Refresh a separately installed copy when updating the checkout; rebuilding the
+Cargo binary does not update that copy.
 
 It exposes `list`, `get`, `create_alias`, `set`, `patch`, `status` and `reload`, namespaced by
 the MCP server name. Reads use the API's masked property metadata. Mutations
@@ -57,7 +59,9 @@ return saved paths rather than submitted values. `patch` accepts the gateway's
 Pointers. A `test` operation can protect a read-modify-write change from a
 concurrent editor. Use `create_alias` to create a named MCP server or another
 entry that requires the gateway's explicit map-key operation before setting
-its fields. Lost mutation responses are reported as uncertain and are
+its fields. Set leaf properties such as `mcp.servers.filesystem.command` and
+`mcp.servers.filesystem.args`; a server alias path is not a writable whole-object
+property. Lost mutation responses are reported as uncertain and are
 never retried automatically; read the current value before deciding what to do.
 
 Create a dedicated paired device using the existing gateway pairing controls,
@@ -113,7 +117,9 @@ Saving and applying are separate. `status` reports the gateway's canonical
 application/reload status and recent write/reload requests. `reload` starts a
 local worker outside the MCP call, waits for pending writes and 15 seconds of
 idle, then requests `POST /admin/reload`. Idle detection reads the runtime admission coordinator across channel, web and
-RPC callers, including admission in progress. It is a point-in-time check rather
+RPC callers, including admission in progress. It uses
+`GET /api/sessions/running?activity_only=true` so probing idle does not load or
+reduce conversation history. It is a point-in-time check rather
 than an admission lock,
 and does not prove that every outbound voice delivery has completed. Clients
 can still reconnect during reload. Requests fail after five minutes without
