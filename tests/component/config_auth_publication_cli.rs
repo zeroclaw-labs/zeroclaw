@@ -1875,6 +1875,54 @@ fn user_remove_of_an_entry_the_daemon_never_loaded_is_saved_to_the_file() {
     daemon.probe();
 }
 
+/// The mirror case: an entry removed from config.toml by hand still binds
+/// its credentials in the running daemon until a reload, and the daemon's
+/// save refuses to remove what the file no longer carries. The command says
+/// the daemon still holds the entry, rather than that there is none, and
+/// changes nothing; a name neither holds is still reported missing.
+#[test]
+fn user_remove_of_an_entry_only_the_daemon_still_holds_is_refused() {
+    let fixture = Fixture::new("admin");
+    let unedited = fixture.config_text();
+    let uid = fixture.other_uid();
+    fixture.write_config_text(&format!(
+        "{unedited}\n[users.bob]\nuid = {uid}\npermission_profiles = [\"reader\"]\n"
+    ));
+    let daemon = Daemon::start(&fixture);
+    fixture.write_config_text(&unedited);
+
+    let output = run_cli(&fixture, &["user", "remove", "bob"], None);
+    assert!(
+        !output.status.success(),
+        "a removal the daemon cannot save must fail\n{}",
+        describe(&output)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("still holds it"),
+        "stderr must say the daemon still holds the entry\n{}",
+        describe(&output)
+    );
+    assert_eq!(
+        fixture.config_text(),
+        unedited,
+        "a refused edit must leave config.toml byte-identical"
+    );
+    let mut probe = daemon.probe();
+    probe
+        .config_get("users.bob.uid")
+        .unwrap_or_else(|error| panic!("the daemon still holds users.bob: {error}"));
+
+    let output = run_cli(&fixture, &["user", "remove", "carol"], None);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success()
+            && stderr.contains("users.carol")
+            && !stderr.contains("still holds"),
+        "a name neither the file nor the daemon holds is reported missing\n{}",
+        describe(&output)
+    );
+}
+
 /// The command decides from config.toml that the name is free, but the
 /// daemon still holds an entry by that name, removed by hand since it
 /// started. Committing would merge into that entry and keep its other

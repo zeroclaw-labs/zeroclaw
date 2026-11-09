@@ -15954,7 +15954,9 @@ async fn handle_user_command(user_command: UserCommands, config: &Config) -> Res
         }
         UserCommands::Remove { name } => {
             let mut edit = RosterEdit::begin(config)?;
-            roster_entry(&mut edit.config, &name)?;
+            if !edit.config.users.contains_key(&name) {
+                return Err(Box::pin(edit.missing_entry(&name)).await);
+            }
             edit.config
                 .delete_map_key("users", &name)
                 .map_err(anyhow::Error::msg)?;
@@ -16060,13 +16062,30 @@ fn roster_entry<'a>(
     config: &'a mut Config,
     name: &str,
 ) -> Result<&'a mut zeroclaw_config::schema::UserConfig> {
-    config.users.get_mut(name).ok_or_else(|| {
-        anyhow::Error::msg(ta(
-            "cli-user-not-found",
-            &[("name", name)],
-            format!("There is no [users.{name}] entry."),
-        ))
-    })
+    config
+        .users
+        .get_mut(name)
+        .ok_or_else(|| user_not_found(name))
+}
+
+#[cfg(feature = "agent-runtime")]
+fn user_not_found(name: &str) -> anyhow::Error {
+    anyhow::Error::msg(ta(
+        "cli-user-not-found",
+        &[("name", name)],
+        format!("There is no [users.{name}] entry."),
+    ))
+}
+
+#[cfg(feature = "agent-runtime")]
+fn live_entry_exists(name: &str) -> anyhow::Error {
+    anyhow::Error::msg(ta(
+        "cli-user-live-entry-exists",
+        &[("name", name)],
+        format!(
+            "users.{name} is not in config.toml, but the running daemon still holds it: a change waits for a reload. Restart the daemon, then run the command again."
+        ),
+    ))
 }
 
 /// The `config/set-many` writes that author the roster entry `name` as
@@ -16173,18 +16192,9 @@ impl RosterEdit {
         let Some((name, in_file)) = &self.daemon_premise else {
             return Ok(());
         };
-        let live = match Box::pin(config_publication::live_map_keys(&self.config, "users")).await {
-            config_publication::LiveMapKeys::NoDaemon => return Ok(()),
-            config_publication::LiveMapKeys::Keys(keys) => keys,
-            config_publication::LiveMapKeys::Unread { detail } => bail!(ta(
-                "cli-user-live-roster-unread",
-                &[("name", name), ("detail", &detail)],
-                format!(
-                    "The running daemon would not show this command its roster ({detail}), so users.{name} could not be checked there and nothing was written. Run the command as an account the daemon grants config read."
-                ),
-            )),
+        let Some(live_has_it) = Box::pin(self.daemon_holds(name)).await? else {
+            return Ok(());
         };
-        let live_has_it = live.iter().any(|key| key == name);
         if live_has_it == *in_file {
             return Ok(());
         }
@@ -16198,13 +16208,7 @@ impl RosterEdit {
             ));
         }
         if live_has_it {
-            bail!(ta(
-                "cli-user-live-entry-exists",
-                &[("name", name)],
-                format!(
-                    "users.{name} is not in config.toml, but the running daemon still holds it: a change waits for a reload. Restart the daemon, then run the command again."
-                ),
-            ));
+            return Err(live_entry_exists(name));
         }
         bail!(ta(
             "cli-user-live-entry-missing",
@@ -16213,6 +16217,40 @@ impl RosterEdit {
                 "users.{name} is in config.toml, but the running daemon has not loaded it: a change waits for a reload. Restart the daemon, then run the command again."
             ),
         ))
+    }
+
+    /// Whether the daemon serving this configuration holds the roster entry
+    /// `name`, or `None` when no daemon would take an edit from this command.
+    /// A daemon that binds this caller but will not show it the roster could
+    /// still take a commit unseen, so the edit refuses.
+    async fn daemon_holds(&self, name: &str) -> Result<Option<bool>> {
+        match Box::pin(config_publication::live_map_keys(&self.config, "users")).await {
+            config_publication::LiveMapKeys::NoDaemon => Ok(None),
+            config_publication::LiveMapKeys::Keys(keys) => {
+                Ok(Some(keys.iter().any(|key| key == name)))
+            }
+            config_publication::LiveMapKeys::Unread { detail } => bail!(ta(
+                "cli-user-live-roster-unread",
+                &[("name", name), ("detail", &detail)],
+                format!(
+                    "The running daemon would not show this command its roster ({detail}), so users.{name} could not be checked there and nothing was written. Run the command as an account the daemon grants config read."
+                ),
+            )),
+        }
+    }
+
+    /// Why `remove` refuses `name`, which config.toml does not have. A
+    /// running daemon can still hold the entry, removed by hand since it
+    /// started, and bind its credentials until a reload: the command says so
+    /// rather than that there is no such entry. It cannot delete the entry
+    /// through that daemon, whose save refuses to remove what the file no
+    /// longer carries, so a restart is what ends those bindings.
+    async fn missing_entry(&self, name: &str) -> anyhow::Error {
+        match Box::pin(self.daemon_holds(name)).await {
+            Ok(Some(true)) => live_entry_exists(name),
+            Ok(Some(false) | None) => user_not_found(name),
+            Err(unread) => unread,
+        }
     }
 
     /// Check the edited roster, and the daemon's roster again against what
@@ -19585,6 +19623,19 @@ mod tests {
             .expect_err("an edit whose roster could not be read must not go ahead")
             .to_string();
         assert!(message.contains("users.bob"), "{message}");
+
+        // `remove` of a name the file lacks asks the daemon whether it still
+        // holds one, and an unread roster is not an absent entry.
+        let removal = Box::pin(handle_user_command(
+            UserCommands::Remove { name: "bob".into() },
+            &config,
+        ))
+        .await;
+        let message = removal
+            .expect_err("a removal whose roster could not be read must not go ahead")
+            .to_string();
+        assert!(message.contains("users.bob"), "{message}");
+        assert_ne!(message, user_not_found("bob").to_string());
     }
 
     /// The daemon's roster is checked before the password prompt, and

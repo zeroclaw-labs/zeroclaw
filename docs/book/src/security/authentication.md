@@ -382,7 +382,8 @@ refuses the edit, because its principal lacks the config grant the method
 needs (`update` for `add` and `passwd`, `delete` for `disable-password`
 and `remove`), or rejects it, the command fails and writes nothing. `add`,
 `passwd`, and `disable-password` also need `read`, to compare the daemon's
-roster first, as described next.
+roster first, and so does `remove` of an entry `config.toml` no longer has,
+as described next.
 
 The command decides from `config.toml` whether the entry exists, but the
 daemon applies the edit to the roster it holds, and the two differ while a
@@ -395,7 +396,11 @@ writer added or removed through the daemon while the prompt was open. A
 daemon that identifies the caller but will not show it the roster refuses
 the edit too, since it could take the commit unseen.
 `remove` of an entry the daemon never loaded leaves the daemon nothing to
-delete, so the command removes it from the file itself.
+delete, so the command removes it from the file itself. `remove` of an entry
+`config.toml` no longer has but the daemon still holds, such as one removed
+by hand since the daemon started, is refused with a message saying so, since
+the daemon's save will not remove what the file no longer carries; the
+entry's credentials stay bound until the daemon is restarted.
 
 Each command checks the edited roster, permission profiles, and OIDC
 entries as one authorization policy before it asks for a password and again
