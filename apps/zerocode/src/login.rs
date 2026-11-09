@@ -96,6 +96,24 @@ fn certificate_usable(section: &config::WssTlsSection) -> bool {
             .is_some()
 }
 
+/// Decide whether login must issue a separate generation.
+///
+/// `Ok(true)` means the saved certificate will not be reused. The previous
+/// directory is left unchanged, including a published manifest that no longer
+/// matches a deleted or damaged `client.crt`. `Ok(false)` means that generation
+/// was validated and may be reused. A mixed set is still refused on that path.
+fn prepare_generation_for_login(
+    credentials: &Path,
+    section: &config::WssTlsSection,
+    force_enroll: bool,
+) -> Result<bool> {
+    if force_enroll || !certificate_usable(section) {
+        return Ok(true);
+    }
+    enroll::recover_and_validate(credentials)?;
+    Ok(false)
+}
+
 /// Own only the candidate generation until authentication succeeds. The config's
 /// atomic path swap selects a generation; no login attempt overwrites one that
 /// another process or the previous saved login may still be using.
@@ -317,9 +335,12 @@ async fn authenticate(
             .saturating_add(i64::try_from(seconds).unwrap_or(i64::MAX))
     });
     let credentials = active_credential_dir(config_dir, uri, section)?;
-    enroll::recover_and_validate(&credentials)?;
+    // Replacement stages a new generation and must not validate or rewrite the
+    // previous one. A missing or damaged certificate fails the published
+    // manifest, and that refusal would otherwise block the replacement.
+    let replacing = prepare_generation_for_login(&credentials, section, force_enroll)?;
     let mut generation = None;
-    if force_enroll || !certificate_usable(section) {
+    if replacing {
         let replace_managed_ca = section.ca_cert_path.is_empty()
             || Path::new(&section.ca_cert_path) == credentials.join("tls/ca.crt");
         let staged = new_generation(config_dir, uri)?;
@@ -424,7 +445,6 @@ pub(crate) async fn run(args: &LoginArgs, cli: &Cli, config_dir: &Path) -> Resul
         gateway_section.skip_verify = cli.tls_skip_verify;
     }
     let credentials = active_credential_dir(config_dir, &uri, &section)?;
-    enroll::recover_and_validate(&credentials)?;
     apply_tls_overrides(&mut section, cli)?;
     for (value, name) in [
         (&mut section.ca_cert_path, "ca.crt"),
@@ -484,14 +504,14 @@ pub(crate) async fn renew_expired(
     if std::env::var("ZEROCLAW_AUTH_TOKEN").is_ok_and(|token| !token.is_empty()) {
         return Ok(());
     }
-    enroll::recover_and_validate(&active_credential_dir(config_dir, &uri, &login.tls)?)?;
     let mut section = login.tls.clone();
     apply_tls_overrides(&mut section, cli)?;
+    let credentials = active_credential_dir(config_dir, &uri, &login.tls)?;
     if !force
-        && certificate_usable(&section)
         && login
             .expires_at
             .is_none_or(|expiry| expiry > chrono::Utc::now().timestamp().saturating_add(30))
+        && !prepare_generation_for_login(&credentials, &section, false)?
     {
         loaded.connection.wss.tls = section;
         return Ok(());
@@ -727,6 +747,95 @@ mod tests {
         assert!(!certificate_usable(&section));
         std::fs::write(&cert, "invalid certificate").unwrap();
         assert!(!certificate_usable(&section));
+    }
+
+    #[test]
+    fn a_damaged_certificate_can_be_replaced_without_changing_the_old_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = "wss://daemon.example/rpc";
+        let generation = credential_dir(dir.path(), uri).join("generations/login-old");
+        let tls = generation.join("tls");
+        std::fs::create_dir_all(&tls).unwrap();
+        let digest = "ab".repeat(32);
+        std::fs::write(
+            tls.join("published.manifest"),
+            format!(
+                "zerocode-published-v1\n{digest} client.crt\n{digest} ca.crt\n{digest} client.key\n{digest} profile.json\n"
+            ),
+        )
+        .unwrap();
+        for (name, bytes) in [
+            ("ca.crt", &b"ca"[..]),
+            ("client.key", &b"key"[..]),
+            ("profile.json", &b"{}"[..]),
+        ] {
+            std::fs::write(tls.join(name), bytes).unwrap();
+        }
+        let cert = tls.join("client.crt");
+        std::fs::write(&cert, b"damaged-cert").unwrap();
+        let before = std::fs::read(&cert).unwrap();
+        let manifest = std::fs::read(tls.join("published.manifest")).unwrap();
+        let section = config::WssTlsSection {
+            client_cert_path: cert.display().to_string(),
+            client_key_path: tls.join("client.key").display().to_string(),
+            ..Default::default()
+        };
+
+        let refused = enroll::recover_and_validate(&generation).unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("published credential set is inconsistent"),
+            "reuse must still refuse the damaged generation: {refused:#}"
+        );
+        assert!(
+            prepare_generation_for_login(&generation, &section, false).unwrap(),
+            "login must be allowed to stage a replacement"
+        );
+        assert!(
+            prepare_generation_for_login(&generation, &section, true).unwrap(),
+            "explicit enrollment must not be blocked by the old manifest"
+        );
+        assert_eq!(std::fs::read(&cert).unwrap(), before);
+        assert_eq!(
+            std::fs::read(tls.join("published.manifest")).unwrap(),
+            manifest
+        );
+        assert_eq!(std::fs::read(tls.join("client.key")).unwrap(), b"key");
+    }
+
+    #[test]
+    fn a_mixed_usable_certificate_is_still_refused_for_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let tls = dir.path().join("tls");
+        std::fs::create_dir_all(&tls).unwrap();
+        let cert = tls.join("client.crt");
+        let key = tls.join("client.key");
+        let pair = rcgen::KeyPair::generate().unwrap();
+        std::fs::write(&key, pair.serialize_pem()).unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2999, 1, 1);
+        std::fs::write(&cert, params.self_signed(&pair).unwrap().pem()).unwrap();
+        let digest = "cd".repeat(32);
+        std::fs::write(
+            tls.join("published.manifest"),
+            format!(
+                "zerocode-published-v1\n{digest} client.crt\n{digest} ca.crt\n{digest} client.key\n{digest} profile.json\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(tls.join("ca.crt"), b"ca").unwrap();
+        std::fs::write(tls.join("profile.json"), b"{}").unwrap();
+        let before = std::fs::read(&cert).unwrap();
+        let section = config::WssTlsSection {
+            client_cert_path: cert.display().to_string(),
+            client_key_path: key.display().to_string(),
+            ..Default::default()
+        };
+
+        assert!(certificate_usable(&section));
+        assert!(prepare_generation_for_login(dir.path(), &section, false).is_err());
+        assert!(prepare_generation_for_login(dir.path(), &section, true).unwrap());
+        assert_eq!(std::fs::read(&cert).unwrap(), before);
     }
 
     #[test]

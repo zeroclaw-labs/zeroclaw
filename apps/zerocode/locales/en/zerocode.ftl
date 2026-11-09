@@ -922,3 +922,4 @@ zc-login-stage-credentials = Could not stage replacement device credentials; the
 
 # apps/zerocode/src/config/mod.rs. Shared by login, startup renewal, and every other config save.
 zc-config-save-lock-timeout = Another process is saving { $config } and still holds { $lock } after { $seconds }s. Let the other zerocode finish saving, then try again.
+zc-config-invalid-saved-login = Saved login configuration is invalid. Zerocode will not use a different login's credentials.

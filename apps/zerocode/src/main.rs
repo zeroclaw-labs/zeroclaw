@@ -896,7 +896,10 @@ async fn run() -> anyhow::Result<()> {
     let local_config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
     let loaded_config = match config::ensure_and_load(&local_config_dir) {
         Ok(cfg) => cfg,
-        Err(e) if e.downcast_ref::<config::InvalidSavedLogin>().is_some() => return Err(e),
+        Err(e) if e.downcast_ref::<config::InvalidSavedLogin>().is_some() => {
+            i18n::init_from_config_dir(&local_config_dir);
+            return Err(e);
+        }
         Err(e) => {
             eprintln!("zerocode: config load failed ({e:#}); starting with defaults");
             config::ZerocodeConfig::default()

@@ -280,7 +280,7 @@ pub(crate) struct InvalidSavedLogin(anyhow::Error);
 
 impl std::fmt::Display for InvalidSavedLogin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("invalid saved login configuration; refusing credential fallback")
+        f.write_str(&crate::i18n::t("zc-config-invalid-saved-login"))
     }
 }
 impl std::error::Error for InvalidSavedLogin {
@@ -3358,6 +3358,9 @@ mod login_tests {
         .unwrap();
         let error = load_persisted(dir.path()).unwrap_err();
         assert!(error.downcast_ref::<InvalidSavedLogin>().is_some());
+        let rendered = error.to_string();
+        assert_eq!(rendered, crate::i18n::t("zc-config-invalid-saved-login"));
+        assert_ne!(rendered, "{zc-config-invalid-saved-login}");
     }
 
     fn held_login_document() -> String {
