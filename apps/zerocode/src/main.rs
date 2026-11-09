@@ -885,7 +885,7 @@ async fn run() -> anyhow::Result<()> {
     // A missing file is created with defaults inside `ensure_and_load`. An
     // existing file that cannot be read or parsed must not fall back: defaults
     // have no saved remote connection, so the next step would talk to (or
-    // spawn) a local daemon instead of the operator's chosen target (#12330).
+    // spawn) a local daemon instead of the operator's chosen target.
     let loaded_config = config::ensure_and_load(&local_config_dir)
         .map_err(|e| anyhow::Error::msg(format!("config load failed ({e:#})")))?;
     let active_theme = loaded_config.resolve_theme().unwrap_or_else(|e| {
