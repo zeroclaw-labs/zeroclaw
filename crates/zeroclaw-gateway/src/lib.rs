@@ -768,25 +768,6 @@ impl GatewaySupervision {
         self.dashboard_ingress = Some(ingress);
         self
     }
-}
-
-/// The relay-forwarded dashboard connections one gateway generation
-/// serves. Waits forever when it has none attached, or once a later
-/// generation has taken over and every connection queued here is served.
-struct DashboardFeed(Option<zeroclaw_runtime::relay_dashboard::DashboardIngressReceiver>);
-
-impl DashboardFeed {
-    async fn next(&mut self) -> zeroclaw_runtime::relay_dashboard::DashboardConn {
-        loop {
-            match &mut self.0 {
-                Some(receiver) => match receiver.recv().await {
-                    Some(conn) => return conn,
-                    None => self.0 = None,
-                },
-                None => std::future::pending::<()>().await,
-            }
-        }
-    }
 
     /// Run as the standalone `zeroclaw gateway` command, without a daemon
     /// generation. Plugin webhooks forward to the daemon listening on the
@@ -850,6 +831,26 @@ impl DashboardFeed {
             plugin_webhooks: PluginWebhookSource::Daemon { socket_path },
             authority,
             sop_driver_handles: None,
+            dashboard_ingress: None,
+        }
+    }
+}
+
+/// The relay-forwarded dashboard connections one gateway generation
+/// serves. Waits forever when it has none attached, or once a later
+/// generation has taken over and every connection queued here is served.
+struct DashboardFeed(Option<zeroclaw_runtime::relay_dashboard::DashboardIngressReceiver>);
+
+impl DashboardFeed {
+    async fn next(&mut self) -> zeroclaw_runtime::relay_dashboard::DashboardConn {
+        loop {
+            match &mut self.0 {
+                Some(receiver) => match receiver.recv().await {
+                    Some(conn) => return conn,
+                    None => self.0 = None,
+                },
+                None => std::future::pending::<()>().await,
+            }
         }
     }
 }
