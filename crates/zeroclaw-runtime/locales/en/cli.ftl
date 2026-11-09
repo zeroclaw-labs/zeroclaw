@@ -498,6 +498,21 @@ channel-telegram-unauthorized-allowlist =
 
     After the operator authorizes it, send your message again.
 
+# Owner heads-up for a turned-away unauthorized sender — delivered to the
+# channel's configured `owner_chat_id` (typically the operator's DM with the
+# bot), because the public stub reaches the sender while a group stub is all
+# bystanders see, and without this the operator learns about unapproved
+# callers only from the logs.
+channel-telegram-unauthorized-owner-notice =
+    ⚠️ Unauthorized message turned away.
+
+    Sender: { $identity }
+    Chat: { $chat }
+    Preview: { $preview }
+
+    Authorize with: { $bindCommand }
+    or add the sender to peer_groups.telegram_{ $alias }.external_peers.
+
 # Onboarding — OpenAI auth picker
 onboard-openai-auth-note =
     OpenAI authentication:
