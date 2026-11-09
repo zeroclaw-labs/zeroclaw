@@ -95,8 +95,10 @@ Tokens and expiry metadata live in
 `[connection.logins."wss://daemon.example.com:9781/"]` in the local
 `zerocode-config.toml`. They are stored **in plaintext**, never printed by
 login, and written atomically with owner-only permissions (`0600`, directory
-`0700` on Unix; protect the directory ACL on other platforms). Treat this file
-as a credential: do not commit or share it. Device certificates and private
+`0700` on Unix; protect the directory ACL on other platforms). Saves of that
+file, including startup renewal, are serialized, so two logins that share a
+config directory cannot erase each other's URL. Treat this file as a
+credential: do not commit or share it. Device certificates and private
 keys are isolated under
 `<config-dir>/connections/<url-sha256>/generations/<generation>/tls/` and use
 the existing crash-recoverable credential writer. The saved certificate path
