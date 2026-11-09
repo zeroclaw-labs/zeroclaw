@@ -9,6 +9,7 @@ pub mod fs;
 pub mod git;
 pub mod local;
 pub mod locales;
+pub mod orphans;
 pub mod session;
 pub mod subscription;
 pub mod transport;

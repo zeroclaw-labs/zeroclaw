@@ -1,5 +1,6 @@
 import { useLocation } from 'react-router-dom';
 import { basePath } from '../../lib/basePath';
+import { navAccessFor, pathAccess } from '../../lib/navAccess';
 import { findActiveNavPath } from './sidebarNav';
 import { railAsideStyle, railLinkClassName, railNavClassName } from './sidebarRail';
 import { SidebarNavLink } from './SidebarNavLink';
@@ -26,6 +27,7 @@ import { t } from '@/lib/i18n';
 import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { getStatus } from '@/lib/api';
+import { useAuth } from '@/hooks/useAuth';
 import { useVersionCheck } from '@/hooks/useVersionCheck';
 import { UpgradeDialog } from '@/components/UpgradeDialog';
 import type { StatusResponse } from '@/types/api';
@@ -327,6 +329,14 @@ interface SidebarProps {
 export default function Sidebar({ open, onClose }: SidebarProps) {
   const { pathname } = useLocation();
   const activePath = findActiveNavPath(pathname, navPaths);
+  // Only destinations the signed-in account can use; everything when paired.
+  const access = navAccessFor(useAuth().session);
+  const visibleGroups = navGroups
+    .map((group) => ({
+      ...group,
+      items: group.items.filter((item) => pathAccess(item.to, access) === 'allowed'),
+    }))
+    .filter((group) => group.items.length > 0);
   const [status, setStatus] = useState<StatusResponse | null>(null);
   useEffect(() => {
     getStatus()
@@ -365,7 +375,7 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
       >
         <RailLogo />
         <nav className={railNavClassName} aria-label={t('nav.aria.primary')}>
-          {navGroups.map((group, index) => (
+          {visibleGroups.map((group, index) => (
             <div key={group.headingKey} className="space-y-1" role="group" aria-label={t(group.headingKey)}>
               {/* Thin divider between clusters (skipped before the first). */}
               {index > 0 && (
@@ -400,7 +410,7 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
       >
         <DrawerLogo />
         <nav className="flex-1 overflow-y-auto py-3 px-2 space-y-0.5" aria-label={t('nav.aria.primary')}>
-          {navGroups.map((group, index) => (
+          {visibleGroups.map((group, index) => (
             <DrawerGroup
               key={group.headingKey}
               group={group}

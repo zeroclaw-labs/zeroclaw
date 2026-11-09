@@ -269,6 +269,7 @@ async fn repair_retains_source_through_the_default_history_adapter() {
     assert!(
         extract(&provider, "test-model", None, "Extract memory.", turn)
             .await
+            .unwrap()
             .is_some()
     );
     let messages = provider.messages.lock();
@@ -374,6 +375,7 @@ async fn native_extraction_reaches_anthropic_wire_with_derived_schema_and_forcin
         ),
     )
     .await
+    .unwrap()
     .unwrap()
     .unwrap();
     assert_eq!(result.history_entry, "Wire summary");

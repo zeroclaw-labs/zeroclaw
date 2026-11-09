@@ -97,13 +97,15 @@ COPY --parents crates/*/Cargo.toml ./
 # `zeroclaw_macros::Configurable` unresolved. Copy its real source now so the
 # proc-macro is built from the genuine implementation during the pre-fetch.
 COPY --parents crates/zeroclaw-macros/src/ ./
-# Nested workspace members (test fixture crates) are not matched by the
-# single-level crates/*/Cargo.toml glob above, so match them with their own
-# glob to keep workspace manifest parsing intact during the pre-fetch. A glob
-# rather than explicit paths means adding a fixture member does not require
-# editing this file — cargo fails the workspace load if any member manifest is
-# missing, and every such member lives at crates/*/tests/fixtures/*/.
+# Test fixture crates are workspace members too, and the single-level
+# crates/*/Cargo.toml glob above does not match them, so match them with their
+# own globs to keep workspace manifest parsing intact during the pre-fetch.
+# Globs rather than explicit paths mean adding a fixture member does not require
+# editing this file: cargo fails the workspace load if any member manifest is
+# missing, and fixture members live at crates/*/tests/fixtures/*/ or
+# tests/fixtures/*/. A member anywhere else needs its own COPY line here.
 COPY --parents crates/*/tests/fixtures/*/Cargo.toml ./
+COPY --parents tests/fixtures/*/Cargo.toml ./
 # apps/tauri: .dockerignore whitelists only Cargo.toml; src and build.rs are stubbed below.
 COPY apps/tauri/Cargo.toml apps/tauri/Cargo.toml
 # apps/zerocode: TUI app not shipped in the server image; copy only its manifest
@@ -145,6 +147,7 @@ RUN mkdir -p src src/bin benches apps/tauri/src apps/zerocode/src apps/zerorelay
     && echo "fn main() {}" > crates/zeroclaw-plugins/examples/sign_manifest.rs \
     && for d in crates/*/; do [ "$d" = "crates/zeroclaw-macros/" ] && continue; mkdir -p "${d}src" && printf '' > "${d}src/lib.rs"; done \
     && for d in crates/*/tests/fixtures/*/; do [ -f "${d}Cargo.toml" ] || continue; mkdir -p "${d}src" && printf '' > "${d}src/lib.rs"; done \
+    && for d in tests/fixtures/*/; do [ -f "${d}Cargo.toml" ] || continue; mkdir -p "${d}src" && printf '' > "${d}src/lib.rs"; done \
     && printf 'fn main() {}' > crates/zeroclaw-log/tests/fixtures/attribution-macro-consumer/src/main.rs
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
@@ -232,10 +235,7 @@ RUN for b in zeroclaw zerocode; do \
 # /zeroclaw-data mount point) so a bind mount on /zeroclaw-data cannot shadow them.
 RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/data && \
     printf '%s\n' \
-        'api_key = ""' \
-        'default_provider = "openrouter"' \
-        'default_model = "anthropic/claude-sonnet-4-20250514"' \
-        'default_temperature = 0.7' \
+        'schema_version = 4' \
         '' \
         '[gateway]' \
         'port = 42617' \
@@ -243,6 +243,18 @@ RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/data && \
         'allow_public_bind = true' \
         'require_pairing = false' \
         'web_dist_dir = "/usr/share/zeroclawlabs/web/dist"' \
+        '' \
+        '[providers.models.openrouter.default]' \
+        'api_key = ""' \
+        'model = "anthropic/claude-sonnet-4-20250514"' \
+        'temperature = 0.7' \
+        '' \
+        '[agents.default]' \
+        'model_provider = "openrouter.default"' \
+        'risk_profile = "default"' \
+        'runtime_profile = "default"' \
+        '' \
+        '[runtime_profiles.default]' \
         '' \
         '[risk_profiles.default]' \
         'level = "supervised"' \

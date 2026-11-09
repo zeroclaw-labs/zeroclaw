@@ -96,15 +96,21 @@ pub async fn consolidate_turn(
         CONSOLIDATION_SYSTEM_PROMPT
     };
 
-    let result = extraction::extract(
+    let extraction = extraction::extract(
         model_provider,
         model,
         temperature,
         system_prompt,
         &truncated,
     )
-    .await
-    .unwrap_or_else(|| consolidation_fallback(&turn_text));
+    .await;
+    let (result, provider_error) = match extraction {
+        Ok(result) => (
+            result.unwrap_or_else(|| consolidation_fallback(&turn_text)),
+            None,
+        ),
+        Err(error) => (consolidation_fallback(&turn_text), Some(error)),
+    };
 
     // Phase 1: Write history entry to Daily category. The gated arm tags the
     // write Episodic; the default arm keeps the exact legacy store call so the
@@ -134,6 +140,12 @@ pub async fn consolidate_turn(
                 None,
             )
             .await?;
+    }
+
+    // Keep fallback history, then let callers observe the provider failure.
+    // Their plain Display logging must not expose provider response payloads.
+    if let Some(error) = provider_error {
+        return Err(error.context("Memory consolidation provider call failed"));
     }
 
     // Phase 2: extract atomic typed facts (gated; default off). Runs before
@@ -890,14 +902,16 @@ mod tests {
                 reasoning_content: None,
             })
         }
-        async fn run(provider: &dyn ModelProvider) -> RecordingMemory {
+        async fn run_outcome(
+            provider: &dyn ModelProvider,
+        ) -> (RecordingMemory, anyhow::Result<()>) {
             let memory = RecordingMemory::default();
             let config = MemoryConfig {
                 types: MemoryTypesConfig { enabled: true },
                 consolidation_extract_facts: true,
                 ..MemoryConfig::default()
             };
-            consolidate_turn(
+            let outcome = consolidate_turn(
                 provider,
                 "test-model",
                 None,
@@ -906,8 +920,12 @@ mod tests {
                 "Discuss deployment.",
                 "Use staged deployment.",
             )
-            .await
-            .unwrap();
+            .await;
+            (memory, outcome)
+        }
+        async fn run(provider: &dyn ModelProvider) -> RecordingMemory {
+            let (memory, outcome) = run_outcome(provider).await;
+            outcome.unwrap();
             memory
         }
         fn assert_fallback(memory: &RecordingMemory) {
@@ -984,8 +1002,21 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn provider_failure_or_missing_output_uses_fallback_without_repair() {
-            for reply in [Err(()), text(None), text(Some("  "))] {
+        async fn provider_failure_propagates_and_missing_output_uses_fallback_without_repair() {
+            let provider = SequenceProvider::new(vec![Err(())], false);
+            let (memory, outcome) = run_outcome(&provider).await;
+            assert_fallback(&memory);
+            let error = outcome.unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Memory consolidation provider call failed"
+            );
+            assert_eq!(
+                error.root_cause().to_string(),
+                "private-provider-error-sentinel"
+            );
+            assert_eq!(provider.requests.lock().len(), 1);
+            for reply in [text(None), text(Some("  "))] {
                 let provider = SequenceProvider::new(vec![reply], false);
                 assert_fallback(&run(&provider).await);
                 assert_eq!(provider.requests.lock().len(), 1);
@@ -1030,12 +1061,25 @@ mod tests {
                 ),
             ] {
                 let provider = SequenceProvider::new(replies, forced);
-                let memory = zeroclaw_log::scope!(
+                let (memory, outcome) = zeroclaw_log::scope!(
                     trace_id: "extraction-failure-regression",
-                    => run(&provider)
+                    => run_outcome(&provider)
                 )
                 .await;
                 assert_fallback(&memory);
+                if reason == "provider_error" {
+                    let error = outcome.unwrap_err();
+                    assert_eq!(
+                        error.to_string(),
+                        "Memory consolidation provider call failed"
+                    );
+                    assert_eq!(
+                        error.root_cause().to_string(),
+                        "private-provider-error-sentinel"
+                    );
+                } else {
+                    outcome.unwrap();
+                }
                 assert_eq!(provider.requests.lock().len(), attempt);
                 let captured: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
                     .filter(|event| {
@@ -2090,14 +2134,20 @@ mod consolidate_turn_tests {
     }
 
     #[tokio::test]
-    async fn provider_failure_writes_only_safe_history() {
+    async fn provider_failure_writes_safe_history_and_propagates_error() {
         let tmp = TempDir::new().unwrap();
         let memory = SqliteMemory::new("sqlite", tmp.path()).unwrap();
         let provider = ScriptedProvider::failing();
 
         let result = run(&provider, &memory, &MemoryConfig::default()).await;
 
-        assert!(result.is_ok());
+        assert!(result.is_err(), "provider failure must reach the caller");
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Memory consolidation provider call failed"
+        );
+        assert_eq!(error.root_cause().to_string(), "scripted provider failure");
         assert_eq!(count(&memory, MemoryCategory::Daily).await, 1);
         assert_eq!(count(&memory, MemoryCategory::Core).await, 0);
     }

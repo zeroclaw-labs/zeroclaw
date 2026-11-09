@@ -242,10 +242,14 @@ pub(super) async fn extract(
     temperature: Option<f64>,
     system_prompt: &str,
     turn: &str,
-) -> Option<ConsolidationResult> {
-    let contract = contract()
-        .map_err(|()| log_failure("contract_initialization_failed", 0))
-        .ok()?;
+) -> anyhow::Result<Option<ConsolidationResult>> {
+    let contract = match contract() {
+        Ok(contract) => contract,
+        Err(()) => {
+            log_failure("contract_initialization_failed", 0);
+            return Ok(None);
+        }
+    };
     let native = provider.supports_forced_tool_choice(model);
     let tool = ToolSpec::new(
         TOOL_NAME,
@@ -288,14 +292,13 @@ pub(super) async fn extract(
                 ),
             )
             .await
-            .map_err(|_| log_failure("provider_error", attempt + 1))
-            .ok()?;
+            .inspect_err(|_| log_failure("provider_error", attempt + 1))?;
         let result = if native {
             native_candidate(response).and_then(|candidate| validate(candidate, contract))
         } else {
             if !response.tool_calls.is_empty() {
                 log_failure("unexpected_tool_calls", attempt + 1);
-                return None;
+                return Ok(None);
             }
             let Some(text) = response
                 .text
@@ -303,12 +306,12 @@ pub(super) async fn extract(
                 .filter(|text| !text.trim().is_empty())
             else {
                 log_failure("missing_output", attempt + 1);
-                return None;
+                return Ok(None);
             };
             parse_prompt(text)
         };
         match result {
-            Ok(result) => return Some(result),
+            Ok(result) => return Ok(Some(result)),
             Err(diagnostics) if attempt == 0 => {
                 // Some prompt adapters forward only the last user message.
                 // Keep the source and repair together instead of depending
@@ -319,11 +322,11 @@ pub(super) async fn extract(
             }
             Err(_) => {
                 log_failure("repair_exhausted", attempt + 1);
-                return None;
+                return Ok(None);
             }
         }
     }
-    None
+    Ok(None)
 }
 
 #[cfg(test)]

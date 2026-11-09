@@ -85,7 +85,11 @@ JSON is capped at 256 KiB, including room for escaped Unicode at every field
 limit. The
 internal tool is never executed. Provider failure, missing output, or failed
 repair uses the existing UTF-8-safe, history-only raw-turn fallback. No partial
-memory update, fact, or trend is stored. Existing storage, policy, retention,
+memory update, fact, or trend is stored. After saving fallback history, provider
+failures return to the caller with a fixed error summary and the original cause
+retained. Channel and gateway callers handle these failures in background tasks
+outside response delivery. Missing or invalid output still returns success
+after fallback. Existing storage, policy, retention,
 deduplication, conflict resolution, and typed-memory controls still apply.
 
 There is no persisted migration. Reverting the extraction change restores the
