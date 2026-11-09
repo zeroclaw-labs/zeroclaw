@@ -963,14 +963,14 @@ fn registry_voice_preferences_authorized(
     registry: &DeviceRegistry,
     key: VoiceDeviceKey<'_>,
     preferences: Option<VoicePreferences>,
-    authorize: impl FnOnce() -> Result<(), axum::response::Response>,
+    authorize: impl FnOnce() -> Result<(), Box<axum::response::Response>>,
 ) -> axum::response::Response {
     if let Some(preferences) = preferences {
         if !preferences.valid() {
             return (StatusCode::BAD_REQUEST, "Invalid voice preferences").into_response();
         }
         match registry.save_voice_preferences_authorized(key, &preferences, authorize) {
-            Ok(Err(refusal)) => return refusal,
+            Ok(Err(refusal)) => return *refusal,
             Ok(Ok(true)) => {}
             Ok(Ok(false)) => {
                 return (StatusCode::NOT_FOUND, "Paired device not registered").into_response();
@@ -1047,7 +1047,7 @@ fn managed_voice_preferences_authorized(
     headers: &HeaderMap,
     device_id: &str,
     preferences: Option<VoicePreferences>,
-    authorize: impl FnOnce() -> Result<(), axum::response::Response>,
+    authorize: impl FnOnce() -> Result<(), Box<axum::response::Response>>,
 ) -> axum::response::Response {
     if let Err(error) = require_auth(state, headers) {
         return error.into_response();
@@ -1130,10 +1130,10 @@ async fn current_operator_voice_preferences(
         dashboard
             .operator_at_write(state, &session, &commit)
             .unwrap_or_else(|| Err(SessionRejection::Expired.body()))
-            .map_err(IntoResponse::into_response)
+            .map_err(|denied| Box::new(denied.into_response()))
     };
     if let Err(refusal) = authorize() {
-        return refusal;
+        return *refusal;
     }
     // The callback runs again after SQLite acquires its writer. The config
     // commit fences mapping changes until the effect finishes.
