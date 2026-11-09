@@ -231,7 +231,7 @@ pub struct A2aServerSection {
 /// a non-goal (peers are explicitly configured, not auto-discovered).
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "a2a_client"]
+#[prefix = "a2a.client"]
 #[serde(default)]
 pub struct A2aClientConfig {
     /// Master switch for the outbound A2A client. Default `false`: no
