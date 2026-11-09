@@ -269,11 +269,11 @@ interruption. It does not contact phone users or invoke model providers.
 For an end-to-end check, send text and a voice note from Android. Confirm
 transcription and text-plus-voice delivery with `output_modality = "voice"`.
 Then start an audio call from Android. Confirm the encryption indicator, speak, hear the reply, interrupt it,
-and repeat with headphones and the screen locked. Confirm that the same main
-conversation is visible from the Web dashboard.
+and repeat with headphones and the screen locked. Confirm that the same
+contact's text chat retains the call's conversation context.
 
 Disable `calls_enabled` to stop admitting calls, or disable this channel and
 reload the daemon to disconnect the helper. Stop the CLI service if desired.
-Preserve the SimpleX databases and session archive; removing the adapter does
-not require erasing either. `SimpleX event processing failed` and
+Preserve the SimpleX databases and existing ZeroClaw transcripts; removing
+the adapter does not require erasing either. `SimpleX event processing failed` and
 `Live call speech update failed` identify adapter failures in the daemon log.
