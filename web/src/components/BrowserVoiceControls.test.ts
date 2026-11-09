@@ -461,6 +461,7 @@ test('silence waits for speech activity, stops capture and submits once after fi
     await act(async () => { await renderer.root.findAllByType('button')[0]!.props.onClick(); });
     capture.onresult!({ resultIndex: 0, results: [{ isFinal: true, 0: { transcript: 'Ready to send' } }] });
     capture.onspeechstart?.();
+    capture.onresult!({ resultIndex: 0, results: [{ isFinal: false, 0: { transcript: 'Still speaking' } }] });
     await act(async () => { context.mock.timers.tick(30000); });
     assert.equal(submitted, 0, 'ongoing speech is not silence');
     capture.onspeechend?.();

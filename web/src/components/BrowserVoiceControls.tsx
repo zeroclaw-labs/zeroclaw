@@ -142,6 +142,7 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
     }
     capture.lang = prefs.language; capture.continuous = true; capture.interimResults = true;
     let captureEnded = false;
+    let speechActive = false;
     const armSilence = () => {
       clearSilence();
       if (!silenceSeconds) return;
@@ -153,13 +154,13 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
         try { capture.stop(); } catch { stopCapture(); setError(t('voice.capture_error')); }
       }, silenceSeconds * 1000);
     };
-    capture.onspeechstart = clearSilence;
-    capture.onspeechend = armSilence;
+    capture.onspeechstart = () => { speechActive = true; clearSilence(); };
+    capture.onspeechend = () => { speechActive = false; armSilence(); };
     if (prefs.recognition === 'local') capture.processLocally = true;
     let receivedText = false;
     capture.onresult = event => {
       if (generation.current !== version || !visible()) return;
-      armSilence();
+      if (!speechActive) armSilence();
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const result = event.results[i];
         const text = result?.isFinal ? result[0].transcript.trim() : '';
@@ -177,6 +178,7 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
     capture.onend = () => {
       if (generation.current !== version) return;
       captureEnded = true;
+      speechActive = false;
       const manualStop = finishing.current && !autoSubmit.current;
       const shouldSubmit = autoSubmit.current && receivedText && visible();
       if (manualStop || autoSubmit.current || !receivedText || !visible()) clearSilence();
