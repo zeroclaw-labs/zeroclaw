@@ -2044,3 +2044,43 @@ test('a scoped chat never shows or keeps a local transcript copy', async () => {
     await unmount(mounted.renderer);
   });
 });
+
+// The live Thinking box's `open` prop: controlled by the stream by default,
+// handed to the reader (`undefined`) when "Keep thinking collapsed" is on.
+const thinkingBoxCases = [
+  { keepCollapsed: false, label: 'follows the stream', whileThinking: true, afterChunk: false },
+  { keepCollapsed: true, label: 'is left to the reader', whileThinking: undefined, afterChunk: undefined },
+];
+for (const { keepCollapsed, label, whileThinking, afterChunk } of thinkingBoxCases) {
+  test(`live Thinking box ${label} (keep collapsed ${keepCollapsed ? 'on' : 'off'})`, async () => {
+    const runtime = new FakeSessionRuntime();
+    runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true, ['earlier'])));
+    const mounted = await mountChat(runtime, true);
+    await openSocket(runtime, 0);
+    await settle();
+
+    const toggle = () => mounted.renderer.root.findAllByType('button')
+      .find((button) => nodeText(button).includes('Keep thinking collapsed'));
+    assert.equal(toggle()?.props['aria-pressed'], false);
+    if (keepCollapsed) {
+      await act(async () => { toggle()!.props.onClick(); });
+      assert.equal(toggle()?.props['aria-pressed'], true);
+      assert.equal(storage.getItem('zeroclaw_keep_thinking_collapsed'), '1');
+    }
+
+    const liveOpen = () => {
+      const boxes = mounted.renderer.root.findAllByType('details');
+      assert.equal(boxes.length, 1);
+      return boxes[0]!.props.open;
+    };
+    await act(async () => {
+      runtime.sockets[0]!.emitMessage({ type: 'thinking', content: 'weighing it up' });
+    });
+    assert.equal(liveOpen(), whileThinking);
+    await act(async () => {
+      runtime.sockets[0]!.emitMessage({ type: 'chunk', content: 'The answer' });
+    });
+    assert.equal(liveOpen(), afterChunk);
+    await unmount(mounted.renderer);
+  });
+}
