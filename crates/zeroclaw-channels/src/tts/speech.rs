@@ -1,5 +1,7 @@
 //! Draft-owned speculative synthesis and private audio assembly.
-use super::{FFMPEG_TRANSCODE_TIMEOUT, TtsManager, transcode_to_opus};
+#[cfg(any(feature = "channel-telegram", test))]
+use super::transcode_to_opus;
+use super::{FFMPEG_TRANSCODE_TIMEOUT, TtsManager};
 use anyhow::{Context, Result, bail};
 use std::io::Write as _;
 
@@ -102,13 +104,32 @@ fn audio_extension(format: &str) -> &'static str {
 /// Each part is a complete provider container. The concat demuxer reads its
 /// headers and ffmpeg encodes the joined samples into one OGG/Opus container.
 /// All parts come from the same provider format; raw headers are never appended.
+#[cfg(any(feature = "channel-telegram", test))]
 pub(crate) async fn concat_parts_to_opus(parts: &[Vec<u8>], format: &str) -> Result<Vec<u8>> {
     concat_parts_with_command(parts, format, tokio::process::Command::new("ffmpeg")).await
 }
 
+#[cfg(any(feature = "channel-telegram", test))]
 async fn concat_parts_with_command(
     parts: &[Vec<u8>],
     format: &str,
+    command: tokio::process::Command,
+) -> Result<Vec<u8>> {
+    concat_parts_with_format(parts, format, SpeechContainer::Opus, command).await
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum SpeechContainer {
+    #[cfg(any(feature = "channel-telegram", test))]
+    Opus,
+    #[cfg(feature = "channel-simplex")]
+    M4a,
+}
+
+pub(crate) async fn concat_parts_with_format(
+    parts: &[Vec<u8>],
+    format: &str,
+    output: SpeechContainer,
     command: tokio::process::Command,
 ) -> Result<Vec<u8>> {
     let parts: Vec<&Vec<u8>> = parts.iter().filter(|p| !p.is_empty()).collect();
@@ -116,7 +137,8 @@ async fn concat_parts_with_command(
 
     // A declared Opus part can pass through. An OGG container alone does
     // not establish the codec, so every other format is transcoded.
-    if parts.len() == 1 {
+    #[cfg(any(feature = "channel-telegram", test))]
+    if output == SpeechContainer::Opus && parts.len() == 1 {
         let only = parts[0].clone();
         let fmt = format.to_ascii_lowercase();
         if fmt == "opus" {
@@ -139,7 +161,7 @@ async fn concat_parts_with_command(
     let dir = staging
         .tempdir()
         .context("failed to create private concat staging directory")?;
-    stage_and_concat(dir.path(), &parts, ext, command).await
+    stage_and_concat(dir.path(), &parts, ext, output, command).await
 }
 
 /// Keep private staged files alive until the owned ffmpeg operation completes.
@@ -147,6 +169,7 @@ async fn stage_and_concat(
     dir: &std::path::Path,
     parts: &[&Vec<u8>],
     ext: &str,
+    output: SpeechContainer,
     mut command: tokio::process::Command,
 ) -> Result<Vec<u8>> {
     let mut staged = Vec::with_capacity(parts.len());
@@ -171,6 +194,24 @@ async fn stage_and_concat(
     let list_path = list_file.path();
 
     use std::process::Stdio;
+    let encoding: &[&str] = match output {
+        #[cfg(any(feature = "channel-telegram", test))]
+        SpeechContainer::Opus => &[
+            "-f", "ogg", "-acodec", "libopus", "-b:a", "32k", "-vbr", "on", "pipe:1",
+        ],
+        #[cfg(feature = "channel-simplex")]
+        SpeechContainer::M4a => &[
+            "-c:a",
+            "aac",
+            "-b:a",
+            "64k",
+            "-movflags",
+            "frag_keyframe+empty_moov",
+            "-f",
+            "mp4",
+            "pipe:1",
+        ],
+    };
     let child = command
         .args([
             "-hide_banner",
@@ -183,9 +224,7 @@ async fn stage_and_concat(
             "-i",
         ])
         .arg(list_path)
-        .args([
-            "-f", "ogg", "-acodec", "libopus", "-b:a", "32k", "-vbr", "on", "pipe:1",
-        ])
+        .args(encoding)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -203,7 +242,7 @@ async fn stage_and_concat(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("ffmpeg concat to opus failed: {stderr}");
+        bail!("ffmpeg audio concat failed: {stderr}");
     }
     anyhow::ensure!(
         !output.stdout.is_empty(),

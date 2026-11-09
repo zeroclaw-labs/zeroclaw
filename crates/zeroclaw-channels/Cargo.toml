@@ -207,6 +207,7 @@ channels-full = [
   "channel-qq",
   "channel-reddit",
   "channel-signal",
+  "channel-simplex",
   "channel-slack",
   "channel-twitch",
   "channel-twitter",
@@ -254,6 +255,7 @@ whatsapp-web = [
 # Channels with no optional deps (cfg gate only)
 channel-discord = ["ws-transport"]
 channel-slack = ["ws-transport"]
+channel-simplex = ["ws-transport"]
 channel-signal = ["dep:mime_guess"]
 channel-mattermost = ["ws-transport"]
 channel-irc = ["tls-client"]

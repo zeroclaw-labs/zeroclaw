@@ -68,3 +68,5 @@ pub(crate) fn capture_log_events() -> tokio::sync::broadcast::Receiver<serde_jso
     });
     ::zeroclaw_log::subscribe_or_install()
 }
+
+pub mod simplex;

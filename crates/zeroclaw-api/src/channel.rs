@@ -390,9 +390,19 @@ pub enum ChannelConversationScope {
     ReplyTarget,
 }
 
+/// Out-of-band control created by an authenticated channel adapter.
+/// Never inferred from message text or replayed from stored conversation input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelControl {
+    /// Cancel this sender/call scope without a visible acknowledgement.
+    Interrupt,
+}
+
 /// A message received from or sent to a channel
 #[derive(Debug, Clone, Default)]
 pub struct ChannelMessage {
+    /// Trusted adapter control; passive content may carry a playback observation.
+    pub control: Option<ChannelControl>,
     pub id: String,
     pub sender: String,
     /// Immutable sender identifier assigned by the channel platform, when
@@ -889,6 +899,19 @@ impl fmt::Display for FinalizeUndelivered {
 
 impl std::error::Error for FinalizeUndelivered {}
 
+/// The platform may have accepted a final response but its acknowledgement
+/// was lost. Callers must not resend the response or claim it was delivered.
+#[derive(Debug)]
+pub struct FinalizeUncertainDelivery {
+    pub reason: String,
+}
+impl fmt::Display for FinalizeUncertainDelivery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "channel_delivery_uncertain: {}", self.reason)
+    }
+}
+impl std::error::Error for FinalizeUncertainDelivery {}
+
 /// Core channel trait — implement for any messaging platform.
 ///
 /// Every `Channel` is `Attributable`: the orchestrator's spawn site opens
@@ -1180,6 +1203,18 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         _recipient: &str,
         _message_id: &str,
         _text: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    /// Stream the currently approved response phase to live call playback.
+    /// The default is inert for transports without live audio.
+    async fn stream_voice_draft(
+        &self,
+        _recipient: &str,
+        _message_id: &str,
+        _phase: usize,
+        _text: &str,
+        _finished: bool,
     ) -> anyhow::Result<()> {
         Ok(())
     }

@@ -21,7 +21,7 @@ pub(crate) mod model_picker_delivery;
 pub mod orchestrator;
 pub mod paced_channel;
 /// Sentence and paragraph boundaries for streaming voice replies.
-#[cfg(feature = "channel-telegram")]
+#[cfg(any(feature = "channel-telegram", feature = "channel-simplex"))]
 pub(crate) mod speech_segment;
 pub mod util;
 
@@ -83,6 +83,8 @@ pub mod qq;
 pub mod reddit;
 #[cfg(feature = "channel-signal")]
 pub mod signal;
+#[cfg(feature = "channel-simplex")]
+pub mod simplex;
 #[cfg(feature = "channel-slack")]
 pub mod slack;
 #[cfg(feature = "channel-telegram")]

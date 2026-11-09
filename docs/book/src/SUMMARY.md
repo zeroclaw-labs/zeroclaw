@@ -100,6 +100,7 @@
   - [Mattermost](./channels/mattermost.md)
   - [LINE](./channels/line.md)
   - [Nextcloud Talk](./channels/nextcloud-talk.md)
+  - [SimpleX](./channels/simplex.md)
   - [Signal](./channels/signal.md)
   - [WhatsApp](./channels/whatsapp.md)
   - [Other chat platforms](./channels/chat-others.md)

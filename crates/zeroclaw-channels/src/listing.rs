@@ -19,6 +19,11 @@ struct ChannelCompileSpec {
 // in the config crate's canonical channel inventory and that keys do not drift.
 const CHANNEL_COMPILE_SPECS: &[ChannelCompileSpec] = &[
     ChannelCompileSpec {
+        schema_name: Some("SimpleX"),
+        type_keys: &["simplex"],
+        compiled: cfg!(feature = "channel-simplex"),
+    },
+    ChannelCompileSpec {
         schema_name: Some("Telegram"),
         type_keys: &["telegram"],
         compiled: cfg!(feature = "channel-telegram"),
