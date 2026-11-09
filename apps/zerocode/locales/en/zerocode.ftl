@@ -910,7 +910,12 @@ zc-login-untrusted = Certificate verification failed for { $url }. Provide --tls
 zc-login-rejected = The daemon did not accept this OIDC login; the previous saved login was not replaced.
 zc-login-saved = Signed in to { $url }. Saved the login in { $path }. Run zerocode to connect; no auth token flags are needed.
 zc-login-env-shadow = ZEROCLAW_AUTH_TOKEN is set and will override this saved login. Unset it to use the saved token.
-zc-login-expired = Your saved OIDC login has expired. Sign in again to continue; the replacement token will be saved automatically.
+zc-login-expired = Your saved OIDC login needs renewal. Sign in again to continue; the replacement credentials will be saved automatically.
 zc-login-conflicting-route = Login takes its destination as a positional URL; do not combine it with --connect or --relay.
+zc-login-device-bootstrap-failed = OIDC device bootstrap failed
+zc-login-invalid-certificate-bootstrap-response = invalid certificate bootstrap response
+zc-login-pkce-randomness-unavailable = system randomness unavailable for PKCE
 
 zc-login-no-pairing-endpoint = OIDC login bootstraps the device through the gateway after sign-in; --enroll-host and --enroll-port are not used. No pairing code or SAS is needed.
+
+zc-login-stage-credentials = Could not stage replacement device credentials; the previous saved login was not replaced.

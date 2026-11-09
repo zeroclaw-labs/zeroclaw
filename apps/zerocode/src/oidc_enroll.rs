@@ -215,14 +215,14 @@ impl GatewayEnrollment {
             .json(&serde_json::json!({"csr_pem": csr}))
             .send()
             .await
-            .context("OIDC device bootstrap failed")?;
+            .with_context(|| crate::i18n::t("zc-login-device-bootstrap-failed"))?;
         if !response.status().is_success() {
             return Err(Self::gateway_error(response).await);
         }
         response
             .json()
             .await
-            .context("invalid certificate bootstrap response")
+            .with_context(|| crate::i18n::t("zc-login-invalid-certificate-bootstrap-response"))
     }
 
     async fn gateway_error(response: reqwest::Response) -> anyhow::Error {
@@ -562,6 +562,10 @@ fn verification_is_disabled(base: &str, tls: &crate::client::ClientTls) -> bool 
     tls.skip_verify && base.starts_with("https://")
 }
 
+fn pkce_randomness_unavailable() -> anyhow::Error {
+    anyhow::Error::msg(crate::i18n::t("zc-login-pkce-randomness-unavailable"))
+}
+
 pub(crate) async fn run_device_flow(
     base: &str,
     tls: &crate::client::ClientTls,
@@ -586,7 +590,7 @@ pub(crate) async fn run_device_flow(
     rustls::crypto::ring::default_provider()
         .secure_random
         .fill(&mut random)
-        .map_err(|_| anyhow::Error::msg("system randomness unavailable for PKCE"))?;
+        .map_err(|_| pkce_randomness_unavailable())?;
     let verifier = zeroize::Zeroizing::new(hex::encode(random));
     random.zeroize();
     let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -756,6 +760,44 @@ mod tests {
         let start = gateway.device_start("corp").await.unwrap();
         assert_eq!(start.user_code, "ABCD-EFGH");
         assert_eq!(start.device_code, "dev-1");
+    }
+
+    #[tokio::test]
+    async fn certificate_bootstrap_errors_use_fluent_messages() {
+        let transport_gateway =
+            GatewayEnrollment::new("http://127.0.0.1:1", &ClientTls::default()).unwrap();
+        let transport_error = transport_gateway
+            .certificate::<serde_json::Value>("corp", "access-token", "csr")
+            .await
+            .unwrap_err();
+        let transport_key = "zc-login-device-bootstrap-failed";
+        let transport_message = crate::i18n::t(transport_key);
+        assert_ne!(transport_message, format!("{{{transport_key}}}"));
+        assert_eq!(transport_error.to_string(), transport_message);
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/oidc/corp/certificate"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not JSON"))
+            .mount(&server)
+            .await;
+        let gateway = GatewayEnrollment::new(&server.uri(), &ClientTls::default()).unwrap();
+        let response_error = gateway
+            .certificate::<serde_json::Value>("corp", "access-token", "csr")
+            .await
+            .unwrap_err();
+        let response_key = "zc-login-invalid-certificate-bootstrap-response";
+        let response_message = crate::i18n::t(response_key);
+        assert_ne!(response_message, format!("{{{response_key}}}"));
+        assert_eq!(response_error.to_string(), response_message);
+    }
+
+    #[test]
+    fn pkce_randomness_failure_uses_fluent_message() {
+        let key = "zc-login-pkce-randomness-unavailable";
+        let message = crate::i18n::t(key);
+        assert_ne!(message, format!("{{{key}}}"));
+        assert_eq!(pkce_randomness_unavailable().to_string(), message);
     }
 
     #[tokio::test]

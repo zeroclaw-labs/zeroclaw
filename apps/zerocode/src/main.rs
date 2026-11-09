@@ -941,7 +941,10 @@ async fn run() -> anyhow::Result<()> {
     let credential_config_dir = selected_uri
         .as_deref()
         .filter(|_| scoped_credentials)
-        .map(|uri| login::credential_dir(&local_config_dir, uri))
+        .map(|uri| {
+            login::active_credential_dir(&local_config_dir, uri, &loaded_config.connection.wss.tls)
+        })
+        .transpose()?
         .unwrap_or_else(|| local_config_dir.clone());
     let active_theme = loaded_config.resolve_theme().unwrap_or_else(|e| {
         let path = config::config_path(&local_config_dir);
@@ -1296,7 +1299,14 @@ async fn run() -> anyhow::Result<()> {
     // TTL (before the terminal is taken over, so any output is visible). No-op
     // when the client never enrolled here.
     if matches!(target, ConnectTarget::Wss(_)) {
-        enroll::maybe_renew(&rpc, &credential_config_dir).await;
+        let active_credentials = if let Some(uri) =
+            selected_uri.as_deref().filter(|_| scoped_credentials)
+        {
+            login::active_credential_dir(&local_config_dir, uri, &loaded_config.connection.wss.tls)?
+        } else {
+            credential_config_dir.clone()
+        };
+        enroll::maybe_renew(&rpc, &active_credentials).await;
     }
 
     let mut term = config_manager::init_terminal()?;

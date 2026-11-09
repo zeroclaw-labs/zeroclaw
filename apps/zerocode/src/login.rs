@@ -79,6 +79,105 @@ pub(crate) fn credential_dir(config_dir: &Path, uri: &str) -> PathBuf {
         .join(hex::encode(Sha256::digest(uri.as_bytes())))
 }
 
+/// The saved certificate path selects its enrollment generation. Legacy URL
+/// caches remain readable; an external certificate never redirects cache writes.
+pub(crate) fn active_credential_dir(
+    config_dir: &Path,
+    uri: &str,
+    section: &config::WssTlsSection,
+) -> Result<PathBuf> {
+    let root = std::path::absolute(credential_dir(config_dir, uri))?;
+    let cert = Path::new(&section.client_cert_path);
+    if let Some(generation) = cert.parent().and_then(Path::parent)
+        && generation.parent() == Some(root.join("generations").as_path())
+        && cert == generation.join("tls/client.crt")
+    {
+        return Ok(generation.to_path_buf());
+    }
+    Ok(root)
+}
+
+/// X.509 is the authority for certificate lifetime, not profile.json or token
+/// expiry. A missing, malformed, expired or not-yet-valid identity is replaced
+/// before a WSS attempt; the new handshake still verifies key/CA/signature.
+fn certificate_usable(section: &config::WssTlsSection) -> bool {
+    let Some(cert) = std::fs::read(&section.client_cert_path)
+        .ok()
+        .and_then(|pem| rustls_pemfile::certs(&mut pem.as_slice()).next())
+        .and_then(Result::ok)
+    else {
+        return false;
+    };
+    let Ok((rest, parsed)) = x509_parser::parse_x509_certificate(cert.as_ref()) else {
+        return false;
+    };
+    let now = chrono::Utc::now().timestamp();
+    rest.is_empty()
+        && parsed.validity().not_before.timestamp() <= now
+        && parsed.validity().not_after.timestamp() > now.saturating_add(30)
+        && std::fs::read(&section.client_key_path)
+            .ok()
+            .and_then(|key| {
+                rustls_pemfile::private_key(&mut key.as_slice())
+                    .ok()
+                    .flatten()
+            })
+            .is_some()
+}
+
+/// Own only the candidate generation until authentication succeeds. The config's
+/// atomic path swap selects a generation; no login attempt overwrites one that
+/// another process or the previous saved login may still be using.
+struct AcceptedLogin {
+    login: config::OidcLogin,
+    generation: Option<tempfile::TempDir>,
+}
+
+impl AcceptedLogin {
+    fn persist(self, config_dir: &Path, uri: &str, select: bool) -> Result<config::OidcLogin> {
+        if let Some(generation) = self.generation {
+            // Keep before writing config: a durability/permissions error can be
+            // returned after its atomic rename has already published new paths.
+            // An orphan candidate is safer than deleting a referenced key.
+            let path = generation.keep();
+            if let Some(parent) = path.parent() {
+                crate::secure_file::sync_dir_where_supported(parent)?;
+            }
+        }
+        config::persist_oidc_login(config_dir, uri, &self.login, select)?;
+        Ok(self.login)
+    }
+}
+
+fn new_generation(config_dir: &Path, uri: &str) -> Result<tempfile::TempDir> {
+    let root = credential_dir(config_dir, uri);
+    let generations = root.join("generations");
+    std::fs::create_dir_all(&generations).context(i18n::t("zc-login-stage-credentials"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        for dir in [&root, &generations] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                .context(i18n::t("zc-login-stage-credentials"))?;
+        }
+    }
+    for dir in [
+        Some(config_dir),
+        root.parent(),
+        Some(root.as_path()),
+        Some(generations.as_path()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        crate::secure_file::sync_dir_where_supported(dir)?;
+    }
+    tempfile::Builder::new()
+        .prefix("login-")
+        .tempdir_in(generations)
+        .context(i18n::t("zc-login-stage-credentials"))
+}
+
 pub(crate) fn tls_from(section: &config::WssTlsSection) -> client::ClientTls {
     client::ClientTls {
         skip_verify: section.skip_verify,
@@ -193,7 +292,7 @@ async fn authenticate(
     gateway_section: &mut config::WssTlsSection,
     config_dir: &Path,
     force_enroll: bool,
-) -> Result<config::OidcLogin> {
+) -> Result<AcceptedLogin> {
     // First contact starts with gateway TLS, not the client-authenticated WSS
     // plane and not the pairing-only enrollment listener.
     verify_peer(gateway, false, gateway_section).await?;
@@ -230,24 +329,27 @@ async fn authenticate(
             .timestamp()
             .saturating_add(i64::try_from(seconds).unwrap_or(i64::MAX))
     });
-    let credentials = credential_dir(config_dir, uri);
+    let credentials = active_credential_dir(config_dir, uri, section)?;
     enroll::recover_and_validate(&credentials)?;
-    if force_enroll
-        || section.client_cert_path.is_empty()
-        || !Path::new(&section.client_cert_path).exists()
-    {
+    let mut generation = None;
+    if force_enroll || !certificate_usable(section) {
+        let replace_managed_ca = section.ca_cert_path.is_empty()
+            || Path::new(&section.ca_cert_path) == credentials.join("tls/ca.crt");
+        let staged = new_generation(config_dir, uri)?;
         let gateway_client =
             oidc_enroll::GatewayEnrollment::new(gateway, &tls_from(gateway_section))?;
-        enroll::enroll_with_oidc(&gateway_client, alias, &token.access_token, &credentials).await?;
+        enroll::enroll_with_oidc(&gateway_client, alias, &token.access_token, staged.path())
+            .await?;
         for (path, name) in [
             (&mut section.client_cert_path, "client.crt"),
             (&mut section.client_key_path, "client.key"),
         ] {
-            *path = absolute(&credentials.join("tls").join(name).to_string_lossy())?;
+            *path = absolute(&staged.path().join("tls").join(name).to_string_lossy())?;
         }
-        if section.ca_cert_path.is_empty() {
-            section.ca_cert_path = absolute(&credentials.join("tls/ca.crt").to_string_lossy())?;
+        if replace_managed_ca {
+            section.ca_cert_path = absolute(&staged.path().join("tls/ca.crt").to_string_lossy())?;
         }
+        generation = Some(staged);
     }
     verify_peer(uri, true, section).await?;
     let tls = tls_from(section);
@@ -268,13 +370,16 @@ async fn authenticate(
     .context(i18n::t("zc-login-rejected"))?;
     // End the validation session; login is a command, not a TUI launch.
     rpc.shutdown();
-    Ok(config::OidcLogin {
-        auth_provider: provider,
-        auth_token: token.access_token,
-        enroll_url: gateway.to_string(),
-        expires_at,
-        tls: section.clone(),
-        gateway_tls: gateway_section.clone(),
+    Ok(AcceptedLogin {
+        login: config::OidcLogin {
+            auth_provider: provider,
+            auth_token: token.access_token,
+            enroll_url: gateway.to_string(),
+            expires_at,
+            tls: section.clone(),
+            gateway_tls: gateway_section.clone(),
+        },
+        generation,
     })
 }
 
@@ -331,7 +436,7 @@ pub(crate) async fn run(args: &LoginArgs, cli: &Cli, config_dir: &Path) -> Resul
         gateway_section.ca_cert_path = absolute(path)?;
         gateway_section.skip_verify = cli.tls_skip_verify;
     }
-    let credentials = credential_dir(config_dir, &uri);
+    let credentials = active_credential_dir(config_dir, &uri, &section)?;
     enroll::recover_and_validate(&credentials)?;
     section.skip_verify |= cli.tls_skip_verify;
     if let Some(path) = &cli.tls_ca_cert {
@@ -363,7 +468,7 @@ pub(crate) async fn run(args: &LoginArgs, cli: &Cli, config_dir: &Path) -> Resul
         cli.enroll,
     )
     .await?;
-    config::persist_oidc_login(config_dir, &uri, &login, true)?;
+    login.persist(config_dir, &uri, true)?;
     eprintln!(
         "{}",
         i18n::t_args(
@@ -398,16 +503,19 @@ pub(crate) async fn renew_expired(
     let Some(login) = persisted.connection.logins.get(&uri) else {
         return Ok(());
     };
-    if (!force
+    if std::env::var("ZEROCLAW_AUTH_TOKEN").is_ok_and(|token| !token.is_empty()) {
+        return Ok(());
+    }
+    enroll::recover_and_validate(&active_credential_dir(config_dir, &uri, &login.tls)?)?;
+    if !force
+        && certificate_usable(&login.tls)
         && login
             .expires_at
-            .is_none_or(|expiry| expiry > chrono::Utc::now().timestamp().saturating_add(30)))
-        || std::env::var("ZEROCLAW_AUTH_TOKEN").is_ok_and(|token| !token.is_empty())
+            .is_none_or(|expiry| expiry > chrono::Utc::now().timestamp().saturating_add(30))
     {
         return Ok(());
     }
     let alias = provider_alias(&login.auth_provider)?;
-    enroll::recover_and_validate(&credential_dir(config_dir, &uri))?;
     let mut section = login.tls.clone();
     let mut gateway_section = login.gateway_tls.clone();
     eprintln!("{}", i18n::t("zc-login-expired"));
@@ -421,7 +529,7 @@ pub(crate) async fn renew_expired(
         false,
     )
     .await?;
-    config::persist_oidc_login(config_dir, &uri, &renewed, false)?;
+    let renewed = renewed.persist(config_dir, &uri, false)?;
     loaded.connection.logins.insert(uri.clone(), renewed);
     loaded.connection.wss = loaded.connection.wss_for(Some(&uri));
     Ok(())
@@ -446,7 +554,8 @@ mod tests {
         }
         for bad in [
             "https://host",
-            "ws://host",
+            // Deliberately rejected input, never an outbound connection.
+            "ws://host", // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
             "wss://user:pass@host",
             "wss://host/?token=secret",
             "wss://host/#secret",
@@ -562,5 +671,83 @@ mod tests {
             );
             server.await.unwrap();
         }
+    }
+    #[test]
+    fn active_generation_is_selected_from_the_saved_certificate_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = "wss://daemon.example/rpc";
+        let root = credential_dir(dir.path(), uri);
+        let generation = root.join("generations/login-candidate");
+        let mut tls = config::WssTlsSection {
+            client_cert_path: generation.join("tls/client.crt").display().to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            active_credential_dir(dir.path(), uri, &tls).unwrap(),
+            generation
+        );
+        tls.client_cert_path = dir.path().join("external/client.crt").display().to_string();
+        assert_eq!(active_credential_dir(dir.path(), uri, &tls).unwrap(), root);
+        tls.client_cert_path = root.join("tls/client.crt").display().to_string();
+        assert_eq!(active_credential_dir(dir.path(), uri, &tls).unwrap(), root);
+    }
+
+    #[test]
+    fn certificate_reuse_requires_valid_x509_and_a_readable_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("client.crt");
+        let key = dir.path().join("client.key");
+        let section = config::WssTlsSection {
+            client_cert_path: cert.display().to_string(),
+            client_key_path: key.display().to_string(),
+            ..Default::default()
+        };
+        assert!(!certificate_usable(&section));
+        let pair = rcgen::KeyPair::generate().unwrap();
+        std::fs::write(&key, pair.serialize_pem()).unwrap();
+        for (before, after, expected) in [
+            ((2000, 1, 1), (2001, 1, 1), false),
+            ((2998, 1, 1), (2999, 1, 1), false),
+            ((2000, 1, 1), (2999, 1, 1), true),
+        ] {
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.not_before = rcgen::date_time_ymd(before.0, before.1, before.2);
+            params.not_after = rcgen::date_time_ymd(after.0, after.1, after.2);
+            std::fs::write(&cert, params.self_signed(&pair).unwrap().pem()).unwrap();
+            assert_eq!(certificate_usable(&section), expected);
+        }
+        std::fs::write(&key, "invalid private key").unwrap();
+        assert!(!certificate_usable(&section));
+        std::fs::write(&cert, "invalid certificate").unwrap();
+        assert!(!certificate_usable(&section));
+    }
+
+    #[test]
+    fn failed_config_save_preserves_prior_files_and_the_accepted_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = "wss://daemon.example/rpc";
+        let generation = new_generation(dir.path(), uri).unwrap();
+        let candidate = generation.path().join("client.key");
+        crate::secure_file::write_durable(&candidate, b"synthetic-new-key", true).unwrap();
+        let old_key = credential_dir(dir.path(), uri).join("old.key");
+        crate::secure_file::write_durable(&old_key, b"synthetic-old-key", true).unwrap();
+        let path = config::config_path(dir.path());
+        std::fs::write(&path, "[connection]\nlogins = 'malformed'\n").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let accepted = AcceptedLogin {
+            login: config::OidcLogin {
+                auth_provider: "oidc.corp".into(),
+                auth_token: "synthetic-token".into(),
+                enroll_url: "https://gateway.example".into(),
+                expires_at: None,
+                tls: config::WssTlsSection::default(),
+                gateway_tls: config::WssTlsSection::default(),
+            },
+            generation: Some(generation),
+        };
+        assert!(accepted.persist(dir.path(), uri, true).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read(old_key).unwrap(), b"synthetic-old-key");
+        assert_eq!(std::fs::read(candidate).unwrap(), b"synthetic-new-key");
     }
 }

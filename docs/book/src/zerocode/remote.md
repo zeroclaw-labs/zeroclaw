@@ -97,12 +97,21 @@ Tokens and expiry metadata live in
 login, and written atomically with owner-only permissions (`0600`, directory
 `0700` on Unix; protect the directory ACL on other platforms). Treat this file
 as a credential: do not commit or share it. Device certificates and private
-keys are isolated under `<config-dir>/connections/<url-sha256>/tls/` and use
-the existing crash-recoverable credential writer.
+keys are isolated under
+`<config-dir>/connections/<url-sha256>/generations/<generation>/tls/` and use
+the existing crash-recoverable credential writer. The saved certificate path
+selects the active generation; older URL-scoped `tls/` caches remain readable.
+A replacement generation is validated with WSS before the config switches to
+it. A refused login removes only its candidate files, never the previous key
+or trust anchor. Previous accepted generations are retained, and a config-save
+error can leave an unselected candidate rather than risk deleting a referenced
+key; protect these directories as credentials too.
 
 Before starting the TUI, zerocode asks you to sign in again if the saved token
-is expired or the daemon rejects its authentication. It saves the replacement
-automatically. There is no refresh-token cache or silent background refresh;
+is expired, the device certificate is missing, malformed, expired or not yet
+valid, or the daemon rejects its authentication. Certificate lifetime is read
+from the actual X.509 certificate, independently of token expiry or cached
+profile metadata. It saves the replacement automatically. There is no refresh-token cache or silent background refresh;
 if a token expires during an active TUI session, restart zerocode to sign in
 again. You can also rerun `zerocode login corp <url>` explicitly. A saved
 custom gateway URL is reused when omitted on a subsequent login.
