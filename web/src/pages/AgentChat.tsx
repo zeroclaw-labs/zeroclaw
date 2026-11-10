@@ -563,6 +563,12 @@ export function AgentChatInner({
   // in-flight turn, the WS handler sends an `error` frame which our
   // onMessage handler already maps to typing=false.
   const handleAbort = useCallback(async () => {
+    // The Stop button occupies the same slot as Send. On touch screens a
+    // second tap aimed at Send lands on Stop and silently cancels the turn;
+    // require an explicit confirmation so a turn is never stopped by reflex.
+    if (typeof window !== 'undefined' && typeof window.confirm === 'function') {
+      if (!window.confirm(t('agent.stop_confirm'))) return;
+    }
     try {
       await abortSession();
     } catch {
@@ -1058,6 +1064,13 @@ const MessageItem = memo(function MessageItem({
   // them (that would clip a message starting with a bracketed datetime). Only
   // server-sourced messages can be prefixed.
   const cleanContent = msg.local || msg.ephemeral ? msg.content : stripServerTimestamp(msg.content);
+  // The gateway persists a cancel as an assistant row named
+  // "[interrupted by user]". The wording blames the operator even when a
+  // stale dashboard or a double-tap caused it, so render a neutral notice
+  // instead of the raw marker.
+  const INTERRUPTED_RE = /\s*\[interrupted by user\]\s*$/;
+  const interrupted = msg.role === 'agent' && !msg.local && INTERRUPTED_RE.test(cleanContent);
+  const displayContent = interrupted ? cleanContent.replace(INTERRUPTED_RE, '') : cleanContent;
 
   return (
     <div
@@ -1103,10 +1116,15 @@ const MessageItem = memo(function MessageItem({
           )}
           {msg.toolCall ? (
             <ToolCallCard toolCall={msg.toolCall} />
-          ) : msg.markdown ? (
-            <div className={`${compact ? 'text-xs' : 'text-sm'} break-words leading-relaxed chat-markdown`}><ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{cleanContent}</ReactMarkdown></div>
-          ) : (
-            <p className={`${compact ? 'text-xs' : 'text-sm'} whitespace-pre-wrap break-words leading-relaxed`}>{cleanContent}</p>
+          ) : displayContent ? (
+            msg.markdown ? (
+              <div className={`${compact ? 'text-xs' : 'text-sm'} break-words leading-relaxed chat-markdown`}><ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{displayContent}</ReactMarkdown></div>
+            ) : (
+              <p className={`${compact ? 'text-xs' : 'text-sm'} whitespace-pre-wrap break-words leading-relaxed`}>{displayContent}</p>
+            )
+          ) : null}
+          {interrupted && (
+            <p className={`${compact ? 'text-[11px]' : 'text-xs'} italic text-pc-text-muted`}>{t('agent.turn_stopped')}</p>
           )}
           {!compact && (
             <p className="text-[10px] mt-1.5 text-pc-text-faint">
@@ -1116,7 +1134,7 @@ const MessageItem = memo(function MessageItem({
         </div>
         <div className="flex items-center justify-end gap-1 mt-1 opacity-0 group-hover:opacity-100 transition-opacity">
           <button
-            onClick={() => onCopy(msg.id, cleanContent)}
+            onClick={() => onCopy(msg.id, displayContent)}
             aria-label={t('agent.copy_message')}
             className="p-1 rounded-[var(--radius-sm)] text-pc-text-muted hover:text-pc-text transition-colors"
           >
