@@ -41017,6 +41017,29 @@ api_token = "tok"
     #[test]
     async fn runtime_proxy_client_cache_survives_owner_runtime_shutdown() {
         let _guard = env_override_lock().await;
+        struct RestoreProxyBypass(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for RestoreProxyBypass {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    // SAFETY: the environment test lock outlives this guard.
+                    unsafe {
+                        match value {
+                            Some(value) => std::env::set_var(key, value),
+                            None => std::env::remove_var(key),
+                        }
+                    }
+                }
+            }
+        }
+        let _bypass = RestoreProxyBypass(
+            ["NO_PROXY", "no_proxy"]
+                .into_iter()
+                .map(|key| (key, std::env::var_os(key)))
+                .collect(),
+        );
+        for key in ["NO_PROXY", "no_proxy"] {
+            set_or_clear_env(key, Some("127.0.0.1"));
+        }
         let previous = runtime_proxy_config();
         set_runtime_proxy_config(ProxyConfig::default());
         let result = tokio::task::spawn_blocking(|| {
