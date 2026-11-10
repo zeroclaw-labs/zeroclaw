@@ -1020,14 +1020,6 @@ fn sorted_agents(cfg: &Config) -> Vec<(&String, &crate::schema::AliasedAgentConf
     v
 }
 
-fn sorted_permission_profiles(
-    cfg: &Config,
-) -> Vec<(&String, &crate::schema::PermissionProfileConfig)> {
-    let mut profiles: Vec<_> = cfg.permission_profiles.iter().collect();
-    profiles.sort_by(|a, b| a.0.cmp(b.0));
-    profiles
-}
-
 fn sorted_peer_groups(cfg: &Config) -> Vec<(&String, &crate::multi_agent::PeerGroupConfig)> {
     let mut v: Vec<_> = cfg.peer_groups.iter().collect();
     v.sort_by(|a, b| a.0.cmp(b.0));
