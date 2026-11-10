@@ -475,7 +475,7 @@ When **`recover()` itself fails** (typically `MAC check for the secret storage k
 
 If `password` + `user_id` aren't configured, auto-recovery can't run: the channel bails with an actionable error pointing at the two choices: configure them, or `rm -rf ~/.zeroclaw/state/matrix/` manually.
 
-## Tool approval over chat (`approval_timeout_secs`)
+## Tool approval over chat (`approval_timeout_secs`, `approval_typed_instructions`)
 
 When a tool requires approval, the bot posts its name, argument summary, and an
 8-character token into the requesting room. It adds ✅, 🔁 and ❌ reactions to
@@ -485,9 +485,11 @@ listener handles reactions in plain and encrypted rooms, provided the bot can
 decrypt the event. If its own identity is unavailable, it refuses reaction
 decisions and offers only the typed path.
 
-The prompt shows only the reaction instruction while reactions are available,
-and the typed instruction otherwise. Typed replies work either way; reply with
-the token from the prompt's heading, for example:
+While reactions are available, the prompt shows the reaction instruction and,
+under it, the typed commands. Without them it shows only the typed commands. To
+show only the reaction instruction, set `approval_typed_instructions = false` on
+the alias; the default is `true`. Typed replies work either way; reply with the
+token from the prompt's heading, for example:
 
 ```text
 ABCD2345 approve
@@ -514,9 +516,10 @@ nothing. `approval_timeout_secs` defaults to 300 seconds; values below 1 use a
 one-second timeout. A timeout denies the request on the runtime's authority.
 
 If placing a reaction fails, the bot logs `matrix: failed to seed approval
-reaction` at `WARN`; typed replies continue to work. This feature needs no new
-configuration. To roll back, run the previous build; typed approvals retain the
-same commands.
+reaction` at `WARN`; typed replies continue to work. When
+`approval_typed_instructions = false`, the bot also posts the typed commands in
+a follow-up message. To roll back, run the previous build; typed approvals
+retain the same commands.
 
 ## See also
 

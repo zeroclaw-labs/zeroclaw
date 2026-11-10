@@ -707,18 +707,25 @@ pub(crate) fn build_approve_deny_approval_prompt(
     position: Option<(u32, u32)>,
 ) -> String {
     let header = build_approval_prompt_header(token, tool_name, arguments_summary, position);
+    let reply = build_approve_deny_reply_instruction(token);
+    format!("{header}\n\n{reply}")
+}
+
+/// The `<TOKEN> approve` / `<TOKEN> deny` / `<TOKEN> always` reply line of an
+/// approve/deny approval prompt.
+#[cfg(any(feature = "channel-matrix", test))]
+pub(crate) fn build_approve_deny_reply_instruction(token: &str) -> String {
     let approve_command = format!("{token} {APPROVAL_REPLY_APPROVE}");
     let deny_command = format!("{token} {APPROVAL_REPLY_DENY}");
     let always_command = format!("{token} {APPROVAL_REPLY_ALWAYS}");
-    let reply = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+    zeroclaw_runtime::i18n::get_required_cli_string_with_args(
         "channel-approval-reply-instruction-approve-deny",
         &[
             ("approve_command", approve_command.as_str()),
             ("deny_command", deny_command.as_str()),
             ("always_command", always_command.as_str()),
         ],
-    );
-    format!("{header}\n\n{reply}")
+    )
 }
 
 /// Heading, position, tool and arguments lines of a Matrix approval prompt,

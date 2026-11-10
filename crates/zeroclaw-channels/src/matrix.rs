@@ -446,6 +446,7 @@ mod approval {
         token: &str,
         request: &zeroclaw_api::channel::ChannelApprovalRequest,
         bot_user_id: Option<&matrix_sdk::ruma::UserId>,
+        typed_instructions: bool,
     ) -> String {
         if bot_user_id.is_none() {
             return crate::util::build_approve_deny_approval_prompt(
@@ -463,7 +464,11 @@ mod approval {
         );
         let react =
             zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-react-instruction");
-        format!("{header}\n\n{react}")
+        if !typed_instructions {
+            return format!("{header}\n\n{react}");
+        }
+        let reply = crate::util::build_approve_deny_reply_instruction(token);
+        format!("{header}\n\n{react}\n{reply}")
     }
 
     pub(super) struct ReactionPolicy<'a> {
@@ -4095,7 +4100,14 @@ mod outbound {
         Ok(event_id)
     }
 
-    pub(super) async fn seed_approval_reactions(room: &Room, event_id: &OwnedEventId) {
+    /// Fires `failed` at the first reaction that cannot be placed, so the
+    /// caller can react without waiting for the remaining sends.
+    pub(super) async fn seed_approval_reactions(
+        room: &Room,
+        event_id: &OwnedEventId,
+        failed: tokio::sync::oneshot::Sender<()>,
+    ) {
+        let mut failed = Some(failed);
         for emoji in [
             super::approval::APPROVAL_EMOJI_APPROVE,
             super::approval::APPROVAL_EMOJI_ALWAYS,
@@ -4104,6 +4116,9 @@ mod outbound {
             let content =
                 ReactionEventContent::new(Annotation::new(event_id.clone(), emoji.to_string()));
             if let Err(e) = room.send(content).await {
+                if let Some(failed) = failed.take() {
+                    let _ = failed.send(());
+                }
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -4736,12 +4751,17 @@ pub struct MatrixChannel {
 }
 
 impl MatrixChannel {
+    /// Seeds the approval reactions and catches up on any already sent. When
+    /// a reaction cannot be placed, sends the typed commands the prompt left
+    /// out without waiting for the catch-up.
     async fn prepare_approval_reactions(
         &self,
         client: &Client,
         room_id: &OwnedRoomId,
         event_id: &OwnedEventId,
         still_live: bool,
+        recipient: &str,
+        token: &str,
     ) {
         let attrs = || {
             ::serde_json::json!({
@@ -4749,12 +4769,21 @@ impl MatrixChannel {
                 "event_id": approval::bounded_log_value(event_id.as_str())
             })
         };
-        if !still_live {
+        if !still_live || client.user_id().is_none() {
             return;
         }
-        if client.user_id().is_some() {
-            if let Some(room) = client.get_room(room_id) {
-                tokio::join!(outbound::seed_approval_reactions(&room, event_id), async {
+        if let Some(room) = client.get_room(room_id) {
+            let (failed_tx, failed_rx) = oneshot::channel();
+            let fallback = async {
+                if failed_rx.await.is_ok() {
+                    self.send_hidden_typed_commands(client, recipient, token)
+                        .await;
+                }
+            };
+            tokio::join!(
+                outbound::seed_approval_reactions(&room, event_id, failed_tx),
+                fallback,
+                async {
                     if let Err(error) = approval::catch_up_reactions(
                         &room,
                         event_id,
@@ -4777,16 +4806,40 @@ impl MatrixChannel {
                             "matrix: failed to catch up approval reactions"
                         );
                     }
-                });
-            } else {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(attrs()),
-                    "matrix: approval room missing; skipping reactions"
-                );
-            }
+                }
+            );
+        } else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(attrs()),
+                "matrix: approval room missing; skipping reactions"
+            );
+            self.send_hidden_typed_commands(client, recipient, token)
+                .await;
+        }
+    }
+
+    /// Sends the typed approval commands when `approval_typed_instructions`
+    /// left them out of the prompt. Failure is logged; the prompt stands.
+    async fn send_hidden_typed_commands(&self, client: &Client, recipient: &str, token: &str) {
+        if self.config.approval_typed_instructions {
+            return;
+        }
+        let reply = crate::util::build_approve_deny_reply_instruction(token);
+        let message = approval::build_prompt_message(reply, recipient);
+        if let Err(error) = outbound::send(&self.outbox(client), &message).await {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "error": approval::bounded_log_value(&error.to_string()),
+                        "recipient": approval::bounded_log_value(recipient)
+                    })),
+                "matrix: failed to send typed approval commands"
+            );
         }
     }
 
@@ -5950,7 +6003,12 @@ impl Channel for MatrixChannel {
             token.clone(),
             Arc::clone(&registration),
         );
-        let prompt = approval::build_approval_prompt(&token, request, client.user_id());
+        let prompt = approval::build_approval_prompt(
+            &token,
+            request,
+            client.user_id(),
+            self.config.approval_typed_instructions,
+        );
 
         let send_msg = approval::build_prompt_message(prompt, recipient);
         let event_id = match outbound::send(&self.outbox(client), &send_msg).await {
@@ -5980,8 +6038,10 @@ impl Channel for MatrixChannel {
         // Catch-up and seeding must not delay a typed answer or stretch the
         // timeout. Dropping the request cancels both alongside the decision wait.
         let seed = async {
-            self.prepare_approval_reactions(client, &room_id, &event_id, still_live)
-                .await;
+            self.prepare_approval_reactions(
+                client, &room_id, &event_id, still_live, recipient, &token,
+            )
+            .await;
             std::future::pending().await
         };
 
@@ -8994,23 +9054,44 @@ mod tests {
         }
 
         #[test]
-        fn reaction_prompt_replaces_the_typed_reply_instruction() {
+        fn reaction_prompt_shows_typed_commands_unless_disabled() {
             use super::super::approval::build_approval_prompt;
             let bot = matrix_sdk::ruma::user_id!("@bot:example.invalid");
-            let prompt = build_approval_prompt("APPROVAL", &approval_request(), Some(bot));
             let react = zeroclaw_runtime::i18n::get_required_cli_string(
                 "channel-approval-react-instruction",
             );
+            let typed = crate::util::build_approve_deny_reply_instruction("APPROVAL");
+            for word in ["approve", "deny", "always"] {
+                assert!(typed.contains(&format!("APPROVAL {word}")), "{typed:?}");
+            }
+
+            let prompt = build_approval_prompt("APPROVAL", &approval_request(), Some(bot), true);
             assert!(
                 prompt.starts_with("APPROVAL REQUIRED [APPROVAL]\n"),
                 "{prompt:?}"
             );
+            assert!(
+                prompt.ends_with(&format!("\n\n{react}\n{typed}")),
+                "{prompt:?}"
+            );
+
+            let prompt = build_approval_prompt("APPROVAL", &approval_request(), Some(bot), false);
             assert!(prompt.ends_with(&format!("\n\n{react}")), "{prompt:?}");
             assert!(!prompt.contains("APPROVAL approve"), "{prompt:?}");
-            assert_eq!(
-                build_approval_prompt("APPROVAL", &approval_request(), None),
-                crate::util::build_approve_deny_approval_prompt("APPROVAL", "shell", "pwd", None)
-            );
+
+            for typed_instructions in [true, false] {
+                assert_eq!(
+                    build_approval_prompt(
+                        "APPROVAL",
+                        &approval_request(),
+                        None,
+                        typed_instructions
+                    ),
+                    crate::util::build_approve_deny_approval_prompt(
+                        "APPROVAL", "shell", "pwd", None
+                    )
+                );
+            }
         }
 
         #[tokio::test]
@@ -9026,6 +9107,7 @@ mod tests {
                 "APPROVAL",
                 &approval_request(),
                 client.user_id(),
+                false,
             );
             assert!(
                 !prompt.contains(&zeroclaw_runtime::i18n::get_required_cli_string(
@@ -9049,6 +9131,8 @@ mod tests {
                     &room_id!("!room:localhost").to_owned(),
                     &event_id!("$prompt:localhost").to_owned(),
                     true,
+                    "!room:localhost",
+                    "APPROVAL",
                 )
                 .await;
             assert!(
@@ -9187,6 +9271,39 @@ mod tests {
 
         #[tokio::test]
         async fn failed_reaction_seeding_keeps_typed_approval_available() {
+            failed_reaction_seeding(true, Stall::Nothing).await;
+        }
+
+        #[tokio::test]
+        async fn failed_reaction_seeding_sends_the_hidden_typed_commands() {
+            failed_reaction_seeding(false, Stall::Nothing).await;
+        }
+
+        #[tokio::test]
+        async fn stalled_reaction_catch_up_does_not_delay_the_typed_commands() {
+            failed_reaction_seeding(false, Stall::CatchUp).await;
+        }
+
+        #[tokio::test]
+        async fn stalled_later_reaction_does_not_delay_the_typed_commands() {
+            failed_reaction_seeding(false, Stall::LaterReactions).await;
+        }
+
+        /// A homeserver request that outlives the approval timeout.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Stall {
+            Nothing,
+            /// The catch-up's relations request.
+            CatchUp,
+            /// Every reaction after the first, rejected one.
+            LaterReactions,
+        }
+
+        /// Reaction sends fail. With the typed commands in the prompt there is
+        /// nothing more to send; without them they follow in a second message
+        /// as soon as one reaction fails, even while other homeserver requests
+        /// are still waiting. Either way a typed reply resolves the approval.
+        async fn failed_reaction_seeding(typed_instructions: bool, stall: Stall) {
             use matrix_sdk::ruma::room_id;
             use matrix_sdk::test_utils::mocks::MatrixMockServer;
             use std::{sync::Arc, time::Duration};
@@ -9206,23 +9323,48 @@ mod tests {
                     ResponseTemplate::new(200)
                         .set_body_json(serde_json::json!({"event_id":"$prompt:localhost"})),
                 )
-                .expect(1)
+                .expect(if typed_instructions { 1 } else { 2 })
                 .mount(matrix.server())
                 .await;
+            if stall == Stall::CatchUp {
+                Mock::given(method("GET"))
+                    .and(path_regex("/relations/"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_json(serde_json::json!({"chunk": []}))
+                            .set_delay(Duration::from_secs(30)),
+                    )
+                    .mount(matrix.server())
+                    .await;
+            }
+            let rejected = if stall == Stall::LaterReactions { 1 } else { 3 };
             Mock::given(method("PUT"))
                 .and(path_regex("/send/m.reaction/"))
                 .respond_with(ResponseTemplate::new(403).set_body_json(
                     serde_json::json!({"errcode":"M_FORBIDDEN","error":"forbidden"}),
                 ))
-                .expect(3)
+                .up_to_n_times(rejected)
+                .expect(rejected)
                 .mount(matrix.server())
                 .await;
+            if stall == Stall::LaterReactions {
+                Mock::given(method("PUT"))
+                    .and(path_regex("/send/m.reaction/"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_json(serde_json::json!({"event_id":"$seed:localhost"}))
+                            .set_delay(Duration::from_secs(30)),
+                    )
+                    .mount(matrix.server())
+                    .await;
+            }
             let workspace = tempfile::tempdir().unwrap();
             let channel = super::super::MatrixChannel::new(
                 MatrixConfig {
                     homeserver: matrix.server().uri(),
                     access_token: Some("test-token".to_string()),
                     approval_timeout_secs: 10,
+                    approval_typed_instructions: typed_instructions,
                     ack_reactions: Some(false),
                     ..MatrixConfig::default()
                 },
@@ -9238,24 +9380,30 @@ mod tests {
                 raw_arguments: None,
                 position: None,
             };
+            let expected_messages = if typed_instructions { 1 } else { 2 };
             let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
                 tokio::join!(
                     channel.request_approval_attributed(room.room_id().as_str(), &request),
                     async {
                         loop {
-                            let seeded = matrix
-                                .server()
-                                .received_requests()
-                                .await
-                                .unwrap()
-                                .iter()
-                                .filter(|req| req.url.path().contains("/send/m.reaction/"))
-                                .count()
-                                == 3;
-                            if seeded {
+                            let requests = matrix.server().received_requests().await.unwrap();
+                            let sent = |kind: &str| {
+                                requests
+                                    .iter()
+                                    .filter(|req| req.url.path().contains(kind))
+                                    .count()
+                            };
+                            if sent("/send/m.reaction/") >= rejected as usize
+                                && sent("/send/m.room.message/") == expected_messages
+                            {
                                 break;
                             }
                             tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                        if typed_instructions {
+                            // Give a wrongly sent follow-up time to reach the
+                            // server before the answer cancels seeding.
+                            tokio::time::sleep(Duration::from_millis(100)).await;
                         }
                         let token = {
                             let pending = channel.pending_approvals.lock().await;
@@ -9284,23 +9432,44 @@ mod tests {
             );
             assert!(channel.pending_approvals.lock().await.pending.is_empty());
             let requests = matrix.server().received_requests().await.unwrap();
-            let prompt = requests
+            let messages: Vec<String> = requests
                 .iter()
-                .find(|req| req.url.path().contains("/send/m.room.message/"))
-                .unwrap()
-                .body_json::<serde_json::Value>()
+                .filter(|req| req.url.path().contains("/send/m.room.message/"))
+                .map(|req| {
+                    req.body_json::<serde_json::Value>().unwrap()["body"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect();
+            assert_eq!(messages.len(), expected_messages, "{messages:?}");
+            let token = messages[0]
+                .strip_prefix("APPROVAL REQUIRED [")
+                .and_then(|rest| rest.split(']').next())
                 .unwrap();
-            assert!(prompt["body"].as_str().unwrap().contains(
-                &zeroclaw_runtime::i18n::get_required_cli_string(
+            let typed = crate::util::build_approve_deny_reply_instruction(token);
+            assert!(
+                messages[0].contains(&zeroclaw_runtime::i18n::get_required_cli_string(
                     "channel-approval-react-instruction"
-                )
-            ));
+                ))
+            );
+            assert_eq!(
+                messages[0].contains(&typed),
+                typed_instructions,
+                "{messages:?}"
+            );
+            if !typed_instructions {
+                assert_eq!(messages[1], typed);
+            }
             let annotations: Vec<serde_json::Value> = requests
                 .iter()
                 .filter(|req| req.url.path().contains("/send/m.reaction/"))
                 .map(|req| req.body_json::<serde_json::Value>().unwrap()["m.relates_to"].clone())
                 .collect();
-            assert_eq!(annotations.len(), 3);
+            assert!(
+                (rejected as usize..=3).contains(&annotations.len()),
+                "{annotations:?}"
+            );
             for (annotation, key) in annotations.iter().zip(["✅", "🔁", "❌"]) {
                 assert_eq!(
                     annotation,
@@ -12117,6 +12286,7 @@ mod tests {
                 recovery_key: None,
                 password: password.map(String::from),
                 approval_timeout_secs: 300,
+                approval_typed_instructions: true,
                 reply_in_thread: true,
                 ack_reactions: Some(true),
                 excluded_tools: vec![],
