@@ -287,6 +287,38 @@ pub struct StatusResponse {
 /// have `model_provider`, `model`, `temperature`, and `memory_backend`
 /// reflect that specific agent's resolved config; omit it for the
 /// install-wide summary.
+/// The model a configured agent answers with, as the status page reports
+/// it.
+#[derive(Debug, Default)]
+pub(crate) struct AgentModel {
+    pub(crate) provider_ref: Option<String>,
+    pub(crate) model: String,
+    pub(crate) temperature: Option<f64>,
+}
+
+/// [`AgentModel`] for `alias`, or `None` when no such agent is configured.
+pub(crate) fn agent_model(config: &Config, alias: &str) -> Option<AgentModel> {
+    let agent = config.agent(alias)?;
+    let provider_ref = if agent.model_provider.is_empty() {
+        None
+    } else {
+        Some(agent.model_provider.as_str().to_string())
+    };
+    let resolved = config.resolved_model_provider_for_agent(alias);
+    let model = config
+        .resolve_model_id(agent.model_provider.as_str())
+        .or_else(|| resolved.as_ref().and_then(|(_, _, cfg)| cfg.model.clone()))
+        .unwrap_or_default();
+    let temperature = config
+        .resolve_model_temperature(agent.model_provider.as_str())
+        .or_else(|| resolved.as_ref().and_then(|(_, _, cfg)| cfg.temperature));
+    Some(AgentModel {
+        provider_ref,
+        model,
+        temperature,
+    })
+}
+
 #[derive(Debug, Deserialize)]
 pub struct StatusQuery {
     #[serde(default)]
@@ -329,19 +361,11 @@ pub async fn handle_api_status(
     let (model_provider, model, temperature, memory_backend) =
         match agent_alias.and_then(|alias| config.agent(alias).map(|a| (alias, a))) {
             Some((alias, agent)) => {
-                let provider_ref = if agent.model_provider.is_empty() {
-                    None
-                } else {
-                    Some(agent.model_provider.as_str().to_string())
-                };
-                let resolved = config.resolved_model_provider_for_agent(alias);
-                let model = config
-                    .resolve_model_id(agent.model_provider.as_str())
-                    .or_else(|| resolved.as_ref().and_then(|(_, _, cfg)| cfg.model.clone()))
-                    .unwrap_or_default();
-                let temperature: Option<f64> = config
-                    .resolve_model_temperature(agent.model_provider.as_str())
-                    .or_else(|| resolved.as_ref().and_then(|(_, _, cfg)| cfg.temperature));
+                let AgentModel {
+                    provider_ref,
+                    model,
+                    temperature,
+                } = agent_model(&config, alias).unwrap_or_default();
                 let backend_kind = agent.memory.backend;
                 let backend = serde_json::to_value(backend_kind)
                     .ok()
@@ -2609,6 +2633,40 @@ pub(crate) mod tests {
                 "base_url": "http://10.0.0.2:42617/peer",
             }])
         );
+    }
+
+    #[test]
+    fn agent_model_resolves_canonical_model_and_preset_for_status_consumers() {
+        let mut config = Config::default();
+        config.providers = toml::from_str(
+            r#"
+[connections."gateway.prod"]
+kind = "custom"
+uri = "https://example.test/v1"
+[model_presets."chat.defaults"]
+capability = "chat"
+options = { temperature = 0.35 }
+[models."chat.fast.us"]
+capability = "chat"
+provider = "gateway.prod"
+model = "upstream-chat-model"
+preset = "chat.defaults"
+"#,
+        )
+        .unwrap();
+        config.agents.insert(
+            "support".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: "chat.fast.us".into(),
+                ..Default::default()
+            },
+        );
+
+        let model = agent_model(&config, "support").unwrap();
+        assert_eq!(model.provider_ref.as_deref(), Some("chat.fast.us"));
+        assert_eq!(model.model, "upstream-chat-model");
+        assert_eq!(model.temperature, Some(0.35));
+        assert!(agent_model(&config, "missing").is_none());
     }
 
     #[tokio::test]

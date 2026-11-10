@@ -1,7 +1,6 @@
 //! RPC session state.
 
 use crate::agent::agent::{Agent, TurnEvent};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -64,15 +63,7 @@ pub enum SteerOutcome {
     NoActiveTurn,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct SessionOverrides {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model_provider: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f64>,
-}
+pub use zeroclaw_rpc_proto::types::SessionOverrides;
 
 /// An entry in the per-session upload index (content-addressed by SHA-256).
 #[derive(Clone, Debug)]

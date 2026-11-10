@@ -11,6 +11,8 @@ publish = true
 [dependencies]
 # Internal workspace crates
 zeroclaw-api.workspace = true
+zeroclaw-rpc-client.workspace = true
+zeroclaw-rpc-proto.workspace = true
 zeroclaw-spawn.workspace = true
 zeroclaw-config.workspace = true
 zeroclaw-tls.workspace = true

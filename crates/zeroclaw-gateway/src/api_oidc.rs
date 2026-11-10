@@ -307,7 +307,7 @@ pub(crate) struct OidcEnrollmentState {
     /// This surface's own attempt counter, deliberately separate from
     /// `AppState::auth_limiter`: a lockout earned here must not reach
     /// pairing or webhook auth, nor theirs reach enrollment.
-    attempts: crate::auth_rate_limit::AuthRateLimiter,
+    pub(crate) attempts: crate::auth_rate_limit::AuthRateLimiter,
     poll_budget: SlidingWindowRateLimiter,
     pub(crate) outbound: Semaphore,
 }
@@ -367,7 +367,7 @@ pub(crate) fn routes_with(enrollment_state: Arc<OidcEnrollmentState>) -> Router<
 /// Attached inside [`routes_with`] so the production router gets it by
 /// merging these routes, next to (not instead of) the gateway-wide
 /// security headers, which set `no-referrer` and COOP but no cache policy.
-async fn no_store(request: Request, next: Next) -> Response {
+pub(crate) async fn no_store(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -378,7 +378,7 @@ async fn no_store(request: Request, next: Next) -> Response {
 /// The client this request is billed to: the forwarded address only where
 /// the deployment trusts its proxy, the peer address otherwise. Same
 /// derivation as every other rate-limited gateway surface.
-fn client_key(state: &AppState, peer: SocketAddr, headers: &HeaderMap) -> String {
+pub(crate) fn client_key(state: &AppState, peer: SocketAddr, headers: &HeaderMap) -> String {
     crate::client_key_from_request(Some(peer), headers, state.trust_forwarded_headers)
 }
 
@@ -408,7 +408,7 @@ fn too_many_requests(message: &str, retry_after_secs: u64) -> Response {
 /// answer shows the caller is polling too fast or feeding the relay
 /// invalid device codes, and a callback once it turns out not to have
 /// finished a sign-in.
-fn auth_gate(
+pub(crate) fn auth_gate(
     enrollment_state: &OidcEnrollmentState,
     key: &str,
     record: bool,
@@ -432,7 +432,10 @@ fn auth_gate(
 /// outbound work. Loopback is exempt on exactly the terms the auth limiter
 /// exempts it on, so a local dashboard and a local zerocode keep working
 /// while a remote caller stays bounded.
-fn budget_gate(enrollment_state: &OidcEnrollmentState, key: &str) -> Result<(), Box<Response>> {
+pub(crate) fn budget_gate(
+    enrollment_state: &OidcEnrollmentState,
+    key: &str,
+) -> Result<(), Box<Response>> {
     if crate::auth_rate_limit::is_loopback_key(key) {
         return Ok(());
     }
@@ -449,12 +452,14 @@ fn budget_gate(enrollment_state: &OidcEnrollmentState, key: &str) -> Result<(), 
 
 /// Reserve one of the outbound slots. The permit is held for the whole IdP
 /// round trip, so the cap counts requests in flight rather than started.
-fn outbound_permit(enrollment_state: &OidcEnrollmentState) -> Option<SemaphorePermit<'_>> {
+pub(crate) fn outbound_permit(
+    enrollment_state: &OidcEnrollmentState,
+) -> Option<SemaphorePermit<'_>> {
     enrollment_state.outbound.try_acquire().ok()
 }
 
 /// Refusal when the outbound cap is reached: nothing is sent to the IdP.
-fn relay_busy() -> Response {
+pub(crate) fn relay_busy() -> Response {
     let mut response = error_json(
         StatusCode::SERVICE_UNAVAILABLE,
         "enrollment relay is busy; retry shortly",
@@ -470,7 +475,7 @@ fn relay_busy_page() -> Response {
     response
 }
 
-fn error_json(status: StatusCode, message: &str) -> Response {
+pub(crate) fn error_json(status: StatusCode, message: &str) -> Response {
     (status, Json(serde_json::json!({ "error": message }))).into_response()
 }
 
@@ -554,12 +559,19 @@ async fn handle_providers(
     Json(serde_json::json!({ "providers": providers })).into_response()
 }
 
+#[derive(Default, Deserialize)]
+struct DeviceStartBody {
+    #[serde(default)]
+    code_challenge: Option<String>,
+}
+
 async fn handle_device_start(
     State(state): State<AppState>,
     Extension(relay): Extension<Arc<OidcEnrollmentState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(alias): Path<String>,
     headers: HeaderMap,
+    body: Option<Json<DeviceStartBody>>,
 ) -> Response {
     let key = client_key(&state, peer, &headers);
     if let Err(denied) = auth_gate(&relay, &key, true) {
@@ -572,7 +584,11 @@ async fn handle_device_start(
     let Some(_permit) = outbound_permit(&relay) else {
         return relay_busy();
     };
-    match enrollment.device_grant_start().await {
+    let body = body.map(|Json(body)| body).unwrap_or_default();
+    match enrollment
+        .device_grant_start_s256(body.code_challenge.as_deref())
+        .await
+    {
         Ok(start) => Json(start).into_response(),
         Err(e) => {
             ::zeroclaw_log::record!(
@@ -593,6 +609,8 @@ async fn handle_device_start(
 #[derive(Deserialize)]
 struct DevicePollBody {
     device_code: String,
+    #[serde(default)]
+    code_verifier: Option<String>,
 }
 
 async fn handle_device_poll(
@@ -617,7 +635,10 @@ async fn handle_device_poll(
     let Some(_permit) = outbound_permit(&relay) else {
         return relay_busy();
     };
-    match enrollment.device_grant_poll(&body.device_code).await {
+    match enrollment
+        .device_grant_poll_s256(&body.device_code, body.code_verifier.as_deref())
+        .await
+    {
         Ok(DevicePollOutcome::Pending) => {
             Json(serde_json::json!({ "status": "pending" })).into_response()
         }
@@ -940,7 +961,7 @@ fn has_dot_segment(path: &str) -> bool {
 
 /// Whether the request reached this gateway on the machine it runs on: a
 /// loopback peer that also named a loopback host.
-fn is_loopback_request(peer: SocketAddr, headers: &HeaderMap) -> bool {
+pub(crate) fn is_loopback_request(peer: SocketAddr, headers: &HeaderMap) -> bool {
     if !peer.ip().is_loopback() {
         return false;
     }
@@ -1151,6 +1172,7 @@ fn pair_first() -> Response {
 async fn handle_auth_session(
     State(state): State<AppState>,
     caller: Option<Extension<DashboardCaller>>,
+    core: Option<Extension<crate::core_rpc::CoreRpc>>,
     headers: HeaderMap,
 ) -> Response {
     if let Some(token) = crate::api::extract_bearer_token(&headers).filter(|t| !t.is_empty()) {
@@ -1163,17 +1185,37 @@ async fn handle_auth_session(
     match caller {
         Some(Extension(DashboardCaller::Session(session))) => {
             let admin = session.is_admin();
+            // Inside the daemon a scoped account's chat and conversations go
+            // through the core, which applies its grants. An administrator
+            // keeps the in-process chat and its history, which is also the
+            // only chat outside the daemon, where there is no core to reach.
+            let core_sessions = !admin
+                && core
+                    .as_ref()
+                    .is_some_and(|Extension(core)| core.connector().is_some());
+            // Chat through the core also needs the grants to use and close a
+            // conversation; see `dashboard_core::may_chat`.
+            let chat = admin || (core_sessions && crate::dashboard_core::may_chat(&session.grants));
+            // On the core path the session ends a little before its token
+            // expires, while its conversations can still be closed.
+            let expires_at = if core_sessions {
+                session
+                    .expires_at
+                    .saturating_sub(crate::dashboard_core::CLOSE_BEFORE_EXPIRY.as_secs())
+            } else {
+                session.expires_at
+            };
             Json(serde_json::json!({
                 "kind": "oidc",
                 "provider": format!("oidc.{}", session.alias),
                 "principal_id": session.principal().id.as_str(),
                 "display_name": session.display_name,
                 "admin": admin,
-                "expires_at": session.expires_at,
+                "expires_at": expires_at,
                 "csrf_token": session.csrf,
                 "features": {
-                    // Chat for other accounts needs the core session path.
-                    "chat": admin,
+                    "chat": chat,
+                    "core_sessions": core_sessions,
                     "operator_pages": admin,
                     // The config routes' own read rule; an administrator's
                     // grants permit everything, so it covers them too.
@@ -3974,5 +4016,42 @@ mod tests {
             0,
             "nothing reached the identity provider"
         );
+    }
+    #[tokio::test]
+    async fn device_proxy_relays_s256_without_returning_the_verifier() {
+        let server = idp().await;
+        Mock::given(http_method("POST")).and(http_path("/device"))
+            .and(body_string_contains("code_challenge_method=S256"))
+            .and(body_string_contains("code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"device_code":"dev-s256","user_code":"ABCD","verification_uri":"https://idp.example/activate","expires_in":600})))
+            .expect(1).mount(&server).await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .and(body_string_contains(
+                "code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"access_token":"synthetic-token","token_type":"Bearer"}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let router = router_for(config_with_alias(&server.uri(), "corp"));
+        let response = send(
+            &router,
+            "POST",
+            "/api/oidc/corp/device/start",
+            "gw.local",
+            Some(
+                serde_json::json!({"code_challenge":"E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"}),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_text(response).await;
+        assert!(!body.contains("code_verifier"));
+        let response = send(&router,"POST","/api/oidc/corp/device/poll","gw.local",Some(serde_json::json!({"device_code":"dev-s256","code_verifier":"dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"}))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(body_text(response).await.contains("synthetic-token"));
     }
 }
