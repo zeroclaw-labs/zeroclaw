@@ -6516,9 +6516,23 @@ impl SecurityPolicy {
 
         // Forbidden paths run the OPPOSITE direction from allowlists:
         // the parent's forbidden set must be a subset of the child's,
-        // i.e. the child cannot drop a parent's forbidden entry.
+        // i.e. the child cannot drop a parent's forbidden entry. Entries
+        // are compared RESOLVED against each policy's own workspace: a
+        // relative entry means different absolute paths under parent and
+        // child workspaces, and raw-string equality would let a child
+        // workspace nested under the parent's carry the same list verbatim
+        // while its denials all shift a level deeper — reopening exactly
+        // the subtree the parent denies (e.g. parent workspace `/srv` with
+        // `deny_read = ["sub/.secrets"]` and a child at `/srv/sub`: the
+        // child's copy resolves to `/srv/sub/sub/.secrets`, so its
+        // workspace grant would reopen `/srv/sub/.secrets`).
         for parent_forbidden in &parent.forbidden_paths {
-            if !self.forbidden_paths.iter().any(|c| c == parent_forbidden) {
+            let parent_resolved = resolve_policy_entry(parent_forbidden, &parent.workspace_dir);
+            let covered = self
+                .forbidden_paths
+                .iter()
+                .any(|c| resolve_policy_entry(c, &self.workspace_dir) == parent_resolved);
+            if !covered {
                 return Err(EscalationViolation::ForbiddenPathDroppedByChild {
                     path: parent_forbidden.clone(),
                 });
@@ -12689,6 +12703,52 @@ mod tests {
             child.ensure_no_escalation_beyond(&parent).is_ok(),
             "matching explicit empty allow_write on both sides is not an escalation: {:?}",
             child.ensure_no_escalation_beyond(&parent)
+        );
+    }
+
+    #[test]
+    fn escalation_rejects_relative_denial_shifted_by_child_workspace() {
+        // A relative denial means different absolute paths under parent and
+        // child workspaces. A child at `/srv/sub` carrying the parent's
+        // `deny_read = ["sub/.secrets"]` verbatim resolves it to
+        // `/srv/sub/sub/.secrets`, so its workspace grant would reopen
+        // `/srv/sub/.secrets`, which the parent denies. The dropped-entry
+        // check compares RESOLVED denials, so the shift is a refusal; a
+        // child entry that genuinely resolves onto the parent's denial
+        // still covers it.
+        let parent_tmp = tempfile::TempDir::new().unwrap();
+        let parent_ws = parent_tmp.path().to_path_buf();
+        std::fs::create_dir_all(parent_ws.join("sub")).unwrap();
+        let child_ws = parent_ws.join("sub");
+
+        let profile = crate::schema::RiskProfileConfig {
+            forbidden_paths: vec!["sub/.secrets".to_string()],
+            ..crate::schema::RiskProfileConfig::default()
+        };
+        let parent = SecurityPolicy::from_risk_profile(&profile, &parent_ws);
+        let child = SecurityPolicy::from_risk_profile(&profile, &child_ws);
+        let err = child
+            .ensure_no_escalation_beyond(&parent)
+            .expect_err("a verbatim relative list shifts meaning under the child workspace");
+        assert!(
+            matches!(err, EscalationViolation::ForbiddenPathDroppedByChild { .. }),
+            "expected a dropped-denial violation, got {err:?}"
+        );
+
+        // Control: a child entry that resolves onto the parent's denial
+        // (the same absolute location) covers it, and the override stands.
+        let covering = crate::schema::RiskProfileConfig {
+            forbidden_paths: vec![
+                "sub/.secrets".to_string(),
+                child_ws.join(".secrets").to_string_lossy().into_owned(),
+            ],
+            ..crate::schema::RiskProfileConfig::default()
+        };
+        let covering_child = SecurityPolicy::from_risk_profile(&covering, &child_ws);
+        assert!(
+            covering_child.ensure_no_escalation_beyond(&parent).is_ok(),
+            "a child entry resolving onto the parent's denial covers it: {:?}",
+            covering_child.ensure_no_escalation_beyond(&parent)
         );
     }
 

@@ -1735,12 +1735,14 @@ impl GitOperationsTool {
     /// rejects. Comparing against the pinned id (rather than re-resolving
     /// the reference at verification time) is what detects the move.
     /// Attach HEAD to `refname` only while the branch still designates
-    /// `pinned`. The mutating command already materialized the PINNED tree
-    /// detached — the only tree Git wrote is the one the preflight listed —
-    /// so attaching is a purely symbolic update that rewrites no files: a
-    /// branch that moved or vanished between resolution and execution costs
-    /// the refusal and nothing else, and the working tree keeps exactly the
-    /// authorized tree instead of a mutation followed by an error.
+    /// `pinned` AND no other worktree already holds it. The mutating
+    /// command already materialized the PINNED tree detached — the only
+    /// tree Git wrote is the one the preflight listed — so attaching is a
+    /// purely symbolic update that rewrites no files: a branch that moved,
+    /// vanished, or is occupied elsewhere between resolution and execution
+    /// costs the refusal and nothing else, and the working tree keeps
+    /// exactly the authorized tree instead of a mutation followed by an
+    /// error.
     async fn attach_head_if_still_pinned(
         &self,
         refname: &str,
@@ -1764,8 +1766,60 @@ impl GitOperationsTool {
                  the working tree stays detached at the authorized commit"
             );
         }
+        // Occupied-branch guard: `git checkout <branch>` and
+        // `git worktree add <path> <branch>` both refuse a branch already
+        // checked out in another worktree, because two worktrees advancing
+        // one branch with separate indexes silently lose each other's
+        // commits. The detached materialization bypassed that refusal, so
+        // restore it here — attach only when the branch is free.
+        if let Err(holder) = self
+            .worktree_other_than_working_dir_holding(refname, working_dir)
+            .await
+        {
+            anyhow::bail!(
+                "branch '{refname}' is already checked out in worktree at '{holder}'; \
+                 refusing to attach HEAD — the working tree stays detached at the \
+                 pinned commit '{pinned}'"
+            );
+        }
         self.run_git_command(&["symbolic-ref", "HEAD", refname], working_dir)
             .await?;
+        Ok(())
+    }
+
+    /// The worktree root of the first entry in `git worktree list
+    /// --porcelain` whose `branch` is exactly `refname`, excluding the
+    /// worktree containing `working_dir`. `Ok(())` when the branch is free.
+    async fn worktree_other_than_working_dir_holding(
+        &self,
+        refname: &str,
+        working_dir: &std::path::Path,
+    ) -> Result<(), String> {
+        let listing = self
+            .run_git_read_command(
+                &["--no-optional-locks", "worktree", "list", "--porcelain"],
+                working_dir,
+            )
+            .await
+            .map_err(|e| format!("<unavailable: {e}>"))?;
+        let here = zeroclaw_config::policy::canonicalize_best_effort(working_dir);
+        let mut current_worktree: Option<String> = None;
+        let mut here_seen = false;
+        for line in listing.lines() {
+            if let Some(dir) = line.strip_prefix("worktree ") {
+                current_worktree = Some(dir.to_string());
+                let dir_canon = zeroclaw_config::policy::canonicalize_best_effort(Path::new(dir));
+                here_seen = here == dir_canon || here.starts_with(&dir_canon);
+                continue;
+            }
+            if let Some(branch) = line.strip_prefix("branch ")
+                && branch == refname
+                && let Some(dir) = &current_worktree
+                && !here_seen
+            {
+                return Err(dir.clone());
+            }
+        }
         Ok(())
     }
 
@@ -7698,6 +7752,142 @@ mod tests {
                 .contains("attached"),
             "the failure must come from the attachment verification: {:?}",
             result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn checkout_refuses_when_another_worktree_holds_the_branch() {
+        // Git itself refuses `git checkout <branch>` when another worktree
+        // already holds it; the pinned detached materialization bypassed
+        // that refusal, so the attach step must restore it. Two worktrees
+        // advancing one branch with separate indexes silently lose each
+        // other's commits.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        run_git(&root, &["checkout", "-b", "topic"]);
+        std::fs::write(root.join("notes.txt"), "topic tip").unwrap();
+        run_git(&root, &["add", "notes.txt"]);
+        run_git(
+            &root,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "tip",
+            ],
+        );
+        run_git(&root, &["checkout", "master"]);
+        // A second worktree takes the branch.
+        run_git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "--",
+                root.join("wt-a").to_str().unwrap(),
+                "topic",
+            ],
+        );
+
+        let tool = test_tool(&root);
+        let result = tool
+            .execute(json!({"operation": "checkout", "branch": "topic"}))
+            .await
+            .unwrap();
+        assert!(
+            !result.success,
+            "a branch held by another worktree must not be attached"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("already checked out"),
+            "the refusal must name the holding worktree: {:?}",
+            result.error
+        );
+        let abbrev = run_git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        assert_eq!(
+            abbrev.trim(),
+            "HEAD",
+            "HEAD must stay detached at the pinned commit rather than attached to the occupied branch"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("notes.txt")).unwrap(),
+            "topic tip",
+            "the working tree must hold the pinned tree"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_add_refuses_when_another_worktree_holds_the_branch() {
+        // Same occupied-branch guard for `worktree add <path> <branch>`:
+        // Git refuses it natively; the detached pinned add bypassed that
+        // refusal, so the attach step restores it and leaves the new
+        // worktree detached at the authorized commit.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        run_git(&root, &["checkout", "-b", "topic"]);
+        std::fs::write(root.join("notes.txt"), "topic tip").unwrap();
+        run_git(&root, &["add", "notes.txt"]);
+        run_git(
+            &root,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "tip",
+            ],
+        );
+        run_git(&root, &["checkout", "master"]);
+        run_git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "--",
+                root.join("wt-a").to_str().unwrap(),
+                "topic",
+            ],
+        );
+
+        let tool = test_tool(&root);
+        let wt_b = root.join("wt-b");
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "add",
+                "worktree_path": wt_b.to_str().unwrap(),
+                "branch": "topic",
+            }))
+            .await
+            .unwrap();
+        assert!(
+            !result.success,
+            "a branch held by another worktree must not be attached in a new worktree"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("already checked out"),
+            "the refusal must name the holding worktree: {:?}",
+            result.error
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt_b.join("notes.txt")).unwrap_or_default(),
+            "topic tip",
+            "the new worktree must hold the pinned tree, detached"
         );
     }
 
