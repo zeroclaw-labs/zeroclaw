@@ -4,7 +4,7 @@ contact_links:
     url: https://github.com/zeroclaw-labs/zeroclaw/security/policy
     about: Please report security vulnerabilities privately via SECURITY.md policy.
   - name: Discord help
-    url: https://discord.gg/zeroclaw
+    url: https://www.zeroclaw.com/discord
     about: Use Discord for quick back-and-forth setup or usage help that does not need durable tracking yet.
   - name: GitHub Discussions
     url: https://github.com/zeroclaw-labs/zeroclaw/discussions

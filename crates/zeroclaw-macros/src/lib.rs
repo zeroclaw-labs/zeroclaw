@@ -523,6 +523,11 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 });
 
                 let field_name_lit = snake_to_kebab(&field_ident.to_string());
+                let section_path = if prefix.is_empty() {
+                    field_name_lit.clone()
+                } else {
+                    format!("{prefix}.{field_name_lit}")
+                };
                 let field_doc = extract_doc(&field.attrs);
                 let value_ty_name = value_ty.to_token_stream().to_string();
 
@@ -824,15 +829,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     // is actually creating.
                     map_key_section_entries.push(quote! {
                         out.push(crate::config::MapKeySection {
-                            path: {
-                                let prefix = Self::configurable_prefix();
-                                let s = if prefix.is_empty() {
-                                    #field_name_lit.to_string()
-                                } else {
-                                    format!("{prefix}.{}", #field_name_lit)
-                                };
-                                Box::leak(s.into_boxed_str())
-                            },
+                            path: #section_path,
                             kind: crate::config::MapKeyKind::Map,
                             value_type: #inner_ty_name,
                             description: #field_doc,
@@ -1086,20 +1083,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     // typed insertion. Both auto-derived — no hand-table.
                     map_key_section_entries.push(quote! {
                         out.push(crate::config::MapKeySection {
-                            // Path is computed at static-init time via the
-                            // configurable_prefix const + field name literal.
-                            path: {
-                                // SAFETY: leak-once for static lifetime; runs
-                                // exactly per (Type, field) pair, bounded by the
-                                // schema's field count.
-                                let prefix = Self::configurable_prefix();
-                                let s = if prefix.is_empty() {
-                                    #field_name_lit.to_string()
-                                } else {
-                                    format!("{prefix}.{}", #field_name_lit)
-                                };
-                                Box::leak(s.into_boxed_str())
-                            },
+                            path: #section_path,
                             kind: crate::config::MapKeyKind::Map,
                             value_type: #value_ty_name,
                             description: #field_doc,
@@ -1384,6 +1368,11 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 let vec_inner_name = vec_inner_ty.to_token_stream().to_string();
                 let field_doc = extract_doc(&field.attrs);
                 let vec_field_name_lit = snake_to_kebab(&field_ident.to_string());
+                let section_path = if prefix.is_empty() {
+                    vec_field_name_lit.clone()
+                } else {
+                    format!("{prefix}.{vec_field_name_lit}")
+                };
                 let vec_natural_key_token = match &natural_key_field {
                     Some(name) => quote! { Some(#name) },
                     None => quote! { None },
@@ -1400,15 +1389,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 }
                 map_key_section_entries.push(quote! {
                     out.push(crate::config::MapKeySection {
-                        path: {
-                            let prefix = Self::configurable_prefix();
-                            let s = if prefix.is_empty() {
-                                #vec_field_name_lit.to_string()
-                            } else {
-                                format!("{prefix}.{}", #vec_field_name_lit)
-                            };
-                            Box::leak(s.into_boxed_str())
-                        },
+                        path: #section_path,
                         kind: crate::config::MapKeyKind::List,
                         value_type: #vec_inner_name,
                         description: #field_doc,
@@ -3180,7 +3161,7 @@ mod tests {
         // must not be enumerated as a settable property.
         let field: syn::Field = parse_quote! {
             #[serde(default, skip_serializing, deserialize_with = "f")]
-            pub nevis: Option<serde_json::Value>
+            pub retired: Option<serde_json::Value>
         };
         assert!(has_serde_skip(&field));
 
