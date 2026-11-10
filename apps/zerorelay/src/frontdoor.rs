@@ -23,6 +23,7 @@
 //! TLS, no X.509 parser and no relay frame codec.
 
 use crate::Inner;
+use crate::dashboard::write_flushed;
 use crate::enroll_proxy::{self, MAX_FRONTDOOR_REQUEST_BYTES, ProxyError};
 use crate::frontdoor_assets::{APP_JS, INDEX_HTML};
 use anyhow::{Context, Result};
@@ -188,7 +189,10 @@ where
         if request_is_head(&head) {
             response = head_only(response);
         }
-        if stream.write_all(&response).await.is_err() {
+        // Flushed, not only written (see `write_flushed`): the read below waits
+        // for the browser's next request, which it sends only once it has all
+        // of this response.
+        if write_flushed(&mut stream, &response).await.is_err() {
             break;
         }
         if close {
@@ -753,6 +757,69 @@ mod tests {
             1,
             "exactly one response: {text}"
         );
+    }
+
+    /// Read one response's head, then its body up to `content-length`.
+    async fn read_response_body<S: AsyncRead + Unpin>(stream: &mut S) -> std::io::Result<Vec<u8>> {
+        let mut data = Vec::new();
+        let mut buf = [0u8; 4096];
+        let (end, length) = loop {
+            let n = stream.read(&mut buf).await?;
+            if n == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            data.extend_from_slice(&buf[..n]);
+            if let Some(end) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&data[..end]).to_ascii_lowercase();
+                let length: usize = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse().ok())
+                    .expect("a content-length");
+                break (end + 4, length);
+            }
+        };
+        let mut body = data.split_off(end);
+        while body.len() < length {
+            let n = stream.read(&mut buf).await?;
+            if n == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            body.extend_from_slice(&buf[..n]);
+        }
+        Ok(body)
+    }
+
+    /// A browser on a real TLS stream gets the whole page script while the
+    /// connection stays open for its next request, not only once the keep-alive
+    /// wait ends and closing the connection flushes the TLS writer. The socket
+    /// holds far less than the script, so its end is still in the writer's own
+    /// buffer when the response has been written (see `write_flushed`).
+    #[tokio::test]
+    async fn a_tls_browser_gets_the_whole_script_before_the_keep_alive_wait_ends() {
+        let cfg = crate::RelayConfig {
+            frontdoor_enabled: true,
+            ..Default::default()
+        };
+        let inner = crate::RelayServer::new(cfg).inner.clone();
+        let (mut browser, relay_side) = crate::dashboard::tls_over_duplex(4 * 1024).await;
+        browser
+            .write_all(b"GET /app.js HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        browser.flush().await.unwrap();
+        let session = match accept(relay_side, true).await.expect("accept") {
+            Accepted::Http(s) => s,
+            _ => panic!("expected a frontdoor HTTP session"),
+        };
+        let serving = tokio::spawn(async move { serve_session(session, inner).await });
+        // Well inside the keep-alive wait, so only a flush can deliver the end.
+        let body = timeout(HTTP_KEEP_ALIVE_IDLE / 2, read_response_body(&mut browser))
+            .await
+            .expect("the whole script must arrive while the connection stays open")
+            .unwrap();
+        assert_eq!(body, APP_JS.as_bytes());
+        serving.abort();
     }
 
     /// The mirror of the test below, and the case an `Err`-based predicate misses:

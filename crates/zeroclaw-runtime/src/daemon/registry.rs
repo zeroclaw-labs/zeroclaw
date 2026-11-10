@@ -75,6 +75,9 @@ pub struct DaemonInboundAuthority {
     pub inbound_auth: Arc<crate::rpc::auth::RpcInboundAuth>,
     /// The live configuration the RPC context reads and writes.
     pub config: zeroclaw_config::live::LiveConfigHandle,
+    /// The generation's single certificate-audit writer, shared with device
+    /// enrollment and RPC renewal. The gateway must never open a second writer.
+    pub cert_audit: Option<Arc<crate::security::audit::AuditLogger>>,
 }
 
 pub type GatewayStarter = Box<
