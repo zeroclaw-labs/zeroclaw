@@ -3599,6 +3599,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queued_chat_drain_checks_access_before_ready_updates() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_rpc_client::Notification;
+
+        let server = idp(&["admins"], "gw").await;
+        let mut config = sign_in_config(&server.uri());
+        config.agents.insert("support".into(), Default::default());
+        let profile = config.permission_profiles.get_mut("admin").unwrap();
+        profile.admin = false;
+        profile.allowed_agents = vec!["support".into()];
+        profile.grants.insert(
+            Resource::Sessions,
+            vec![Verb::Create, Verb::Read, Verb::Execute, Verb::Update],
+        );
+        let fixture = fixture(config.clone());
+        let signed_in = sign_in(&fixture, &server).await;
+        let DashboardCaller::Session(session) = fixture
+            .auth
+            .admit(|alias| Some(pin_for(&fixture, alias)), &signed_in.cookie)
+            .await
+        else {
+            panic!("signed in")
+        };
+        let mut watch = SessionWatch::for_chat(
+            Arc::clone(&fixture.auth),
+            session,
+            "support",
+            &fixture.state,
+        );
+        assert_eq!(watch.admits_now(&fixture.state).await, Ok(()));
+        config
+            .permission_profiles
+            .get_mut("admin")
+            .unwrap()
+            .grants
+            .get_mut(&Resource::Sessions)
+            .unwrap()
+            .retain(|verb| *verb != Verb::Read);
+        let authority = fixture.auth.inbound.authority_ref().upgrade().unwrap();
+        authority
+            .publish_accepted(&config, authority.accepted_revision() + 1)
+            .unwrap();
+        watch.recheck = tokio::time::interval(std::time::Duration::from_millis(1));
+        let mut watch = Some(watch);
+        let mut stopping = fixture.state.shutdown_tx.subscribe();
+        let (tx, mut updates) = tokio::sync::broadcast::channel(4);
+        let code = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                tx.send(Notification {
+                    method: "session/update".into(),
+                    params: serde_json::json!({"type": "agent_message_chunk", "session_id": "queued", "text": "chunk"}),
+                }).unwrap();
+                match crate::chat_core::next_queued_update(
+                    &mut watch, &fixture.state, &mut stopping, &mut updates,
+                ).await {
+                    Err(crate::chat_core::Stop::Close(code)) => break code,
+                    Ok(Ok(_)) => {
+                        // A reading browser can yield on every write while
+                        // leaving the next notification ready for the drain.
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                    other => panic!("unexpected queued drain result: {other:?}"),
+                }
+            }
+        }).await.expect("queued output cannot starve the actual permission watch");
+        assert_eq!(code, WS_CLOSE_ACCESS_LOST);
+    }
+
+    #[tokio::test]
     async fn a_socket_watch_fires_when_its_session_is_signed_out() {
         let server = idp(&["admins"], "gw").await;
         let fixture = fixture(sign_in_config(&server.uri()));

@@ -233,13 +233,30 @@ pub(crate) async fn ws_chat_through_core(
 }
 
 /// How a socket ends.
-enum Stop {
+#[derive(Debug)]
+pub(crate) enum Stop {
     /// The peer left, or the socket was already closed.
     Gone,
     /// Close with this code; the client must not reconnect on its own.
     Close(u16),
     /// The gateway generation is stopping: close so the client reconnects.
     Reconnect,
+}
+
+/// Take a queued update without waiting for another, while keeping the
+/// session check ahead of output even when every receive is ready.
+pub(crate) async fn next_queued_update(
+    watch: &mut Option<SessionWatch>,
+    state: &AppState,
+    stopping: &mut watch::Receiver<bool>,
+    updates: &mut broadcast::Receiver<Notification>,
+) -> Result<Result<Notification, broadcast::error::TryRecvError>, Stop> {
+    tokio::select! {
+        biased;
+        code = session_lost(watch, state) => Err(Stop::Close(code)),
+        _ = gateway_stop_signal(stopping) => Err(Stop::Reconnect),
+        update = async { updates.try_recv() } => Ok(update),
+    }
 }
 
 /// How a turn ended, for the socket.
@@ -610,6 +627,16 @@ impl Chat {
             }
             tokio::select! {
                 biased;
+                code = session_lost(&mut self.watch, &self.state), if !turn.client_gone => {
+                    // Poll access before output, including after the prompt
+                    // answers: a busy stream must not starve its recheck.
+                    turn.stop = Some(Stop::Close(code));
+                    turn.disconnect().await;
+                },
+                _ = gateway_stop_signal(stopping), if !turn.client_gone => {
+                    turn.stop = Some(Stop::Reconnect);
+                    turn.disconnect().await;
+                },
                 update = updates.recv() => match update {
                     Ok(note) => {
                         if turn.relay(sender, note).await == Relayed::TurnEnded {
@@ -630,11 +657,22 @@ impl Chat {
                     }
                 },
                 answered = &mut prompt => {
-                    // Every frame of the turn reached the connection before
-                    // its answer did; take whatever this receiver has not
-                    // read yet.
+                    // Every frame reached the connection before its answer.
+                    // Drain without waiting, but poll access before each
+                    // update just as in the main loop. recv() being Pending
+                    // can mean cooperative yielding, not an empty queue.
                     loop {
-                        match updates.try_recv() {
+                        let update = match next_queued_update(
+                            &mut self.watch, &self.state, stopping, &mut updates,
+                        ).await {
+                            Ok(update) => update,
+                            Err(stop) => {
+                                turn.stop = Some(stop);
+                                turn.disconnect().await;
+                                return turn.end();
+                            }
+                        };
+                        match update {
                             Ok(note) => {
                                 if turn.relay(sender, note).await == Relayed::TurnEnded {
                                     return turn.end();
@@ -680,16 +718,6 @@ impl Chat {
                         }
                     }
                     return turn.end();
-                },
-                code = session_lost(&mut self.watch, &self.state), if !turn.client_gone => {
-                    // The chat ends here: the approvals it was shown are
-                    // refused, and its close cancels the turn.
-                    turn.stop = Some(Stop::Close(code));
-                    turn.disconnect().await;
-                },
-                _ = gateway_stop_signal(stopping), if !turn.client_gone => {
-                    turn.stop = Some(Stop::Reconnect);
-                    turn.disconnect().await;
                 },
                 frame = receiver.next(), if !turn.client_gone => {
                     let text = match frame {

@@ -4090,6 +4090,227 @@ mod tests {
         }
     }
 
+    /// A finite burst followed by a gated end, so the browser can leave the
+    /// relay backlogged both while the prompt runs and after it completes.
+    struct QueuedReply {
+        uri: String,
+        emitted: Arc<std::sync::atomic::AtomicUsize>,
+        finish: Arc<tokio::sync::Semaphore>,
+        _server: crate::dashboard_session::TaskGuard,
+    }
+
+    impl QueuedReply {
+        const CHUNKS: usize = 32;
+
+        async fn new() -> Self {
+            let emitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let finish = Arc::new(tokio::sync::Semaphore::new(0));
+            let emitted_for_route = Arc::clone(&emitted);
+            let finish_for_route = Arc::clone(&finish);
+            let router = Router::new().route(
+                "/chat/completions",
+                post(move |Json(request): Json<Value>| {
+                    assert_eq!(request["stream"], true, "the fixture must stream");
+                    let emitted = Arc::clone(&emitted_for_route);
+                    let finish = Arc::clone(&finish_for_route);
+                    async move {
+                        let (tx, rx) = tokio::sync::mpsc::channel(1);
+                        zeroclaw_spawn::spawn!(async move {
+                            for index in 0..Self::CHUNKS {
+                                // The first frame cannot fit in the pinned
+                                // TCP buffers. Its blocked write lets the
+                                // remaining updates queue before revocation.
+                                let bytes = if index == 0 { 1024 * 1024 } else { 128 * 1024 };
+                                let data = json!({
+                                    "choices": [{"index": 0, "delta": {"content": "x".repeat(bytes)}, "finish_reason": null}],
+                                });
+                                let frame = Ok::<_, std::convert::Infallible>(format!("data: {data}\n\n"));
+                                if tx.send(frame).await.is_err() {
+                                    return;
+                                }
+                                emitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            tokio::select! {
+                                () = tx.closed() => return,
+                                permit = finish.acquire() => {
+                                    permit.unwrap().forget();
+                                }
+                            }
+                            let end = json!({
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                            });
+                            let _ = tx.send(Ok(format!("data: {end}\n\ndata: [DONE]\n\n"))).await;
+                        });
+                        (
+                            [("content-type", "text/event-stream")],
+                            Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)),
+                        )
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let uri = format!("http://{}", listener.local_addr().unwrap());
+            let server = zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, router).await.unwrap();
+            });
+            Self {
+                uri,
+                emitted,
+                finish,
+                _server: crate::dashboard_session::TaskGuard(server),
+            }
+        }
+
+        async fn wait_queued(&self) {
+            tokio::time::timeout(Duration::from_secs(15), async {
+                while self.emitted.load(std::sync::atomic::Ordering::SeqCst) < Self::CHUNKS {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the provider emitted the queued burst");
+        }
+    }
+
+    async fn queued_chat_fixture() -> (Fixture, QueuedReply, ChatSocket, String) {
+        let reply = QueuedReply::new().await;
+        let mut fixture = Fixture::with_config(|config| {
+            config.gateway.websocket_ping_interval_secs = 0;
+            let provider = config
+                .providers
+                .models
+                .ensure("llamacpp", "queued")
+                .unwrap();
+            provider.uri = Some(reply.uri.clone());
+            provider.model = Some("queued-model".into());
+            config.agents.get_mut("support").unwrap().model_provider = "llamacpp.queued".into();
+        })
+        .await;
+        // The timing belongs to this fixture, not a process-wide override.
+        fixture.auth = Arc::new(
+            DashboardAuth::new(
+                Arc::clone(&fixture.auth.sessions),
+                Arc::clone(&fixture.auth.inbound),
+            )
+            .with_socket_recheck(Duration::from_millis(50))
+            .for_generation(&fixture.state),
+        );
+        let addr = serve_with_small_send_buffers(fixture.router()).await;
+        let (alice, _) = fixture.sign_in("alice").await;
+        let (mut socket, core_id) = {
+            let mut socket = open_chat_with_small_receive_buffer(addr, &alice, "support", "queued")
+                .await
+                .unwrap();
+            let start = await_frame(&mut socket, "session_start").await;
+            (socket, start["session_id"].as_str().unwrap().to_string())
+        };
+        socket
+            .send(ClientMessage::Text(
+                json!({"type": "message", "content": "remember me in this queued reply"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        reply.wait_queued().await;
+        (fixture, reply, socket, core_id)
+    }
+
+    #[tokio::test]
+    async fn queued_chat_output_cannot_starve_permission_checks() {
+        for completed in [false, true] {
+            for narrowing in ["read", "update", "agent"] {
+                let (fixture, reply, mut socket, core_id) = queued_chat_fixture().await;
+                if completed {
+                    reply.finish.add_permits(1);
+                    tokio::time::timeout(Duration::from_secs(15), async {
+                        while fixture.store.has_inflight_turn(&core_id) {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .expect("the core completed with its output still queued");
+                }
+                fixture.narrow_profile("chat-user", |profile| match narrowing {
+                    "read" => without_session_verb(profile, Verb::Read),
+                    "update" => without_session_verb(profile, Verb::Update),
+                    _ => profile.allowed_agents = vec!["other".into()],
+                });
+                // Let the fixture's recheck become due while the first
+                // browser write remains blocked, well below WRITE_DEADLINE.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let (chunks, code) = tokio::time::timeout(Duration::from_secs(8), async {
+                    let mut chunks = 0;
+                    loop {
+                        match socket.next().await {
+                            Some(Ok(ClientMessage::Text(text))) => {
+                                let frame: Value = serde_json::from_str(&text).unwrap();
+                                assert_ne!(
+                                    frame["type"], "done",
+                                    "revoked output completed: {narrowing}, completed={completed}"
+                                );
+                                if frame["type"] == "chunk" {
+                                    chunks += 1;
+                                    tokio::time::sleep(Duration::from_millis(25)).await;
+                                }
+                            }
+                            Some(Ok(ClientMessage::Close(close))) => {
+                                break (chunks, close.map(|c| u16::from(c.code)));
+                            }
+                            Some(Ok(_)) => {}
+                            other => panic!("expected the access-lost close, got {other:?}"),
+                        }
+                    }
+                })
+                .await
+                .expect("revocation closes the queued stream");
+                assert_eq!(code, Some(crate::dashboard_session::WS_CLOSE_ACCESS_LOST));
+                assert!(
+                    chunks < QueuedReply::CHUNKS / 2,
+                    "revocation waited for the backlog: {chunks} chunks, {narrowing}, completed={completed}"
+                );
+                assert_closed_not_deleted(&fixture, &core_id).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_chat_output_with_unchanged_access_finishes_once() {
+        let (fixture, reply, mut socket, core_id) = queued_chat_fixture().await;
+        reply.finish.add_permits(1);
+        let mut chunks = 0;
+        let done = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let frame = socket.next().await.unwrap().unwrap();
+                let ClientMessage::Text(text) = frame else {
+                    continue;
+                };
+                let frame: Value = serde_json::from_str(&text).unwrap();
+                match frame["type"].as_str() {
+                    Some("chunk") => {
+                        chunks += 1;
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                    Some("done") => break frame,
+                    Some("error" | "aborted") => panic!("queued turn failed: {frame}"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("authorized output finishes");
+        assert_eq!(chunks, QueuedReply::CHUNKS);
+        assert_eq!(
+            done["full_response"].as_str().unwrap().len(),
+            1024 * 1024 + (QueuedReply::CHUNKS - 1) * 128 * 1024
+        );
+        assert!(fixture.store.list_ids().await.contains(&core_id));
+        drop(socket);
+        fixture
+            .assert_nothing_live("the control conversation closes normally")
+            .await;
+    }
+
     #[tokio::test]
     async fn mid_turn_a_frame_after_a_lost_grant_closes_the_socket_unacted() {
         let fixture = Fixture::new().await;
