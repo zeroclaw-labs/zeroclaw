@@ -122,7 +122,7 @@ export function ChatTabBar({
   for (const tb of tabs) openCounts.set(tb.alias, (openCounts.get(tb.alias) ?? 0) + 1);
 
   return (
-    <div className="relative z-20 flex items-stretch border-b border-pc-border bg-pc-surface">
+    <div className="relative z-30 flex items-stretch border-b border-pc-border bg-pc-surface">
       <div
         role="tablist"
         aria-label={t('workspace.tablist_label')}
