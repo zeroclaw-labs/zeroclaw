@@ -295,6 +295,8 @@ impl ToolSearchTool {
         let mut builtin_specs: Vec<_> = guard.deferred_builtin_specs().collect();
         builtin_specs.sort_by(|a, b| a.name.cmp(&b.name));
         for spec in builtin_specs {
+            let projected = crate::send_via::contextual_discovery_spec(spec);
+            let spec = projected.as_ref().unwrap_or(spec);
             let hits = deferred_search_score(&spec.name, &spec.description, &terms);
             if hits > 0 && self.is_allowed(&spec.name) {
                 results.push((spec.name.clone(), hits));
@@ -489,6 +491,32 @@ mod tests {
                 .output
                 .contains("\"required\":[\"target\",\"body\"]")
         );
+        for keyword in ["voice", "text only"] {
+            let handle = Arc::new(Mutex::new(Vec::new()));
+            let found = crate::send_via::TURN_ROUTING
+                .scope(
+                    Some(handle),
+                    search.execute(serde_json::json!({"query": keyword})),
+                )
+                .await
+                .unwrap();
+            assert!(
+                found.output.contains("send_via"),
+                "{keyword}: {}",
+                found.output
+            );
+        }
+        let listing = crate::send_via::TURN_ROUTING
+            .scope(Some(Arc::new(Mutex::new(Vec::new()))), async {
+                {
+                    let mut fresh = ActivatedToolSet::new();
+                    fresh.set_deferred_builtin_specs(vec![cached.clone()]);
+                    crate::mcp_deferred::build_deferred_builtin_tools_section(&fresh, None)
+                }
+            })
+            .await;
+        assert!(!listing.contains("cached metadata"));
+        assert!(listing.contains("send_via"));
         let background_again = search.execute(query).await.unwrap();
         assert!(
             background_again

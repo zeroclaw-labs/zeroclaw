@@ -402,6 +402,8 @@ fn render_deferred_builtin_tools_section(
          <available-deferred-builtin-tools>\n",
     );
     for spec in specs {
+        let projected = crate::send_via::contextual_discovery_spec(spec);
+        let spec = projected.as_ref().unwrap_or(spec);
         out.push_str(&spec.name);
         out.push_str(" - ");
         out.push_str(&summary_line(&spec.description, 120));
