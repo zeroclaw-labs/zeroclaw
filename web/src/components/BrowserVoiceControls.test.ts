@@ -597,3 +597,20 @@ test('narration shares displayed timestamp cleanup and preserves literal timesta
     assert.match(spoken[spoken.length - 1]!, /2026-11-09/);
   } finally { await act(async () => { renderer.unmount(); }); }
 });
+
+
+test('manual stop cancels an automatic stop still awaiting final recognition', async (context) => {
+  let submitted = 0;
+  let renderer!: ReactTestRenderer;
+  await act(async () => { renderer = create(createElement(Controls, { messages: [], hydrated: true, typing: false, onTranscript() {}, onSilence() { submitted++; } }), options); });
+  context.mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    await act(async () => { await renderer.root.findAllByType('button')[0]!.props.onClick(); });
+    capture.stop = () => {};
+    capture.onresult!({ resultIndex: 0, results: [{ isFinal: true, 0: { transcript: 'Unsent final draft' } }] });
+    await act(async () => { context.mock.timers.tick(15000); });
+    await act(async () => { await renderer.root.findAllByType('button')[0]!.props.onClick(); });
+    await act(async () => { capture.onend?.(); context.mock.timers.tick(30000); });
+    assert.equal(submitted, 0);
+  } finally { context.mock.timers.reset(); await act(async () => { renderer.unmount(); }); }
+});

@@ -112,8 +112,8 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
   }, [prefs.dictation, prefs.reading]);
   const toggleMicrophone = async () => {
     if (recognition.current) {
-      if (finishing.current) return;
       clearSilence(); autoSubmit.current = false;
+      if (finishing.current) return;
       finishing.current = true;
       // End capture and let the recognizer deliver the final utterance.
       try { recognition.current.stop(); }
