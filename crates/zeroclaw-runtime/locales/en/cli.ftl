@@ -1734,6 +1734,7 @@ rpc-auth-alias-not-entitled = Principal is not entitled to the requested agent
 rpc-auth-misconfigured = Authentication is misconfigured on this daemon (fail closed)
 rpc-auth-local-roster-required = A local user roster is configured: connect from a mapped uid or present auth_token in initialize
 rpc-auth-remote-token-required = Remote connections must present auth_token in initialize
+rpc-auth-inproc-token-required = In-process connections must present auth_token in initialize
 rpc-auth-first-call-initialize = First call must be 'initialize'
 rpc-auth-revalidation-due = Credential revalidation due: re-initialize to revalidate
 rpc-auth-pairing-revoked = Pairing token revoked: re-pair and re-initialize
