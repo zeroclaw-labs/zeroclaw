@@ -47,7 +47,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pemfile = "2"
 # Inspect the existing X.509 validity before reusing an OIDC device certificate.
 x509-parser = "0.16"
-sha2 = "0.10"
+sha2 = "0.11"
 base64 = "0.22"
 hex = "0.4"
 # Public roots for the outer-mTLS variant when a client also presents an outer
