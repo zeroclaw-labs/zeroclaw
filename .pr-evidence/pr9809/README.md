@@ -1,5 +1,22 @@
 # Provider registry dashboard evidence
 
+The [canonical UI follow-up](canonical-ui-20261110/observations.json) records
+the production Web bundle rendered in Chrome with synthetic API data. It
+checks selecting the exact model key `chat.fast.us`, clearing and selecting
+the single-part key `main`, and opening the registry's Models tab through an
+exact-key link. The captures use `en-US`, desktop 1280 × 900 and mobile
+390 × 844; they do not establish real-backend or vendor behavior.
+
+- [Quickstart desktop](canonical-ui-20261110/quickstart-desktop.png).
+- [Quickstart selected model](canonical-ui-20261110/quickstart-selected.png).
+- [Azure required resource](canonical-ui-20261110/quickstart-azure-required.png):
+  staging remains disabled until the connection's resource is supplied.
+- [Quickstart mobile](canonical-ui-20261110/quickstart-mobile.png).
+- [Registry desktop](canonical-ui-20261110/registry-desktop.png).
+- [Registry mobile](canonical-ui-20261110/registry-mobile.png).
+
+The earlier registry-save evidence below is historical.
+
 Captured on the reviewed fixes at `130f5f025e` (the exact revision and Web tree are recorded in `browser-results.json`).
 The follow-up evidence commit changes only these artifacts; the rendered Web
 source is identical. The app is the actual Vite dashboard at

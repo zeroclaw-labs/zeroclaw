@@ -2637,9 +2637,9 @@ pub(crate) mod tests {
 
     #[test]
     fn agent_model_resolves_canonical_model_and_preset_for_status_consumers() {
-        let mut config = Config::default();
-        config.providers = toml::from_str(
-            r#"
+        let mut config = Config {
+            providers: toml::from_str(
+                r#"
 [connections."gateway.prod"]
 kind = "custom"
 uri = "https://example.test/v1"
@@ -2652,8 +2652,10 @@ provider = "gateway.prod"
 model = "upstream-chat-model"
 preset = "chat.defaults"
 "#,
-        )
-        .unwrap();
+            )
+            .unwrap(),
+            ..Config::default()
+        };
         config.agents.insert(
             "support".into(),
             zeroclaw_config::schema::AliasedAgentConfig {

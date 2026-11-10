@@ -1161,6 +1161,17 @@ pub struct TtsManager {
     max_text_length: usize,
 }
 
+/// Canonical models enable this capability directly; the legacy enable flag
+/// applies to the legacy section. Consumers share this admission rule.
+#[must_use]
+pub fn is_enabled(config: &Config) -> bool {
+    config.tts.enabled
+        || config
+            .providers
+            .models
+            .has_canonical_capability(zeroclaw_api::capability::Capability::Tts)
+}
+
 impl TtsManager {
     pub fn from_config(config: &Config) -> Result<Self> {
         Self::from_config_for_agent(config, None)

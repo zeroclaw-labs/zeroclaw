@@ -12071,9 +12071,7 @@ impl RpcDispatcher {
 
     fn handle_config_sections(&self) -> RpcResult {
         use zeroclaw_config::schema::Config;
-        use zeroclaw_config::sections::{
-            QUICKSTART_SECTIONS, Section, SectionShape, section_help, section_index_for_key,
-        };
+        use zeroclaw_config::sections::{QUICKSTART_SECTIONS, Section, SectionShape, section_help};
 
         let config = self.ctx.config.read().clone();
 
@@ -12114,7 +12112,7 @@ impl RpcDispatcher {
         for s in QUICKSTART_SECTIONS {
             roots.insert(s.as_str().to_string());
         }
-        roots.insert("providers.registry".to_string());
+        super::types::project_provider_editor_sections(&mut roots);
 
         let direct_scalar_parents: std::collections::HashSet<String> = config
             .prop_fields()
@@ -12145,14 +12143,17 @@ impl RpcDispatcher {
 
         // Sort: onboarding sections in canonical order first, rest alpha.
         let mut ordered: Vec<String> = roots.into_iter().collect();
-        ordered.sort_by(
-            |a, b| match (section_index_for_key(a), section_index_for_key(b)) {
+        ordered.sort_by(|a, b| {
+            match (
+                super::types::config_editor_section_index(a),
+                super::types::config_editor_section_index(b),
+            ) {
                 (Some(ai), Some(bi)) => ai.cmp(&bi),
                 (Some(_), None) => std::cmp::Ordering::Less,
                 (None, Some(_)) => std::cmp::Ordering::Greater,
                 (None, None) => a.cmp(b),
-            },
-        );
+            }
+        });
 
         // Picker eligibility: map-keyed section or onboarding section
         // with a picker shape.
@@ -12288,11 +12289,11 @@ impl RpcDispatcher {
 
     async fn handle_config_catalog_models(&self, params: &Value) -> RpcResult {
         let req: CatalogModelsParams = parse_params(params)?;
-        let local = crate::quickstart::model_provider_is_local(&req.model_provider);
         // Snapshot config so the catalog can resolve the alias credential and
         // reach the native /models endpoint (surfacing new native-only models
         // that models.dev may not carry yet) rather than silently falling back.
         let config = self.ctx.config.read().clone();
+        let local = crate::quickstart::model_reference_is_local(&config, &req.model_provider);
         let (models, pricing, live) =
             crate::quickstart::model_catalog_with_config_result(Some(&config), &req.model_provider)
                 .await
@@ -31616,7 +31617,7 @@ mod tests {
                 alias: "anthropic".into(),
                 model: "claude-sonnet-4-5".into(),
                 fields: std::collections::HashMap::from([(
-                    "api_key".to_string(),
+                    "auth.api_key".to_string(),
                     "sk-test".to_string(),
                 )]),
             }),
@@ -42050,7 +42051,7 @@ mod tests {
         let params = json!({"submission": BuilderSubmission {
             model_provider: SelectorChoice::Fresh(ModelProviderChoice {
                 provider_type: "anthropic".into(), alias: "anthropic".into(), model: "claude-sonnet-4-5".into(),
-                fields: std::collections::HashMap::from([("api_key".into(), "sk-test".into())]),
+                fields: std::collections::HashMap::from([("auth.api_key".into(), "sk-test".into())]),
             }),
             risk_profile: SelectorChoice::Fresh("balanced".into()),
             runtime_profile: SelectorChoice::Fresh("balanced".into()),

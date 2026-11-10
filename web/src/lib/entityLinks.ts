@@ -1,5 +1,5 @@
-// Resolves an entity reference (agent alias, channel composite, model
-// provider composite, profile / bundle alias) to its `/config/...` edit
+// Resolves an entity reference (agent alias, channel composite, exact
+// model key, profile / bundle alias) to its `/config/...` edit
 // surface. The route shape follows `Section::shape()` in
 // `crates/zeroclaw-config/src/sections.rs`:
 //
@@ -9,12 +9,12 @@
 //
 // Adding a new entity kind is one row in `ENTITY_SECTION`.
 
-type Shape = 'alias' | 'typed' | 'picker';
+type Shape = 'alias' | 'typed' | 'picker' | 'registry';
 
 const ENTITY_SECTION = {
   agent:               { section: 'agents',           shape: 'alias'  },
   channel:             { section: 'channels',         shape: 'typed'  },
-  'model-provider':    { section: 'providers.models', shape: 'typed'  },
+  'model-provider':    { section: 'providers.registry', shape: 'registry' },
   'memory-backend':    { section: 'memory',           shape: 'picker' },
   'risk-profile':      { section: 'risk_profiles',    shape: 'alias'  },
   'runtime-profile':   { section: 'runtime_profiles', shape: 'alias'  },
@@ -27,38 +27,11 @@ const ENTITY_SECTION = {
 
 export type EntityKind = keyof typeof ENTITY_SECTION;
 
-export function modelProfileRef(id: string, aliases: readonly string[]): string | undefined {
-  const dot = id.indexOf('.');
-  if (dot < 1) return undefined;
-  const tail = id.slice(dot + 1);
-  const alias = aliases.filter((candidate) => tail === candidate || tail.startsWith(`${candidate}.`))
-    .sort((a, b) => b.length - a.length)[0];
-  return alias ? `${id.slice(0, dot)}.${alias}` : undefined;
-}
-
-/** Property paths are flattened config paths, not TOML source to tokenize.
- * Resolve the dynamic key from configured aliases before examining its fields.
- */
-export function modelCatalogTarget(path: string, aliases: readonly string[]): { family: string; alias: string; array: boolean } | undefined {
-  const reference = path.startsWith('providers.models.') ? path.slice('providers.models.'.length) : '';
-  const profile = modelProfileRef(reference, aliases);
-  if (!profile) return undefined;
-  const field = reference.slice(profile.length);
-  if (field !== '.model' && !/^\.models\..+\.id$/.test(field)) return undefined;
-  const dot = profile.indexOf('.');
-  return { family: profile.slice(0, dot), alias: profile.slice(dot + 1), array: false };
-}
-
-export function entityConfigPath(kind: EntityKind, id: string, modelAliases: readonly string[] = []): string {
+export function entityConfigPath(kind: EntityKind, id: string): string {
   const { section, shape } = ENTITY_SECTION[kind];
   if (shape === 'picker') return `/config/${section}`;
+  if (shape === 'registry') return `/config/${section}?model=${encodeURIComponent(id)}`;
   if (shape === 'typed') {
-    if (kind === 'model-provider') {
-      const profile = modelProfileRef(id, modelAliases);
-      if (!profile) return `/config/providers.registry?model=${encodeURIComponent(id)}`;
-      const dot = profile.indexOf('.');
-      return `/config/${section}/${encodeURIComponent(profile.slice(0, dot))}/${encodeURIComponent(profile.slice(dot + 1))}`;
-    }
     const dot = id.indexOf('.');
     if (dot > 0) {
       return `/config/${section}/${encodeURIComponent(id.slice(0, dot))}/${encodeURIComponent(id.slice(dot + 1))}`;

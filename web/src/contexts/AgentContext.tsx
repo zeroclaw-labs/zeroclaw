@@ -23,7 +23,6 @@ import {
   getProp,
   putProp,
   resolveAliasSource,
-  listProps,
   getStatus,
   getSessionMessages,
   abortSession,
@@ -1071,12 +1070,8 @@ export function AgentProvider({
           return;
         }
 
-        // Per-agent model (multi-agent / schema V3). The old global `model` /
-        // `default_model` keys were removed in V3, so the source of truth is THIS
-        // agent's own `agents.<alias>.model_provider` — a ref into
-        // `providers.models.<family>.<alias>`. (Previously this read the global
-        // keys, which now 404, so the button fell back to the daemon's global
-        // status model — the wrong model on every agent page.)
+        // Read this agent's exact configured model key. Model names do not
+        // encode a provider family and must survive selection unchanged.
         let activeRef: string | null = null;
         try {
           const refProp = await getProp(`agents.${agentAlias}.model_provider`);
@@ -1096,23 +1091,12 @@ export function AgentProvider({
         // falling back to the daemon status model only if unset.
         setCurrentModel(activeRef ?? activeModel);
 
-        // Available switch targets = every configured provider ref
-        // (`providers.models.<family>.<alias>`, plus a three-segment
-        // `<family>.<alias>.<model_alias>` per nested model entry), resolved
-        // and sorted by the config layer's canonical alias-source resolver.
-        //
-        // The `/api/config/resolve-alias-source` endpoint only exists on
-        // daemons that declare the `PropKind::AliasRef` contract. Embedded-web
-        // builds ship the bundle inside the daemon binary, so skew is
-        // impossible there — but `gateway.web_dist_dir` filesystem serving can
-        // pair a newer bundle with an older daemon. `resolveAvailableModels`
-        // falls back to the pre-resolver `listProps` scan (sorted through the
-        // same key) when the endpoint is unavailable, so the picker never
-        // silently collapses to a single ref on those deployments.
+        // Available switch targets come from the canonical alias-source
+        // resolver. Canonical model keys are already exact TOML keys, so the
+        // web picker must not reconstruct them by splitting property paths.
         try {
           const refs = await resolveAvailableModels({
             resolveAliasSource: () => resolveAliasSource('model_providers'),
-            listProps: () => listProps('providers.models'),
           });
           if (cancelled) return;
           setAvailableModels(refs.length > 0 ? refs : activeRef ? [activeRef] : []);

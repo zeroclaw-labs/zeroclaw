@@ -11,6 +11,30 @@ use serde::{Deserialize, Serialize};
 
 pub use zeroclaw_rpc_proto::types::*;
 
+/// UI provider editing has one canonical surface. The retained legacy config
+/// maps are migration/runtime inputs, not separate editor destinations.
+pub fn project_provider_editor_sections(roots: &mut std::collections::BTreeSet<String>) {
+    use zeroclaw_config::sections::Section;
+    for section in [
+        Section::ModelProviders,
+        Section::TtsProviders,
+        Section::TranscriptionProviders,
+    ] {
+        roots.remove(section.as_str());
+    }
+    roots.insert("providers.registry".to_owned());
+}
+
+/// Keep the registry at the provider setup position in the canonical ordering.
+pub fn config_editor_section_index(key: &str) -> Option<usize> {
+    use zeroclaw_config::sections::{Section, section_index, section_index_for_key};
+    if key == "providers.registry" {
+        section_index(Section::ModelProviders)
+    } else {
+        section_index_for_key(key)
+    }
+}
+
 /// Synthetic editor section shared by HTTP and RPC consumers. The registry
 /// stays outside legacy flattened prop paths; this is a navigation entry.
 pub fn provider_registry_section(config: &zeroclaw_config::schema::Config) -> ConfigSectionEntry {
@@ -269,6 +293,31 @@ rpc_type! {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn provider_editor_sections_replace_legacy_destinations_in_setup_order() {
+        let mut roots = [
+            "providers.models",
+            "providers.tts",
+            "providers.transcription",
+            "agents",
+        ]
+        .map(str::to_owned)
+        .into_iter()
+        .collect();
+        project_provider_editor_sections(&mut roots);
+        assert_eq!(
+            roots,
+            ["agents", "providers.registry"]
+                .map(str::to_owned)
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(
+            config_editor_section_index("providers.registry"),
+            config_editor_section_index("providers.models"),
+        );
+    }
 
     #[test]
     fn interaction_surface_is_closed_and_snake_case() {

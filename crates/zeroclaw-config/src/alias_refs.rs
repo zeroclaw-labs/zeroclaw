@@ -3586,7 +3586,11 @@ mod tests {
     fn model_picker_does_not_invent_truncated_profile_keys() {
         let cfg: Config = toml::from_str(
             r#"
-[providers.models.openrouter."glm-5.2"]
+[providers.connections.gateway]
+kind = "custom"
+[providers.models."openrouter.glm-5.2"]
+capability = "chat"
+provider = "gateway"
 model = "glm-5.2"
 "#,
         )
@@ -3611,18 +3615,7 @@ model_provider = "custom.gw.v2.fast.v1"
         )
         .unwrap();
         let refs = cfg.resolve_alias_source(crate::traits::AliasSource::ModelProviders);
-        assert_eq!(
-            refs,
-            vec![
-                "custom.gw",
-                "custom.gw.v2",
-                "custom.gw.v2.fast",
-                "custom.gw.v2.fast.v1"
-            ]
-        );
-        assert!(refs.contains(&"custom.gw.v2".to_string()));
-        assert!(refs.contains(&"custom.gw.v2.fast.v1".to_string()));
-        assert!(!refs.contains(&"custom.gw.models".to_string()));
+        assert!(refs.is_empty(), "retired profiles are not picker options");
         assert!(
             find_all_references(&cfg, &model_alias_kind("custom", "gw"), "v2.fast.v1").is_empty()
         );

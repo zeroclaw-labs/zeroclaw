@@ -801,6 +801,7 @@ cli-quickstart-error-auth-validation = authorization config rejected before pers
 cli-quickstart-error-not-type-alias-ref = `{$reference}` is not a `<type>.<alias>` reference
 cli-quickstart-error-no-configured-path = no `{$path}` configured
 cli-quickstart-error-provider-required = provider type, alias, and model are required
+cli-quickstart-error-provider-field-required = provider field `{$field}` is required
 cli-quickstart-error-unknown-provider-type = unknown model provider type `{$provider}` — pick one from the provider list
 cli-quickstart-error-unknown-openai-auth-mode = unknown OpenAI auth mode `{$mode}` — pick `api_key` or `codex`
 cli-quickstart-error-unknown-anthropic-auth-mode = unknown Anthropic auth mode `{$mode}` — pick `api_key` or `setup_token`

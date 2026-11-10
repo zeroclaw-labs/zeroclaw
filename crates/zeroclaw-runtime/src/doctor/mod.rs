@@ -180,13 +180,20 @@ pub(crate) async fn probe_models(config: &Config) -> Vec<DiagResult> {
         probes.push((provider_name.clone(), probe));
     }
 
-    collapse_model_probes(probes)
+    if config.providers.models.has_canonical_models() {
+        probes
+            .into_iter()
+            .map(|(name, probe)| model_probe_row(&name, &probe))
+            .collect()
+    } else {
+        collapse_model_probes(probes)
+    }
 }
 
 fn codex_auth_wiring_items(codex_profile_present: bool, config: &Config) -> Vec<DiagItem> {
     const CAT: &str = "providers.auth";
 
-    let auth_slots: Vec<String> = config
+    let mut auth_slots: Vec<String> = config
         .providers
         .models
         .openai
@@ -194,6 +201,18 @@ fn codex_auth_wiring_items(codex_profile_present: bool, config: &Config) -> Vec<
         .filter(|(_, cfg)| cfg.base.requires_openai_auth)
         .map(|(alias, _)| format!("openai.{alias}"))
         .collect();
+
+    if let Ok(registry) = config.provider_registry() {
+        auth_slots.extend(
+            registry
+                .connections
+                .iter()
+                .filter(|(_, connection)| connection.uses_openai_codex_auth())
+                .map(|(name, _)| name.to_string()),
+        );
+        auth_slots.sort();
+        auth_slots.dedup();
+    }
 
     let mut items = Vec::new();
     match (codex_profile_present, auth_slots.is_empty()) {
@@ -383,6 +402,35 @@ fn classify_model_probe_error(err_message: &str) -> ModelProbeOutcome {
 }
 
 fn doctor_model_targets(config: &Config, provider_override: Option<&str>) -> Vec<String> {
+    if config.providers.models.has_canonical_models() {
+        let references =
+            config.resolve_alias_source(zeroclaw_config::traits::AliasSource::ModelProviders);
+        let Some(requested) = provider_override
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return references;
+        };
+        if config.is_canonical_model_ref(requested) {
+            return vec![requested.to_owned()];
+        }
+        // A bare provider kind expands via the connection, never via model
+        // name segments. Unrecognized input is left for the builder to reject.
+        if let Ok(registry) = config.provider_registry() {
+            let matches: Vec<String> = references
+                .into_iter()
+                .filter(|reference| {
+                    registry
+                        .resolve_chat(&reference.as_str().into())
+                        .is_ok_and(|model| model.selection.connection.kind() == requested)
+                })
+                .collect();
+            if !matches.is_empty() {
+                return matches;
+            }
+        }
+        return vec![requested.to_owned()];
+    }
     if let Some(model_provider) = provider_override.map(str::trim).filter(|p| !p.is_empty()) {
         if model_provider.contains('.') {
             return vec![model_provider.to_string()];
@@ -428,7 +476,8 @@ fn create_doctor_model_provider(
 ) -> anyhow::Result<Box<dyn zeroclaw_api::model_provider::ModelProvider>> {
     let provider_name = provider_name.trim();
     let default_ref;
-    let reference = if !provider_name.contains(['.', ':'])
+    let reference = if !config.is_canonical_model_ref(provider_name)
+        && !provider_name.contains(['.', ':'])
         && config
             .providers
             .models
@@ -517,7 +566,11 @@ pub fn persist_model_cache(
         };
 
     // Replace or insert the entry for this provider.
-    let canonical = canonicalize_provider_ref(provider_name);
+    let canonical = if config.is_canonical_model_ref(provider_name) {
+        provider_name.trim().to_owned()
+    } else {
+        canonicalize_provider_ref(provider_name)
+    };
     cache.entries.retain(|e| e.model_provider != canonical);
     cache
         .entries
@@ -1240,7 +1293,10 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
 
     // ModelProvider validity — check each configured provider entry
     {
-        let mut found_any = false;
+        let mut found_any = config
+            .providers
+            .models
+            .has_canonical_capability(zeroclaw_api::capability::Capability::Chat);
         for (family, alias, entry) in config.providers.models.iter_entries() {
             found_any = true;
             let label = format!("{family}.{alias}");
@@ -2869,6 +2925,42 @@ mod tests {
             data_dir: tmp.path().to_path_buf(),
             ..Config::default()
         }
+    }
+
+    #[test]
+    fn canonical_doctor_targets_and_cache_preserve_exact_model_keys() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with_install_root(&tmp);
+        config.providers = serde_json::from_value(serde_json::json!({
+            "connections": {"gateway.prod": {"kind": "custom"}},
+            "models": {
+                "main": {"capability": "chat", "provider": "gateway.prod", "model": "upstream"},
+                "chat.fast.us": {"capability": "chat", "provider": "gateway.prod", "model": "upstream"},
+                "voice": {"capability": "asr", "provider": "gateway.prod", "model": "whisper-1"},
+            },
+        })).unwrap();
+        assert_eq!(
+            doctor_model_targets(&config, None),
+            vec!["chat.fast.us", "main"]
+        );
+        assert_eq!(
+            doctor_model_targets(&config, Some("custom")),
+            vec!["chat.fast.us", "main"]
+        );
+        assert_eq!(doctor_model_targets(&config, Some("main")), vec!["main"]);
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        assert!(
+            !items
+                .iter()
+                .any(|item| item.message == "no model providers configured")
+        );
+        persist_model_cache(&config, "main", &["upstream".into()]).unwrap();
+        let cache: zeroclaw_config::schema::ModelCacheState = serde_json::from_str(
+            &std::fs::read_to_string(tmp.path().join("state/models_cache.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cache.entries[0].model_provider, "main");
     }
 
     #[test]

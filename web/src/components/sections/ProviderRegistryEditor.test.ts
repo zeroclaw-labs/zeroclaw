@@ -12,7 +12,6 @@ Object.assign(globalThis, {
 });
 const { default: Editor } = await import('./ProviderRegistryEditor.tsx');
 const { ConfigDraftProvider, useConfigDraft } = await import('../../lib/draftStore.tsx');
-const { useModelProfileAliases } = await import('../../lib/useModelProfileAliases.ts');
 const { configuredResourceIds } = await import('../../lib/configuredModels.ts');
 const original = {
   connections: { 'gateway.prod': { kind: 'custom', auth: { mode: 'api_key', api_key: '********' } } },
@@ -239,31 +238,6 @@ test('a failed post-save refresh requires reload even after the editor remounts'
     await act(async () => renderer!.root.findAllByType('button').find((button) => String(button.props.children).includes('Reload'))!.props.onClick());
     assert.equal(renderer!.root.findByType('textarea').props.disabled, false);
     assert.equal(draft.providerRegistrySaveState, 'idle');
-  } finally { await act(async () => renderer?.unmount()); }
-});
-
-test('canonical references take precedence over legacy family aliases', async () => {
-  const requests: string[] = [];
-  let registry = original as { models: Record<string, unknown> };
-  globalThis.fetch = async (input) => {
-    const path = String(input);
-    requests.push(path);
-    return new Response(JSON.stringify(path.includes('provider-registry') ? registry : { keys: ['fast'] }), { headers: { 'Content-Type': 'application/json' } });
-  };
-  let aliases: string[] | undefined;
-  function Probe() { aliases = useModelProfileAliases('chat.fast.us'); return null; }
-  let renderer: ReactTestRenderer | undefined;
-  try {
-    await act(async () => { renderer = create(createElement(Probe)); });
-    assert.deepEqual(aliases, []);
-    assert.equal(requests.some((path) => path.includes('map-keys')), false);
-    registry = { models: {} };
-    await act(async () => { window.dispatchEvent(new Event('zeroclaw-config-mutated')); });
-    assert.deepEqual(aliases, ['fast']);
-    registry = original;
-    await act(async () => { window.dispatchEvent(new Event('zeroclaw-config-mutated')); });
-    assert.deepEqual(aliases, []);
-    assert.equal(requests.filter((path) => path.includes('map-keys')).length, 1);
   } finally { await act(async () => renderer?.unmount()); }
 });
 

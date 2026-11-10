@@ -2639,7 +2639,7 @@ impl Chat {
                     .await;
                 }
             }
-            ModelPickerOverlay::ConfiguredProviderStage(p) => {
+            ModelPickerOverlay::ConfiguredModel(p) => {
                 let choice = p.selected().map(str::to_string);
                 state.model_picker = ModelPickerOverlay::None;
                 if let Some(model_provider) = choice {
@@ -4218,8 +4218,7 @@ impl Chat {
             // Movement first.
             if up || down {
                 match &mut state.model_picker {
-                    ModelPickerOverlay::Model(p)
-                    | ModelPickerOverlay::ConfiguredProviderStage(p) => {
+                    ModelPickerOverlay::Model(p) | ModelPickerOverlay::ConfiguredModel(p) => {
                         if up {
                             p.move_up();
                         } else {
@@ -5078,7 +5077,7 @@ impl Chat {
         }
     }
 
-    /// Resolve the agent's configured model_provider reference (`<type>.<alias>`)
+    /// Resolve the agent's configured model reference (an exact registry key)
     /// from config.
     async fn resolve_model_provider_ref(rpc: &RpcClient, agent_alias: &str) -> Option<String> {
         let prop = format!("agents.{agent_alias}.model_provider");
@@ -5090,51 +5089,15 @@ impl Chat {
         })
     }
 
-    /// Read the model for an exact registry reference or legacy profile,
-    /// used to pre-select the current model in the picker.
+    /// Read the upstream model ID for an exact configured model reference.
     async fn configured_model(rpc: &RpcClient, model_provider_ref: &str) -> Option<String> {
-        // Exact canonical keys may contain dots or have no dot at all. Only
-        // enter the legacy family/alias resolver after an exact lookup misses.
         let registry = rpc.provider_registry().await.ok()?;
-        if let Some(model) = registry
-            .get("models")
-            .and_then(|models| models.get(model_provider_ref))
-        {
-            return model
-                .get("model")
-                .and_then(|value| value.as_str())
-                .map(str::to_owned);
-        }
-        let (family, tail) = model_provider_ref.trim().split_once('.')?;
-        let aliases = rpc
-            .config_map_keys(&format!("providers.models.{family}"))
-            .await
-            .ok()?;
-        let alias = aliases
-            .iter()
-            .filter(|alias| tail == alias.as_str() || tail.starts_with(&format!("{alias}.")))
-            .max_by_key(|alias| alias.len())?;
-        let profile = format!("providers.models.{family}.{alias}");
-        let models = rpc
-            .config_map_keys(&format!("{profile}.models"))
-            .await
-            .ok()?;
-        let selected = match tail.strip_prefix(alias.as_str())?.strip_prefix('.') {
-            Some(model) => Some(models.iter().find(|key| key.as_str() == model)?.as_str()),
-            None if models.iter().any(|key| key == "default") => Some("default"),
-            None if models.len() == 1 => Some(models[0].as_str()),
-            None => None,
-        };
-        let entries = rpc.config_list(Some(&profile)).await.ok()?;
-        let read = |prop: &str| {
-            entries
-                .iter()
-                .find(|entry| entry.path == prop)
-                .and_then(|entry| entry.value.as_ref()?.as_str().map(str::to_string))
-        };
-        selected
-            .and_then(|model| read(&format!("{profile}.models.{model}.id")))
-            .or_else(|| read(&format!("{profile}.model")))
+        registry
+            .get("models")?
+            .get(model_provider_ref)?
+            .get("model")?
+            .as_str()
+            .map(str::to_owned)
     }
 
     /// Fetch the model catalog for a configured model_provider reference while
@@ -5270,7 +5233,7 @@ impl Chat {
         state.mark_dirty_full();
     }
 
-    /// Open stage 1 of the two-stage model_provider picker.
+    /// Select an exact configured model reference in a single step.
     async fn open_provider_picker(rpc: &RpcClient, state: &mut ChatState) {
         match rpc.quickstart_state().await {
             Ok(snap) => {
@@ -5287,7 +5250,7 @@ impl Chat {
                     None => Self::resolve_model_provider_ref(rpc, &state.agent_alias).await,
                 };
                 state.input_bar.set_provider_catalog(providers.clone());
-                state.model_picker = ModelPickerOverlay::ConfiguredProviderStage(
+                state.model_picker = ModelPickerOverlay::ConfiguredModel(
                     crate::widgets::PickerState::new(providers, current.as_deref()),
                 );
                 state.mark_dirty_full();
@@ -6720,7 +6683,7 @@ fn render_with_plan_placement(
             )
             .render(f, area);
         }
-        ModelPickerOverlay::ConfiguredProviderStage(picker) => {
+        ModelPickerOverlay::ConfiguredModel(picker) => {
             crate::widgets::PickerModal::new(
                 &crate::i18n::t("zc-model-provider-picker-title"),
                 &picker.items,
@@ -6746,13 +6709,11 @@ fn model_picker_overlay_area(model_picker: &ModelPickerOverlay, area: Rect) -> O
             &picker.items,
             area,
         ),
-        ModelPickerOverlay::ConfiguredProviderStage(picker) => {
-            crate::widgets::PickerModal::area_for(
-                &crate::i18n::t("zc-model-provider-picker-title"),
-                &picker.items,
-                area,
-            )
-        }
+        ModelPickerOverlay::ConfiguredModel(picker) => crate::widgets::PickerModal::area_for(
+            &crate::i18n::t("zc-model-provider-picker-title"),
+            &picker.items,
+            area,
+        ),
         ModelPickerOverlay::None => None,
     }
 }
@@ -9945,9 +9906,8 @@ enum SessionOverlay {
     },
 }
 
-/// Active model / model_provider picker overlay. `None` when no picker is open.
-/// The model_provider variant is two-stage: pick a model_provider, then (after a
-/// catalog fetch) pick a model from it.
+/// Pick a configured model reference directly, or browse upstream model IDs
+/// through the active connection. `None` when no picker is open.
 #[derive(Debug, Clone, Default)]
 enum ModelPickerOverlay {
     /// No picker open.
@@ -9958,7 +9918,7 @@ enum ModelPickerOverlay {
     Loading,
     /// Single-stage model picker over the active model_provider's catalog.
     Model(crate::widgets::PickerState),
-    ConfiguredProviderStage(crate::widgets::PickerState),
+    ConfiguredModel(crate::widgets::PickerState),
 }
 
 impl ModelPickerOverlay {
@@ -9968,7 +9928,7 @@ impl ModelPickerOverlay {
 
     fn item_count(&self) -> usize {
         match self {
-            Self::Model(p) | Self::ConfiguredProviderStage(p) => p.items.len(),
+            Self::Model(p) | Self::ConfiguredModel(p) => p.items.len(),
             Self::Loading => 1,
             Self::None => 0,
         }
@@ -9976,7 +9936,7 @@ impl ModelPickerOverlay {
 
     fn picker_mut(&mut self) -> Option<&mut crate::widgets::PickerState> {
         match self {
-            Self::Model(p) | Self::ConfiguredProviderStage(p) => Some(p),
+            Self::Model(p) | Self::ConfiguredModel(p) => Some(p),
             Self::Loading | Self::None => None,
         }
     }
@@ -13205,7 +13165,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_model_resolves_canonical_exact_key_before_legacy_paths() {
+    async fn configured_model_resolves_exact_registry_key() {
         let (tx, mut rx) = mpsc::channel(8);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = RpcClient::with_rpc(Arc::clone(&rpc));
@@ -13229,29 +13189,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_model_uses_complete_profile_keys_and_nested_inheritance() {
-        for (reference, models, nested, expected) in [
-            ("custom.gw.v2", vec![], None, "legacy-id"),
-            (
-                "custom.gw.v2",
-                vec!["default", "fast.v1"],
-                Some(("default", "default-id")),
-                "default-id",
-            ),
-            (
-                "custom.gw.v2",
-                vec!["fast.v1"],
-                Some(("fast.v1", "sole-id")),
-                "sole-id",
-            ),
-            (
-                "custom.gw.v2.fast.v1",
-                vec!["default", "fast.v1"],
-                Some(("fast.v1", "fast-id")),
-                "fast-id",
-            ),
-            ("custom.gw.v2.fast.v1", vec!["fast.v1"], None, "legacy-id"),
-        ] {
+    async fn missing_configured_model_does_not_probe_legacy_profile_paths() {
+        for reference in ["custom.gw.v2.fast.v1", "main"] {
             let (tx, mut rx) = mpsc::channel(8);
             let rpc = Arc::new(RpcOutbound::new(tx));
             let client = RpcClient::with_rpc(Arc::clone(&rpc));
@@ -13260,31 +13199,11 @@ mod tests {
             let request = next_rpc_request(&mut rx, "canonical registry").await;
             assert_eq!(request["method"], "config/provider-registry");
             respond_ok(&rpc, &request, serde_json::json!({"models": {}}));
-            let request = next_rpc_request(&mut rx, "profile keys").await;
-            assert_eq!(request["method"], crate::client::method::CONFIG_MAP_KEYS);
-            assert_eq!(request["params"]["path"], "providers.models.custom");
-            respond_ok(&rpc, &request, serde_json::json!({"keys": ["gw", "gw.v2"]}));
-            let request = next_rpc_request(&mut rx, "nested model keys").await;
-            assert_eq!(
-                request["params"]["path"],
-                "providers.models.custom.gw.v2.models"
+            assert!(task.await.unwrap().is_none());
+            assert!(
+                rx.try_recv().is_err(),
+                "a missing key must not become a legacy profile lookup"
             );
-            respond_ok(&rpc, &request, serde_json::json!({"keys": models}));
-            let request = next_rpc_request(&mut rx, "profile fields").await;
-            let mut entries = vec![serde_json::json!({
-                "path": "providers.models.custom.gw.v2.model", "value": "legacy-id",
-                "description": "", "type_hint": "String", "kind": "string", "populated": true,
-                "category": "", "is_secret": false
-            })];
-            if let Some((alias, id)) = nested {
-                entries.push(serde_json::json!({
-                    "path": format!("providers.models.custom.gw.v2.models.{alias}.id"), "value": id,
-                    "description": "", "type_hint": "String", "kind": "string", "populated": true,
-                    "category": "", "is_secret": false
-                }));
-            }
-            respond_ok(&rpc, &request, serde_json::json!({"entries": entries}));
-            assert_eq!(task.await.unwrap().as_deref(), Some(expected));
         }
     }
 
@@ -17308,11 +17227,10 @@ mod tests {
     #[test]
     fn model_provider_picker_overlay_rows_are_hit_testable() {
         let mut s = state();
-        s.model_picker =
-            ModelPickerOverlay::ConfiguredProviderStage(crate::widgets::PickerState::new(
-                vec!["openai.default".into(), "deepseek.default".into()],
-                None,
-            ));
+        s.model_picker = ModelPickerOverlay::ConfiguredModel(crate::widgets::PickerState::new(
+            vec!["openai.default".into(), "deepseek.default".into()],
+            None,
+        ));
 
         let area = Rect::new(0, 0, 80, 20);
         let modal = model_picker_overlay_area(&s.model_picker, area).unwrap();
@@ -17388,7 +17306,7 @@ mod tests {
         let model =
             ModelPickerOverlay::Model(crate::widgets::PickerState::new(vec!["a".into()], None));
         assert!(model.is_open());
-        let stage1 = ModelPickerOverlay::ConfiguredProviderStage(crate::widgets::PickerState::new(
+        let stage1 = ModelPickerOverlay::ConfiguredModel(crate::widgets::PickerState::new(
             vec!["anthropic.personal_code".into()],
             None,
         ));

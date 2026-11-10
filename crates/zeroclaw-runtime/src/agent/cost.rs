@@ -38,6 +38,38 @@ pub fn build_model_provider_pricing(config: &Config) -> ModelProviderPricing {
         pricing.insert(format!("{type_k}.{alias_k}"), slot);
     }
 
+    // Canonical V4 models own their pricing in model metadata. Keep the
+    // exact registry key as the billing owner, then index the configured
+    // upstream model id inside that slot so both canonical routing and the
+    // provider's wire model resolve to the same rates.
+    if let Ok(registry) = config.provider_registry() {
+        for (model_ref, model) in &registry.models {
+            let zeroclaw_config::provider_registry::ModelDefinition::Chat(chat) = model else {
+                continue;
+            };
+            let mut slot = HashMap::new();
+            let model_id = chat.model.as_deref().unwrap_or(model_ref.as_str());
+            if let Some(rates) = chat.metadata.pricing.as_ref() {
+                if let Some(input) = rates.input_per_mtok {
+                    slot.insert(format!("{model_id}.input"), input);
+                }
+                if let Some(output) = rates.output_per_mtok {
+                    slot.insert(format!("{model_id}.output"), output);
+                }
+                if let Some(cached) = rates.cached_input_per_mtok {
+                    slot.insert(format!("{model_id}.cached_input"), cached);
+                }
+                if let Some(write) = rates.cache_write_per_mtok {
+                    slot.insert(format!("{model_id}.cache_write"), write);
+                }
+            }
+            if let Some(connection) = registry.connections.get(&chat.provider) {
+                apply_rate_sheet_pricing(config, connection.kind(), &mut slot);
+            }
+            pricing.insert(model_ref.to_string(), slot);
+        }
+    }
+
     pricing
 }
 
@@ -1476,6 +1508,51 @@ mod tests {
         let mut map = pricing_with_cache(model, input, cached_input, output);
         map.insert(format!("{model}.cache_write"), cache_write);
         map
+    }
+
+    #[test]
+    fn canonical_model_metadata_prices_exact_refs_independently() {
+        let config = Config {
+            providers: toml::from_str(
+                r#"
+[connections."gateway.prod"]
+kind = "custom"
+[models."chat.fast.us"]
+capability = "chat"
+provider = "gateway.prod"
+model = "same-wire-id"
+[models."chat.fast.us".metadata.pricing]
+input_per_mtok = 0.0
+output_per_mtok = 2.0
+cached_input_per_mtok = 0.0
+cache_write_per_mtok = 0.5
+[models."chat.backup"]
+capability = "chat"
+provider = "gateway.prod"
+model = "same-wire-id"
+[models."chat.backup".metadata.pricing]
+input_per_mtok = 3.0
+output_per_mtok = 4.0
+"#,
+            )
+            .unwrap(),
+            ..Config::default()
+        };
+        let pricing = build_model_provider_pricing(&config);
+        let fast = resolve_rates_opt(
+            provider_pricing(&pricing, "chat.fast.us").unwrap(),
+            "same-wire-id",
+        );
+        let backup = resolve_rates_opt(
+            provider_pricing(&pricing, "chat.backup").unwrap(),
+            "same-wire-id",
+        );
+        assert_eq!(fast.input_per_mtok, Some(0.0));
+        assert_eq!(fast.output_per_mtok, Some(2.0));
+        assert_eq!(fast.cached_input_per_mtok, Some(0.0));
+        assert_eq!(fast.cache_write_per_mtok, Some(0.5));
+        assert_eq!(backup.input_per_mtok, Some(3.0));
+        assert_eq!(backup.output_per_mtok, Some(4.0));
     }
 
     #[test]

@@ -305,21 +305,42 @@ pub async fn model_catalog_with_config_result(
     Option<std::collections::HashMap<String, zeroclaw_api::model_provider::ModelPricing>>,
     bool,
 )> {
+    let canonical_ref = zeroclaw_config::provider_registry::ModelRef::from(model_provider);
+    let canonical_family = match config {
+        Some(cfg)
+            if cfg
+                .providers
+                .models
+                .canonical_model(&canonical_ref)
+                .is_some() =>
+        {
+            let registry = cfg.provider_registry()?;
+            Some(
+                registry
+                    .resolve_chat(&canonical_ref)?
+                    .selection
+                    .connection
+                    .kind()
+                    .to_owned(),
+            )
+        }
+        _ => None,
+    };
     let resolved = config.and_then(|cfg| cfg.providers.models.find_by_name(model_provider));
-    // `create_model_provider` and the chat-catalog ranker expect a bare family
-    // name, not a dotted ref. Prefer the family `find_by_name` resolved; when it
-    // could not (no config / unknown alias) strip any `<family>.<alias>` suffix
-    // ourselves so a dotted selector still constructs.
-    let family: &str = resolved
-        .as_ref()
-        .map(|(family, _alias, _base)| *family)
+    // Catalog construction accepts both exact canonical model refs and the
+    // legacy family/alias form. Canonical refs derive their provider family
+    // from the referenced connection; their dots are never split as alias
+    // boundaries.
+    let family = canonical_family
+        .as_deref()
+        .or_else(|| resolved.as_ref().map(|(family, _, _)| *family))
         .unwrap_or_else(|| {
             model_provider
                 .split_once('.')
                 .map_or(model_provider, |(f, _)| f)
         });
 
-    let configured_profile = resolved.is_some();
+    let configured_profile = canonical_family.is_some() || resolved.is_some();
     let has_dotted_profile_shape = model_provider
         .split_once('.')
         .is_some_and(|(family, _)| !family.contains(':'));
@@ -335,16 +356,20 @@ pub async fn model_catalog_with_config_result(
     let configured = config
         .filter(|_| configured_profile)
         .map(|config| Box::new(config.clone()));
-    let reference = resolved.as_ref().map_or_else(
-        || model_provider.to_owned(),
-        |(family, alias, _)| {
-            if model_provider.contains('.') {
-                model_provider.to_owned()
-            } else {
-                format!("{family}.{alias}")
-            }
-        },
-    );
+    let reference = if canonical_family.is_some() {
+        model_provider.to_owned()
+    } else {
+        resolved.as_ref().map_or_else(
+            || model_provider.to_owned(),
+            |(family, alias, _)| {
+                if model_provider.contains('.') {
+                    model_provider.to_owned()
+                } else {
+                    format!("{family}.{alias}")
+                }
+            },
+        )
+    };
     let family_for_build = family.to_owned();
     let handle = crate::model::build_nonblocking(move || match configured {
         Some(config) => crate::model::build_raw_provider(
@@ -455,6 +480,37 @@ mod tests {
             missing.is_empty(),
             "catalog_source_for is missing entries for: {missing:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn canonical_catalog_preserves_exact_key_and_connection_auth() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(header("authorization", "Bearer catalog-test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "upstream-model"}],
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let config = zeroclaw_config::schema::Config {
+            providers: serde_json::from_value(serde_json::json!({
+                "connections": {"gateway.prod": {
+                    "kind": "custom", "uri": format!("{}/v1", server.uri()),
+                    "auth": {"mode": "api_key", "api_key": "catalog-test-key"},
+                }},
+                "models": {"chat.fast.us": {"capability": "chat", "provider": "gateway.prod", "model": "upstream-model"}},
+            })).unwrap(),
+            ..Default::default()
+        };
+        let (models, _, live) = model_catalog_with_config_result(Some(&config), "chat.fast.us")
+            .await
+            .unwrap();
+        assert!(live);
+        assert_eq!(models, vec!["upstream-model"]);
     }
 
     #[tokio::test]

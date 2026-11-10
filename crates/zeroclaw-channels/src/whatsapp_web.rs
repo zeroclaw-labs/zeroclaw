@@ -668,7 +668,7 @@ impl WhatsAppWebChannel {
 
     #[cfg(feature = "whatsapp-web")]
     pub fn with_tts(mut self, config: &zeroclaw_config::schema::Config) -> Self {
-        if config.tts.enabled {
+        if zeroclaw_providers::tts::is_enabled(config) {
             let owner = config.agent_for_channel(&format!("whatsapp.{}", self.alias));
             match zeroclaw_providers::tts::TtsManager::from_config_for_agent(config, owner) {
                 Ok(m) => self.tts_manager = Some(Arc::new(m)),

@@ -1107,6 +1107,17 @@ pub struct TranscriptionManager {
     agent_transcription_provider: String,
 }
 
+/// Canonical models enable this capability directly; the legacy enable flag
+/// applies to the legacy section. Consumers share this admission rule.
+#[must_use]
+pub fn is_enabled(config: &Config) -> bool {
+    config.transcription.enabled
+        || config
+            .providers
+            .models
+            .has_canonical_capability(Capability::Asr)
+}
+
 impl TranscriptionManager {
     /// Empty manager with no providers. Used as a base when only typed
     /// `[providers.transcription.<family>.<alias>]` config is present and
@@ -3065,6 +3076,47 @@ mod channel_builder_tests {
             transcription: legacy_groq(),
             ..Config::default()
         }
+    }
+
+    #[tokio::test]
+    async fn canonical_channel_asr_uses_exact_model_reference_and_connection() {
+        use wiremock::matchers::{body_string_contains, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .and(header("authorization", "Bearer asr-test-key"))
+            .and(body_string_contains("whisper-upstream"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"text": "canonical transcript"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let config = Config {
+            providers: serde_json::from_value(serde_json::json!({
+                "connections": {"gateway.prod": {"kind": "custom", "uri": format!("{}/v1", server.uri()),
+                    "auth": {"mode": "api_key", "api_key": "asr-test-key"}}},
+                "models": {"asr.voice.us": {"capability": "asr", "provider": "gateway.prod", "model": "whisper-upstream"}},
+            })).unwrap(),
+            ..Config::default()
+        };
+        assert!(
+            !config.transcription.enabled,
+            "canonical ASR must not depend on legacy enablement"
+        );
+        let manager = build_transcription_manager(&config, "asr.voice.us").unwrap();
+        assert_eq!(manager.agent_transcription_provider, "asr.voice.us");
+        assert_eq!(
+            manager
+                .transcribe(b"audio bytes", "voice.wav")
+                .await
+                .unwrap(),
+            "canonical transcript"
+        );
+        let auto_bound = build_transcription_manager(&config, "").unwrap();
+        assert_eq!(auto_bound.agent_transcription_provider, "asr.voice.us");
     }
 
     #[test]

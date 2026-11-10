@@ -2064,8 +2064,7 @@ impl Agent {
             );
             // Include shared construction defaults (reasoning, multimodal,
             // secrets directory) through the existing options materializer.
-            let mut provider_config =
-                serde_json::to_value((&config.providers.models, options)).ok()?;
+            let mut provider_config = serde_json::to_value((&config.providers, options)).ok()?;
             provider_config.sort_all_objects();
             let bytes = serde_json::to_vec(&provider_config).ok()?;
             format!("{:x}", Sha256::digest(bytes))
@@ -19115,6 +19114,41 @@ options = { extract_text_tool_calls = true }
         ];
         let key = agent.response_cache_key_for_messages(&plain_messages, "test-model");
         assert!(key.is_some(), "plain text prompt must produce a cache key");
+
+        let mut config = Config {
+            providers: serde_json::from_value(serde_json::json!({
+                "connections": {"gateway.prod": {"kind": "custom", "uri": "https://first.invalid/v1"}},
+                "models": {"chat.fast.us": {"capability": "chat", "provider": "gateway.prod", "model": "test-model", "preset": "chat-defaults"}},
+                "model_presets": {"chat-defaults": {"capability": "chat", "options": {"temperature": 0.2}}},
+            })).unwrap(),
+            ..Config::default()
+        };
+        let install = |agent: &mut Agent, config: &Config| {
+            agent.provider_switch_config = Some(ProviderSwitchConfig {
+                config: Some(Arc::new(config.clone())),
+                ..Default::default()
+            });
+            agent
+                .response_cache_key_for_messages(&plain_messages, "test-model")
+                .unwrap()
+        };
+        let original_key = install(&mut agent, &config);
+        let mut providers = serde_json::to_value(&config.providers).unwrap();
+        providers["connections"]["gateway.prod"]["uri"] = "https://second.invalid/v1".into();
+        config.providers = serde_json::from_value(providers.clone()).unwrap();
+        let changed_endpoint = install(&mut agent, &config);
+        assert_ne!(
+            original_key, changed_endpoint,
+            "same wire model on another endpoint must miss cache"
+        );
+        providers["model_presets"]["chat-defaults"]["options"]["temperature"] = 0.8.into();
+        config.providers = serde_json::from_value(providers).unwrap();
+        assert_ne!(
+            changed_endpoint,
+            install(&mut agent, &config),
+            "inherited request options must affect cache identity"
+        );
+        agent.provider_switch_config = None;
 
         let structurally_distinct_a = vec![
             ChatMessage::system("s"),

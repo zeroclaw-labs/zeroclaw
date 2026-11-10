@@ -56,17 +56,6 @@ fn is_direct_child_path(path: &str, prefix: &str) -> bool {
         .is_some_and(|relative| !relative.is_empty() && !relative.contains('.'))
 }
 
-fn model_field_catalog_reference(path: &str) -> Option<String> {
-    let profile = path.strip_prefix("providers.models.")?;
-    if let Some(reference) = profile.strip_suffix(".model") {
-        return reference.contains('.').then(|| reference.to_string());
-    }
-    let nested = profile.strip_suffix(".id")?;
-    nested
-        .rsplit_once(".models.")
-        .map(|(reference, _)| reference.to_string())
-}
-
 fn retain_direct_children(fields: &mut Vec<ConfigFieldEntry>, prefix: &str) {
     fields.retain(|field| is_direct_child_path(&field.path, prefix));
 }
@@ -4149,46 +4138,12 @@ impl App {
     async fn enter_field_edit(&mut self, idx: usize, term: &mut Term) {
         self.prepare_edit_at(idx);
 
-        // Model field inside a provider alias → fetch available models.
-        let field_path = self.fields[idx].path.clone();
         let field_current = self.fields[idx]
             .value
             .as_ref()
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        if let Some(provider_ref) = model_field_catalog_reference(&field_path) {
-            let family = provider_ref
-                .split_once('.')
-                .map_or(provider_ref.as_str(), |(family, _)| family)
-                .to_string();
-
-            // Show loading indicator before the blocking RPC call.
-            self.status_msg = Some(crate::i18n::t_args(
-                "zc-config-status-fetching-models",
-                &[("family", &family)],
-            ));
-            let _ = self.draw(term);
-
-            match self.rpc.catalog_models(&provider_ref).await {
-                Ok(res) if !res.models.is_empty() => {
-                    self.select_cursor = res
-                        .models
-                        .iter()
-                        .position(|m| m == &field_current)
-                        .unwrap_or(0);
-                    self.select_items = res.models;
-                    self.status_msg = None;
-                }
-                Ok(_) => {
-                    self.status_msg = Some(crate::i18n::t("zc-config-status-no-models"));
-                }
-                Err(_) => {
-                    self.status_msg = Some(crate::i18n::t("zc-config-status-model-fetch-failed"));
-                }
-            }
-        }
-
         // Alias-reference fields resolve their picker list generically from
         // the field's `alias_source` — no per-path special-casing.
         if let Some(source) = self.fields[idx].alias_source {
@@ -6726,34 +6681,6 @@ mod tests {
     fn mouse_shift_capture_uses_xtshiftescape_sequences() {
         assert_eq!(mouse_shift_capture_sequence(true), "\x1b[>1s");
         assert_eq!(mouse_shift_capture_sequence(false), "\x1b[>0s");
-    }
-
-    #[test]
-    fn model_field_catalog_reference_supports_nested_id_and_dotted_profile() {
-        assert_eq!(
-            model_field_catalog_reference("providers.models.openai.edge.v2.models.fast.id"),
-            Some("openai.edge.v2".into())
-        );
-        assert_eq!(
-            model_field_catalog_reference("providers.models.openai.edge.v2.model"),
-            Some("openai.edge.v2".into())
-        );
-    }
-
-    #[test]
-    fn model_field_catalog_reference_preserves_typed_alias() {
-        assert_eq!(
-            model_field_catalog_reference("providers.models.hailo_ollama.edge.model"),
-            Some("hailo_ollama.edge".to_string())
-        );
-        assert_eq!(
-            model_field_catalog_reference("providers.models.openai.default.model"),
-            Some("openai.default".to_string())
-        );
-        assert_eq!(
-            model_field_catalog_reference("providers.models.ollama.default"),
-            None
-        );
     }
 
     #[test]

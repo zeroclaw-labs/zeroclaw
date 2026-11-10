@@ -22,7 +22,10 @@ function sectionDraft(document: ProviderRegistryDocument): RegistrySections {
 export default function ProviderRegistryEditor({ onSaved }: { onSaved: () => void }) {
   const [params] = useSearchParams();
   const selectedModel = params.get('model');
-  const [section, setSection] = useState<Section>(selectedModel ? 'models' : 'connections');
+  const requestedSection = selectedModel
+    ? 'models'
+    : sections.find((key) => key === params.get('tab'));
+  const [section, setSection] = useState<Section>(requestedSection ?? 'connections');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const editVersion = useRef(0);
@@ -70,7 +73,7 @@ export default function ProviderRegistryEditor({ onSaved }: { onSaved: () => voi
     // Re-read the masked server document so the editor remains usable.
     if (!providerRegistryDraft) void load().catch(() => undefined);
   }, [load, providerRegistryDraft]);
-  useEffect(() => { if (selectedModel) setSection('models'); }, [selectedModel]);
+  useEffect(() => { if (requestedSection) setSection(requestedSection); }, [requestedSection, selectedModel]);
 
   const save = async () => {
     try {

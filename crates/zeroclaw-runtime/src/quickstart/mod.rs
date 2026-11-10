@@ -7,7 +7,7 @@ use zeroclaw_config::presets::{
     AgentIdentity, BuilderSubmission, ChannelQuickStart, MemoryChoice, ModelProviderChoice,
     SelectorChoice, recommended_runtime_preset, risk_preset, runtime_preset,
 };
-use zeroclaw_config::schema::{Config, WireApi};
+use zeroclaw_config::schema::Config;
 
 /// Which surface invoked the Quickstart. Stamped on every event in
 /// the apply path so SSE/dashboard consumers can filter by origin
@@ -606,7 +606,7 @@ pub struct QuickstartState {
     pub runtime_profiles: Vec<String>,
     /// Canonical runtime fallback used when a provider has no recommendation.
     pub default_runtime_profile: String,
-    /// `<provider_type>.<alias>` refs for every configured model provider.
+    /// Exact canonical chat-model keys from `providers.models`.
     pub model_providers: Vec<String>,
     /// `<channel_type>.<alias>` refs.
     pub channels: Vec<String>,
@@ -702,31 +702,9 @@ pub fn snapshot_state(cfg: &Config) -> QuickstartState {
         default_runtime_profile: recommended_runtime_preset(None)
             .map(|preset| preset.preset_name.to_string())
             .unwrap_or_default(),
-        // The two-segment profile ref, plus one three-segment ref per model
-        // entry so pickers can target a specific model on the same provider
-        // profile. `resolve_alias_source` (the generic two-tier resolver)
-        // only sees the flat `prop_fields()` view and can't produce these
-        // per-model refs, so this list is built directly from the nested
-        // `providers.models` structure instead.
-        model_providers: {
-            let mut refs: Vec<String> = cfg
-                .providers
-                .models
-                .iter_entries()
-                .flat_map(|(family, alias, cfg)| {
-                    let base = format!("{family}.{alias}");
-                    let mut model_aliases: Vec<String> = cfg.models.keys().cloned().collect();
-                    model_aliases.sort();
-                    std::iter::once(base.clone()).chain(
-                        model_aliases
-                            .into_iter()
-                            .map(move |m| format!("{base}.{m}")),
-                    )
-                })
-                .collect();
-            refs.sort();
-            refs
-        },
+        // Canonical model keys are opaque TOML keys, including literal dots.
+        model_providers: cfg
+            .resolve_alias_source(zeroclaw_config::traits::AliasSource::ModelProviders),
         channels: collect_aliased_refs(&cfg.channels),
         unassigned_channels: collect_aliased_refs(&cfg.channels)
             .into_iter()
@@ -870,33 +848,21 @@ pub struct FieldDescriptor {
 }
 
 /// Return the renderable field shape for a single section + type
-/// combination. Walks `prop_fields()` against a synthetic config with
-/// one default-instantiated entry under the requested type, then
-/// filters to the per-section "essential" allowlist.
+/// combination. Provider fields come from the canonical connection type;
+/// channel and peer-group fields use the schema's essential allowlist.
 pub fn field_shape(section: FieldSection, type_key: &str) -> Vec<FieldDescriptor> {
     const SYNTHETIC_ALIAS: &str = "qs0probe";
-    let (section_path, essentials, codex_auth_preselected) = match section {
-        FieldSection::ModelProvider => {
-            let Some((provider_type, codex_auth_preselected)) =
-                resolve_model_provider_type(type_key)
-            else {
-                return Vec::new();
-            };
-            (
-                format!("providers.models.{provider_type}"),
-                MODEL_PROVIDER_ESSENTIALS,
-                codex_auth_preselected,
-            )
-        }
+    let (section_path, essentials) = match section {
+        FieldSection::ModelProvider => return canonical_model_field_shape(type_key),
         FieldSection::Channel => {
             let essentials = if type_key == "webhook" {
                 WEBHOOK_CHANNEL_ESSENTIALS
             } else {
                 CHANNEL_ESSENTIALS
             };
-            (format!("channels.{type_key}"), essentials, false)
+            (format!("channels.{type_key}"), essentials)
         }
-        FieldSection::PeerGroup => ("peer_groups".to_string(), PEER_GROUP_ESSENTIALS, false),
+        FieldSection::PeerGroup => ("peer_groups".to_string(), PEER_GROUP_ESSENTIALS),
     };
 
     // A throwaway Config we can mutate freely. Inject one default
@@ -931,34 +897,16 @@ pub fn field_shape(section: FieldSection, type_key: &str) -> Vec<FieldDescriptor
                 Some(raw.to_string())
             }
         };
-        let help = if section_path == "providers.models.anthropic" && field_path == "api_key" {
-            crate::i18n::get_required_cli_string("cli-quickstart-anthropic-api-key-help")
-        } else {
-            info.description.trim().to_string()
-        };
         out.push(FieldDescriptor {
             key: field_path.to_string(),
             label: kebab_to_snake(field_path),
-            help,
+            help: info.description.trim().to_string(),
             kind: info.kind,
             is_secret: info.is_secret,
             enum_variants: info.enum_variants.map(|f| f()),
-            // `uri` is an override-only field — operators set it only
-            // when pointing at a self-hosted gateway. `api_key` is left
-            // non-required because local providers (Ollama) and Codex
-            // subscription auth don't need one — the runtime surfaces a clear
-            // error at request time if a remote provider is missing its key.
-            // Everything else in the essentials list is required to actually
-            // issue a request.
-            required: !matches!(field_path, "uri" | "api_key"),
+            required: true,
             default,
         });
-    }
-    if matches!(section, FieldSection::ModelProvider)
-        && let Some(provider_type) = section_path.strip_prefix("providers.models.")
-        && let Some(descriptor) = auth_mode_descriptor(provider_type, codex_auth_preselected)
-    {
-        out.push(descriptor);
     }
     out.sort_by_key(|d| {
         essentials
@@ -969,12 +917,59 @@ pub fn field_shape(section: FieldSection, type_key: &str) -> Vec<FieldDescriptor
     out
 }
 
+fn canonical_model_field_shape(type_key: &str) -> Vec<FieldDescriptor> {
+    let Some((kind, codex)) = resolve_model_provider_type(type_key) else {
+        return Vec::new();
+    };
+    let Ok(connection) = serde_json::from_value::<
+        zeroclaw_config::provider_registry::ProviderConnection,
+    >(serde_json::json!({"kind": kind})) else {
+        return Vec::new();
+    };
+    let Ok(document) = serde_json::to_value(connection) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if let Some(descriptor) = auth_mode_descriptor(kind, codex) {
+        out.push(descriptor);
+    }
+    for (key, supported, secret, required) in [
+        ("auth.api_key", document.get("auth").is_some(), true, false),
+        ("uri", document.get("uri").is_some(), false, false),
+        (
+            "extra.resource",
+            document.pointer("/extra/resource").is_some(),
+            false,
+            true,
+        ),
+        ("model", true, false, true),
+    ] {
+        if !supported {
+            continue;
+        }
+        out.push(FieldDescriptor {
+            key: key.to_owned(),
+            label: key.to_owned(),
+            help: if kind == "anthropic" && secret {
+                crate::i18n::get_required_cli_string("cli-quickstart-anthropic-api-key-help")
+            } else {
+                String::new()
+            },
+            kind: zeroclaw_config::traits::PropKind::String,
+            is_secret: secret,
+            enum_variants: None,
+            required,
+            default: None,
+        });
+    }
+    out
+}
+
 /// Essentials per section kind. Kept in one place so adding a
 /// provider type or channel kind lights up Quickstart for free,
 /// while keeping the modal focused on what an agent cannot start
 /// without. `model` comes last for model providers: the model catalog
 /// is listed from the endpoint and credentials asked before it.
-const MODEL_PROVIDER_ESSENTIALS: &[&str] = &[QUICKSTART_AUTH_MODE_FIELD, "api_key", "uri", "model"];
 const CHANNEL_ESSENTIALS: &[&str] = &["bot_token", "token", "webhook_url", "allowed_users"];
 const WEBHOOK_CHANNEL_ESSENTIALS: &[&str] = &[
     "bot_token",
@@ -986,7 +981,7 @@ const WEBHOOK_CHANNEL_ESSENTIALS: &[&str] = &[
 ];
 const PEER_GROUP_ESSENTIALS: &[&str] = &["channel", "external_peers", "agents", "ignore"];
 
-const QUICKSTART_AUTH_MODE_FIELD: &str = "auth_mode";
+const QUICKSTART_AUTH_MODE_FIELD: &str = "auth.mode";
 const QUICKSTART_AUTH_MODE_API_KEY: &str = "api_key";
 const QUICKSTART_AUTH_MODE_CODEX: &str = "codex";
 const QUICKSTART_AUTH_MODE_SETUP_TOKEN: &str = "setup_token";
@@ -1049,6 +1044,27 @@ fn apply_into(
         return None;
     }
     let provider_ref = apply_model_provider(config, &submission.model_provider, errors, ctx)?;
+    if matches!(submission.model_provider, SelectorChoice::Fresh(_))
+        && let Ok(handle) = tokio::runtime::Handle::try_current()
+        && handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        && let Some(window) = tokio::task::block_in_place(|| {
+            handle.block_on(fetch_quickstart_context_window(
+                config.clone(),
+                provider_ref.clone(),
+            ))
+        })
+    {
+        let model_ref = provider_ref.as_str().into();
+        if let Some(zeroclaw_config::provider_registry::ModelDefinition::Chat(mut model)) =
+            config.providers.models.canonical_model(&model_ref).cloned()
+        {
+            model.metadata.context_window = Some(window);
+            config.providers.models.insert_canonical_model(
+                model_ref,
+                zeroclaw_config::provider_registry::ModelDefinition::Chat(model),
+            );
+        }
+    }
     emit_selector_pick(
         ctx,
         "model_provider",
@@ -1240,14 +1256,23 @@ fn emit_selector_pick(ctx: Option<&RunCtx>, selector: &str, mode: &str, value: &
 /// contract for interactive gateway and doctor callers.
 const CONTEXT_WINDOW_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
-async fn fetch_quickstart_context_window(
-    provider_type: &str,
-    provider_config: &zeroclaw_config::schema::ModelProviderConfig,
-) -> Option<usize> {
-    tokio::time::timeout(
-        CONTEXT_WINDOW_FETCH_TIMEOUT,
-        zeroclaw_providers::fetch_context_window(provider_type, provider_config),
-    )
+async fn fetch_quickstart_context_window(config: Config, reference: String) -> Option<usize> {
+    tokio::time::timeout(CONTEXT_WINDOW_FETCH_TIMEOUT, async move {
+        let resolved = zeroclaw_providers::model::build_nonblocking(move || {
+            zeroclaw_providers::model::build_raw_provider(&config, &reference, Default::default())
+        })
+        .await
+        .ok()?;
+        let model = resolved.model?;
+        resolved
+            .provider
+            .list_models_with_pricing()
+            .await
+            .ok()?
+            .into_iter()
+            .find(|info| info.id == model)?
+            .context_window
+    })
     .await
     .ok()
     .flatten()
@@ -1261,32 +1286,18 @@ fn apply_model_provider(
 ) -> Option<String> {
     match choice {
         SelectorChoice::Existing(reference) => {
-            // A model_provider ref may be three-segment
-            // (`<type>.<alias>.<model>`); key the profile off the first two
-            // segments so a model-selecting ref is not rejected.
-            let (family, alias) = match config.providers.models.profile_ref(reference) {
-                Some(parts) => parts,
-                None => {
-                    errors.push(QuickstartError::for_surface(
-                        ctx,
-                        QuickstartStep::ModelProvider,
-                        "",
-                        format!("`{reference}` is not a `<type>.<alias>` reference"),
-                        "cli-quickstart-error-not-type-alias-ref",
-                        &[("reference", reference)],
-                    ));
-                    return None;
-                }
-            };
-            if config.providers.models.find(family, alias).is_none() {
-                let path = format!("providers.models.{family}.{alias}");
+            if let Err(error) = config.provider_registry().and_then(|registry| {
+                registry
+                    .resolve_chat(&reference.as_str().into())
+                    .map(|_| ())
+            }) {
                 errors.push(QuickstartError::for_surface(
                     ctx,
                     QuickstartStep::ModelProvider,
                     "",
-                    format!("no `{path}` configured"),
+                    error.to_string(),
                     "cli-quickstart-error-no-configured-path",
-                    &[("path", &path)],
+                    &[("path", reference)],
                 ));
                 return None;
             }
@@ -1307,13 +1318,9 @@ fn apply_model_provider(
                 ));
                 return None;
             }
-            // Canonicalize the provider type against the registry. The picker
-            // offers canonical `info.name` keys, but a hand-typed or
-            // whitespace-padded value (e.g. "llamacpp ", "llama.cpp") would
-            // otherwise reach `create_map_key` verbatim and fail with a cryptic
-            // "no map-keyed/list section" because the family key doesn't match.
-            // `openai-codex` is accepted as a convenience input alias and
-            // normalizes to the existing `openai` config family.
+            // The connection discriminator and generated reference share one
+            // canonical kind. Convenience aliases such as `openai-codex`
+            // select their typed authentication mode here.
             let Some((provider_type, codex_alias_requested)) =
                 resolve_model_provider_type(&choice.provider_type)
             else {
@@ -1367,127 +1374,101 @@ fn apply_model_provider(
                 ));
                 return None;
             }
-            if config
-                .providers
-                .models
-                .find(provider_type, &choice.alias)
-                .is_some()
+            let reference = format!("{}.{}", provider_type, choice.alias.trim());
+            for field in canonical_model_field_shape(provider_type) {
+                if field.required
+                    && field.key != "model"
+                    && choice.fields.get(&field.key).map_or_else(
+                        || field.default.as_deref().unwrap_or("").trim().is_empty(),
+                        |value| value.trim().is_empty(),
+                    )
+                {
+                    errors.push(QuickstartError::for_surface(
+                        ctx,
+                        QuickstartStep::ModelProvider,
+                        &field.key,
+                        format!("provider field `{}` is required", field.key),
+                        "cli-quickstart-error-provider-field-required",
+                        &[("field", &field.key)],
+                    ));
+                    return None;
+                }
+            }
+            let registry = match config.provider_registry() {
+                Ok(registry) => registry,
+                Err(error) => {
+                    errors.push(QuickstartError::new(
+                        QuickstartStep::ModelProvider,
+                        "",
+                        error.to_string(),
+                    ));
+                    return None;
+                }
+            };
+            if registry.models.contains_key(reference.as_str())
+                || registry.connections.contains_key(reference.as_str())
             {
-                let alias_ref = format!("{}.{}", provider_type, choice.alias);
                 errors.push(QuickstartError::for_surface(
                     ctx,
                     QuickstartStep::ModelProvider,
                     "alias",
-                    format!("alias `{alias_ref}` already exists"),
+                    format!("alias `{reference}` already exists"),
                     "cli-quickstart-error-alias-exists",
-                    &[("alias", &alias_ref)],
+                    &[("alias", &reference)],
                 ));
                 return None;
             }
+            let mut connection = serde_json::json!({"kind": provider_type});
             let codex_auth = provider_type == "openai" && auth_mode == QUICKSTART_AUTH_MODE_CODEX;
-            let prefix = format!("providers.models.{}.{}", provider_type, choice.alias);
-            if let Err(err) = config.create_map_key(
-                &format!("providers.models.{}", provider_type),
-                &choice.alias,
-            ) {
-                errors.push(QuickstartError::new(
-                    QuickstartStep::ModelProvider,
-                    "provider_type",
-                    err.to_string(),
-                ));
-                return None;
-            }
-            if let Err(err) = config.set_prop_persistent(&format!("{prefix}.model"), &choice.model)
-            {
-                errors.push(QuickstartError::new(
-                    QuickstartStep::ModelProvider,
-                    "model",
-                    err.to_string(),
-                ));
-                return None;
-            }
             if codex_auth {
-                if let Err(err) = config
-                    .set_prop_persistent(&format!("{prefix}.wire_api"), WireApi::Responses.as_str())
-                {
-                    errors.push(QuickstartError::new(
-                        QuickstartStep::ModelProvider,
-                        "wire_api",
-                        err.to_string(),
-                    ));
-                    return None;
-                }
-                if let Err(err) =
-                    config.set_prop_persistent(&format!("{prefix}.requires_openai_auth"), "true")
-                {
-                    errors.push(QuickstartError::new(
-                        QuickstartStep::ModelProvider,
-                        "requires_openai_auth",
-                        err.to_string(),
-                    ));
-                    return None;
-                }
-            }
-            // Round-trip every field the surface echoed back. Keys are
-            // whatever `field_shape()` emitted — the daemon authored
-            // them, so it knows where they go.
-            let mut entries: Vec<(&String, &String)> = choice.fields.iter().collect();
-            entries.sort_by(|a, b| a.0.cmp(b.0));
-            for (key, value) in entries {
-                if key == QUICKSTART_AUTH_MODE_FIELD {
-                    continue;
-                }
-                if codex_auth
-                    && matches!(
-                        key.as_str(),
-                        "api_key" | "wire_api" | "requires_openai_auth"
-                    )
-                {
-                    continue;
-                }
-                if value.is_empty() {
-                    continue;
-                }
-                if let Err(err) = config.set_prop_persistent(&format!("{prefix}.{key}"), value) {
-                    errors.push(QuickstartError::new(
-                        QuickstartStep::ModelProvider,
-                        zeroclaw_config::helpers::kebab_to_snake(key),
-                        err.to_string(),
-                    ));
-                    return None;
-                }
-            }
-            // Auto-populate context_window from provider's /models endpoint if supported.
-            // Silently ignores failures (falls back to config default).
-            // Only runs on multi-threaded Tokio runtime (actual CLI), not single-threaded test runtime.
-            let provider_config = zeroclaw_config::schema::ModelProviderConfig {
-                model: Some(choice.model.clone()),
-                uri: config.get_prop(&format!("{prefix}.uri")).ok(),
-                api_key: choice
-                    .fields
-                    .get("api_key")
-                    .and_then(|v| if v.is_empty() { None } else { Some(v.clone()) }),
-                ..Default::default()
-            };
-            if tokio::runtime::Handle::try_current()
-                .map(|h| {
-                    matches!(
-                        h.runtime_flavor(),
-                        tokio::runtime::RuntimeFlavor::MultiThread
-                    )
-                })
-                .unwrap_or(false)
-                && let Some(ctx) = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(fetch_quickstart_context_window(
-                        provider_type,
-                        &provider_config,
-                    ))
-                })
+                connection["auth"] = serde_json::json!({"mode": "codex"});
+                connection["api"] = serde_json::json!({"chat": {"wire_api": "responses"}});
+            } else if let Some(key) = choice
+                .fields
+                .get("auth.api_key")
+                .filter(|key| !key.is_empty())
             {
-                let _ = config
-                    .set_prop_persistent(&format!("{prefix}.context_window"), &ctx.to_string());
+                connection["auth"] = serde_json::json!({"mode": "api_key", "api_key": key});
             }
-            Some(format!("{}.{}", provider_type, choice.alias))
+            for (key, value) in &choice.fields {
+                if value.is_empty()
+                    || matches!(key.as_str(), "auth.api_key" | "auth.mode" | "model")
+                {
+                    continue;
+                }
+                if key == "extra.resource" {
+                    connection["extra"]["resource"] = value.clone().into();
+                } else {
+                    connection[key] = serde_json::Value::String(value.clone());
+                }
+            }
+            let result = (|| -> anyhow::Result<()> {
+                let connection: zeroclaw_config::provider_registry::ProviderConnection =
+                    serde_json::from_value(connection)?;
+                let mut providers = config.providers.clone();
+                providers
+                    .connections
+                    .insert(reference.as_str().into(), connection);
+                providers.models.insert_canonical_model(
+                    reference.as_str().into(),
+                    serde_json::from_value(serde_json::json!({
+                        "capability": "chat", "provider": reference, "model": choice.model.trim(),
+                    }))?,
+                );
+                providers.canonical_registry()?;
+                config.providers = providers;
+                config.mark_dirty("providers");
+                Ok(())
+            })();
+            if let Err(error) = result {
+                errors.push(QuickstartError::new(
+                    QuickstartStep::ModelProvider,
+                    "",
+                    error.to_string(),
+                ));
+                return None;
+            }
+            Some(reference)
         }
     }
 }
@@ -2377,9 +2358,10 @@ pub async fn model_catalog(
 }
 
 /// Catalog for a model provider Quickstart has not written yet. A `uri` or
-/// `api_key` already entered in `fields` is used for the listing, so a
+/// `auth.api_key` already entered in `fields` is used for the listing, so a
 /// self-hosted server is asked at the address the operator gave rather than
-/// at the family default. With neither, this is [`model_catalog`].
+/// at the family default. Discovery uses the same canonical connection/model
+/// construction as the eventual submission.
 pub async fn model_catalog_for_fields(
     type_key: &str,
     fields: &std::collections::HashMap<String, String>,
@@ -2388,28 +2370,24 @@ pub async fn model_catalog_for_fields(
     Option<std::collections::HashMap<String, zeroclaw_api::model_provider::ModelPricing>>,
     bool,
 ) {
-    const PROBE_ALIAS: &str = "quickstart";
-    let entered = |key: &str| {
-        fields
-            .get(key)
-            .map(|value| value.trim())
-            .filter(|value| !value.is_empty() && *value != zeroclaw_config::traits::UNSET_DISPLAY)
-            .map(str::to_string)
-    };
-    let (uri, api_key) = (entered("uri"), entered("api_key"));
-    if uri.is_none() && api_key.is_none() {
-        return model_catalog(type_key).await;
-    }
-    let Some((provider_type, _)) = resolve_model_provider_type(type_key) else {
-        return model_catalog(type_key).await;
-    };
     let mut probe = Config::default();
-    let Some(entry) = probe.providers.models.ensure(provider_type, PROBE_ALIAS) else {
-        return model_catalog(type_key).await;
+    let choice = ModelProviderChoice {
+        provider_type: type_key.to_owned(),
+        alias: "quickstart".to_owned(),
+        // Catalog discovery only needs a configured chat binding.
+        model: "catalog-probe".to_owned(),
+        fields: fields.clone(),
     };
-    entry.uri = uri;
-    entry.api_key = api_key;
-    model_catalog_with_config(Some(&probe), &format!("{provider_type}.{PROBE_ALIAS}")).await
+    let mut errors = Vec::new();
+    match apply_model_provider(
+        &mut probe,
+        &SelectorChoice::Fresh(choice),
+        &mut errors,
+        None,
+    ) {
+        Some(reference) => model_catalog_with_config(Some(&probe), &reference).await,
+        None => (Vec::new(), None, false),
+    }
 }
 
 /// Backward-compatible catalog projection for callers that intentionally treat
@@ -2446,13 +2424,24 @@ pub(crate) fn model_listing_is_unsupported(error: &anyhow::Error) -> bool {
 /// `true` for model_provider families that need no remote credential.
 #[must_use]
 pub fn model_provider_is_local(model_provider: &str) -> bool {
-    let family = model_provider
-        .split_once('.')
-        .map_or(model_provider, |(family, _)| family);
     zeroclaw_providers::list_model_providers()
         .iter()
-        .find(|p| p.name == family)
+        .find(|p| p.name == model_provider)
         .is_some_and(|p| p.local)
+}
+
+/// Classify an exact configured model through its owning connection. Names do
+/// not encode provider kinds; bare kinds remain valid for public discovery.
+#[must_use]
+pub fn model_reference_is_local(config: &Config, reference: &str) -> bool {
+    match config.providers.models.canonical_model(&reference.into()) {
+        Some(model) => config
+            .providers
+            .connections
+            .get(model.provider())
+            .is_some_and(|connection| model_provider_is_local(connection.kind())),
+        None => model_provider_is_local(reference),
+    }
 }
 
 #[cfg(test)]
@@ -2555,13 +2544,7 @@ mod tests {
 
     #[test]
     fn snapshot_state_sorts_configured_model_provider_refs() {
-        let mut cfg = Config::default();
-        cfg.create_map_key("providers.models.openai", "zeta")
-            .unwrap();
-        cfg.create_map_key("providers.models.anthropic", "omega")
-            .unwrap();
-        cfg.create_map_key("providers.models.anthropic", "alpha")
-            .unwrap();
+        let cfg = canonical_test_config(&["openai.zeta", "anthropic.omega", "anthropic.alpha"]);
 
         let snapshot = snapshot_state(&cfg);
 
@@ -2577,11 +2560,7 @@ mod tests {
 
     #[test]
     fn model_provider_alias_checks_preserve_existing_and_duplicate_behavior() {
-        let mut cfg = Config::default();
-        cfg.providers
-            .models
-            .openrouter
-            .insert("default".into(), Default::default());
+        let mut cfg = canonical_test_config(&["openrouter.default"]);
 
         let mut errors = Vec::new();
         let existing = apply_model_provider(
@@ -2615,6 +2594,27 @@ mod tests {
         );
     }
 
+    fn canonical_test_config(refs: &[&str]) -> Config {
+        let models: serde_json::Map<String, serde_json::Value> = refs
+            .iter()
+            .map(|reference| {
+                (
+                    (*reference).to_owned(),
+                    serde_json::json!({
+                        "capability": "chat", "provider": "gateway.prod", "model": "upstream-model",
+                    }),
+                )
+            })
+            .collect();
+        Config {
+            providers: serde_json::from_value(serde_json::json!({
+                "connections": {"gateway.prod": {"kind": "custom"}}, "models": models,
+            }))
+            .unwrap(),
+            ..Config::default()
+        }
+    }
+
     fn fresh_submission(agent_name: &str) -> BuilderSubmission {
         BuilderSubmission {
             model_provider: SelectorChoice::Fresh(ModelProviderChoice {
@@ -2622,7 +2622,7 @@ mod tests {
                 alias: "anthropic".into(),
                 model: "claude-sonnet-4-5".into(),
                 fields: std::collections::HashMap::from([(
-                    "api_key".to_string(),
+                    "auth.api_key".to_string(),
                     "sk-test".to_string(),
                 )]),
             }),
@@ -2753,7 +2753,10 @@ mod tests {
         assert!(errors.is_empty(), "apply_into errors: {errors:?}");
         assert!(applied.is_some());
         assert!(
-            cfg.providers.models.find("llamacpp", "local").is_some(),
+            cfg.providers
+                .models
+                .canonical_model(&"llamacpp.local".into())
+                .is_some(),
             "expected providers.models.llamacpp.local to exist"
         );
         let agent = cfg.agents.get("bot").expect("agent created");
@@ -2770,7 +2773,12 @@ mod tests {
         });
         assert!(errors.is_empty(), "apply_into errors: {errors:?}");
         assert!(applied.is_some());
-        assert!(cfg.providers.models.find("anthropic", "main").is_some());
+        assert!(
+            cfg.providers
+                .models
+                .canonical_model(&"anthropic.main".into())
+                .is_some()
+        );
     }
 
     #[test]
@@ -2780,22 +2788,23 @@ mod tests {
             alias: "max".into(),
             model: "claude-sonnet-4-5".into(),
             fields: std::collections::HashMap::from([
-                ("auth_mode".to_string(), "setup_token".to_string()),
-                ("api_key".to_string(), "sk-ant-oat01-test-token".to_string()),
+                ("auth.mode".to_string(), "setup_token".to_string()),
+                (
+                    "auth.api_key".to_string(),
+                    "sk-ant-oat01-test-token".to_string(),
+                ),
             ]),
         });
         assert!(errors.is_empty(), "apply_into errors: {errors:?}");
         assert!(applied.is_some());
-        let entry = cfg
-            .providers
-            .models
-            .find("anthropic", "max")
-            .expect("anthropic.max entry");
-        assert_eq!(entry.model.as_deref(), Some("claude-sonnet-4-5"));
-        assert_eq!(entry.api_key.as_deref(), Some("sk-ant-oat01-test-token"));
-        assert!(
-            cfg.get_prop("providers.models.anthropic.max.auth_mode")
-                .is_err()
+        let registry = serde_json::to_value(cfg.provider_registry().unwrap()).unwrap();
+        assert_eq!(
+            registry["models"]["anthropic.max"]["model"],
+            "claude-sonnet-4-5"
+        );
+        assert_eq!(
+            registry["connections"]["anthropic.max"]["auth"]["api_key"],
+            "sk-ant-oat01-test-token"
         );
         let agent = cfg.agents.get("bot").expect("agent created");
         assert_eq!(agent.model_provider.as_str(), "anthropic.max");
@@ -2811,14 +2820,16 @@ mod tests {
         });
         assert!(errors.is_empty(), "apply_into errors: {errors:?}");
         assert!(applied.is_some());
-        let entry = cfg
-            .providers
-            .models
-            .find("openai", "coding")
-            .expect("openai.coding entry");
-        assert_eq!(entry.model.as_deref(), Some("gpt-5.4"));
-        assert_eq!(entry.wire_api, Some(WireApi::Responses));
-        assert!(entry.requires_openai_auth);
+        let registry = serde_json::to_value(cfg.provider_registry().unwrap()).unwrap();
+        assert_eq!(registry["models"]["openai.coding"]["model"], "gpt-5.4");
+        assert_eq!(
+            registry["connections"]["openai.coding"]["api"]["chat"]["wire_api"],
+            "responses"
+        );
+        assert_eq!(
+            registry["connections"]["openai.coding"]["auth"]["mode"],
+            "codex"
+        );
         let agent = cfg.agents.get("bot").expect("agent created");
         assert_eq!(agent.model_provider.as_str(), "openai.coding");
     }
@@ -2830,23 +2841,20 @@ mod tests {
             alias: "coding".into(),
             model: "gpt-5.4".into(),
             fields: std::collections::HashMap::from([
-                ("auth_mode".to_string(), "codex".to_string()),
-                ("api_key".to_string(), "sk-should-not-persist".to_string()),
+                ("auth.mode".to_string(), "codex".to_string()),
+                (
+                    "auth.api_key".to_string(),
+                    "sk-should-not-persist".to_string(),
+                ),
             ]),
         });
         assert!(errors.is_empty(), "apply_into errors: {errors:?}");
         assert!(applied.is_some());
-        let entry = cfg
-            .providers
-            .models
-            .find("openai", "coding")
-            .expect("openai.coding entry");
-        assert_eq!(entry.wire_api, Some(WireApi::Responses));
-        assert!(entry.requires_openai_auth);
-        assert!(
-            entry.api_key.is_none(),
-            "Codex auth must not persist an API key from the Quickstart form"
-        );
+        let registry = serde_json::to_value(cfg.provider_registry().unwrap()).unwrap();
+        let connection = &registry["connections"]["openai.coding"];
+        assert_eq!(connection["api"]["chat"]["wire_api"], "responses");
+        assert_eq!(connection["auth"]["mode"], "codex");
+        assert!(connection["auth"].get("api_key").is_none());
     }
 
     #[test]
@@ -2856,7 +2864,7 @@ mod tests {
             alias: "main".into(),
             model: "claude-sonnet-4-5".into(),
             fields: std::collections::HashMap::from([(
-                "auth_mode".to_string(),
+                "auth.mode".to_string(),
                 "not_real".to_string(),
             )]),
         });
@@ -2865,7 +2873,7 @@ mod tests {
             errors
                 .iter()
                 .any(|e| e.step == QuickstartStep::ModelProvider
-                    && e.field == "auth_mode"
+                    && e.field == "auth.mode"
                     && e.message.contains("unknown Anthropic auth mode")),
             "expected a clear unknown-Anthropic-auth-mode error, got: {errors:?}"
         );
@@ -2988,6 +2996,40 @@ mod tests {
     }
 
     #[test]
+    fn quickstart_azure_requires_and_materializes_the_canonical_resource() {
+        let rows = field_shape(FieldSection::ModelProvider, "azure");
+        assert!(
+            rows.iter()
+                .any(|field| field.key == "extra.resource" && field.required)
+        );
+        assert!(!rows.iter().any(|field| field.key == "uri"));
+        let mut choice = ModelProviderChoice {
+            provider_type: "azure".into(),
+            alias: "prod.us".into(),
+            model: "chat-deployment".into(),
+            fields: Default::default(),
+        };
+        let (_, applied, errors) = apply_fresh_provider(choice.clone());
+        assert!(applied.is_none());
+        assert!(errors.iter().any(|error| error.field == "extra.resource"));
+        choice
+            .fields
+            .insert("extra.resource".into(), "example-resource".into());
+        let (config, applied, errors) = apply_fresh_provider(choice);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(applied.is_some());
+        let providers = serde_json::to_value(config.providers).unwrap();
+        assert_eq!(
+            providers["connections"]["azure.prod.us"]["extra"]["resource"],
+            "example-resource"
+        );
+        assert_eq!(
+            providers["models"]["azure.prod.us"]["provider"],
+            "azure.prod.us"
+        );
+    }
+
+    #[test]
     fn field_shape_returns_model_provider_rows_for_canonical_types() {
         for kind in ["anthropic", "openai", "ollama", "openrouter", "groq"] {
             let rows = super::field_shape(super::FieldSection::ModelProvider, kind);
@@ -2997,7 +3039,7 @@ mod tests {
                 "field_shape for `{kind}` is missing `model` row; got {keys:?}",
             );
             assert!(
-                keys.contains(&"api_key"),
+                keys.contains(&"auth.api_key"),
                 "field_shape for `{kind}` is missing `api_key` row; got {keys:?}",
             );
         }
@@ -3009,7 +3051,7 @@ mod tests {
             let rows = super::field_shape(super::FieldSection::ModelProvider, kind);
             let keys: Vec<&str> = rows.iter().map(|r| r.key.as_str()).collect();
             assert!(
-                keys.contains(&"uri") && keys.contains(&"api_key"),
+                keys.contains(&"uri") && keys.contains(&"auth.api_key"),
                 "field_shape for `{kind}` must ask for the endpoint and key; got {keys:?}",
             );
             assert_eq!(
@@ -3030,7 +3072,7 @@ mod tests {
         let rows = super::field_shape(super::FieldSection::ModelProvider, "openai");
         let keys: Vec<&str> = rows.iter().map(|r| r.key.as_str()).collect();
         assert!(
-            keys.contains(&"auth_mode"),
+            keys.contains(&"auth.mode"),
             "field_shape for openai must include `auth_mode` for Codex subscription; got {keys:?}",
         );
         assert!(
@@ -3039,7 +3081,7 @@ mod tests {
         );
         let auth = rows
             .iter()
-            .find(|row| row.key == "auth_mode")
+            .find(|row| row.key == "auth.mode")
             .expect("auth_mode row");
         assert!(auth.required);
         assert_eq!(
@@ -3066,7 +3108,7 @@ mod tests {
         let rows = super::field_shape(super::FieldSection::ModelProvider, "openai-codex");
         let auth = rows
             .iter()
-            .find(|row| row.key == "auth_mode")
+            .find(|row| row.key == "auth.mode")
             .expect("auth_mode row");
         assert_eq!(auth.default.as_deref(), Some("codex"));
     }
@@ -3076,12 +3118,12 @@ mod tests {
         let rows = super::field_shape(super::FieldSection::ModelProvider, "claude");
         let keys: Vec<&str> = rows.iter().map(|r| r.key.as_str()).collect();
         assert!(
-            keys.contains(&"auth_mode"),
+            keys.contains(&"auth.mode"),
             "field_shape for claude/anthropic must include `auth_mode`; got {keys:?}",
         );
         let auth = rows
             .iter()
-            .find(|row| row.key == "auth_mode")
+            .find(|row| row.key == "auth.mode")
             .expect("auth_mode row");
         assert!(auth.required);
         assert_eq!(
@@ -3091,7 +3133,7 @@ mod tests {
         assert_eq!(auth.default.as_deref(), Some("api_key"));
         let api_key = rows
             .iter()
-            .find(|row| row.key == "api_key")
+            .find(|row| row.key == "auth.api_key")
             .expect("api_key row");
         assert!(
             api_key.help.contains("claude setup-token"),
@@ -3107,7 +3149,7 @@ mod tests {
     fn field_shape_api_key_is_not_required() {
         for kind in ["openai", "ollama"] {
             let rows = super::field_shape(super::FieldSection::ModelProvider, kind);
-            let api_key_row = rows.iter().find(|r| r.key == "api_key");
+            let api_key_row = rows.iter().find(|r| r.key == "auth.api_key");
             assert!(
                 api_key_row.is_some(),
                 "field_shape for `{kind}` must include `api_key`",
@@ -3969,11 +4011,20 @@ mod tests {
     }
 
     #[test]
-    fn model_provider_is_local_classifies_configured_refs_by_family() {
+    fn model_locality_resolves_connection_instead_of_reference_prefix() {
+        let cfg = Config {
+            providers: serde_json::from_value(serde_json::json!({
+                "connections": {"local.prod": {"kind": "ollama"}, "remote.prod": {"kind": "openai"}},
+                "models": {
+                    "openai.not-a-family": {"capability": "chat", "provider": "local.prod", "model": "local-model"},
+                    "ollama.not-a-family": {"capability": "chat", "provider": "remote.prod", "model": "remote-model"},
+                },
+            })).unwrap(),
+            ..Config::default()
+        };
         assert!(model_provider_is_local("hailo_ollama"));
-        assert!(model_provider_is_local("hailo_ollama.edge"));
-        assert!(model_provider_is_local("ollama.local"));
-        assert!(!model_provider_is_local("openai.primary"));
+        assert!(model_reference_is_local(&cfg, "openai.not-a-family"));
+        assert!(!model_reference_is_local(&cfg, "ollama.not-a-family"));
     }
 
     #[tokio::test]
@@ -4297,13 +4348,12 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let provider_config = zeroclaw_config::schema::ModelProviderConfig {
-            model: Some("slow-model".into()),
-            uri: Some(server.uri()),
-            ..Default::default()
-        };
-
-        let result = fetch_quickstart_context_window("groq", &provider_config).await;
+        let mut cfg = canonical_test_config(&["chat.slow"]);
+        let mut providers = serde_json::to_value(&cfg.providers).unwrap();
+        providers["connections"]["gateway.prod"]["uri"] = server.uri().into();
+        providers["models"]["chat.slow"]["model"] = "slow-model".into();
+        cfg.providers = serde_json::from_value(providers).unwrap();
+        let result = fetch_quickstart_context_window(cfg, "chat.slow".into()).await;
 
         assert_eq!(result, None, "slow enrichment should degrade to fallback");
     }
@@ -4345,7 +4395,7 @@ mod tests {
                 alias: "primary".into(),
                 model: "claude-sonnet-4-5".into(),
                 fields: std::collections::HashMap::from([(
-                    "api_key".to_string(),
+                    "auth.api_key".to_string(),
                     "sk-test".to_string(),
                 )]),
             }),

@@ -4714,8 +4714,8 @@ pub struct ChannelAliasInfo {
 
 impl Config {
     /// Resolve the configured alias values valid for an [`crate::traits::AliasSource`].
-    /// Two-tier sources return dotted `<type>.<alias>` keys; flat sources
-    /// return bare alias keys. The single resolver every surface uses for
+    /// Provider sources return exact canonical model keys; other sources
+    /// return their section's alias keys. The single resolver every surface uses for
     /// `PropKind::AliasRef` pickers and validation.
     #[must_use]
     pub fn resolve_alias_source(&self, source: crate::traits::AliasSource) -> Vec<String> {
@@ -4739,21 +4739,6 @@ impl Config {
                         .map(|(name, _)| name.to_string()),
                 );
             }
-            if capability == zeroclaw_api::capability::Capability::Tts {
-                refs.extend(
-                    self.providers
-                        .tts
-                        .iter_entries()
-                        .map(|(family, alias, _)| format!("{family}.{alias}")),
-                );
-            } else {
-                refs.extend(
-                    self.providers
-                        .transcription
-                        .iter_aliases()
-                        .map(|(family, alias)| format!("{family}.{alias}")),
-                );
-            }
             refs.sort();
             refs.dedup();
             return refs;
@@ -4773,15 +4758,6 @@ impl Config {
                             model.capability() == zeroclaw_api::capability::Capability::Chat
                         })
                         .map(|(model_ref, _)| model_ref.to_string()),
-                );
-            }
-            for (family, alias, profile) in self.providers.models.iter_entries() {
-                refs.push(format!("{family}.{alias}"));
-                refs.extend(
-                    profile
-                        .models
-                        .keys()
-                        .map(|model| format!("{family}.{alias}.{model}")),
                 );
             }
             refs.sort();

@@ -336,6 +336,17 @@ impl ModelProviders {
         self.canonical_models.get(model_ref)
     }
 
+    /// Insert an exact model key into a caller-owned configuration candidate.
+    /// Validate the candidate with `Providers::canonical_registry` before
+    /// publishing or persisting it; connection-dependent options resolve there.
+    pub fn insert_canonical_model(
+        &mut self,
+        model_ref: ModelRef,
+        model: ModelDefinition<serde_json::Value>,
+    ) {
+        self.canonical_models.insert(model_ref, model);
+    }
+
     pub fn has_canonical_models(&self) -> bool {
         !self.canonical_models.is_empty()
     }

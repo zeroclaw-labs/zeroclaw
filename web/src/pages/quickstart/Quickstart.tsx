@@ -74,7 +74,10 @@ interface StagedPreset {
 }
 
 interface FormState {
-  provider: StagedProvider | null;
+  provider:
+    | { mode: "fresh"; value: StagedProvider }
+    | { mode: "existing"; value: string }
+    | null;
   risk: StagedPreset | null;
   runtime: RuntimeSelection | null;
   memory: StagedPreset | null;
@@ -162,7 +165,7 @@ export default function Quickstart() {
     setBusy(true);
     setErrors([]);
     const res = await quickstartApply({
-      model_provider: { mode: "fresh", value: form.provider! },
+      model_provider: form.provider!,
       risk_profile: { mode: "fresh", value: form.risk!.preset_name },
       runtime_profile: {
         mode: "fresh",
@@ -257,37 +260,85 @@ export default function Quickstart() {
         title={t("quickstart.model_provider_title")}
         done={providerDone}
         summary={
-          form.provider
-            ? `${form.provider.provider_type}.${form.provider.alias} — ${form.provider.model}`
-            : null
+          form.provider?.mode === "existing"
+            ? form.provider.value
+            : form.provider?.mode === "fresh"
+              ? `${form.provider.value.provider_type}.${form.provider.value.alias} — ${form.provider.value.model}`
+              : null
         }
       >
         {form.provider ? (
           <StagedRow
-            label={`${form.provider.provider_type}.${form.provider.alias}`}
-            sub={`${t("quickstart.model_prefix")}${form.provider.model}`}
+            label={
+              form.provider.mode === "existing"
+                ? form.provider.value
+                : `${form.provider.value.provider_type}.${form.provider.value.alias}`
+            }
+            sub={
+              form.provider.mode === "fresh"
+                ? `${t("quickstart.model_prefix")}${form.provider.value.model}`
+                : ""
+            }
             onRemove={() => setForm((f) => ({ ...f, provider: null }))}
           />
         ) : (
-          <ProviderForm
-            state={state}
-            onStage={(p) => {
-              setForm((f) => {
-                const runtime = runtimeAfterProviderChange(
-                  state,
-                  p.provider_type,
-                  f.runtime,
-                  runtimeAutoDefaultedRef.current,
-                );
-                return {
-                  ...f,
-                  provider: p,
-                  runtime,
-                };
-              });
-              recordStep("model_provider");
-            }}
-          />
+          <>
+            {!!state?.model_providers.length && (
+              <label className="block mb-4">
+                <div className="text-xs uppercase tracking-wider mb-1" style={MUTED}>
+                  {t("quickstart.existing_model")}
+                </div>
+                <select
+                  className={INPUT_CLASS}
+                  value=""
+                  onChange={(event) => {
+                    const reference = event.target.value;
+                    if (!reference) return;
+                    setForm((current) => ({
+                      ...current,
+                      provider: { mode: "existing", value: reference },
+                      runtime: runtimeAfterProviderChange(
+                        state,
+                        "",
+                        current.runtime,
+                        runtimeAutoDefaultedRef.current,
+                      ),
+                    }));
+                    recordStep("model_provider");
+                  }}
+                >
+                  <option value="" disabled>{t("quickstart.pick_model")}</option>
+                  {state.model_providers.map((reference) => (
+                    <option key={reference} value={reference}>{reference}</option>
+                  ))}
+                </select>
+              </label>
+            )}
+            {!!state?.model_providers.length && (
+              <div className="text-xs uppercase tracking-wider pt-2" style={MUTED}>
+                {t("quickstart.new_model")}
+              </div>
+            )}
+            <ProviderForm
+              state={state}
+              onStage={(p) => {
+                setForm((f) => {
+                  const runtime = runtimeAfterProviderChange(
+                    state,
+                    p.provider_type,
+                    f.runtime,
+                    runtimeAutoDefaultedRef.current,
+                  );
+                  return {
+                    ...f,
+                    provider: { mode: "fresh", value: p },
+                    runtime,
+                  };
+                });
+                recordStep("model_provider");
+              }}
+            />
+          </>
         )}
       </Section>
 
@@ -711,6 +762,8 @@ function ProviderForm({
       return;
     }
     let cancelled = false;
+    setDescriptors([]);
+    setFieldValues({});
     void (async () => {
       try {
         const f = await quickstartFields({
@@ -751,27 +804,20 @@ function ProviderForm({
     };
   }, [type]);
 
-  const isLocal = useMemo(
-    () =>
-      state?.model_provider_types.find((t) => t.kind === type)?.local ?? false,
-    [state, type],
-  );
-  // A required secret descriptor (e.g. `api-key`) is the gate that
-  // prevents adding the provider when the user hasn't pasted a key.
-  // Local providers (Ollama, etc.) carry `local = true` and skip the
-  // gate even if a secret descriptor happens to exist.
-  const missingRequiredSecret = descriptors.some(
+  const fieldsReady = descriptors.some((descriptor) => descriptor.key === "model");
+  const missingRequiredField = descriptors.some(
     (d) =>
       d.required &&
-      d.is_secret &&
-      !isLocal &&
-      (fieldValues[d.key] ?? "").trim() === "",
+      d.key !== "model" &&
+      !(d.key === "auth.api_key" && fieldValues["auth.mode"] === "codex") &&
+      (fieldValues[d.key] ?? d.default ?? "").trim() === "",
   );
   const canAdd =
     type !== "" &&
     alias.trim() !== "" &&
     model.trim() !== "" &&
-    !missingRequiredSecret;
+    fieldsReady &&
+    !missingRequiredField;
 
   return (
     <>
@@ -824,8 +870,8 @@ function ProviderForm({
         .filter(
           (d) =>
             !(
-              d.key === "api_key" &&
-              (fieldValues["auth_mode"] ?? "").trim() === "codex"
+              d.key === "auth.api_key" &&
+              (fieldValues["auth.mode"] ?? "").trim() === "codex"
             ),
         )
         .map((d) =>
@@ -851,6 +897,7 @@ function ProviderForm({
               label={d.label}
               help={d.help}
               type={d.is_secret ? "password" : "text"}
+              required={d.required}
               value={fieldValues[d.key] ?? ""}
               placeholder={d.default ?? ""}
               onChange={(value) =>

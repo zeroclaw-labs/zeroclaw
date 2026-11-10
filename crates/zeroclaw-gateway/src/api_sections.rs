@@ -67,12 +67,12 @@ pub async fn handle_catalog_models(
     State(state): State<AppState>,
     Query(q): Query<ModelsQuery>,
 ) -> Response {
-    let local = zeroclaw_runtime::quickstart::model_provider_is_local(&q.model_provider);
     let catalog_provider_ref = q.catalog_provider_ref();
     // Snapshot config so the catalog resolves the alias credential and can reach
     // the native /models endpoint (surfacing new native-only models that the
     // models.dev snapshot may not carry yet) instead of silently falling back.
     let cfg = state.config.read().clone();
+    let local = zeroclaw_runtime::quickstart::model_reference_is_local(&cfg, &catalog_provider_ref);
     let (models, pricing, live) =
         match zeroclaw_runtime::quickstart::model_catalog_with_config_result(
             Some(&cfg),
@@ -338,7 +338,7 @@ pub async fn handle_sections(State(state): State<AppState>) -> Response {
     for s in zeroclaw_config::sections::QUICKSTART_SECTIONS {
         roots.insert(s.as_str().to_string());
     }
-    roots.insert("providers.registry".to_string());
+    zeroclaw_runtime::rpc::types::project_provider_editor_sections(&mut roots);
 
     // Drop bare parent-segment entries when a dotted child is present
     // — `providers` is phantom once `providers.models` etc. are listed.
@@ -353,8 +353,8 @@ pub async fn handle_sections(State(state): State<AppState>) -> Response {
     let mut ordered: Vec<String> = roots.into_iter().collect();
     ordered.sort_by(|a, b| {
         match (
-            zeroclaw_config::sections::section_index_for_key(a),
-            zeroclaw_config::sections::section_index_for_key(b),
+            zeroclaw_runtime::rpc::types::config_editor_section_index(a),
+            zeroclaw_runtime::rpc::types::config_editor_section_index(b),
         ) {
             (Some(ai), Some(bi)) => ai.cmp(&bi),
             (Some(_), None) => std::cmp::Ordering::Less,
@@ -1410,9 +1410,13 @@ mod tests {
 
     #[test]
     fn build_agent_options_returns_every_configured_alias() {
-        let mut cfg = zeroclaw_config::schema::Config::default();
-        cfg.create_map_key("providers.models.anthropic", "default")
-            .unwrap();
+        let mut cfg = zeroclaw_config::schema::Config {
+            providers: serde_json::from_value(serde_json::json!({
+                "connections": {"gateway.prod": {"kind": "custom"}},
+                "models": {"chat.fast.us": {"capability": "chat", "provider": "gateway.prod", "model": "upstream"}},
+            })).unwrap(),
+            ..Default::default()
+        };
         cfg.create_map_key("risk_profiles", "alpha_risk").unwrap();
         cfg.create_map_key("runtime_profiles", "alpha_runtime")
             .unwrap();
@@ -1424,7 +1428,7 @@ mod tests {
 
         let resp = build_agent_options(&cfg);
 
-        assert_eq!(resp.model_providers, vec!["anthropic.default".to_string()]);
+        assert_eq!(resp.model_providers, vec!["chat.fast.us".to_string()]);
         assert_eq!(resp.risk_profiles, vec!["alpha_risk".to_string()]);
         assert_eq!(resp.runtime_profiles, vec!["alpha_runtime".to_string()]);
         assert_eq!(resp.skill_bundles, vec!["alpha_skills".to_string()]);
@@ -1795,6 +1799,14 @@ model = "upstream-model"
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let result: ConfigSectionsResult = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result.sections[0].key, "providers.registry");
+        for retired in [
+            "providers.models",
+            "providers.tts",
+            "providers.transcription",
+        ] {
+            assert!(!result.sections.iter().any(|section| section.key == retired));
+        }
         let cron = result
             .sections
             .iter()

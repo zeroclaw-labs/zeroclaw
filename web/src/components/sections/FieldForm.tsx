@@ -55,7 +55,6 @@ import {
   descriptionForPath,
   fetchConfigSchema,
   getAgentOptions,
-  getCatalogModels,
   getChannels,
   listProps,
   mcpRequiredByTransport,
@@ -70,8 +69,7 @@ import {
   type PatchOp,
 } from "../../lib/api";
 import { useConfigDraft } from "../../lib/draftStore";
-import { entityConfigPath, modelCatalogTarget } from "../../lib/entityLinks";
-import { useModelProfileAliases } from "../../lib/useModelProfileAliases";
+import { entityConfigPath } from "../../lib/entityLinks";
 import { fuzzyFilter } from "../../lib/fuzzy";
 import {
   SECRET_MAP_KIND,
@@ -79,7 +77,6 @@ import {
   secretMapEntryKey,
   secretMapKeyError,
 } from "./secretMap.logic";
-import { isLocalModelProviderName, primeModelProviderCatalog } from "../../lib/modelProviders";
 import EntityEnabledToggle from "../EntityEnabledToggle";
 
 function entryValue(entry: ListResponseEntry): unknown {
@@ -250,11 +247,6 @@ function humanizeFieldLabel(path: string): string {
 
 function setupFieldPriority(entry: ListResponseEntry): number {
   const leaf = entry.path.split(".").pop() ?? "";
-  if (/^providers\.models\.[^.]+\.[^.]+\./.test(entry.path)) {
-    const order = ["model", "api_key", "requires_openai_auth", "uri"];
-    const idx = order.indexOf(leaf);
-    if (idx >= 0) return idx;
-  }
   if (/^agents\.[^.]+\./.test(entry.path)) {
     const order = [
       "enabled",
@@ -291,19 +283,6 @@ function setupRequirement(
   requiredByTransport?: Record<string, string> | null,
 ): { label: string; tone: "required" | "choice" | "optional" } | null {
   const leaf = entry.path.split(".").pop() ?? "";
-  if (/^providers\.models\.[^.]+\.[^.]+\./.test(entry.path)) {
-    const localProvider = isLocalModelProviderPath(entry.path);
-    if (leaf === "model") return { label: t("fieldform.badge_required"), tone: "required" };
-    if (leaf === "api_key") {
-      return localProvider
-        ? { label: t("fieldform.badge_optional_for_remote_auth"), tone: "optional" }
-        : { label: t("fieldform.badge_required_for_api_key_auth"), tone: "required" };
-    }
-    if (leaf === "requires_openai_auth")
-      return { label: t("fieldform.badge_auth_option"), tone: "choice" };
-    if (leaf === "uri") return { label: t("fieldform.badge_endpoint_option"), tone: "choice" };
-    return { label: t("fieldform.badge_optional"), tone: "optional" };
-  }
   const topLevelAgentField =
     entry.path.match(/^agents\.[^.]+\.([^.]+)$/)?.[1] ?? null;
   if (topLevelAgentField) {
@@ -364,17 +343,6 @@ function requirementBadgeTone(
   // `choice` and `optional` both render the calm `neutral` tint, so they
   // share the default below (the `choice` branch was identity with default).
   return "neutral";
-}
-
-function isLocalModelProviderPath(path: string): boolean {
-  const provider = path.match(/^providers\.models\.([^.]+)\./)?.[1] ?? "";
-  return isLocalModelProviderName(provider);
-}
-
-function modelFallbackExample(path: string): string {
-  return isLocalModelProviderPath(path)
-    ? "llama3.2"
-    : "claude-sonnet-4-5-20251101";
 }
 
 function defaultInputValue(entry: ListResponseEntry): string {
@@ -622,14 +590,6 @@ function validationHint(
   return null;
 }
 
-// Per-provider+alias catalog cache. Cleared via clearFieldFormCatalogCaches() on
-// nav so a new model alias added under (say) `anthropic` shows up the next
-// time the user opens an agent form without a hard refresh.
-let modelsCache: Record<
-  string,
-  { models: string[]; live: boolean; local: boolean }
-> = {};
-
 // In-flight `getAgentOptions()` promise so N FieldForm rows mounting at
 // once share a single round-trip. Cleared when the request resolves;
 // the response itself is NOT cached across mounts — each FieldForm mount
@@ -661,14 +621,6 @@ function loadAliasSource(source: string): Promise<string[]> {
     });
   aliasSourcePromises[source] = p;
   return p;
-}
-
-/// Clear the per-provider model catalog cache. Called by Config.tsx when
-/// the user navigates between sections so a model alias added under e.g.
-/// `providers.models.anthropic` shows up the next time another agent's
-/// `model_provider` dropdown is opened.
-export function clearFieldFormCatalogCaches() {
-  modelsCache = {};
 }
 
 // Single-select alias-ref fields on an agent: render as <select> with the
@@ -829,14 +781,13 @@ function AgentEmptyAliasFallback({
 function agentAliasJumpPath(
   fieldKind: keyof AgentOptionsResponse,
   alias: string,
-  modelAliases: readonly string[],
 ): string {
   const base = AGENT_ALIAS_SOURCE_PATH[fieldKind];
   // Channels and model_providers use dotted alias (`telegram.default`,
   // `anthropic.work`); split into the two URL segments. Single-tier
   // sections use the alias directly.
   if (fieldKind === "model_providers") {
-    return entityConfigPath('model-provider', alias, modelAliases);
+    return entityConfigPath('model-provider', alias);
   }
   if (fieldKind === "channels") {
     const dot = alias.indexOf(".");
@@ -1916,20 +1867,6 @@ function FieldRow({
   // permanent second input to every row. Open it automatically when a
   // comment value is already staged so the operator sees their own note.
   const [showComment, setShowComment] = useState(comment.length > 0);
-  const [providerModels, setProviderModels] = useState<string[] | null>(null);
-  const [modelsFetchFailed, setModelsFetchFailed] = useState(false);
-  // Per-alias model field — the profile-level `providers.models.<type>.<alias>.model`
-  // or a multi-model entry's `providers.models.<type>.<alias>.models.<model_alias>.id`.
-  // Both are provider-local model IDs that get the known-model dropdown.
-  const catalogAliases = useModelProfileAliases(
-    entry.path.startsWith('providers.models.') ? entry.path.slice('providers.models.'.length) : undefined,
-  );
-  const catalogTarget = modelCatalogTarget(entry.path, catalogAliases);
-  const isProviderModelField = catalogTarget !== undefined && !catalogTarget.array;
-  // Legacy family/alias model fields still use the provider catalog. Fallbacks
-  // are exact canonical model references under `[providers.fallback]` and do
-  // not use a provider-local model-id array.
-  const needsProviderModels = isProviderModelField;
   // Skill-bundle directory field — `skill-bundles.<alias>.directory` (or
   // the legacy snake form `skill_bundles.<alias>.directory`). When unset
   // the runtime falls back to `<install>/shared/skills/<alias>/`; render
@@ -2006,40 +1943,6 @@ function FieldRow({
   const [agentOptions, setAgentOptions] = useState<AgentOptionsResponse | null>(
     null,
   );
-  const modelProfileAliases = useModelProfileAliases(
-    agentSingleAliasKind === 'model_providers' ? value : undefined,
-  );
-
-  useEffect(() => {
-    if (!needsProviderModels) return;
-    void primeModelProviderCatalog();
-    const provider = catalogTarget?.family;
-    const alias = catalogTarget?.alias;
-    if (!provider || !alias) return;
-    const cacheKey = `${provider}.${alias}`;
-    const cached = modelsCache[cacheKey];
-    if (cached) {
-      setProviderModels(cached.models);
-      setModelsFetchFailed(!cached.live && cached.models.length === 0);
-      return;
-    }
-    void getCatalogModels(provider, alias)
-      .then((r) => {
-        modelsCache[cacheKey] = { models: r.models, live: r.live, local: r.local };
-        setProviderModels(r.models);
-        setModelsFetchFailed(!r.live && r.models.length === 0);
-      })
-      .catch(() => {
-        modelsCache[cacheKey] = {
-          models: [],
-          live: false,
-          local: isLocalModelProviderName(provider),
-        };
-        setProviderModels([]);
-        setModelsFetchFailed(true);
-      });
-  }, [needsProviderModels, entry.path, catalogTarget?.family, catalogTarget?.alias]);
-
   // Refetch on every mount so newly-created channels / agents / bundles
   // (added in a different section) surface without a page reload.
   useEffect(() => {
@@ -2241,52 +2144,6 @@ function FieldRow({
               aria-label={fieldShortLabel(entry)}
             />
           )
-        ) : isProviderModelField &&
-          providerModels !== null &&
-          providerModels.length > 0 ? (
-          // Discoverable combobox (caret + filterable listbox) rather than a
-          // native <datalist>, which showed no affordance — users never saw
-          // the known-model list. Free text is still accepted for unlisted IDs.
-          <ComboBox
-            id={entry.path}
-            value={value}
-            onChange={onChange}
-            options={providerModels}
-            openOnFocus
-            placeholder={t("fieldform.model_combo_placeholder")}
-            emptyText={t("fieldform.model_combo_empty")}
-            aria-label={t("fieldform.model_aria")}
-          />
-        ) : isProviderModelField && modelsFetchFailed ? (
-          // Fetch failed — fall back to free text with explicit help.
-          <>
-            <input
-              id={entry.path}
-              value={value}
-              onChange={(e) => onChange(e.target.value)}
-              className="input-electric w-full px-3 py-2 text-sm"
-              placeholder={t("fieldform.model_input_unreachable_placeholder")}
-            />
-            <p className="text-xs" style={{ color: "var(--pc-text-muted)" }}>
-              {t("fieldform.model_catalog_unreachable_help")}{" "}
-              <code>{modelFallbackExample(entry.path)}</code>).
-            </p>
-          </>
-        ) : isProviderModelField && providerModels === null ? (
-          // Fetching catalog…
-          <>
-            <input
-              id={entry.path}
-              value={value}
-              onChange={(e) => onChange(e.target.value)}
-              className="input-electric w-full px-3 py-2 text-sm"
-              placeholder={t("fieldform.fetching_models_placeholder")}
-              disabled
-            />
-            <p className="text-xs" style={{ color: "var(--pc-text-muted)" }}>
-              {t("fieldform.fetching_models_help")}
-            </p>
-          </>
         ) : isAgentSystemPrompt ? (
           <textarea
             id={entry.path}
@@ -2316,7 +2173,7 @@ function FieldRow({
               </select>
               {value && (
                 <Link
-                  to={agentAliasJumpPath(agentSingleAliasKind, value, modelProfileAliases)}
+                  to={agentAliasJumpPath(agentSingleAliasKind, value)}
                   title={`${t("fieldform.edit_in_source_prefix")}${value}${t("fieldform.edit_in_source_suffix")}`}
                   className="btn-icon flex-shrink-0"
                 >

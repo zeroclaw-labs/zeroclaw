@@ -21,7 +21,7 @@ impl VoicePipeline {
     }
 
     pub fn from_config_for_agent(config: &Config, agent_alias: Option<&str>) -> Result<Self> {
-        let stt = if config.transcription.enabled {
+        let stt = if zeroclaw_providers::transcription::is_enabled(config) {
             Some(
                 TranscriptionManager::from_config_for_agent(config, agent_alias)
                     .context("failed to initialize transcription manager")?,
@@ -30,7 +30,7 @@ impl VoicePipeline {
             None
         };
 
-        let tts = if config.tts.enabled {
+        let tts = if zeroclaw_providers::tts::is_enabled(config) {
             Some(
                 TtsManager::from_config_for_agent(config, agent_alias)
                     .context("failed to initialize TTS manager")?,
@@ -190,6 +190,34 @@ mod tests {
             },
         );
         config
+    }
+
+    #[test]
+    fn canonical_voice_models_enable_pipeline_without_legacy_flags() {
+        let mut config = Config {
+            providers: serde_json::from_value(serde_json::json!({
+                "connections": {"gateway.prod": {"kind": "custom", "uri": "https://voice.invalid/v1",
+                    "auth": {"mode": "api_key", "api_key": "voice-test-key"}}},
+                "models": {
+                    "asr.voice.us": {"capability": "asr", "provider": "gateway.prod", "model": "whisper-1"},
+                    "tts.voice.us": {"capability": "tts", "provider": "gateway.prod", "model": "tts-1", "options": {"voice": "alloy"}},
+                },
+            })).unwrap(),
+            ..Config::default()
+        };
+        config.agents.insert(
+            "voice-agent".into(),
+            AliasedAgentConfig {
+                transcription_provider: "asr.voice.us".into(),
+                tts_provider: "tts.voice.us".into(),
+                ..Default::default()
+            },
+        );
+        assert!(!config.transcription.enabled && !config.tts.enabled);
+        let pipeline = VoicePipeline::from_config_for_agent(&config, Some("voice-agent")).unwrap();
+        assert!(pipeline.is_full_duplex());
+        assert_eq!(pipeline.stt_providers(), vec!["asr.voice.us"]);
+        assert_eq!(pipeline.tts_providers(), vec!["tts.voice.us"]);
     }
 
     #[test]

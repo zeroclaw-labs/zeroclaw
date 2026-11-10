@@ -153,7 +153,7 @@ export default function AgentDrawer({
                   kind="model-provider"
                   id={agent.modelProvider}
                   className="block text-xs truncate font-mono text-pc-text-muted hover:text-pc-text-secondary hover:underline"
-                  title={`${t('agent.open_config_prefix')}providers.models.${agent.modelProvider}${t('agent.open_config_suffix')}`}
+                  title={`${t('agent.open_config_prefix')}providers.models.${JSON.stringify(agent.modelProvider)}${t('agent.open_config_suffix')}`}
                 >
                   {agent.modelProvider}
                 </EntityLink>

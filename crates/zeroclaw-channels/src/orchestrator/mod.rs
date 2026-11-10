@@ -714,8 +714,7 @@ struct ChannelRuntimeContext {
     interrupt_on_new_message: InterruptOnNewMessageConfig,
     multimodal: zeroclaw_config::schema::MultimodalConfig,
     media_pipeline: zeroclaw_config::schema::MediaPipelineConfig,
-    transcription_config: zeroclaw_config::schema::TranscriptionConfig,
-    /// Resolved per-agent transcription provider alias (`<type>.<alias>`)
+    /// Resolved per-agent ASR model reference (an exact registry key)
     /// for the runtime-active agent that owns this channel context.
     /// Empty when the agent has no transcription_provider set; downstream
     /// `TranscriptionManager.transcribe` calls then fail loud.
@@ -9503,23 +9502,24 @@ async fn process_channel_message_body(
     if ctx.media_pipeline.enabled && !msg.attachments.is_empty() {
         let vision =
             ctx.model_provider.supports_vision() || ctx.multimodal.vision_model_provider.is_some();
-        // Build from legacy config; if that fails (e.g. no legacy api_key
-        // but typed providers are configured), fall back to an empty shell
-        // so with_typed_providers() can still populate the registry.
-        let transcription_manager = {
-            let base = zeroclaw_providers::transcription::TranscriptionManager::new(
-                &ctx.transcription_config,
-            )
-            .unwrap_or_else(|_| zeroclaw_providers::transcription::TranscriptionManager::empty());
-            let m = base
-                .with_typed_providers(&ctx.prompt_config.providers.transcription)
-                .with_agent_transcription_provider(ctx.agent_transcription_provider.clone());
-            if m.available_providers().is_empty() {
-                None
-            } else {
-                Some(m)
-            }
-        };
+        let transcription_manager =
+            match zeroclaw_providers::transcription::build_transcription_manager(
+                &ctx.prompt_config,
+                &ctx.agent_transcription_provider,
+            ) {
+                Ok(manager) if !manager.available_providers().is_empty() => Some(manager),
+                Ok(_) => None,
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                        "Media transcription configuration failed"
+                    );
+                    None
+                }
+            };
         let pipeline = media_pipeline::MediaPipeline::new(
             &ctx.media_pipeline,
             transcription_manager.as_ref(),
@@ -13522,7 +13522,7 @@ fn build_channel_by_id(
                     MatrixChannel::new(mx.clone(), alias, peer_resolver, state_dir)?
                         .with_transcription_manager_factory(move || {
                             let config = transcription_config_arc.read();
-                            if !config.transcription.enabled {
+                            if !zeroclaw_providers::transcription::is_enabled(&config) {
                                 return None;
                             }
                             let provider = resolve_agent_transcription_provider(
@@ -13535,7 +13535,7 @@ fn build_channel_by_id(
                         })
                         .with_tts_manager_factory(move || {
                             let config = tts_config_arc.read();
-                            if !config.tts.enabled {
+                            if !zeroclaw_providers::tts::is_enabled(&config) {
                                 return None;
                             }
                             let owner = resolve_agent_tts_owner(&config, &tts_channel_key);
@@ -14626,7 +14626,7 @@ fn resolved_transcription_manager(
     config: &Config,
     channel_key: &str,
 ) -> Option<Arc<zeroclaw_providers::transcription::TranscriptionManager>> {
-    if !config.transcription.enabled {
+    if !zeroclaw_providers::transcription::is_enabled(config) {
         return None;
     }
     let provider = resolve_agent_transcription_provider(config, channel_key);
@@ -14776,7 +14776,7 @@ pub(crate) fn build_configured_matrix_channel(
     Ok(channel
         .with_transcription_manager_factory(move || {
             let config = transcription_config_arc.read();
-            if !config.transcription.enabled {
+            if !zeroclaw_providers::transcription::is_enabled(&config) {
                 return None;
             }
             let provider =
@@ -14787,7 +14787,7 @@ pub(crate) fn build_configured_matrix_channel(
         })
         .with_tts_manager_factory(move || {
             let config = tts_config_arc.read();
-            if !config.tts.enabled {
+            if !zeroclaw_providers::tts::is_enabled(&config) {
                 return None;
             }
             let owner = resolve_agent_tts_owner(&config, &tts_channel_key);
@@ -17726,7 +17726,6 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
             interrupt_on_new_message,
             multimodal: config.multimodal.clone(),
             media_pipeline: config.media_pipeline.clone(),
-            transcription_config: config.transcription.clone(),
             agent_transcription_provider: agent.transcription_provider.as_str().to_string(),
             hooks: if config.hooks.enabled {
                 Some(Arc::new(
@@ -18419,7 +18418,6 @@ fn concurrent_persist_lock_serialization() {
         },
         multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
         media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-        transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
         agent_transcription_provider: String::new(),
         hooks: None,
         workspace_dir: Arc::new(std::env::temp_dir()),
@@ -18600,7 +18598,6 @@ fn test_channel_ctx_with_backend(
         },
         multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
         media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-        transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
         agent_transcription_provider: String::new(),
         hooks: None,
         workspace_dir: Arc::new(std::env::temp_dir()),
@@ -18722,7 +18719,6 @@ fn test_channel_ctx_with_backend_channel_and_provider(
         },
         multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
         media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-        transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
         agent_transcription_provider: String::new(),
         hooks: None,
         workspace_dir: Arc::new(std::env::temp_dir()),
@@ -22950,7 +22946,6 @@ temperature = 0.3
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -23989,7 +23984,6 @@ temperature = 0.3
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -24566,7 +24560,6 @@ api_key = "second-key"
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -24673,7 +24666,6 @@ api_key = "second-key"
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -24798,7 +24790,6 @@ api_key = "second-key"
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -24927,7 +24918,6 @@ api_key = "second-key"
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -26980,7 +26970,6 @@ options = { extract_text_tool_calls = true }
             interrupt_on_new_message,
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -27106,7 +27095,6 @@ options = { extract_text_tool_calls = true }
             interrupt_on_new_message,
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -30368,7 +30356,6 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -30827,7 +30814,6 @@ BTC is currently around $65,000 based on latest tool output."#
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             model_routes: Arc::new(Vec::new()),
@@ -31005,7 +30991,6 @@ BTC is currently around $65,000 based on latest tool output."#
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             model_routes: Arc::new(Vec::new()),
@@ -31209,7 +31194,6 @@ BTC is currently around $65,000 based on latest tool output."#
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             model_routes: Arc::new(Vec::new()),
@@ -31399,7 +31383,6 @@ BTC is currently around $65,000 based on latest tool output."#
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: Some(Arc::new(hook_runner)),
             model_routes: Arc::new(Vec::new()),
@@ -31598,7 +31581,6 @@ BTC is currently around $65,000 based on latest tool output."#
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: Some(Arc::new(hook_runner)),
             model_routes: Arc::new(Vec::new()),
@@ -32171,7 +32153,6 @@ BTC is currently around $65,000 based on latest tool output."#
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: Some(Arc::new(hook_runner)),
             model_routes: Arc::new(Vec::new()),
@@ -32318,7 +32299,6 @@ BTC is currently around $65,000 based on latest tool output."#
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             hooks: None,
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
@@ -32441,7 +32421,6 @@ BTC is currently around $65,000 based on latest tool output."#
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             hooks: None,
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
@@ -32751,7 +32730,6 @@ BTC is currently around $65,000 based on latest tool output."#
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             hooks: None,
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
@@ -32882,7 +32860,6 @@ BTC is currently around $65,000 based on latest tool output."#
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             hooks: None,
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
@@ -33036,7 +33013,6 @@ BTC is currently around $65,000 based on latest tool output."#
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             model_routes: Arc::new(Vec::new()),
@@ -33173,7 +33149,6 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -33295,7 +33270,6 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -33435,7 +33409,6 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -33603,7 +33576,6 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -33806,7 +33778,6 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -34327,7 +34298,6 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -34444,7 +34414,6 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -34574,7 +34543,6 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -36062,7 +36030,6 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -36270,7 +36237,6 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -36439,7 +36405,6 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -36607,7 +36572,6 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -36773,7 +36737,6 @@ BTC is currently around $65,000 based on latest tool output."#
             session_store: None,
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -36978,7 +36941,6 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: interrupt_on_new_message_config(&channel_config),
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -37218,7 +37180,6 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -37362,7 +37323,6 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -38043,7 +38003,6 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -38180,7 +38139,6 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -38321,7 +38279,6 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -38454,7 +38411,6 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -38587,7 +38543,6 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -39007,7 +38962,6 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -40537,7 +40491,6 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -47264,7 +47217,6 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -47450,7 +47402,6 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(vec!["read_skill".to_string()]),
@@ -48024,7 +47975,6 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -48523,7 +48473,6 @@ BTC is currently around $65,000 based on latest tool output."#
                 enabled: true,
                 ..Default::default()
             },
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -48696,7 +48645,6 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -52741,7 +52689,6 @@ This is an example JSON object for profile settings."#;
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -52876,7 +52823,6 @@ This is an example JSON object for profile settings."#;
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -53079,7 +53025,6 @@ This is an example JSON object for profile settings."#;
             sop_audit: None,
             sop_driver_sink: None,
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             security: Arc::new(SecurityPolicy::default()),
         });
@@ -53368,7 +53313,6 @@ This is an example JSON object for profile settings."#;
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -53531,7 +53475,6 @@ This is an example JSON object for profile settings."#;
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -53686,7 +53629,6 @@ This is an example JSON object for profile settings."#;
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -53861,7 +53803,6 @@ This is an example JSON object for profile settings."#;
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -55039,7 +54980,6 @@ This is an example JSON object for profile settings."#;
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),

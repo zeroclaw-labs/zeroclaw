@@ -440,18 +440,7 @@ fn provider_type_options(snapshot: Option<&QuickstartStateResult>) -> Vec<Picker
 
 fn ordered_existing_provider_refs(existing: &[String]) -> Vec<String> {
     let mut refs: Vec<String> = existing.to_vec();
-    refs.sort_by(|a, b| {
-        let rank = |value: &str| {
-            if value == "openrouter.default" {
-                0
-            } else if value.ends_with(".default") {
-                1
-            } else {
-                2
-            }
-        };
-        rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
-    });
+    refs.sort();
     refs
 }
 
@@ -536,15 +525,12 @@ struct FormState {
     provider_alias: String,
     provider_mode: SelectorMode,
     model: String,
-    /// Set when an existing provider was picked as a three-segment ref
-    /// `<family>.<alias>.<model_alias>`; reassembled into the submitted ref so
-    /// the agent binds to that specific model entry. `None` for plain
-    /// two-segment profile picks.
-    provider_model_alias: Option<String>,
+    /// Exact configured model key; punctuation has no structural meaning.
+    existing_model_ref: String,
     /// Captured field-form values for the model_provider entry,
-    /// keyed by `FieldDescriptor.key` (kebab-case schema identifier).
-    /// Submitted verbatim via `ModelProviderChoice.fields`; the
-    /// daemon writes each entry under `<prefix>.<key>`.
+    /// keyed by `FieldDescriptor.key`, such as `auth.api_key` or `uri`.
+    /// Submitted verbatim via `ModelProviderChoice.fields`; the daemon
+    /// constructs the canonical connection and model.
     provider_fields: std::collections::HashMap<String, String>,
     risk: String,
     risk_mode: SelectorMode,
@@ -575,7 +561,7 @@ impl FormState {
             provider_alias: String::new(),
             provider_mode: SelectorMode::Fresh,
             model: String::new(),
-            provider_model_alias: None,
+            existing_model_ref: String::new(),
             provider_fields: std::collections::HashMap::new(),
             risk: String::new(),
             risk_mode: SelectorMode::Fresh,
@@ -601,9 +587,7 @@ impl FormState {
                         && !self.provider_alias.is_empty()
                         && !self.model.is_empty()
                 }
-                SelectorMode::Existing => {
-                    !self.provider_type.is_empty() && !self.provider_alias.is_empty()
-                }
+                SelectorMode::Existing => !self.existing_model_ref.is_empty(),
             },
             Selector::RiskProfile => !self.risk.is_empty(),
             Selector::RuntimeProfile => !self.runtime.is_empty(),
@@ -644,19 +628,14 @@ impl FormState {
     fn summary(&self, sel: Selector) -> String {
         match sel {
             Selector::ModelProvider => {
-                if self.provider_type.is_empty() {
+                if self.provider_mode == SelectorMode::Existing {
+                    self.existing_model_ref.clone()
+                } else if self.provider_type.is_empty() {
                     "not yet chosen".to_string()
                 } else {
-                    // Prefer the picked model alias (three-segment existing ref);
-                    // fall back to the free-form model id (fresh provider form).
-                    let model = self
-                        .provider_model_alias
-                        .as_deref()
-                        .filter(|m| !m.is_empty())
-                        .unwrap_or(self.model.as_str());
                     format!(
                         "{} ({}) — {}",
-                        self.provider_type, self.provider_alias, model
+                        self.provider_type, self.provider_alias, self.model
                     )
                 }
             }
@@ -699,16 +678,7 @@ impl FormState {
                 model: self.model.clone(),
                 fields: self.provider_fields.clone(),
             }),
-            SelectorMode::Existing => {
-                // Reassemble a three-segment ref when a specific model entry
-                // was picked, else the plain two-segment profile ref.
-                let base = format!("{}.{}", self.provider_type, self.provider_alias);
-                let dotted = match &self.provider_model_alias {
-                    Some(m) if !m.is_empty() => format!("{base}.{m}"),
-                    _ => base,
-                };
-                SelectorChoice::Existing(dotted)
-            }
+            SelectorMode::Existing => SelectorChoice::Existing(self.existing_model_ref.clone()),
         };
         let risk_profile = match self.risk_mode {
             SelectorMode::Fresh => SelectorChoice::Fresh(self.risk.clone()),
@@ -783,19 +753,14 @@ fn apply_existing_provider_choice(
     snapshot: Option<&QuickstartStateResult>,
     dotted_ref: &str,
 ) {
-    // Accept both `<family>.<alias>` and `<family>.<alias>.<model_alias>`.
-    let mut parts = dotted_ref.splitn(3, '.');
-    let (Some(provider_type), Some(alias)) = (parts.next(), parts.next()) else {
-        return;
-    };
-    let model_alias = parts.next();
-    form.provider_type = provider_type.to_string();
-    form.provider_alias = alias.to_string();
-    form.provider_model_alias = model_alias.map(str::to_string);
+    form.existing_model_ref = dotted_ref.to_owned();
+    form.provider_type.clear();
+    form.provider_alias.clear();
     form.provider_mode = SelectorMode::Existing;
     form.model.clear();
     form.provider_fields.clear();
-    form.apply_provider_runtime_default(provider_runtime_default(snapshot, provider_type));
+    // Configured model names do not encode a provider family.
+    form.apply_provider_runtime_default(provider_runtime_default(snapshot, ""));
 }
 
 /// Modal kinds the pane can put up over the main checklist. Each
@@ -2702,20 +2667,15 @@ fn wrapped_selectable_option_index(options: &[PickerOption], current: usize, del
 }
 
 fn current_provider_picker_cursor(options: &[PickerOption], form: &FormState) -> usize {
-    if form.provider_type.is_empty() {
-        return first_selectable_option_index(options);
-    }
-
-    let target = if form.provider_mode == SelectorMode::Existing && !form.provider_alias.is_empty()
-    {
-        format!("{}.{}", form.provider_type, form.provider_alias)
+    let target = if form.provider_mode == SelectorMode::Existing {
+        &form.existing_model_ref
     } else {
-        form.provider_type.clone()
+        &form.provider_type
     };
 
     options
         .iter()
-        .position(|o| o.value == target && o.is_selectable())
+        .position(|o| o.value == *target && o.is_selectable())
         .unwrap_or_else(|| first_selectable_option_index(options))
 }
 
@@ -2880,7 +2840,7 @@ fn field_form_uses_openai_codex_auth(form: &FieldFormModal) -> bool {
     matches!(form.selector, Selector::ModelProvider)
         && form.type_key.trim().eq_ignore_ascii_case("openai")
         && form.fields.iter().any(|row| {
-            row.descriptor.key == "auth_mode" && row.buf.trim().eq_ignore_ascii_case("codex")
+            row.descriptor.key == "auth.mode" && row.buf.trim().eq_ignore_ascii_case("codex")
         })
 }
 
@@ -2888,7 +2848,7 @@ fn field_form_row_visible(form: &FieldFormModal, index: usize) -> bool {
     let Some(row) = form.fields.get(index) else {
         return false;
     };
-    !(field_form_uses_openai_codex_auth(form) && row.descriptor.key == "api_key")
+    !(field_form_uses_openai_codex_auth(form) && row.descriptor.key == "auth.api_key")
 }
 
 fn visible_field_form_indices(
@@ -3600,8 +3560,10 @@ mod tests {
     #[test]
     fn quickstart_submission_adapter_preserves_provider_webhook_and_agent_name() {
         let mut form = complete_form();
-        form.provider_fields
-            .insert("api_key".into(), "placeholder-provider-credential".into());
+        form.provider_fields.insert(
+            "auth.api_key".into(),
+            "placeholder-provider-credential".into(),
+        );
         form.channels.push(ChannelDraft {
             channel_type: "webhook".into(),
             alias: "incoming".into(),
@@ -3647,7 +3609,7 @@ mod tests {
         );
         assert_eq!(
             rpc_params
-                .pointer("/submission/model_provider/value/fields/api_key")
+                .pointer("/submission/model_provider/value/fields/auth.api_key")
                 .and_then(serde_json::Value::as_str),
             Some("placeholder-provider-credential")
         );
@@ -3788,8 +3750,8 @@ mod tests {
         let options = model_provider_picker_options(Some(&snap), false);
         let labels = selectable_labels(&options);
 
-        assert_eq!(labels[0], "openrouter.default");
-        assert_eq!(labels[1], "openai.gpt5");
+        assert_eq!(labels[0], "openai.gpt5");
+        assert_eq!(labels[1], "openrouter.default");
         assert!(
             labels.contains(&"OpenRouter"),
             "create-new provider rows must remain visible"
@@ -3810,28 +3772,40 @@ mod tests {
 
         let collapsed = model_provider_picker_options(Some(&snap), false);
         let collapsed_labels = selectable_labels(&collapsed);
-        assert!(collapsed_labels.contains(&"  [+ Show 2 more existing providers]"));
+        assert!(collapsed_labels.contains(&"  [+ Show 2 more configured models]"));
         assert!(!collapsed_labels.contains(&"xai.grok"));
 
         let expanded = model_provider_picker_options(Some(&snap), true);
         let expanded_labels = selectable_labels(&expanded);
         assert!(expanded_labels.contains(&"xai.grok"));
-        assert!(expanded_labels.contains(&"  [- Show fewer existing providers]"));
+        assert!(expanded_labels.contains(&"  [- Show fewer configured models]"));
         assert!(expanded_labels.contains(&"OpenRouter"));
     }
 
     #[test]
-    fn existing_local_provider_adoption_uses_daemon_runtime_default() {
-        let snapshot = model_provider_snapshot(vec!["lmstudio.default"]);
+    fn existing_model_adoption_preserves_exact_ref_and_uses_global_runtime_default() {
+        let snapshot = model_provider_snapshot(vec!["chat.fast.us"]);
         let mut form = FormState::default_form();
 
-        apply_existing_provider_choice(&mut form, Some(&snapshot), "lmstudio.default");
+        apply_existing_provider_choice(&mut form, Some(&snapshot), "chat.fast.us");
 
-        assert_eq!(form.provider_type, "lmstudio");
-        assert_eq!(form.provider_alias, "default");
+        assert_eq!(form.existing_model_ref, "chat.fast.us");
+        assert!(form.provider_type.is_empty());
+        assert!(form.provider_alias.is_empty());
         assert_eq!(form.provider_mode, SelectorMode::Existing);
-        assert_eq!(form.runtime, "local_small");
+        assert_eq!(
+            form.runtime,
+            snapshot.default_runtime_profile.clone().unwrap()
+        );
         assert!(form.runtime_auto_defaulted);
+        assert!(
+            matches!(form.to_submission().model_provider, SelectorChoice::Existing(reference) if reference == "chat.fast.us")
+        );
+        apply_existing_provider_choice(&mut form, Some(&snapshot), "main");
+        assert!(form.is_satisfied(Selector::ModelProvider));
+        assert!(
+            matches!(form.to_submission().model_provider, SelectorChoice::Existing(reference) if reference == "main")
+        );
     }
 
     #[test]
@@ -4281,8 +4255,8 @@ mod tests {
             },
             FieldFormRow {
                 descriptor: QuickstartFieldDescriptor {
-                    key: "api_key".into(),
-                    label: "api_key".into(),
+                    key: "auth.api_key".into(),
+                    label: "auth.api_key".into(),
                     help: String::new(),
                     kind: crate::client::QuickstartFieldKind::String,
                     is_secret: true,
@@ -4326,8 +4300,8 @@ mod tests {
                 default: None,
             },
             QuickstartFieldDescriptor {
-                key: "api_key".into(),
-                label: "api_key".into(),
+                key: "auth.api_key".into(),
+                label: "auth.api_key".into(),
                 help: String::new(),
                 kind: crate::client::QuickstartFieldKind::String,
                 is_secret: true,
@@ -4359,7 +4333,7 @@ mod tests {
         let options = vec![
             opt("anthropic", "Anthropic", ""),
             opt("openai", "OpenAI", ""),
-            existing_opt("openai.default".into()),
+            existing_opt("chat.fast.us".into()),
         ];
         let mut form = FormState::default_form();
 
@@ -4367,8 +4341,7 @@ mod tests {
         form.provider_mode = SelectorMode::Fresh;
         assert_eq!(current_provider_picker_cursor(&options, &form), 1);
 
-        form.provider_alias = "default".into();
-        form.provider_mode = SelectorMode::Existing;
+        apply_existing_provider_choice(&mut form, None, "chat.fast.us");
         assert_eq!(current_provider_picker_cursor(&options, &form), 2);
     }
 
@@ -4386,8 +4359,8 @@ mod tests {
                 default: None,
             },
             QuickstartFieldDescriptor {
-                key: "api_key".into(),
-                label: "api_key".into(),
+                key: "auth.api_key".into(),
+                label: "auth.api_key".into(),
                 help: String::new(),
                 kind: crate::client::QuickstartFieldKind::String,
                 is_secret: true,
@@ -4402,7 +4375,7 @@ mod tests {
         form.provider_mode = SelectorMode::Fresh;
         form.model = "gpt-5".into();
         form.provider_fields.insert(
-            "api_key".into(),
+            "auth.api_key".into(),
             "sk-test-value-that-is-long-enough-to-wrap".into(),
         );
 
@@ -4418,7 +4391,7 @@ mod tests {
         assert_eq!(rows[0].buf, "work");
         assert_eq!(rows[1].descriptor.key, "model");
         assert_eq!(rows[1].buf, "gpt-5");
-        assert_eq!(rows[2].descriptor.key, "api_key");
+        assert_eq!(rows[2].descriptor.key, "auth.api_key");
         assert_eq!(rows[2].buf, "sk-test-value-that-is-long-enough-to-wrap");
         assert!(masked_secret(&rows[2].buf).contains("(+"));
     }
@@ -4437,7 +4410,7 @@ mod tests {
                 default: None,
             },
             QuickstartFieldDescriptor {
-                key: "auth_mode".into(),
+                key: "auth.mode".into(),
                 label: "Authentication".into(),
                 help: String::new(),
                 kind: crate::client::QuickstartFieldKind::Enum,
@@ -4447,8 +4420,8 @@ mod tests {
                 default: Some("codex".into()),
             },
             QuickstartFieldDescriptor {
-                key: "api_key".into(),
-                label: "api_key".into(),
+                key: "auth.api_key".into(),
+                label: "auth.api_key".into(),
                 help: String::new(),
                 kind: crate::client::QuickstartFieldKind::String,
                 is_secret: true,
@@ -4470,7 +4443,7 @@ mod tests {
         let keys: Vec<&str> = visible_field_form_indices(&form)
             .map(|index| form.fields[index].descriptor.key.as_str())
             .collect();
-        assert_eq!(keys, vec!["alias", "model", "auth_mode"]);
+        assert_eq!(keys, vec!["alias", "model", "auth.mode"]);
 
         move_field_form_cursor(&mut form, 1);
         assert_eq!(
@@ -4481,13 +4454,13 @@ mod tests {
         let auth_mode = form
             .fields
             .iter_mut()
-            .find(|row| row.descriptor.key == "auth_mode")
+            .find(|row| row.descriptor.key == "auth.mode")
             .expect("auth_mode row");
         auth_mode.buf = "api_key".into();
         let keys: Vec<&str> = visible_field_form_indices(&form)
             .map(|index| form.fields[index].descriptor.key.as_str())
             .collect();
-        assert_eq!(keys, vec!["alias", "model", "auth_mode", "api_key"]);
+        assert_eq!(keys, vec!["alias", "model", "auth.mode", "auth.api_key"]);
     }
 
     #[test]
