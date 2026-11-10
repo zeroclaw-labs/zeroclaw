@@ -113,23 +113,37 @@ impl PrivateStore {
                 .query_map([], |r| Ok((r.get(1)?, r.get(2)?)))?
                 .collect::<std::result::Result<_, _>>()?)
         };
+        type ReplayColumn = (String, String, bool, Option<String>, i64);
+        let replay_schema: Vec<ReplayColumn> = connection
+            .prepare("PRAGMA table_info(seen)")?
+            .query_map([], |r| {
+                Ok((r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        let legacy: [ReplayColumn; 2] = [
+            ("sender".into(), "TEXT".into(), false, None, 1),
+            ("id".into(), "TEXT".into(), false, None, 2),
+        ];
+        let tls_column: ReplayColumn = (
+            "tls_only".into(),
+            "INTEGER".into(),
+            true,
+            Some("0".into()),
+            0,
+        );
+        let classified = replay_schema.len() == 3
+            && replay_schema[..2] == legacy
+            && replay_schema[2] == tls_column;
         if tls_only {
             let objects: Vec<(String,String)> = connection.prepare("SELECT type,name FROM sqlite_master WHERE name NOT LIKE 'sqlite_autoindex_%' ORDER BY name")?
                 .query_map([],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<std::result::Result<_,_>>()?;
+            let mut expected = vec![("table".into(), "seen".into())];
+            if classified {
+                expected.push(("index".into(), "seen_tls_only".into()));
+            }
+            ensure!(objects == expected, "Not an exact TLS-only database");
             ensure!(
-                objects == vec![("table".into(), "seen".into())],
-                "Not an exact TLS-only database"
-            );
-            let schema: Vec<(String, String, bool, i64)> = connection
-                .prepare("PRAGMA table_info(seen)")?
-                .query_map([], |r| Ok((r.get(1)?, r.get(2)?, r.get(3)?, r.get(5)?)))?
-                .collect::<std::result::Result<_, _>>()?;
-            ensure!(
-                schema
-                    == vec![
-                        ("sender".into(), "TEXT".into(), false, 1),
-                        ("id".into(), "TEXT".into(), false, 2)
-                    ],
+                replay_schema == legacy || classified,
                 "Not the known TLS-only replay schema"
             );
         } else {
@@ -141,15 +155,17 @@ impl PrivateStore {
                     ],
                 "Unsupported state schema"
             );
+            // Older encrypted stores accepted the two replay column names/types.
+            // Keep that compatibility while recognizing only the exact new shape.
+            ensure!(
+                classified
+                    || replay_schema
+                        .iter()
+                        .map(|c| (c.0.as_str(), c.1.as_str()))
+                        .eq([("sender", "TEXT"), ("id", "TEXT")]),
+                "Unsupported replay schema"
+            );
         }
-        ensure!(
-            columns("seen")?
-                == vec![
-                    ("sender".into(), "TEXT".into()),
-                    ("id".into(), "TEXT".into())
-                ],
-            "Unsupported replay schema"
-        );
         Ok(Self {
             connection,
             _file: file,

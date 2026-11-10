@@ -32,6 +32,7 @@ use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 use zeroclaw_config::schema::{XmppConfig, XmppProtocol};
 
 const OUTBOUND_TIMEOUT: Duration = Duration::from_secs(60);
+const TLS_SEEN_LIMIT: i64 = 8192;
 
 // XmlStream serializes each borrowed stanza synchronously in start_send.
 // Adapt ownership at that boundary so split I/O does not retain a borrowed stanza.
@@ -312,15 +313,44 @@ impl XmppChannel {
         ensure!(file.metadata()?.is_file(), "Unsafe XMPP state database");
         #[cfg(unix)]
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        let db = Connection::open_with_flags(
+        let mut db = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
         db.busy_timeout(Duration::from_millis(250))?;
-        db.execute_batch(
+        let schema = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        schema.execute_batch(
             "CREATE TABLE IF NOT EXISTS seen(sender TEXT, id TEXT, PRIMARY KEY(sender,id));",
         )?;
+        let classified: bool = schema.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('seen') WHERE name='tls_only')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !classified {
+            // Legacy rows may be encrypted receipts, so only new TLS writes opt into eviction.
+            schema.execute_batch(
+                "ALTER TABLE seen ADD COLUMN tls_only INTEGER NOT NULL DEFAULT 0 CHECK(tls_only IN (0,1));",
+            )?;
+        }
+        schema.execute_batch(
+            "CREATE INDEX IF NOT EXISTS seen_tls_only ON seen(tls_only) WHERE tls_only=1;",
+        )?;
+        schema.commit()?;
         Ok(db)
+    }
+    fn remember_tls_message(db: &Connection, sender: &str, id: &str) -> anyhow::Result<()> {
+        db.execute(
+            "INSERT OR IGNORE INTO seen(sender,id,tls_only) VALUES(?1,?2,1)",
+            params![sender, id],
+        )?;
+        db.execute(
+            "DELETE FROM seen WHERE tls_only=1 AND rowid <= (
+                SELECT rowid FROM seen WHERE tls_only=1 ORDER BY rowid DESC LIMIT 1 OFFSET ?1
+            )",
+            [TLS_SEEN_LIMIT],
+        )?;
+        Ok(())
     }
     fn inbound(&self, message: Message, own: &jid::BareJid) -> Option<ChannelMessage> {
         if !matches!(message.type_, MessageType::Chat | MessageType::Normal) {
@@ -867,11 +897,7 @@ impl XmppChannel {
                             if let Some(db) = &db
                                 && !identity.1.is_empty()
                             {
-                                db.execute(
-                                    "INSERT OR IGNORE INTO seen(sender,id) VALUES(?1,?2)",
-                                    params![identity.0, identity.1],
-                                )?;
-                                db.execute("DELETE FROM seen WHERE rowid NOT IN (SELECT rowid FROM seen ORDER BY rowid DESC LIMIT 8192)",[])?;
+                                Self::remember_tls_message(db, &identity.0, &identity.1)?;
                             }
                         }
                     }
@@ -1633,6 +1659,109 @@ mod tests {
             .unwrap(),
             "fixture-identity"
         );
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tls_cache_eviction_preserves_encrypted_replay_and_reviewed_release() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir_in("/var/tmp")?;
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))?;
+        let channel = adapter(root.path().into());
+        let vault = zeroclaw_config::secrets::SecretStore::new(root.path(), true);
+        vault.encrypt("synthetic initialization")?;
+        let cipher = Arc::new(VaultInboxCipher {
+            store: vault,
+            alias: channel.alias.clone(),
+        });
+        let mut state = crate::xmpp_omemo::channel_state::ChannelState::open_or_initialize(
+            &channel.storage,
+            &channel.config.username,
+            cipher,
+            64000,
+        )?;
+        let peer = "alice@example.test";
+        let id = "old-encrypted";
+        state.stage_admitted_fixture(id, false)?;
+        state.control_returned(peer, id, "queued_cancelled")?;
+        drop(state);
+
+        // Open the legacy encrypted store in TLS-only mode and exceed the cache limit.
+        let db = channel.seen_database()?;
+        db.execute(
+            "WITH RECURSIVE ids(n) AS (VALUES(0) UNION ALL SELECT n+1 FROM ids WHERE n+1 < ?1)
+             INSERT INTO seen(sender,id,tls_only) SELECT ?2,'tls-'||n,1 FROM ids",
+            params![TLS_SEEN_LIMIT, peer],
+        )?;
+        XmppChannel::remember_tls_message(&db, peer, "new-tls")?;
+        let tls_count: i64 =
+            db.query_row("SELECT count(*) FROM seen WHERE tls_only=1", [], |r| {
+                r.get(0)
+            })?;
+        assert_eq!(tls_count, TLS_SEEN_LIMIT);
+        assert!(!db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM seen WHERE sender=?1 AND id='tls-0')",
+            [peer],
+            |r| r.get::<_, bool>(0)
+        )?);
+        drop(db);
+
+        let mut args = vec![
+            "inspect".into(),
+            root.path().to_string_lossy().into_owned(),
+            channel.storage.to_string_lossy().into_owned(),
+            channel.alias.clone(),
+            channel.config.username.clone(),
+            peer.into(),
+            id.into(),
+        ];
+        let review = inbox_admin::run(&args)?;
+        assert_eq!(review["phase"], "returned");
+        args[0] = "release-returned".into();
+        args.extend([
+            review["review_token"].as_str().unwrap().into(),
+            "synthetic reviewed completion".into(),
+        ]);
+        assert_eq!(inbox_admin::run(&args)?["released"], true);
+        let db = channel.seen_database()?;
+        XmppChannel::remember_tls_message(&db, peer, "another-tls")?;
+        assert!(db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM seen WHERE sender=?1 AND id=?2 AND tls_only=0)",
+            params![peer, id],
+            |r| r.get::<_, bool>(0)
+        )?);
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn classified_tls_store_upgrades_to_omemo_without_losing_seen_ids() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir_in("/var/tmp")?;
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))?;
+        let channel = adapter(root.path().into());
+        let db = channel.seen_database()?;
+        XmppChannel::remember_tls_message(&db, "alice@example.test", "tls-first")?;
+        drop(db);
+        let vault = zeroclaw_config::secrets::SecretStore::new(root.path(), true);
+        vault.encrypt("synthetic initialization")?;
+        let cipher = Arc::new(VaultInboxCipher {
+            store: vault,
+            alias: channel.alias.clone(),
+        });
+        let mut state = crate::xmpp_omemo::channel_state::ChannelState::open_or_initialize(
+            &channel.storage,
+            &channel.config.username,
+            cipher,
+            64000,
+        )?;
+        assert!(!state.public_bundle()?.xml.is_empty());
+        drop(state);
+        let db = channel.seen_database()?;
+        assert!(db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM seen WHERE id='tls-first' AND tls_only=1)",
+            [],
+            |r| r.get::<_, bool>(0)
+        )?);
+        Ok(())
     }
     #[tokio::test]
     #[ignore = "requires isolated Prosody accounts and SSL_CERT_FILE with the fixture CA"]

@@ -537,7 +537,7 @@ mod policy_tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
         let db_path = path.join("omemo.sqlite3");
         let db = rusqlite::Connection::open(&db_path)?;
-        db.execute_batch("CREATE TABLE seen(sender TEXT,id TEXT,PRIMARY KEY(sender,id));INSERT INTO seen VALUES('alice@example.test','old-tls-message');")?;
+        db.execute_batch("CREATE TABLE seen(sender TEXT,id TEXT,PRIMARY KEY(sender,id));INSERT INTO seen(sender,id) VALUES('alice@example.test','old-tls-message');")?;
         std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600))?;
         drop(db);
         let mut state = super::ChannelState::open_or_initialize(
@@ -561,7 +561,7 @@ mod policy_tests {
                 b"synthetic control",
             )?;
             tx.execute(
-                "INSERT INTO seen VALUES('alice@example.test',?1)",
+                "INSERT INTO seen(sender,id) VALUES('alice@example.test',?1)",
                 [control],
             )?;
             tx.commit()?;

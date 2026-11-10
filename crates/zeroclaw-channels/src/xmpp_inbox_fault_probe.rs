@@ -446,7 +446,7 @@ pub(super) fn check(f: &Value, fresh: bool, root: &std::path::Path) -> anyhow::R
         "Released without canonical replay marker"
     );
     db.execute(
-        "INSERT INTO seen VALUES('alice@example.test','fault-incoming')",
+        "INSERT INTO seen(sender,id) VALUES('alice@example.test','fault-incoming')",
         [],
     )?;
     ensure!(

@@ -78,8 +78,13 @@ implicitly. Runtime commands such as `/new` and `/stop` use the shared path.
 
 Only direct `chat` and `normal` messages with bodies are admitted. Self echoes,
 groupchat, forwarded envelopes, sent/received carbons and delayed archive
-messages are ignored. A bounded SQLite message-ID cache suppresses replay over
-reconnects. Oversized inbound bodies and unsupported attachments are rejected.
+messages are ignored. SQLite message-ID markers suppress replay over reconnects.
+TLS-only retention evicts only newly classified TLS markers; legacy and OMEMO
+markers are preserved when switching modes so reviewed encrypted receipts
+remain releasable. The TLS listener adds the classification column in place
+without rewriting existing IDs. Use a compatible build for rollback after
+that migration; older builds may only recognize the two-column replay table.
+Oversized inbound bodies and unsupported attachments are rejected.
 Outbound sends are also subject to the live peer policy. A successful send
 means the TLS socket write and local reservation cleanup completed. It does
 not confirm server storage, recipient decryption, delivery or human reading.
