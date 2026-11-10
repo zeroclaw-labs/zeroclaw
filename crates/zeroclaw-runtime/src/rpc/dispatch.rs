@@ -29635,6 +29635,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conversation_cost_uses_authorized_gateway_key_and_refuses_namespace_collisions() {
+        use crate::cost::{TokenUsage, UsageCompleteness};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fixture = conversation_cost_fixture(&tmp);
+        let ctx = &fixture.ctx;
+        let owner = scoped_dispatcher(ctx, 4242).await;
+        let other = scoped_dispatcher(ctx, 4343).await;
+        let backend = ctx.session_backend.as_ref().unwrap();
+        backend
+            .set_session_principal("gw_gateway-only", "user:alice")
+            .unwrap();
+        for (id, amount) in [("gw_gateway-only", 7.0), ("gateway-only", 99.0)] {
+            ctx.cost_tracker
+                .as_ref()
+                .unwrap()
+                .record_observed_usage(
+                    TokenUsage::new("model", 1_000_000, 0, 0, amount, 0.0, 0.0),
+                    UsageCompleteness::Complete,
+                    None,
+                    Some(id.into()),
+                )
+                .unwrap();
+        }
+        for id in ["gateway-only", "gw_gateway-only"] {
+            let summary = owner
+                .handle_session_cost(&json!({"session_id":id}))
+                .await
+                .unwrap();
+            assert_eq!(summary["estimated_cost_usd"], 7.0);
+        }
+        backend
+            .set_session_principal("collision", "user:alice")
+            .unwrap();
+        backend
+            .set_session_principal("rpc_collision", "user:bob")
+            .unwrap();
+        for reader in [&owner, &other] {
+            assert_eq!(
+                reader
+                    .handle_session_cost(&json!({"session_id":"collision"}))
+                    .await
+                    .unwrap_err()
+                    .code,
+                FORBIDDEN
+            );
+        }
+        ctx.acp_session_store
+            .as_ref()
+            .unwrap()
+            .create_session("ambiguous", "test-agent", "/ws", Some("user:alice"))
+            .unwrap();
+        backend
+            .set_session_principal("rpc_ambiguous", "user:alice")
+            .unwrap();
+        assert_eq!(
+            owner
+                .handle_session_cost(&json!({"session_id":"ambiguous"}))
+                .await
+                .unwrap_err()
+                .code,
+            INVALID_PARAMS
+        );
+    }
+
+    #[tokio::test]
     async fn conversation_cost_requires_both_read_grants() {
         use zeroclaw_api::grants::Resource;
         for resource in [Resource::Cost, Resource::Sessions] {
@@ -29664,7 +29729,7 @@ mod tests {
 
     #[tokio::test]
     async fn conversation_cost_frame_rechecks_grants_and_session_after_read() {
-        for revoke in [false, true] {
+        for change in ["revoke", "remove", "replace"] {
             let tmp = tempfile::TempDir::new().unwrap();
             let fixture = conversation_cost_fixture(&tmp);
             let ctx = Arc::clone(&fixture.ctx);
@@ -29682,7 +29747,7 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_secs(10), arrived.notified())
                 .await
                 .unwrap();
-            if revoke {
+            if change == "revoke" {
                 let mut config = ctx.config_authority.snapshot_config();
                 config
                     .permission_profiles
@@ -29694,6 +29759,15 @@ mod tests {
                 ctx.config_authority.publish_for_test(config);
             } else {
                 ctx.sessions.remove("owned").await;
+                if change == "replace" {
+                    scoped_dispatcher(&ctx, 4242)
+                        .await
+                        .handle_session_new_for_test(
+                            &json!({"agent_alias":"test-agent", "session_id":"owned"}),
+                        )
+                        .await
+                        .unwrap();
+                }
             }
             release.notify_one();
             pending.await.unwrap();
