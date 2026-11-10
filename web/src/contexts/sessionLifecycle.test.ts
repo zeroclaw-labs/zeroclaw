@@ -1136,6 +1136,27 @@ test('CAPABILITY_MISSING refuses the request but keeps the running turn', async 
   await unmount(mounted.renderer);
 });
 
+test('approval refusal uses the web catalogue and keeps the turn running', async () => {
+  const { t, tLocale } = await import('../lib/i18n.ts');
+  const runtime = new FakeSessionRuntime();
+  const mounted = await mountChat(runtime, true);
+  await openSocket(runtime, 0);
+  await settle();
+  await act(async () => { mounted.context().sendMessage('hello'); });
+  await act(async () => {
+    runtime.sockets[0]!.emitMessage({
+      type: 'error', code: 'APPROVAL_ACTION_UNAVAILABLE', message: 'untranslated server text',
+    } as WsMessage);
+  });
+  const message = t('agent.approval_action_unavailable');
+  assert.notEqual(message, 'agent.approval_action_unavailable');
+  assert.notEqual(tLocale('agent.approval_action_unavailable', 'fr'), 'agent.approval_action_unavailable');
+  assert.ok(mounted.context().messages.some((item) => item.content.includes(message)));
+  assert.ok(nodeText(mounted.renderer.root).includes(message));
+  assert.equal(mounted.context().typing, true);
+  await unmount(mounted.renderer);
+});
+
 
 function seedLocalTranscript(sessionId: string): void {
   saveChatHistory(sessionId, [
