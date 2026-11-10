@@ -74,6 +74,11 @@ pub enum CoreLink {
 #[derive(Clone, Default)]
 pub struct CoreRpc {
     link: Arc<RwLock<CoreLink>>,
+    /// This generation's in-process connector, once attached. Each
+    /// dashboard chat dials a connection of its own through it.
+    connector: Arc<std::sync::OnceLock<InprocConnector>>,
+    /// What each account holds on the core in this generation.
+    pub(crate) accounts: crate::dashboard_core::Accounts,
 }
 
 impl CoreRpc {
@@ -96,10 +101,17 @@ impl CoreRpc {
         self.link.read().await.clone()
     }
 
+    /// The generation's in-process connector, when this gateway runs inside
+    /// the daemon.
+    pub(crate) fn connector(&self) -> Option<&InprocConnector> {
+        self.connector.get()
+    }
+
     /// Dial the core through `connector`, presenting `options` in every
     /// handshake, and keep the handle current across reconnects until the
     /// generation is cancelled.
     pub fn attach_inproc(&self, connector: InprocConnector, options: ConnectOptions) {
+        let _ = self.connector.set(connector.clone());
         self.attach(Dialer::Inproc(connector), options, CancellationToken::new());
     }
 
@@ -920,6 +932,31 @@ mod tests {
             assert!(
                 accepted.try_recv().is_err(),
                 "a stopped loop never dials again"
+            );
+        }
+    }
+
+    /// The client crate keeps its own copy of the daemon's endpoint
+    /// derivation so it need not link the runtime. This crate links both,
+    /// so it is where the two copies are held to the same answer.
+    #[test]
+    fn the_client_resolves_the_endpoint_the_daemon_listens_on() {
+        assert_eq!(zeroclaw_rpc_client::endpoint::SOCKET_ENV, "ZEROCLAW_SOCKET");
+        let tmp = tempfile::tempdir().expect("temp dir");
+        for data_dir in [
+            tmp.path().join("data"),
+            tmp.path().join("data dir with spaces"),
+            tmp.path().join("données-数据"),
+        ] {
+            let config = zeroclaw_config::schema::Config {
+                data_dir: data_dir.clone(),
+                ..Default::default()
+            };
+            assert_eq!(
+                zeroclaw_rpc_client::endpoint::resolve_socket_path(&data_dir),
+                zeroclaw_runtime::rpc::local::socket_path(&config),
+                "{}",
+                data_dir.display()
             );
         }
     }

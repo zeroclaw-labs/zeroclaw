@@ -16,7 +16,7 @@ use zeroclaw_api::jsonrpc::{
     JSONRPC_VERSION, JsonRpcError, JsonRpcFrame, JsonRpcResponse, RpcOutbound,
 };
 use zeroclaw_rpc_proto::types::{InitializeParams, InitializeResult};
-use zeroclaw_rpc_proto::{Method, RPC_PROTOCOL_VERSION};
+use zeroclaw_rpc_proto::{MAX_FRAME_BYTES, Method, RPC_PROTOCOL_VERSION};
 
 /// How long the `initialize` round trip may take before the dial fails.
 pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -30,8 +30,6 @@ const WRITER_QUEUE_DEPTH: usize = 64;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 /// Notifications retained for a slow subscriber before it observes a lag.
 const NOTIFICATION_CAPACITY: usize = 256;
-/// Largest frame accepted from the daemon. Mirrors the daemon's inbound cap.
-const MAX_FRAME_BYTES: u64 = 8 * 1024 * 1024;
 /// Server-initiated requests held for the application. Beyond this the
 /// client answers each new one with [`INBOUND_REQUEST_REJECTED`] instead of
 /// holding it, so a peer that floods requests nobody consumes cannot grow
@@ -461,7 +459,7 @@ impl RpcClient {
         let response = tokio::time::timeout(handshake_timeout, async {
             tokio::select! {
                 biased;
-                result = rpc.request(Method::Initialize.wire_name(), params) => Some(result),
+                result = rpc.request_bounded(Method::Initialize.wire_name(), params, MAX_FRAME_BYTES) => Some(result),
                 () = rpc.closed() => None,
             }
         })
@@ -549,7 +547,7 @@ impl RpcClient {
         let outcome = tokio::time::timeout(timeout, async {
             tokio::select! {
                 biased;
-                result = self.rpc.request(method, params) => Some(result),
+                result = self.rpc.request_bounded(method, params, MAX_FRAME_BYTES) => Some(result),
                 () = self.rpc.closed() => None,
             }
         })
@@ -971,6 +969,35 @@ mod tests {
             .expect("status");
         assert_eq!(status["active_sessions"], json!(0));
         assert_eq!(client.state(), ConnectionState::Connected);
+    }
+
+    /// The client refuses a request whose encoded frame would exceed the
+    /// shared frame limit before writing it, and the connection stays usable.
+    #[tokio::test]
+    async fn an_oversized_request_is_refused_before_it_is_written() {
+        let (client_half, server_half) = tokio::io::duplex(64 * 1024);
+        let _seen = fake_daemon(server_half, None);
+        let client = RpcClient::connect_over(client_half, ConnectOptions::default())
+            .await
+            .expect("handshake");
+        let blob = "x".repeat(usize::try_from(MAX_FRAME_BYTES).expect("limit fits in usize"));
+        let refused = client
+            .request(Method::Status, json!({ "blob": blob }))
+            .await
+            .expect_err("an oversized frame is refused");
+        let ClientError::Rpc(error) = refused else {
+            panic!("expected an RPC error, got {refused:?}");
+        };
+        assert_eq!(
+            error.code,
+            zeroclaw_api::jsonrpc::error_codes::INVALID_PARAMS
+        );
+        assert_eq!(error.data.expect("error data")["reason"], "frame_too_large");
+        let status = client
+            .request(Method::Status, json!({}))
+            .await
+            .expect("the connection is still usable");
+        assert_eq!(status["active_sessions"], json!(0));
     }
 
     #[tokio::test]

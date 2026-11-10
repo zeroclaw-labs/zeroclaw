@@ -18,6 +18,12 @@
 //!
 //! In-process connections are counted separately from socket clients, so an
 //! `--ephemeral` daemon still exits when its last real client leaves.
+//!
+//! The socket listener's connection limits deliberately do not apply here:
+//! there is no initialize deadline and no connection cap, because the only
+//! peer is this process's own gateway code. A caller of
+//! [`InprocConnector::connect`] that opens connections on behalf of remote
+//! users must bound them itself before it dials.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -356,8 +362,29 @@ impl InprocConnector {
     }
 
     /// Open one in-process connection and return the client's half. `None`
-    /// when the generation is cancelled before a context is bound.
+    /// when admission is sealed or the generation is cancelled.
     pub async fn connect(&self) -> Option<DuplexStream> {
+        self.connect_with(None).await.map(|(stream, _)| stream)
+    }
+
+    /// [`Self::connect`] for a connection whose bearer is bound to one OIDC
+    /// provider and to the principal that signed in. Every
+    /// `initialize` on it is verified against that binding, so a provider
+    /// repointed or removed since then never receives the bearer and a different
+    /// principal cannot register or resume a TUI. With the
+    /// client's half comes [`Served`], which resolves once the daemon's task
+    /// for the connection has ended.
+    pub async fn connect_bound(
+        &self,
+        binding: OidcSessionBinding,
+    ) -> Option<(DuplexStream, Served)> {
+        self.connect_with(Some(binding)).await
+    }
+
+    async fn connect_with(
+        &self,
+        binding: Option<OidcSessionBinding>,
+    ) -> Option<(DuplexStream, Served)> {
         let ctx = {
             let mut rx = self.inner.ctx.subscribe();
             loop {
@@ -405,14 +432,52 @@ impl InprocConnector {
         let (client_half, server_half) = tokio::io::duplex(DUPLEX_BUFFER_BYTES);
         let conn_cancel = self.inner.cancel.child_token();
         let activity = super::ConnectionActivity::new(Arc::clone(&self.inner.connections));
+        let ended = CancellationToken::new();
         // Reap the connections that already ended so the set only holds live
         // tasks; `JoinSet` keeps finished entries until polled.
         while registry.tasks.try_join_next().is_some() {}
-        registry
-            .tasks
-            .spawn(serve(ctx, server_half, conn_cancel, activity));
+        registry.tasks.spawn(serve(
+            ctx,
+            server_half,
+            conn_cancel,
+            activity,
+            binding,
+            ended.clone().drop_guard(),
+        ));
         drop(registry);
-        Some(client_half)
+        Some((client_half, Served(ended)))
+    }
+}
+
+/// The provider and principal established when the dashboard accepted the bearer.
+#[derive(Clone)]
+pub struct OidcSessionBinding {
+    pub provider: super::auth::OidcBinding,
+    pub principal_id: zeroclaw_api::principal::PrincipalId,
+}
+
+/// Resolves once the daemon's task for one in-process connection has ended,
+/// or was aborted at drain. A client that gives up on the connection, or
+/// drops its half, does not end that task: an `initialize` still verifying a
+/// bearer runs to completion first. Prompt tasks the connection started hold
+/// their own share of the activity count and can outlive the task in a forced
+/// teardown; the generation's drain waits for those separately.
+#[derive(Clone)]
+#[must_use]
+pub struct Served(CancellationToken);
+
+impl Served {
+    /// Wait until the daemon's task for the connection has ended.
+    pub async fn wait(&self) {
+        // Cancelled only by the connection task's drop guard, when the task
+        // ends or is aborted.
+        self.0.cancelled().await;
+    }
+}
+
+impl std::fmt::Debug for Served {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Served")
     }
 }
 
@@ -425,14 +490,18 @@ async fn serve(
     stream: DuplexStream,
     conn_cancel: CancellationToken,
     activity: super::ConnectionActivity,
+    binding: Option<OidcSessionBinding>,
+    ended: tokio_util::sync::DropGuard,
 ) {
     // Admitted under the lock but cancelled before this task ran: do not
     // start a dispatcher for a generation that is already retiring. The
     // activity token drops here, so the drain sees this task end.
     if conn_cancel.is_cancelled() {
+        drop(activity);
+        drop(ended);
         return;
     }
-    let _count_guard = activity.clone();
+    let count_guard = activity.clone();
     let mut transport = InprocTransport::new(stream, conn_cancel.clone());
     let writer_tx = transport.writer();
     let mut dispatcher = RpcDispatcher::new_with_cancel_and_channel_access(
@@ -444,7 +513,8 @@ async fn serve(
         None,
     )
     .with_connection_activity(activity)
-    .with_transport(transport.kind(), transport.credential());
+    .with_transport(transport.kind(), transport.credential())
+    .with_auth_binding(binding);
     tokio::select! {
         () = dispatcher.run(&mut transport) => {}
         () = conn_cancel.cancelled() => {}
@@ -453,6 +523,11 @@ async fn serve(
     if let Some((tui_id, tui_epoch)) = dispatcher.tui_registration() {
         ctx.tui_registry.unregister(tui_id, tui_epoch);
     }
+    // The task's own share of the activity count is released before `Served` resolves.
+    drop(dispatcher);
+    drop(transport);
+    drop(count_guard);
+    drop(ended);
 }
 
 #[cfg(test)]
@@ -625,6 +700,262 @@ mod tests {
 
         cancel.cancel();
         drop(writer);
+    }
+
+    /// A mock identity provider that verifies `corp-at` for `alice` in the
+    /// `ops` group, by introspection.
+    async fn introspecting_idp() -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": issuer,
+                "introspection_endpoint": format!("{issuer}/introspect"),
+            })))
+            .mount(&server)
+            .await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        Mock::given(method("POST"))
+            .and(path("/introspect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "active": true,
+                "token_type": "Bearer",
+                "client_id": "daemon-client",
+                "iss": issuer,
+                "sub": "alice",
+                "aud": "zeroclaw",
+                "exp": now + 600,
+                "groups": ["ops"],
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn oidc_entry(issuer: &str) -> zeroclaw_config::schema::OidcConfig {
+        zeroclaw_config::schema::OidcConfig {
+            issuer: issuer.to_string(),
+            audience: "zeroclaw".into(),
+            client_id: "daemon".into(),
+            client_secret: Some("s3cret".into()),
+            validation: zeroclaw_config::schema::OidcValidation::Introspection,
+            claim_path: "groups".into(),
+            profile_map: std::collections::HashMap::from([("ops".into(), "operator".into())]),
+            interactive_clients: vec!["daemon-client".into()],
+            ..zeroclaw_config::schema::OidcConfig::default()
+        }
+    }
+
+    fn alice_binding(provider: crate::rpc::auth::OidcBinding) -> OidcSessionBinding {
+        OidcSessionBinding {
+            principal_id: zeroclaw_api::principal::PrincipalId::for_oidc(&provider.issuer, "alice"),
+            provider,
+        }
+    }
+
+    async fn introspections(server: &wiremock::MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|request| request.url.path() == "/introspect")
+            .count()
+    }
+
+    /// A connection bound to one OIDC provider, as it was configured when its
+    /// bearer was issued, presents the bearer only to that provider: once the
+    /// provider by that name names another issuer, `initialize` is refused
+    /// before the bearer is sent anywhere.
+    #[tokio::test]
+    async fn a_bound_duplex_never_sends_its_bearer_to_a_repointed_provider() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The bearer came from `issued`; the policy now points `corp` at
+        // `other`, which would accept it.
+        let (issued, other) = (introspecting_idp().await, introspecting_idp().await);
+        let mut config = base_config(tmp.path());
+        config.permission_profiles.insert(
+            "operator".into(),
+            PermissionProfileConfig {
+                grants: std::collections::HashMap::from([(Resource::Sessions, vec![Verb::Read])]),
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.oidc.insert("corp".into(), oidc_entry(&other.uri()));
+        let now_bound = crate::rpc::auth::OidcBinding::of(&config.oidc["corp"]);
+        let issued_bound = crate::rpc::auth::OidcBinding::of(&oidc_entry(&issued.uri()));
+        let ctx = with_tui_signing(ctx_for(config), tmp.path());
+        let cancel = CancellationToken::new();
+        let connector = InprocConnector::new(cancel.clone());
+        connector.bind(Arc::clone(&ctx));
+        let params = InitializeParams {
+            auth_token: Some("corp-at".to_string()),
+            auth_provider: Some("oidc.corp".to_string()),
+            ..initialize_params()
+        };
+
+        let (stream, _) = connector
+            .connect_bound(alice_binding(issued_bound))
+            .await
+            .expect("bound connector connects");
+        let (read_half, mut writer) = tokio::io::split(stream);
+        let mut reader = BufReader::new(read_half);
+        writer
+            .write_all(rpc_request(Method::Initialize, &params, 1).as_bytes())
+            .await
+            .unwrap();
+        let frame = read_frame(&mut reader).await;
+        assert_eq!(
+            frame["error"]["code"],
+            zeroclaw_api::jsonrpc::error_codes::AUTH_REQUIRED,
+            "a bearer bound to another provider is refused: {frame}"
+        );
+        assert_eq!(
+            introspections(&other).await,
+            0,
+            "the repointed provider got it"
+        );
+        assert_eq!(introspections(&issued).await, 0, "nothing was sent at all");
+        drop(writer);
+
+        // Bound to the provider as it is now, the same bearer verifies.
+        let (stream, _) = connector
+            .connect_bound(alice_binding(now_bound.clone()))
+            .await
+            .expect("bound connector connects");
+        let (read_half, mut writer) = tokio::io::split(stream);
+        let mut reader = BufReader::new(read_half);
+        writer
+            .write_all(rpc_request(Method::Initialize, &params, 1).as_bytes())
+            .await
+            .unwrap();
+        let frame = read_frame(&mut reader).await;
+        assert!(frame["error"].is_null(), "unexpected RPC error: {frame}");
+        assert_eq!(introspections(&other).await, 1);
+
+        // Even a valid TUI signature cannot move the original registration
+        // to a connection bound to another principal.
+        let initialized: InitializeResult =
+            serde_json::from_value(frame["result"].clone()).unwrap();
+        let resume = InitializeParams {
+            tui_id: initialized.tui_id,
+            tui_sig: initialized.tui_sig,
+            ..params
+        };
+        let other_account = OidcSessionBinding {
+            principal_id: zeroclaw_api::principal::PrincipalId::for_oidc(&other.uri(), "bob"),
+            provider: now_bound,
+        };
+        let (impostor, served) = connector.connect_bound(other_account).await.unwrap();
+        let (read_half, mut attempt) = tokio::io::split(impostor);
+        let mut replies = BufReader::new(read_half);
+        attempt
+            .write_all(rpc_request(Method::Initialize, &resume, 2).as_bytes())
+            .await
+            .unwrap();
+        let denied = read_frame(&mut replies).await;
+        assert_eq!(
+            denied["error"]["code"],
+            zeroclaw_api::jsonrpc::error_codes::AUTH_REQUIRED
+        );
+        drop(attempt);
+        drop(replies);
+        served.wait().await;
+        assert!(
+            ctx.tui_registry
+                .list()
+                .iter()
+                .any(|entry| Some(&entry.tui_id) == resume.tui_id.as_ref()),
+            "a refused reconnect must leave the original registration live"
+        );
+        cancel.cancel();
+        drop(writer);
+    }
+
+    /// A client that gives up on a bound connection while its bearer is
+    /// still being verified does not end the daemon's work on it: `Served`
+    /// resolves only once the verification is over and the connection is no
+    /// longer counted.
+    #[tokio::test]
+    async fn a_bound_connection_is_served_until_the_daemon_is_done_with_it() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let tmp = tempfile::tempdir().unwrap();
+        let idp = introspecting_idp().await;
+        let verifying_for = Duration::from_millis(1500);
+        Mock::given(method("POST"))
+            .and(path("/introspect"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "active": false }))
+                    .set_delay(verifying_for),
+            )
+            .with_priority(1)
+            .mount(&idp)
+            .await;
+        let mut config = base_config(tmp.path());
+        config.permission_profiles.insert(
+            "operator".into(),
+            PermissionProfileConfig {
+                grants: std::collections::HashMap::from([(Resource::Sessions, vec![Verb::Read])]),
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.oidc.insert("corp".into(), oidc_entry(&idp.uri()));
+        let binding = crate::rpc::auth::OidcBinding::of(&config.oidc["corp"]);
+        let ctx = with_tui_signing(ctx_for(config), tmp.path());
+        let cancel = CancellationToken::new();
+        let connector = InprocConnector::new(cancel.clone());
+        connector.bind(ctx);
+        let params = InitializeParams {
+            auth_token: Some("corp-at".to_string()),
+            auth_provider: Some("oidc.corp".to_string()),
+            ..initialize_params()
+        };
+
+        let (stream, served) = connector
+            .connect_bound(alice_binding(binding))
+            .await
+            .expect("bound connector connects");
+        let started = std::time::Instant::now();
+        let (_, mut writer) = tokio::io::split(stream);
+        writer
+            .write_all(rpc_request(Method::Initialize, &params, 1).as_bytes())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while introspections(&idp).await == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the daemon starts verifying the bearer");
+        // The client gives up on the connection.
+        drop(writer);
+
+        let mut served = std::pin::pin!(served.wait());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut served)
+                .await
+                .is_err(),
+            "served while the bearer was still being verified"
+        );
+        tokio::time::timeout(Duration::from_secs(10), &mut served)
+            .await
+            .expect("served once the verification is over");
+        assert!(
+            started.elapsed() >= verifying_for,
+            "served after {:?}",
+            started.elapsed()
+        );
+        assert_eq!(connector.connection_count(), 0, "nothing of it is counted");
+        cancel.cancel();
     }
 
     /// The duplex is a non-local caller, so the remote identity fence applies
@@ -811,6 +1142,41 @@ mod tests {
         );
     }
 
+    /// Closing admission refuses a connect already parked at the admission
+    /// boundary even though the generation is not cancelled yet: the seal
+    /// check inside the critical section holds `close_admission`'s contract
+    /// on its own, not only the cancellation check behind it.
+    #[tokio::test]
+    async fn connect_paused_at_admission_is_refused_once_admission_is_closed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = ctx_for(base_config(tmp.path()));
+        let cancel = CancellationToken::new();
+        let (gate_tx, gate_rx) = watch::channel(false);
+        let connector = InprocConnector::with_admission_gate(cancel.clone(), gate_rx);
+        connector.bind(ctx);
+        let parked = connector.clone();
+        let pending = zeroclaw_spawn::spawn!(async move { parked.connect().await.is_some() });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(connector.registered_tasks(), 0);
+
+        connector.close_admission();
+        assert!(!cancel.is_cancelled());
+        gate_tx.send(true).unwrap();
+        let admitted = tokio::time::timeout(Duration::from_secs(2), pending)
+            .await
+            .expect("parked connect finishes")
+            .expect("connect task");
+        assert!(
+            !admitted,
+            "a connect that reaches admission after close_admission must be refused"
+        );
+        assert_eq!(connector.connection_count(), 0);
+        assert_eq!(connector.registered_tasks(), 0);
+        cancel.cancel();
+    }
+
     /// Many connects racing retirement: each one either belongs to the drain
     /// (its connection is joined, the client sees EOF) or is refused; none
     /// leaves activity or a task behind once the drain has returned.
@@ -918,17 +1284,84 @@ mod tests {
     /// generation is sealed, even before its token is cancelled.
     #[tokio::test]
     async fn connect_waiting_for_bind_gives_up_when_sealed() {
-        let connector = InprocConnector::new(CancellationToken::new());
+        use std::future::{Future, poll_fn};
+
+        let cancel = CancellationToken::new();
+        let connector = InprocConnector::new(cancel.clone());
         let waiter = connector.clone();
-        let pending = zeroclaw_spawn::spawn!(async move { waiter.connect().await.is_some() });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!pending.is_finished(), "connect waits for a bound context");
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+        let pending = zeroclaw_spawn::spawn!(async move {
+            let mut connect = std::pin::pin!(waiter.connect());
+            let mut parked_tx = Some(parked_tx);
+            poll_fn(|cx| {
+                let result = connect.as_mut().poll(cx);
+                if result.is_pending()
+                    && let Some(parked_tx) = parked_tx.take()
+                {
+                    parked_tx.send(()).expect("test waits for a pending poll");
+                }
+                result
+            })
+            .await
+            .is_some()
+        });
+        // Confirm the task has registered its waker before sealing. Await its
+        // handle below so the test cannot repoll connect and hide a missed wake.
+        tokio::time::timeout(Duration::from_secs(2), parked_rx)
+            .await
+            .expect("connect reaches its bind wait")
+            .expect("connect must wait for a bound context");
         connector.close_admission();
         let connected = tokio::time::timeout(Duration::from_secs(2), pending)
             .await
             .expect("waiter ends on seal")
             .expect("waiter task did not panic");
         assert!(!connected);
+        assert!(!cancel.is_cancelled(), "sealing alone wakes the waiter");
+    }
+
+    /// Drain must release the context even when the caller has not closed
+    /// admission first and another owner retains a connector clone.
+    #[tokio::test]
+    async fn draining_alone_releases_the_bound_context() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = ctx_for(base_config(tmp.path()));
+        let weak = Arc::downgrade(&ctx);
+        let cancel = CancellationToken::new();
+        let connector = InprocConnector::new(cancel.clone());
+        let surviving_clone = connector.clone();
+        connector.bind(ctx);
+        assert!(weak.upgrade().is_some(), "the connector holds the context");
+
+        let aborted = tokio::time::timeout(Duration::from_secs(2), connector.drain())
+            .await
+            .expect("an idle connector drains without cancellation");
+        assert_eq!(aborted, 0);
+        assert!(!surviving_clone.is_bound(), "draining unbinds every clone");
+        assert!(
+            weak.upgrade().is_none(),
+            "drain alone must release the generation's context"
+        );
+
+        let rebound = ctx_for(base_config(tmp.path()));
+        let rebound_weak = Arc::downgrade(&rebound);
+        surviving_clone.bind(rebound);
+        assert!(
+            !surviving_clone.is_bound(),
+            "a drained connector stays unbound"
+        );
+        assert!(rebound_weak.upgrade().is_none());
+        let late = tokio::time::timeout(Duration::from_secs(2), surviving_clone.connect())
+            .await
+            .expect("a drained connector answers without waiting for cancel");
+        assert!(
+            late.is_none(),
+            "a drained connector hands out no connection"
+        );
+        assert!(
+            !cancel.is_cancelled(),
+            "none of this relied on cancellation"
+        );
     }
 
     /// A config with one agent, so a session can be opened over the duplex.

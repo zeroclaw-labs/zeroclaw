@@ -26,6 +26,10 @@ pub mod types;
 
 pub use method::{Method, MethodContract, Shape};
 
+/// Maximum NDJSON frame size, including the terminating newline, for the
+/// daemon's local and in-process transports and their clients.
+pub const MAX_FRAME_BYTES: u64 = 8 * 1024 * 1024;
+
 /// JSON-RPC error codes returned by the daemon.
 ///
 /// The constants live in `zeroclaw-api` next to the envelope types; this

@@ -48,7 +48,7 @@ The wire contract of the daemon RPC: the `Method` enum with its single wire-name
 
 ### `zeroclaw-rpc-client`
 
-The client half of the daemon RPC: dials the local socket, a named pipe or any byte stream, runs the `initialize` handshake, multiplexes requests, notifications and server-initiated requests, and backs off between reconnects. Depends on `zeroclaw-api` and `zeroclaw-rpc-proto` plus tokio, never on the runtime. The supervised gateway dials the daemon's in-process duplex (`zeroclaw_runtime::rpc::inproc`) with it; that duplex is its own transport class and refuses any `initialize` without an explicit credential, so the seam stays idle until the gateway has a credential to present. It is the seam the gateway split migrates routes through; the standalone `zeroclaw gateway` dials the daemon socket with it for plugin webhook forwarding on Unix.
+The client half of the daemon RPC: dials the local socket, a named pipe or any byte stream, runs the `initialize` handshake, multiplexes requests, notifications and server-initiated requests, and backs off between reconnects. Depends on `zeroclaw-api` and `zeroclaw-rpc-proto` plus tokio, never on the runtime. The supervised gateway dials the daemon's in-process duplex (`zeroclaw_runtime::rpc::inproc`) with it; that duplex is its own transport class and refuses any `initialize` without an explicit credential, so the seam stays idle until the gateway has a credential to present. It is the seam the gateway split migrates routes through; a separate gateway process later dials the socket with the same client.
 
 ## Layer: Edge
 

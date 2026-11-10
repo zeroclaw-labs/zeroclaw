@@ -43,6 +43,8 @@ export type AuthFailureReason =
   | 'session_expired'
   | 'session_invalid'
   | 'operator_required'
+  | 'not_permitted'
+  | 'agent_not_allowed'
   | 'csrf'
   | 'origin';
 
@@ -50,9 +52,18 @@ const FAILURE_REASONS: readonly AuthFailureReason[] = [
   'session_expired',
   'session_invalid',
   'operator_required',
+  'not_permitted',
+  'agent_not_allowed',
   'csrf',
   'origin',
 ];
+
+/** 403 reasons that mean "this account may not do that", shown as not available. */
+export const NOT_AVAILABLE_REASONS: ReadonlySet<AuthFailureReason> = new Set([
+  'operator_required',
+  'not_permitted',
+  'agent_not_allowed',
+]);
 
 /** Name of the BroadcastChannel sign-in, re-auth and sign-out talk on. */
 export const AUTH_CHANNEL = 'zeroclaw-auth';
@@ -140,6 +151,7 @@ export function parseOidcSession(value: unknown): OidcSession | null {
     features: {
       chat: flags.chat === true,
       operator_pages: flags.operator_pages === true,
+      core_sessions: flags.core_sessions === true,
       config: flags.config === true,
     },
   };

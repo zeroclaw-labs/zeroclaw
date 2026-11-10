@@ -819,6 +819,11 @@ pub async fn run_with_authority(
         )?,
     );
 
+    // In-process RPC seam for the supervised gateway. Created before the
+    // gateway starts and bound once this generation's RPC context exists;
+    // the gateway's connect waits for that bind.
+    let inproc_connector = crate::rpc::inproc::InprocConnector::new(channels_cancel.child_token());
+
     // THE certificate audit logger for this daemon iteration. Built once
     // here and shared through RpcContext so enrollment, in-band renewal
     // and the issued-cert ledger all append through a single Merkle-chain
