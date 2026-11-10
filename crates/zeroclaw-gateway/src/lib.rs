@@ -13,6 +13,7 @@ pub mod api_browse;
 pub mod api_config;
 pub mod api_logs;
 pub mod api_oidc;
+mod api_oidc_enroll;
 pub mod api_pairing;
 pub mod api_personality;
 pub mod api_plugins;
@@ -1362,14 +1363,16 @@ pub async fn run_gateway_with_plugin_webhooks(
             "a supervised gateway resolves plugin webhooks in process and must not forward them to a daemon"
         );
     }
-    let (shared_pairing, shared_inbound_auth, shared_config) = match daemon_authority {
-        Some(authority) => (
-            Some(authority.pairing),
-            Some(authority.inbound_auth),
-            Some(authority.config),
-        ),
-        None => (None, None, None),
-    };
+    let (shared_pairing, shared_inbound_auth, shared_config, shared_cert_audit) =
+        match daemon_authority {
+            Some(authority) => (
+                Some(authority.pairing),
+                Some(authority.inbound_auth),
+                Some(authority.config),
+                authority.cert_audit,
+            ),
+            None => (None, None, None, None),
+        };
 
     // The in-process RPC seam: dial the daemon's dispatcher when a
     // supervised run provides its connector, and hand the handle to every
@@ -2496,6 +2499,7 @@ pub async fn run_gateway_with_plugin_webhooks(
             &state.config,
         )))
         .merge(api_oidc::routes())
+        .merge(api_oidc_enroll::routes(Arc::clone(&inbound_auth), shared_cert_audit))
         // ── Admin routes (for CLI management) ──
         .route("/admin/shutdown", post(handle_admin_shutdown))
         .route("/admin/reload", post(handle_admin_reload))
