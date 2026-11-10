@@ -190,7 +190,7 @@ impl GatewayInboundAuth {
     /// in one persist order. A writer that was slower to publish can never
     /// reinstall policy a later persist superseded: a revision that is not
     /// newer than the accepted one is refused as a no-op.
-    fn publish_persisted(&self, persisted: &Config) -> anyhow::Result<u64> {
+    pub(crate) fn publish_persisted(&self, persisted: &Config) -> anyhow::Result<u64> {
         let revision = self.inner.accepted_revision().saturating_add(1);
         self.inner.publish_accepted(persisted, revision)
     }
@@ -246,6 +246,12 @@ impl GatewayInboundAuth {
         self.inner
             .authenticate_bound(TransportKind::Wss, token, provider, binding)
             .await
+    }
+
+    /// Hold the accepted policy through a synchronous certificate issuance,
+    /// so a concurrent provider/profile revocation cannot race the effect.
+    pub(crate) fn hold_authority(&self) -> zeroclaw_runtime::rpc::auth::AuthorityLease<'_> {
+        self.inner.hold_authority()
     }
 
     /// Verify a native pairing bearer (the pre-existing gateway

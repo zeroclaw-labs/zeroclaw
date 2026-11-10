@@ -267,6 +267,7 @@ struct ConnEdit {
 
 impl ZerocodePane {
     pub(crate) fn new(config_dir: &Path) -> Self {
+        let warning_mark = config::migration_warning_mark();
         let themes: Vec<String> = theme::theme_names().map(str::to_string).collect();
         let presets: Vec<String> = config::keybindings::preset_names()
             .map(str::to_string)
@@ -314,7 +315,10 @@ impl ZerocodePane {
                 .ok()
                 .and_then(|c| c.resolve_locale()),
             pending_fetch: None,
-            status: None,
+            // A skipped keybinding migration during these loads is otherwise
+            // invisible: startup already drained its notice queue, and stderr
+            // is behind the alternate screen.
+            status: config::take_migration_warning_since(warning_mark),
             list_error: None,
             last_area: Rect::default(),
             focus_area: Rect::default(),
@@ -322,7 +326,7 @@ impl ZerocodePane {
             double_click: crate::mouse::DoubleClickTracker::new(),
             conn: config::ensure_and_load(config_dir)
                 .ok()
-                .map(|c| c.connection.wss)
+                .map(|c| c.connection.wss_for(None))
                 .unwrap_or_default(),
             conn_cursor: 0,
             conn_edit: None,
@@ -1397,9 +1401,25 @@ impl ZerocodePane {
             self.set_ui_save_error(&error);
             return;
         }
-        self.conn = candidate;
+        let warning_mark = config::migration_warning_mark();
+        self.conn = if field == ConnField::Uri {
+            // The selected URL owns its credentials and TLS choices. Do not
+            // keep the previous URL's editable projection after switching it.
+            match config::load_persisted(&self.config_dir) {
+                Ok(config) => config.connection.wss_for(None),
+                Err(error) => {
+                    self.set_ui_save_error(&error);
+                    return;
+                }
+            }
+        } else {
+            candidate
+        };
         self.conn_edit = None;
-        self.status = Some(crate::i18n::t("zc-zerocode-conn-saved"));
+        self.status = Some(
+            config::take_migration_warning_since(warning_mark)
+                .unwrap_or_else(|| crate::i18n::t("zc-zerocode-conn-saved")),
+        );
     }
 
     fn handle_conn_edit_key(&mut self, key: KeyEvent) {
@@ -1514,6 +1534,7 @@ impl ZerocodePane {
         }
         // Verify against the persisted file (not the env-overridden view) so
         // the success status reflects what was actually written to disk.
+        let warning_mark = config::migration_warning_mark();
         match config::load_persisted(&self.config_dir) {
             Ok(loaded) => {
                 let persisted_resolved = loaded.resolve_todo_tracker();
@@ -1539,7 +1560,10 @@ impl ZerocodePane {
                     Ok(_) => "zc-zerocode-tracker-saved",
                     Err(_) => "zc-zerocode-tracker-saved-resolve-error",
                 };
-                self.status = Some(crate::i18n::t(key));
+                self.status = Some(
+                    config::take_migration_warning_since(warning_mark)
+                        .unwrap_or_else(|| crate::i18n::t(key)),
+                );
             }
             Err(error) => self.set_ui_save_error(&error),
         }
@@ -2086,6 +2110,73 @@ mod tests {
             .unwrap();
         assert_eq!(row.label, "Renommer le fournisseur");
         assert!(!row.chords.is_empty());
+    }
+
+    /// The config pane loads after startup has already drained its notice
+    /// queue. A skipped keybinding migration must still reach the pane status,
+    /// because stderr is behind the alternate screen.
+    #[test]
+    fn skipped_migration_is_shown_when_the_pane_opens() {
+        const CHILD: &str = "ZEROCODE_PANE_MIGRATION_WARNING_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                crate::config::config_path(dir.path()),
+                "locale = \"fr\"\n\n[keybindings]\n\"input_bar.clear_input\" = \"ctrl+u\"\n",
+            )
+            .unwrap();
+            let catalogue = dir.path().join("data/ftl/fr");
+            std::fs::create_dir_all(&catalogue).unwrap();
+            std::fs::write(
+                catalogue.join("zerocode.ftl"),
+                "zc-config-migration-lock-skipped = PANE-MIGRATION-MARKER { $path }\nzc-config-lock-not-regular = PANE-LOCK-MARKER { $path }\n",
+            )
+            .unwrap();
+            std::fs::create_dir(dir.path().join(".zerocode-config.lock")).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "zerocode_pane::tests::skipped_migration_is_shown_when_the_pane_opens",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("ZEROCODE_PANE_MIGRATION_DIR", dir.path())
+                .env_remove("ZEROCLAW_CONFIG_DIR")
+                .env_remove("ZEROCODE_LOCALE_DIR")
+                .env_remove("ZEROCODE_locale")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "child failed: {stderr}\n{stdout}");
+            assert!(
+                stdout.contains("PANE-MIGRATION-MARKER"),
+                "the pane must show the skipped migration, got: {stdout}"
+            );
+            assert_eq!(
+                stderr.matches("PANE-MIGRATION-MARKER").count(),
+                1,
+                "opening the pane loads config more than once, but must print once: {stderr}"
+            );
+            return;
+        }
+
+        let dir = std::path::PathBuf::from(
+            std::env::var("ZEROCODE_PANE_MIGRATION_DIR").expect("child config dir"),
+        );
+        crate::i18n::init("fr", &dir);
+        let pane = ZerocodePane::new(&dir);
+        println!("{}", pane.status().unwrap_or_default());
+        // A connection edit reloads after the pane has already taken the
+        // warning. That later read must hand the warning back, not only rely
+        // on the stderr line from the first load.
+        let mark = crate::config::migration_warning_mark();
+        crate::config::load_persisted(&dir).expect("later read");
+        let again = crate::config::take_migration_warning_since(mark).unwrap_or_default();
+        assert!(
+            again.contains("PANE-MIGRATION-MARKER"),
+            "a later read must return the warning to its caller, got: {again}"
+        );
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -3118,5 +3209,66 @@ mod tests {
             "Down in Sections moves to the next section"
         );
         assert_eq!(pane.cursor, PaneCursor::Sections);
+    }
+    #[test]
+    fn switching_saved_connection_reloads_visible_tls_and_edits_only_that_url() {
+        let _guard = crate::test_support::env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let make_login = |skip_verify, route: &str| config::OidcLogin {
+            auth_provider: "oidc.corp".into(),
+            auth_token: "synthetic-token".into(),
+            enroll_url: "https://gateway.example".into(),
+            expires_at: None,
+            tls: config::WssTlsSection {
+                skip_verify,
+                skip_verify_routes: vec![route.into()],
+                ..Default::default()
+            },
+            gateway_tls: config::WssTlsSection::default(),
+        };
+        let a = "wss://first.example/";
+        let b = "wss://second.example/";
+        config::persist_oidc_login(dir.path(), b, &make_login(true, b), false).unwrap();
+        config::persist_oidc_login(dir.path(), a, &make_login(false, a), true).unwrap();
+        let mut pane = ZerocodePane::new(dir.path());
+        pane.focus = Focus::Connection;
+        pane.conn_cursor = CONN_FIELDS
+            .iter()
+            .position(|f| *f == ConnField::Uri)
+            .unwrap();
+        pane.activate_connection();
+        pane.conn_edit.as_mut().unwrap().buf = b.into();
+        pane.handle_conn_edit_key(key(KeyCode::Enter));
+        assert!(pane.conn_edit.is_none());
+        assert_eq!(pane.conn.uri.as_deref(), Some(b));
+        assert_eq!(pane.conn_field_value(ConnField::SkipVerify), "true");
+        assert_eq!(pane.conn_field_value(ConnField::SkipVerifyRoutes), b);
+        let output = render_rows(&mut pane, 120, 16).join("\n");
+        assert!(output.contains(b), "{output}");
+        assert!(
+            !output.contains(a),
+            "previous destination remains visible: {output}"
+        );
+        pane.conn_cursor = CONN_FIELDS
+            .iter()
+            .position(|f| *f == ConnField::SkipVerify)
+            .unwrap();
+        pane.activate_connection();
+        pane.conn_cursor = CONN_FIELDS
+            .iter()
+            .position(|f| *f == ConnField::SkipVerifyRoutes)
+            .unwrap();
+        pane.activate_connection();
+        pane.conn_edit.as_mut().unwrap().buf = "wss://second.example/new-route".into();
+        pane.handle_conn_edit_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(pane.conn_edit.is_none());
+        let saved = config::load_persisted(dir.path()).unwrap();
+        assert!(!saved.connection.logins[b].tls.skip_verify);
+        assert_eq!(
+            saved.connection.logins[b].tls.skip_verify_routes,
+            ["wss://second.example/new-route"]
+        );
+        assert!(!saved.connection.logins[a].tls.skip_verify);
+        assert_eq!(saved.connection.logins[a].tls.skip_verify_routes, [a]);
     }
 }

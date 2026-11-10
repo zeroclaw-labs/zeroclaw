@@ -9,6 +9,7 @@ pub mod docker_tags;
 pub mod docs;
 pub mod flake;
 pub mod install_sh;
+pub mod openrpc;
 pub mod packaging;
 pub mod release;
 pub mod review_docs;
