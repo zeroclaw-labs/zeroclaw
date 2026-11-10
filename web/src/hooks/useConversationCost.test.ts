@@ -73,7 +73,11 @@ test('cost hook stops unsupported or denied polling across views until its reset
     assert.equal(calls, denied ? 2 : 1);
     await act(async () => { root.update(createElement(Probe, { id: 'b', connected: false })); });
     await act(async () => { root.update(createElement(Probe, { id: 'b' })); });
-    assert.equal(calls, denied ? 3 : 2);
+    assert.equal(calls, 2);
+    if (denied) {
+      await act(async () => { windowEvents.dispatchEvent(new Event(AUTH_EVENTS.resumed)); });
+      assert.equal(calls, 3);
+    }
     await act(async () => { root.unmount(); });
   }
 });
