@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   classifyCompletion,
+  errorEndsTurn,
   initialTurnStreamState,
   reduceTurnFrame,
   type CompletionOutcome,
@@ -205,4 +206,16 @@ test('captured thinking takes precedence over pending thinking', () => {
     ),
     { kind: 'commit', content: '', thinking: 'captured' },
   );
+});
+
+test('request refusals leave the running turn going', () => {
+  assert.equal(errorEndsTurn('CAPABILITY_MISSING'), false);
+  assert.equal(errorEndsTurn('INVALID_JSON'), false);
+  assert.equal(errorEndsTurn('APPROVAL_ACTION_UNAVAILABLE'), false);
+  for (const code of [
+    'AGENT_ERROR', 'CORE_UNAVAILABLE', 'TURN_RESULT_LOST', 'NOT_PERMITTED',
+    'SESSION_NOT_FOUND', 'CORE_REFUSED', 'PROVIDER_ERROR', undefined,
+  ]) {
+    assert.equal(errorEndsTurn(code), true, String(code));
+  }
 });
