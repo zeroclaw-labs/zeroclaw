@@ -31,6 +31,8 @@ use tokio_xmpp::{
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 use zeroclaw_config::schema::{XmppConfig, XmppProtocol};
 
+const OUTBOUND_TIMEOUT: Duration = Duration::from_secs(60);
+
 // XmlStream serializes each borrowed stanza synchronously in start_send.
 // Adapt ownership at that boundary so split I/O does not retain a borrowed stanza.
 struct OwnedStanzaStream<Io>(XmlStream<Io, Stanza>);
@@ -577,6 +579,126 @@ impl XmppChannel {
         }
         Ok(owner.clone())
     }
+    async fn write_outbound<S>(
+        &self,
+        mut sink: S,
+        mut rx: mpsc::Receiver<Outbound>,
+        #[cfg(target_os = "linux")] crypto: Option<CryptoOwner>,
+    ) -> anyhow::Result<()>
+    where
+        S: Sink<Stanza> + Unpin,
+        S::Error: std::fmt::Display,
+    {
+        while let Some(request) = rx.recv().await {
+            match request {
+                Outbound::Control(stanza) => {
+                    // Inbound traffic must not keep a blocked writer healthy indefinitely.
+                    tokio::time::timeout(OUTBOUND_TIMEOUT, sink.send(*stanza))
+                        .await
+                        .context("XMPP control write deadline exceeded; reconnect required")?
+                        .map_err(|error| anyhow::anyhow!("XMPP control write failed: {error}"))?;
+                }
+                Outbound::Message {
+                    recipient,
+                    content,
+                    mut result,
+                    deadline,
+                } => {
+                    if result.is_closed() || tokio::time::Instant::now() >= deadline {
+                        continue;
+                    }
+                    if !self.allowed(&recipient) {
+                        let _ = result.send(Err("XMPP recipient is not authorized".into()));
+                        continue;
+                    }
+                    let mut message = Message::new(Some(recipient.parse::<jid::Jid>()?));
+                    message.type_ = MessageType::Chat;
+                    message.id = Some(Id(uuid::Uuid::new_v4().to_string()));
+                    #[cfg(target_os = "linux")]
+                    let mut reservation = None;
+                    let prepared = (|| -> anyhow::Result<()> {
+                        #[cfg(target_os = "linux")]
+                        if let Some(state) = &crypto {
+                            let resolve = self
+                                .pins
+                                .as_ref()
+                                .context("Missing live fingerprint resolver")?;
+                            let policy = resolve();
+                            let envelope = state
+                                .lock()
+                                .map_err(|_| {
+                                    ::zeroclaw_log::record!(
+                                        ERROR,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Fail
+                                        ),
+                                        "Encrypted state lock poisoned"
+                                    );
+                                    anyhow::Error::msg("Encrypted state lock poisoned")
+                                })?
+                                .reserve_existing(
+                                    &recipient,
+                                    &message.id.as_ref().context("Missing stanza ID")?.0,
+                                    content.as_bytes(),
+                                    &policy,
+                                )?;
+                            message
+                                .payloads
+                                .push(crate::xmpp_omemo::stanza::serialize(&envelope)?.parse()?);
+                            ensure!(
+                                self.allowed(&recipient) && resolve() == policy,
+                                "XMPP authorization changed before socket write"
+                            );
+                            reservation = Some(envelope);
+                        } else {
+                            message.bodies.insert(Lang::default(), content);
+                        }
+                        #[cfg(not(target_os = "linux"))]
+                        message.bodies.insert(Lang::default(), content);
+                        Ok(())
+                    })();
+                    if let Err(error) = prepared {
+                        let _ = result.send(Err(error.to_string()));
+                        continue;
+                    }
+                    let sent = write_before_deadline(
+                        &mut sink,
+                        Stanza::Message(message),
+                        &mut result,
+                        deadline,
+                    )
+                    .await;
+                    if let Err(error) = sent {
+                        let _ = result.send(Err(error.to_string()));
+                        return Err(error);
+                    }
+                    #[cfg(target_os = "linux")]
+                    if let (Some(state), Some(envelope)) = (&crypto, reservation)
+                        && let Err(error) = state
+                            .lock()
+                            .map_err(|_| {
+                                ::zeroclaw_log::record!(
+                                    ERROR,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Fail
+                                    ),
+                                    "Encrypted state lock poisoned"
+                                );
+                                anyhow::Error::msg("Encrypted state lock poisoned")
+                            })?
+                            .complete_socket_write(&envelope)
+                    {
+                        let _ = result.send(Err(error.to_string()));
+                        return Err(error);
+                    }
+                    let _ = result.send(Ok(()));
+                }
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    }
     async fn run(&self, tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         let own = self.validate()?;
         if tokio_xmpp::rustls::crypto::CryptoProvider::get_default().is_none() {
@@ -608,114 +730,15 @@ impl XmppChannel {
         } else {
             Some(self.seen_database()?)
         };
-        let (requests, mut rx) = mpsc::channel(32);
+        let (requests, rx) = mpsc::channel(32);
         // Split protocol I/O, not a mutex around a Client. Full writes cannot stop reads.
-        let (mut sink, mut source) = OwnedStanzaStream(stream).split();
-        let writer = async {
-            while let Some(request) = rx.recv().await {
-                match request {
-                    Outbound::Control(stanza) => sink.send(*stanza).await?,
-                    Outbound::Message {
-                        recipient,
-                        content,
-                        mut result,
-                        deadline,
-                    } => {
-                        if result.is_closed() || tokio::time::Instant::now() >= deadline {
-                            continue;
-                        }
-                        if !self.allowed(&recipient) {
-                            let _ = result.send(Err("XMPP recipient is not authorized".into()));
-                            continue;
-                        }
-                        let mut message = Message::new(Some(recipient.parse::<jid::Jid>()?));
-                        message.type_ = MessageType::Chat;
-                        message.id = Some(Id(uuid::Uuid::new_v4().to_string()));
-                        #[cfg(target_os = "linux")]
-                        let mut reservation = None;
-                        let prepared = (|| -> anyhow::Result<()> {
-                            #[cfg(target_os = "linux")]
-                            if let Some(state) = &crypto {
-                                let resolve = self
-                                    .pins
-                                    .as_ref()
-                                    .context("Missing live fingerprint resolver")?;
-                                let policy = resolve();
-                                let envelope = state
-                                    .lock()
-                                    .map_err(|_| {
-                                        ::zeroclaw_log::record!(
-                                            ERROR,
-                                            ::zeroclaw_log::Event::new(
-                                                module_path!(),
-                                                ::zeroclaw_log::Action::Fail
-                                            ),
-                                            "Encrypted state lock poisoned"
-                                        );
-                                        anyhow::Error::msg("Encrypted state lock poisoned")
-                                    })?
-                                    .reserve_existing(
-                                        &recipient,
-                                        &message.id.as_ref().context("Missing stanza ID")?.0,
-                                        content.as_bytes(),
-                                        &policy,
-                                    )?;
-                                message.payloads.push(
-                                    crate::xmpp_omemo::stanza::serialize(&envelope)?.parse()?,
-                                );
-                                ensure!(
-                                    self.allowed(&recipient) && resolve() == policy,
-                                    "XMPP authorization changed before socket write"
-                                );
-                                reservation = Some(envelope);
-                            } else {
-                                message.bodies.insert(Lang::default(), content);
-                            }
-                            #[cfg(not(target_os = "linux"))]
-                            message.bodies.insert(Lang::default(), content);
-                            Ok(())
-                        })();
-                        if let Err(error) = prepared {
-                            let _ = result.send(Err(error.to_string()));
-                            continue;
-                        }
-                        let sent = write_before_deadline(
-                            &mut sink,
-                            Stanza::Message(message),
-                            &mut result,
-                            deadline,
-                        )
-                        .await;
-                        if let Err(error) = sent {
-                            let _ = result.send(Err(error.to_string()));
-                            return Err(error);
-                        }
-                        #[cfg(target_os = "linux")]
-                        if let (Some(state), Some(envelope)) = (&crypto, reservation)
-                            && let Err(error) = state
-                                .lock()
-                                .map_err(|_| {
-                                    ::zeroclaw_log::record!(
-                                        ERROR,
-                                        ::zeroclaw_log::Event::new(
-                                            module_path!(),
-                                            ::zeroclaw_log::Action::Fail
-                                        ),
-                                        "Encrypted state lock poisoned"
-                                    );
-                                    anyhow::Error::msg("Encrypted state lock poisoned")
-                                })?
-                                .complete_socket_write(&envelope)
-                        {
-                            let _ = result.send(Err(error.to_string()));
-                            return Err(error);
-                        }
-                        let _ = result.send(Ok(()));
-                    }
-                }
-            }
-            Ok::<(), anyhow::Error>(())
-        };
+        let (sink, mut source) = OwnedStanzaStream(stream).split();
+        let writer = self.write_outbound(
+            sink,
+            rx,
+            #[cfg(target_os = "linux")]
+            crypto,
+        );
         let reader = async move {
             let mut pending = std::collections::VecDeque::new();
             #[cfg(target_os = "linux")]
@@ -1084,7 +1107,7 @@ impl Channel for XmppChannel {
             .clone()
             .context("XMPP channel is offline")?;
         let (result, ack) = oneshot::channel();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let deadline = tokio::time::Instant::now() + OUTBOUND_TIMEOUT;
         tokio::time::timeout_at(deadline, async {
             sender
                 .send(Outbound::Message {
@@ -1107,6 +1130,201 @@ impl Channel for XmppChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct StalledControlSink {
+        writes: Arc<std::sync::atomic::AtomicUsize>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl Sink<Stanza> for StalledControlSink {
+        type Error = std::io::Error;
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _: &mut TaskContext<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn start_send(self: Pin<&mut Self>, _: Stanza) -> Result<(), Self::Error> {
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _: &mut TaskContext<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _: &mut TaskContext<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+    impl Drop for StalledControlSink {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    fn writer_test_channel() -> XmppChannel {
+        XmppChannel::new(
+            XmppConfig {
+                username: "bot@example.test".into(),
+                ..Default::default()
+            },
+            "test".into(),
+            PathBuf::new(),
+            Arc::new(|| vec!["alice@example.test".into()]),
+        )
+    }
+    fn control_probe() -> Outbound {
+        Outbound::Control(Box::new(Stanza::Iq(Iq::from_get(
+            "probe".to_owned(),
+            tokio_xmpp::parsers::ping::Ping,
+        ))))
+    }
+    #[tokio::test(start_paused = true)]
+    async fn blocked_control_write_drops_writer_and_queued_replies_at_deadline()
+    -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let writes = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let sink = StalledControlSink {
+            writes: writes.clone(),
+            dropped: dropped.clone(),
+        };
+        let channel = writer_test_channel();
+        let (tx, rx) = mpsc::channel(2);
+        tx.send(control_probe()).await?;
+        let (result, mut ack) = oneshot::channel();
+        tx.send(Outbound::Message {
+            recipient: "alice@example.test".into(),
+            content: "queued".into(),
+            result,
+            deadline: tokio::time::Instant::now() + Duration::from_secs(120),
+        })
+        .await?;
+        drop(tx);
+        let writer = tokio::spawn(async move {
+            channel
+                .write_outbound(
+                    sink,
+                    rx,
+                    #[cfg(target_os = "linux")]
+                    None,
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(59)).await;
+        assert!(!writer.is_finished());
+        assert!(matches!(
+            ack.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            writer.is_finished(),
+            "blocked control write must terminate the writer at 60 seconds"
+        );
+        assert!(
+            writer
+                .await?
+                .unwrap_err()
+                .to_string()
+                .contains("control write deadline exceeded")
+        );
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "connection writer must be dropped on timeout"
+        );
+        assert!(
+            ack.await.is_err(),
+            "queued replies must be released when the writer fails"
+        );
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            1,
+            "queued replies must not be written later"
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn successful_control_write_leaves_writer_usable() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let channel = writer_test_channel();
+        let (tx, rx) = mpsc::channel(2);
+        tx.send(control_probe()).await?;
+        let (result, ack) = oneshot::channel();
+        tx.send(Outbound::Message {
+            recipient: "alice@example.test".into(),
+            content: "queued".into(),
+            result,
+            deadline: tokio::time::Instant::now() + Duration::from_secs(60),
+        })
+        .await?;
+        drop(tx);
+        let writes = Arc::new(AtomicUsize::new(0));
+        let counted = writes.clone();
+        let sink = Box::pin(futures_util::sink::unfold((), move |(), _: Stanza| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            async { Ok::<_, std::io::Error>(()) }
+        }));
+        channel
+            .write_outbound(
+                sink,
+                rx,
+                #[cfg(target_os = "linux")]
+                None,
+            )
+            .await?;
+        assert!(ack.await?.is_ok());
+        assert_eq!(writes.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn failed_control_write_releases_queued_replies() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let channel = writer_test_channel();
+        let (tx, rx) = mpsc::channel(2);
+        tx.send(control_probe()).await?;
+        let (result, ack) = oneshot::channel();
+        tx.send(Outbound::Message {
+            recipient: "alice@example.test".into(),
+            content: "queued".into(),
+            result,
+            deadline: tokio::time::Instant::now() + Duration::from_secs(60),
+        })
+        .await?;
+        drop(tx);
+        let writes = Arc::new(AtomicUsize::new(0));
+        let counted = writes.clone();
+        let sink = Box::pin(futures_util::sink::unfold((), move |(), _: Stanza| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            async {
+                Err::<(), _>(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "synthetic closed socket",
+                ))
+            }
+        }));
+        let error = channel
+            .write_outbound(
+                sink,
+                rx,
+                #[cfg(target_os = "linux")]
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("control write failed"));
+        assert!(ack.await.is_err());
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn disconnected_listener_keeps_runtime_and_control_receipts_releasable()

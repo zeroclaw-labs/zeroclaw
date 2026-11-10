@@ -86,6 +86,10 @@ not confirm server storage, recipient decryption, delivery or human reading.
 Queued sends use the same absolute deadline as the caller. Expired/cancelled
 requests are refused before writing; cancellation during a write terminates
 the connection and leaves the outcome uncertain.
+Control writes (including pings and discovery) are also limited to 60 seconds.
+A control-write timeout or socket error terminates the listener and drops its
+socket and queued replies, allowing the shared supervisor to reconnect.
+Queued replies are not reported as delivered or replayed by the writer.
 
 This initial slice does not implement MUC rooms, file transfer, MAM backfill,
 carbons, delivery/read receipts or cross-channel session joining. Existing
