@@ -97,7 +97,6 @@ zc-zerocode-config-invalid-number = 请输入有效的正整数。
 zc-zerocode-config-positive-required = 数值必须大于零。
 zc-zerocode-config-save-failed = 保存失败：{ $error }
 zc-zerocode-config-save-mismatch = 已保存的值与新会话将使用的值不同。
-zc-zerocode-config-lock-timeout = 另一个进程正在更新 { $file }，并在 { $seconds } 秒后仍持有 { $path }。请等另一个 zerocode 写完配置后再试。
 zc-zerocode-help-todo-tracker = 编辑待办事项跟踪器字段
 zc-zerocode-locale-loading = 正在加载语言…
 zc-zerocode-locale-download = ⬇ 下载所选语言文件
