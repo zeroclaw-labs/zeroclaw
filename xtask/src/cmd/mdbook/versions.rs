@@ -369,6 +369,12 @@ fn is_locale_code(name: &str) -> bool {
             .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric()))
 }
 
+/// The root 404 page's redirect logic. [`root_404_html`] sets its `target`
+/// and `locales` on the two lines before it, and
+/// `scripts/docs/promote_stable.py` rewrites those two lines on promotion, so
+/// their shape (`var target = "...";`, `var locales = [...];`) is shared.
+const ROOT_404_SCRIPT: &str = include_str!("root_404.js");
+
 fn root_404_html(target: &str, locales: &[String]) -> anyhow::Result<String> {
     let locales = serde_json::to_string(locales)?;
     Ok(format!(
@@ -380,29 +386,15 @@ fn root_404_html(target: &str, locales: &[String]) -> anyhow::Result<String> {
 <title>Page not found · ZeroClaw Docs</title>
 <style>body{{font:16px/1.5 system-ui,sans-serif;max-width:40rem;margin:4rem auto;padding:0 1rem}}</style>
 <script>
-(function () {{
-  var target = "{target}";
-  var locales = {locales};
-  var version = /^(master|v\d+\.\d+\.\d+(-[A-Za-z0-9.-]+)?)$/;
-  var segments = location.pathname.split("/").filter(Boolean);
-  var rest = null;
-  if (segments.length >= 2 && version.test(segments[0]) && locales.indexOf(segments[1]) >= 0) {{
-    rest = segments.slice(1);
-  }} else if (segments.length >= 1 && locales.indexOf(segments[0]) >= 0) {{
-    rest = segments;
-  }}
-  if (!rest) return;
-  var path = "/" + target + "/" + rest.join("/");
-  if (location.pathname.slice(-1) === "/") path += "/";
-  if (path === location.pathname) return;
-  location.replace(path + location.search + location.hash);
-}})();
-</script>
+var target = "{target}";
+var locales = {locales};
+{script}</script>
 <h1>Page not found</h1>
 <p>This page is not in the ZeroClaw docs. It may have moved in a newer release.</p>
 <p><a href="/">Go to the documentation home</a></p>
 </html>
-"#
+"#,
+        script = ROOT_404_SCRIPT,
     ))
 }
 
@@ -703,8 +695,10 @@ mod tests {
     fn root_404_names_the_redirect_target_and_only_plain_locale_codes() {
         let html = root_404_html(STABLE_ALIAS, &["en".into(), "zh-CN".into()]).unwrap();
         assert!(html.contains("<meta name=\"robots\" content=\"noindex\">"));
-        assert!(html.contains("var target = \"stable\";"));
-        assert!(html.contains("var locales = [\"en\",\"zh-CN\"];"));
+        // promote_stable.py rewrites exactly these two lines.
+        assert!(html.contains("\nvar target = \"stable\";\n"));
+        assert!(html.contains("\nvar locales = [\"en\",\"zh-CN\"];\n"));
+        assert!(html.contains(ROOT_404_SCRIPT));
         assert!(html.contains("<a href=\"/\">"));
 
         for ok in ["en", "zh-CN", "pt-BR"] {

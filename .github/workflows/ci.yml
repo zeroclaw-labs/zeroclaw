@@ -223,8 +223,8 @@ jobs:
         with:
           node-version-file: '.nvmrc'
 
-      - name: Test docs version selector
-        run: node --test scripts/docs/version_selector_test.mjs
+      - name: Test docs version selector and root 404 redirect
+        run: node --test scripts/docs/version_selector_test.mjs scripts/docs/root_404_test.mjs
 
   relay-container-smoke-changes:
     name: Detect Relay Container Smoke changes
