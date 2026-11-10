@@ -1,6 +1,6 @@
 # ZeroClaw v0.9.0
 
-ZeroClaw v0.9.0 is the first release in which people other than the operator can sign in, spanning **113 commits** from **22 contributors**. The dashboard can sign people in through your own OpenID Connect provider, accounts that aren't administrators get their own scoped chat, and the daemon keeps each account inside what its permission profile allows. The dashboard can also be served through a ZeroRelay, servers can install a build without the dashboard, and the configuration moves to schema version 4: read [Breaking Changes](#breaking-changes) before upgrading.
+ZeroClaw v0.9.0 is the first release in which people other than the operator can sign in, spanning **117 commits** from **22 contributors**. The dashboard can sign people in through your own OpenID Connect provider, accounts that aren't administrators get their own scoped chat, and the daemon keeps each account inside what its permission profile allows. The dashboard can also be served through a ZeroRelay, servers can install a build without the dashboard, and the configuration moves to schema version 4: read [Breaking Changes](#breaking-changes) before upgrading.
 
 ## In brief
 
@@ -209,7 +209,21 @@ These issues ship in v0.9.0. None of them weakens a security check; where behavi
 
 ## Binary size
 
-⟨TODO-RC: per-target `zeroclaw` bytes from qualification run A against v0.8.7's release run, with the 80 MiB (83,886,080 B) cap, in a `text` block with the measuring targets named⟩
+Per-target size of the `zeroclaw` binary from the release-recipe qualification builds of v0.8.7 and v0.9.0. The cap is 80 MiB (83,886,080 bytes); the largest v0.9.0 binary leaves 5.60 MiB of headroom.
+
+```text
+target                               v0.8.7      v0.9.0       delta  delta %
+x86_64-unknown-linux-gnu         76,715,464  77,969,256  +1,253,792    +1.6%
+x86_64-unknown-linux-musl        76,774,224  78,012,720  +1,238,496    +1.6%
+aarch64-unknown-linux-gnu        55,978,512  56,897,504    +918,992    +1.6%
+aarch64-unknown-linux-musl       51,685,280  52,616,576    +931,296    +1.8%
+x86_64-apple-darwin              64,408,904  65,437,152  +1,028,248    +1.6%
+aarch64-apple-darwin             42,860,816  43,561,504    +700,688    +1.6%
+x86_64-pc-windows-msvc           64,529,408  65,561,600  +1,032,192    +1.6%
+armv7-unknown-linux-gnueabihf    53,063,388  54,075,852  +1,012,464    +1.9%
+arm-unknown-linux-gnueabihf      53,382,876  54,407,628  +1,024,752    +1.9%
+aarch64-linux-android            45,540,096  46,446,520    +906,424    +2.0%
+```
 
 ## Contributors
 
