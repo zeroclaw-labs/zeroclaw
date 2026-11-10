@@ -122,6 +122,7 @@ export class VoiceNotes {
     try {
       // Transport stays encrypted. Only this private, short-lived STT file is
       // plaintext; no untrusted fileSource path is ever opened by the bridge.
+      record.downloadStarted = performance.now();
       await this.rpc(`/freceive ${fileId} encrypt=off ${record.path}`);
     } catch (error) {await this.remove(record); throw error;}
   }
@@ -142,6 +143,7 @@ export class VoiceNotes {
       const item = resp.chatItem, file = item?.chatItem?.file;
       const record = this.receiving.get(file?.fileId);
       if (!record) return;
+      const downloadCompleted = performance.now();
       clearTimeout(record.timer);
       try {
         const current = identity(item);
@@ -157,8 +159,11 @@ export class VoiceNotes {
         } finally {await handle.close();}
         const seconds = await duration(record.path);
         if (seconds > record.maxDuration) throw Error('simplex_voice_duration_limit');
+        const encoded = audio.toString('base64');
         await this.emit({type: 'voice_note', contact: record.contact, id: record.id,
-          audio: audio.toString('base64'), filename: `voice${extname(record.path)}`, duration: seconds});
+          audio: encoded, filename: `voice${extname(record.path)}`, duration: seconds,
+          download_ms: Math.round(downloadCompleted - record.downloadStarted),
+          prepare_ms: Math.round(performance.now() - downloadCompleted)});
       } catch {
         await this.emit({type: 'voice_transfer_failed', contact: record.contact, outgoing: record.direction === 'send'});
       } finally {await this.remove(record);}

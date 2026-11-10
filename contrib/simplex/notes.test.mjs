@@ -71,6 +71,9 @@ test('voice invitations require native admission before download; receive only o
     assert.equal(events[1].id, '42'); assert.equal(events[1].contact, '17');
     assert.deepEqual(Buffer.from(events[1].audio, 'base64'), audio);
     assert.ok(events[1].duration > 0 && events[1].duration < 1);
+    for (const field of ['download_ms', 'prepare_ms']) {
+      assert.ok(Number.isSafeInteger(events[1][field]) && events[1][field] >= 0);
+    }
     await assert.rejects(stat(path), {code: 'ENOENT'});
   } finally {await notes.close();}
 });

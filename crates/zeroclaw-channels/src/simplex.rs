@@ -720,6 +720,7 @@ impl SimplexChannel {
         let call = kind == "utterance";
         let voice = call || kind == "voice_note";
         let mut text = if voice {
+            let prepare_started = std::time::Instant::now();
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(event["audio"].as_str().context("simplex_audio_missing")?)?;
             ensure!(
@@ -757,7 +758,26 @@ impl SimplexChannel {
                     .as_str()
                     .context("simplex_voice_filename_missing")?
             };
-            manager.transcribe(&bytes, filename).await?
+            let transcription_started = std::time::Instant::now();
+            let transcription = manager.transcribe(&bytes, filename).await;
+            if !call {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(json!({
+                            "message_id": event["id"].as_str().and_then(|id| id.parse::<u64>().ok()),
+                            "audio_bytes": bytes.len(),
+                            "audio_duration_secs": event["duration"].as_f64(),
+                            "download_ms": event["download_ms"].as_u64(),
+                            "bridge_prepare_ms": event["prepare_ms"].as_u64(),
+                            "native_prepare_ms": transcription_started.duration_since(prepare_started).as_millis(),
+                            "transcription_ms": transcription_started.elapsed().as_millis(),
+                            "transcribed": transcription.is_ok(),
+                        })),
+                    "simplex_voice_ingress_timing"
+                );
+            }
+            transcription?
         } else {
             event["text"]
                 .as_str()
@@ -1684,10 +1704,39 @@ mod tests {
 
     #[tokio::test]
     async fn live_text_coalesces_updates_and_finalizes_without_a_duplicate_send() {
+        use zeroclaw_api::session_events::capture::{
+            DeliveryFuture, DeliveryIntent, EngineTurnFuture, EngineTurnInput, SessionContextPort,
+            SessionControlPort, SessionExecutionPort, scope_session_execution,
+        };
+
+        #[derive(Default)]
+        struct ReceiptRecorder(Mutex<Vec<String>>);
+        #[async_trait::async_trait]
+        impl SessionContextPort for ReceiptRecorder {}
+        #[async_trait::async_trait]
+        impl SessionControlPort for ReceiptRecorder {}
+        #[async_trait::async_trait]
+        impl SessionExecutionPort for ReceiptRecorder {
+            async fn execute(&self, _: EngineTurnInput, _: EngineTurnFuture<'_>) -> Result<String> {
+                anyhow::bail!("unexpected turn execution")
+            }
+
+            async fn deliver(
+                &self,
+                intent: DeliveryIntent,
+                send: DeliveryFuture<'_>,
+            ) -> Result<Value> {
+                let result = send.await?;
+                self.0.lock().push(intent.completion_boundary);
+                Ok(result)
+            }
+        }
+
         let (channel, _) = fixture();
         let (values, worker) = record_bridge(&channel);
-        let id = channel
-            .send_draft(&SendMessage::new("", "17"))
+        let receipts = Arc::new(ReceiptRecorder::default());
+        let message = SendMessage::new("", "17");
+        let id = scope_session_execution(receipts.clone(), channel.send_draft(&message))
             .await
             .unwrap()
             .unwrap();
@@ -1727,6 +1776,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(values.lock().last().unwrap()["type"], "live_finish");
+        let edits = values
+            .lock()
+            .iter()
+            .filter(|value| value["type"] == "live_update")
+            .count();
+        assert_eq!(
+            receipts.0.lock().as_slice(),
+            vec!["live_text_preview:channel_adapter_acceptance"; edits]
+        );
         let before = values.lock().len();
         let error = channel
             .finalize_draft("17", &id, "Final answer", true)
