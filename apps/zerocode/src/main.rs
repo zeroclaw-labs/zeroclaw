@@ -2640,6 +2640,58 @@ mod connection_tests {
         );
     }
 
+    /// A successful migration also initializes translations, and that cache
+    /// cannot be replaced. `ZEROCODE_locale` must win over the saved locale,
+    /// or the rest of the session stays in the file's language.
+    #[test]
+    fn migration_uses_the_locale_override() {
+        if std::env::var_os("ZEROCODE_MIGRATION_OVERRIDE_CHILD").is_some() {
+            let dir = std::path::PathBuf::from(
+                std::env::var("ZEROCODE_MIGRATION_LOCALE_DIR").expect("child config dir"),
+            );
+            crate::config::ensure_and_load(&dir).expect("migration load");
+            println!("{}", crate::i18n::t("zc-config-invalid-saved-login"));
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            crate::config::config_path(dir.path()),
+            "locale = \"en\"\n\n[keybindings]\n\"input_bar.clear_input\" = \"ctrl+u\"\n",
+        )
+        .unwrap();
+        let catalogue = dir.path().join("data/ftl/fr");
+        std::fs::create_dir_all(&catalogue).unwrap();
+        std::fs::write(
+            catalogue.join("zerocode.ftl"),
+            "zc-config-invalid-saved-login = OVERRIDE-LOCALE-MARKER\n",
+        )
+        .unwrap();
+
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("current zerocode test binary path"),
+        )
+        .args([
+            "connection_tests::migration_uses_the_locale_override",
+            "--exact",
+            "--nocapture",
+        ])
+        .env("ZEROCODE_MIGRATION_OVERRIDE_CHILD", "1")
+        .env("ZEROCODE_MIGRATION_LOCALE_DIR", dir.path())
+        .env("ZEROCODE_locale", "fr")
+        .env_remove("ZEROCLAW_CONFIG_DIR")
+        .env_remove("ZEROCODE_LOCALE_DIR")
+        .output()
+        .expect("spawn override child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "child failed: {stderr}\n{stdout}");
+        assert!(
+            stdout.contains("OVERRIDE-LOCALE-MARKER"),
+            "a successful migration must keep ZEROCODE_locale, got: {stdout}{stderr}"
+        );
+    }
+
     #[test]
     fn explicit_relay_enroll_uses_relay_route() {
         let cli = Cli::parse_from([

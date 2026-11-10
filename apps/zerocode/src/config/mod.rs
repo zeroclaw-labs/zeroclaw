@@ -34,6 +34,19 @@ std::thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+/// Locale for a warning printed before `ensure_and_load` applies overrides.
+/// A non-empty `ZEROCODE_locale` wins, matching `apply_env_overrides` plus
+/// `resolve_locale`. The file locale is the fallback.
+fn startup_locale(config: &ZerocodeConfig) -> String {
+    if let Ok(value) = std::env::var("ZEROCODE_locale") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return crate::i18n::normalize_locale(trimmed);
+        }
+    }
+    config.resolve_locale().unwrap_or_else(|| "en".to_string())
+}
+
 fn migration_lock_wait() -> std::time::Duration {
     #[cfg(test)]
     if let Some(wait) = MIGRATION_LOCK_WAIT_OVERRIDE.get() {
@@ -1063,10 +1076,11 @@ pub(crate) fn load_persisted(config_dir: &Path) -> Result<ZerocodeConfig> {
                 // under the same lock every other writer holds.
                 None => {
                     // Startup has not called `i18n::init` yet. A warning or
-                    // lock error here would cache the default directory's
-                    // language for the process, and the later init cannot
-                    // replace it. Use this config directory first.
-                    crate::i18n::init_from_config_dir(config_dir);
+                    // lock error here would cache a language for the process,
+                    // and the later init cannot replace it. Use this config
+                    // directory and the same locale `ensure_and_load` will
+                    // resolve, including `ZEROCODE_locale`.
+                    crate::i18n::init(&startup_locale(&config), config_dir);
                     match ConfigWriteLock::acquire_within(config_dir, migration_lock_wait()) {
                         Ok(lock) => {
                             write_lock = Some(lock);
