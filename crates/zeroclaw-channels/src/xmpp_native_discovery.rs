@@ -42,10 +42,13 @@ async fn exchange<R>(
 where
     R: Stream<Item = Result<Stanza, ReadError>> + Unpin,
 {
-    requests
-        .try_send(Outbound::Control(Box::new(Stanza::Iq(request))))
-        .context("XMPP discovery write queue full")?;
     tokio::time::timeout(Duration::from_secs(10), async {
+        // Share one deadline for queue admission and the response. Ordinary
+        // outbound congestion must not immediately tear down the listener.
+        requests
+            .send(Outbound::Control(Box::new(Stanza::Iq(request))))
+            .await
+            .context("XMPP discovery write queue closed")?;
         loop {
             let stanza = match source
                 .next()
@@ -730,6 +733,111 @@ mod discovery_queue_tests {
             payload: Element::builder("items", PUBSUB).build(),
         }
     }
+    #[tokio::test(start_paused = true)]
+    async fn full_outbound_queue_waits_for_capacity_before_discovery() {
+        let channel = fixture_channel();
+        let own = "bob@example.test".parse().unwrap();
+        let (requests, mut receiver) = mpsc::channel(1);
+        requests
+            .try_send(Outbound::Control(Box::new(Stanza::Iq(request()))))
+            .unwrap();
+        let mut source = futures_util::stream::iter([Ok(reply())]);
+        let mut pending = VecDeque::new();
+        let release = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert!(receiver.recv().await.is_some());
+        };
+        let (result, ()) = tokio::join!(
+            exchange(
+                &channel,
+                &mut source,
+                &requests,
+                &mut pending,
+                request(),
+                &own,
+                &own,
+                "fixture-query",
+                false
+            ),
+            release,
+        );
+        assert!(matches!(result, Ok(Reply::Result(_))));
+        assert!(matches!(receiver.try_recv(), Ok(Outbound::Control(_))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn congestion_and_reply_share_the_existing_peer_deadline() {
+        for release_after in [None, Some(9)] {
+            let channel = fixture_channel();
+            let own = "bob@example.test".parse().unwrap();
+            let peer = "alice@example.test".parse().unwrap();
+            let (requests, mut receiver) = mpsc::channel(1);
+            requests
+                .try_send(Outbound::Control(Box::new(Stanza::Iq(request()))))
+                .unwrap();
+            let mut source = futures_util::stream::pending();
+            let mut pending = VecDeque::new();
+            let start = tokio::time::Instant::now();
+            let release = async {
+                if let Some(seconds) = release_after {
+                    tokio::time::sleep(Duration::from_secs(seconds)).await;
+                    assert!(receiver.recv().await.is_some());
+                }
+            };
+            let (result, ()) = tokio::join!(
+                exchange(
+                    &channel,
+                    &mut source,
+                    &requests,
+                    &mut pending,
+                    request(),
+                    &peer,
+                    &own,
+                    "fixture-query",
+                    false
+                ),
+                release,
+            );
+            let error = result
+                .err()
+                .expect("unresponsive discovery must remain bounded");
+            assert!(
+                error.is::<crate::xmpp_omemo::RejectedInbound>(),
+                "peer congestion must not become a fatal listener error: {error}"
+            );
+            assert_eq!(start.elapsed(), Duration::from_secs(10));
+            assert!(receiver.try_recv().is_ok());
+            assert!(receiver.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_queue_admission_never_enqueues_a_late_iq() {
+        let channel = fixture_channel();
+        let own = "bob@example.test".parse().unwrap();
+        let (requests, mut receiver) = mpsc::channel(1);
+        requests
+            .try_send(Outbound::Control(Box::new(Stanza::Iq(request()))))
+            .unwrap();
+        let mut source = futures_util::stream::pending();
+        let mut pending = VecDeque::new();
+        let mut future = Box::pin(exchange(
+            &channel,
+            &mut source,
+            &requests,
+            &mut pending,
+            request(),
+            &own,
+            &own,
+            "fixture-query",
+            false,
+        ));
+        assert!(futures_util::poll!(&mut future).is_pending());
+        drop(future);
+        assert!(receiver.recv().await.is_some());
+        assert!(receiver.try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn unauthorized_flood_and_full_authorized_queue_do_not_abort_discovery() {
         let channel = fixture_channel();
