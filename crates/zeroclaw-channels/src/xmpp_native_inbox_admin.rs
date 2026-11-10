@@ -5,6 +5,7 @@ use crate::xmpp_omemo::{
     private_store::PrivateStore,
 };
 use anyhow::{Context, Result, ensure};
+use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 use std::{os::unix::fs::MetadataExt, path::Path, sync::Arc};
 pub fn run(args: &[String]) -> Result<Value> {
@@ -192,7 +193,23 @@ fn inspect_session(
     )?;
     let outbox: u64 = tx.query_row("SELECT count(*) FROM native_omemo_outbox", [], |r| r.get(0))?;
     let mut digest = Sha256::new();
-    digest.update(b"zeroclaw-offline-session-reset-v1");
+    digest.update(b"zeroclaw-offline-session-reset-v2");
+    // The reviewed operation also changes this peer's shared device index.
+    // Bind it to the token so a later inspection cannot overwrite unseen changes.
+    let index: Option<String> = tx
+        .query_row(
+            "SELECT value FROM state WHERE key=?1",
+            [format!(
+                "omemo//eu.siacs.conversations.axolotl/{peer}/device_ids"
+            )],
+            |row| row.get(0),
+        )
+        .optional()?;
+    digest.update([u8::from(index.is_some())]);
+    if let Some(index) = index {
+        digest.update((index.len() as u64).to_be_bytes());
+        digest.update(index.as_bytes());
+    }
     for value in [
         account.as_bytes(),
         peer.as_bytes(),
@@ -265,6 +282,28 @@ fn recover_session(
             deleted as u64 == snapshot.rows,
             "Session changed during recovery"
         );
+        // Session rows and the canonical recipient index must change atomically.
+        // Otherwise another device's reply tries to load this deleted session.
+        let index_key = format!("omemo//eu.siacs.conversations.axolotl/{peer}/device_ids");
+        let index: Option<String> = tx
+            .query_row(
+                "SELECT value FROM state WHERE key=?1",
+                [&index_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(index) = index {
+            let mut ids: Vec<u32> = serde_json::from_str(&index)?;
+            ensure!(
+                ids.len() <= 256 && ids.iter().all(|id| (1..=i32::MAX as u32).contains(id)),
+                "Invalid peer device index"
+            );
+            ids.retain(|id| *id != device);
+            tx.execute(
+                "UPDATE state SET value=?1 WHERE key=?2",
+                rusqlite::params![serde_json::to_string(&ids)?, index_key],
+            )?;
+        }
         let receipt = json!({"account":account,"peer":peer,"device":device,"fingerprint":hex::encode(snapshot.fingerprint),"own":hex::encode(snapshot.own),"own_device":snapshot.own_device,"review_token":expected,"operator":operator,"evidence":evidence});
         let receipt = zeroize::Zeroizing::new(receipt.to_string());
         let sealed = cipher.seal(&receipt)?;
@@ -363,6 +402,42 @@ mod tests {
             "INSERT INTO state(key,value) VALUES(?1,'{}')",
             ["omemo//eu.siacs.conversations.axolotl/alice@example.test/1010/double_ratchet"],
         )?;
+        let index_key = "omemo//eu.siacs.conversations.axolotl/alice@example.test/device_ids";
+        tx.execute(
+            "INSERT INTO state(key,value) VALUES(?1,'[101,1010]')",
+            [index_key],
+        )?;
+        // A second device has a usable established ratchet; exercise the actual
+        // outbound path after resetting device101 rather than only inspecting JSON.
+        let latin = |byte: u8| std::iter::repeat_n(char::from(byte), 32).collect::<String>();
+        let ratchet = json!({"version":"1.0.0","diffie_hellman_ratchet":{
+            "version":"1.0.0","own_ratchet_priv":latin(3),"other_ratchet_pub":latin(4),
+            "root_chain":{"version":"1.0.0","length":2,"key":latin(5)},
+            "symmetric_key_ratchet":{"version":"1.0.0","previous_sending_chain_length":0,
+                "sending_chain":{"version":"1.0.0","length":0,"key":latin(6)},
+                "receiving_chain":{"version":"1.0.0","length":1,"key":latin(7)}}},
+            "skipped_message_keys":[]});
+        for (key, value) in [
+            (
+                "associated_data",
+                store::load(&tx, &format!("{prefix}associated_data"))?,
+            ),
+            ("initiation", json!("PASSIVE")),
+            (
+                "key_exchange/identity_key",
+                json!(URL_SAFE.encode(peer_ed.compress().to_bytes())),
+            ),
+            ("confirmed", json!(true)),
+            ("double_ratchet", ratchet),
+        ] {
+            tx.execute(
+                "INSERT OR REPLACE INTO state(key,value) VALUES(?1,?2)",
+                rusqlite::params![
+                    format!("omemo//eu.siacs.conversations.axolotl/alice@example.test/1010/{key}"),
+                    value.to_string()
+                ],
+            )?;
+        }
         tx.commit()?;
         for id in ["old-returned", "uncertain"] {
             assert!(inbox::admit(db, "alice@example.test", id)?);
@@ -472,9 +547,21 @@ mod tests {
             "stale review must not reset changed session state"
         );
         let inspect = run(&args)?;
+        let mut owner = PrivateStore::open_existing(&state)?;
+        owner.connection().execute(
+            "UPDATE state SET value='[1010,101]' WHERE key=?1",
+            [index_key],
+        )?;
+        drop(owner);
+        assert!(
+            run(&reset_args(&inspect)).is_err(),
+            "index changes invalidate the reviewed reset"
+        );
+        let inspect = run(&args)?;
         assert_eq!(run(&reset_args(&inspect))?["reset"], true);
         let mut owner = PrivateStore::open_existing(&state)?;
         let db = owner.connection();
+        assert_eq!(store::load(&db.transaction()?, index_key)?, json!([1010]));
         assert_eq!(
             db.query_row(
                 "SELECT value FROM state WHERE key='public/identity'",
@@ -538,6 +625,13 @@ mod tests {
         drop(owner);
         let mut channel = ChannelState::open_existing(&state, "bob@example.test", cipher, 64000)?;
         assert_eq!(channel.public_bundle()?.device, own_bundle.device);
+        let policy = vec![format!("alice@example.test {}", hex::encode(peer_pin))];
+        channel.reserve_existing(
+            "alice@example.test",
+            "reply-after-reset",
+            b"still reachable",
+            &policy,
+        )?;
         let message = SignalMessage {
             ratchet_key: vec![4; 32],
             counter: 0,
@@ -561,7 +655,6 @@ mod tests {
             STANDARD.encode([0; 12]),
             STANDARD.encode([0; 16])
         );
-        let policy = vec![format!("alice@example.test {}", hex::encode(peer_pin))];
         assert_eq!(
             channel.discovery_request("alice@example.test", &xml, &policy)?,
             Some((101, peer_pin)),
