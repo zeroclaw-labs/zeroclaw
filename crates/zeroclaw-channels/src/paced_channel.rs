@@ -206,6 +206,18 @@ impl PacedChannel {
             state
                 .queue
                 .retain(|pending| !(pending.expires_with_caller && pending.reply.is_closed()));
+            // A final/durable reply takes precedence over live best-effort
+            // notices from any conversation lane sharing this recipient.
+            if !expires_with_caller
+                && state.queue.len() >= self.queue_depth
+                && let Some(index) = state
+                    .queue
+                    .iter()
+                    .position(|pending| pending.expires_with_caller)
+                && let Some(superseded) = state.queue.remove(index)
+            {
+                let _ = superseded.reply.send(Ok(()));
+            }
             // Progress always belongs to the worker, including its first send:
             // dropping a slow direct send must not strand in_flight=true.
             if !expires_with_caller
@@ -820,6 +832,48 @@ mod tests {
             self.polls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn final_reply_supersedes_another_lanes_live_progress() {
+        let inner = Arc::new(CountingChannel {
+            sends: AtomicUsize::new(0),
+            final_sends: AtomicUsize::new(0),
+            finalize_drafts: AtomicUsize::new(0),
+        });
+        let paced = Arc::new(PacedChannel {
+            inner: inner.clone(),
+            min_interval: Duration::from_millis(80),
+            queue_depth: 1,
+            recipients: Arc::new(Mutex::new(RecipientMap::new())),
+        });
+        paced
+            .send(&SendMessage::new("initial", "peer"))
+            .await
+            .unwrap();
+        let notice_channel = paced.clone();
+        let notice = zeroclaw_spawn::spawn!(async move {
+            scope_progress_send(notice_channel.send(&SendMessage::new("progress", "peer"))).await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !paced.recipients.lock().await.inner["peer"].queue.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("send was not queued");
+        paced
+            .send_final(&SendMessage::new("final", "peer"))
+            .await
+            .unwrap();
+        notice.await.unwrap().unwrap();
+        assert_eq!(inner.sends.load(Ordering::SeqCst), 1);
+        assert_eq!(inner.final_sends.load(Ordering::SeqCst), 1);
+        // A discarded notice must not reserve another pacing interval.
+        assert!(paced.recipients.lock().await.inner["peer"].queue.is_empty());
     }
 
     #[tokio::test]
