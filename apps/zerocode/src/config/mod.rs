@@ -1071,16 +1071,12 @@ pub(crate) fn load_persisted(config_dir: &Path) -> Result<ZerocodeConfig> {
                     // config, including its remote target. Rewriting is
                     // optional; failing the load would make startup drop that
                     // target and dial the local socket.
-                    // Do not format this here. `t_args` would cache a
-                    // language and `CONFIG_DIR` before startup applies
-                    // environment overrides and its own init, and those
-                    // caches cannot be replaced. The notice is printed
-                    // after that init.
                     Err(error) => {
-                        push_startup_notice(StartupNotice {
-                            path: path.display().to_string(),
-                            failure: pending_lock_failure(&error),
-                        });
+                        // Format only after `i18n::init`. Doing it earlier
+                        // caches a language and `CONFIG_DIR` that startup
+                        // cannot replace. Later reads print immediately:
+                        // `emit_startup_notices` runs only once.
+                        record_skipped_migration(&path, &error);
                         return Ok(config);
                     }
                 },
@@ -1114,10 +1110,53 @@ enum PendingLockFailure {
 std::thread_local! {
     static STARTUP_NOTICES: std::cell::RefCell<Vec<StartupNotice>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Formatted warning from a post-init skipped migration, for the caller
+    /// that just loaded. Stderr is not visible once the alternate screen is up.
+    static MIGRATION_WARNING: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+    static MIGRATION_WARNING_GEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static MIGRATION_WARNING_PRINTED: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn push_startup_notice(notice: StartupNotice) {
     STARTUP_NOTICES.with(|notices| notices.borrow_mut().push(notice));
+}
+
+fn record_skipped_migration(path: &Path, error: &anyhow::Error) {
+    let notice = StartupNotice {
+        path: path.display().to_string(),
+        failure: pending_lock_failure(error),
+    };
+    if !crate::i18n::is_initialized() {
+        push_startup_notice(notice);
+        return;
+    }
+    let message = format_notice(&notice);
+    let repeat = MIGRATION_WARNING_PRINTED
+        .with(|printed| printed.borrow().as_deref() == Some(message.as_str()));
+    MIGRATION_WARNING.with(|warning| *warning.borrow_mut() = Some(message.clone()));
+    MIGRATION_WARNING_GEN.with(|generation| generation.set(generation.get().wrapping_add(1)));
+    if repeat {
+        return;
+    }
+    MIGRATION_WARNING_PRINTED.with(|printed| *printed.borrow_mut() = Some(message.clone()));
+    eprintln!("{message}");
+}
+
+/// Generation of the latest post-init skipped-migration warning on this thread.
+pub(crate) fn migration_warning_mark() -> u64 {
+    MIGRATION_WARNING_GEN.with(|generation| generation.get())
+}
+
+/// The skipped-migration warning recorded after `mark`, if this thread's last
+/// load hit one. A load that did not skip migration leaves an older warning
+/// where it is, so a later caller does not report it as its own.
+pub(crate) fn take_migration_warning_since(mark: u64) -> Option<String> {
+    if MIGRATION_WARNING_GEN.with(|generation| generation.get()) == mark {
+        return None;
+    }
+    MIGRATION_WARNING.with(|warning| warning.borrow_mut().take())
 }
 
 fn pending_lock_failure(error: &anyhow::Error) -> PendingLockFailure {
@@ -1136,38 +1175,39 @@ fn pending_lock_failure(error: &anyhow::Error) -> PendingLockFailure {
     PendingLockFailure::Other(format!("{error:#}"))
 }
 
+fn format_notice(notice: &StartupNotice) -> String {
+    let detail = match &notice.failure {
+        PendingLockFailure::Timeout {
+            config,
+            lock,
+            seconds,
+        } => {
+            let seconds = seconds.to_string();
+            crate::i18n::t_args(
+                "zc-config-save-lock-timeout",
+                &[
+                    ("config", config.as_str()),
+                    ("lock", lock.as_str()),
+                    ("seconds", seconds.as_str()),
+                ],
+            )
+        }
+        PendingLockFailure::NotRegular { path } => {
+            crate::i18n::t_args("zc-config-lock-not-regular", &[("path", path.as_str())])
+        }
+        PendingLockFailure::Other(message) => message.clone(),
+    };
+    crate::i18n::t_args(
+        "zc-config-migration-lock-skipped",
+        &[("path", notice.path.as_str()), ("error", detail.as_str())],
+    )
+}
+
 /// Print migration-lock warnings using the locale startup just initialized.
 pub(crate) fn emit_startup_notices() {
     let notices = STARTUP_NOTICES.with(|notices| std::mem::take(&mut *notices.borrow_mut()));
     for notice in notices {
-        let detail = match notice.failure {
-            PendingLockFailure::Timeout {
-                config,
-                lock,
-                seconds,
-            } => {
-                let seconds = seconds.to_string();
-                crate::i18n::t_args(
-                    "zc-config-save-lock-timeout",
-                    &[
-                        ("config", config.as_str()),
-                        ("lock", lock.as_str()),
-                        ("seconds", seconds.as_str()),
-                    ],
-                )
-            }
-            PendingLockFailure::NotRegular { path } => {
-                crate::i18n::t_args("zc-config-lock-not-regular", &[("path", path.as_str())])
-            }
-            PendingLockFailure::Other(message) => message,
-        };
-        eprintln!(
-            "{}",
-            crate::i18n::t_args(
-                "zc-config-migration-lock-skipped",
-                &[("path", notice.path.as_str()), ("error", detail.as_str())],
-            )
-        );
+        eprintln!("{}", format_notice(&notice));
     }
 }
 

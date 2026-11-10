@@ -2708,6 +2708,79 @@ mod connection_tests {
         );
     }
 
+    /// Startup drains the notice queue once. A later read that still cannot
+    /// migrate must print then, not leave the warning queued forever.
+    #[test]
+    fn later_migration_lock_failure_is_reported_immediately() {
+        if std::env::var_os("ZEROCODE_MIGRATION_LATER_CHILD").is_some() {
+            let dir = std::path::PathBuf::from(
+                std::env::var("ZEROCODE_MIGRATION_LOCALE_DIR").expect("child config dir"),
+            );
+            crate::i18n::init("fr", &dir);
+            crate::config::ensure_and_load(&dir).expect("later migration load");
+            eprintln!("BEFORE-EMIT");
+            crate::config::emit_startup_notices();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::config_path(dir.path());
+        std::fs::write(
+            &config,
+            "locale = \"fr\"\n\n[keybindings]\n\"input_bar.clear_input\" = \"ctrl+u\"\n",
+        )
+        .unwrap();
+        let before = std::fs::read(&config).unwrap();
+        let catalogue = dir.path().join("data/ftl/fr");
+        std::fs::create_dir_all(&catalogue).unwrap();
+        std::fs::write(
+            catalogue.join("zerocode.ftl"),
+            "zc-config-migration-lock-skipped = LATER-MIGRATION-MARKER { $path }\nzc-config-lock-not-regular = LATER-LOCK-MARKER { $path }\n",
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join(".zerocode-config.lock")).unwrap();
+
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("current zerocode test binary path"),
+        )
+        .args([
+            "connection_tests::later_migration_lock_failure_is_reported_immediately",
+            "--exact",
+            "--nocapture",
+        ])
+        .env("ZEROCODE_MIGRATION_LATER_CHILD", "1")
+        .env("ZEROCODE_MIGRATION_LOCALE_DIR", dir.path())
+        .env_remove("ZEROCLAW_CONFIG_DIR")
+        .env_remove("ZEROCODE_LOCALE_DIR")
+        .env_remove("ZEROCODE_locale")
+        .output()
+        .expect("spawn later-migration child");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "child failed: {stderr}\n{stdout}");
+        let (printed, drained) = stderr
+            .split_once("BEFORE-EMIT")
+            .expect("child must mark the startup drain");
+        assert!(
+            printed.contains("LATER-MIGRATION-MARKER"),
+            "a load after i18n::init must print the skipped migration, got: {stderr}"
+        );
+        assert_eq!(
+            printed.matches("LATER-MIGRATION-MARKER").count(),
+            1,
+            "one load must not print the warning twice: {printed}"
+        );
+        assert!(
+            !drained.contains("LATER-MIGRATION-MARKER"),
+            "the warning must not also be left for emit_startup_notices: {drained}"
+        );
+        assert_eq!(
+            std::fs::read(&config).unwrap(),
+            before,
+            "a refused lock must leave the file unchanged"
+        );
+    }
+
     #[test]
     fn explicit_relay_enroll_uses_relay_route() {
         let cli = Cli::parse_from([
