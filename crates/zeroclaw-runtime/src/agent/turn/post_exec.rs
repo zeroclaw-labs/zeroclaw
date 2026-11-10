@@ -5,7 +5,7 @@ use super::call_prep::StreamToolCall;
 use super::context::TurnCtx;
 use super::events::{ProgressEvent, StreamDelta, send_progress};
 use super::redact::scrub_credentials;
-use crate::agent::tool_execution::CompletedToolExecution;
+use crate::agent::tool_execution::{CompletedToolExecution, ToolExecutionOutcome};
 use zeroclaw_tool_call_parser::ParsedToolCall;
 
 /// Record each executed tool call's outcome (upstream loop body,
