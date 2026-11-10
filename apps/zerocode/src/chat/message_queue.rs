@@ -115,8 +115,7 @@ impl MessageQueue {
         if self.items.len() >= Self::CAPACITY {
             return Err((AdmissionError::Full, attachments));
         }
-        let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1);
+        let id = self.alloc_id();
         let message = QueuedMessage {
             id,
             text,
@@ -128,6 +127,12 @@ impl MessageQueue {
             QueueItemStatus::Injected => self.items.insert(self.injected_insert_at(), message),
         }
         Ok(())
+    }
+
+    fn alloc_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        id
     }
 
     fn injected_insert_at(&self) -> usize {
@@ -164,6 +169,24 @@ impl MessageQueue {
             self.selected = None;
         }
         Some(message)
+    }
+
+    /// Return a message the daemon refused before its turn started
+    /// (`SESSION_BUSY`) to the front of the queue and pause. It comes back as
+    /// `Pending` even if it was injected, because injected items bypass the
+    /// pause and would be re-sent straight into the busy session. Capacity is
+    /// not checked: the message already held a slot when it was dispatched,
+    /// and refusing it here would lose what the user typed.
+    pub(super) fn requeue_refused(&mut self, text: String, attachments: Vec<PendingAttachment>) {
+        let id = self.alloc_id();
+        self.items.push_front(QueuedMessage {
+            id,
+            text,
+            attachments,
+            status: QueueItemStatus::Pending,
+        });
+        self.paused = Some(QueuePauseReason::Generic);
+        self.reset_resume_override();
     }
 
     pub(super) fn toggle_pause(&mut self) -> bool {

@@ -556,6 +556,7 @@ mod tests {
             "everforest_dark",
             "material_light",
             "hacker_green",
+            "oxocarbon",
         ] {
             assert!(
                 theme_by_name(name).is_some(),

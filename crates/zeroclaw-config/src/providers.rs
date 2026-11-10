@@ -233,6 +233,7 @@ macro_rules! emit_model_providers_struct {
         #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
         #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
         #[prefix = "providers.models"]
+        #[application = "model_provider_refresh"]
         pub struct ModelProviders {
             $(
                 #[serde(default, skip_serializing_if = "HashMap::is_empty")]

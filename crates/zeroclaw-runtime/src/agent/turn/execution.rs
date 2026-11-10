@@ -45,6 +45,10 @@ pub struct SettledAttemptSummary {
     pub output_tokens: Option<u64>,
     pub cost_usd: Option<f64>,
     pub accepted: bool,
+    /// Display-only estimate of the summary request's input tokens, set by
+    /// the caller when the provider omitted `input_tokens`. Rejected attempts
+    /// leave this `None`; accounting reads only `input_tokens`.
+    pub estimated_input_tokens: Option<u64>,
 }
 
 /// Append summaries for the billable subset of `attempts` as rejected
@@ -64,6 +68,7 @@ fn extend_rejected_summaries(out: &mut Vec<SettledAttemptSummary>, attempts: &[A
                 billable.usage,
             ),
             accepted: false,
+            estimated_input_tokens: None,
         });
     }
 }
@@ -171,6 +176,11 @@ impl ResolvedModelAccess<'_> {
                         .and_then(|usage| usage.output_tokens),
                     cost_usd: accepted_cost_usd,
                     accepted: true,
+                    // The caller (max_iter) fills this from the summary
+                    // request's message history when the provider omitted
+                    // `input_tokens`, so the context meter keeps its numerator
+                    // after the final-summary event.
+                    estimated_input_tokens: None,
                 });
                 Ok(response)
             }
@@ -229,6 +239,7 @@ pub struct ResolvedAgentExecution<'a> {
     pub parallel_tools: bool,
     /// Truncation limit for tool outputs.
     pub max_tool_result_chars: usize,
+    pub keep_tool_context_turns: usize,
     /// Capacity and proactive-trim budget resolved together for the selected
     /// route at the turn boundary.
     pub context_limits: ResolvedContextLimits,
@@ -276,6 +287,7 @@ pub struct ResolvedRuntimeKnobs<'a> {
     pub strict_tool_parsing: bool,
     pub parallel_tools: bool,
     pub max_tool_result_chars: usize,
+    pub keep_tool_context_turns: usize,
     pub context_limits: ResolvedContextLimits,
     /// Single live limits authority; see [`ResolvedAgentExecution::context_limits_resolver`].
     pub context_limits_resolver: Option<ContextLimitsResolver>,
@@ -307,6 +319,7 @@ impl<'a> ResolvedAgentExecution<'a> {
             strict_tool_parsing: runtime.strict_tool_parsing,
             parallel_tools: runtime.parallel_tools,
             max_tool_result_chars: runtime.max_tool_result_chars,
+            keep_tool_context_turns: runtime.keep_tool_context_turns,
             context_limits: runtime.context_limits,
             context_limits_resolver: runtime.context_limits_resolver,
             receipt_generator: io.receipt_generator,

@@ -82,6 +82,13 @@ pub enum PropKind {
     StringArray,
     ObjectArray,
     Object,
+    /// Container row for a `#[secret] HashMap<String, String>` field (MCP
+    /// `env`/`headers`, provider `extra_headers`, …). The row exists so
+    /// surfaces can offer "add key" even when the map is empty; its display
+    /// value lists key names only, never values. Individual entries are the
+    /// `<path>.<KEY>` rows: set one to add/replace it, set it to the empty
+    /// string (`config delete`) to remove it.
+    SecretMap,
 }
 
 /// Maps Rust types to PropKind at compile time.
@@ -349,6 +356,23 @@ impl std::fmt::Display for ConfigTab {
     }
 }
 
+/// Setup information for a field required by a covered configuration contract.
+/// Absence of this metadata means the requirement is unknown.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ConfigFieldSetup {
+    pub missing: bool,
+}
+
+/// Potential application mechanism, not evidence of consumer adoption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ApplicationCapability {
+    #[default]
+    ReloadRequired,
+    ModelProviderRefresh,
+}
+
 /// Describes a single property field discovered via `#[derive(Configurable)]`.
 #[derive(Clone)]
 pub struct PropFieldInfo {
@@ -379,6 +403,8 @@ pub struct PropFieldInfo {
     pub derived_from_secret: bool,
     /// Explicit security classification for credential-shaped surfaces.
     pub credential_class: Option<CredentialSurfaceClass>,
+    /// Conservative schema-owned application capability.
+    pub application: ApplicationCapability,
     /// Tab grouping for this field. `ConfigTab::None` when the field has
     /// no tab annotation (flat display, no tab bar).
     pub tab: ConfigTab,
@@ -388,6 +414,9 @@ pub struct PropFieldInfo {
     /// should render a multi-line text area (e.g. a PEM key body) rather
     /// than a single-line input.
     pub multiline: bool,
+    /// Derived from typed config independently of secret display masking. Present only
+    /// for fields required by a covered setup contract.
+    pub setup: Option<ConfigFieldSetup>,
 }
 
 impl PropKind {
@@ -405,6 +434,7 @@ impl PropKind {
             Self::StringArray => "string_array",
             Self::ObjectArray => "object_array",
             Self::Object => "object",
+            Self::SecretMap => "secret_map",
         }
     }
 }
@@ -422,6 +452,7 @@ impl std::fmt::Debug for PropFieldInfo {
             .field("kind", &self.kind)
             .field("is_secret", &self.is_secret)
             .field("credential_class", &self.credential_class)
+            .field("application", &self.application)
             .field("tab", &self.tab)
             .finish_non_exhaustive()
     }
@@ -855,6 +886,9 @@ pub struct ConfigFieldEntry {
     /// instead of a single-line input.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub multiline: bool,
+    /// A present entry identifies a required field. Absence is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<ConfigFieldSetup>,
 }
 
 impl ConfigFieldEntry {
@@ -888,6 +922,7 @@ impl ConfigFieldEntry {
             tab: info.tab,
             alias_source: info.alias_source,
             multiline: info.multiline,
+            setup: info.setup,
         }
     }
 }

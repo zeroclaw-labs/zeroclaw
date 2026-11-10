@@ -31,12 +31,23 @@
 #   services.zeroclaw.instances.me = {
 #     environmentFile = "/run/agenix/zeroclaw-bot-token";
 #     settings = {
-#       default_provider = "anthropic";
-#       default_model = "claude-sonnet-4-6";
-#       channels.telegram = {
+#       schema_version = 4;   # always set it; see the `settings` option
+#       providers.models.anthropic.default.model = "claude-sonnet-4-6";
+#       agents.default = {
+#         model_provider = "anthropic.default";
+#         risk_profile = "default";
+#         runtime_profile = "default";
+#       };
+#       risk_profiles.default = { };
+#       runtime_profiles.default = { };
+#       channels.telegram.default = {
 #         enabled = true;
 #         bot_token = "$BOT_TOKEN";   # systemd $VAR — substituted at load
-#         allowed_users = [ "12345" ];
+#       };
+#       peer_groups.telegram_default = {
+#         channel = "telegram";
+#         agents = [ "default" ];
+#         external_peers = [ "12345" ];
 #       };
 #     };
 #   };
@@ -167,17 +178,34 @@ let
           default = { };
           example = literalExpression ''
             {
-              default_provider = "anthropic";
-              default_model = "claude-sonnet-4-6";
-              channels.telegram = {
+              schema_version = 4;
+              providers.models.anthropic.default.model = "claude-sonnet-4-6";
+              agents.default = {
+                model_provider = "anthropic.default";
+                risk_profile = "default";
+                runtime_profile = "default";
+              };
+              risk_profiles.default = { };
+              runtime_profiles.default = { };
+              channels.telegram.default = {
                 enabled = true;
                 bot_token = "$BOT_TOKEN";
-                allowed_users = [ "12345" ];
+              };
+              peer_groups.telegram_default = {
+                channel = "telegram";
+                agents = [ "default" ];
+                external_peers = [ "12345" ];
               };
             }
           '';
           description = ''
-            ZeroClaw configuration as a Nix attrset. Rendered to TOML in the
+            ZeroClaw configuration as a Nix attrset. Set `schema_version` to
+            the version the attrset is written for (`4` for the current
+            shape). The module renders the attrset as written and does not add
+            it: a file without it is read as the oldest schema and migrated,
+            unless its sections are plainly in the current shape.
+
+            Rendered to TOML in the
             Nix store at build time, then `envsubst`'d into
             `''${dataDir}/config.toml` (mode `0600`) by the unit's
             `ExecStartPre`.
@@ -408,8 +436,17 @@ let
         ProtectHostname = true;
         ProtectProc = "invisible";
         ProcSubset = "pid";
-        # MemoryDenyWriteExecute=yes blocks W+X mappings; safe for a
-        # Rust binary with no JIT. ZeroClaw 0.7.x has no JIT path.
+        # MemoryDenyWriteExecute=yes forbids memory that becomes executable
+        # after it is written. The package built from the distribution
+        # feature list carries the WASM plugin host, whose compiler writes
+        # code into memory and then marks it executable, so under this unit
+        # every plugin load fails with a memory-protection error while the
+        # rest of the daemon, which needs no such transition, runs normally.
+        # That is the intended default:
+        # plugins are off unless the operator enables them. An instance that
+        # runs plugins must override this setting on its own unit:
+        #   systemd.services."zeroclaw-<name>".serviceConfig.MemoryDenyWriteExecute =
+        #     lib.mkForce false;
         MemoryDenyWriteExecute = true;
         # PrivateUsers=yes runs the unit in its own user namespace. The
         # StateDirectory= bind-mount happens in the host namespace

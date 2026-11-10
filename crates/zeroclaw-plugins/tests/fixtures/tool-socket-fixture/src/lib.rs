@@ -24,8 +24,17 @@ mod component {
         ConnectMode, ConnectRequest, Connection, ReceiveEvent, SocketError, connect,
     };
 
-    /// Receive polls before giving up. Each idle poll yields to the host.
-    const RECEIVE_POLLS: usize = 5_000;
+    /// Receive polls before giving up. Every poll is one of the frame's host
+    /// calls, and a frame that spends the host's budget of 1,000 gets
+    /// `host-unavailable`, so this stays well inside it even for STARTTLS,
+    /// which waits twice.
+    const RECEIVE_POLLS: usize = 400;
+
+    /// Pause after an idle poll. `receive` never blocks, so a loop that does
+    /// not pause spends its whole budget within milliseconds, sooner than a
+    /// loaded machine completes a loopback TLS echo. The sleep is a WASI clock
+    /// wait: the host runs the peer meanwhile, and it costs no host call.
+    const IDLE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
 
     struct SocketFixtureTool;
 
@@ -49,7 +58,7 @@ mod component {
         for _ in 0..RECEIVE_POLLS {
             match receive().map_err(failure)? {
                 ReceiveEvent::Data(bytes) => return Ok(bytes),
-                ReceiveEvent::Idle => {}
+                ReceiveEvent::Idle => std::thread::sleep(IDLE_BACKOFF),
                 ReceiveEvent::Closed(reason) => return Err(format!("closed:{reason:?}")),
             }
         }

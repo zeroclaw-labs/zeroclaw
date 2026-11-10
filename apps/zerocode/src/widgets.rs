@@ -104,6 +104,10 @@ use ratatui::{
 /// Returns `None` from `widget()` when there is nothing to show.
 pub struct CtxBar {
     pub input_tokens: Option<u64>,
+    /// Provenance of `input_tokens` ("provider" or "estimate"). When the count
+    /// is estimated the label is prefixed with `~` so a derived value is never
+    /// presented with the same authority as provider-reported usage.
+    pub input_tokens_source: Option<String>,
     /// Preemptive-trim budget: the point where history trimming triggers.
     pub max_tokens: Option<u64>,
     /// Model's full context window. When present it is the bar denominator, and
@@ -115,13 +119,27 @@ pub struct CtxBar {
 impl CtxBar {
     pub fn new(
         input_tokens: Option<u64>,
+        input_tokens_source: Option<String>,
         max_tokens: Option<u64>,
         model_window: Option<u64>,
     ) -> Self {
         Self {
             input_tokens,
+            input_tokens_source,
             max_tokens,
             model_window,
+        }
+    }
+
+    /// `~` when the displayed count is an estimate, otherwise a space.
+    ///
+    /// A dedicated marker column keeps the estimated and measured forms the
+    /// same width, so turning provenance on cannot shift the rest of the
+    /// status bar.
+    fn approx_marker(&self) -> &'static str {
+        match self.input_tokens_source.as_deref() {
+            Some("estimate") => "~",
+            _ => " ",
         }
     }
 
@@ -154,8 +172,9 @@ impl CtxBar {
                     *cell = '\u{2502}'; // │ trim-budget marker
                 }
                 let bar: String = cells.into_iter().collect();
+                let approx = self.approx_marker();
                 let label = format!(
-                    " ctx: {:>7} / {:>7}  [{}]  {:.0}%",
+                    " ctx: {approx}{:>7} / {:>7}  [{}]  {approx}{:.0}%",
                     fmt_tokens(used),
                     fmt_tokens(total),
                     bar,
@@ -164,7 +183,7 @@ impl CtxBar {
                 (label, Some(pct))
             }
             (Some(used), None) => {
-                let label = format!(" ctx: {} tokens", fmt_tokens(used));
+                let label = format!(" ctx: {}{} tokens", self.approx_marker(), fmt_tokens(used));
                 (label, None)
             }
             _ => return None,
@@ -213,7 +232,12 @@ mod context_bar_tests {
 
     #[test]
     fn model_window_is_denominator_and_budget_is_marker() {
-        let rendered = render(CtxBar::new(Some(100_000), Some(180_000), Some(200_000)));
+        let rendered = render(CtxBar::new(
+            Some(100_000),
+            None,
+            Some(180_000),
+            Some(200_000),
+        ));
         assert!(rendered.contains("100,000 / 200,000"));
         assert!(rendered.contains('│'));
         assert!(rendered.contains("50%"));
@@ -221,10 +245,72 @@ mod context_bar_tests {
 
     #[test]
     fn missing_model_window_keeps_legacy_budget_denominator() {
-        let rendered = render(CtxBar::new(Some(16_000), Some(32_000), None));
+        let rendered = render(CtxBar::new(Some(16_000), None, Some(32_000), None));
         assert!(rendered.contains("16,000 /  32,000"));
         assert!(!rendered.contains('│'));
         assert!(rendered.contains("50%"));
+    }
+
+    #[test]
+    fn estimated_count_renders_an_approximation_marker() {
+        let rendered = render(CtxBar::new(
+            Some(100_000),
+            Some("estimate".to_string()),
+            Some(180_000),
+            Some(200_000),
+        ));
+        assert!(
+            rendered.contains("~100,000"),
+            "estimated count must be marked approximate: {rendered}"
+        );
+        assert!(
+            rendered.contains("~50%"),
+            "estimated percentage must be marked approximate: {rendered}"
+        );
+    }
+
+    #[test]
+    fn provider_reported_count_renders_without_an_approximation_marker() {
+        let rendered = render(CtxBar::new(
+            Some(100_000),
+            Some("provider".to_string()),
+            Some(180_000),
+            Some(200_000),
+        ));
+        assert!(rendered.contains("100,000 / 200,000"));
+        assert!(
+            !rendered.contains('~'),
+            "measured usage must not be marked approximate: {rendered}"
+        );
+        assert!(
+            rendered.contains(" ctx:  100,000 / 200,000"),
+            "measured form reserves the marker column so widths stay stable: {rendered}"
+        );
+    }
+
+    #[test]
+    fn unknown_provenance_is_not_marked_approximate() {
+        let rendered = render(CtxBar::new(
+            Some(100_000),
+            None,
+            Some(180_000),
+            Some(200_000),
+        ));
+        assert!(!rendered.contains('~'));
+    }
+
+    #[test]
+    fn estimated_count_without_a_denominator_is_still_marked() {
+        let rendered = render(CtxBar::new(
+            Some(4_200),
+            Some("estimate".to_string()),
+            None,
+            None,
+        ));
+        assert!(
+            rendered.contains("~4,200 tokens"),
+            "bare-count form must also mark estimates: {rendered}"
+        );
     }
 }
 

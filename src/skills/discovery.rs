@@ -584,7 +584,10 @@ fn extract_zip(bytes: &[u8], destination: &Path) -> Result<()> {
         let mut entry = archive
             .by_index(index)
             .context("failed to read zip archive entry")?;
-        let raw = entry.name().to_string();
+        let raw = entry
+            .name()
+            .context("failed to read zip archive entry name")?
+            .into_owned();
         let relative = validate_archive_path(&raw)?;
         if !paths.insert(archive_path_key(&relative)) {
             bail!("archive contains duplicate path: {raw}")
