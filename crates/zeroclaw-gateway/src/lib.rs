@@ -13,6 +13,7 @@ pub mod api_browse;
 pub mod api_config;
 pub mod api_logs;
 pub mod api_oidc;
+mod api_oidc_enroll;
 pub mod api_pairing;
 pub mod api_personality;
 pub mod api_plugins;
@@ -33,6 +34,9 @@ pub mod api_webauthn;
 pub mod api_webhook;
 pub mod auth_rate_limit;
 pub mod canvas;
+mod chat_core;
+pub mod core_rpc;
+pub mod dashboard_core;
 pub mod dashboard_session;
 pub mod node_tool;
 pub mod nodes;
@@ -1403,14 +1407,30 @@ pub async fn run_gateway_with_plugin_webhooks(
         sop_driver_handles,
         dashboard_ingress,
     } = supervision;
-    let (shared_pairing, shared_inbound_auth, shared_config) = match daemon_authority {
-        Some(authority) => (
-            Some(authority.pairing),
-            Some(authority.inbound_auth),
-            Some(authority.config),
-        ),
-        None => (None, None, None),
-    };
+    let (shared_pairing, shared_inbound_auth, shared_config, shared_cert_audit) =
+        match daemon_authority {
+            Some(authority) => (
+                Some(authority.pairing),
+                Some(authority.inbound_auth),
+                Some(authority.config),
+                authority.cert_audit,
+            ),
+            None => (None, None, None, None),
+        };
+
+    // The in-process RPC seam: dial the daemon's dispatcher when a
+    // supervised run provides its connector, and hand the handle to every
+    // request as an extension so routes can migrate onto RPC one at a time.
+    // The gateway has no credential of its own yet, so the dial is refused
+    // and the seam stays idle until that credential exists; it never rides
+    // the daemon's anonymous compatibility path.
+    let core_rpc = core_rpc::CoreRpc::default();
+    if let Some(connector) = reload_controls
+        .as_ref()
+        .and_then(|controls| controls.inproc.clone())
+    {
+        core_rpc.attach_inproc(connector, zeroclaw_rpc_client::ConnectOptions::default());
+    }
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host)
         && config.tunnel.tunnel_provider == "none"
@@ -2527,6 +2547,7 @@ pub async fn run_gateway_with_plugin_webhooks(
             &state.config,
         )))
         .merge(api_oidc::routes())
+        .merge(api_oidc_enroll::routes(Arc::clone(&inbound_auth), shared_cert_audit))
         // ── Admin routes (for CLI management) ──
         .route("/admin/shutdown", post(handle_admin_shutdown))
         .route("/admin/reload", post(handle_admin_reload))
@@ -2549,7 +2570,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         .merge(optional_channel_routes())
         .merge(optional_tool_routes())
         // ── Web Dashboard API routes ──
-        .route("/api/status", get(api::handle_api_status))
+        .route("/api/status", get(dashboard_core::status))
         .route("/api/version/check", get(version::handle_version_check))
         .route("/api/version/upgrade", post(version::handle_version_upgrade))
         .route(
@@ -2711,15 +2732,16 @@ pub async fn run_gateway_with_plugin_webhooks(
         )
         .route("/api/health", get(api::handle_api_health))
         .route("/api/tuis", get(api::handle_api_tuis))
-        .route("/api/sessions", get(api::handle_api_sessions_list))
+        .route("/api/sessions", get(dashboard_core::sessions_list))
         .route("/api/sessions/running", get(api::handle_api_sessions_running))
         .route(
             "/api/sessions/{id}/messages",
-            get(api::handle_api_session_messages).post(api::handle_api_session_message_post),
+            get(dashboard_core::session_messages).post(api::handle_api_session_message_post),
         )
-        .route("/api/sessions/{id}", delete(api::handle_api_session_delete).put(api::handle_api_session_rename))
+        .route("/api/sessions/{id}", delete(dashboard_core::session_delete).put(dashboard_core::session_rename))
         .route("/api/sessions/{id}/state", get(api::handle_api_session_state))
-        .route("/api/sessions/{id}/abort", post(api::handle_api_session_abort))
+        .route("/api/sessions/{id}/abort", post(dashboard_core::session_abort))
+        .route("/api/agents/available", get(dashboard_core::agents_available))
         // ── Pairing + Device management API ──
         .route(
             "/api/pairing/initiate",
@@ -2858,7 +2880,9 @@ pub async fn run_gateway_with_plugin_webhooks(
             Duration::from_secs(gateway_long_running_request_timeout_secs(&config.gateway)),
         ));
 
-    let inner = inner.merge(long_running_router);
+    let inner = inner
+        .merge(long_running_router)
+        .layer(axum::Extension(core_rpc));
 
     // Nest under path prefix when configured (axum strips prefix before routing).
     // nest() at "/prefix" handles both "/prefix" and "/prefix/*" but not "/prefix/"
