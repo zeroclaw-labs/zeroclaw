@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::keymap::{overrides::OverrideTable, ChatTabAction, Chord, GlobalAction};
+use crate::keymap::{ChatTabAction, Chord, GlobalAction, overrides::OverrideTable};
 use crate::theme::{self, Theme};
 
 const FILE_NAME: &str = "zerocode-config.toml";
@@ -953,12 +953,18 @@ impl ConfigWriteLock {
                 Ok(()) => return Ok(Self { file }),
                 Err(std::fs::TryLockError::WouldBlock) => {
                     if std::time::Instant::now() >= deadline {
+                        let path_display = path.display().to_string();
+                        let seconds = wait.as_secs().to_string();
                         anyhow::bail!(
-                            "another process is updating {FILE_NAME} and still holds {} \
-                             after {}s. Let the other zerocode finish writing the config, \
-                             then try again.",
-                            path.display(),
-                            wait.as_secs()
+                            "{}",
+                            crate::i18n::t_args(
+                                "zc-zerocode-config-lock-timeout",
+                                &[
+                                    ("file", FILE_NAME),
+                                    ("path", &path_display),
+                                    ("seconds", &seconds),
+                                ],
+                            )
                         );
                     }
                     std::thread::sleep(CONFIG_LOCK_POLL);
@@ -1590,6 +1596,33 @@ mod tests {
     }
 
     #[test]
+    fn lock_timeout_names_the_sidecar_and_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), "locale = \"en\"\n");
+        let _guard = ConfigWriteLock::acquire(dir.path()).unwrap();
+        let err = ConfigWriteLock::acquire_within(dir.path(), std::time::Duration::from_millis(30))
+            .expect_err("held lock should time out");
+        let message = err.to_string();
+        assert!(
+            message.contains(FILE_NAME),
+            "timeout should name {FILE_NAME}: {message}"
+        );
+        assert!(
+            message.contains(CONFIG_LOCK_FILE_NAME),
+            "timeout should name {CONFIG_LOCK_FILE_NAME}: {message}"
+        );
+        assert!(
+            message.contains(
+                dir.path()
+                    .join(CONFIG_LOCK_FILE_NAME)
+                    .to_string_lossy()
+                    .as_ref()
+            ),
+            "timeout should include the sidecar path: {message}"
+        );
+    }
+
+    #[test]
     fn sidebar_and_theme_persists_keep_both_updates() {
         let dir = tempfile::tempdir().unwrap();
         seed(
@@ -1837,10 +1870,12 @@ mod tests {
         let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
         assert_eq!(doc["theme"]["name"].as_str(), Some("nord"));
         assert_eq!(doc["future"]["keep"].as_bool(), Some(true));
-        assert!(doc["keybindings"]
-            .as_table()
-            .unwrap()
-            .contains_key("dashboard.up"));
+        assert!(
+            doc["keybindings"]
+                .as_table()
+                .unwrap()
+                .contains_key("dashboard.up")
+        );
     }
 
     #[test]
@@ -2977,7 +3012,7 @@ mod tests {
     // variables through `ensure_and_load` rather than calling `set_prop`
     // directly, so the public spelling stays covered.
 
-    use crate::test_support::{env_test_lock, EnvVarGuard};
+    use crate::test_support::{EnvVarGuard, env_test_lock};
 
     #[test]
     fn canonical_env_spelling_overrides_tracker_field() {

@@ -97,6 +97,7 @@ zc-zerocode-config-invalid-number = Introduce un número entero positivo válido
 zc-zerocode-config-positive-required = Los valores numéricos deben ser mayores que cero.
 zc-zerocode-config-save-failed = Error al guardar: { $error }
 zc-zerocode-config-save-mismatch = Los valores guardados difieren de los que usarán las nuevas sesiones.
+zc-zerocode-config-lock-timeout = Otro proceso está actualizando { $file } y sigue reteniendo { $path } después de { $seconds }s. Deja que el otro zerocode termine de escribir la configuración e inténtalo de nuevo.
 zc-zerocode-help-todo-tracker = editar el campo del seguimiento de tareas
 zc-zerocode-locale-loading = cargando configuraciones regionales…
 zc-zerocode-locale-download = ⬇ Descargar archivo de la configuración regional seleccionada

@@ -97,6 +97,7 @@ zc-zerocode-config-invalid-number = 有効な正の整数を入力してくだ�
 zc-zerocode-config-positive-required = 数値は0より大きくする必要があります。
 zc-zerocode-config-save-failed = 保存に失敗しました: { $error }
 zc-zerocode-config-save-mismatch = 保存した値は、新しいセッションで使用される値と異なります。
+zc-zerocode-config-lock-timeout = 別のプロセスが { $file } を更新中で、{ $seconds } 秒経過後も { $path } を保持しています。もう一方の zerocode が設定の書き込みを終えてから再試行してください。
 zc-zerocode-help-todo-tracker = Todoトラッカーのフィールドを編集
 zc-zerocode-locale-loading = ロケールを読み込んでいます…
 zc-zerocode-locale-download = ⬇ 選択したロケールファイルをダウンロード

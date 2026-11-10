@@ -116,6 +116,7 @@ zc-zerocode-config-invalid-number = Enter a valid positive whole number.
 zc-zerocode-config-positive-required = Numeric values must be greater than zero.
 zc-zerocode-config-save-failed = Save failed: { $error }
 zc-zerocode-config-save-mismatch = Saved values differ from what new sessions will use.
+zc-zerocode-config-lock-timeout = Another process is updating { $file } and still holds { $path } after { $seconds }s. Let the other zerocode finish writing the config, then try again.
 zc-zerocode-help-todo-tracker = edit todo tracker field
 zc-zerocode-locale-loading = loading locales…
 zc-zerocode-locale-download = ⬇ Download selected locale file
