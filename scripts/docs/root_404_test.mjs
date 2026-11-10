@@ -59,6 +59,11 @@ test("without a stable pointer the target is master", () => {
   assert.equal(redirect("/v0.7.5/en/setup/linux.html", { target: "master" }), "/master/en/setup/linux.html");
 });
 
+test("a missing page under the redirect target is not sent to itself", () => {
+  assert.equal(redirect("/master/en/gone.html", { target: "master" }), null);
+  assert.equal(redirect("/master/fr/", { target: "master" }), null);
+});
+
 test("other missing paths stay on the not-found message", () => {
   for (const url of [
     "/stable/en/missing.html", // already under the alias: no loop
