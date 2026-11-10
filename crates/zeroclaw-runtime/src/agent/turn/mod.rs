@@ -3602,10 +3602,7 @@ async fn run_tool_call_loop_impl<'a>(
             &executed_completed_indices,
             &executed_completed_calls,
             &executed_completed_stream_calls,
-            executed_completed_outcomes
-                .into_iter()
-                .map(|completed| completed.outcome)
-                .collect(),
+            executed_completed_outcomes,
             &mut ordered_results,
             iteration,
         )
