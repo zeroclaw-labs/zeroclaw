@@ -33,6 +33,10 @@ pub async fn maybe_run_skill_review(
     provider: &dyn ModelProvider,
     provider_name: &str,
     model_name: &str,
+    // Reuse the parent's invocation override and thinking adjustment. Each
+    // selected model still resolves its own configured default; configless
+    // calls with no override keep temperature off the wire.
+    temperature: zeroclaw_providers::temperature::Temperature,
     observer: &dyn Observer,
     multimodal: &MultimodalConfig,
     pacing: &PacingConfig,
@@ -135,7 +139,7 @@ pub async fn maybe_run_skill_review(
                         provider_name,
                         model: model_name,
                         dispatch_model: model_name,
-                        temperature: Some(0.3).into(),
+                        temperature,
                     },
                     crate::agent::loop_::ResolvedIo {
                         tools_registry: &tools,
@@ -485,6 +489,114 @@ mod tests {
         assert_eq!(
             extract_action_summary(receipt),
             Some("archived old-thing".to_string())
+        );
+    }
+
+    struct RecordingTemperatureProvider {
+        temperatures: Mutex<Vec<Option<f64>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for RecordingTemperatureProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.temperatures.lock().unwrap().push(temperature);
+            Ok("Nothing to save.".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            self.temperatures.lock().unwrap().push(temperature);
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("Nothing to save.".into()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for RecordingTemperatureProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "RecordingTemperatureProvider"
+        }
+    }
+
+    async fn review_fork_temperatures(temperature: Option<f64>) -> Vec<Option<f64>> {
+        let provider = RecordingTemperatureProvider {
+            temperatures: Mutex::new(Vec::new()),
+        };
+        let workspace = tempfile::TempDir::new().unwrap();
+        let review_config = SkillImprovementConfig {
+            enabled: true,
+            cooldown_secs: 0,
+            nudge_interval_iterations: 1,
+            max_review_iterations: 2,
+        };
+        // One completed tool call so should_trigger at threshold 1 fires.
+        let history = vec![
+            msg("system", "test"),
+            msg("user", "hello"),
+            msg("assistant", "..."),
+            msg("tool", "ok"),
+        ];
+        maybe_run_skill_review(
+            None,
+            workspace.path().to_path_buf(),
+            review_config,
+            false,
+            history,
+            Vec::new(),
+            &provider,
+            "mock-provider",
+            "mock-model",
+            temperature.into(),
+            &crate::observability::noop::NoopObserver,
+            &MultimodalConfig::default(),
+            &PacingConfig::default(),
+            0,
+            0,
+            None,
+            None,
+            None,
+        )
+        .await;
+        provider.temperatures.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn skill_review_fork_omits_temperature_when_the_parent_turn_did() {
+        let seen = review_fork_temperatures(None).await;
+        assert!(!seen.is_empty(), "the review fork should call the provider");
+        assert!(
+            seen.iter().all(|t| t.is_none()),
+            "unset parent temperature must stay off the review fork wire, got {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_review_fork_uses_the_parent_turns_temperature() {
+        let seen = review_fork_temperatures(Some(0.7)).await;
+        assert!(!seen.is_empty(), "the review fork should call the provider");
+        assert!(
+            seen.iter().all(|t| *t == Some(0.7)),
+            "the review fork must reuse the parent turn temperature, got {seen:?}"
         );
     }
 }
