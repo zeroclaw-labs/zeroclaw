@@ -909,6 +909,7 @@ async fn run() -> anyhow::Result<()> {
         .resolve_locale()
         .unwrap_or_else(i18n::detect_locale);
     i18n::init(&resolved_locale, &local_config_dir);
+    config::emit_startup_notices();
     if let Some(Command::Login(args)) = &cli.command {
         return login::run(args, &cli, &local_config_dir).await;
     }
@@ -2591,7 +2592,13 @@ mod connection_tests {
             let dir = std::path::PathBuf::from(
                 std::env::var("ZEROCODE_MIGRATION_LOCALE_DIR").expect("child config dir"),
             );
-            let _ = crate::config::ensure_and_load(&dir);
+            let loaded = crate::config::ensure_and_load(&dir).expect("migration load");
+            let locale = loaded
+                .resolve_locale()
+                .unwrap_or_else(crate::i18n::detect_locale);
+            crate::i18n::init(&locale, &dir);
+            crate::config::emit_startup_notices();
+            println!("{}", crate::i18n::t("zc-config-invalid-saved-login"));
             return;
         }
 
@@ -2605,7 +2612,7 @@ mod connection_tests {
         std::fs::create_dir_all(&catalogue).unwrap();
         std::fs::write(
             catalogue.join("zerocode.ftl"),
-            "zc-config-migration-lock-skipped = SAVED-LOCALE-MARKER { $path }\n",
+            "zc-config-migration-lock-skipped = SAVED-LOCALE-MARKER { $path }\nzc-config-invalid-saved-login = SAVED-LATER-MARKER\nzc-config-lock-not-regular = SAVED-LOCK-MARKER { $path }\n",
         )
         .unwrap();
         std::fs::create_dir(dir.path().join(".zerocode-config.lock")).unwrap();
@@ -2630,9 +2637,14 @@ mod connection_tests {
             "child failed: {stderr}\n{}",
             String::from_utf8_lossy(&output.stdout)
         );
+        let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             stderr.contains("SAVED-LOCALE-MARKER"),
             "the warning must use the saved config directory's language, got: {stderr}"
+        );
+        assert!(
+            stdout.contains("SAVED-LATER-MARKER"),
+            "a later message must use the same saved language, got: {stdout}"
         );
         assert!(
             !stderr.contains("Could not lock"),
@@ -2649,7 +2661,11 @@ mod connection_tests {
             let dir = std::path::PathBuf::from(
                 std::env::var("ZEROCODE_MIGRATION_LOCALE_DIR").expect("child config dir"),
             );
-            crate::config::ensure_and_load(&dir).expect("migration load");
+            let loaded = crate::config::ensure_and_load(&dir).expect("migration load");
+            let locale = loaded
+                .resolve_locale()
+                .unwrap_or_else(crate::i18n::detect_locale);
+            crate::i18n::init(&locale, &dir);
             println!("{}", crate::i18n::t("zc-config-invalid-saved-login"));
             return;
         }

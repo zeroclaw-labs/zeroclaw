@@ -34,19 +34,6 @@ std::thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// Locale for a warning printed before `ensure_and_load` applies overrides.
-/// A non-empty `ZEROCODE_locale` wins, matching `apply_env_overrides` plus
-/// `resolve_locale`. The file locale is the fallback.
-fn startup_locale(config: &ZerocodeConfig) -> String {
-    if let Ok(value) = std::env::var("ZEROCODE_locale") {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            return crate::i18n::normalize_locale(trimmed);
-        }
-    }
-    config.resolve_locale().unwrap_or_else(|| "en".to_string())
-}
-
 fn migration_lock_wait() -> std::time::Duration {
     #[cfg(test)]
     if let Some(wait) = MIGRATION_LOCK_WAIT_OVERRIDE.get() {
@@ -1074,41 +1061,164 @@ pub(crate) fn load_persisted(config_dir: &Path) -> Result<ZerocodeConfig> {
                 // The first read ran without the lock. Do not publish that
                 // snapshot: a login saved after it would be discarded. Re-read
                 // under the same lock every other writer holds.
-                None => {
-                    // Startup has not called `i18n::init` yet. A warning or
-                    // lock error here would cache a language for the process,
-                    // and the later init cannot replace it. Use this config
-                    // directory and the same locale `ensure_and_load` will
-                    // resolve, including `ZEROCODE_locale`.
-                    crate::i18n::init(&startup_locale(&config), config_dir);
-                    match ConfigWriteLock::acquire_within(config_dir, migration_lock_wait()) {
-                        Ok(lock) => {
-                            write_lock = Some(lock);
-                            continue;
-                        }
-                        // Contention and a filesystem that refuses locks take the
-                        // same path. The snapshot already parsed is the saved
-                        // config, including its remote target. Rewriting is
-                        // optional; failing the load would make startup drop that
-                        // target and dial the local socket.
-                        Err(error) => {
-                            let path_label = path.display().to_string();
-                            eprintln!(
-                                "{}",
-                                crate::i18n::t_args(
-                                    "zc-config-migration-lock-skipped",
-                                    &[("path", &path_label), ("error", &format!("{error:#}"))],
-                                )
-                            );
-                            return Ok(config);
-                        }
+                None => match ConfigWriteLock::acquire_within(config_dir, migration_lock_wait()) {
+                    Ok(lock) => {
+                        write_lock = Some(lock);
+                        continue;
                     }
-                }
+                    // Contention and a filesystem that refuses locks take the
+                    // same path. The snapshot already parsed is the saved
+                    // config, including its remote target. Rewriting is
+                    // optional; failing the load would make startup drop that
+                    // target and dial the local socket.
+                    // Do not format this here. `t_args` would cache a
+                    // language and `CONFIG_DIR` before startup applies
+                    // environment overrides and its own init, and those
+                    // caches cannot be replaced. The notice is printed
+                    // after that init.
+                    Err(error) => {
+                        push_startup_notice(StartupNotice {
+                            path: path.display().to_string(),
+                            failure: pending_lock_failure(&error),
+                        });
+                        return Ok(config);
+                    }
+                },
                 Some(lock) => write_document(&path, &doc, lock)?,
             }
         }
 
         return Ok(config);
+    }
+}
+
+/// A migration-lock failure kept for startup to print after `i18n::init`.
+/// Formatting it inside the loader would cache the wrong language.
+struct StartupNotice {
+    path: String,
+    failure: PendingLockFailure,
+}
+
+enum PendingLockFailure {
+    Timeout {
+        config: String,
+        lock: String,
+        seconds: u64,
+    },
+    NotRegular {
+        path: String,
+    },
+    Other(String),
+}
+
+std::thread_local! {
+    static STARTUP_NOTICES: std::cell::RefCell<Vec<StartupNotice>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn push_startup_notice(notice: StartupNotice) {
+    STARTUP_NOTICES.with(|notices| notices.borrow_mut().push(notice));
+}
+
+fn pending_lock_failure(error: &anyhow::Error) -> PendingLockFailure {
+    if let Some(timeout) = error.downcast_ref::<ConfigLockTimeout>() {
+        return PendingLockFailure::Timeout {
+            config: timeout.config.clone(),
+            lock: timeout.lock.clone(),
+            seconds: timeout.seconds,
+        };
+    }
+    if let Some(not_regular) = error.downcast_ref::<ConfigLockNotRegular>() {
+        return PendingLockFailure::NotRegular {
+            path: not_regular.path.clone(),
+        };
+    }
+    PendingLockFailure::Other(format!("{error:#}"))
+}
+
+/// Print migration-lock warnings using the locale startup just initialized.
+pub(crate) fn emit_startup_notices() {
+    let notices = STARTUP_NOTICES.with(|notices| std::mem::take(&mut *notices.borrow_mut()));
+    for notice in notices {
+        let detail = match notice.failure {
+            PendingLockFailure::Timeout {
+                config,
+                lock,
+                seconds,
+            } => {
+                let seconds = seconds.to_string();
+                crate::i18n::t_args(
+                    "zc-config-save-lock-timeout",
+                    &[
+                        ("config", config.as_str()),
+                        ("lock", lock.as_str()),
+                        ("seconds", seconds.as_str()),
+                    ],
+                )
+            }
+            PendingLockFailure::NotRegular { path } => {
+                crate::i18n::t_args("zc-config-lock-not-regular", &[("path", path.as_str())])
+            }
+            PendingLockFailure::Other(message) => message,
+        };
+        eprintln!(
+            "{}",
+            crate::i18n::t_args(
+                "zc-config-migration-lock-skipped",
+                &[("path", notice.path.as_str()), ("error", detail.as_str())],
+            )
+        );
+    }
+}
+
+#[derive(Debug)]
+struct ConfigLockTimeout {
+    config: String,
+    lock: String,
+    seconds: u64,
+}
+
+impl std::fmt::Display for ConfigLockTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let seconds = self.seconds.to_string();
+        formatter.write_str(&crate::i18n::t_args(
+            "zc-config-save-lock-timeout",
+            &[
+                ("config", self.config.as_str()),
+                ("lock", self.lock.as_str()),
+                ("seconds", seconds.as_str()),
+            ],
+        ))
+    }
+}
+
+impl std::error::Error for ConfigLockTimeout {}
+
+#[derive(Debug)]
+struct ConfigLockNotRegular {
+    path: String,
+}
+
+impl std::fmt::Display for ConfigLockNotRegular {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&crate::i18n::t_args(
+            "zc-config-lock-not-regular",
+            &[("path", self.path.as_str())],
+        ))
+    }
+}
+
+impl std::error::Error for ConfigLockNotRegular {}
+
+fn reject_non_regular_lock(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(_) => Err(ConfigLockNotRegular {
+            path: path.display().to_string(),
+        }
+        .into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
     }
 }
 
@@ -1142,6 +1252,10 @@ impl ConfigWriteLock {
         std::fs::create_dir_all(config_dir)
             .with_context(|| format!("creating config dir {}", config_dir.display()))?;
         let path = config_dir.join(CONFIG_LOCK_FILE);
+        // A directory or symlink is rejected before open, including on
+        // Windows where `O_NOFOLLOW` is unavailable. Opening it would either
+        // fail with a generic `EISDIR` or follow the link onto another inode.
+        reject_non_regular_lock(&path)?;
         let mut options = std::fs::OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
         #[cfg(unix)]
@@ -1160,11 +1274,10 @@ impl ConfigWriteLock {
             .metadata()
             .with_context(|| format!("reading metadata for {}", path.display()))?;
         if !metadata.is_file() {
-            let path_label = path.display().to_string();
-            bail!(crate::i18n::t_args(
-                "zc-config-lock-not-regular",
-                &[("path", &path_label)],
-            ));
+            return Err(ConfigLockNotRegular {
+                path: path.display().to_string(),
+            }
+            .into());
         }
         #[cfg(unix)]
         {
@@ -1180,13 +1293,12 @@ impl ConfigWriteLock {
                 Ok(()) => return Ok(Self { file }),
                 Err(std::fs::TryLockError::WouldBlock) => {
                     if std::time::Instant::now() >= deadline {
-                        let config = config_path(config_dir).display().to_string();
-                        let lock = path.display().to_string();
-                        let seconds = wait.as_secs().to_string();
-                        bail!(crate::i18n::t_args(
-                            "zc-config-save-lock-timeout",
-                            &[("config", &config), ("lock", &lock), ("seconds", &seconds),],
-                        ));
+                        return Err(ConfigLockTimeout {
+                            config: config_path(config_dir).display().to_string(),
+                            lock: path.display().to_string(),
+                            seconds: wait.as_secs(),
+                        }
+                        .into());
                     }
                     std::thread::sleep(CONFIG_LOCK_POLL);
                 }

@@ -923,5 +923,5 @@ zc-login-stage-credentials = Could not stage replacement device credentials; the
 # apps/zerocode/src/config/mod.rs. Shared by login, startup renewal, and every other config save.
 zc-config-save-lock-timeout = Another process is saving { $config } and still holds { $lock } after { $seconds }s. Let the other zerocode finish saving, then try again.
 zc-config-invalid-saved-login = Saved login configuration is invalid. Zerocode will not use a different login's credentials.
-zc-config-migration-lock-skipped = Could not lock { $path } to update saved keybindings ({ $error }). The loaded configuration was kept and the file was not changed. The update will run on the next start.
+zc-config-migration-lock-skipped = Could not lock { $path } to update saved keybindings ({ $error }). The loaded configuration was kept and the file was not changed. Zerocode will try the update again the next time it can lock the file.
 zc-config-lock-not-regular = { $path } is not a regular file, so it cannot be used as the config lock.
