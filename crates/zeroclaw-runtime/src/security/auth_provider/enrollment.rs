@@ -263,6 +263,24 @@ impl Enrollment {
     /// Start the Device Authorization Grant: returns the user code and
     /// verification URI to show the human, plus the polling parameters.
     pub async fn device_grant_start(&self) -> Result<DeviceGrantStart> {
+        self.device_grant_start_s256(None).await
+    }
+
+    /// Device authorization bound to an optional client-held S256 verifier.
+    /// The gateway relays only the challenge; it never stores the verifier.
+    pub async fn device_grant_start_s256(
+        &self,
+        challenge: Option<&str>,
+    ) -> Result<DeviceGrantStart> {
+        if let Some(challenge) = challenge {
+            anyhow::ensure!(
+                challenge.len() == 43
+                    && challenge
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+                "invalid S256 code challenge"
+            );
+        }
         let discovery = self.discovery().await?;
         let Some(endpoint) = discovery.device_authorization_endpoint else {
             bail!(
@@ -272,6 +290,10 @@ impl Enrollment {
             );
         };
         let mut form = vec![("scope", "openid".to_string())];
+        if let Some(challenge) = challenge {
+            form.push(("code_challenge_method", "S256".into()));
+            form.push(("code_challenge", challenge.to_string()));
+        }
         let request = self.with_client_auth(self.http.post(&endpoint), &mut form);
         let response = request.form(&form).send().await?;
         let response =
@@ -287,6 +309,24 @@ impl Enrollment {
 
     /// One poll of the token endpoint for an in-flight device grant.
     pub async fn device_grant_poll(&self, device_code: &str) -> Result<DevicePollOutcome> {
+        self.device_grant_poll_s256(device_code, None).await
+    }
+
+    /// Redeem a PKCE-bound device grant without retaining the secret verifier.
+    pub async fn device_grant_poll_s256(
+        &self,
+        device_code: &str,
+        verifier: Option<&str>,
+    ) -> Result<DevicePollOutcome> {
+        if let Some(verifier) = verifier {
+            anyhow::ensure!(
+                (43..=128).contains(&verifier.len())
+                    && verifier
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"-._~".contains(&b)),
+                "invalid PKCE verifier"
+            );
+        }
         let discovery = self.discovery().await?;
         let mut form = vec![
             (
@@ -295,6 +335,9 @@ impl Enrollment {
             ),
             ("device_code", device_code.to_string()),
         ];
+        if let Some(verifier) = verifier {
+            form.push(("code_verifier", verifier.to_string()));
+        }
         let request = self.with_client_auth(self.http.post(&discovery.token_endpoint), &mut form);
         let response = request.form(&form).send().await?;
         let response = Self::refuse_redirect(response, "token endpoint")?;
@@ -2320,5 +2363,58 @@ mod tests {
             let err = result.unwrap_err();
             assert!(err.to_string().contains("mix-up"), "{err}");
         }
+    }
+    #[tokio::test]
+    async fn device_pkce_s256_is_forwarded_without_changing_legacy_flow() {
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        Mock::given(method("GET")).and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer":issuer,"device_authorization_endpoint":format!("{issuer}/device"), "token_endpoint":format!("{issuer}/token")
+            }))).mount(&server).await;
+        Mock::given(method("POST")).and(path("/device"))
+            .and(body_string_contains("code_challenge_method=S256"))
+            .and(body_string_contains("code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"device_code":"dev-pkce","user_code":"ABCD","verification_uri":"https://issuer.example/activate","expires_in":600})))
+            .expect(1).mount(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains(
+                "code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"access_token":"synthetic-token","token_type":"Bearer"}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let entry = config(&issuer, None);
+        let enrollment = Enrollment::new("test", entry).unwrap();
+        let start = enrollment
+            .device_grant_start_s256(Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            enrollment
+                .device_grant_poll_s256(
+                    &start.device_code,
+                    Some("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk")
+                )
+                .await
+                .unwrap(),
+            DevicePollOutcome::Token(_)
+        ));
+        assert!(
+            enrollment
+                .device_grant_start_s256(Some("plain"))
+                .await
+                .is_err()
+        );
+        assert!(
+            enrollment
+                .device_grant_poll_s256("dev", Some("invalid"))
+                .await
+                .is_err()
+        );
     }
 }
