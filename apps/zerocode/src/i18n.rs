@@ -46,6 +46,23 @@ pub fn init(locale: &str, config_dir: &std::path::Path) {
     FTL_BUNDLES.get_or_init(|| load_ftl_bundles(locale));
 }
 
+/// Whether [`init`] has already bound this process to a config directory.
+///
+/// `t` and `t_args` can fill their caches without this, and those caches
+/// cannot be replaced. Callers that format user-facing text before `init`
+/// must keep the message as data and print it afterwards.
+pub(crate) fn is_initialized() -> bool {
+    CONFIG_DIR.get().is_some()
+}
+
+/// Initialise from a config directory before a startup error is printed.
+/// A missing or unreadable locale falls back to English. The embedded catalogue
+/// still supplies any key the selected locale has not translated.
+pub fn init_from_config_dir(config_dir: &std::path::Path) {
+    let locale = locale_from_config_dir(config_dir).unwrap_or_else(|| "en".to_string());
+    init(&locale, config_dir);
+}
+
 pub fn t(key: &str) -> String {
     let map = STRINGS.get_or_init(|| load_strings(active_locale()));
     if let Some(value) = map.get(key) {

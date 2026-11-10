@@ -20,6 +20,10 @@ pub type StarterFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 pub struct GatewayReloadControls {
     pub shutdown_tx: watch::Sender<bool>,
     pub reload_tx: watch::Sender<bool>,
+    /// The generation's in-process RPC connector, so the supervised gateway
+    /// can dial the dispatcher over an in-memory duplex instead of the
+    /// socket. `None` for a standalone gateway, which has no daemon to dial.
+    pub inproc: Option<crate::rpc::inproc::InprocConnector>,
     pub(crate) channel_generation_control: Option<Arc<super::ChannelGenerationControl>>,
 }
 
@@ -28,6 +32,7 @@ impl GatewayReloadControls {
         Self {
             shutdown_tx,
             reload_tx,
+            inproc: None,
             channel_generation_control: None,
         }
     }
@@ -41,6 +46,7 @@ impl GatewayReloadControls {
         Self {
             shutdown_tx,
             reload_tx,
+            inproc: None,
             channel_generation_control: Some(Arc::new(super::ChannelGenerationControl::new(Some(
                 registry_clearer,
             )))),
@@ -75,6 +81,9 @@ pub struct DaemonInboundAuthority {
     pub inbound_auth: Arc<crate::rpc::auth::RpcInboundAuth>,
     /// The live configuration the RPC context reads and writes.
     pub config: zeroclaw_config::live::LiveConfigHandle,
+    /// The generation's single certificate-audit writer, shared with device
+    /// enrollment and RPC renewal. The gateway must never open a second writer.
+    pub cert_audit: Option<Arc<crate::security::audit::AuditLogger>>,
 }
 
 pub type GatewayStarter = Box<

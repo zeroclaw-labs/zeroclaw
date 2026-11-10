@@ -63,6 +63,36 @@ The local endpoint bounds what one client can hold:
 Payloads larger than a frame travel as a chunked upload rather than in one
 line. See [Chunked uploads](#chunked-uploads).
 
+## Live sessions
+
+The daemon keeps at most 64 sessions live at once, across all clients. Past
+that, `session/new` is refused with `-32001` ("Session limit reached").
+
+A session stays live when its client disconnects, so the client can reconnect
+with its identity and carry on. A remote client (WSS) that stays away
+releases its sessions. Once the client has had no live connection for
+`wss.orphaned_session_timeout_secs` (default 1800), the daemon closes each of
+its sessions that:
+
+- has also been idle that long (a turn counts as activity when it finishes);
+- has no turn running;
+- has no approval pending.
+
+Closing one works as `session/close` does: the session leaves the live map,
+and its transcript is kept. Retirement never writes a transcript: a chat
+session is closed only when its store already holds all of its history. A
+session whose store lacks part of it (a failed save, say), differs from it, or
+can't be read stays live. The daemon logs each one it closes.
+
+After that, the transcript is in the store but out of a remote client's reach.
+Over WSS a client reaches only live sessions its own identity owns, so it
+can't list, read or resume a closed one. A local client can resume it.
+
+Sessions of local clients are not closed this way. Setting
+`wss.orphaned_session_timeout_secs` to `0` keeps every orphaned session live
+until the daemon restarts. A change takes effect within a minute, without a
+restart.
+
 ## Handshake
 
 The first RPC call must be `initialize`. The daemon rejects all other methods
@@ -161,7 +191,9 @@ than answered, preventing response loops.
 
 ### Turn streaming
 
-`session/prompt` returns the final result when the turn completes. During
+The request form of `session/prompt` answers an empty object
+(`SessionPromptAck`) once the turn has ended; the turn's text and outcome
+arrive on the `turn_complete` `session/update` notification. During
 execution, the daemon sends `session/update` notifications with incremental
 events:
 
@@ -298,17 +330,33 @@ Paste lines one at a time:
 On Windows, use any named-pipe client (PowerShell `[System.IO.Pipes.NamedPipeClientStream]`,
 `nc` via WSL, or just run `zerocode`).
 
+## Contract document
+
+The method table, every wire type's JSON Schema, the notification names and
+the error codes are rendered into
+[`zeroclaw-rpc.openrpc.json`](zeroclaw-rpc.openrpc.json) by
+`cargo generate openrpc`. CI fails when that file drifts from
+`zeroclaw-rpc-proto`. OpenRPC describes what travels inside the JSON-RPC
+envelope; the NDJSON framing, handshake and transport rules on this page are
+the prose half of the contract.
+
 ## Internals
 
-The dispatch layer lives in `crates/zeroclaw-runtime/src/rpc/`:
+The wire contract lives in `crates/zeroclaw-rpc-proto/` and the dispatch
+layer in `crates/zeroclaw-runtime/src/rpc/`:
 
 | File | Role |
 |---|---|
+| `zeroclaw-rpc-proto/src/method.rs` | `Method` enum, the single wire-name table, per-method params/result contract |
+| `zeroclaw-rpc-proto/src/types.rs` | wire-stable request, response and notification payload types |
+| `zeroclaw-rpc-proto/src/notification.rs` | server-to-client notification names |
+| `zeroclaw-rpc-client/src/client.rs` | `RpcClient`: dial, handshake, request/notification mux, reconnect backoff |
 | `transport.rs` | `RpcTransport` trait |
 | `turn.rs` | `execute_turn()` shared turn executor |
 | `session.rs` | `RpcSession`, `SessionStore` |
-| `dispatch.rs` | `RpcDispatcher` method routing |
+| `dispatch.rs` | `RpcDispatcher` method routing and `Method::authz` classification |
 | `local.rs` | `LocalTransport` + listener (Unix socket / Windows named pipe) |
+| `inproc.rs` | `InprocTransport` + `InprocConnector`: in-memory duplex connections for the supervised gateway; their own transport class, no peer credential, and no anonymous compatibility path, so every in-process `initialize` needs an explicit credential |
 | `wss.rs` | WSS (WebSocket Secure) transport + TLS acceptor |
 | `attachments.rs` | File upload processing, dedup, marker generation |
 | `upload.rs` | Chunked-upload staging: ordering, per-connection and process-wide bounds |

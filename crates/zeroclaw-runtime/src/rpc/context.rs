@@ -121,6 +121,16 @@ impl ApprovalPendingMap {
             .is_some()
     }
 
+    /// Whether any approval raised for `session_id` is still waiting for an
+    /// answer.
+    pub fn has_pending_for_session(&self, session_id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|entry| entry.session_id == session_id)
+    }
+
     #[cfg(test)]
     pub fn contains(&self, request_id: &str) -> bool {
         self.inner

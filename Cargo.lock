@@ -69,6 +69,7 @@ dependencies = [
  "cipher 0.5.2",
  "cpubits",
  "cpufeatures 0.3.0",
+ "zeroize",
 ]
 
 [[package]]
@@ -1070,6 +1071,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cdd35008169921d80bc60d3d0ab416eecb028c4cd653352907921d95084790be"
 dependencies = [
  "hybrid-array",
+ "zeroize",
 ]
 
 [[package]]
@@ -1509,6 +1511,7 @@ dependencies = [
  "cipher 0.5.2",
  "cpufeatures 0.3.0",
  "rand_core 0.10.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -1534,6 +1537,7 @@ dependencies = [
  "chacha20 0.10.2",
  "cipher 0.5.2",
  "poly1305 0.9.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -1618,6 +1622,7 @@ dependencies = [
  "block-buffer 0.12.0",
  "crypto-common 0.2.2",
  "inout 0.2.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -2747,6 +2752,7 @@ dependencies = [
  "const-oid 0.10.2",
  "crypto-common 0.2.2",
  "ctutils",
+ "zeroize",
 ]
 
 [[package]]
@@ -4364,6 +4370,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27f864f10dfb56725ce5ce5472bc52252c8f93a4ab86327122cebf62c5f59a17"
 dependencies = [
  "typenum",
+ "zeroize",
 ]
 
 [[package]]
@@ -6574,7 +6581,7 @@ version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
 dependencies = [
- "proc-macro-crate 3.5.0",
+ "proc-macro-crate 1.3.1",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -7923,7 +7930,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -10381,7 +10388,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand 2.4.1",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
@@ -11541,9 +11548,9 @@ checksum = "051eb1abcf10076295e815102942cc58f9d5e3b4560e46e53c21e8ff6f3af7b1"
 
 [[package]]
 name = "vodozemac"
-version = "0.11.0"
+version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba935af014ca0ae5fb468daa51da81a8a0df7daad23c052c878b7c690cdf2574"
+checksum = "cafdb6875115a436251b280d741286a9cec7fc4daab0588ea26481dd8e2bab2f"
 dependencies = [
  "aes 0.9.3",
  "arrayvec",
@@ -13664,6 +13671,7 @@ dependencies = [
  "cargo_metadata 0.18.1",
  "clap",
  "fluent-syntax 0.12.0",
+ "jsonschema",
  "pulldown-cmark",
  "reqwest 0.12.28",
  "schemars 1.2.2",
@@ -13679,6 +13687,7 @@ dependencies = [
  "zeroclaw-gateway",
  "zeroclaw-hardware",
  "zeroclaw-providers",
+ "zeroclaw-rpc-proto",
  "zeroclaw-runtime",
  "zerocode",
 ]
@@ -14179,6 +14188,8 @@ dependencies = [
  "zeroclaw-memory",
  "zeroclaw-plugins",
  "zeroclaw-providers",
+ "zeroclaw-rpc-client",
+ "zeroclaw-rpc-proto",
  "zeroclaw-runtime",
  "zeroclaw-spawn",
  "zeroclaw-tls",
@@ -14416,6 +14427,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeroclaw-rpc-client"
+version = "0.8.7"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+ "zeroclaw-api",
+ "zeroclaw-rpc-proto",
+]
+
+[[package]]
+name = "zeroclaw-rpc-proto"
+version = "0.8.7"
+dependencies = [
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "zeroclaw-api",
+ "zeroclaw-config",
+ "zeroclaw-sop-graph",
+]
+
+[[package]]
 name = "zeroclaw-runtime"
 version = "0.8.7"
 dependencies = [
@@ -14500,6 +14534,7 @@ dependencies = [
  "zeroclaw-plugins",
  "zeroclaw-providers",
  "zeroclaw-relay-proto",
+ "zeroclaw-rpc-proto",
  "zeroclaw-sop-graph",
  "zeroclaw-spawn",
  "zeroclaw-tls",
@@ -14682,6 +14717,7 @@ name = "zerocode"
 version = "0.8.7"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "crossterm",
@@ -14715,6 +14751,7 @@ dependencies = [
  "url",
  "webpki-roots 0.26.11",
  "wiremock",
+ "x509-parser 0.16.0",
  "zeroclaw-api",
  "zeroize",
 ]

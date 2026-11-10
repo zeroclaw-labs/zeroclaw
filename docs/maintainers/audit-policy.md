@@ -35,7 +35,7 @@ tool blocks the PR. What actually fails each tool differs by category:
 - **`cargo audit`** (bare, no `--deny warnings`): vulnerability
   advisories are errors (exit 1); informational and unmaintained
   advisories are reported as allowed warnings and exit 0.
-- **`cargo deny check advisories`**: vulnerability *and* unmaintained advisories for crates in the resolved graph are errors (exit 1). That is why the live unmaintained exceptions for `rustls-pemfile` and `anymap2` remain in `deny.toml`. A stale graph-ignore instead emits `advisory-not-detected`, which is a warning (exit 0); it is never triggered by removing an entry from `.cargo/audit.toml`.
+- **`cargo deny check advisories`**: vulnerability *and* unmaintained advisories for crates in the resolved graph are errors (exit 1). That is why the live unmaintained exceptions for `rustls-pemfile`, `anymap2` and `pin-utils` remain in `deny.toml`. A stale graph-ignore instead emits `advisory-not-detected`, which is a warning (exit 0); it is never triggered by removing an entry from `.cargo/audit.toml`.
 
 An audit-only ignore is needed by `cargo audit` but not by `cargo deny`
 under its configured graph. That describes tool scope, not advisory
@@ -60,12 +60,27 @@ There are two kinds of ignored advisory:
 These ignores mark advisories with an exploitable bug. They are
 **temporary** and must be removed when a fix lands.
 
-There is currently no live entry in this category. The last one,
-`RUSTSEC-2026-0292` (`imbl-sized-chunks` double free), was waived in PR
-#11038 on 2026-09-21 and cleared four days later by the `matrix-sdk` 0.19
-bump, which resolves `imbl` 7.0.2 and with it the patched
-`imbl-sized-chunks` 0.2; the waiver came out of both tool files in the
-same change.
+Live, deny+audit (both files):
+
+- **`libsqlite3-sys` (`RUSTSEC-2026-0459`, CVE-2026-119375)**: the bundled
+  SQLite 3.53.2 can return uninitialized page-cache memory when a process
+  opens a database file together with a crafted sibling `-wal` file. The
+  vector is local and needs both files. ZeroClaw opens its own databases
+  under its data directory, plus the macOS Messages database read-only for
+  the iMessage channel.
+  - **The fix is unreachable from here.** It's `libsqlite3-sys` 0.39 (SQLite
+    3.54), which needs `rusqlite` 0.41. `matrix-sdk-sqlite` 0.19.1, the newest
+    release, requires `rusqlite` 0.40.2, and `libsqlite3-sys` is a `links`
+    crate, so `Cargo.lock` can hold only one version of it.
+  - **When to remove it:** take the entry out of both files in the
+    `rusqlite` 0.41 bump, once `matrix-sdk-sqlite` accepts it. Tracking
+    #12320.
+
+The previous entry in this category, `RUSTSEC-2026-0292`
+(`imbl-sized-chunks` double free), was waived in PR #11038 on 2026-09-21
+and cleared four days later by the `matrix-sdk` 0.19 bump, which resolves
+`imbl` 7.0.2 and with it the patched `imbl-sized-chunks` 0.2; the waiver
+came out of both tool files in the same change.
 
 The entry before that, the wasmtime-wasi CVE bundle tracked
 in **#8519** (`RUSTSEC-2026-0149`, `-0182`, `-0188`, then `-0222`), was
@@ -107,6 +122,7 @@ any more, so the visible `bitmaps` unsoundness warning
 Live, deny-only:
 
 - **`anymap2` (`RUSTSEC-2026-0319`)**: unmaintained; `matrix-sdk 0.19.1` still depends on it, with no replacement SDK release available. The advisory recommends `anymap3`. Only `deny.toml` needs an exception because the configured `cargo audit` invocation treats this maintenance advisory as an allowed warning. Remove the exception once the resolved dependency graph no longer includes an affected `anymap2`. Tracking #11429.
+- **`pin-utils` (`RUSTSEC-2026-0441`)**: unmaintained; its only path is `async-imap` 0.11.3, used by `zeroclaw-channels` and `zeroclaw-tools`, and the latest release, `async-imap` 0.12.0, still depends on it, so no upgrade removes it today. Only `deny.toml` needs an exception because the configured `cargo audit` invocation treats this maintenance advisory as an allowed warning. Remove the exception once the resolved dependency graph no longer includes `pin-utils`, through an `async-imap` release without it or a move off `async-imap`. Tracking #12252.
 
 ### Audit-only inventory (scope, not severity)
 
@@ -189,7 +205,8 @@ unaffected by the advisory):
   `Cargo.lock`. `rand` is removed from both files because every
   locked version (0.8.6, 0.9.4, 0.10.1) is patched per the advisory,
   not because the crate left `Cargo.lock`. Remaining deny+audit live
-  ignore: `rustls-pemfile`. Remaining audit-only ignores:
+  ignores: `rustls-pemfile`, and the `libsqlite3-sys` waiver tracked in
+  #12320. Remaining audit-only ignores:
   `lru` (1, tracked in #9602) plus the 19 lockfile-stale entries above.
 - **#9899**: *Remove the `matrix-sdk -> imbl` advisory waivers.* Closed by
   the `matrix-sdk` 0.19 bump. The resolved graph and `Cargo.lock` no longer
@@ -198,6 +215,12 @@ unaffected by the advisory):
   `RUSTSEC-2025-0167` warning are all gone, and the waiver text is out of
   both tool files and this document.
 - **#11429**: *Remove the `anymap2` maintenance exception after Matrix migrates.* The RUSTSEC-2026-0319 exception is present only in `deny.toml`. Keep this issue open until the Matrix dependency update removes the affected crate from the resolved graph, then remove the exception and update this inventory.
+- **#12252**: *Accept the `pin-utils` maintenance advisory (RUSTSEC-2026-0441) until `async-imap` moves off it.* The RUSTSEC-2026-0441 exception is present only in `deny.toml`. Keep this issue open until the email dependency update removes `pin-utils` from the resolved graph, then remove the exception and update this inventory.
+- **#12320**: *Security job fails on every build: RUSTSEC-2026-0459.* Owns
+  the `libsqlite3-sys` waiver in both files. It stays open until the
+  workspace moves to `rusqlite` 0.41 and `libsqlite3-sys` 0.39.1 or later,
+  which needs a `matrix-sdk-sqlite` release that accepts `rusqlite` 0.41.
+  That change removes the waiver from both files.
 - **#8059**: *Policy cleanup: deny.toml ignored-advisory tracking,
   multiple-versions, wildcards.* piiiico's RFC on adding per-entry
   rationale to `deny.toml` ignore blocks. This doc is the
@@ -232,6 +255,16 @@ two tools have drifted again. Open or update the tracking issue.
 
 ## Change log
 
+- 2026-11-09: Added `RUSTSEC-2026-0459` (`libsqlite3-sys` 0.38.2, bundled
+  SQLite 3.53.2, CVE-2026-119375) to both files, with its category 1 entry
+  above.
+  - **Why a waiver:** the advisory reached the database on 2026-11-09 and
+    failed the `Security` job on every build. The patched `libsqlite3-sys`
+    0.39 needs `rusqlite` 0.41, which `matrix-sdk-sqlite` 0.19.1 doesn't
+    accept yet, so `cargo update` can't take it.
+  - **Tracking:** both reasons point at #12320.
+  - **`deny.toml`:** its `ignore` comment now names both kinds of entry it
+    holds, as PR #11038 had it.
 - 2026-10-21: Refreshed container CA stores and added compromised-issuer
   regressions. After #11924 removed the legacy MQTT verifier and its
   four ignores, removed its stale inventory here. Distinguished audit
