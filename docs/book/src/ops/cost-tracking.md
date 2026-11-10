@@ -10,6 +10,52 @@ This page describes the schema, the lookup pipeline, and the operator
 surfaces. The code lives in `crates/zeroclaw-config/src/cost/` and
 `crates/zeroclaw-runtime/src/agent/cost.rs`.
 
+## Conversation estimates
+
+ZeroCode Chat and native Code, and the dashboard chat, show the estimated cost
+of recorded usage for the open conversation. The display refreshes every two
+seconds while visible, including while the parent turn is idle. Opening,
+reconnecting, or completing a turn also refreshes it. Failed reads show
+`Cost unavailable` and retry with capped backoff.
+
+The total is derived from saved `cost_usd` values with the same `conversation_id`.
+RPC Chat and native Code record their public session ID; gateway chat records
+its gateway session key. RPC history's `rpc_` storage prefix is not part of
+its ledger identity. The ledger's `session_id` identifies a daemon lifetime
+and is not a conversation. Switching models does not reset the
+total, and editing rates does not reprice existing records. Clearing or trimming
+history keeps the total when the conversation identity stays the same.
+
+Delegated calls sharing the conversation key contribute as their usage is
+recorded, while retaining their own agent attribution. A background delegate
+can therefore increase the total after the parent turn finishes. Completing a
+delegate never adds its charges again. Independent conversations stay separate.
+Simple delegates using a string-only provider API preserve a missing-usage gap;
+only observed token usage can contribute a priced amount.
+
+`Est. $3.4200` means recorded usage has usable pricing. `incomplete` means the
+recorded amount omits some unknown spending. Disabled tracking, no recorded
+usage, or wholly unavailable usage/pricing does not become a zero estimate.
+Explicitly free usage may show `$0.0000`; positive amounts smaller than four
+decimal places show `<$0.0001`. The web tooltip and ZeroCode help explain gaps.
+
+New ledger rows carry optional `usage_completeness`: `complete`, `lower_bound`,
+or `unavailable`. Missing or invalid usage produces an `unavailable` coverage
+row with zero numeric values; current readers exclude that row from request,
+token, budget, and monetary rollups. A missing field on an older row means its
+coverage is unverified. Both spending and saved coverage gaps survive restart.
+Records without `conversation_id` remain unattributed.
+
+An unresolved ledger append or sync failure makes conversation estimates
+unavailable for the current process. A later successful read cannot prove that
+all charges were saved. Restarting reports only the records that survived;
+activity while tracking was off, external untracked agents, and charges never
+persisted cannot be reconstructed. These are recorded estimates, not invoices.
+
+The format is additive and needs no migration. Older binaries retain the same
+dollar totals but may count coverage-only rows as requests. When rolling back,
+keep the ledger; do not delete history to reset a display.
+
 ## Config schema
 
 Two related sections own the surface. `cost` covers budget enforcement and recording behavior. `cost.rates.*`

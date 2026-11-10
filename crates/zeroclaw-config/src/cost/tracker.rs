@@ -1,5 +1,6 @@
 use super::types::{
-    AgentCostStats, BudgetCheck, CostRecord, CostSummary, ModelStats, TokenUsage, UsagePeriod,
+    AgentCostStats, BudgetCheck, CostRecord, CostSummary, ModelStats, TokenUsage,
+    UsageCompleteness, UsagePeriod,
 };
 use crate::schema::CostConfig;
 use anyhow::{Context, Result};
@@ -7,9 +8,10 @@ use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use parking_lot::{Mutex, MutexGuard, RwLock};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+use zeroclaw_api::cost::{ConversationCostReason, ConversationCostSummary};
 
 /// Process-local subtree accounting for one hop of a delegation chain.
 ///
@@ -602,6 +604,25 @@ impl CostTracker {
         )
     }
 
+    /// Persist the physical attempt's observation, including coverage-only gaps.
+    pub fn record_observed_usage(
+        &self,
+        usage: TokenUsage,
+        completeness: UsageCompleteness,
+        agent_alias: Option<&str>,
+        conversation_id: Option<String>,
+    ) -> Result<()> {
+        let record = CostRecord::with_attribution(
+            &self.session_id,
+            agent_alias.map(str::to_owned),
+            None,
+            usage,
+        )
+        .with_conversation_id(conversation_id)
+        .with_usage_completeness(completeness);
+        self.record_cost_record_with_sync(record, true, File::sync_all)
+    }
+
     pub fn record_scoped_usage_with_owned_task_attribution(
         &self,
         usage: TokenUsage,
@@ -637,35 +658,52 @@ impl CostTracker {
         honor_enabled: bool,
         sync_file: fn(&File) -> std::io::Result<()>,
     ) -> Result<()> {
+        let record = CostRecord::with_attribution(
+            &self.session_id,
+            agent_alias.map(str::to_owned),
+            task_id,
+            usage,
+        )
+        .with_conversation_id(conversation_id);
+        self.record_cost_record_with_sync(record, honor_enabled, sync_file)
+    }
+
+    fn record_cost_record_with_sync(
+        &self,
+        mut record: CostRecord,
+        honor_enabled: bool,
+        sync_file: fn(&File) -> std::io::Result<()>,
+    ) -> Result<()> {
         let (enabled, track_per_agent) = self.mode();
         if honor_enabled && !enabled {
             return Ok(());
         }
 
+        let usage = &record.usage;
         if !usage.cost_usd.is_finite() || usage.cost_usd < 0.0 {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"cost_usd": usage.cost_usd})),
-                "token usage record rejected: cost is not finite or is negative"
-            );
+            self.lock_storage().persistence_uncertain = true;
             anyhow::bail!("Token usage cost must be a finite, non-negative value");
         }
-
-        let effective_alias = if track_per_agent {
-            agent_alias.map(str::to_string)
-        } else {
-            None
-        };
-        let cost_usd = usage.cost_usd;
-        let total_tokens = usage.total_tokens;
-        // Kept past the session-totals move below: the ancestor
-        // accumulator loop compares it against each ancestor's alias.
+        if record.is_coverage_only()
+            && (usage.cost_usd != 0.0
+                || usage.total_tokens != 0
+                || usage.input_tokens != 0
+                || usage.output_tokens != 0
+                || usage.cached_input_tokens != 0
+                || usage.cache_creation_input_tokens != 0
+                || usage.unpriced_tokens != 0)
+        {
+            self.lock_storage().persistence_uncertain = true;
+            anyhow::bail!("Coverage-only records cannot contain billable usage");
+        }
+        if !track_per_agent {
+            record.agent_alias = None;
+        }
+        let effective_alias = record.agent_alias.clone();
         let recorded_alias = effective_alias.clone();
-        let record =
-            CostRecord::with_attribution(&self.session_id, effective_alias.clone(), task_id, usage)
-                .with_conversation_id(conversation_id);
+        let cost_usd = record.usage.cost_usd;
+        let total_tokens = record.usage.total_tokens;
+        let coverage_only = record.is_coverage_only();
         // The UTC day this record belongs to. The ledger's rebuild folds
         // the row into this day's aggregates and no other day's, so the
         // descendant accumulator keys on the same day and the two agree
@@ -674,6 +712,9 @@ impl CostTracker {
 
         let mut storage = self.lock_storage();
         let append_outcome = storage.add_record_with_sync(record, sync_file)?;
+        if coverage_only {
+            return append_outcome.into_result();
+        }
 
         {
             let mut totals = self.lock_session_totals();
@@ -710,6 +751,65 @@ impl CostTracker {
         }
 
         append_outcome.into_result()
+    }
+
+    /// Read a point-in-time conversation projection. Call on a blocking worker.
+    /// The append lock protects only opening the snapshot, not its scan.
+    pub fn get_summary_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<ConversationCostSummary> {
+        self.conversation_summary_at_snapshot(conversation_id, || {})
+    }
+
+    fn conversation_summary_at_snapshot(
+        &self,
+        conversation_id: &str,
+        after_snapshot: impl FnOnce(),
+    ) -> Result<ConversationCostSummary> {
+        if !self.config.read().enabled {
+            return Ok(ConversationCostSummary::unavailable(
+                ConversationCostReason::TrackingDisabled,
+            ));
+        }
+        let snapshot = {
+            let storage = self.lock_storage();
+            if storage.persistence_uncertain {
+                return Ok(ConversationCostSummary::unavailable(
+                    ConversationCostReason::PersistenceUncertain,
+                ));
+            }
+            storage.read_snapshot()?
+        };
+        after_snapshot();
+        let mut summary = super::conversation::ConversationSummary::default();
+        if let Some((file, length, path)) = snapshot {
+            let rejected = CostStorage::scan_records(
+                BufReader::new(file.take(length)),
+                &path,
+                false,
+                |record| {
+                    if record.conversation_id.as_deref() == Some(conversation_id) {
+                        summary.record(record);
+                    }
+                },
+            )?;
+            if rejected > 0 {
+                summary.reason(ConversationCostReason::LedgerIntegrity);
+            }
+        }
+        // A concurrent writer can fail while the snapshot is being scanned.
+        if self.lock_storage().persistence_uncertain {
+            return Ok(ConversationCostSummary::unavailable(
+                ConversationCostReason::PersistenceUncertain,
+            ));
+        }
+        if !self.config.read().enabled {
+            return Ok(ConversationCostSummary::unavailable(
+                ConversationCostReason::TrackingDisabled,
+            ));
+        }
+        Ok(summary.finish())
     }
 
     /// Get the current cost summary. When `[cost].track_per_agent` is
@@ -1167,6 +1267,9 @@ impl CostSummaryAccumulator {
 }
 
 struct CostStorage {
+    /// Canonical process-local evidence of an unresolved append/sync failure.
+    /// Shared by all derived trackers; a successful read cannot clear it.
+    persistence_uncertain: bool,
     /// JSONL ledger path.
     path: PathBuf,
     /// Cached total for the current UTC day.
@@ -1242,6 +1345,7 @@ impl CostStorage {
         }
         let now = Utc::now();
         Ok(Self {
+            persistence_uncertain: false,
             path: path.to_path_buf(),
             daily_cost_usd: 0.0,
             monthly_cost_usd: 0.0,
@@ -1266,35 +1370,52 @@ impl CostStorage {
         Ok(())
     }
 
-    /// Scan every non-empty ledger line, handing each complete record to
-    /// `on_record`. Returns the number of lines that could not be read as
-    /// complete records: a line whose single parse fails and whose
-    /// concatenated-record recovery also fails leaves unreadable bytes
-    /// behind. Callers use that count to report the ledger as incomplete;
-    /// the raw lines are never rewritten.
+    /// Open the ledger and capture the committed byte boundary under the
+    /// storage lock. The returned file can be scanned after releasing it.
+    fn read_snapshot(&self) -> Result<Option<(File, u64, PathBuf)>> {
+        match File::open(&self.path) {
+            Ok(file) => {
+                let length = file.metadata()?.len();
+                Ok(Some((file, length, self.path.clone())))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).context("Failed to open cost ledger snapshot"),
+        }
+    }
+
     fn for_each_record<F>(&self, mut on_record: F) -> Result<usize>
     where
         F: FnMut(CostRecord),
     {
-        if !self.path.exists() {
+        let Some((file, length, path)) = self.read_snapshot()? else {
             return Ok(0);
-        }
+        };
+        Self::scan_records(BufReader::new(file.take(length)), &path, true, |record| {
+            if !record.is_coverage_only() {
+                on_record(record);
+            }
+        })
+    }
 
-        let file = File::open(&self.path).with_context(|| {
-            format!(
-                "Failed to read cost storage from {}",
-                self.path.display().to_string()
-            )
-        })?;
-        let reader = BufReader::new(file);
-
+    /// Stream records using the ledger's concatenated-row recovery. Return
+    /// the number of malformed lines without rewriting any source bytes.
+    /// Polling projections suppress repeated diagnostics for those same rows.
+    fn scan_records<F>(
+        reader: impl BufRead,
+        path: &Path,
+        report_errors: bool,
+        mut on_record: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(CostRecord),
+    {
         let mut rejected_records = 0_usize;
         for (line_number, line) in reader.lines().enumerate() {
             let raw_line = line.with_context(|| {
                 format!(
                     "Failed to read line {} from cost storage {}",
                     line_number + 1,
-                    self.path.display()
+                    path.display()
                 )
             })?;
 
@@ -1310,21 +1431,23 @@ impl CostStorage {
                         Self::recover_concatenated_records(trimmed, &mut on_record)
                     {
                         rejected_records += 1;
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({
-                                "path": self.path.display().to_string(),
-                                "line": line_number + 1,
-                                "parse_error": parse_error.to_string(),
-                                "recovery_error": recovery_error.to_string(),
-                            })),
-                            "skipping malformed cost record"
-                        );
+                        if report_errors {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({
+                                    "path": path.display().to_string(),
+                                    "line": line_number + 1,
+                                    "parse_error": parse_error.to_string(),
+                                    "recovery_error": recovery_error.to_string(),
+                                })),
+                                "skipping malformed cost record"
+                            );
+                        }
                     }
                 }
             }
@@ -1386,6 +1509,18 @@ impl CostStorage {
         record: CostRecord,
         sync_file: fn(&File) -> std::io::Result<()>,
     ) -> Result<AppendOutcome> {
+        let outcome = self.append_record_with_sync(record, sync_file);
+        if !matches!(outcome, Ok(AppendOutcome::Synced)) {
+            self.persistence_uncertain = true;
+        }
+        outcome
+    }
+
+    fn append_record_with_sync(
+        &mut self,
+        record: CostRecord,
+        sync_file: fn(&File) -> std::io::Result<()>,
+    ) -> Result<AppendOutcome> {
         self.ensure_period_cache_current()?;
 
         let mut file = OpenOptions::new()
@@ -1408,23 +1543,25 @@ impl CostStorage {
             )
         })?;
 
-        let timestamp = record.usage.timestamp.naive_utc();
-        if timestamp.date() == self.cached_day {
-            self.daily_cost_usd += record.usage.cost_usd;
-            if let Some(agent_alias) = &record.agent_alias {
-                *self
-                    .daily_cost_by_agent
-                    .entry(agent_alias.clone())
-                    .or_insert(0.0) += record.usage.cost_usd;
+        if !record.is_coverage_only() {
+            let timestamp = record.usage.timestamp.naive_utc();
+            if timestamp.date() == self.cached_day {
+                self.daily_cost_usd += record.usage.cost_usd;
+                if let Some(agent_alias) = &record.agent_alias {
+                    *self
+                        .daily_cost_by_agent
+                        .entry(agent_alias.clone())
+                        .or_insert(0.0) += record.usage.cost_usd;
+                }
+            } else {
+                // A record for a prior day landed outside its day's cache: the
+                // per-alias day buckets would go stale, so drop the whole cache
+                // and let the next check rebuild it.
+                self.aggregates_current = false;
             }
-        } else {
-            // A record for a prior day landed outside its day's cache: the
-            // per-alias day buckets would go stale, so drop the whole cache
-            // and let the next check rebuild it.
-            self.aggregates_current = false;
-        }
-        if timestamp.year() == self.cached_year && timestamp.month() == self.cached_month {
-            self.monthly_cost_usd += record.usage.cost_usd;
+            if timestamp.year() == self.cached_year && timestamp.month() == self.cached_month {
+                self.monthly_cost_usd += record.usage.cost_usd;
+            }
         }
 
         let sync_result = sync_file(&file).with_context(|| {
@@ -3755,3 +3892,7 @@ mod tests {
         assert_eq!(wire["rejected_records"], serde_json::json!(0));
     }
 }
+
+#[cfg(test)]
+#[path = "conversation_tests.rs"]
+mod conversation_tests;

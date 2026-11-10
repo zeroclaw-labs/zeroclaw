@@ -1981,6 +1981,8 @@ pub async fn run(
         inbound_router.drain(&mut chat_pane, &mut acp_pane);
         acp_pane.tick_transport_events();
         chat_pane.tick_transport_events();
+        chat_pane.tick_conversation_cost(mode == Mode::Chat);
+        acp_pane.tick_conversation_cost(mode == Mode::Acp);
         let chrome_summary = chrome_status.summary_line();
         doctor_pane.poll_refresh().await;
         if mode == Mode::Doctor && !matches!(conn_state, ConnectionState::Disconnected { .. }) {
@@ -2097,12 +2099,20 @@ pub async fn run(
                         Mode::Acp => acp_pane.in_browse_mode(),
                         _ => false,
                     };
+                    let cost_label = match mode {
+                        Mode::Chat => chat_pane.conversation_cost_label(),
+                        Mode::Acp => acp_pane.conversation_cost_label(),
+                        _ => None,
+                    };
                     draw_status_bar(
                         frame,
                         chunks[2],
                         &conn_state,
                         rpc.tui_id(),
-                        CtxBar::new(ctx_input, ctx_input_source, ctx_max, ctx_model_window),
+                        (
+                            CtxBar::new(ctx_input, ctx_input_source, ctx_max, ctx_model_window),
+                            cost_label.as_deref(),
+                        ),
                         needs_intervention,
                         browse_mode,
                     );
@@ -3232,7 +3242,7 @@ fn draw_status_bar(
     area: Rect,
     state: &ConnectionState,
     tui_id: Option<&str>,
-    ctx: CtxBar,
+    conversation: (CtxBar, Option<&str>),
     needs_intervention: bool,
     browse_mode: bool,
 ) {
@@ -3310,7 +3320,19 @@ fn draw_status_bar(
     } else {
         left_area
     };
-    if SHOW_CTX_BAR && let Some(w) = ctx.widget() {
+    let left_area = if let Some(cost) = conversation.1 {
+        let span = Span::styled(format!(" {cost}  "), crate::theme::dim_style());
+        let chunks = Layout::horizontal([
+            Constraint::Length(span.width().min(u16::MAX as usize) as u16),
+            Constraint::Min(0),
+        ])
+        .split(left_area);
+        frame.render_widget(Paragraph::new(Line::from(span)), chunks[0]);
+        chunks[1]
+    } else {
+        left_area
+    };
+    if SHOW_CTX_BAR && let Some(w) = conversation.0.widget() {
         frame.render_widget(w, left_area);
     }
 }
@@ -5411,10 +5433,51 @@ mod tests {
         assert_eq!(pane.selected_name(), Some("deploy"));
     }
 
-    /// Render the real status bar through the production renderer and return
-    /// the final terminal cells a user sees. Reaches the outermost TUI
-    /// boundary for the context meter, not a component snapshot.
-    #[cfg(test)]
+    #[test]
+    fn conversation_cost_status_bar_renders_estimates_and_unavailable_at_terminal_widths() {
+        use ratatui::{Terminal, backend::TestBackend};
+        use zeroclaw_api::cost::{ConversationCostStatus as Status, ConversationCostSummary};
+        for width in [80, 120] {
+            for (amount, status, expected) in [
+                (Some(3.42), Status::Estimated, "Est. $3.4200"),
+                (Some(3.42), Status::Partial, "Est. $3.4200 · incomplete"),
+                (Some(0.0000001), Status::Estimated, "Est. <$0.0001"),
+                (None, Status::Unavailable, "Cost unavailable"),
+            ] {
+                let summary = ConversationCostSummary {
+                    estimated_cost_usd: amount,
+                    status,
+                    reasons: Vec::new(),
+                };
+                let label = crate::conversation_cost::label(Some(&summary));
+                let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        draw_status_bar(
+                            frame,
+                            frame.area(),
+                            &ConnectionState::Connected,
+                            Some("tui-1"),
+                            (CtxBar::new(None, None, None, None), Some(&label)),
+                            false,
+                            false,
+                        )
+                    })
+                    .unwrap();
+                let text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                assert!(text.contains(expected), "width={width}: {text}");
+                assert!(text.contains("Connected"), "{text}");
+            }
+        }
+    }
+
+    /// Render the production status bar and return its final terminal cells.
     fn render_status_bar_cells(ctx: CtxBar, width: u16) -> String {
         use ratatui::{Terminal, backend::TestBackend};
 
@@ -5427,7 +5490,7 @@ mod tests {
                     frame.area(),
                     &ConnectionState::Connected,
                     Some("tui-1"),
-                    ctx,
+                    (ctx, None),
                     false,
                     false,
                 );

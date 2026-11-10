@@ -1882,6 +1882,64 @@ fn gateway_display_session_id(session_key: &str) -> &str {
     session_key.strip_prefix("gw_").unwrap_or(session_key)
 }
 
+/// GET /api/sessions/{id}/cost — recorded spending for an authorized conversation.
+pub async fn handle_api_session_cost(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    use zeroclaw_api::cost::{ConversationCostReason, ConversationCostSummary};
+    if let Err(error) = require_auth(&state, &headers) {
+        return error.into_response();
+    }
+    let key = resolve_gateway_session_key(&id, |key| {
+        state
+            .session_backend
+            .as_ref()
+            .is_some_and(|backend| backend.session_exists(key))
+    });
+    let result = if let Some(tracker) = &state.cost_tracker {
+        let tracker = std::sync::Arc::clone(tracker);
+        tokio::task::spawn_blocking(move || tracker.get_summary_for_conversation(&key))
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|result| result)
+    } else {
+        Ok(ConversationCostSummary::unavailable(
+            if state.config.read().cost.enabled {
+                ConversationCostReason::TrackingUnavailable
+            } else {
+                ConversationCostReason::TrackingDisabled
+            },
+        ))
+    };
+    // Re-admit after disk I/O; never release an estimate to a revoked caller.
+    if let Err(error) = require_auth(&state, &headers) {
+        return error.into_response();
+    }
+    match result {
+        Ok(summary) => (
+            [(axum::http::header::CACHE_CONTROL, "no-store")],
+            Json(summary),
+        )
+            .into_response(),
+        Err(error) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Read)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(serde_json::json!({"error": error.to_string()})),
+                "Failed to read conversation cost"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "conversation_cost_unavailable"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// GET /api/sessions/{id}/messages — load persisted gateway WebSocket chat transcript
 pub async fn handle_api_session_messages(
     State(state): State<AppState>,
@@ -3481,6 +3539,63 @@ pub(crate) mod tests {
                 .iter()
                 .any(|item| item.contains("Bind this channel"))
         );
+    }
+
+    #[tokio::test]
+    async fn conversation_cost_http_uses_gateway_keys_and_reports_unavailable() {
+        use zeroclaw_config::cost::{CostTracker, TokenUsage, UsageCompleteness};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.cost.enabled = true;
+        let tracker = Arc::new(CostTracker::new(config.cost.clone(), tmp.path()).unwrap());
+        tracker
+            .record_observed_usage(
+                TokenUsage::new("model", 1_000_000, 0, 0, 2.0, 0.0, 0.0),
+                UsageCompleteness::Complete,
+                None,
+                Some("gw_chat".into()),
+            )
+            .unwrap();
+        tracker
+            .record_observed_usage(
+                TokenUsage::new("model", 1_000_000, 0, 0, 40.0, 0.0, 0.0),
+                UsageCompleteness::Complete,
+                None,
+                Some("gw_other".into()),
+            )
+            .unwrap();
+        let mut state = test_state(config);
+        state.cost_tracker = Some(tracker);
+        for id in ["chat", "gw_chat"] {
+            let response =
+                handle_api_session_cost(State(state.clone()), HeaderMap::new(), Path(id.into()))
+                    .await
+                    .into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response_json(response).await["estimated_cost_usd"], 2.0);
+        }
+        state.cost_tracker = None;
+        let response = handle_api_session_cost(State(state), HeaderMap::new(), Path("chat".into()))
+            .await
+            .into_response();
+        let body = response_json(response).await;
+        assert!(body["estimated_cost_usd"].is_null());
+        assert_eq!(body["status"], "unavailable");
+    }
+
+    #[tokio::test]
+    async fn conversation_cost_http_requires_authentication() {
+        let mut state = test_state(Config::default());
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
+        let response =
+            handle_api_session_cost(State(state), HeaderMap::new(), Path("known-id".into()))
+                .await
+                .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]

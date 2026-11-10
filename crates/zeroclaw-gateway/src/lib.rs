@@ -2715,6 +2715,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         )
         .route("/api/sessions/{id}", delete(api::handle_api_session_delete).put(api::handle_api_session_rename))
         .route("/api/sessions/{id}/state", get(api::handle_api_session_state))
+        .route("/api/sessions/{id}/cost", get(api::handle_api_session_cost))
         .route("/api/sessions/{id}/abort", post(api::handle_api_session_abort))
         // ── Pairing + Device management API ──
         .route(

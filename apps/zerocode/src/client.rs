@@ -137,6 +137,7 @@ pub mod method {
     pub const MEMORY_LIST: &str = "memory/list";
     pub const MEMORY_SEARCH: &str = "memory/search";
     pub const SESSION_MESSAGES: &str = "session/messages";
+    pub const SESSION_COST: &str = "session/cost";
     // TUI identity
     pub const TUI_LIST: &str = "tui/list";
     pub const FS_LIST_DIR: &str = "fs/list_dir";
@@ -2892,6 +2893,17 @@ impl RpcClient {
         self.call(
             method::SESSION_CONFIGURE,
             serde_json::json!({ "session_id": session_id, "overrides": overrides }),
+        )
+        .await
+    }
+
+    pub async fn session_cost(
+        &self,
+        session_id: &str,
+    ) -> Result<zeroclaw_api::cost::ConversationCostSummary> {
+        self.call(
+            method::SESSION_COST,
+            serde_json::json!({ "session_id": session_id }),
         )
         .await
     }

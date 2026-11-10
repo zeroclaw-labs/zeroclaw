@@ -3166,6 +3166,7 @@ async fn run_tool_call_loop_impl<'a>(
             llm_started_at,
             iteration,
             accepted_route.as_ref(),
+            attempts.last().map(|attempt| attempt.outcome()),
         )
         .await;
 
@@ -6778,6 +6779,7 @@ mod active_route_context_tests {
             &history,
             Instant::now(),
             0,
+            None,
             None,
         )
         .await;
