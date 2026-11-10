@@ -75,6 +75,46 @@ fn resolve_session_backend_for_owned_state(
         .map(Some)
 }
 
+/// Resolve the memory backend on a blocking thread. Reopening a configured
+/// SQLite backend can wait out a competing writer's busy timeout, which must
+/// not hold a Tokio worker.
+async fn resolve_memory_off_worker(
+    config: &Arc<Config>,
+    memory: Option<&Arc<dyn Memory>>,
+    warnings: &mut Vec<String>,
+) -> Option<Arc<dyn Memory>> {
+    let config = Arc::clone(config);
+    let memory = memory.cloned();
+    match tokio::task::spawn_blocking(move || {
+        resolve_memory_for_owned_state(&config, memory.as_ref())
+    })
+    .await
+    {
+        Ok(Ok(memory)) => memory,
+        Ok(Err(error)) => {
+            warnings.push(format!("memory backend unavailable: {error}"));
+            None
+        }
+        Err(error) => {
+            warnings.push(format!("memory backend task failed: {error}"));
+            None
+        }
+    }
+}
+
+/// Open the knowledge graph on a blocking thread. Opening runs migrations
+/// under SQLite's busy timeout.
+async fn open_knowledge_graph_off_worker(
+    path: PathBuf,
+    max_nodes: usize,
+) -> anyhow::Result<zeroclaw_memory::knowledge_graph::KnowledgeGraph> {
+    tokio::task::spawn_blocking(move || {
+        zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(&path, max_nodes)
+    })
+    .await
+    .context("knowledge graph open task failed")?
+}
+
 /// What a filesystem probe could establish about a lifecycle path.
 ///
 /// The alias lifecycle needs three answers, not two. "Exists" and "does not
@@ -683,13 +723,11 @@ pub async fn cascade_owned_state_with_retirement(
         ));
     }
 
-    let resolved_memory = match resolve_memory_for_owned_state(config, mem) {
-        Ok(memory) => memory,
-        Err(error) => {
-            warnings.push(format!("memory backend unavailable: {error}"));
-            None
-        }
-    };
+    // The cron, ACP, session, knowledge and control-plane stores are
+    // synchronous SQLite handles with a busy timeout, so every call into them
+    // runs on a blocking thread rather than holding a Tokio worker.
+    let blocking_config = Arc::new(config.clone());
+    let resolved_memory = resolve_memory_off_worker(&blocking_config, mem, &mut warnings).await;
 
     // ── memory: export → archive → purge. Failures are SURFACED in `warnings`,
     // not masked as 0 (markdown/none have no DB rows — their memory lives in the
@@ -731,10 +769,12 @@ pub async fn cascade_owned_state_with_retirement(
     // operator has never enabled knowledge.
     let knowledge_path = config.knowledge.resolved_db_path();
     let knowledge_purge = match inspect_lifecycle_path(&knowledge_path).await {
-        PathPresence::Present => match zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
-            &knowledge_path,
+        PathPresence::Present => match open_knowledge_graph_off_worker(
+            knowledge_path.clone(),
             config.knowledge.max_nodes,
-        ) {
+        )
+        .await
+        {
             Ok(graph) => match retirement {
                 Ok(Some(snapshot)) => match serde_json::to_vec_pretty(&snapshot)
                     .context("serialize owned knowledge export")
@@ -746,7 +786,14 @@ pub async fn cascade_owned_state_with_retirement(
                             Ok(()) => {
                                 #[cfg(test)]
                                 wait_at_knowledge_archive(&cascade_dir).await;
-                                match graph.purge_archived_owner(alias, &snapshot) {
+                                let purge_alias = alias.to_string();
+                                match tokio::task::spawn_blocking(move || {
+                                    graph.purge_archived_owner(&purge_alias, &snapshot)
+                                })
+                                .await
+                                .context("knowledge purge task failed")
+                                .and_then(|result| result)
+                                {
                                     Ok(report) => report,
                                     Err(error) => {
                                         warnings.push(knowledge_purge_skipped_warning(&error));
@@ -787,17 +834,35 @@ pub async fn cascade_owned_state_with_retirement(
     };
 
     // ── cron: list → archive → remove (cron_runs cascade off job_id) ─────────
-    let cron_removed = match crate::cron::list_jobs_by_agent(config, alias) {
+    let cron_list = {
+        let config = Arc::clone(&blocking_config);
+        let alias = alias.to_string();
+        tokio::task::spawn_blocking(move || crate::cron::list_jobs_by_agent(&config, &alias))
+            .await
+            .context("cron list task failed")
+            .and_then(|result| result)
+    };
+    let cron_removed = match cron_list {
         Ok(jobs) => match serde_json::to_vec_pretty(&jobs).context("serialize cron export") {
             Ok(bytes) => {
                 match write_json(&cascade_dir.join("cron.json"), bytes, &durable_root).await {
-                    Ok(()) => match crate::cron::remove_jobs_by_agent(config, alias) {
-                        Ok(n) => n,
-                        Err(error) => {
-                            warnings.push(format!("cron remove: {error}"));
-                            0
+                    Ok(()) => {
+                        let config = Arc::clone(&blocking_config);
+                        let alias = alias.to_string();
+                        match tokio::task::spawn_blocking(move || {
+                            crate::cron::remove_jobs_by_agent(&config, &alias)
+                        })
+                        .await
+                        .context("cron remove task failed")
+                        .and_then(|result| result)
+                        {
+                            Ok(n) => n,
+                            Err(error) => {
+                                warnings.push(format!("cron remove: {error}"));
+                                0
+                            }
                         }
-                    },
+                    }
                     Err(error) => {
                         warnings.push(archive_warning("cron", &error));
                         0
@@ -817,61 +882,91 @@ pub async fn cascade_owned_state_with_retirement(
 
     // ── acp: list → archive → delete (only killed sessions remain) ───────────
     let mut acp_removed = 0;
-    match AcpSessionStore::new(&config.data_dir) {
-        Ok(store) => match store.list_sessions_by_agent(alias) {
-            Ok(sessions) => {
-                // AcpSessionSummary isn't Serialize; hand-map the fields we keep.
-                let json: Vec<serde_json::Value> = sessions
-                    .iter()
-                    .map(|s| {
-                        serde_json::json!({
-                            "session_uuid": s.session_uuid,
-                            "agent_alias": s.agent_alias,
-                            "workspace_dir": s.workspace_dir,
-                            "token_count": s.token_count,
-                            "message_count": s.message_count,
-                            "created_at": s.created_at.to_rfc3339(),
-                            "last_activity": s.last_activity.to_rfc3339(),
-                        })
+    let acp_list = {
+        let data_dir = config.data_dir.clone();
+        let alias = alias.to_string();
+        tokio::task::spawn_blocking(move || match AcpSessionStore::new(&data_dir) {
+            Ok(store) => match store.list_sessions_by_agent(&alias) {
+                Ok(sessions) => Ok((store, sessions)),
+                Err(error) => Err(format!("acp list: {error}")),
+            },
+            Err(error) => Err(format!("acp store open: {error}")),
+        })
+        .await
+        .unwrap_or_else(|error| Err(format!("acp list task failed: {error}")))
+    };
+    match acp_list {
+        Ok((store, sessions)) => {
+            // AcpSessionSummary isn't Serialize; hand-map the fields we keep.
+            let json: Vec<serde_json::Value> = sessions
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "session_uuid": s.session_uuid,
+                        "agent_alias": s.agent_alias,
+                        "workspace_dir": s.workspace_dir,
+                        "token_count": s.token_count,
+                        "message_count": s.message_count,
+                        "created_at": s.created_at.to_rfc3339(),
+                        "last_activity": s.last_activity.to_rfc3339(),
                     })
-                    .collect();
-                match serde_json::to_vec_pretty(&json).context("serialize ACP export") {
-                    Ok(bytes) => {
-                        match write_json(&cascade_dir.join("acp.json"), bytes, &durable_root).await
-                        {
-                            Ok(()) => match store.delete_sessions_by_agent(alias) {
-                                Ok(n) => acp_removed = n,
-                                Err(error) => warnings.push(format!("acp delete: {error}")),
-                            },
-                            Err(error) => warnings.push(archive_warning("ACP", &error)),
+                })
+                .collect();
+            match serde_json::to_vec_pretty(&json).context("serialize ACP export") {
+                Ok(bytes) => {
+                    match write_json(&cascade_dir.join("acp.json"), bytes, &durable_root).await {
+                        Ok(()) => {
+                            let alias = alias.to_string();
+                            match tokio::task::spawn_blocking(move || {
+                                store.delete_sessions_by_agent(&alias)
+                            })
+                            .await
+                            {
+                                Ok(Ok(n)) => acp_removed = n,
+                                Ok(Err(error)) => {
+                                    warnings.push(format!("acp delete: {error}"));
+                                }
+                                Err(error) => {
+                                    warnings.push(format!("acp delete task failed: {error}"));
+                                }
+                            }
                         }
+                        Err(error) => warnings.push(archive_warning("ACP", &error)),
                     }
-                    Err(error) => warnings.push(archive_warning("ACP", &error)),
                 }
+                Err(error) => warnings.push(archive_warning("ACP", &error)),
             }
-            Err(error) => warnings.push(format!("acp list: {error}")),
-        },
-        Err(e) => warnings.push(format!("acp store open: {e}")),
+        }
+        Err(warning) => warnings.push(warning),
     }
 
     // ── session metadata: clear the stale agent attribution (keep the convo) ─
-    let resolved_session_backend =
-        match resolve_session_backend_for_owned_state(config, session_backend) {
-            Ok(backend) => backend,
-            Err(error) => {
-                warnings.push(format!("session backend unavailable: {error}"));
-                None
+    let sessions_cleared = {
+        let config = Arc::clone(&blocking_config);
+        let backend = session_backend.cloned();
+        let alias = alias.to_string();
+        match tokio::task::spawn_blocking(move || -> Result<usize, String> {
+            let backend = resolve_session_backend_for_owned_state(&config, backend.as_ref())
+                .map_err(|error| format!("session backend unavailable: {error}"))?;
+            match backend {
+                Some(backend) => backend
+                    .clear_agent_attribution(&alias)
+                    .map_err(|error| format!("session attribution clear: {error}")),
+                None => Ok(0),
             }
-        };
-    let sessions_cleared = match resolved_session_backend.as_ref() {
-        Some(b) => match b.clear_agent_attribution(alias) {
-            Ok(n) => n,
-            Err(e) => {
-                warnings.push(format!("session attribution clear: {e}"));
+        })
+        .await
+        {
+            Ok(Ok(n)) => n,
+            Ok(Err(warning)) => {
+                warnings.push(warning);
                 0
             }
-        },
-        None => 0,
+            Err(error) => {
+                warnings.push(format!("session attribution task failed: {error}"));
+                0
+            }
+        }
     };
 
     let control_plane_tasks_removed = if config.data_dir.join("control_plane.db").exists() {
@@ -968,13 +1063,10 @@ pub async fn cascade_rename_agent(
 ) -> RenameStateReport {
     let mut warnings: Vec<String> = Vec::new();
 
-    let resolved_memory = match resolve_memory_for_owned_state(config, mem) {
-        Ok(memory) => memory,
-        Err(error) => {
-            warnings.push(format!("memory backend unavailable: {error}"));
-            None
-        }
-    };
+    // As in the delete cascade, the synchronous SQLite stores run on blocking
+    // threads so a competing writer's busy timeout never holds a Tokio worker.
+    let blocking_config = Arc::new(config.clone());
+    let resolved_memory = resolve_memory_off_worker(&blocking_config, mem, &mut warnings).await;
 
     let memory_rows = if let Some(mem) = resolved_memory.as_ref() {
         match mem.rename_agent(from, to).await {
@@ -990,17 +1082,26 @@ pub async fn cascade_rename_agent(
 
     let knowledge_path = config.knowledge.resolved_db_path();
     let knowledge_rows = match inspect_lifecycle_path(&knowledge_path).await {
-        PathPresence::Present => match zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
-            &knowledge_path,
+        PathPresence::Present => match open_knowledge_graph_off_worker(
+            knowledge_path.clone(),
             config.knowledge.max_nodes,
-        ) {
-            Ok(graph) => match graph.rename_owner(from, to) {
-                Ok(n) => n,
-                Err(e) => {
-                    warnings.push(format!("knowledge rename: {e}"));
-                    0
+        )
+        .await
+        {
+            Ok(graph) => {
+                let (from, to) = (from.to_string(), to.to_string());
+                match tokio::task::spawn_blocking(move || graph.rename_owner(&from, &to))
+                    .await
+                    .context("knowledge rename task failed")
+                    .and_then(|result| result)
+                {
+                    Ok(n) => n,
+                    Err(e) => {
+                        warnings.push(format!("knowledge rename: {e}"));
+                        0
+                    }
                 }
-            },
+            }
             Err(e) => {
                 warnings.push(format!("knowledge graph open: {e}"));
                 0
@@ -1016,46 +1117,62 @@ pub async fn cascade_rename_agent(
         }
     };
 
-    let cron_jobs = match crate::cron::rename_jobs_by_agent(config, from, to) {
-        Ok(n) => n,
-        Err(e) => {
-            warnings.push(format!("cron rename: {e}"));
-            0
-        }
-    };
+    let blocking_backend = session_backend.cloned();
+    let (blocking_from, blocking_to) = (from.to_string(), to.to_string());
+    let blocking = tokio::task::spawn_blocking(move || {
+        let mut warnings = Vec::new();
+        let cron_jobs =
+            match crate::cron::rename_jobs_by_agent(&blocking_config, &blocking_from, &blocking_to)
+            {
+                Ok(n) => n,
+                Err(e) => {
+                    warnings.push(format!("cron rename: {e}"));
+                    0
+                }
+            };
 
-    let acp_sessions = match AcpSessionStore::new(&config.data_dir) {
-        Ok(store) => match store.rename_sessions_by_agent(from, to) {
-            Ok(n) => n,
+        let acp_sessions = match AcpSessionStore::new(&blocking_config.data_dir) {
+            Ok(store) => match store.rename_sessions_by_agent(&blocking_from, &blocking_to) {
+                Ok(n) => n,
+                Err(e) => {
+                    warnings.push(format!("acp rename: {e}"));
+                    0
+                }
+            },
             Err(e) => {
-                warnings.push(format!("acp rename: {e}"));
+                warnings.push(format!("acp store open: {e}"));
                 0
             }
-        },
-        Err(e) => {
-            warnings.push(format!("acp store open: {e}"));
-            0
-        }
-    };
+        };
 
-    let resolved_session_backend =
-        match resolve_session_backend_for_owned_state(config, session_backend) {
+        let resolved_session_backend = match resolve_session_backend_for_owned_state(
+            &blocking_config,
+            blocking_backend.as_ref(),
+        ) {
             Ok(backend) => backend,
             Err(error) => {
                 warnings.push(format!("session backend unavailable: {error}"));
                 None
             }
         };
-    let sessions_repointed = match resolved_session_backend.as_ref() {
-        Some(b) => match b.rename_agent_attribution(from, to) {
-            Ok(n) => n,
-            Err(e) => {
-                warnings.push(format!("session attribution rename: {e}"));
-                0
-            }
-        },
-        None => 0,
+        let sessions_repointed = match resolved_session_backend.as_ref() {
+            Some(b) => match b.rename_agent_attribution(&blocking_from, &blocking_to) {
+                Ok(n) => n,
+                Err(e) => {
+                    warnings.push(format!("session attribution rename: {e}"));
+                    0
+                }
+            },
+            None => 0,
+        };
+        (cron_jobs, acp_sessions, sessions_repointed, warnings)
+    })
+    .await;
+    let (cron_jobs, acp_sessions, sessions_repointed, blocking_warnings) = match blocking {
+        Ok(result) => result,
+        Err(error) => (0, 0, 0, vec![format!("rename state task failed: {error}")]),
     };
+    warnings.extend(blocking_warnings);
 
     if !warnings.is_empty() {
         ::zeroclaw_log::record!(
