@@ -13,6 +13,7 @@ pub mod api_browse;
 pub mod api_config;
 pub mod api_logs;
 pub mod api_oidc;
+mod api_oidc_enroll;
 pub mod api_pairing;
 pub mod api_personality;
 pub mod api_plugins;
@@ -33,6 +34,9 @@ pub mod api_webauthn;
 pub mod api_webhook;
 pub mod auth_rate_limit;
 pub mod canvas;
+mod chat_core;
+pub mod core_rpc;
+pub mod dashboard_core;
 pub mod dashboard_session;
 pub mod node_tool;
 pub mod nodes;
@@ -40,6 +44,7 @@ pub mod openapi;
 #[cfg(feature = "plugins-wasm")]
 mod plugin_webhook;
 pub mod principal_gate;
+mod relay_ingress;
 pub mod security_headers;
 pub mod session_queue;
 pub mod sse;
@@ -859,6 +864,9 @@ pub struct GatewaySupervision {
     /// register resumed headless drivers here so a reload drains them with the
     /// generation that owns them. `None` standalone, where no generation exists.
     sop_driver_handles: Option<zeroclaw_runtime::sop::SopDriverHandles>,
+    /// Where the relay bridge hands over the browser connections of a
+    /// relay-served dashboard (`[relay.dashboard]`). `None` serves none.
+    dashboard_ingress: Option<zeroclaw_runtime::relay_dashboard::DashboardIngress>,
 }
 
 impl GatewaySupervision {
@@ -875,6 +883,37 @@ impl GatewaySupervision {
             plugin_webhooks,
             authority,
             sop_driver_handles,
+            dashboard_ingress: None,
+        }
+    }
+
+    /// Serve the dashboard connections the relay bridge delivers to
+    /// `ingress` as well as this gateway's own listener.
+    #[must_use]
+    pub fn with_dashboard_ingress(
+        mut self,
+        ingress: zeroclaw_runtime::relay_dashboard::DashboardIngress,
+    ) -> Self {
+        self.dashboard_ingress = Some(ingress);
+        self
+    }
+}
+
+/// The relay-forwarded dashboard connections one gateway generation
+/// serves. Waits forever when it has none attached, or once a later
+/// generation has taken over and every connection queued here is served.
+struct DashboardFeed(Option<zeroclaw_runtime::relay_dashboard::DashboardIngressReceiver>);
+
+impl DashboardFeed {
+    async fn next(&mut self) -> zeroclaw_runtime::relay_dashboard::DashboardConn {
+        loop {
+            match &mut self.0 {
+                Some(receiver) => match receiver.recv().await {
+                    Some(conn) => return conn,
+                    None => self.0 = None,
+                },
+                None => std::future::pending::<()>().await,
+            }
         }
     }
 }
@@ -1366,15 +1405,32 @@ pub async fn run_gateway_with_plugin_webhooks(
         plugin_webhooks,
         authority,
         sop_driver_handles,
+        dashboard_ingress,
     } = supervision;
-    let (shared_pairing, shared_inbound_auth, shared_config) = match daemon_authority {
-        Some(authority) => (
-            Some(authority.pairing),
-            Some(authority.inbound_auth),
-            Some(authority.config),
-        ),
-        None => (None, None, None),
-    };
+    let (shared_pairing, shared_inbound_auth, shared_config, shared_cert_audit) =
+        match daemon_authority {
+            Some(authority) => (
+                Some(authority.pairing),
+                Some(authority.inbound_auth),
+                Some(authority.config),
+                authority.cert_audit,
+            ),
+            None => (None, None, None, None),
+        };
+
+    // The in-process RPC seam: dial the daemon's dispatcher when a
+    // supervised run provides its connector, and hand the handle to every
+    // request as an extension so routes can migrate onto RPC one at a time.
+    // The gateway has no credential of its own yet, so the dial is refused
+    // and the seam stays idle until that credential exists; it never rides
+    // the daemon's anonymous compatibility path.
+    let core_rpc = core_rpc::CoreRpc::default();
+    if let Some(connector) = reload_controls
+        .as_ref()
+        .and_then(|controls| controls.inproc.clone())
+    {
+        core_rpc.attach_inproc(connector, zeroclaw_rpc_client::ConnectOptions::default());
+    }
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host)
         && config.tunnel.tunnel_provider == "none"
@@ -2480,6 +2536,9 @@ pub async fn run_gateway_with_plugin_webhooks(
     };
 
     let dashboard_layer_state = state.clone();
+    // On every route that issues or redeems a pairing code: refused through a
+    // relay-served dashboard, where the relay would see the code.
+    let no_relayed_pairing = axum::middleware::from_fn(relay_ingress::no_pairing_through_a_relay);
 
     // Build router with middleware
     let inner = Router::new()
@@ -2488,6 +2547,7 @@ pub async fn run_gateway_with_plugin_webhooks(
             &state.config,
         )))
         .merge(api_oidc::routes())
+        .merge(api_oidc_enroll::routes(Arc::clone(&inbound_auth), shared_cert_audit))
         // ── Admin routes (for CLI management) ──
         .route("/admin/shutdown", post(handle_admin_shutdown))
         .route("/admin/reload", post(handle_admin_reload))
@@ -2500,14 +2560,17 @@ pub async fn run_gateway_with_plugin_webhooks(
         // ── Existing routes ──
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
-        .route("/pair", post(handle_pair))
+        .route(
+            "/pair",
+            post(handle_pair).layer(no_relayed_pairing.clone()),
+        )
         .route("/pair/code", get(handle_pair_code))
         .route("/webhook", post(handle_webhook))
         .merge(sop_webhook_routes())
         .merge(optional_channel_routes())
         .merge(optional_tool_routes())
         // ── Web Dashboard API routes ──
-        .route("/api/status", get(api::handle_api_status))
+        .route("/api/status", get(dashboard_core::status))
         .route("/api/version/check", get(version::handle_version_check))
         .route("/api/version/upgrade", post(version::handle_version_upgrade))
         .route(
@@ -2665,18 +2728,25 @@ pub async fn run_gateway_with_plugin_webhooks(
         )
         .route("/api/health", get(api::handle_api_health))
         .route("/api/tuis", get(api::handle_api_tuis))
-        .route("/api/sessions", get(api::handle_api_sessions_list))
+        .route("/api/sessions", get(dashboard_core::sessions_list))
         .route("/api/sessions/running", get(api::handle_api_sessions_running))
         .route(
             "/api/sessions/{id}/messages",
-            get(api::handle_api_session_messages).post(api::handle_api_session_message_post),
+            get(dashboard_core::session_messages).post(api::handle_api_session_message_post),
         )
-        .route("/api/sessions/{id}", delete(api::handle_api_session_delete).put(api::handle_api_session_rename))
+        .route("/api/sessions/{id}", delete(dashboard_core::session_delete).put(dashboard_core::session_rename))
         .route("/api/sessions/{id}/state", get(api::handle_api_session_state))
-        .route("/api/sessions/{id}/abort", post(api::handle_api_session_abort))
+        .route("/api/sessions/{id}/abort", post(dashboard_core::session_abort))
+        .route("/api/agents/available", get(dashboard_core::agents_available))
         // ── Pairing + Device management API ──
-        .route("/api/pairing/initiate", post(api_pairing::initiate_pairing))
-        .route("/api/pair", post(api_pairing::submit_pairing_enhanced))
+        .route(
+            "/api/pairing/initiate",
+            post(api_pairing::initiate_pairing).layer(no_relayed_pairing.clone()),
+        )
+        .route(
+            "/api/pair",
+            post(api_pairing::submit_pairing_enhanced).layer(no_relayed_pairing.clone()),
+        )
         .route("/api/devices", get(api_pairing::list_devices))
         .route(
             "/api/devices/me/capabilities",
@@ -2685,7 +2755,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         .route("/api/devices/{id}", delete(api_pairing::revoke_device))
         .route(
             "/api/devices/{id}/token/rotate",
-            post(api_pairing::rotate_token),
+            post(api_pairing::rotate_token).layer(no_relayed_pairing),
         )
         // ── Live Canvas (A2UI) routes ──
         .route("/api/canvas", get(canvas::handle_canvas_list))
@@ -2806,7 +2876,9 @@ pub async fn run_gateway_with_plugin_webhooks(
             Duration::from_secs(gateway_long_running_request_timeout_secs(&config.gateway)),
         ));
 
-    let inner = inner.merge(long_running_router);
+    let inner = inner
+        .merge(long_running_router)
+        .layer(axum::Extension(core_rpc));
 
     // Nest under path prefix when configured (axum strips prefix before routing).
     // nest() at "/prefix" handles both "/prefix" and "/prefix/*" but not "/prefix/"
@@ -2883,6 +2955,14 @@ pub async fn run_gateway_with_plugin_webhooks(
     // the stop no request reaches this gateway's router. Its tasks are in
     // `tasks`, so the stop also cancels whatever outlasts the drain.
     let mut app = app.into_make_service_with_connect_info::<SocketAddr>();
+    // Attached once this generation is about to serve, and detached when
+    // it returns, so the bridge never hands a connection to a gateway that
+    // can't serve it.
+    let mut dashboard_feed = DashboardFeed(
+        dashboard_ingress
+            .as_ref()
+            .map(zeroclaw_runtime::relay_dashboard::DashboardIngress::attach),
+    );
     let tasks = ServeTasks::default();
     let _cancel_on_drop = ServeTasksGuard::new(tasks.clone());
     let admission = Admission {
@@ -2975,6 +3055,54 @@ pub async fn run_gateway_with_plugin_webhooks(
                     }
                 });
             }
+            conn = dashboard_feed.next() => {
+                // A browser connection a relay-served dashboard forwarded.
+                // Served like an accepted socket - same router, admission
+                // and drain - with the browser's address as the peer (never
+                // loopback) and each request admitted for that dashboard's
+                // origin alone. No TLS here: the browser's ended at the
+                // relay, and the bridge carries the stream inside the
+                // daemon's own TLS link to it.
+                let (stream, client_addr, origin) = conn.into_parts();
+                let relay = relay_ingress::RelayConnection::new(origin);
+                let svc = tower::MakeService::<
+                    SocketAddr,
+                    hyper::Request<hyper::body::Incoming>,
+                >::make_service(&mut app, client_addr)
+                .await
+                .expect("infallible make_service");
+                let mut stopping = shutdown_rx.clone();
+                let admission = admission.clone();
+                tasks.spawn(async move {
+                    let hyper_svc = hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
+                        let svc = svc.clone();
+                        let admission = admission.clone();
+                        let admitted = relay.admit(&mut req);
+                        async move {
+                            match admitted {
+                                Ok(()) => serve_while_current(svc, &admission, req).await,
+                                Err(refusal) => Ok(*refusal),
+                            }
+                        }
+                    });
+                    // HTTP/1.1 only, which is all the relay offers browsers:
+                    // one connection then carries requests for one host.
+                    let connection = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), hyper_svc)
+                        .with_upgrades();
+                    tokio::pin!(connection);
+                    let served = tokio::select! {
+                        served = connection.as_mut() => served,
+                        () = gateway_stop_requested(&mut stopping) => {
+                            connection.as_mut().graceful_shutdown();
+                            connection.as_mut().await
+                        }
+                    };
+                    if let Err(e) = served {
+                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": format!("{}", e), "remote_addr": client_addr})), "relay dashboard connection error from");
+                    }
+                });
+            }
             _ = shutdown_rx.changed() => {
                 ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "ZeroClaw Gateway shutting down");
                 break;
@@ -2984,6 +3112,9 @@ pub async fn run_gateway_with_plugin_webhooks(
     // Let go of the port at once, as `axum::serve` does: a connection made
     // from here on is refused, not accepted into a backlog nothing serves.
     drop(listener);
+    // And stop taking relay-forwarded dashboard connections: the bridge
+    // refuses them until the next generation attaches.
+    drop(dashboard_feed);
     // Every connection finishes the request in flight and closes; whatever
     // is still open after the drain (an event stream, a connection that
     // ignored the shutdown) is cancelled. Nothing waits on it beyond that:
