@@ -11803,9 +11803,11 @@ mod tool_lifecycle_abandonment_tests {
             }),
         ]);
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("run")];
-        let mut pacing = zeroclaw_config::schema::PacingConfig::default();
-        pacing.loop_detection_max_repeats = 1;
-        pacing.loop_ignore_tools = vec!["queue_sop".into()];
+        let pacing = zeroclaw_config::schema::PacingConfig {
+            loop_detection_max_repeats: 1,
+            loop_ignore_tools: vec!["queue_sop".into()],
+            ..Default::default()
+        };
         let recovery = super::ToolLoopRecovery::default();
         let output = run_recovery_sop_scenario(
             &provider,
