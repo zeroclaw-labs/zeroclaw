@@ -343,13 +343,17 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
       .then(setStatus)
       .catch(() => { /* silently ignore */ });
   }, []);
-  // `check_updates` is undefined on older gateways → treat as enabled.
-  const checkUpdates = status?.check_updates !== false;
+  // `check_updates` is undefined on older gateways → treat as enabled. Updates
+  // are an operator action, so a signed-in account without the operator
+  // dashboard neither checks nor opens the upgrade dialog.
+  const checkUpdates = access.operatorPages && status?.check_updates !== false;
   const { info, loading, refetch } = useVersionCheck(checkUpdates);
   const hasUpdate = info?.is_newer === true;
   const version = status?.version ?? null;
   const [upgradeOpen, setUpgradeOpen] = useState(false);
-  const openUpgrade = () => setUpgradeOpen(true);
+  const openUpgrade = () => {
+    if (access.operatorPages) setUpgradeOpen(true);
+  };
 
   return (
     <>
