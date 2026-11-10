@@ -169,9 +169,7 @@ fn inspect_session(
     let (_, own, own_device) = store::identity(tx, account)?;
     let prefix = format!("omemo//eu.siacs.conversations.axolotl/{peer}/{device}/");
     let associated = store::load(tx, &format!("{prefix}associated_data"))?;
-    let encoded = associated
-        .as_str()
-        .context("Missing session identities")?;
+    let encoded = associated.as_str().context("Missing session identities")?;
     let bytes = URL_SAFE
         .decode(encoded)
         .or_else(|_| URL_SAFE_NO_PAD.decode(encoded))?;

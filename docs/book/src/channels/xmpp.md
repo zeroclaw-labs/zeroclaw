@@ -241,7 +241,6 @@ before the reader answers them. A full queue drops excess messages before admiss
 logs the overload without disconnecting the alias; it does not report those
 messages as accepted.
 
-
 ### Peer resets an OMEMO session
 
 If a pinned contact resets its session while retaining the same identity and
