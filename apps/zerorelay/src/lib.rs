@@ -31,10 +31,13 @@
 //! is for in-daemon tasks. Mirrors the `apps/zerocode` exemption.
 #![allow(clippy::disallowed_methods)]
 
+mod dashboard;
 mod enroll_proxy;
 mod enroll_route;
 mod frontdoor;
 mod frontdoor_assets;
+
+pub use dashboard::{DashboardConfig, check_dashboard_startup};
 
 use anyhow::Result;
 use base64::Engine as _;
@@ -47,7 +50,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
@@ -315,6 +318,13 @@ pub struct RelayConfig {
     /// zerocode/native enrollment is relay-blind regardless of this knob, and
     /// the RPC plane is unaffected.
     pub frontdoor_enabled: bool,
+    /// Serve allowlisted daemons' web dashboards at per-node hosts
+    /// (`[dashboard]`). `None` (the default) serves none.
+    ///
+    /// OFF by default, and the one relay route that is not blind: the relay
+    /// ends the browser's TLS and forwards plaintext HTTP, so its operator can
+    /// read and change those dashboards' traffic. See [`DashboardConfig`].
+    pub dashboard: Option<DashboardConfig>,
 }
 
 impl RelayConfig {
@@ -348,6 +358,7 @@ impl Default for RelayConfig {
             handshake_timeout: Duration::from_secs(10),
             max_registered_nodes: 1024,
             frontdoor_enabled: false,
+            dashboard: None,
         }
     }
 }
@@ -402,6 +413,29 @@ type ConnRoutes = HashMap<u64, ConnRoute>;
 enum ClientRoute {
     Wss,
     Enrollment,
+}
+
+/// The dashboard host label for a daemon's registration public key: the one
+/// rule both ends use ([`zeroclaw_relay_proto::dashboard_label_from_digest`]).
+fn dashboard_label_for_pubkey(pubkey: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(zeroclaw_relay_proto::DASHBOARD_LABEL_CONTEXT);
+    hasher.update(pubkey);
+    let digest: [u8; 32] = hasher.finalize().into();
+    zeroclaw_relay_proto::dashboard_label_from_digest(&digest)
+}
+
+/// The dashboard host a registering daemon gets: only when this relay serves
+/// dashboards, the daemon asked for one (`Hello.dashboard`), AND the operator
+/// listed its key. The label is bound to that key, which `Register` proves.
+fn dashboard_label_for(
+    tier: Option<&dashboard::DashboardTier>,
+    opted_in: bool,
+    fpr: &str,
+    pubkey: &[u8],
+) -> Option<String> {
+    (opted_in && tier.is_some_and(|tier| tier.allows(fpr)))
+        .then(|| dashboard_label_for_pubkey(pubkey))
 }
 
 impl ClientRoute {
@@ -485,6 +519,11 @@ struct DaemonHandle {
     /// re-register the same node-id repeatedly and accumulate live links while
     /// `max_registered_nodes` stayed at a single map entry.
     supersede: Arc<tokio::sync::Notify>,
+    /// The host label this daemon's dashboard is served under, when the daemon
+    /// opted in (`Hello.dashboard`) and `[dashboard] allow` lists its key.
+    dashboard_label: Option<String>,
+    /// Live dashboard connections to this daemon (`[dashboard]` per-node cap).
+    dashboard_live: Arc<AtomicUsize>,
 }
 
 /// How many distinct source IPs the accept-rate map tracks before it prunes idle
@@ -535,6 +574,8 @@ struct Inner {
     /// traffic shed the daemons and clients that pool exists to protect. This
     /// bounds the frontdoor on its own instead.
     frontdoor_permits: Arc<tokio::sync::Semaphore>,
+    /// Per-node dashboard hosts (opt-in; see [`RelayConfig::dashboard`]).
+    dashboard: Option<Arc<dashboard::DashboardTier>>,
     max_registered_nodes: usize,
     daemons: Mutex<HashMap<String, DaemonHandle>>,
     next_conn: AtomicU64,
@@ -621,6 +662,9 @@ impl RelayServer {
                 handshake_timeout: cfg.handshake_timeout,
                 frontdoor_enabled: cfg.frontdoor_enabled,
                 frontdoor_permits: Arc::new(tokio::sync::Semaphore::new(MAX_FRONTDOOR_SESSIONS)),
+                dashboard: cfg
+                    .dashboard
+                    .map(|dashboard| Arc::new(dashboard::DashboardTier::new(dashboard))),
                 max_registered_nodes: cfg.max_registered_nodes.max(1),
                 daemons: Mutex::new(HashMap::new()),
                 next_conn: AtomicU64::new(1),
@@ -713,6 +757,17 @@ impl RelayServer {
                     } else {
                         None
                     };
+                    // A dashboard host is decided by the TLS server name alone,
+                    // before anything is read: its HTTP goes to the daemon unparsed.
+                    if let Some(host) = hs_inner.dashboard.as_ref().and_then(|tier| {
+                        accepted
+                            .get_ref()
+                            .1
+                            .server_name()
+                            .and_then(|name| tier.classify(name))
+                    }) {
+                        return Some(Classified::Dashboard(accepted, host));
+                    }
                     match frontdoor::accept(accepted, hs_inner.frontdoor_enabled).await {
                         Ok(frontdoor::Accepted::WebSocket(w)) => {
                             Some(Classified::WebSocket(w, cert_node_id))
@@ -747,6 +802,15 @@ impl RelayServer {
                         frontdoor::serve_http(session, inner).await;
                         return;
                     }
+                    // A dashboard connection lives as long as the browser uses it
+                    // (a chat socket can stay open for hours), so it is bounded by
+                    // its own per-address and per-node caps and the idle timeout,
+                    // not by the pre-admission pool.
+                    Classified::Dashboard(stream, host) => {
+                        drop(permit);
+                        dashboard::serve(inner, stream, host, peer).await;
+                        return;
+                    }
                 };
                 let mut ws = *ws;
                 let first = match tokio::time::timeout_at(deadline, next_control(&mut ws)).await {
@@ -775,6 +839,8 @@ enum Classified<S> {
     ),
     /// A plain HTTP request for the opt-in browser frontdoor.
     Frontdoor(frontdoor::HttpSession<S>),
+    /// A TLS connection whose server name is under the dashboard domain.
+    Dashboard(S, dashboard::DashboardHost),
 }
 
 /// The target node-id for a client: the outer client cert CN (outer-mTLS variant)
@@ -817,13 +883,17 @@ where
             daemon_pubkey,
             node_id,
             relay_token,
+            dashboard,
         }) => {
             handle_daemon(
                 inner,
                 ws,
-                daemon_pubkey,
-                node_id,
-                relay_token,
+                Registrant {
+                    daemon_pubkey,
+                    node_id,
+                    relay_token,
+                    dashboard,
+                },
                 permit,
                 deadline,
             )
@@ -1093,18 +1163,31 @@ impl Drop for RegistrationGuard {
 /// peer that never sends `Register` retain a task, a TLS session and a parser
 /// outside every handshake bound. `deadline` closes the same hole in the time
 /// dimension: the wait for `Register` shares the one absolute setup budget.
-async fn handle_daemon<S>(
-    inner: Arc<Inner>,
-    mut ws: WebSocketStream<S>,
+/// What a daemon's `Hello` asked for.
+struct Registrant {
     daemon_pubkey: String,
     node_id: String,
     relay_token: Option<String>,
+    /// It serves its dashboard through this relay (`Hello.dashboard`).
+    dashboard: bool,
+}
+
+async fn handle_daemon<S>(
+    inner: Arc<Inner>,
+    mut ws: WebSocketStream<S>,
+    registrant: Registrant,
     permit: tokio::sync::OwnedSemaphorePermit,
     deadline: tokio::time::Instant,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let Registrant {
+        daemon_pubkey,
+        node_id,
+        relay_token,
+        dashboard,
+    } = registrant;
     // Reject a malformed node-id before spending a nonce and a signature
     // verification on it: it is the registry key, so it must be bounded and
     // printable regardless of who is asking.
@@ -1231,6 +1314,8 @@ where
         return Ok(());
     }
 
+    let dashboard_label = dashboard_label_for(inner.dashboard.as_deref(), dashboard, &fpr, &pubkey);
+
     // node-id <-> pubkey binding + last-writer-wins registration.
     let epoch = inner.next_epoch.fetch_add(1, Ordering::Relaxed);
     let (to_daemon, mut from_clients) = mpsc::channel::<Message>(256);
@@ -1296,6 +1381,8 @@ where
                     inner.connect_rate_per_node,
                 ))),
                 supersede: supersede.clone(),
+                dashboard_label,
+                dashboard_live: Arc::new(AtomicUsize::new(0)),
             },
         );
         RegistrationGuard::armed(inner.clone(), node_id.clone(), epoch, conns.clone())
@@ -1593,6 +1680,7 @@ where
                 Control::Open {
                     conn_id,
                     peer_hint: route.peer_hint().map(str::to_string),
+                    client_addr: None,
                 }
                 .to_json(),
             )),
@@ -2042,6 +2130,7 @@ mod tests {
             daemon_pubkey: "a".repeat(MAX_CONTROL_FRAME),
             node_id: "node".into(),
             relay_token: None,
+            dashboard: false,
         }
         .to_json();
 
@@ -2343,7 +2432,13 @@ mod registration_tests {
         let deadline = tokio::time::Instant::now() + inner.handshake_timeout;
         let node = node_id.to_string();
         let task = tokio::spawn(async move {
-            handle_daemon(inner, relay_ws, pubkey, node, relay_token, permit, deadline).await
+            let registrant = Registrant {
+                daemon_pubkey: pubkey,
+                node_id: node,
+                relay_token,
+                dashboard: false,
+            };
+            handle_daemon(inner, relay_ws, registrant, permit, deadline).await
         });
         (
             PeerLink {
@@ -2789,6 +2884,8 @@ mod paired_client_tests {
                 metrics: Arc::new(NodeMetrics::default()),
                 connect_bucket: Arc::new(Mutex::new(TokenBucket::new(60, 20.0))),
                 supersede: Arc::new(tokio::sync::Notify::new()),
+                dashboard_label: None,
+                dashboard_live: Arc::new(AtomicUsize::new(0)),
             },
         );
         (daemon_rx, conns)
@@ -3442,6 +3539,8 @@ mod enroll_route_reclaim_tests {
                 // leg in this test; reclamation, not rate-limiting, is the point.
                 connect_bucket: Arc::new(Mutex::new(TokenBucket::new(4096, 4096.0))),
                 supersede: Arc::new(tokio::sync::Notify::new()),
+                dashboard_label: None,
+                dashboard_live: Arc::new(AtomicUsize::new(0)),
             },
         );
         (daemon_rx, conns)
@@ -3655,5 +3754,322 @@ mod enroll_route_reclaim_tests {
             );
         }
         silent.abort();
+    }
+}
+
+/// The relay-served dashboard's routing, from a registered daemon to its
+/// routes. Lives here because it registers `DaemonHandle`s, whose fields are
+/// private to this module.
+#[cfg(test)]
+mod dashboard_route_tests {
+    use super::*;
+    use crate::dashboard::{DashboardHost, serve};
+    use std::net::SocketAddr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use zeroclaw_relay_proto::PEER_HINT_GATEWAY;
+
+    const BROWSER: &str = "203.0.113.7:51000";
+
+    fn tier_config(allow: &[&str]) -> DashboardConfig {
+        DashboardConfig {
+            domain: "relay.test".into(),
+            allow: allow.iter().map(|fpr| fpr.to_string()).collect(),
+            max_conns_per_node: 2,
+            max_conns_per_ip: 4,
+        }
+    }
+
+    fn server() -> RelayServer {
+        RelayServer::new(RelayConfig {
+            dashboard: Some(tier_config(&["stub-fingerprint"])),
+            ..RelayConfig::default()
+        })
+    }
+
+    /// A daemon's registry entry, with the dashboard label it would have been
+    /// given, its outbound channel and its conn map.
+    fn daemon(
+        fpr: &str,
+        epoch: u64,
+        label: Option<&str>,
+    ) -> (
+        DaemonHandle,
+        mpsc::Receiver<Message>,
+        Arc<Mutex<ConnRoutes>>,
+    ) {
+        let (to_daemon, daemon_rx) = mpsc::channel::<Message>(64);
+        let conns: Arc<Mutex<ConnRoutes>> = Arc::new(Mutex::new(HashMap::new()));
+        let handle = DaemonHandle {
+            fpr: fpr.into(),
+            epoch,
+            to_daemon,
+            conns: conns.clone(),
+            metrics: Arc::new(NodeMetrics::default()),
+            connect_bucket: Arc::new(Mutex::new(TokenBucket::new(60, 20.0))),
+            supersede: Arc::new(tokio::sync::Notify::new()),
+            dashboard_label: label.map(str::to_string),
+            dashboard_live: Arc::new(AtomicUsize::new(0)),
+        };
+        (handle, daemon_rx, conns)
+    }
+
+    /// Register a daemon directly, with the dashboard label it would have been
+    /// given, and hand back its outbound channel and conn map.
+    async fn register(
+        server: &RelayServer,
+        node_id: &str,
+        epoch: u64,
+        label: Option<&str>,
+    ) -> (mpsc::Receiver<Message>, Arc<Mutex<ConnRoutes>>) {
+        let (handle, daemon_rx, conns) = daemon("stub-fingerprint", epoch, label);
+        server
+            .inner
+            .daemons
+            .lock()
+            .await
+            .insert(node_id.to_string(), handle);
+        (daemon_rx, conns)
+    }
+
+    fn label(fill: char) -> String {
+        std::iter::repeat_n(fill, zeroclaw_relay_proto::DASHBOARD_LABEL_LEN).collect()
+    }
+
+    /// The next `Open` the daemon is sent.
+    async fn next_open(daemon_rx: &mut mpsc::Receiver<Message>) -> Control {
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(2), daemon_rx.recv())
+                .await
+                .expect("a frame to the daemon")
+                .expect("the daemon link is open");
+            let Ok(text) = frame.into_text() else {
+                continue;
+            };
+            if let Ok(open @ Control::Open { .. }) = Control::from_json(text.as_str()) {
+                return open;
+            }
+        }
+    }
+
+    async fn answer(browser: &mut tokio::io::DuplexStream) -> String {
+        let mut answer = String::new();
+        tokio::time::timeout(Duration::from_secs(10), browser.read_to_string(&mut answer))
+            .await
+            .expect("the relay answers and closes")
+            .expect("read");
+        answer
+    }
+
+    #[test]
+    fn a_daemon_gets_a_dashboard_host_only_if_it_asked_and_is_listed() {
+        let tier = dashboard::DashboardTier::new(tier_config(&["listed"]));
+        let pubkey = [7u8; 32];
+        let expected = dashboard_label_for_pubkey(&pubkey);
+        assert!(zeroclaw_relay_proto::is_dashboard_label(&expected));
+        assert_eq!(
+            dashboard_label_for(Some(&tier), true, "listed", &pubkey),
+            Some(expected)
+        );
+        assert_eq!(
+            dashboard_label_for(Some(&tier), false, "listed", &pubkey),
+            None,
+            "a daemon that did not opt in"
+        );
+        assert_eq!(
+            dashboard_label_for(Some(&tier), true, "unlisted", &pubkey),
+            None,
+            "a daemon the operator did not list"
+        );
+        assert_eq!(
+            dashboard_label_for(None, true, "listed", &pubkey),
+            None,
+            "a relay that serves no dashboards"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dashboard_route_stays_with_the_daemon_its_label_matched() {
+        // Matching the label and opening the route are two steps. If the
+        // daemon goes away between them and another key registers its
+        // node-id, the browser must not be routed to that key.
+        let server = server();
+        let mine = label('a');
+        let (mut daemon_rx, _conns) = register(&server, "node", 1, Some(&mine)).await;
+        let (newcomer, mut newcomer_rx, _newcomer_conns) = daemon("another-key", 2, None);
+
+        // Hold the registry so the browser's lookup, then the takeover, queue
+        // behind it in that order: tokio's mutex is fair.
+        let held = server.inner.daemons.lock().await;
+        let (_browser, relay_side) = tokio::io::duplex(64 * 1024);
+        let peer: SocketAddr = BROWSER.parse().unwrap();
+        let served = tokio::spawn(serve(
+            server.inner.clone(),
+            relay_side,
+            DashboardHost::Label(mine),
+            peer,
+        ));
+        tokio::task::yield_now().await;
+        let inner = server.inner.clone();
+        let takeover = tokio::spawn(async move {
+            inner
+                .daemons
+                .lock()
+                .await
+                .insert("node".to_string(), newcomer);
+        });
+        tokio::task::yield_now().await;
+        drop(held);
+        takeover.await.unwrap();
+
+        assert!(matches!(
+            next_open(&mut daemon_rx).await,
+            Control::Open { .. }
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), newcomer_rx.recv())
+                .await
+                .is_err(),
+            "the key that took over the node-id was sent the browser's route"
+        );
+        served.abort();
+    }
+
+    #[tokio::test]
+    async fn a_dashboard_host_opens_a_gateway_route_for_the_browser() {
+        let server = server();
+        let mine = label('a');
+        let (mut daemon_rx, conns) = register(&server, "node", 1, Some(&mine)).await;
+        let (mut browser, relay_side) = tokio::io::duplex(64 * 1024);
+        let inner = server.inner.clone();
+        let host = DashboardHost::Label(mine);
+        let peer: SocketAddr = BROWSER.parse().unwrap();
+        let served = tokio::spawn(async move { serve(inner, relay_side, host, peer).await });
+
+        let conn_id = match next_open(&mut daemon_rx).await {
+            Control::Open {
+                conn_id,
+                peer_hint,
+                client_addr,
+            } => {
+                assert_eq!(peer_hint.as_deref(), Some(PEER_HINT_GATEWAY));
+                assert_eq!(client_addr.as_deref(), Some(BROWSER));
+                conn_id
+            }
+            other => panic!("expected an Open, got {other:?}"),
+        };
+        let events = conns.lock().await.get(&conn_id).unwrap().events.clone();
+        events.send(ConnEvent::Opened).await.unwrap();
+
+        // Browser -> daemon, unparsed.
+        browser.write_all(b"GET / HTTP/1.1\r\n").await.unwrap();
+        let data = loop {
+            let frame = tokio::time::timeout(Duration::from_secs(2), daemon_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if let Message::Binary(bytes) = frame {
+                break bytes;
+            }
+        };
+        assert_eq!(
+            zeroclaw_relay_proto::decode_data(&data),
+            Some((conn_id, &b"GET / HTTP/1.1\r\n"[..]))
+        );
+        // Daemon -> browser.
+        events
+            .send(ConnEvent::Data(b"HTTP/1.1 200 OK\r\n".to_vec()))
+            .await
+            .unwrap();
+        let mut got = [0u8; 17];
+        browser.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"HTTP/1.1 200 OK\r\n");
+
+        drop(browser);
+        tokio::time::timeout(Duration::from_secs(2), served)
+            .await
+            .expect("the browser leaving ends the dashboard connection")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_newest_registration_under_a_label_serves_it() {
+        // A node-id rotation's grace window: one key, two node-ids.
+        let server = server();
+        let shared = label('b');
+        let (mut old_rx, _old) = register(&server, "old-id", 1, Some(&shared)).await;
+        let (mut new_rx, _new) = register(&server, "new-id", 2, Some(&shared)).await;
+        let (_browser, relay_side) = tokio::io::duplex(64 * 1024);
+        let inner = server.inner.clone();
+        let host = DashboardHost::Label(shared);
+        tokio::spawn(async move { serve(inner, relay_side, host, BROWSER.parse().unwrap()).await });
+        assert!(matches!(next_open(&mut new_rx).await, Control::Open { .. }));
+        assert!(
+            old_rx.try_recv().is_err(),
+            "the superseded registration is not sent the route"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_or_unserved_label_gets_no_dashboard() {
+        let server = server();
+        // Registered, but without a dashboard label: it did not opt in, or
+        // the operator did not list it.
+        let (mut daemon_rx, _conns) = register(&server, "node", 1, None).await;
+        for host in [DashboardHost::Label(label('c')), DashboardHost::Unknown] {
+            let (mut browser, relay_side) = tokio::io::duplex(64 * 1024);
+            browser
+                .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+                .await
+                .unwrap();
+            serve(
+                server.inner.clone(),
+                relay_side,
+                host.clone(),
+                BROWSER.parse().unwrap(),
+            )
+            .await;
+            let reply = answer(&mut browser).await;
+            assert!(reply.starts_with("HTTP/1.1 404 "), "{host:?}: {reply}");
+        }
+        assert!(
+            daemon_rx.try_recv().is_err(),
+            "no route is opened for a host that is not served"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_daemons_dashboard_connections_are_capped() {
+        let server = server();
+        let mine = label('d');
+        let (mut daemon_rx, conns) = register(&server, "node", 1, Some(&mine)).await;
+        // Fill the per-node cap (2) with routes the daemon accepts and keeps.
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            let (browser, relay_side) = tokio::io::duplex(64 * 1024);
+            let inner = server.inner.clone();
+            let host = DashboardHost::Label(mine.clone());
+            tokio::spawn(
+                async move { serve(inner, relay_side, host, BROWSER.parse().unwrap()).await },
+            );
+            let Control::Open { conn_id, .. } = next_open(&mut daemon_rx).await else {
+                unreachable!()
+            };
+            let events = conns.lock().await.get(&conn_id).unwrap().events.clone();
+            events.send(ConnEvent::Opened).await.unwrap();
+            held.push((browser, events));
+        }
+        let (mut third, relay_side) = tokio::io::duplex(64 * 1024);
+        third
+            .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        serve(
+            server.inner.clone(),
+            relay_side,
+            DashboardHost::Label(mine),
+            "198.51.100.4:40000".parse().unwrap(),
+        )
+        .await;
+        assert!(answer(&mut third).await.starts_with("HTTP/1.1 503 "));
     }
 }

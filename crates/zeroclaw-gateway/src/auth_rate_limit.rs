@@ -1,4 +1,11 @@
 //! Sliding-window rate limiter for authentication attempts.
+//!
+//! Three ledgers are built from it, each with the thresholds below and the
+//! loopback exemption, and each counting on its own so a lockout earned on
+//! one surface never reaches another: `AppState::auth_limiter` for pairing
+//! and webhook auth, the enrollment relay's own in
+//! `api_oidc::OidcEnrollmentState`, and the config route group's bearer
+//! ledger in `principal_gate::BearerVerificationLimits`.
 
 use parking_lot::Mutex;
 use std::collections::HashMap;

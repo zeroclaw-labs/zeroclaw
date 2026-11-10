@@ -473,23 +473,10 @@ pub async fn archive_agent_workspace(
     }
 }
 
-/// What the owned-state cascade removed.
-#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
-pub struct OwnedStateReport {
-    pub memory_purged: usize,
-    pub knowledge_purged: usize,
-    #[serde(default)]
-    pub knowledge_foreign_edges_purged: usize,
-    pub cron_removed: usize,
-    pub acp_removed: usize,
-    pub sessions_cleared: usize,
-    pub control_plane_tasks_removed: usize,
-    pub archived_to: Option<String>,
-    /// Surfaced failures (export / purge / delete errors). Non-empty means part
-    /// of the cascade did NOT complete — those rows were not silently treated as
-    /// removed. The handler logs these; nothing is masked as success.
-    pub warnings: Vec<String>,
-}
+/// What the owned-state cascade removed. It crosses the wire in
+/// `config/map-key/delete` results, so the definition lives in the protocol
+/// crate; the cascade below fills it in.
+pub use zeroclaw_rpc_proto::types::OwnedStateReport;
 
 /// Write one archive artifact, refusing to replace an existing one.
 ///

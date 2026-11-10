@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub enum RuntimeConfigKind {
     Default,
     Custom,
@@ -13,6 +14,7 @@ pub enum RuntimeConfigKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub enum RuntimeShellFamily {
     Posix,
     #[serde(rename = "cmd")]
@@ -23,6 +25,7 @@ pub enum RuntimeShellFamily {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct RuntimeShellProfile {
     pub name: String,
     pub family: RuntimeShellFamily,

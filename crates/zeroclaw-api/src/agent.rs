@@ -62,6 +62,7 @@ impl ToolArtifact {
 /// provider-reported figure).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub enum TokenCountSource {
     /// Count comes from provider-reported usage.
     Provider,
@@ -86,6 +87,7 @@ impl TokenCountSource {
 /// The cost-limit period a [`TurnEvent::BudgetWarning`] refers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub enum BudgetWarningPeriod {
     Day,
     Month,

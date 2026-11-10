@@ -1,0 +1,63 @@
+{
+  "frames": [
+    {
+      "channel": "http",
+      "dir": "send",
+      "payload": {
+        "body": "never answered",
+        "headers": [],
+        "method": "POST",
+        "path": "/plugin/stalled"
+      }
+    },
+    {
+      "channel": "plugin",
+      "dir": "recv",
+      "payload": {
+        "body": "never answered",
+        "headers": [
+          [
+            "host",
+            "<gateway>"
+          ],
+          [
+            "connection",
+            "close"
+          ],
+          [
+            "content-length",
+            "14"
+          ]
+        ],
+        "method": "POST",
+        "query": "",
+        "route": "stalled"
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "recv",
+      "payload": {
+        "body": "webhook processing timed out",
+        "content_type": "text/plain; charset=utf-8",
+        "status": 504
+      }
+    },
+    {
+      "channel": "plugin",
+      "dir": "recv",
+      "payload": {
+        "cancelled": true,
+        "route": "stalled"
+      }
+    },
+    {
+      "channel": "plugin",
+      "dir": "meta",
+      "payload": {
+        "unclaimed_reports": []
+      }
+    }
+  ],
+  "scenario": "plugin_webhook_timeout"
+}
