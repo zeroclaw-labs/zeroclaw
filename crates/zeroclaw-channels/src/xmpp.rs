@@ -596,7 +596,17 @@ impl XmppChannel {
                     tokio::time::timeout(OUTBOUND_TIMEOUT, sink.send(*stanza))
                         .await
                         .context("XMPP control write deadline exceeded; reconnect required")?
-                        .map_err(|error| anyhow::anyhow!("XMPP control write failed: {error}"))?;
+                        .map_err(|error| {
+                            ::zeroclaw_log::record!(
+                                ERROR,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Fail
+                                ),
+                                "XMPP control write failed: {error}"
+                            );
+                            anyhow::Error::msg(format!("XMPP control write failed: {error}"))
+                        })?;
                 }
                 Outbound::Message {
                     recipient,
@@ -1206,7 +1216,7 @@ mod tests {
         })
         .await?;
         drop(tx);
-        let writer = tokio::spawn(async move {
+        let writer = ::zeroclaw_spawn::spawn!(async move {
             channel
                 .write_outbound(
                     sink,
