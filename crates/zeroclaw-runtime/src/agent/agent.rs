@@ -4900,18 +4900,26 @@ impl Agent {
         // One logical turn owns SSH across every SteeringPending re-entry.
         // Inner tool-loop scopes reuse this owner rather than resetting failures.
         let mut outcome = None;
-        let cleanup = zeroclaw_tools::task_ssh::scope(Box::pin(async {
-            outcome = Some(
-                self.turn_streamed_with_steering_body(
-                    user_message,
-                    event_tx,
-                    cancel_token,
-                    steering.0.as_deref_mut(),
-                )
-                .await,
-            );
-            Ok(())
-        }))
+        let session_agent = self
+            .forwarded_environment
+            .as_ref()
+            .and_then(|environment| environment.get("SSH_AUTH_SOCK"))
+            .map(std::ffi::OsString::from);
+        let cleanup = zeroclaw_tools::task_ssh::scope_with_agent(
+            session_agent,
+            Box::pin(async {
+                outcome = Some(
+                    self.turn_streamed_with_steering_body(
+                        user_message,
+                        event_tx,
+                        cancel_token,
+                        steering.0.as_deref_mut(),
+                    )
+                    .await,
+                );
+                Ok(())
+            }),
+        )
         .await;
         match (cleanup, outcome) {
             (Ok(()), Some(outcome)) => outcome,

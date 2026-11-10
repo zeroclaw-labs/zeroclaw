@@ -38,8 +38,23 @@ pub async fn scope<T>(
     scope_with_helper(std::env::var_os("ZEROCLAW_SSH_TASK_HELPER"), future).await
 }
 
+pub async fn scope_with_agent<T>(
+    agent: Option<std::ffi::OsString>,
+    future: std::pin::Pin<Box<dyn Future<Output = Result<T>> + Send + '_>>,
+) -> Result<T> {
+    scope_with_helper_and_agent(std::env::var_os("ZEROCLAW_SSH_TASK_HELPER"), agent, future).await
+}
+
 async fn scope_with_helper<T>(
     helper: Option<std::ffi::OsString>,
+    future: std::pin::Pin<Box<dyn Future<Output = Result<T>> + Send + '_>>,
+) -> Result<T> {
+    scope_with_helper_and_agent(helper, None, future).await
+}
+
+async fn scope_with_helper_and_agent<T>(
+    helper: Option<std::ffi::OsString>,
+    agent: Option<std::ffi::OsString>,
     future: std::pin::Pin<Box<dyn Future<Output = Result<T>> + Send + '_>>,
 ) -> Result<T> {
     let Some(helper) = helper else {
@@ -49,7 +64,11 @@ async fn scope_with_helper<T>(
         return future.await;
     }
     let task = uuid::Uuid::new_v4().simple().to_string();
-    let mut child = Command::new(helper)
+    let mut command = Command::new(helper);
+    if let Some(agent) = agent {
+        command.env("SSH_AUTH_SOCK", agent);
+    }
+    let mut child = command
         .arg("--serve")
         .arg(&task)
         .stdin(Stdio::piped())
@@ -130,6 +149,41 @@ mod tests {
         std::fs::write(&file, format!("#!/bin/sh\nprintf '{{\"ready\":true,\"state_dir\":\"/tmp\"}}\\n'\ncat >/dev/null\nprintf closed > '{}'\n", marker.display())).unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o700)).unwrap();
         file
+    }
+
+    #[tokio::test]
+    async fn session_agents_reach_the_broker_without_crossing_tasks() {
+        let inherited = std::env::var_os("SSH_AUTH_SOCK");
+        async fn run(agent: &'static str) {
+            let directory = tempfile::tempdir().unwrap();
+            let command = helper(directory.path());
+            let marker = directory.path().join("agent");
+            let source = std::fs::read_to_string(&command).unwrap();
+            std::fs::write(
+                &command,
+                source.replace(
+                    "cat >/dev/null",
+                    &format!(
+                        "printf '%s' \"$SSH_AUTH_SOCK\" > '{}'\ncat >/dev/null",
+                        marker.display()
+                    ),
+                ),
+            )
+            .unwrap();
+            scope_with_helper_and_agent(
+                Some(command.into_os_string()),
+                Some(agent.into()),
+                Box::pin(async {
+                    tokio::task::yield_now().await;
+                    Ok(())
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(std::fs::read_to_string(marker).unwrap(), agent);
+        }
+        tokio::join!(run("/session-a/agent.sock"), run("/session-b/agent.sock"));
+        assert_eq!(std::env::var_os("SSH_AUTH_SOCK"), inherited);
     }
 
     #[tokio::test]
