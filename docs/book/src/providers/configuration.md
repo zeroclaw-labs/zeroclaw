@@ -108,6 +108,11 @@ documented development defaults (Ollama `11434`, LM Studio `1234`, vLLM
 `8000`, SGLang `30000`, llama.cpp `8080`, and LiteLLM `4000`) when `uri` is
 omitted. `custom`, `openai-compatible`, and `system-one` connections must
 provide `uri`.
+For Gemini gateways, `uri` includes the protocol prefix, such as
+`https://gateway.example.com/v1beta` for API-key authentication or
+`https://gateway.example.com/v1internal` for OAuth Code Assist. Generation,
+API-key warmup, and OAuth project discovery use that endpoint. OAuth token
+refresh still uses Google's authentication service.
 The OpenAI-compatible capability adapters derive the standard audio paths
 from the same connection URI: `/v1/audio/speech` for TTS and
 `/v1/audio/transcriptions` for ASR. This applies to OpenAI, `custom`,

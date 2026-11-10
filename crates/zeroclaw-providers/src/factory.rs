@@ -1572,7 +1572,7 @@ impl FamilyProviderFactory for GeminiModelProviderConfig {
         &self,
         alias: &str,
         key: Option<&str>,
-        _api_url: Option<&str>,
+        api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
         let state_dir = opts.zeroclaw_dir.clone().unwrap_or_else(|| {
@@ -1585,6 +1585,7 @@ impl FamilyProviderFactory for GeminiModelProviderConfig {
         Ok(Box::new(
             crate::gemini::GeminiModelProvider::builder(alias)
                 .api_key(key)
+                .api_url(api_url)
                 .managed_auth(auth_service, opts.auth_profile_override.clone())
                 .oauth_project_seed(self.oauth_project.clone())
                 .oauth_client(
@@ -2575,6 +2576,60 @@ mod tests {
                 built.err()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn canonical_gemini_gateway_receives_generation_and_warmup() {
+        use serde_json::json;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::provider_registry::{ModelRef, ProviderRegistry};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/gateway/v1beta/models"))
+            .and(header("x-goog-api-key", "test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": []})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/gateway/v1beta/models/gemini-test:generateContent"))
+            .and(header("x-goog-api-key", "test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "candidates": [{"content": {"parts": [{"text": "gateway reply"}]}}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let registry: ProviderRegistry = serde_json::from_value(json!({
+            "connections": {"gateway.prod": {"kind": "gemini",
+                "uri": format!("{}/gateway/v1beta/", server.uri()),
+                "auth": {"mode": "api_key", "api_key": "test-key"}}},
+            "models": {"chat.fast.us": {"capability": "chat", "provider": "gateway.prod", "model": "gemini-test"}}
+        })).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let provider = dispatch_model_ref_with_registry(
+            &registry,
+            &ModelRef::from("chat.fast.us"),
+            &ModelProviderRuntimeOptions {
+                zeroclaw_dir: Some(root.path().to_owned()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            provider.default_base_url(),
+            Some(format!("{}/gateway/v1beta", server.uri()).as_str())
+        );
+        provider.warmup().await.unwrap();
+        assert_eq!(
+            provider
+                .chat_with_system(None, "ping", "gemini-test", None)
+                .await
+                .unwrap(),
+            "gateway reply"
+        );
     }
 
     #[tokio::test]
