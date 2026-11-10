@@ -67,6 +67,41 @@ def root_llms(pages, tag):
     return {name: read_file(source / name) for name in LLMS_FILES}
 
 
+# File names gen-seo leaves out of the sitemap at any depth (SKIP_FILES in
+# xtask/src/cmd/mdbook/seo.rs).
+SITEMAP_SKIP = {"print.html", "404.html", "toc.html"}
+
+
+def sitemap_escape(text):
+    # The same escaping as gen-seo's `escape`.
+    return text.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def stable_sitemap(pages, release):
+    """sitemap.xml for `release` as the stable alias, as xtask's gen-seo writes
+    it: the site root, then every page of every locale under stable/, locales
+    and pages in gen-seo's order. Promotion replaces stable/ with the release,
+    so a sitemap still listing the previous release's pages would send
+    crawlers to pages the release removed, and miss the ones it added.
+    """
+    host = read_file(pages / "CNAME").strip()
+    require(bool(host), "CNAME is empty")
+    site = f"https://{host}"
+    urls = [f"{site}/"]
+    locale_dirs = sorted(entry.name for entry in release.iterdir()
+                         if entry.is_dir() and (entry / "index.html").is_file())
+    for locale in locale_dirs:
+        root = release / locale
+        found = [path for path in root.rglob("*.html") if path.is_file() and path.name not in SITEMAP_SKIP]
+        # gen-seo sorts paths by component, so `a/b.html` comes before `a-b.html`.
+        for page in sorted(found, key=lambda path: path.relative_to(root).parts):
+            urls.append(f"{site}/{STABLE_ALIAS}/{locale}/{page.relative_to(root).as_posix()}")
+    return ('<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+            + "".join(f"  <url><loc>{sitemap_escape(url)}</loc></url>\n" for url in urls)
+            + "</urlset>\n")
+
+
 def contains_symlink(root):
     for directory, dirs, files in os.walk(root):
         if any(os.path.islink(os.path.join(directory, name)) for name in dirs + files):
@@ -143,6 +178,7 @@ def promote(*, pages, repo, master_sha, tag, workflow_ref, minimum, check_only=F
     require(not alias.is_symlink(), "The stable alias must not be a symlink")
     require(not contains_symlink(target), "Release directory must not contain symlinks")
     llms = root_llms(pages, tag)
+    sitemap = stable_sitemap(pages, target)
     for entry in entries:
         if entry["tag"] == current:
             entry["label"] = current
@@ -157,6 +193,7 @@ def promote(*, pages, repo, master_sha, tag, workflow_ref, minimum, check_only=F
              f'<link rel="canonical" href="{destination}">\n<title>ZeroClaw Docs</title>\n')
     if not check_only:
         (pages / "stable-version.txt").write_text(tag + "\n", encoding="utf-8")
+        (pages / "sitemap.xml").write_text(sitemap, encoding="utf-8")
         (pages / "versions.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         (pages / "index.html").write_text(index, encoding="utf-8")
         for name, text in llms.items():
