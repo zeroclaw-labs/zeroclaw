@@ -106,7 +106,7 @@ test('reconnect discovery only emits sent live item metadata; recovery requires 
     if(cmd==='/u')return {type:'activeUser',user:{userId:1}};
     if(cmd.startsWith('/_get chats'))return {chats:[{chatInfo:{type:'direct',contact:{contactId:17}}}]};
     if(cmd.startsWith('/_get chat'))return {chat:{chatItems:[
-      {meta:{itemId:42,itemLive:true,createdAt:new Date(now).toISOString()},chatDir:{type:'directSnd'},content:{type:'sndMsgContent',msgContent:{type:'text',text:'*Bold* _italic_'}}},
+      {meta:{itemId:42,itemLive:true,createdAt:new Date(now-2*3600000).toISOString()},chatDir:{type:'directSnd'},content:{type:'sndMsgContent',msgContent:{type:'text',text:'*Bold* _italic_'}}},
       {meta:{itemId:43,itemLive:true,createdAt:new Date(now).toISOString()},chatDir:{type:'directRcv'},content:{type:'rcvMsgContent',msgContent:{type:'text',text:'Untrusted'}}},
     ]}};
     response=cmd;return {type:'chatItemUpdated'};

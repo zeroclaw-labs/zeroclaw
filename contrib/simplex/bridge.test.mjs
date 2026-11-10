@@ -70,7 +70,7 @@ test('stdio bridge streams and finalizes one live message, then recovers only au
       if(cmd==='/u')resp={type:'activeUser',user:{userId:1}};
       else if(cmd.startsWith('/_get chats'))resp={type:'apiChats',chats:[{chatInfo:{type:'direct',contact:{contactId:17}}}]};
       else if(cmd.startsWith('/_get chat'))resp={type:'apiChat',chat:{chatItems:[{
-        meta:{itemId:42,itemLive:true,createdAt:new Date(Date.now()-1000).toISOString()},chatDir:{type:'directSnd'},
+        meta:{itemId:42,itemLive:true,createdAt:new Date(Date.now()-2*3600000).toISOString()},chatDir:{type:'directSnd'},
         content:{type:'sndMsgContent',msgContent:{type:'text',text:'Earlier partial'}},
       }]}};
       else if(cmd.startsWith('/_send ')) {

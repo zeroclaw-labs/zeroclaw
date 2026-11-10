@@ -109,7 +109,7 @@ export class LiveTexts {
       for (const item of (response.chat?.chatItems ?? []).slice(-20)) {
         const created = Date.parse(item.meta?.createdAt);
         if (item.chatDir?.type !== 'directSnd' || item.meta?.itemLive !== true
-          || !positive(item.meta?.itemId) || !(created <= now && created >= now - 3600000)
+          || !positive(item.meta?.itemId) || !(created <= now)
           || item.content?.type !== 'sndMsgContent' || item.content.msgContent?.type !== 'text'
           || this.orphans.size >= 64) continue;
         const key = `${contact}/${item.meta.itemId}`;

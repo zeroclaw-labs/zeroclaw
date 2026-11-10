@@ -94,11 +94,12 @@ is withheld until the shared delivery path approves it. Text finalizes before
 waiting for a voice note, so text and speech do not delay one another.
 
 Cancellation deletes an unused placeholder or finalizes visible partial text
-with `[Interrupted]`. On reconnect, the helper discovers only recent sent live
-items in bounded direct-chat history; native authorization must approve each
-cleanup. It does not replay an answer after an uncertain final edit. Old items
-outside that recovery window can remain unfinished. Update the helper and the
-native binary together when upgrading this adapter.
+with `[Interrupted]`. On reconnect, the helper discovers sent live items in
+bounded recent direct-chat history; native authorization must approve each
+cleanup. Items older than an hour remain eligible, so a long turn can be
+finalized after a restart. It does not replay an answer after an uncertain final
+edit. Items outside the bounded history scan can remain unfinished. Update the
+helper and the native binary together when upgrading this adapter.
 
 ## Voice notes
 
