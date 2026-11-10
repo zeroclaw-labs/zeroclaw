@@ -127,3 +127,14 @@ export function reduceTurnFrame(
       return { state: initialTurnStreamState(), completion: null };
   }
 }
+
+/**
+ * Whether an `error` frame ends the running turn. Two codes refuse only the
+ * request that caused them, so the turn keeps streaming: `CAPABILITY_MISSING`
+ * (a message sent mid-turn, or an SOP approval answer, on a gateway that
+ * serves chat through the core) and `INVALID_JSON` (a malformed client frame).
+ * Every other error code ends it.
+ */
+export function errorEndsTurn(code: string | undefined): boolean {
+  return code !== 'CAPABILITY_MISSING' && code !== 'INVALID_JSON';
+}
