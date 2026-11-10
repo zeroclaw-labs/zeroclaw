@@ -652,9 +652,8 @@ impl Logs {
         cursor_legacy: Option<(String, String)>,
     ) {
         // The persisted log is refused with the stream: there is nothing to
-        // page, so don't ask, and don't offer older events.
+        // page, so don't ask.
         if self.refused.is_some() {
-            self.at_end = true;
             return;
         }
         self.loading = true;
@@ -931,9 +930,11 @@ impl Logs {
         let status = Line::from(vec![
             Span::styled(" Logs ", theme::title_style()),
             Span::styled(format!("({}) ", filtered.len()), theme::dim_style()),
+            // Older events are offered only while there is history to page:
+            // a refused pane has none, whatever a refilter did to `at_end`.
             if self.loading {
                 Span::styled("[loading] ", theme::warn_style())
-            } else if !self.at_end {
+            } else if !self.at_end && self.refused.is_none() {
                 Span::styled("[more\u{2191}] ", theme::dim_style())
             } else {
                 Span::raw("")
@@ -2249,6 +2250,43 @@ mod tests {
             !screen.contains("[more\u{2191}]"),
             "no older events are offered: {screen}"
         );
+    }
+
+    /// Changing the severity or the search refilters the pane, which resets
+    /// its paging. A refused pane must still offer no older events, and ask
+    /// the daemon for nothing more.
+    #[tokio::test]
+    async fn a_refused_log_never_offers_older_events() {
+        let (mut logs, seen) = logs_with_daemon(rpc_error(
+            crate::jsonrpc::error_codes::FORBIDDEN,
+            "Scoped principals cannot read the daemon-wide logs",
+        ));
+        logs.init()
+            .await
+            .expect("a refused log is not a startup failure");
+        let offers_more = |logs: &mut Logs| rendered(logs, 120, 12).contains("[more\u{2191}]");
+        assert!(!offers_more(&mut logs));
+
+        for (key, what) in [
+            (KeyCode::Char('+'), "severity up"),
+            (KeyCode::Char('-'), "severity down"),
+            (KeyCode::Char('/'), "search begun"),
+            (KeyCode::Char('x'), "search typed"),
+            (KeyCode::Enter, "search accepted"),
+        ] {
+            logs.handle_key(KeyEvent::new(key, KeyModifiers::NONE))
+                .await;
+            assert!(!offers_more(&mut logs), "older events offered after {what}");
+        }
+        assert_eq!(logs.search_query, "x", "the search was accepted");
+        logs.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE))
+            .await;
+        assert!(logs.search_query.is_empty(), "the search was cleared");
+        assert!(
+            !offers_more(&mut logs),
+            "older events offered after the search was cleared"
+        );
+        assert_eq!(*seen.lock().unwrap(), ["logs/subscribe"]);
     }
 
     /// Any other failure still fails startup, as before.
