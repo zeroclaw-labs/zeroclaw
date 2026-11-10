@@ -1,6 +1,6 @@
 import { displayMessageText } from '@/lib/chatMessageText';
 import BrowserVoiceControls from '@/components/BrowserVoiceControls';
-import { memo, useState, useEffect, useRef, useCallback } from 'react';
+import { memo, useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Link, Navigate, useParams } from 'react-router-dom';
 import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench, Brain, BarChart2, FolderOpen, ImagePlus, Loader2 } from 'lucide-react';
 import ReactMarkdown, { type Components } from 'react-markdown';
@@ -8,16 +8,18 @@ import remarkGfm from 'remark-gfm';
 import { useAgent, type ChatMessage } from '@/contexts/AgentContext';
 import { ApiError, uploadChatImage } from '@/lib/api';
 import { useDraft } from '@/hooks/useDraft';
+import { useAvailableAgents, useNavAccess } from '@/hooks/useNavAccess';
 import { t } from '@/lib/i18n';
 import {
-  COMMANDS,
+  commandsFor,
   helpText,
   isSlashCommand,
   matchCommands,
   parseCommand,
   type CommandSpec,
 } from '@/lib/slashCommands';
-import { Button } from '@/components/ui';
+import { Button, Card } from '@/components/ui';
+import { NotAvailable } from '@/components/auth/NotAvailable';
 import ChatWorkspace from '@/pages/ChatWorkspace';
 
 import ToolCallCard from '@/components/ToolCallCard';
@@ -76,10 +78,68 @@ function ContextBar({ contextMaxTokens, contextModelWindow, contextInputTokens }
  */
 export default function AgentChat() {
   const { alias } = useParams<{ alias: string }>();
+  const access = useNavAccess();
   if (!alias) {
     return <Navigate to="/agents" replace />;
   }
+  if (!access.operatorPages) {
+    return <ScopedChatWorkspace alias={alias} />;
+  }
   return <ChatWorkspace initialAlias={alias} />;
+}
+
+/**
+ * A signed-in account without the operator dashboard chats only with the
+ * agents `/api/agents/available` lists. The gateway refuses any other agent
+ * before the socket opens, which the browser would otherwise retry forever,
+ * so an unlisted alias shows "not available" and stale tabs for other agents
+ * are dropped. A list that failed to load says nothing about the account's
+ * access, so it offers another try instead.
+ */
+function ScopedChatWorkspace({ alias }: { alias: string }) {
+  const { loading, agents, error, retry } = useAvailableAgents(true);
+  const allowed = useMemo(
+    () => new Set(agents.filter((a) => a.enabled).map((a) => a.alias)),
+    [agents],
+  );
+  if (loading) {
+    return (
+      <div className="min-h-[60vh] flex items-center justify-center">
+        <div className="h-8 w-8 border-2 rounded-full animate-spin border-pc-border border-t-pc-accent" />
+      </div>
+    );
+  }
+  if (error !== null) {
+    return <AvailabilityLoadError error={error} onRetry={retry} />;
+  }
+  if (!allowed.has(alias)) {
+    return <NotAvailable access="not-available" />;
+  }
+  return <ChatWorkspace initialAlias={alias} allowedAliases={allowed} />;
+}
+
+/** The agents list failed to load: the error and a Retry, not a refusal. */
+function AvailabilityLoadError({ error, onRetry }: { error: string; onRetry: () => void }) {
+  return (
+    <div className="p-6">
+      <Card padded={false} className="p-6 w-full max-w-lg" data-agents-load-error="">
+        <div className="flex items-center gap-2 mb-2">
+          <AlertCircle className="h-5 w-5 shrink-0 text-status-error" />
+          <h2 className="text-lg font-semibold" style={{ color: 'var(--pc-text-primary)' }}>
+            {t('agent.availability_load_failed')}
+          </h2>
+        </div>
+        {error && (
+          <p className="text-sm mb-4 break-words" style={{ color: 'var(--pc-text-muted)' }}>
+            {error}
+          </p>
+        )}
+        <Button size="sm" onClick={onRetry} data-agents-retry="">
+          {t('common.retry')}
+        </Button>
+      </Card>
+    </div>
+  );
 }
 
 /** Status snapshot a chat pane pushes up to the workspace tab bar. */
@@ -109,6 +169,12 @@ export function AgentChatInner({
     messages,
     sendMessage,
     connected,
+    conversationLimited,
+    retryConnection,
+    conversationPerSocket,
+    startsConversationOnSend,
+    unsentMessage,
+    takeUnsentMessage,
     error,
     typing,
     streamingContent,
@@ -130,6 +196,14 @@ export function AgentChatInner({
     contextModelWindow,
     contextInputTokens,
   } = useAgent();
+  // A signed-in account without the operator dashboard can't switch the
+  // agent's model (that rewrites its config for everyone), upload, or open the
+  // agent's workspace.
+  const operator = useNavAccess().operatorPages;
+  const commands = useMemo(() => commandsFor(operator), [operator]);
+  // With one conversation per socket, no socket is open between
+  // conversations, and a message is what opens the next one.
+  const canSend = connected || startsConversationOnSend;
 
   // Keyed by conversation, not just alias: with the same agent open in two
   // panes an alias-only key would make both share one draft, so typing in one
@@ -206,6 +280,14 @@ export function AgentChatInner({
     writeInput(draft);
   }, [draftKey, draft, writeInput]);
 
+  // A message that never reached a conversation comes back to the composer,
+  // ahead of anything typed since.
+  useEffect(() => {
+    if (unsentMessage === null) return;
+    applyInput((typed) => (typed ? `${unsentMessage}\n${typed}` : unsentMessage));
+    takeUnsentMessage();
+  }, [unsentMessage, applyInput, takeUnsentMessage]);
+
   // Report live status (typing + message count) up to the host workspace so it
   // can render streaming / unread indicators in the tab bar. Fires on every
   // typing flip or message-count change; the workspace decides what to do with
@@ -245,7 +327,7 @@ export function AgentChatInner({
     const { command, args } = parseCommand(trimmed);
     switch (command) {
       case 'help':
-        addLocalMessage(helpText());
+        addLocalMessage(helpText(commands));
         return true;
 
       case 'clear':
@@ -263,6 +345,10 @@ export function AgentChatInner({
         return true;
 
       case 'upload':
+        if (!operator) {
+          addLocalMessage(t('auth.not_available'));
+          return true;
+        }
         // Same picker as the attach button — the input click is allowed here
         // because runCommand fires from the user's Enter keypress, keeping
         // the browser's user-activation requirement satisfied.
@@ -270,6 +356,10 @@ export function AgentChatInner({
         return true;
 
       case 'model': {
+        if (!operator) {
+          addLocalMessage(t('auth.not_available'));
+          return true;
+        }
         const name = args.trim();
         if (!name) {
           const current = currentModel
@@ -313,7 +403,7 @@ export function AgentChatInner({
         addLocalMessage(t('agent.cmd_unknown').replace('{cmd}', `/${command}`));
         return true;
     }
-  }, [addLocalMessage, clearAllMessages, startNewSession, currentModel, availableModels, switchModel, modelLoading]);
+  }, [addLocalMessage, clearAllMessages, startNewSession, currentModel, availableModels, switchModel, modelLoading, operator, commands]);
 
   const [voiceSubmitRequested, setVoiceSubmitRequested] = useState<string | null>(null);
   const cancelVoiceCapture = useRef<(() => void) | null>(null);
@@ -331,6 +421,7 @@ export function AgentChatInner({
     if (command) {
       runCommand(trimmed);
     } else {
+      if (!canSend) return;
       // `//` is the documented escape for a literal leading slash (#7223);
       // strip one `/` so `//foo` is sent to the agent as `/foo`.
       sendMessage(trimmed.startsWith('//') ? trimmed.slice(1) : trimmed);
@@ -409,6 +500,7 @@ export function AgentChatInner({
   const handleDragEnter = (e: React.DragEvent) => {
     if (!dragHasFiles(e)) return;
     e.preventDefault();
+    if (!operator) return;
     dragDepthRef.current += 1;
     setDragActive(true);
   };
@@ -416,15 +508,18 @@ export function AgentChatInner({
     if (dragHasFiles(e)) e.preventDefault();
   };
   const handleDragLeave = (e: React.DragEvent) => {
-    if (!dragHasFiles(e)) return;
+    if (!dragHasFiles(e) || !operator) return;
     dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
     if (dragDepthRef.current === 0) setDragActive(false);
   };
   const handleDrop = (e: React.DragEvent) => {
     if (!dragHasFiles(e)) return;
+    // Without upload the drop is still swallowed, so the browser doesn't
+    // navigate away to the file.
     e.preventDefault();
     dragDepthRef.current = 0;
     setDragActive(false);
+    if (!operator) return;
     void uploadImages(e.dataTransfer.files);
   };
 
@@ -434,7 +529,7 @@ export function AgentChatInner({
     // Show the command popover while typing the command token (a single
     // leading '/' with no space yet). Hide once the user moves to arguments or
     // the token no longer matches any command.
-    const showHint = /^\/[^/\s]*$/.test(value) && matchCommands(value.slice(1)).length > 0;
+    const showHint = /^\/[^/\s]*$/.test(value) && matchCommands(value.slice(1), commands).length > 0;
     setShowCommandHint(showHint);
     e.target.style.height = 'auto';
     e.target.style.height = `${Math.min(e.target.scrollHeight, 200)}px`;
@@ -452,8 +547,8 @@ export function AgentChatInner({
   }, [applyInput]);
 
   const matchedCommands: CommandSpec[] = /^\/[^/\s]*$/.test(input)
-    ? matchCommands(input.slice(1))
-    : COMMANDS.slice();
+    ? matchCommands(input.slice(1), commands)
+    : commands.slice();
 
   const handleCopy = useCallback((msgId: string, content: string) => {
     const onSuccess = () => {
@@ -596,57 +691,70 @@ export function AgentChatInner({
         <div className="flex items-center gap-2 min-w-0">
           <Bot className="h-4 w-4 shrink-0 text-pc-accent" />
           <span className="text-sm font-medium text-pc-text truncate">{agentAlias}</span>
-          <Link
-            to={`/agent/${encodeURIComponent(agentAlias)}/workspace`}
-            className="inline-flex items-center gap-1 px-2 h-6 rounded-[var(--radius-md)] text-xs font-medium text-pc-text-secondary transition-colors hover:text-pc-text hover:bg-[var(--pc-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
-            title={t('agentchat.open_workspace')}
-          >
-            <FolderOpen className="h-3.5 w-3.5" />
-            {t('agentchat.files')}
-          </Link>
+          {operator && (
+            <Link
+              to={`/agent/${encodeURIComponent(agentAlias)}/workspace`}
+              className="inline-flex items-center gap-1 px-2 h-6 rounded-[var(--radius-md)] text-xs font-medium text-pc-text-secondary transition-colors hover:text-pc-text hover:bg-[var(--pc-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
+              title={t('agentchat.open_workspace')}
+            >
+              <FolderOpen className="h-3.5 w-3.5" />
+              {t('agentchat.files')}
+            </Link>
+          )}
         </div>
 
         <div className="flex items-center justify-between gap-2 min-w-0 w-full @xl/chat-header:w-auto ms-auto">
-          <SessionPicker agentAlias={agentAlias} />
+          {/* Nothing to list or reopen when each socket is its own conversation. */}
+          {!conversationPerSocket && <SessionPicker agentAlias={agentAlias} />}
 
-          <div className="relative min-w-0" ref={modelDropdownRef}>
-            <button
-              type="button"
-              onClick={() => setShowModelDropdown((v) => !v)}
-              aria-expanded={showModelDropdown && availableModels.length > 0}
-              disabled={modelLoading || typing || (availableModels.length === 0 && currentModel === null)}
-              className="flex items-center gap-2 px-3 h-7 max-w-full rounded-[var(--radius-md)] text-xs font-medium border border-pc-border bg-pc-elevated text-pc-text-secondary transition-colors hover:text-pc-text hover:border-pc-border-strong disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
+          {operator ? (
+            <div className="relative min-w-0" ref={modelDropdownRef}>
+              <button
+                type="button"
+                onClick={() => setShowModelDropdown((v) => !v)}
+                aria-expanded={showModelDropdown && availableModels.length > 0}
+                disabled={modelLoading || typing || (availableModels.length === 0 && currentModel === null)}
+                className="flex items-center gap-2 px-3 h-7 max-w-full rounded-[var(--radius-md)] text-xs font-medium border border-pc-border bg-pc-elevated text-pc-text-secondary transition-colors hover:text-pc-text hover:border-pc-border-strong disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
+              >
+                <span className="max-w-[180px] truncate">
+                  {modelLoading
+                    ? t('agent.model_switching')
+                    : (currentModel ?? (availableModels.length === 0 ? t('agent.model_loading') : t('agent.select_model')))}
+                </span>
+                <ChevronDown className="h-3 w-3 shrink-0" />
+              </button>
+
+              {showModelDropdown && availableModels.length > 0 && (
+                <div className="absolute end-0 mt-1.5 rounded-[var(--radius-md)] border border-pc-border bg-pc-elevated shadow-[var(--pc-shadow-md)] z-50 py-1 min-w-[200px] max-h-60 overflow-y-auto">
+                  {availableModels.map((model) => {
+                    const isActive = model === currentModel;
+                    return (
+                      <button
+                        key={model}
+                        type="button"
+                        onClick={() => handleModelSwitch(model)}
+                        className={`w-full text-left px-3 py-2 text-xs transition-colors ${
+                          isActive
+                            ? 'text-pc-accent bg-pc-accent/10'
+                            : 'text-pc-text hover:bg-[var(--pc-hover)]'
+                        }`}
+                      >
+                        {model}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          ) : (
+            // Read-only: switching rewrites the agent's config for everyone.
+            <span
+              data-model-readonly=""
+              className="flex items-center px-3 h-7 rounded-[var(--radius-md)] text-xs font-medium border border-pc-border bg-pc-elevated text-pc-text-secondary"
             >
-              <span className="max-w-[180px] truncate">
-                {modelLoading
-                  ? t('agent.model_switching')
-                  : (currentModel ?? (availableModels.length === 0 ? t('agent.model_loading') : t('agent.select_model')))}
-              </span>
-              <ChevronDown className="h-3 w-3 shrink-0" />
-            </button>
-
-            {showModelDropdown && availableModels.length > 0 && (
-              <div className="absolute end-0 mt-1.5 rounded-[var(--radius-md)] border border-pc-border bg-pc-elevated shadow-[var(--pc-shadow-md)] z-50 py-1 min-w-[200px] max-h-60 overflow-y-auto">
-                {availableModels.map((model) => {
-                  const isActive = model === currentModel;
-                  return (
-                    <button
-                      key={model}
-                      type="button"
-                      onClick={() => handleModelSwitch(model)}
-                      className={`w-full text-left px-3 py-2 text-xs transition-colors ${
-                        isActive
-                          ? 'text-pc-accent bg-pc-accent/10'
-                          : 'text-pc-text hover:bg-[var(--pc-hover)]'
-                      }`}
-                    >
-                      {model}
-                    </button>
-                  );
-                })}
-              </div>
-            )}
-          </div>
+              <span className="max-w-[180px] truncate">{currentModel ?? t('agent.model_loading')}</span>
+            </span>
+          )}
         </div>
       </div>
 
@@ -655,6 +763,18 @@ export function AgentChatInner({
         <div className="px-4 py-2 border-b border-status-error/20 bg-status-error/10 text-status-error flex items-center gap-2 text-sm animate-fade-in">
           <AlertCircle className="h-4 w-4 shrink-0" />
           {error}
+        </div>
+      )}
+      {conversationLimited && (
+        <div
+          data-conversation-limit=""
+          className="px-4 py-2 border-b border-pc-border bg-pc-surface text-pc-text-secondary flex items-center gap-2 text-sm animate-fade-in"
+        >
+          <AlertCircle className="h-4 w-4 shrink-0" />
+          <span className="flex-1">{t('agent.conversation_limit')}</span>
+          <Button size="sm" variant="ghost" onClick={retryConnection}>
+            {t('common.retry')}
+          </Button>
         </div>
       )}
 
@@ -719,6 +839,11 @@ export function AgentChatInner({
               <>
                 <p className="text-base font-semibold mb-1 text-pc-text">{t('agentchat.empty_title')}</p>
                 <p className="text-sm text-pc-text-muted">{t('agent.start_conversation')}</p>
+                {conversationPerSocket && (
+                  <p data-conversation-scope-note="" className="text-xs mt-2 text-pc-text-faint">
+                    {t('agent.conversation_ends_with_page')}
+                  </p>
+                )}
               </>
             ) : (
               <p className="text-sm text-pc-text-muted">{t('agent.session_loading')}</p>
@@ -806,32 +931,38 @@ export function AgentChatInner({
           </div>
         )}
         <div className="flex items-end gap-3 max-w-4xl mx-auto">
-          <BrowserVoiceControls key={draftKey} captureRef={cancelVoiceCapture} onSilence={() => setVoiceSubmitRequested(draftKey)} messages={messages} hydrated={hydrated} typing={typing} onTranscript={text => applyInput(prev => `${prev}${prev && !/\s$/.test(prev) ? ' ' : ''}${text}`)} />
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="image/*"
-            multiple
-            className="hidden"
-            onChange={(e) => {
-              if (e.target.files) void uploadImages(e.target.files);
-              // Reset so picking the same file again re-fires onChange.
-              e.target.value = '';
-            }}
-          />
-          <Button
-            variant="ghost"
-            size="md"
-            onClick={() => fileInputRef.current?.click()}
-            disabled={uploading}
-            className="flex-shrink-0 w-10 px-0"
-            aria-label={t('agent.attach_image')}
-            title={t('agent.attach_image')}
-          >
-            {uploading
-              ? <Loader2 className="h-4 w-4 animate-spin" />
-              : <ImagePlus className="h-4 w-4" />}
-          </Button>
+          {canSend && (
+            <BrowserVoiceControls key={draftKey} captureRef={cancelVoiceCapture} onSilence={() => setVoiceSubmitRequested(draftKey)} messages={messages} hydrated={hydrated} typing={typing} onTranscript={text => applyInput(prev => `${prev}${prev && !/\s$/.test(prev) ? ' ' : ''}${text}`)} />
+          )}
+          {operator && (
+            <>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/*"
+                multiple
+                className="hidden"
+                onChange={(e) => {
+                  if (e.target.files) void uploadImages(e.target.files);
+                  // Reset so picking the same file again re-fires onChange.
+                  e.target.value = '';
+                }}
+              />
+              <Button
+                variant="ghost"
+                size="md"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={uploading}
+                className="flex-shrink-0 w-10 px-0"
+                aria-label={t('agent.attach_image')}
+                title={t('agent.attach_image')}
+              >
+                {uploading
+                  ? <Loader2 className="h-4 w-4 animate-spin" />
+                  : <ImagePlus className="h-4 w-4" />}
+              </Button>
+            </>
+          )}
           <textarea
             ref={inputRef}
             rows={1}
@@ -840,14 +971,14 @@ export function AgentChatInner({
             onKeyDown={handleKeyDown}
             onCompositionStart={() => { isComposingRef.current = true; }}
             onCompositionEnd={() => { isComposingRef.current = false; }}
-            placeholder={!connected
+            placeholder={!canSend
               ? t('agent.connecting')
               : !hydrated
                 ? t('agent.session_loading')
                 : typing
                   ? t('agent.running')
                   : t('agent.type_message')}
-            disabled={!connected || typing || !hydrated}
+            disabled={!canSend || typing || !hydrated}
             className="flex-1 px-4 text-sm resize-none rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-pc-text placeholder:text-pc-text-muted transition-colors focus:outline-none focus:border-pc-accent focus:ring-2 focus:ring-pc-accent/30 disabled:opacity-40"
             style={{ minHeight: '40px', maxHeight: '200px', paddingTop: '9px', paddingBottom: '9px' }}
           />
@@ -867,7 +998,7 @@ export function AgentChatInner({
               variant="primary"
               size="md"
               onClick={handleSend}
-              disabled={!connected || !hydrated || !input.trim()}
+              disabled={!canSend || !hydrated || !input.trim()}
               className="flex-shrink-0 w-10 px-0"
               aria-label={t('agent.send')}
             >
@@ -883,7 +1014,9 @@ export function AgentChatInner({
                 ? { background: 'var(--pc-accent)', boxShadow: '0 0 6px var(--pc-accent)' }
                 : connected
                   ? { background: 'var(--color-status-success)', boxShadow: '0 0 6px var(--color-status-success)' }
-                  : { background: 'var(--color-status-error)', boxShadow: '0 0 6px var(--color-status-error)' }
+                  : startsConversationOnSend
+                    ? { background: 'var(--pc-text-faint)' }
+                    : { background: 'var(--color-status-error)', boxShadow: '0 0 6px var(--color-status-error)' }
               }
             />
             <span className="text-[10px]" style={{ color: 'var(--pc-text-faint)' }}>
@@ -891,7 +1024,9 @@ export function AgentChatInner({
                 ? t('agent.running')
                 : connected
                   ? t('agent.connected_status')
-                  : t('agent.disconnected_status')}
+                  : startsConversationOnSend
+                    ? t('agent.ready_status')
+                    : t('agent.disconnected_status')}
             </span>
           </div>
           <ContextBar contextMaxTokens={contextMaxTokens} contextModelWindow={contextModelWindow} contextInputTokens={contextInputTokens} />
