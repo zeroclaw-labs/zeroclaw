@@ -52,10 +52,14 @@ port 9781 and the gateway at
 by default: use `--gateway-url` to name its TLS-terminating proxy. A gateway
 path prefix is supported. Plain HTTP is accepted only on loopback.
 
-Public clients that enforce PKCE are supported: zerocode sends an S256
-challenge on device authorization and the matching verifier only when polling
-for its token. The verifier lives only for the sign-in, is never persisted, and
-is not part of the gateway's device-start response.
+Every device grant zerocode performs sends an S256 PKCE challenge,
+including `zerocode login` and the legacy automatic enrollment path
+(`[connection.wss]` with `auth_provider = "oidc.<alias>"`, an `enroll_url`
+and no token). The matching verifier is sent only when polling for the token,
+lives only for that grant, is never persisted, and is not part of the
+gateway's device-start response. A provider that rejects `code_challenge` on
+its device authorization endpoint will fail both paths; providers that ignore
+unrecognized parameters, as RFC 8628 section 3.1 requires, continue to work.
 
 Login works from a completely empty client configuration directory:
 
@@ -125,8 +129,23 @@ use an explicit `zerocode login` invocation to save replacement TLS settings.
 
 `ZEROCLAW_AUTH_TOKEN` still overrides the selected token for a one-off run;
 login warns if that environment variable would shadow the token it just
-saved. Existing manually configured `[connection.wss]` credentials continue to
-work for connections without a saved URL login.
+saved.
+
+Manually configured `[connection.wss]` credentials (a token, a provider, TLS
+files or a relay) keep working, with limits once any URL login is saved:
+
+- With no saved login, they are used for whichever URL is selected, including
+  a `--connect` to another daemon, as before.
+- Once a login exists, they are used only for the URL in
+  `[connection.wss] uri`. Any other `--connect` URL gets none of them, even
+  on the same host with a different port or path. Two spellings of one URL,
+  such as with and without a trailing slash, count as the same URL.
+- `zerocode login` makes the URL it signed in to the default by rewriting
+  `[connection.wss] uri`. If the manual credentials were for a different
+  daemon, they are no longer used after that, and `zerocode --connect` to
+  that daemon runs without them. To keep using them, set `uri` back to that
+  daemon and reach the signed-in one with `--connect`, or run `zerocode login`
+  for that daemon too.
 
 Use `--config-dir` to select a separate client configuration directory.
 `--enroll` forces a fresh OIDC-authorized device certificate, without any
