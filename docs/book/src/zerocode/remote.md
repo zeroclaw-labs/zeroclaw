@@ -120,14 +120,30 @@ custom gateway URL is reused when omitted on a subsequent login.
 
 Login issues a device client certificate valid for 30 days. `cert/renew` is
 authenticated by the presented client certificate, not by an OIDC principal,
-so 30 days is not an absolute device lifetime: an unrevoked device can renew
-past that date. Removing a user's OIDC mapping stops principal-authorized
-operations, but it does not retire the device or stop renewal. Revoking the
-device is a separate operator step (`zeroclaw security revoke-client-cert`);
-the issued-cert ledger's `actor` field identifies a user's certificates. The
-CRL is checked at the next TLS handshake, so a revoke does not drop an
-already established connection. A leaked access token can be used to obtain
-a device certificate, and that certificate remains valid until it is revoked.
+so 30 days is not an absolute device lifetime: zerocode renews about halfway
+through, and an unrevoked device can keep renewing. Removing a user's OIDC
+mapping stops principal-authorized operations, but it does not retire the
+device or stop renewal.
+
+Revoking the device is a separate operator step:
+
+1. Run `zeroclaw security list-client-certs`. The certificate issued at
+   sign-in has an `actor` that starts with `oidc:` and names the user's
+   issuer and subject. Note its `device`.
+2. Run `zeroclaw security revoke-client-cert --device <id>`. That revokes
+   every active certificate the device holds.
+
+Revoke by device, not by fingerprint. A renewed certificate is recorded with
+the actor `renew`, so only the device ID ties it to the user, and revoking
+one fingerprint leaves the device's other certificates able to renew. Each
+sign-in that issues a certificate creates a new device ID, so one user can
+have several. The CRL is checked at the next TLS handshake, so a revoke does
+not drop an already established connection.
+
+A leaked access token can be used to obtain a device certificate, and that
+device can keep renewing until it is revoked. The certificate alone
+authorizes only renewal: every other operation still needs a valid access
+token.
 
 Startup renewal and a rejected-token retry honor the current `--tls-ca-cert`,
 `--tls-client-cert`, `--tls-client-key`, and `--tls-skip-verify` choices. Those

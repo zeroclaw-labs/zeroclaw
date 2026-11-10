@@ -14295,9 +14295,9 @@ pub struct OidcConfig {
     pub allowed_authorized_parties: Vec<String>,
     /// Client identities whose tokens are ALWAYS service principals
     /// (`client_credentials` callers), matched against the token's
-    /// verified `client_id` claim, or in JWKS mode the signed `azp` when
-    /// `client_id` is absent. An `azp`-only token cannot authenticate a
-    /// service actor; service tokens still require `client_id`. Service
+    /// verified `client_id` claim. Service tokens always need `client_id`:
+    /// in JWKS mode a token with no `client_id` whose signed `azp` names one
+    /// of these clients is refused, never treated as a service. Service
     /// principals are keyed by issuer + client identity and never inherit
     /// human-user assumptions, whatever provider-specific shape their
     /// `sub` takes (`<client>@clients`, a service-account user id, or the
