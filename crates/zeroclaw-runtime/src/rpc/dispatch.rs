@@ -31714,11 +31714,13 @@ mod tests {
                 config_path: tmp.path().join("config.toml"),
                 ..zeroclaw_config::schema::Config::default()
             };
-            config
-                .providers
-                .models
-                .openrouter
-                .insert("default".into(), Default::default());
+            config.providers = serde_json::from_value(json!({
+                "connections": {"gateway.prod": {"kind": "openrouter"}},
+                "models": {"chat.fast.us": {
+                    "capability": "chat", "provider": "gateway.prod", "model": "test-model",
+                }},
+            }))
+            .expect("canonical provider fixture");
             std::fs::create_dir_all(&config.data_dir).expect("workspace directory");
 
             let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
@@ -31737,7 +31739,7 @@ mod tests {
             dispatcher.set_authenticated_for_test();
 
             let mut submission = quickstart_apply_test_submission();
-            submission.model_provider = SelectorChoice::Existing("openrouter.default".into());
+            submission.model_provider = SelectorChoice::Existing("chat.fast.us".into());
             let frame = json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -31761,7 +31763,7 @@ mod tests {
             let response: Value =
                 serde_json::from_str(&response).expect("valid quickstart/apply response");
             assert_eq!(response["id"], json!(1));
-            assert_eq!(response["result"]["kind"], "applied");
+            assert_eq!(response["result"]["kind"], "applied", "{response}");
         });
     }
 

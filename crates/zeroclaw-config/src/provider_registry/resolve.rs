@@ -37,6 +37,36 @@ impl ProviderRegistry {
                 ));
             }
         }
+        for (capability, path, preset) in [
+            (
+                Capability::Chat,
+                "api.chat.preset",
+                connection.chat_defaults().and_then(|(preset, _)| preset),
+            ),
+            (
+                Capability::Tts,
+                "api.tts.preset",
+                connection.tts_defaults().and_then(|(preset, _)| preset),
+            ),
+            (
+                Capability::Asr,
+                "api.asr.preset",
+                connection.asr_defaults().and_then(|(preset, _)| preset),
+            ),
+        ] {
+            if let Some(preset) = preset {
+                let found = self.model_presets.get(preset).ok_or_else(|| {
+                    RegistryError::connection(name, path, "preset does not exist")
+                })?;
+                if preset_capability(found) != capability {
+                    return Err(RegistryError::connection(
+                        name,
+                        path,
+                        "preset capability does not match API capability",
+                    ));
+                }
+            }
+        }
         if let Some(wire_api) = connection.decision_api().and_then(|api| api.wire_api)
             && !connection.decision_wire_apis().contains(&wire_api)
         {
@@ -136,18 +166,6 @@ impl ProviderRegistry {
         if let Some(preset) = config.preset.as_ref() {
             ensure_preset(self, name, preset, Capability::Chat)?;
         }
-        if let Some(api) = connection.chat_api()
-            && api
-                .preset
-                .as_ref()
-                .is_some_and(|preset| !self.model_presets.contains_key(preset))
-        {
-            return Err(RegistryError::connection(
-                &config.provider,
-                "api.chat.preset",
-                "preset does not exist",
-            ));
-        }
         Ok(())
     }
 
@@ -192,10 +210,14 @@ impl ProviderRegistry {
             request_timeout_secs = api.request_timeout_secs.clone();
             read_timeout_secs = api.read_timeout_secs.clone();
             live_pricing = api.live_pricing;
-            if let Some(preset) = &api.preset {
+        }
+        // CLI and Hailo drivers have their own transport object, but inherit
+        // the same chat preset/options shape as HTTP drivers.
+        if let Some((preset, defaults)) = selection.connection.chat_defaults() {
+            if let Some(preset) = preset {
                 apply_chat_preset(&self.model_presets, preset, &mut options)?;
             }
-            options.overlay(&api.options);
+            options.overlay(defaults);
         }
         if let Some(preset) = &model.preset {
             apply_chat_preset(&self.model_presets, preset, &mut options)?;
@@ -227,12 +249,7 @@ fn ensure_preset(
         .model_presets
         .get(preset)
         .ok_or_else(|| RegistryError::model(model, "preset", "preset does not exist"))?;
-    let actual = match found {
-        ModelPreset::Chat(_) => Capability::Chat,
-        ModelPreset::Tts(_) => Capability::Tts,
-        ModelPreset::Asr(_) => Capability::Asr,
-    };
-    if actual != capability {
+    if preset_capability(found) != capability {
         return Err(RegistryError::model(
             model,
             "preset",
@@ -240,6 +257,14 @@ fn ensure_preset(
         ));
     }
     Ok(())
+}
+
+fn preset_capability(preset: &ModelPreset) -> Capability {
+    match preset {
+        ModelPreset::Chat(_) => Capability::Chat,
+        ModelPreset::Tts(_) => Capability::Tts,
+        ModelPreset::Asr(_) => Capability::Asr,
+    }
 }
 
 fn apply_chat_preset(

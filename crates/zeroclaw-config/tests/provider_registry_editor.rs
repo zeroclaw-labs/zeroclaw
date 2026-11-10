@@ -39,6 +39,101 @@ model = "model-two"
 }
 
 #[test]
+fn connection_presets_require_matching_capabilities_even_without_models() {
+    use zeroclaw_config::provider_registry::ProviderRegistry;
+
+    for capability in ["chat", "tts", "asr"] {
+        let mut value = json!({
+            "connections": {
+                "gateway.prod": {"kind": "custom", "api": {
+                    (capability): {"preset": "defaults.prod"}
+                }}
+            },
+            "model_presets": {
+                "defaults.prod": {"capability": capability, "options": {}}
+            }
+        });
+        serde_json::from_value::<ProviderRegistry>(value.clone())
+            .expect("matching API preset should validate without any models");
+        value["model_presets"]["defaults.prod"]["capability"] =
+            json!(if capability == "asr" { "chat" } else { "asr" });
+        let mismatch = serde_json::from_value::<ProviderRegistry>(value.clone()).unwrap_err();
+        assert!(
+            mismatch
+                .to_string()
+                .contains(&format!("api.{capability}.preset")),
+            "{mismatch}"
+        );
+        assert!(mismatch.to_string().contains("capability"), "{mismatch}");
+        value["model_presets"] = json!({});
+        let missing = serde_json::from_value::<ProviderRegistry>(value).unwrap_err();
+        assert!(
+            missing.to_string().contains("preset does not exist"),
+            "{missing}"
+        );
+    }
+}
+
+#[test]
+fn registry_editor_rejects_deleting_a_connection_preset_atomically() {
+    let mut config = config();
+    let expected = snapshot(&config).unwrap();
+    let mut registry = expected.clone();
+    registry["model_presets"] = json!({"voice.default": {"capability": "tts", "options": {}}});
+    registry["connections"]["gateway.prod"]["api"] = json!({"tts": {"preset": "voice.default"}});
+    stage(&mut config, RegistryEdit { expected, registry }).unwrap();
+    let expected = snapshot(&config).unwrap();
+    let mut registry = expected.clone();
+    registry["model_presets"] = json!({});
+    let result = stage(
+        &mut config,
+        RegistryEdit {
+            expected: expected.clone(),
+            registry,
+        },
+    );
+    assert!(
+        result.is_err(),
+        "a referenced connection preset cannot be deleted"
+    );
+    assert_eq!(snapshot(&config).unwrap(), expected);
+}
+
+#[test]
+fn chat_defaults_apply_to_driver_specific_api_objects() {
+    use zeroclaw_config::provider_registry::{Override, ProviderRegistry};
+    for kind in [
+        "custom",
+        "gemini_cli",
+        "kilocli",
+        "grok_cli",
+        "hailo_ollama",
+    ] {
+        let registry: ProviderRegistry = serde_json::from_value(json!({
+            "connections": {"gateway.prod": {"kind": kind, "api": {"chat": {
+                "preset": "chat.defaults", "options": {"temperature": 0.4}
+            }}}},
+            "model_presets": {"chat.defaults": {"capability": "chat", "options": {
+                "temperature": 0.2, "extract_text_reasoning": false
+            }}},
+            "models": {"chat.fast.us": {"capability": "chat", "provider": "gateway.prod", "model": "model-one"}}
+        })).unwrap();
+        let model_ref = "chat.fast.us".into();
+        let resolved = registry.resolve_chat(&model_ref).unwrap();
+        assert_eq!(
+            resolved.options.temperature,
+            Some(Override::Set(0.4)),
+            "{kind}"
+        );
+        assert_eq!(
+            resolved.options.extract_text_reasoning,
+            Some(false),
+            "{kind}"
+        );
+    }
+}
+
+#[test]
 fn registry_editor_preserves_exact_keys_secrets_and_legacy_maps() {
     let mut config = config();
     let expected = snapshot(&config).unwrap();

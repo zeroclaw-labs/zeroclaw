@@ -157,10 +157,9 @@ pub fn selection_auth_ready(config: &Config, selection_ref: &str) -> anyhow::Res
     {
         let registry = config.provider_registry()?;
         let selection = registry.resolve_chat(&canonical_ref)?;
-        return Ok(selection.selection.connection.api_key().is_some()
-            || selection.selection.connection.kind() == "ollama"
-            || selection.selection.connection.kind() == "custom"
-            || selection.selection.connection.kind() == "openai-compatible");
+        return Ok(crate::factory::canonical_auth_ready(
+            selection.selection.connection,
+        ));
     }
     let selection = config
         .resolve_model_selection(selection_ref)

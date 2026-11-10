@@ -2444,22 +2444,22 @@
         "description": "Model provider selection submitted by the Quickstart builder.",
         "properties": {
           "alias": {
-            "description": "User-named alias. Defaults to `\"default\"` in the UI; users\noverride when stacking multiple aliases of the same provider\ntype (e.g. `anthropic-work`, `anthropic-personal`).",
+            "description": "Name suffix for the new connection and model. The generated\n`<kind>.<alias>` is one exact registry key, including any literal dots.",
             "type": "string"
           },
           "fields": {
             "additionalProperties": {
               "type": "string"
             },
-            "description": "Round-trip of every field the daemon described in\n`quickstart/fields`. Surfaces echo back exactly what was\nemitted; the daemon writes each entry under `<prefix>.<key>`\nusing its own schema knowledge.",
+            "description": "Round-trip of every field the daemon described in\n`quickstart/fields`. Surfaces echo back exactly what was\nemitted, such as `auth.api_key` and `uri`; the daemon constructs a\ntyped canonical connection using its own schema knowledge.",
             "type": "object"
           },
           "model": {
-            "description": "Model id written to `providers.models.<type>.<alias>.model` at\napply time.",
+            "description": "Upstream model ID written to the new canonical model's `model` field.",
             "type": "string"
           },
           "provider_type": {
-            "description": "Provider type identifier (`anthropic`, `openai`, `openrouter`,\n`ollama`, etc.). Used as the type segment in the TOML path.",
+            "description": "Provider type identifier (`anthropic`, `openai`, `openrouter`,\n`ollama`, etc.). Written as the new connection's `kind`.",
             "type": "string"
           }
         },
