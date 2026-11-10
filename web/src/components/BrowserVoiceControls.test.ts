@@ -589,11 +589,11 @@ test('narration shares displayed timestamp cleanup and preserves literal timesta
   try {
     await act(async () => { renderer.update(createElement(Controls, { messages: [reply('server-prefix', text)], hydrated: true, typing: false, onTranscript() {} })); });
     await act(async () => { renderer.root.findAllByType('button')[1]!.props.onClick(); });
-    assert.doesNotMatch(spoken.at(-1)!, /2026-11-09/);
-    assert.match(spoken.at(-1)!, /2025-01-01/);
+    assert.doesNotMatch(spoken[spoken.length - 1]!, /2026-11-09/);
+    assert.match(spoken[spoken.length - 1]!, /2025-01-01/);
     await act(async () => { spokenUtterance?.onend?.(); });
     await act(async () => { renderer.update(createElement(Controls, { messages: [{...reply('literal-prefix', text), local:true}], hydrated: true, typing: false, onTranscript() {} })); });
     await act(async () => { renderer.root.findAllByType('button')[1]!.props.onClick(); });
-    assert.match(spoken.at(-1)!, /2026-11-09/);
+    assert.match(spoken[spoken.length - 1]!, /2026-11-09/);
   } finally { await act(async () => { renderer.unmount(); }); }
 });
