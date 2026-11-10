@@ -286,11 +286,90 @@ pub(crate) enum AnthropicThinkingStyle {
 /// so the bare `claude-fable-5` substring intentionally covers `fable-5` and
 /// `fable-5-1` alike; a hypothetical future budget-shaped member of the
 /// family would need this matcher revisited.
+///
+/// Adaptive-only models (Opus 4.7+, Fable 5+, Mythos 5+) reject the
+/// fixed-budget `enabled` shape with HTTP 400 and require `adaptive`.
+/// The version floor is enforced by checking the major.minor version
+/// against the known adaptive-only minimums per family.
 pub(crate) fn anthropic_thinking_style(model: &str) -> AnthropicThinkingStyle {
-    if model.contains("claude-opus-4-7") || model.contains("claude-fable-5") {
-        AnthropicThinkingStyle::Adaptive
+    // Extract the version suffix from the model name. Model IDs look like
+    // `claude-opus-4-7`, `claude-fable-5-1`, `claude-mythos-5-2`, etc.
+    // We parse the trailing `X-Y` version pair and compare against the
+    // minimum adaptive-only version for each family.
+    if let Some(version) = extract_model_version(model) {
+        if is_adaptive_only_family(model, version) {
+            return AnthropicThinkingStyle::Adaptive;
+        }
+    }
+    AnthropicThinkingStyle::Budget
+}
+
+/// Extract the trailing version pair (major, minor) from a model name.
+/// Returns `None` if no version suffix is found.
+///
+/// Model IDs may carry a date suffix (e.g. `claude-opus-4-7-20260101`),
+/// so we scan from the end and skip any trailing non-numeric segments
+/// that are clearly dates or build identifiers.
+///
+/// Version formats:
+/// - `claude-opus-4-7` → (4, 7)
+/// - `claude-fable-5` → (5, 0)
+/// - `claude-fable-5-1` → (5, 1)
+/// - `claude-opus-4-7-20260101` → (4, 7)
+fn extract_model_version(model: &str) -> Option<(u32, u32)> {
+    let trimmed = model.trim_end_matches('/').trim();
+    let parts: Vec<&str> = trimmed.split('-').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    // Scan from the end, skipping segments that look like dates
+    // (8+ digit numbers) or other non-version suffixes.
+    let mut idx = parts.len() - 1;
+    while idx > 0 {
+        let segment = parts[idx];
+        if segment.len() >= 8 && segment.chars().all(|c| c.is_ascii_digit()) {
+            // Likely a date suffix like 20260101 — skip it.
+            idx -= 1;
+            continue;
+        }
+        break;
+    }
+    if idx == 0 {
+        return None;
+    }
+    let minor = parts[idx].parse::<u32>().ok()?;
+    // Check if there's a major version before the minor.
+    // If the segment before minor is numeric, it's the major version.
+    // If it's not numeric (e.g. "fable"), the minor is actually the
+    // major version with minor=0.
+    if idx >= 2 {
+        if let Ok(major) = parts[idx - 1].parse::<u32>() {
+            return Some((major, minor));
+        }
+    }
+    // Single version number: treat as major with minor=0.
+    Some((minor, 0))
+}
+
+/// Determine whether a model family + version combination is adaptive-only.
+///
+/// Adaptive-only families and their minimum versions:
+/// - Opus: 4.7+ (claude-opus-4-7, claude-opus-5-5, etc.)
+/// - Fable: 5+ (claude-fable-5, claude-fable-5-1, etc.)
+/// - Mythos: 5+ (claude-mythos-5, claude-mythos-5-2, etc.)
+fn is_adaptive_only_family(model: &str, version: (u32, u32)) -> bool {
+    let (major, minor) = version;
+    if model.contains("claude-opus") {
+        // Opus 4.7+ is adaptive-only
+        major > 4 || (major == 4 && minor >= 7)
+    } else if model.contains("claude-fable") {
+        // Fable 5+ is adaptive-only
+        major >= 5
+    } else if model.contains("claude-mythos") {
+        // Mythos 5+ is adaptive-only
+        major >= 5
     } else {
-        AnthropicThinkingStyle::Budget
+        false
     }
 }
 
@@ -4627,11 +4706,23 @@ data: {\"type\":\"message_stop\"}\n\n";
             AnthropicThinkingStyle::Adaptive
         );
         assert_eq!(
+            anthropic_thinking_style("claude-opus-5-5"),
+            AnthropicThinkingStyle::Adaptive
+        );
+        assert_eq!(
+            anthropic_thinking_style("claude-opus-5-5-20260101"),
+            AnthropicThinkingStyle::Adaptive
+        );
+        assert_eq!(
             anthropic_thinking_style("claude-fable-5-1"),
             AnthropicThinkingStyle::Adaptive
         );
         assert_eq!(
             anthropic_thinking_style("claude-fable-5-1-20260815"),
+            AnthropicThinkingStyle::Adaptive
+        );
+        assert_eq!(
+            anthropic_thinking_style("claude-mythos-5-2"),
             AnthropicThinkingStyle::Adaptive
         );
         // The whole Fable 5 family is adaptive-only: bare fable-5 and
