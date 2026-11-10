@@ -576,7 +576,7 @@ mod tests {
                 tool_call_id: None,
             })
             .collect();
-        let outcomes = (0..4)
+        let outcomes: Vec<_> = (0..4)
             .map(|_| Some(("shell".into(), None, outcome("connection refused", false))))
             .collect();
         let collected = collect_tool_results(
@@ -605,7 +605,7 @@ mod tests {
                 tool_call_id: None,
             })
             .collect();
-        let outcomes = (0..8)
+        let outcomes: Vec<_> = (0..8)
             .map(|_| Some(("shell".into(), None, outcome("(no output)", true))))
             .collect();
         let collected = collect_tool_results(
@@ -635,7 +635,7 @@ mod tests {
             arguments: serde_json::json!({"path":"same"}),
             tool_call_id: None,
         };
-        let ordered = (0..4)
+        let ordered: Vec<_> = (0..4)
             .map(|_| Some(("file_read".into(), None, outcome("same", true))))
             .collect();
         let mut detector = LoopDetector::new(LoopDetectorConfig::default());

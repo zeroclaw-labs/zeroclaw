@@ -150,7 +150,6 @@ pub(crate) async fn notify_executed_outcomes(
 }
 
 #[cfg(test)]
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn record_executed_outcomes(
     ctx: &TurnCtx<'_>,
     executable_indices: &[usize],

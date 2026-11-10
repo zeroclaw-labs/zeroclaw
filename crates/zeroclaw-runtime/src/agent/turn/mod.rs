@@ -65,8 +65,6 @@ pub(crate) use parse_response::{
     interpret_chat_response, record_accepted_chat_response, resolve_display_text,
     unforwarded_narration,
 };
-#[cfg(test)]
-pub(crate) use post_exec::record_executed_outcomes;
 use post_exec::{notify_executed_outcomes, retain_executed_outcomes};
 pub(crate) use provider_call::{
     ProviderCallOutcome, announce_budget_warning, announce_llm_request, call_provider,
@@ -11513,7 +11511,7 @@ mod tool_lifecycle_abandonment_tests {
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token,
-            on_delta: Some(&delta_tx),
+            on_delta: Some(delta_tx.clone()),
             shared_budget: None,
             channel: None,
             collected_receipts: None,
