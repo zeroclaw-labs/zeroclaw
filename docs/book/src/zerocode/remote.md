@@ -52,10 +52,14 @@ port 9781 and the gateway at
 by default: use `--gateway-url` to name its TLS-terminating proxy. A gateway
 path prefix is supported. Plain HTTP is accepted only on loopback.
 
-Public clients that enforce PKCE are supported: zerocode sends an S256
-challenge on device authorization and the matching verifier only when polling
-for its token. The verifier lives only for the sign-in, is never persisted, and
-is not part of the gateway's device-start response.
+Every device grant zerocode performs now sends an S256 PKCE challenge,
+including `zerocode login` and the legacy automatic enrollment path
+(`[connection.wss] auth_provider = "oidc.<alias>"` with no token). The
+matching verifier is sent only when polling for the token, lives only for
+that grant, is never persisted, and is not part of the gateway's
+device-start response. A provider that rejects `code_challenge` on its
+device authorization endpoint will fail both paths; providers that follow
+RFC 6749 and ignore unrecognized parameters continue to work.
 
 Login works from a completely empty client configuration directory:
 
@@ -126,7 +130,8 @@ use an explicit `zerocode login` invocation to save replacement TLS settings.
 `ZEROCLAW_AUTH_TOKEN` still overrides the selected token for a one-off run;
 login warns if that environment variable would shadow the token it just
 saved. Existing manually configured `[connection.wss]` credentials continue to
-work for connections without a saved URL login.
+work for the selected default URL only. Once any URL login exists, those
+credentials are not used for a `--connect` to a different host.
 
 Use `--config-dir` to select a separate client configuration directory.
 `--enroll` forces a fresh OIDC-authorized device certificate, without any
