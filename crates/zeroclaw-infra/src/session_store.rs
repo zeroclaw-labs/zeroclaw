@@ -514,6 +514,27 @@ impl SessionBackend for SessionStore {
         self.append(session_key, message)
     }
 
+    fn append_authorized(
+        &self,
+        session_key: &str,
+        message: &ChatMessage,
+        authorize: &crate::session_backend::SessionEffectAuthorization<'_>,
+        committed: &mut dyn FnMut(),
+    ) -> std::io::Result<usize> {
+        let _guard = self.mutation_guard()?;
+        if !is_regular_jsonl_session_file(&self.session_path(session_key)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Session not found",
+            ));
+        }
+        let _authority = authorize(None)?;
+        let count = self.try_load(session_key)?.len() + 1;
+        self.append_unlocked(session_key, message)?;
+        committed();
+        Ok(count)
+    }
+
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
         self.remove_last(session_key)
     }
@@ -645,6 +666,61 @@ impl SessionBackend for SessionStore {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn guarded_jsonl_append_requires_existing_authorized_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+        store.append("s", &ChatMessage::user("before")).unwrap();
+        let called = std::cell::Cell::new(false);
+        let denied = backend.append_authorized(
+            "s",
+            &ChatMessage::assistant("denied"),
+            &|owner| {
+                assert_eq!(owner, None);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "revoked",
+                ))
+            },
+            &mut || called.set(true),
+        );
+        assert_eq!(
+            denied.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(!called.get());
+        assert_eq!(store.load("s").len(), 1);
+        let count = backend
+            .append_authorized(
+                "s",
+                &ChatMessage::assistant("allowed"),
+                &|owner| {
+                    assert_eq!(owner, None);
+                    Ok(Box::new(()))
+                },
+                &mut || called.set(true),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+        assert!(called.get());
+        assert_eq!(store.load("s").len(), 2);
+        backend.delete_session("s").unwrap();
+        assert_eq!(
+            backend
+                .append_authorized(
+                    "s",
+                    &ChatMessage::assistant("recreated"),
+                    &|_| panic!("missing row cannot be authorized"),
+                    &mut || panic!("missing row cannot publish effects"),
+                )
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert!(!backend.session_exists("s"));
+    }
+
     #[test]
     fn no_state_backend_admits_locked_live_owner_without_persisting_state() {
         let tmp = tempfile::TempDir::new().unwrap();

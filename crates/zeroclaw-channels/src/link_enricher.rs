@@ -551,6 +551,12 @@ mod tests {
         assert_eq!(extract_title(html), None);
     }
 
+    #[test]
+    fn extract_title_decodes_angle_bracket_entity() {
+        let html = "<title>Tom &lt;3</title>";
+        assert_eq!(extract_title(html).as_deref(), Some("tom <3"));
+    }
+
     // ── Body text extraction ────────────────────────────────────────
 
     #[test]

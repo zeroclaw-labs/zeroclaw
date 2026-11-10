@@ -1582,6 +1582,12 @@ impl ModelRoutingConfigTool {
 
 #[async_trait]
 impl Tool for ModelRoutingConfigTool {
+    fn requires_unrestricted_principal(&self) -> bool {
+        // Saving config changes every agent's later runs, which RPC gates
+        // behind `config:update`; the caller's principal does not reach them.
+        true
+    }
+
     fn name(&self) -> &str {
         "model_routing_config"
     }
@@ -1837,6 +1843,13 @@ mod tests {
         let contents = std::fs::read_to_string(cfg_path).ok()?;
         let cfg = zeroclaw_config::migration::migrate_to_current(&contents).ok()?;
         cfg.providers.models.find(family, alias).cloned()
+    }
+
+    #[tokio::test]
+    async fn model_routing_config_requires_an_unrestricted_principal() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, test_security());
+        assert!(tool.requires_unrestricted_principal());
     }
 
     #[test]

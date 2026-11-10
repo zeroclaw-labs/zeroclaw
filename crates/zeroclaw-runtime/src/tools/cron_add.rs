@@ -173,6 +173,11 @@ fn schedule_error_result(error: String) -> ToolResult {
 
 #[async_trait]
 impl Tool for CronAddTool {
+    fn requires_unrestricted_principal(&self) -> bool {
+        // This path uses agent authority without carrying the session owner.
+        true
+    }
+
     fn name(&self) -> &str {
         "cron_add"
     }
