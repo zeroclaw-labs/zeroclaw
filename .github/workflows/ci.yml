@@ -182,6 +182,9 @@ jobs:
       - name: Test release tool installer mappings
         run: bash scripts/ci/install_release_tool.test.sh
 
+      - name: Test binary size safeguard
+        run: python3 scripts/ci/check_binary_size_test.py
+
       - name: Test crates.io publish ordering and preflight
         run: python3 scripts/release/publish_crates_test.py
 
