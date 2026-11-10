@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::keymap::{ChatTabAction, Chord, GlobalAction, overrides::OverrideTable};
@@ -17,6 +17,47 @@ use crate::theme::{self, Theme};
 const FILE_NAME: &str = "zerocode-config.toml";
 const ENV_PREFIX: &str = "ZEROCODE_";
 const ENV_SEP: &str = "__";
+/// Advisory lock identity for every read-modify-write of [`FILE_NAME`].
+///
+/// Left in the config directory after release. Deleting it would let a later
+/// process lock a different inode while a holder of this one still has the
+/// old file open.
+const CONFIG_LOCK_FILE: &str = ".zerocode-config.lock";
+/// A config rewrite is a few filesystem calls. The bound exists so a wedged
+/// holder surfaces as an error instead of hanging login or startup renewal.
+const CONFIG_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+const CONFIG_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+#[cfg(test)]
+std::thread_local! {
+    static MIGRATION_LOCK_WAIT_OVERRIDE: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn migration_lock_wait() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(wait) = MIGRATION_LOCK_WAIT_OVERRIDE.get() {
+        return wait;
+    }
+    CONFIG_LOCK_WAIT
+}
+
+#[cfg(test)]
+pub(crate) fn set_migration_lock_wait_for_test(wait: Option<std::time::Duration>) {
+    MIGRATION_LOCK_WAIT_OVERRIDE.set(wait);
+}
+
+#[cfg(test)]
+pub(crate) struct TestConfigLock {
+    _inner: ConfigWriteLock,
+}
+
+#[cfg(test)]
+pub(crate) fn hold_config_lock_for_test(config_dir: &Path) -> Result<TestConfigLock> {
+    Ok(TestConfigLock {
+        _inner: ConfigWriteLock::acquire(config_dir)?,
+    })
+}
 
 /// One or more chords bound to an action. Accepts a bare string (one
 /// chord) or an array on the wire; always serialized back as an array.
@@ -191,11 +232,153 @@ impl Default for ThemeSection {
 pub(crate) struct ConnectionSection {
     #[serde(default, skip_serializing_if = "WssSection::is_empty")]
     pub wss: WssSection,
+    /// OIDC logins keyed by normalized WSS URL. Credentials never follow a
+    /// different --connect destination, even on the same hostname.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub logins: HashMap<String, OidcLogin>,
 }
 
 impl ConnectionSection {
     fn is_empty(&self) -> bool {
-        self.wss.is_empty()
+        self.wss.is_empty() && self.logins.is_empty()
+    }
+
+    /// A saved login, or any other destination once logins exist, owns its own
+    /// credential files. The legacy manual connection does not.
+    pub(crate) fn uses_scoped_credentials(&self, selected: Option<&str>) -> bool {
+        selected.is_some_and(|uri| {
+            self.logins.contains_key(uri)
+                || (!self.logins.is_empty()
+                    && !same_wss_destination(Some(uri), self.wss.uri.as_deref()))
+        })
+    }
+}
+
+/// The canonical WSS destination, shared with login so a stored spelling and a
+/// startup spelling of the same daemon compare equal. Not a user-facing error:
+/// callers add their own message.
+pub(crate) fn canonical_wss_target(target: &str) -> Result<String> {
+    let target = if target.contains("://") {
+        target.to_string()
+    } else {
+        // Remember an explicit :443 before URL normalization removes it.
+        let url = url::Url::parse(&format!("wss://{target}")).context("invalid WSS target")?;
+        let authority = target.split('/').next().unwrap_or(target);
+        let explicit_port = authority
+            .rsplit_once(':')
+            .is_some_and(|(_, tail)| tail.parse::<u16>().is_ok());
+        if explicit_port {
+            url.to_string()
+        } else {
+            let mut url = url;
+            url.set_port(Some(9781))
+                .map_err(|()| anyhow::Error::msg("invalid WSS target"))?;
+            url.to_string()
+        }
+    };
+    let url = url::Url::parse(&target).context("invalid WSS target")?;
+    if url.scheme() != "wss"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        bail!("invalid WSS target");
+    }
+    Ok(url.to_string())
+}
+
+/// True when both sides name the same daemon, including equivalent spellings
+/// such as a missing trailing slash. An unparseable side falls back to an
+/// exact compare so two different invalid strings are not treated as one
+/// destination.
+fn same_wss_destination(left: Option<&str>, right: Option<&str>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            match (canonical_wss_target(left), canonical_wss_target(right)) {
+                (Ok(canonical_left), Ok(canonical_right)) => canonical_left == canonical_right,
+                _ => left == right,
+            }
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct InvalidSavedLogin(anyhow::Error);
+
+impl std::fmt::Display for InvalidSavedLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&crate::i18n::t("zc-config-invalid-saved-login"))
+    }
+}
+impl std::error::Error for InvalidSavedLogin {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+/// The persisted login is the credential authority for this exact URL. The
+/// active `wss.uri` selects it; no copy of its token is written to `wss`.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct OidcLogin {
+    pub auth_provider: String,
+    pub auth_token: String,
+    pub enroll_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+    #[serde(default)]
+    pub tls: WssTlsSection,
+    #[serde(default)]
+    pub gateway_tls: WssTlsSection,
+}
+
+impl std::fmt::Debug for OidcLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OidcLogin")
+            .field("auth_provider", &self.auth_provider)
+            .field("auth_token", &"[REDACTED]")
+            .field("enroll_url", &self.enroll_url)
+            .field("expires_at", &self.expires_at)
+            .field("tls", &self.tls)
+            .field("gateway_tls", &self.gateway_tls)
+            .finish()
+    }
+}
+
+impl ConnectionSection {
+    pub fn wss_for(&self, uri: Option<&str>) -> WssSection {
+        let mut wss = self.wss.clone();
+        let uri = uri.or(wss.uri.as_deref()).map(str::to_owned);
+        if let Some(login) = uri.as_ref().and_then(|uri| self.logins.get(uri)) {
+            wss.auth_token = Some(login.auth_token.clone());
+            wss.auth_token_file = None;
+            wss.auth_provider = Some(login.auth_provider.clone());
+            wss.enroll_url = Some(login.enroll_url.clone());
+            wss.tls = login.tls.clone();
+            // A direct URL login must not inherit another daemon's relay.
+            wss.relay_url = None;
+            wss.relay_node = None;
+        } else if !self.logins.is_empty()
+            && !same_wss_destination(uri.as_deref(), self.wss.uri.as_deref())
+        {
+            // Compare canonical destinations. Startup normalizes the selected
+            // URL, while a manual connection may still be stored as
+            // `wss://host:9781` rather than `wss://host:9781/`. A spelling
+            // difference is not a different daemon and must not drop the
+            // manual token, provider, or TLS files.
+            wss.auth_token = None;
+            wss.auth_token_file = None;
+            wss.auth_provider = None;
+            wss.enroll_url = None;
+            wss.tls = WssTlsSection::default();
+            wss.relay_url = None;
+            wss.relay_node = None;
+        }
+        wss.uri = uri;
+        wss
     }
 }
 
@@ -803,148 +986,451 @@ pub(crate) fn load_persisted(config_dir: &Path) -> Result<ZerocodeConfig> {
         .with_context(|| format!("creating config dir {}", config_dir.display()))?;
 
     let path = config_path(config_dir);
-    if !path.exists() {
-        // Another writer may save a real config between the check above and
-        // this write, so the default is only ever created, never swapped in
-        // over a file that appeared meanwhile.
-        let default = ZerocodeConfig::default();
-        let body = toml::to_string_pretty(&default).context("serializing default config")?;
-        crate::secure_file::create_private_if_absent(&path, body.as_bytes())
-            .with_context(|| format!("writing default {}", path.display()))?;
-    } else {
-        // An existing file may predate the owner-only rule, and reading it
-        // does not go through the write funnel.
-        crate::secure_file::restrict_to_owner(&path, config_dir)?;
-    }
+    // Held only when a keybinding migration must rewrite the file. The
+    // continue below re-reads under it; a pure read does not take the lock.
+    let mut write_lock = None;
+    loop {
+        if !path.exists() {
+            // Another writer may save a real config between the check above and
+            // this write, so the default is only ever created, never swapped in
+            // over a file that appeared meanwhile.
+            let default = ZerocodeConfig::default();
+            let body = toml::to_string_pretty(&default).context("serializing default config")?;
+            crate::secure_file::create_private_if_absent(&path, body.as_bytes())
+                .with_context(|| format!("writing default {}", path.display()))?;
+        } else {
+            // An existing file may predate the owner-only rule, and reading it
+            // does not go through the write funnel.
+            crate::secure_file::restrict_to_owner(&path, config_dir)?;
+        }
 
-    let mut doc = load_document(&path)?;
-    let mut config = ZerocodeConfig::default();
-    let mut migrated_keybindings = false;
-    if let Some(v) = doc.get("locale").and_then(|v| v.as_str()) {
-        let trimmed = v.trim();
-        if !trimmed.is_empty() {
-            config.locale = Some(trimmed.to_string());
+        let mut doc = load_document(&path)?;
+        let mut config = ZerocodeConfig::default();
+        let mut migrated_keybindings = false;
+        if let Some(v) = doc.get("locale").and_then(|v| v.as_str()) {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                config.locale = Some(trimmed.to_string());
+            }
         }
-    }
-    if let Some(v) = doc.get("theme") {
-        match v.clone().try_into::<ThemeSection>() {
-            Ok(section) => config.theme = section,
-            Err(e) => eprintln!(
-                "zerocode: ignoring [theme] in {} ({e}); using default",
-                path.display()
-            ),
+        if let Some(v) = doc.get("theme") {
+            match v.clone().try_into::<ThemeSection>() {
+                Ok(section) => config.theme = section,
+                Err(e) => eprintln!(
+                    "zerocode: ignoring [theme] in {} ({e}); using default",
+                    path.display()
+                ),
+            }
         }
-    }
-    if let Some(v) = doc.get("connection") {
-        match v.clone().try_into::<ConnectionSection>() {
-            Ok(section) => config.connection = section,
-            Err(e) => eprintln!(
-                "zerocode: ignoring [connection] in {} ({e}); using default",
-                path.display()
-            ),
-        }
-    }
-    if let Some(v) = doc.get("sidebar") {
-        match v.clone().try_into::<SidebarSection>() {
-            Ok(section) => config.sidebar = section,
-            Err(e) => eprintln!(
-                "zerocode: ignoring [sidebar] in {} ({e}); using default",
-                path.display()
-            ),
-        }
-    }
-    if let Some(v) = doc.get("sessions") {
-        match v.clone().try_into::<SessionsSection>() {
-            Ok(section) => config.sessions = section,
-            Err(e) => eprintln!(
-                "zerocode: ignoring [sessions] in {} ({e}); using default",
-                path.display()
-            ),
-        }
-    }
-    if let Some(v) = doc.get("keybindings") {
-        let mut migrated_value = v.clone();
-        let migrated_legacy = migrate_legacy_ctrl_bindings(&mut migrated_value);
-        if migrated_legacy {
-            // Rewrite legacy spellings before parsing the rows. A malformed,
-            // unrelated row must not leave otherwise valid legacy values in
-            // the file indefinitely; the tolerant loader still falls back to
-            // defaults for the malformed section below.
-            doc.insert("keybindings".to_string(), migrated_value.clone());
-            migrated_keybindings = true;
-        }
-        match migrated_value
-            .clone()
-            .try_into::<HashMap<String, ChordSpec>>()
-        {
-            Ok(mut rows) => {
-                if migrate_legacy_help_binding(&mut rows) {
-                    let key = GlobalAction::Help.action_key();
-                    let value = toml::Value::try_from(
-                        rows.get(&key)
-                            .expect("migrated Help binding remains present")
-                            .clone(),
-                    )
-                    .context("serializing migrated Help binding")?;
-                    doc.get_mut("keybindings")
-                        .and_then(toml::Value::as_table_mut)
-                        .expect("parsed keybindings remain a table")
-                        .insert(key, value);
-                    migrated_keybindings = true;
+        if let Some(v) = doc.get("connection") {
+            match v.clone().try_into::<ConnectionSection>() {
+                Ok(section) => config.connection = section,
+                Err(e) if v.get("logins").is_some() => {
+                    return Err(InvalidSavedLogin(e.into()).into());
                 }
-                if migrate_legacy_copy_binding(&mut rows) {
-                    let key = ChatTabAction::CopySelection.action_key();
-                    let value = toml::Value::try_from(ChordSpec::Many(
-                        ChatTabAction::CopySelection.default_chords(),
-                    ))
-                    .context("serializing migrated Copy binding")?;
-                    let bindings = doc
-                        .get_mut("keybindings")
-                        .and_then(toml::Value::as_table_mut)
-                        .context("accessing parsed keybindings table")?;
-                    bindings.insert(key, value);
-                    migrated_keybindings = true;
+                Err(e) => eprintln!(
+                    "zerocode: ignoring [connection] in {} ({e}); using default",
+                    path.display()
+                ),
+            }
+        }
+        if let Some(v) = doc.get("sidebar") {
+            match v.clone().try_into::<SidebarSection>() {
+                Ok(section) => config.sidebar = section,
+                Err(e) => eprintln!(
+                    "zerocode: ignoring [sidebar] in {} ({e}); using default",
+                    path.display()
+                ),
+            }
+        }
+        if let Some(v) = doc.get("sessions") {
+            match v.clone().try_into::<SessionsSection>() {
+                Ok(section) => config.sessions = section,
+                Err(e) => eprintln!(
+                    "zerocode: ignoring [sessions] in {} ({e}); using default",
+                    path.display()
+                ),
+            }
+        }
+        if let Some(v) = doc.get("keybindings") {
+            let mut migrated_value = v.clone();
+            let migrated_legacy = migrate_legacy_ctrl_bindings(&mut migrated_value);
+            if migrated_legacy {
+                // Rewrite legacy spellings before parsing the rows. A malformed,
+                // unrelated row must not leave otherwise valid legacy values in
+                // the file indefinitely; the tolerant loader still falls back to
+                // defaults for the malformed section below.
+                doc.insert("keybindings".to_string(), migrated_value.clone());
+                migrated_keybindings = true;
+            }
+            match migrated_value
+                .clone()
+                .try_into::<HashMap<String, ChordSpec>>()
+            {
+                Ok(mut rows) => {
+                    if migrate_legacy_help_binding(&mut rows) {
+                        let key = GlobalAction::Help.action_key();
+                        let value = toml::Value::try_from(
+                            rows.get(&key)
+                                .expect("migrated Help binding remains present")
+                                .clone(),
+                        )
+                        .context("serializing migrated Help binding")?;
+                        doc.get_mut("keybindings")
+                            .and_then(toml::Value::as_table_mut)
+                            .expect("parsed keybindings remain a table")
+                            .insert(key, value);
+                        migrated_keybindings = true;
+                    }
+                    if migrate_legacy_copy_binding(&mut rows) {
+                        let key = ChatTabAction::CopySelection.action_key();
+                        let value = toml::Value::try_from(ChordSpec::Many(
+                            ChatTabAction::CopySelection.default_chords(),
+                        ))
+                        .context("serializing migrated Copy binding")?;
+                        let bindings = doc
+                            .get_mut("keybindings")
+                            .and_then(toml::Value::as_table_mut)
+                            .context("accessing parsed keybindings table")?;
+                        bindings.insert(key, value);
+                        migrated_keybindings = true;
+                    }
+                    for (action, legacy) in [
+                        (ChatTabAction::JumpStart, Chord::char('g')),
+                        (ChatTabAction::JumpEnd, Chord::char('G')),
+                    ] {
+                        if !migrate_legacy_chat_jump_binding(&mut rows, action, legacy) {
+                            continue;
+                        }
+                        let key = action.action_key();
+                        let value = toml::Value::try_from(ChordSpec::Many(action.default_chords()))
+                            .context("serializing migrated chat jump binding")?;
+                        let bindings = doc
+                            .get_mut("keybindings")
+                            .and_then(toml::Value::as_table_mut)
+                            .context("accessing parsed keybindings table")?;
+                        bindings.insert(key, value);
+                        migrated_keybindings = true;
+                    }
+                    config.keybindings = rows;
                 }
-                for (action, legacy) in [
-                    (ChatTabAction::JumpStart, Chord::char('g')),
-                    (ChatTabAction::JumpEnd, Chord::char('G')),
-                ] {
-                    if !migrate_legacy_chat_jump_binding(&mut rows, action, legacy) {
+                Err(e) => eprintln!(
+                    "zerocode: ignoring [keybindings] in {} ({e}); using defaults",
+                    path.display()
+                ),
+            }
+        }
+        if let Some(v) = doc.get("todotracker") {
+            match v.clone().try_into::<TodoTrackerSection>() {
+                Ok(section) => config.todotracker = section,
+                Err(e) => eprintln!(
+                    "zerocode: ignoring [todotracker] in {} ({e}); using default",
+                    path.display()
+                ),
+            }
+        }
+
+        if migrated_keybindings {
+            match write_lock.as_ref() {
+                // The first read ran without the lock. Do not publish that
+                // snapshot: a login saved after it would be discarded. Re-read
+                // under the same lock every other writer holds.
+                None => match ConfigWriteLock::acquire_within(config_dir, migration_lock_wait()) {
+                    Ok(lock) => {
+                        write_lock = Some(lock);
                         continue;
                     }
-                    let key = action.action_key();
-                    let value = toml::Value::try_from(ChordSpec::Many(action.default_chords()))
-                        .context("serializing migrated chat jump binding")?;
-                    let bindings = doc
-                        .get_mut("keybindings")
-                        .and_then(toml::Value::as_table_mut)
-                        .context("accessing parsed keybindings table")?;
-                    bindings.insert(key, value);
-                    migrated_keybindings = true;
-                }
-                config.keybindings = rows;
+                    // Contention and a filesystem that refuses locks take the
+                    // same path. The snapshot already parsed is the saved
+                    // config, including its remote target. Rewriting is
+                    // optional; failing the load would make startup drop that
+                    // target and dial the local socket.
+                    Err(error) => {
+                        // Format only after `i18n::init`. Doing it earlier
+                        // caches a language and `CONFIG_DIR` that startup
+                        // cannot replace. Later reads print immediately:
+                        // `emit_startup_notices` runs only once.
+                        record_skipped_migration(&path, &error);
+                        return Ok(config);
+                    }
+                },
+                Some(lock) => write_document(&path, &doc, lock)?,
             }
-            Err(e) => eprintln!(
-                "zerocode: ignoring [keybindings] in {} ({e}); using defaults",
-                path.display()
-            ),
         }
+
+        return Ok(config);
     }
-    if let Some(v) = doc.get("todotracker") {
-        match v.clone().try_into::<TodoTrackerSection>() {
-            Ok(section) => config.todotracker = section,
-            Err(e) => eprintln!(
-                "zerocode: ignoring [todotracker] in {} ({e}); using default",
-                path.display()
-            ),
+}
+
+/// A migration-lock failure kept for startup to print after `i18n::init`.
+/// Formatting it inside the loader would cache the wrong language.
+struct StartupNotice {
+    path: String,
+    failure: PendingLockFailure,
+}
+
+enum PendingLockFailure {
+    Timeout {
+        config: String,
+        lock: String,
+        seconds: u64,
+    },
+    NotRegular {
+        path: String,
+    },
+    Other(String),
+}
+
+std::thread_local! {
+    static STARTUP_NOTICES: std::cell::RefCell<Vec<StartupNotice>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Formatted warning from a post-init skipped migration, for the caller
+    /// that just loaded. Stderr is not visible once the alternate screen is up.
+    static MIGRATION_WARNING: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+    static MIGRATION_WARNING_GEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static MIGRATION_WARNING_PRINTED: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn push_startup_notice(notice: StartupNotice) {
+    STARTUP_NOTICES.with(|notices| notices.borrow_mut().push(notice));
+}
+
+fn record_skipped_migration(path: &Path, error: &anyhow::Error) {
+    let notice = StartupNotice {
+        path: path.display().to_string(),
+        failure: pending_lock_failure(error),
+    };
+    if !crate::i18n::is_initialized() {
+        push_startup_notice(notice);
+        return;
+    }
+    let message = format_notice(&notice);
+    let repeat = MIGRATION_WARNING_PRINTED
+        .with(|printed| printed.borrow().as_deref() == Some(message.as_str()));
+    MIGRATION_WARNING.with(|warning| *warning.borrow_mut() = Some(message.clone()));
+    MIGRATION_WARNING_GEN.with(|generation| generation.set(generation.get().wrapping_add(1)));
+    if repeat {
+        return;
+    }
+    MIGRATION_WARNING_PRINTED.with(|printed| *printed.borrow_mut() = Some(message.clone()));
+    eprintln!("{message}");
+}
+
+/// Generation of the latest post-init skipped-migration warning on this thread.
+pub(crate) fn migration_warning_mark() -> u64 {
+    MIGRATION_WARNING_GEN.with(|generation| generation.get())
+}
+
+/// The skipped-migration warning recorded after `mark`, if this thread's last
+/// load hit one. A load that did not skip migration leaves an older warning
+/// where it is, so a later caller does not report it as its own.
+pub(crate) fn take_migration_warning_since(mark: u64) -> Option<String> {
+    if MIGRATION_WARNING_GEN.with(|generation| generation.get()) == mark {
+        return None;
+    }
+    MIGRATION_WARNING.with(|warning| warning.borrow_mut().take())
+}
+
+fn pending_lock_failure(error: &anyhow::Error) -> PendingLockFailure {
+    if let Some(timeout) = error.downcast_ref::<ConfigLockTimeout>() {
+        return PendingLockFailure::Timeout {
+            config: timeout.config.clone(),
+            lock: timeout.lock.clone(),
+            seconds: timeout.seconds,
+        };
+    }
+    if let Some(not_regular) = error.downcast_ref::<ConfigLockNotRegular>() {
+        return PendingLockFailure::NotRegular {
+            path: not_regular.path.clone(),
+        };
+    }
+    PendingLockFailure::Other(format!("{error:#}"))
+}
+
+fn format_notice(notice: &StartupNotice) -> String {
+    let detail = match &notice.failure {
+        PendingLockFailure::Timeout {
+            config,
+            lock,
+            seconds,
+        } => {
+            let seconds = seconds.to_string();
+            crate::i18n::t_args(
+                "zc-config-save-lock-timeout",
+                &[
+                    ("config", config.as_str()),
+                    ("lock", lock.as_str()),
+                    ("seconds", seconds.as_str()),
+                ],
+            )
         }
+        PendingLockFailure::NotRegular { path } => {
+            crate::i18n::t_args("zc-config-lock-not-regular", &[("path", path.as_str())])
+        }
+        PendingLockFailure::Other(message) => message.clone(),
+    };
+    crate::i18n::t_args(
+        "zc-config-migration-lock-skipped",
+        &[("path", notice.path.as_str()), ("error", detail.as_str())],
+    )
+}
+
+/// Print migration-lock warnings using the locale startup just initialized.
+pub(crate) fn emit_startup_notices() {
+    let notices = STARTUP_NOTICES.with(|notices| std::mem::take(&mut *notices.borrow_mut()));
+    for notice in notices {
+        eprintln!("{}", format_notice(&notice));
+    }
+}
+
+#[derive(Debug)]
+struct ConfigLockTimeout {
+    config: String,
+    lock: String,
+    seconds: u64,
+}
+
+impl std::fmt::Display for ConfigLockTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let seconds = self.seconds.to_string();
+        formatter.write_str(&crate::i18n::t_args(
+            "zc-config-save-lock-timeout",
+            &[
+                ("config", self.config.as_str()),
+                ("lock", self.lock.as_str()),
+                ("seconds", seconds.as_str()),
+            ],
+        ))
+    }
+}
+
+impl std::error::Error for ConfigLockTimeout {}
+
+#[derive(Debug)]
+struct ConfigLockNotRegular {
+    path: String,
+}
+
+impl std::fmt::Display for ConfigLockNotRegular {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&crate::i18n::t_args(
+            "zc-config-lock-not-regular",
+            &[("path", self.path.as_str())],
+        ))
+    }
+}
+
+impl std::error::Error for ConfigLockNotRegular {}
+
+fn reject_non_regular_lock(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(_) => Err(ConfigLockNotRegular {
+            path: path.display().to_string(),
+        }
+        .into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// Exclusive inter-process lock over one config directory's `zerocode-config.toml`.
+///
+/// Every persist rewrites the whole file from a snapshot. An atomic rename
+/// keeps a reader from seeing a torn write, but two processes can still read
+/// the same snapshot, add different URL logins, and both report success. The
+/// last rename then deletes the other login. Startup renewal races a login
+/// the same way, and a theme, sidebar, or keybinding save can erase a login
+/// it never read.
+///
+/// The lock therefore covers the whole read-modify-write, not the rename.
+/// `File::try_lock` is `flock(LOCK_EX)` on Unix and `LockFileEx` on Windows.
+/// It is advisory: every zerocode writer takes it, and an operator editing
+/// the file by hand is not blocked. The kernel releases it when this handle
+/// closes, including on process death.
+#[must_use = "the config write lock is released when this guard drops"]
+struct ConfigWriteLock {
+    file: std::fs::File,
+}
+
+impl ConfigWriteLock {
+    fn acquire(config_dir: &Path) -> Result<Self> {
+        Self::acquire_within(config_dir, CONFIG_LOCK_WAIT)
     }
 
-    if migrated_keybindings {
-        write_document(&path, &doc)?;
+    /// Wait up to `wait` for another writer to finish. A wedged holder must
+    /// fail with the lock path, not hang login or renewal.
+    fn acquire_within(config_dir: &Path, wait: std::time::Duration) -> Result<Self> {
+        std::fs::create_dir_all(config_dir)
+            .with_context(|| format!("creating config dir {}", config_dir.display()))?;
+        let path = config_dir.join(CONFIG_LOCK_FILE);
+        // A directory or symlink is rejected before open, including on
+        // Windows where `O_NOFOLLOW` is unavailable. Opening it would either
+        // fail with a generic `EISDIR` or follow the link onto another inode.
+        reject_non_regular_lock(&path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+            // Do not follow a symlink planted at the lock path. After an atomic
+            // replace the followed target is a different inode, so two writers
+            // would each believe they held the lock.
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("reading metadata for {}", path.display()))?;
+        if !metadata.is_file() {
+            return Err(ConfigLockNotRegular {
+                path: path.display().to_string(),
+            }
+            .into());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            // fchmod the opened handle. A path-based chmod would follow a
+            // symlink and change whatever file it points at.
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("restricting {}", path.display()))?;
+        }
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { file }),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(ConfigLockTimeout {
+                            config: config_path(config_dir).display().to_string(),
+                            lock: path.display().to_string(),
+                            seconds: wait.as_secs(),
+                        }
+                        .into());
+                    }
+                    std::thread::sleep(CONFIG_LOCK_POLL);
+                }
+                Err(std::fs::TryLockError::Error(error)) => {
+                    return Err(error).with_context(|| format!("locking {}", path.display()));
+                }
+            }
+        }
     }
+}
 
-    Ok(config)
+impl Drop for ConfigWriteLock {
+    fn drop(&mut self) {
+        // Closing the handle releases the lock on both platforms. Unlocking
+        // first makes that release explicit rather than a side effect of drop
+        // order. The lock file stays: it is the lock's identity.
+        let _ = self.file.unlock();
+    }
 }
 
 /// Load the on-disk file as a raw `toml::Table`. A missing or empty file
@@ -976,7 +1462,10 @@ fn load_document(path: &Path) -> Result<toml::Table> {
 /// owner-only and atomically: a partial rewrite cannot lose a token that was
 /// already there, and a file that predates this is repaired rather than left
 /// world-readable.
-fn write_document(path: &Path, doc: &toml::Table) -> Result<()> {
+///
+/// `lock` must be the guard acquired before the snapshot in `doc` was read.
+/// The rename is atomic, but it does not by itself stop a lost update.
+fn write_document(path: &Path, doc: &toml::Table, _lock: &ConfigWriteLock) -> Result<()> {
     let body = toml::to_string_pretty(doc).context("serializing config")?;
     crate::secure_file::write_private_atomic(path, body.as_bytes())
 }
@@ -998,6 +1487,7 @@ fn persist_sidebar_leaf(
     replacement: toml_edit::Item,
     shadowed: bool,
 ) -> Result<bool> {
+    let _lock = ConfigWriteLock::acquire(config_dir)?;
     std::fs::create_dir_all(config_dir)
         .with_context(|| format!("creating config dir {}", config_dir.display()))?;
     let path = config_path(config_dir);
@@ -1151,26 +1641,28 @@ pub(crate) fn persist_sidebar_queue_percent(config_dir: &Path, queue_percent: u1
 
 /// Persist the selected theme name, editing only the `[theme]` section.
 pub(crate) fn persist_theme(config_dir: &Path, theme_name: &str) -> Result<()> {
+    let lock = ConfigWriteLock::acquire(config_dir)?;
     let path = config_path(config_dir);
     let mut doc = load_document(&path)?;
     section_mut(&mut doc, "theme")?.insert(
         "name".to_string(),
         toml::Value::String(theme_name.to_string()),
     );
-    write_document(&path, &doc)
+    write_document(&path, &doc, &lock)
 }
 
 /// Persist a per-agent theme override, writing only
 /// `[theme.agent_override.<alias>].name`. Other agents' overrides and every
 /// other section are preserved.
 pub(crate) fn persist_agent_theme(config_dir: &Path, alias: &str, theme_name: &str) -> Result<()> {
+    let lock = ConfigWriteLock::acquire(config_dir)?;
     let path = config_path(config_dir);
     let mut doc = load_document(&path)?;
     section_mut_path(&mut doc, &["theme", "agent_override", alias])?.insert(
         "name".to_string(),
         toml::Value::String(theme_name.to_string()),
     );
-    write_document(&path, &doc)
+    write_document(&path, &doc, &lock)
 }
 
 /// Remove a per-agent theme override, dropping the whole
@@ -1178,22 +1670,23 @@ pub(crate) fn persist_agent_theme(config_dir: &Path, alias: &str, theme_name: &s
 /// becomes empty). A no-op when the agent has no override. Other sections are
 /// preserved.
 pub(crate) fn persist_agent_theme_clear(config_dir: &Path, alias: &str) -> Result<()> {
+    let lock = ConfigWriteLock::acquire(config_dir)?;
     let path = config_path(config_dir);
     let mut doc = load_document(&path)?;
     let Some(theme_tbl) = doc.get_mut("theme").and_then(toml::Value::as_table_mut) else {
-        return write_document(&path, &doc);
+        return write_document(&path, &doc, &lock);
     };
     let Some(over_tbl) = theme_tbl
         .get_mut("agent_override")
         .and_then(toml::Value::as_table_mut)
     else {
-        return write_document(&path, &doc);
+        return write_document(&path, &doc, &lock);
     };
     over_tbl.remove(alias);
     if over_tbl.is_empty() {
         theme_tbl.remove("agent_override");
     }
-    write_document(&path, &doc)
+    write_document(&path, &doc, &lock)
 }
 
 fn section_mut_path<'a>(doc: &'a mut toml::Table, keys: &[&str]) -> Result<&'a mut toml::Table> {
@@ -1205,9 +1698,19 @@ fn section_mut_path<'a>(doc: &'a mut toml::Table, keys: &[&str]) -> Result<&'a m
 }
 
 pub(crate) fn persist_wss_route_ack(config_dir: &Path, uri: &str) -> Result<()> {
+    let lock = ConfigWriteLock::acquire(config_dir)?;
     let path = config_path(config_dir);
     let mut doc = load_document(&path)?;
-    let tls = section_mut_path(&mut doc, &["connection", "wss", "tls"])?;
+    let scoped = doc
+        .get("connection")
+        .and_then(|v| v.get("logins"))
+        .and_then(|v| v.get(uri))
+        .is_some();
+    let tls = if scoped {
+        section_mut_path(&mut doc, &["connection", "logins", uri, "tls"])?
+    } else {
+        section_mut_path(&mut doc, &["connection", "wss", "tls"])?
+    };
     let routes = tls
         .entry("skip_verify_routes")
         .or_insert_with(|| toml::Value::Array(Vec::new()))
@@ -1217,7 +1720,7 @@ pub(crate) fn persist_wss_route_ack(config_dir: &Path, uri: &str) -> Result<()> 
     if !already {
         routes.push(toml::Value::String(uri.to_string()));
     }
-    write_document(&path, &doc)
+    write_document(&path, &doc, &lock)
 }
 
 /// Persist the entire `[todotracker]` section, editing only that section.
@@ -1227,6 +1730,7 @@ pub(crate) fn persist_wss_route_ack(config_dir: &Path, uri: &str) -> Result<()> 
 /// section that is unparseable, even if the caller's older snapshot
 /// and proposed section are valid.
 pub(crate) fn persist_todotracker(config_dir: &Path, section: &TodoTrackerSection) -> Result<()> {
+    let lock = ConfigWriteLock::acquire(config_dir)?;
     let path = config_path(config_dir);
     let mut doc = load_document(&path)?;
     if let Some(value) = doc.get("todotracker") {
@@ -1246,7 +1750,35 @@ pub(crate) fn persist_todotracker(config_dir: &Path, section: &TodoTrackerSectio
         .cloned()
         .unwrap_or_default();
     doc.insert("todotracker".to_string(), toml::Value::Table(serialized));
-    write_document(&path, &doc)
+    write_document(&path, &doc, &lock)
+}
+
+/// Save one URL's accepted login, optionally selecting it, in one owner-only
+/// write. The read, mutation, and publish share [`ConfigWriteLock`] with every
+/// other config writer, so a second login or a startup renewal cannot replace
+/// this URL's entry with a snapshot that never contained it. Re-read the
+/// persisted document so transient env overrides and other URLs' credentials
+/// are never copied or lost.
+pub(crate) fn persist_oidc_login(
+    config_dir: &Path,
+    uri: &str,
+    login: &OidcLogin,
+    select: bool,
+) -> Result<()> {
+    let lock = ConfigWriteLock::acquire(config_dir)?;
+    let path = config_path(config_dir);
+    let mut doc = load_document(&path)?;
+    let connection = section_mut(&mut doc, "connection")?;
+    if !connection.is_empty() {
+        toml::Value::Table(connection.clone())
+            .try_into::<ConnectionSection>()
+            .context("refusing to overwrite malformed connection settings")?;
+    }
+    section_mut(connection, "logins")?.insert(uri.to_string(), toml::Value::try_from(login)?);
+    if select {
+        section_mut(connection, "wss")?.insert("uri".into(), toml::Value::String(uri.into()));
+    }
+    write_document(&path, &doc, &lock)
 }
 
 pub(crate) fn persist_connection_field(
@@ -1254,26 +1786,48 @@ pub(crate) fn persist_connection_field(
     leaf_path: &str,
     value: toml::Value,
 ) -> Result<()> {
+    let lock = ConfigWriteLock::acquire(config_dir)?;
     let path = config_path(config_dir);
     let mut doc = load_document(&path)?;
     let mut segments: Vec<&str> = leaf_path.split('.').collect();
     let leaf = segments
         .pop()
         .ok_or_else(|| anyhow::Error::msg("empty connection field path"))?;
-    let mut prefix = vec!["connection", "wss"];
+    let selected_login = doc
+        .get("connection")
+        .and_then(|c| c.get("wss"))
+        .and_then(|w| w.get("uri"))
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned)
+        .filter(|uri| {
+            doc.get("connection")
+                .and_then(|c| c.get("logins"))
+                .and_then(|l| l.get(uri))
+                .is_some()
+        });
+    let mut prefix = if leaf_path.starts_with("tls.") {
+        if let Some(uri) = selected_login.as_deref() {
+            vec!["connection", "logins", uri]
+        } else {
+            vec!["connection", "wss"]
+        }
+    } else {
+        vec!["connection", "wss"]
+    };
     prefix.extend(segments);
     section_mut_path(&mut doc, &prefix)?.insert(leaf.to_string(), value);
-    write_document(&path, &doc)
+    write_document(&path, &doc, &lock)
 }
 
 pub(crate) fn persist_locale(config_dir: &Path, locale: &str) -> Result<()> {
+    let lock = ConfigWriteLock::acquire(config_dir)?;
     let path = config_path(config_dir);
     let mut doc = load_document(&path)?;
     doc.insert(
         "locale".to_string(),
         toml::Value::String(locale.to_string()),
     );
-    write_document(&path, &doc)
+    write_document(&path, &doc, &lock)
 }
 
 /// Overwrite the `[keybindings]` section from a resolved override table
@@ -1281,6 +1835,7 @@ pub(crate) fn persist_locale(config_dir: &Path, locale: &str) -> Result<()> {
 /// else falls back to compile-time defaults on next load. Only the
 /// `[keybindings]` section is touched; other sections are preserved.
 pub(crate) fn persist_keybindings(config_dir: &Path, table: &OverrideTable) -> Result<()> {
+    let lock = ConfigWriteLock::acquire(config_dir)?;
     let path = config_path(config_dir);
     let mut doc = load_document(&path)?;
     let rows = flatten_table(table);
@@ -1290,7 +1845,7 @@ pub(crate) fn persist_keybindings(config_dir: &Path, table: &OverrideTable) -> R
         .cloned()
         .unwrap_or_default();
     doc.insert("keybindings".to_string(), toml::Value::Table(serialized));
-    write_document(&path, &doc)
+    write_document(&path, &doc, &lock)
 }
 
 /// Insert or replace a single `"<tag>.<variant>"` row (capture-modal
@@ -1300,11 +1855,12 @@ pub(crate) fn persist_keybind_row(
     action_key: &str,
     chords: Vec<Chord>,
 ) -> Result<()> {
+    let lock = ConfigWriteLock::acquire(config_dir)?;
     let path = config_path(config_dir);
     let mut doc = load_document(&path)?;
     let value = toml::Value::try_from(ChordSpec::Many(chords)).context("serializing chords")?;
     section_mut(&mut doc, "keybindings")?.insert(action_key.to_string(), value);
-    write_document(&path, &doc)
+    write_document(&path, &doc, &lock)
 }
 
 /// Collapse a nested `tag -> variant -> chords` table into the flat
@@ -2110,14 +2666,15 @@ mod tests {
         persist_theme(dir.path(), "gruvbox").unwrap();
         persist_locale(dir.path(), "fr").unwrap();
 
-        let entries: Vec<String> = std::fs::read_dir(dir.path())
+        let mut entries: Vec<String> = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
+        entries.sort();
         assert_eq!(
             entries,
-            vec![FILE_NAME.to_string()],
-            "the publish must leave no staging file behind: {entries:?}"
+            vec![CONFIG_LOCK_FILE.to_string(), FILE_NAME.to_string()],
+            "the publish must leave no staging file; the lock file stays as the lock identity: {entries:?}"
         );
         let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
         assert_eq!(doc["theme"]["name"].as_str(), Some("gruvbox"));
@@ -2987,6 +3544,442 @@ mod tests {
         assert_eq!(
             reloaded.width, 30,
             "the env-injected width must not be written to disk"
+        );
+    }
+}
+
+#[cfg(test)]
+mod login_tests {
+    use super::*;
+
+    fn login(token: &str) -> OidcLogin {
+        OidcLogin {
+            auth_provider: "oidc.corp".into(),
+            auth_token: token.into(),
+            enroll_url: "https://gateway.example/zeroclaw".into(),
+            expires_at: Some(2000000000),
+            tls: WssTlsSection {
+                ca_cert_path: "ca.pem".into(),
+                ..Default::default()
+            },
+            gateway_tls: WssTlsSection::default(),
+        }
+    }
+
+    #[test]
+    fn save_login_is_url_scoped_preserves_other_settings_and_redacts_debug() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = "wss://host:9781/a";
+        let b = "wss://host:9781/b";
+        std::fs::write(config_path(dir.path()), "[future]\nkeep = 'unchanged'\n").unwrap();
+        persist_oidc_login(dir.path(), a, &login("sentinel-a"), true).unwrap();
+        persist_oidc_login(dir.path(), b, &login("sentinel-b"), true).unwrap();
+        let cfg = load_persisted(dir.path()).unwrap();
+        assert_eq!(cfg.connection.wss.uri.as_deref(), Some(b));
+        assert_eq!(cfg.connection.logins.len(), 2);
+        assert_eq!(
+            cfg.connection.wss_for(Some(a)).auth_token.as_deref(),
+            Some("sentinel-a")
+        );
+        assert_eq!(
+            cfg.connection.wss_for(None).auth_token.as_deref(),
+            Some("sentinel-b")
+        );
+        let other = cfg.connection.wss_for(Some("wss://other:9781/"));
+        assert!(other.auth_token.is_none());
+        assert!(other.auth_provider.is_none());
+        assert!(other.tls.ca_cert_path.is_empty());
+        assert!(!format!("{:?}", cfg).contains("sentinel"));
+        let doc: toml::Table =
+            toml::from_str(&std::fs::read_to_string(config_path(dir.path())).unwrap()).unwrap();
+        assert_eq!(doc["future"]["keep"].as_str(), Some("unchanged"));
+        assert!(doc["connection"]["wss"].get("auth_token").is_none());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(config_path(dir.path()))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_connection_refuses_save_without_losing_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = "[connection]\nlogins = 7\n";
+        std::fs::write(config_path(dir.path()), original).unwrap();
+        assert!(persist_oidc_login(dir.path(), "wss://host/", &login("new-token"), true).is_err());
+        assert_eq!(
+            std::fs::read_to_string(config_path(dir.path())).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn route_ack_updates_login_not_legacy_wss() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = "wss://host:9781/";
+        persist_oidc_login(dir.path(), uri, &login("test-token"), true).unwrap();
+        persist_wss_route_ack(dir.path(), uri).unwrap();
+        let cfg = load_persisted(dir.path()).unwrap();
+        assert!(cfg.connection.wss_for(Some(uri)).tls.route_acked(uri));
+        assert!(cfg.connection.wss.tls.skip_verify_routes.is_empty());
+    }
+    #[test]
+    fn renewing_one_url_does_not_change_the_default_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = "wss://host:9781/a";
+        let b = "wss://host:9781/b";
+        persist_oidc_login(dir.path(), a, &login("old-a"), true).unwrap();
+        persist_oidc_login(dir.path(), b, &login("b-token"), true).unwrap();
+        persist_oidc_login(dir.path(), a, &login("new-a"), false).unwrap();
+        let cfg = load_persisted(dir.path()).unwrap();
+        assert_eq!(cfg.connection.wss.uri.as_deref(), Some(b));
+        assert_eq!(cfg.connection.logins[a].auth_token, "new-a");
+        assert_eq!(cfg.connection.logins[b].auth_token, "b-token");
+    }
+
+    #[test]
+    fn connection_editor_changes_the_selected_logins_tls() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = "wss://host:9781/";
+        persist_oidc_login(dir.path(), uri, &login("test-token"), true).unwrap();
+        persist_connection_field(dir.path(), "tls.skip_verify", toml::Value::Boolean(true))
+            .unwrap();
+        let cfg = load_persisted(dir.path()).unwrap();
+        assert!(cfg.connection.wss_for(None).tls.skip_verify);
+        assert!(!cfg.connection.wss.tls.skip_verify);
+    }
+
+    #[test]
+    fn equivalent_manual_url_keeps_credentials_when_other_logins_exist() {
+        let mut cfg = ZerocodeConfig::default();
+        cfg.connection.wss.uri = Some("wss://legacy.example:9781".into());
+        cfg.connection.wss.auth_token = Some("manual-token".into());
+        cfg.connection.wss.auth_token_file = Some("manual-token-file".into());
+        cfg.connection.wss.auth_provider = Some("native".into());
+        cfg.connection.wss.enroll_url = Some("https://legacy.example:42617".into());
+        cfg.connection.wss.tls.ca_cert_path = "legacy-ca.pem".into();
+        cfg.connection.wss.tls.client_cert_path = "legacy-client.pem".into();
+        cfg.connection.wss.tls.client_key_path = "legacy-key.pem".into();
+        cfg.connection
+            .logins
+            .insert("wss://other.example:9781/".into(), login("other-token"));
+
+        let kept = cfg.connection.wss_for(Some("wss://legacy.example:9781/"));
+        assert_eq!(kept.auth_token.as_deref(), Some("manual-token"));
+        assert_eq!(kept.auth_token_file.as_deref(), Some("manual-token-file"));
+        assert_eq!(kept.auth_provider.as_deref(), Some("native"));
+        assert_eq!(
+            kept.enroll_url.as_deref(),
+            Some("https://legacy.example:42617")
+        );
+        assert_eq!(kept.tls.ca_cert_path, "legacy-ca.pem");
+        assert_eq!(kept.tls.client_cert_path, "legacy-client.pem");
+        assert_eq!(kept.tls.client_key_path, "legacy-key.pem");
+        assert!(
+            !cfg.connection
+                .uses_scoped_credentials(Some("wss://legacy.example:9781/")),
+            "an equivalent spelling is still the manual connection"
+        );
+
+        let other_path = cfg
+            .connection
+            .wss_for(Some("wss://legacy.example:9781/rpc"));
+        assert!(
+            other_path.auth_token.is_none(),
+            "a different path is a different destination"
+        );
+        assert!(other_path.tls.ca_cert_path.is_empty());
+
+        let other = cfg
+            .connection
+            .wss_for(Some("wss://elsewhere.example:9781/"));
+        assert!(other.auth_token.is_none());
+        assert!(other.auth_provider.is_none());
+        assert!(other.tls.ca_cert_path.is_empty());
+        assert!(other.tls.client_cert_path.is_empty());
+        assert!(
+            cfg.connection
+                .uses_scoped_credentials(Some("wss://elsewhere.example:9781/")),
+            "a different daemon must not reuse the manual credential files"
+        );
+    }
+
+    #[test]
+    fn invalid_saved_login_never_falls_back_to_another_principal() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config_path(dir.path()),
+            "[connection.logins.\"wss://host/\"]\nauth_token = 'token-without-provider'\n",
+        )
+        .unwrap();
+        let error = load_persisted(dir.path()).unwrap_err();
+        assert!(error.downcast_ref::<InvalidSavedLogin>().is_some());
+        let rendered = error.to_string();
+        assert_eq!(rendered, crate::i18n::t("zc-config-invalid-saved-login"));
+        assert_ne!(rendered, "{zc-config-invalid-saved-login}");
+    }
+
+    fn held_login_document() -> String {
+        "\
+[future]
+keep = \"unchanged\"
+
+[connection.logins.\"wss://held.example/\"]
+auth_provider = \"oidc.corp\"
+auth_token = \"held-token\"
+enroll_url = \"https://gateway.example/zeroclaw\"
+"
+        .to_string()
+    }
+
+    /// Hold the config lock, start `writer`, and publish `during_hold` only
+    /// once `writer` is blocked. The writer must re-read after it acquires the
+    /// lock; a snapshot taken before the wait would drop `during_hold`.
+    fn assert_writer_rereads_under_lock(
+        dir: &Path,
+        during_hold: &str,
+        writer: impl FnOnce(&Path) + Send + 'static,
+    ) {
+        let held = ConfigWriteLock::acquire(dir).expect("the test lock must be free");
+        let dir = dir.to_path_buf();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let writer_dir = dir.clone();
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).expect("test thread still listening");
+            writer(&writer_dir);
+        });
+        started_rx.recv().expect("writer started");
+        // The sleep only lets the writer reach the lock. Finishing while it
+        // is held means the writer did not take the lock at all.
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        assert!(
+            !handle.is_finished(),
+            "writer published while another holder still had the config lock"
+        );
+        std::fs::write(config_path(&dir), during_hold).unwrap();
+        drop(held);
+        handle.join().expect("writer thread");
+    }
+
+    #[test]
+    fn a_login_saved_while_another_save_waits_is_not_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(config_path(dir.path()), "[future]\nkeep = \"seed\"\n").unwrap();
+        assert_writer_rereads_under_lock(dir.path(), &held_login_document(), |dir| {
+            persist_oidc_login(
+                dir,
+                "wss://incoming.example/",
+                &login("incoming-token"),
+                false,
+            )
+            .expect("the waiting login must save once the lock is free");
+        });
+        let cfg = load_persisted(dir.path()).unwrap();
+        assert_eq!(
+            cfg.connection
+                .logins
+                .get("wss://held.example/")
+                .map(|saved| saved.auth_token.as_str()),
+            Some("held-token"),
+            "a snapshot taken before the lock would erase the login published while waiting"
+        );
+        assert_eq!(
+            cfg.connection
+                .logins
+                .get("wss://incoming.example/")
+                .map(|saved| saved.auth_token.as_str()),
+            Some("incoming-token")
+        );
+        let doc: toml::Table =
+            toml::from_str(&std::fs::read_to_string(config_path(dir.path())).unwrap()).unwrap();
+        assert_eq!(doc["future"]["keep"].as_str(), Some("unchanged"));
+    }
+
+    #[test]
+    fn theme_and_sidebar_saves_reread_under_the_same_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(config_path(dir.path()), "[future]\nkeep = \"seed\"\n").unwrap();
+        assert_writer_rereads_under_lock(dir.path(), &held_login_document(), |dir| {
+            persist_theme(dir, "gruvbox").expect("theme save must wait, then publish");
+        });
+        let cfg = load_persisted(dir.path()).unwrap();
+        assert_eq!(cfg.theme.name, "gruvbox");
+        assert_eq!(
+            cfg.connection
+                .logins
+                .get("wss://held.example/")
+                .map(|saved| saved.auth_token.as_str()),
+            Some("held-token"),
+            "a theme save must not publish a snapshot taken before the lock"
+        );
+
+        std::fs::write(config_path(dir.path()), "[future]\nkeep = \"seed\"\n").unwrap();
+        assert_writer_rereads_under_lock(dir.path(), &held_login_document(), |dir| {
+            persist_sidebar_width(dir, 31).expect("sidebar save must wait, then publish");
+        });
+        let cfg = load_persisted(dir.path()).unwrap();
+        assert_eq!(cfg.sidebar.width, 31);
+        assert_eq!(
+            cfg.connection
+                .logins
+                .get("wss://held.example/")
+                .map(|saved| saved.auth_token.as_str()),
+            Some("held-token"),
+            "a sidebar save must not publish a snapshot taken before the lock"
+        );
+    }
+
+    #[test]
+    fn keybinding_migration_rereads_under_the_config_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config_path(dir.path()),
+            "[keybindings]\n\"input_bar.clear_input\" = \"ctrl+u\"\n",
+        )
+        .unwrap();
+        let during_hold = "\
+[keybindings]
+\"input_bar.clear_input\" = \"ctrl+u\"
+
+[connection.logins.\"wss://held.example/\"]
+auth_provider = \"oidc.corp\"
+auth_token = \"held-token\"
+enroll_url = \"https://gateway.example/zeroclaw\"
+";
+        assert_writer_rereads_under_lock(dir.path(), during_hold, |dir| {
+            let cfg = load_persisted(dir).expect("migration must finish once the lock is free");
+            assert_eq!(
+                cfg.connection
+                    .logins
+                    .get("wss://held.example/")
+                    .map(|saved| saved.auth_token.as_str()),
+                Some("held-token"),
+                "migration must re-read under the lock"
+            );
+        });
+        let body = std::fs::read_to_string(config_path(dir.path())).unwrap();
+        assert!(
+            body.contains("held-token"),
+            "migration must not publish the pre-lock snapshot:\n{body}"
+        );
+        assert!(
+            body.contains("primary+u"),
+            "the legacy binding must still be migrated:\n{body}"
+        );
+        assert!(
+            !body.contains("ctrl+u"),
+            "the legacy spelling must not remain:\n{body}"
+        );
+    }
+
+    #[test]
+    fn concurrent_login_saves_keep_both_urls() {
+        let dir = tempfile::tempdir().unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for (url, token) in [
+            ("wss://alpha.example/", "alpha-final"),
+            ("wss://beta.example/", "beta-final"),
+        ] {
+            let dir = dir.path().to_path_buf();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for i in 0..20 {
+                    let value = if i == 19 {
+                        token.to_string()
+                    } else {
+                        format!("{token}-{i}")
+                    };
+                    persist_oidc_login(&dir, url, &login(&value), false)
+                        .expect("concurrent login save");
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("concurrent login thread");
+        }
+        let cfg = load_persisted(dir.path()).unwrap();
+        assert_eq!(
+            cfg.connection
+                .logins
+                .get("wss://alpha.example/")
+                .map(|saved| saved.auth_token.as_str()),
+            Some("alpha-final")
+        );
+        assert_eq!(
+            cfg.connection
+                .logins
+                .get("wss://beta.example/")
+                .map(|saved| saved.auth_token.as_str()),
+            Some("beta-final")
+        );
+    }
+
+    #[test]
+    fn a_config_lock_that_is_never_released_fails_with_an_actionable_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let _held = ConfigWriteLock::acquire(dir.path()).unwrap();
+        let started = std::time::Instant::now();
+        let err =
+            match ConfigWriteLock::acquire_within(dir.path(), std::time::Duration::from_millis(80))
+            {
+                Err(error) => format!("{error:#}"),
+                Ok(_) => panic!("a lock held by another writer must not block forever"),
+            };
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the wait must be bounded"
+        );
+        let config = config_path(dir.path()).display().to_string();
+        let lock = dir.path().join(CONFIG_LOCK_FILE).display().to_string();
+        let expected = crate::i18n::t_args(
+            "zc-config-save-lock-timeout",
+            &[("config", &config), ("lock", &lock), ("seconds", "0")],
+        );
+        assert_ne!(
+            expected, "{zc-config-save-lock-timeout}",
+            "the timeout key must resolve from the English catalogue"
+        );
+        assert!(
+            err.contains(&expected),
+            "the timeout must use the catalogue message, got: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_lock_file_is_rejected_without_changing_its_target() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_path(dir.path());
+        std::fs::write(&config, "[theme]\nname = \"nord\"\n").unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&config, dir.path().join(CONFIG_LOCK_FILE)).unwrap();
+        let before = std::fs::read(&config).unwrap();
+
+        let err = persist_theme(dir.path(), "gruvbox").unwrap_err();
+        let err = format!("{err:#}");
+        assert!(
+            err.contains(CONFIG_LOCK_FILE) || err.contains("not a regular file"),
+            "got: {err}"
+        );
+        assert_eq!(std::fs::read(&config).unwrap(), before);
+        assert_eq!(
+            std::fs::metadata(&config).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "rejecting the symlink must not chmod the config file"
+        );
+        assert_ne!(
+            crate::i18n::t_args("zc-config-lock-not-regular", &[("path", "lock")]),
+            "{zc-config-lock-not-regular}"
         );
     }
 }
