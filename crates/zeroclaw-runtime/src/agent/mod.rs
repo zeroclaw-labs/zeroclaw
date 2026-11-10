@@ -35,12 +35,10 @@ pub use turn::{
     redact::{is_credential_key, scrub_credentials_value},
     semantic_empty_terminal_completion_message, terminal_completion_error_message,
 };
+pub use turn::{SteeringAdmission, SteeringAdmit, SteeringInput, SteeringPosture};
 
 pub(crate) fn is_runtime_approved_arg_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "shell" | "schedule" | "cron_add" | "cron_update" | "cron_run"
-    )
+    zeroclaw_api::tool::takes_runtime_approval(tool_name)
 }
 
 pub(crate) fn set_runtime_approved_arg(
@@ -73,7 +71,10 @@ impl ::zeroclaw_api::attribution::Attributable for AgentAttribution<'_> {
 #[allow(unused_imports)]
 pub use agent::{Agent, AgentBuilder, TurnEvent};
 #[allow(unused_imports)]
-pub use loop_::{process_message, process_message_with_live_config, run};
+pub use loop_::{
+    process_message, process_message_with_capabilities, process_message_with_live_config, run,
+    run_with_capabilities,
+};
 
 #[cfg(test)]
 mod tests;

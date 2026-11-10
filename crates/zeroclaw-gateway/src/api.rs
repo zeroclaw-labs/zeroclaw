@@ -52,6 +52,12 @@ pub(crate) fn require_auth(
     // Defense-in-depth: reject empty tokens explicitly so a future
     // refactor of is_authenticated cannot accidentally treat "" as valid.
     if token.is_empty() {
+        // No bearer: a signed-in dashboard session may stand in for one,
+        // as classified by the session layer for this request. Only an
+        // administrator session is operator-equivalent.
+        if let Some(caller) = crate::dashboard_session::current_caller() {
+            return caller.admit_operator();
+        }
         return Err((
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({
@@ -281,6 +287,36 @@ pub struct StatusResponse {
 /// have `model_provider`, `model`, `temperature`, and `memory_backend`
 /// reflect that specific agent's resolved config; omit it for the
 /// install-wide summary.
+/// The model a configured agent answers with, as the status page reports
+/// it.
+#[derive(Debug, Default)]
+pub(crate) struct AgentModel {
+    pub(crate) provider_ref: Option<String>,
+    pub(crate) model: String,
+    pub(crate) temperature: Option<f64>,
+}
+
+/// [`AgentModel`] for `alias`, or `None` when no such agent is configured.
+pub(crate) fn agent_model(config: &Config, alias: &str) -> Option<AgentModel> {
+    let agent = config.agent(alias)?;
+    let provider_ref = if agent.model_provider.is_empty() {
+        None
+    } else {
+        Some(agent.model_provider.as_str().to_string())
+    };
+    let resolved = config.resolved_model_provider_for_agent(alias);
+    let model = resolved
+        .as_ref()
+        .and_then(|(_, _, cfg)| cfg.model.clone())
+        .unwrap_or_default();
+    let temperature = resolved.as_ref().and_then(|(_, _, cfg)| cfg.temperature);
+    Some(AgentModel {
+        provider_ref,
+        model,
+        temperature,
+    })
+}
+
 #[derive(Debug, Deserialize)]
 pub struct StatusQuery {
     #[serde(default)]
@@ -323,18 +359,11 @@ pub async fn handle_api_status(
     let (model_provider, model, temperature, memory_backend) =
         match agent_alias.and_then(|alias| config.agent(alias).map(|a| (alias, a))) {
             Some((alias, agent)) => {
-                let provider_ref = if agent.model_provider.is_empty() {
-                    None
-                } else {
-                    Some(agent.model_provider.as_str().to_string())
-                };
-                let resolved = config.resolved_model_provider_for_agent(alias);
-                let model = resolved
-                    .as_ref()
-                    .and_then(|(_, _, cfg)| cfg.model.clone())
-                    .unwrap_or_default();
-                let temperature: Option<f64> =
-                    resolved.as_ref().and_then(|(_, _, cfg)| cfg.temperature);
+                let AgentModel {
+                    provider_ref,
+                    model,
+                    temperature,
+                } = agent_model(&config, alias).unwrap_or_default();
                 let backend_kind = agent.memory.backend;
                 let backend = serde_json::to_value(backend_kind)
                     .ok()
@@ -675,7 +704,7 @@ pub async fn handle_api_cron_run(
     }
 
     let selection = zeroclaw_runtime::live_config_authority::AgentExecutionCapability::from_parts(
-        std::sync::Arc::clone(&state.config),
+        state.config.clone(),
         state.agent_lifecycle.clone(),
     )
     .capture_selection();
@@ -898,12 +927,23 @@ pub async fn handle_api_cron_settings_patch(
         return e.into_response();
     }
 
-    // Held through the swap below so a concurrent config writer can't land
-    // between this read and the save.
-    let _cfg_guard = std::sync::Arc::clone(&state.config_write_lock)
-        .lock_owned()
-        .await;
-    let mut config = state.config.read().clone();
+    // Admit one serialized config commit: held from this read through the
+    // save-and-publish below so a concurrent config writer can't land
+    // between them. The save runs retained on the commit, so a dropped
+    // request cannot abandon a dispatched save without its publication.
+    let commit = match state.begin_config_commit().await {
+        Ok(commit) => commit,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "config commit refused without any change: the daemon generation is closing"
+                })),
+            )
+                .into_response();
+        }
+    };
+    let mut config = commit.current_config();
 
     if let Some(v) = body.get("enabled").and_then(|v| v.as_bool()) {
         config.scheduler.enabled = v;
@@ -918,15 +958,43 @@ pub async fn handle_api_cron_settings_patch(
         config.mark_dirty("scheduler.max-run-history");
     }
 
-    if let Err(e) = config.save_dirty().await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to save config: {e}")})),
-        )
-            .into_response();
-    }
-
-    *state.config.write() = config.clone();
+    let revision = match commit.next_revision() {
+        Ok(revision) => revision,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("config revision unavailable: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    let task =
+        zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(Box::pin(async move {
+            if let Err(e) = config.save_dirty().await {
+                return Err(format!("Failed to save config: {e}"));
+            }
+            commit
+                .publish(revision, config.clone())
+                .map_err(|e| format!("Failed to publish config: {e}"))?;
+            Ok(config)
+        }));
+    let config = match task.await {
+        Ok(Ok(config)) => config,
+        Ok(Err(message)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": message})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("config commit task failed: {e}")})),
+            )
+                .into_response();
+        }
+    };
 
     Json(serde_json::json!({
         "status": "ok",
@@ -1263,6 +1331,7 @@ pub async fn handle_api_cost(
                 "monthly_cost_usd": 0.0,
                 "total_tokens": 0,
                 "request_count": 0,
+                "rejected_records": 0,
                 "by_model": {},
                 "by_agent": {},
             }
@@ -2219,6 +2288,7 @@ pub async fn handle_api_session_abort(
 
 // ── Claude Code hook endpoint ────────────────────────────────────
 
+#[cfg(feature = "tool-claude-code-runner")]
 pub async fn handle_claude_code_hook(
     State(state): State<AppState>,
     Json(payload): Json<zeroclaw_tools::claude_code_runner::ClaudeCodeHookEvent>,
@@ -2246,7 +2316,6 @@ pub(crate) mod tests {
     use async_trait::async_trait;
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
-    use parking_lot::RwLock;
     // Gated on every channel feature whose `AppState` fields below are built
     // with `HashMap::new()`, not just `channel-linq`. With only one of the
     // others enabled the import vanished while its uses remained, so
@@ -2419,10 +2488,11 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn test_state(config: zeroclaw_config::schema::Config) -> AppState {
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
         AppState {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            agent_lifecycle: Default::default(),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider: Arc::new(MockModelProvider),
             model: "test-model".into(),
             temperature: None,
@@ -2470,7 +2540,6 @@ pub(crate) mod tests {
             session_backend: None,
             session_queue: Arc::new(crate::session_queue::SessionActorQueue::new(8, 30, 600)),
             device_registry: None,
-            pending_pairings: None,
             path_prefix: String::new(),
             web_dist_dir: None,
             canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
@@ -3215,14 +3284,14 @@ pub(crate) mod tests {
     }
 
     fn link_job_to_test_agent(state: &AppState, job_id: &str) {
-        state
-            .config
-            .write()
-            .agents
-            .get_mut("test-agent")
-            .expect("test-agent configured by with_test_agent")
-            .cron_jobs
-            .push(job_id.to_string());
+        state.publish_test_config(|config| {
+            config
+                .agents
+                .get_mut("test-agent")
+                .expect("test-agent configured by with_test_agent")
+                .cron_jobs
+                .push(job_id.to_string());
+        });
     }
 
     fn config_with_webhook(
@@ -5852,6 +5921,7 @@ pub(crate) mod tests {
 
         let response = rotate_device_token(
             State(state.clone()),
+            None,
             bearer_headers(&old_token),
             Path(device_id.clone()),
         )
@@ -5877,6 +5947,7 @@ pub(crate) mod tests {
 
         let response = rotate_device_token(
             State(state.clone()),
+            None,
             bearer_headers(&old_token),
             Path(device_id),
         )
@@ -5933,6 +6004,7 @@ pub(crate) mod tests {
 
         let response = revoke_device(
             State(state.clone()),
+            None,
             bearer_headers(&old_token),
             Path(device_id),
         )
@@ -5956,6 +6028,243 @@ pub(crate) mod tests {
         );
     }
 
+    /// A guarded RPC write holds the config write lock from its credential
+    /// check to its commit, so a device revocation or rotation changes the
+    /// live token set only once it holds that lock. While another writer
+    /// holds it, the handler waits with the token still authenticating, and
+    /// the revocation lands once the lock is released.
+    #[tokio::test]
+    async fn device_revoke_and_rotate_remove_the_live_token_only_under_the_config_write_lock() {
+        for rotate in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (state, old_token, device_id) = paired_state_with_device(&tmp).await;
+
+            let in_flight = state.config_authority.lock_config_writer().await;
+            let mut revoke = if rotate {
+                Box::pin(async {
+                    rotate_device_token(
+                        State(state.clone()),
+                        None,
+                        bearer_headers(&old_token),
+                        Path(device_id.clone()),
+                    )
+                    .await
+                    .into_response()
+                }) as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>
+            } else {
+                Box::pin(async {
+                    revoke_device(
+                        State(state.clone()),
+                        None,
+                        bearer_headers(&old_token),
+                        Path(device_id.clone()),
+                    )
+                    .await
+                    .into_response()
+                })
+            };
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(
+                std::future::Future::poll(revoke.as_mut(), &mut cx).is_pending(),
+                "rotate={rotate}: the revocation must wait for the config write lock"
+            );
+            assert!(
+                state.pairing.is_authenticated(&old_token),
+                "rotate={rotate}: the token stays live while the revocation waits"
+            );
+            assert!(
+                device_listed(&state, &device_id),
+                "rotate={rotate}: the device stays while the revocation waits"
+            );
+
+            drop(in_flight);
+            let response = revoke.await;
+            assert_eq!(response.status(), StatusCode::OK, "rotate={rotate}");
+            assert!(
+                !state.pairing.is_authenticated(&old_token),
+                "rotate={rotate}: the token is revoked once the lock is released"
+            );
+            assert!(!device_listed(&state, &device_id), "rotate={rotate}");
+        }
+    }
+
+    fn device_listed(state: &AppState, device_id: &str) -> bool {
+        state
+            .device_registry
+            .as_ref()
+            .expect("the fixture has a device registry")
+            .list()
+            .expect("the device registry lists")
+            .iter()
+            .any(|device| device.id == device_id)
+    }
+
+    /// Pair one more device on `state` and return its bearer token.
+    async fn add_paired_device(state: &AppState, device_id: &str) -> String {
+        let code = state
+            .pairing
+            .generate_new_pairing_code(zeroclaw_config::pairing::PairingCodePolicy::default())
+            .expect("pairing is enabled");
+        let token = state
+            .pairing
+            .try_pair(&code, device_id)
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .device_registry
+            .as_ref()
+            .expect("the fixture has a device registry")
+            .register(
+                PairingGuard::token_hash(&token),
+                DeviceInfo {
+                    id: device_id.to_string(),
+                    name: None,
+                    device_type: None,
+                    paired_at: Utc::now(),
+                    last_seen: Utc::now(),
+                    ip_address: None,
+                    capabilities: None,
+                },
+            )
+            .expect("test device registry insert");
+        token
+    }
+
+    /// A device request is authenticated when it arrives, but it acts only
+    /// once it holds the config write lock, and a revocation queued ahead of
+    /// it can revoke its caller meanwhile. Device B deletes device A while A,
+    /// still valid when it asked, waits to rotate or delete B. A must be
+    /// refused once the lock is held: B keeps its device and its token, and
+    /// A is not handed a new pairing code.
+    #[tokio::test]
+    async fn a_device_request_queued_behind_its_callers_revocation_is_refused() {
+        for rotate in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (state, token_a, device_a) = paired_state_with_device(&tmp).await;
+            let token_b = add_paired_device(&state, "dev-b").await;
+            assert!(
+                state.pairing.pairing_code().is_none(),
+                "the pairing-code slot starts empty"
+            );
+
+            let in_flight = state.config_authority.lock_config_writer().await;
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            let mut delete_a = Box::pin({
+                let state = state.clone();
+                let token_b = token_b.clone();
+                let device_a = device_a.clone();
+                async move {
+                    revoke_device(State(state), None, bearer_headers(&token_b), Path(device_a))
+                        .await
+                        .into_response()
+                }
+            });
+            assert!(std::future::Future::poll(delete_a.as_mut(), &mut cx).is_pending());
+            let mut against_b = Box::pin({
+                let state = state.clone();
+                let token_a = token_a.clone();
+                async move {
+                    let path = Path("dev-b".to_string());
+                    if rotate {
+                        rotate_device_token(State(state), None, bearer_headers(&token_a), path)
+                            .await
+                            .into_response()
+                    } else {
+                        revoke_device(State(state), None, bearer_headers(&token_a), path)
+                            .await
+                            .into_response()
+                    }
+                }
+            });
+            assert!(
+                std::future::Future::poll(against_b.as_mut(), &mut cx).is_pending(),
+                "rotate={rotate}: A's request passes its first check and waits"
+            );
+
+            drop(in_flight);
+            assert_eq!(delete_a.await.status(), StatusCode::OK);
+            assert!(!state.pairing.is_authenticated(&token_a));
+
+            let refused = against_b.await;
+            assert_eq!(
+                refused.status(),
+                StatusCode::UNAUTHORIZED,
+                "rotate={rotate}: the revoked caller is refused under the lock"
+            );
+            assert!(device_listed(&state, "dev-b"), "rotate={rotate}");
+            assert!(state.pairing.is_authenticated(&token_b), "rotate={rotate}");
+            assert!(
+                state.pairing.pairing_code().is_none(),
+                "rotate={rotate}: no pairing code is issued to the revoked caller"
+            );
+        }
+    }
+
+    /// The gateway's request timeout drops a handler future that is still
+    /// waiting. A revoke or rotate dropped while it waits for the config
+    /// write lock must leave the device row and its token as they were, so
+    /// the same request retried later still finds the device and revokes
+    /// both.
+    #[tokio::test]
+    async fn device_revoke_and_rotate_dropped_while_waiting_can_be_retried() {
+        for rotate in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (state, old_token, device_id) = paired_state_with_device(&tmp).await;
+            let call = |state: AppState, token: String, device_id: String| async move {
+                if rotate {
+                    rotate_device_token(State(state), None, bearer_headers(&token), Path(device_id))
+                        .await
+                        .into_response()
+                } else {
+                    revoke_device(State(state), None, bearer_headers(&token), Path(device_id))
+                        .await
+                        .into_response()
+                }
+            };
+
+            let in_flight = state.config_authority.lock_config_writer().await;
+            let mut waiting = Box::pin(call(state.clone(), old_token.clone(), device_id.clone()));
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(
+                std::future::Future::poll(waiting.as_mut(), &mut cx).is_pending(),
+                "rotate={rotate}: the revocation must wait for the config write lock"
+            );
+            drop(waiting);
+            drop(in_flight);
+
+            assert!(
+                device_listed(&state, &device_id),
+                "rotate={rotate}: a dropped revocation must not delete the device"
+            );
+            assert!(
+                state.pairing.is_authenticated(&old_token),
+                "rotate={rotate}: a dropped revocation must not strand a half-revoked token"
+            );
+
+            let response = call(state.clone(), old_token.clone(), device_id.clone()).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "rotate={rotate}: the retry"
+            );
+            assert!(!device_listed(&state, &device_id), "rotate={rotate}");
+            assert!(
+                !state.pairing.is_authenticated(&old_token),
+                "rotate={rotate}"
+            );
+            assert!(
+                !state
+                    .config
+                    .read()
+                    .gateway
+                    .paired_tokens
+                    .contains(&PairingGuard::token_hash(&old_token)),
+                "rotate={rotate}: the retry persists the revocation"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn rotate_unknown_device_returns_not_found() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -5963,6 +6272,7 @@ pub(crate) mod tests {
 
         let response = rotate_device_token(
             State(state.clone()),
+            None,
             bearer_headers(&token),
             Path("does-not-exist".into()),
         )
@@ -5987,6 +6297,7 @@ pub(crate) mod tests {
 
         let response = rotate_device_token(
             State(state.clone()),
+            None,
             bearer_headers(&token),
             Path(device_id.clone()),
         )
@@ -6061,12 +6372,12 @@ pub(crate) mod tests {
         let h2 = bearer_headers(&admin_token);
         let (r1, r2) = tokio::join!(
             async move {
-                rotate_device_token(State(s1), h1, Path("dev-a".into()))
+                rotate_device_token(State(s1), None, h1, Path("dev-a".into()))
                     .await
                     .into_response()
             },
             async move {
-                rotate_device_token(State(s2), h2, Path("dev-b".into()))
+                rotate_device_token(State(s2), None, h2, Path("dev-b".into()))
                     .await
                     .into_response()
             },

@@ -46,6 +46,23 @@ pub fn init(locale: &str, config_dir: &std::path::Path) {
     FTL_BUNDLES.get_or_init(|| load_ftl_bundles(locale));
 }
 
+/// Whether [`init`] has already bound this process to a config directory.
+///
+/// `t` and `t_args` can fill their caches without this, and those caches
+/// cannot be replaced. Callers that format user-facing text before `init`
+/// must keep the message as data and print it afterwards.
+pub(crate) fn is_initialized() -> bool {
+    CONFIG_DIR.get().is_some()
+}
+
+/// Initialise from a config directory before a startup error is printed.
+/// A missing or unreadable locale falls back to English. The embedded catalogue
+/// still supplies any key the selected locale has not translated.
+pub fn init_from_config_dir(config_dir: &std::path::Path) {
+    let locale = locale_from_config_dir(config_dir).unwrap_or_else(|| "en".to_string());
+    init(&locale, config_dir);
+}
+
 pub fn t(key: &str) -> String {
     let map = STRINGS.get_or_init(|| load_strings(active_locale()));
     if let Some(value) = map.get(key) {
@@ -614,11 +631,26 @@ mod tests {
                 "zc-chat-status-awaiting-approval",
                 "zc-chat-status-awaiting-input",
                 "zc-chat-status-cancelling",
+                "zc-dashboard-label-context",
+                "zc-dashboard-label-code-context",
+                "zc-dashboard-label-chat-context",
+                "zc-dashboard-context-idle",
+                "zc-dashboard-context-working",
+                "zc-dashboard-context-blocked",
+                "zc-dashboard-context-done",
             ] {
                 assert!(
                     format_ftl_message(&bundle, key, &[]).is_some(),
                     "{key} must format for {locale}"
                 );
+            }
+            for key in [
+                "zc-dashboard-context-client-queue",
+                "zc-dashboard-context-client-queue-paused",
+            ] {
+                let queue = format_ftl_message(&bundle, key, &[("count", "2")])
+                    .unwrap_or_else(|| panic!("{key} must format for {locale}"));
+                assert!(queue.contains('2'), "{key} must interpolate for {locale}");
             }
             let calling_tool = format_ftl_message(
                 &bundle,
@@ -635,6 +667,88 @@ mod tests {
             )
             .unwrap_or_else(|| panic!("sidebar picker error must format for {locale}"));
             assert!(picker_error.contains("socket closed"));
+        }
+    }
+
+    #[test]
+    fn queue_paused_hints_name_the_send_key_in_all_locales() {
+        use unicode_width::UnicodeWidthStr;
+
+        // An empty send resumes the queue on every terminal; the Alt chord
+        // types a character instead under macOS Terminal's default Option
+        // key, so the hints must name the send key.
+        let available_cells = 80 - crate::config::SidebarSection::default().width as usize - 2;
+        for (locale, source) in [
+            ("en", EN_FTL),
+            ("es", include_str!("../locales/es/zerocode.ftl")),
+            ("fr", include_str!("../locales/fr/zerocode.ftl")),
+            ("ja", include_str!("../locales/ja/zerocode.ftl")),
+            ("zh-CN", include_str!("../locales/zh-CN/zerocode.ftl")),
+        ] {
+            let bundle = build_ftl_bundle(source, locale);
+            let unbound = format_ftl_message(&bundle, "zc-queue-paused-no-key-ghost", &[])
+                .unwrap_or_else(|| panic!("unbound hint must format for {locale}"));
+            assert!(!unbound.is_empty());
+            assert!(unbound.width() <= available_cells, "{locale}: {unbound}");
+            for key in ["Enter", "F5", "F6", "Alt+p", "Option+p", "⌥P"] {
+                for id in [
+                    "zc-queue-paused-single-key-ghost",
+                    "zc-queue-missing-completion-single-key-ghost",
+                ] {
+                    let hint = format_ftl_message(&bundle, id, &[("key", key)])
+                        .unwrap_or_else(|| panic!("{id} must format for {locale}"));
+                    assert!(hint.contains(key), "{locale}/{id}: {hint}");
+                    if id == "zc-queue-missing-completion-single-key-ghost" {
+                        assert!(hint.width() <= available_cells, "{locale}/{key}: {hint}");
+                    }
+                }
+            }
+            for chord in ["Alt+p", "⌥P"] {
+                let args = [("key", chord), ("send", "Enter")];
+                let paused = format_ftl_message(&bundle, "zc-queue-paused-ghost", &args)
+                    .unwrap_or_else(|| panic!("paused hint must format for {locale}"));
+                assert!(paused.contains("Enter"), "{locale}: {paused}");
+                assert!(paused.contains(chord), "{locale}: {paused}");
+                let missing =
+                    format_ftl_message(&bundle, "zc-queue-missing-completion-ghost", &args)
+                        .unwrap_or_else(|| panic!("recovery hint must format for {locale}"));
+                assert!(missing.contains("Enter"), "{locale}: {missing}");
+                assert!(
+                    missing.width() <= available_cells,
+                    "{locale}/{chord}: {} cells exceed {available_cells}: {missing}",
+                    missing.width()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_completion_hint_fits_default_queue_dock_in_all_locales() {
+        use unicode_width::UnicodeWidthStr;
+
+        let available_cells = 80 - crate::config::SidebarSection::default().width as usize - 2;
+        for (locale, source) in [
+            ("en", EN_FTL),
+            ("es", include_str!("../locales/es/zerocode.ftl")),
+            ("fr", include_str!("../locales/fr/zerocode.ftl")),
+            ("ja", include_str!("../locales/ja/zerocode.ftl")),
+            ("zh-CN", include_str!("../locales/zh-CN/zerocode.ftl")),
+        ] {
+            let bundle = build_ftl_bundle(source, locale);
+            for chord in ["Alt+p", "Option+p"] {
+                let hint = format_ftl_message(
+                    &bundle,
+                    "zc-queue-missing-completion-ghost",
+                    &[("key", chord), ("send", "Enter")],
+                )
+                .unwrap_or_else(|| panic!("recovery hint must format for {locale}"));
+                assert!(hint.contains("Enter"), "{locale}: {hint}");
+                assert!(
+                    hint.width() <= available_cells,
+                    "{locale}/{chord}: {} cells exceed {available_cells}: {hint}",
+                    hint.width()
+                );
+            }
         }
     }
 

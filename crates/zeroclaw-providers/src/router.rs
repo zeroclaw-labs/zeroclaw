@@ -346,6 +346,15 @@ impl CostOptimizedStrategy {
 
 #[async_trait]
 impl ModelProvider for RouterModelProvider {
+    fn supports_exact_request_replay(&self, request: ChatRequest<'_>, model: &str) -> bool {
+        let (provider_idx, resolved_model) = self.resolve(model);
+        self.model_providers
+            .get(provider_idx)
+            .is_some_and(|(_, provider)| {
+                provider.supports_exact_request_replay(request, &resolved_model)
+            })
+    }
+
     fn has_stable_request_identity(&self, model: &str) -> bool {
         if model.starts_with("hint:") {
             return false;
@@ -412,16 +421,33 @@ impl ModelProvider for RouterModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
+        self.chat_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+        .await
+    }
+
+    async fn chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> anyhow::Result<ChatResponse> {
         mark_current_dispatch_composite();
         let (provider_idx, resolved_model) = self.resolve(model);
         let (provider_name, model_provider) = &self.model_providers[provider_idx];
         with_exact_dispatch_route(
             provider_name.clone(),
             resolved_model.clone(),
-            ProviderDispatch::from_ref(&**model_provider).chat(
+            ProviderDispatch::from_ref(&**model_provider).chat_with_tool_round_policy(
                 request,
                 &resolved_model,
                 temperature,
+                policy,
             ),
         )
         .await
@@ -522,6 +548,23 @@ impl ModelProvider for RouterModelProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+        self.stream_chat_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            options,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+    }
+
+    fn stream_chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> BoxStream<'static, StreamResult<StreamEvent>> {
         mark_current_dispatch_composite();
         let (provider_idx, resolved_model) = self.resolve(model);
         let (provider_name, model_provider) = &self.model_providers[provider_idx];
@@ -557,10 +600,11 @@ impl ModelProvider for RouterModelProvider {
                 match with_exact_dispatch_route(
                     provider_name,
                     resolved_model.clone(),
-                    ProviderDispatch::from_ref(&*provider).chat(
+                    ProviderDispatch::from_ref(&*provider).chat_with_tool_round_policy(
                         request,
                         &resolved_model,
                         temperature,
+                        policy,
                     ),
                 )
                 .await
@@ -586,13 +630,21 @@ impl ModelProvider for RouterModelProvider {
         stream_with_exact_dispatch_route(
             provider_name.clone(),
             resolved_model.clone(),
-            ProviderDispatch::from_ref(&**model_provider).stream_chat(
+            ProviderDispatch::from_ref(&**model_provider).stream_chat_with_tool_round_policy(
                 request,
                 &resolved_model,
                 temperature,
                 options,
+                policy,
             ),
         )
+    }
+
+    fn supports_single_tool_rounds(&self, model: &str) -> bool {
+        let (index, resolved_model) = self.resolve(model);
+        self.model_providers[index]
+            .1
+            .supports_single_tool_rounds(&resolved_model)
     }
 
     fn capabilities(&self) -> crate::traits::ProviderCapabilities {
@@ -718,6 +770,10 @@ mod tests {
 
     #[async_trait]
     impl ModelProvider for MockModelProvider {
+        fn supports_exact_request_replay(&self, request: ChatRequest<'_>, model: &str) -> bool {
+            self.vision && model == "replay-model" && request.tools.is_none()
+        }
+
         fn has_stable_request_identity(&self, _model: &str) -> bool {
             true
         }
@@ -1119,6 +1175,56 @@ mod tests {
         assert_eq!(unknown.provider_name, "default.profile");
         assert_eq!(unknown.model, "hint:missing");
         assert_eq!(unknown.kind, RouteResolutionKind::UnknownHintFallback);
+    }
+
+    #[test]
+    fn exact_replay_uses_selected_provider_and_model() {
+        let router = RouterModelProvider::new(
+            "test",
+            vec![
+                (
+                    "default".into(),
+                    Box::new(MockModelProvider::new("no replay")),
+                ),
+                (
+                    "replay".into(),
+                    Box::new(MockModelProvider::new("ok").with_vision(true)),
+                ),
+            ],
+            vec![
+                (
+                    "safe".into(),
+                    Route {
+                        provider_name: "replay".into(),
+                        model: "replay-model".into(),
+                    },
+                ),
+                (
+                    "unsafe".into(),
+                    Route {
+                        provider_name: "replay".into(),
+                        model: "other-model".into(),
+                    },
+                ),
+            ],
+            "replay-model".into(),
+        );
+        let request = ChatRequest {
+            messages: &[],
+            tools: None,
+            thinking: None,
+        };
+        assert!(router.supports_exact_request_replay(request, "hint:safe"));
+        for model in ["hint:unsafe", "hint:unknown", "replay-model"] {
+            assert!(!router.supports_exact_request_replay(request, model));
+        }
+        assert!(!router.supports_exact_request_replay(
+            ChatRequest {
+                tools: Some(&[]),
+                ..request
+            },
+            "hint:safe"
+        ));
     }
 
     #[test]

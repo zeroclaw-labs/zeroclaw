@@ -133,7 +133,7 @@ struct InlineData {
 /// multimodal pipeline), they are extracted as inline_data parts. The remaining
 /// text becomes a text part. Falls back to a single text part if no markers.
 fn build_parts(content: &str) -> Vec<Part> {
-    let (text, image_refs) = crate::multimodal::parse_image_markers(content);
+    let (text, image_refs) = crate::multimodal::parse_user_message_image_refs(content);
     let mut parts = Vec::new();
     let trimmed = text.trim();
     if !trimmed.is_empty() {

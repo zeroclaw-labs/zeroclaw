@@ -395,6 +395,11 @@ def parse_repository(value: str) -> str:
     return value
 
 
+def report_labels(labels: set[str]) -> set[str]:
+    """The subset of PR labels `build_report` reads."""
+    return labels & {*RISK_LABELS, MANUAL_LABEL, SECURITY_LABEL}
+
+
 def parse_pr_metadata(pr: Any) -> tuple[str, str, set[str], int]:
     require(isinstance(pr, dict), "PR metadata is malformed")
     head = pr.get("head")
@@ -854,7 +859,10 @@ def classify(
 
 
 def build_report(pr: dict[str, Any], classification: dict[str, Any]) -> dict[str, Any]:
-    head_sha, base_sha, live_labels, changed_files = parse_pr_metadata(pr)
+    head_sha, base_sha, pr_labels, changed_files = parse_pr_metadata(pr)
+    # Read labels only through `report_labels`, so the stale-metadata check
+    # in `evaluate` compares exactly the labels the report can see.
+    live_labels = report_labels(pr_labels)
     current_risk = [label for label in RISK_LABELS if label in live_labels]
     manual = MANUAL_LABEL in live_labels
     security = SECURITY_LABEL in live_labels
@@ -1012,9 +1020,13 @@ def evaluate(api: Any, pr_number: int, policy_path: Path) -> dict[str, Any]:
 
     latest_pr = api.get_pull(pr_number)
     latest_head, latest_base, latest_labels, latest_file_count = parse_pr_metadata(latest_pr)
+    # Labels the report does not read (size, path, topic) are applied by
+    # sibling labeler workflows that start on the same PR event and can
+    # land mid-evaluation; only a change to a label the report reads makes
+    # the evaluation stale.
     require(
-        (latest_head, latest_base, latest_labels, latest_file_count)
-        == (head_sha, base_sha, live_labels, changed_file_count),
+        (latest_head, latest_base, report_labels(latest_labels), latest_file_count)
+        == (head_sha, base_sha, report_labels(live_labels), changed_file_count),
         "PR metadata changed during evaluation",
     )
     report = build_report(latest_pr, classification)

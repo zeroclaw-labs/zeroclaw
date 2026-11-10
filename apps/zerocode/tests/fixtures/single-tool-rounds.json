@@ -1,0 +1,12 @@
+{
+  "unsupported_notice": "[Single-tool rounds are unavailable on the current provider route. Continuing with batch tool calls.]",
+  "updates": [
+    {"jsonrpc": "2.0", "method": "session/update", "params": {"type": "agent_message_chunk", "session_id": "sess-1", "text": "before-first"}},
+    {"jsonrpc": "2.0", "method": "session/update", "params": {"type": "tool_call", "session_id": "sess-1", "tool_call_id": "call-one", "name": "echo", "raw_input": {}}},
+    {"jsonrpc": "2.0", "method": "session/update", "params": {"type": "tool_result", "session_id": "sess-1", "tool_call_id": "call-one", "name": "echo", "raw_output": "result-1"}},
+    {"jsonrpc": "2.0", "method": "session/update", "params": {"type": "agent_message_chunk", "session_id": "sess-1", "text": "after-first"}},
+    {"jsonrpc": "2.0", "method": "session/update", "params": {"type": "tool_call", "session_id": "sess-1", "tool_call_id": "call-two", "name": "echo", "raw_input": {}}},
+    {"jsonrpc": "2.0", "method": "session/update", "params": {"type": "tool_result", "session_id": "sess-1", "tool_call_id": "call-two", "name": "echo", "raw_output": "result-2"}},
+    {"jsonrpc": "2.0", "method": "session/update", "params": {"type": "agent_message_chunk", "session_id": "sess-1", "text": "done"}}
+  ]
+}

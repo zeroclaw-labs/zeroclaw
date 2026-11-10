@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use zeroclaw_api::turn_stop::{TurnStop, TurnStopCode, tag, turn_stop};
 
 /// Info about a model_provider fallback that occurred during a request.
 #[derive(Debug, Clone)]
@@ -63,6 +64,32 @@ tokio::task_local! {
 
 tokio::task_local! {
     static STREAM_REFUSAL_RECOVERY: RefCell<Option<AnthropicRefusalError>>;
+}
+
+tokio::task_local! {
+    static PROVIDER_ATTEMPT_ALLOWLIST: Option<Arc<HashSet<String>>>;
+}
+
+/// Restrict physical provider attempts for one automatically routed turn.
+/// `None` preserves the existing unrestricted reliability behavior.
+pub async fn scope_provider_attempt_allowlist<F: std::future::Future>(
+    allowed: Option<Arc<HashSet<String>>>,
+    future: F,
+) -> F::Output {
+    PROVIDER_ATTEMPT_ALLOWLIST.scope(allowed, future).await
+}
+
+/// Return whether a physical provider reference is eligible in the current
+/// turn. Direct side routes (for example the configured vision provider) use
+/// this before dispatch so they cannot bypass Reliable's candidate filter.
+pub fn provider_ref_allowed_for_turn(provider_ref: &str) -> bool {
+    PROVIDER_ATTEMPT_ALLOWLIST
+        .try_with(|allowed| {
+            allowed
+                .as_ref()
+                .is_none_or(|candidates| candidates.contains(provider_ref))
+        })
+        .unwrap_or(true)
 }
 
 /// Seed a non-streaming recovery with the refusal that ended a pre-output
@@ -112,6 +139,7 @@ pub(crate) struct ReliableCallAccounting {
     stream_resume_after: Option<ReliableEntryId>,
     stream_recovery_semantic_empty: bool,
     stream_recovery_semantic_empty_permission: bool,
+    stream_recovery_image_replacement_permission: bool,
     stream_recovery_failure: Option<ProviderErrorDiagnostic>,
     /// True iff the recorded stream failure carries a transport-reported
     /// connect failure: some error in the chain downcasts to
@@ -228,6 +256,18 @@ pub(crate) fn mark_stream_recovery_semantic_empty() {
         let mut accounting = accounting.lock();
         accounting.stream_recovery_semantic_empty = true;
         accounting.stream_recovery_semantic_empty_permission = true;
+    });
+}
+
+/// Permit one non-streaming call to the exact entry whose image-bearing stream
+/// ended in HTTP 400. Runtime grants this only after constructing a provider-
+/// only request view with the novel image identities removed.
+#[doc(hidden)]
+pub fn permit_exact_image_recovery() {
+    let _ = RELIABLE_CALL_ACCOUNTING.try_with(|accounting| {
+        accounting
+            .lock()
+            .stream_recovery_image_replacement_permission = true;
     });
 }
 
@@ -532,6 +572,33 @@ fn record_accepted_route(route: AcceptedRoute) {
         .try_with(|accounting| accounting.lock().accepted_route = Some(route));
 }
 
+/// Classify a chat call that exhausted every provider/model in the chain.
+/// The kind comes from the typed terminal failure the exhaustion path already
+/// built, so the auth case is classified where it was identified rather than
+/// re-sniffed from the aggregate text.
+fn provider_exhausted_stop(err: &anyhow::Error) -> TurnStop {
+    let kind = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ReliableProviderTerminalFailure>())
+        .map(ReliableProviderTerminalFailure::kind);
+    let detail = err.to_string();
+    match kind {
+        Some(
+            ReliableProviderTerminalFailureKind::Authentication
+            | ReliableProviderTerminalFailureKind::CredentialsMissing,
+        ) => TurnStop::fatal(TurnStopCode::ProviderAuth, detail),
+        _ => TurnStop::recoverable(TurnStopCode::ProviderUnavailable, detail),
+    }
+}
+
+/// Attach the exhaustion stop without disturbing the error itself: `tag` keeps
+/// the cause's `Display` and source chain, so every existing `chain()` walk
+/// (rejected usage, semantic-empty, terminal failure) still finds what it did.
+fn provider_exhausted(err: anyhow::Error) -> anyhow::Error {
+    let stop = provider_exhausted_stop(&err);
+    tag(err, stop)
+}
+
 pub fn transient_error_hint(err: &anyhow::Error) -> Option<&'static str> {
     if crate::model_refusal_from_error(err).is_some() {
         return Some(
@@ -628,6 +695,17 @@ pub fn is_non_retryable(err: &anyhow::Error) -> bool {
         return true;
     }
 
+    // Typed stop next; the string heuristics below stay as the fallback for
+    // errors that came from outside our code.
+    if let Some(stop) = turn_stop(err) {
+        match stop.code {
+            // Recoverable by trimming history — same carve-out as the string path.
+            TurnStopCode::ContextOverflow => return false,
+            TurnStopCode::ProviderAuth => return true,
+            _ => {}
+        }
+    }
+
     // Context window errors are NOT non-retryable — they can be recovered
     // by truncating conversation history, so let the retry loop handle them.
     if is_context_window_exceeded(err) {
@@ -704,6 +782,12 @@ fn is_terminal_provider_failure(err: &anyhow::Error) -> bool {
 /// Used by channels to evict cached model_providers whose OAuth tokens may have
 /// expired so the next request triggers a fresh credential resolution.
 pub fn is_auth_error(err: &anyhow::Error) -> bool {
+    if let Some(stop) = turn_stop(err)
+        && stop.code == TurnStopCode::ProviderAuth
+    {
+        return true;
+    }
+
     if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>()
         && let Some(status) = reqwest_err.status()
     {
@@ -754,12 +838,19 @@ pub fn is_tool_schema_error(err: &anyhow::Error) -> bool {
 }
 
 pub fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
+    if let Some(stop) = turn_stop(err)
+        && stop.code == TurnStopCode::ContextOverflow
+    {
+        return true;
+    }
     let hints = [
         "exceeds the context window",
         "exceeds the available context size",
         "context window of this model",
         "maximum context length",
         "context length exceeded",
+        // snake_case form used by local OpenAI-compatible servers.
+        "context_length_exceeded",
         "too many tokens",
         "token limit exceeded",
         "prompt is too long",
@@ -923,6 +1014,29 @@ fn compact_error_detail(err: &anyhow::Error) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Sanitized HTTP failure retained across provider wrappers so runtime policy
+/// can act on the status code without parsing provider prose.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct ProviderHttpError {
+    status: u16,
+    message: String,
+}
+
+impl ProviderHttpError {
+    pub(crate) fn new(status: reqwest::StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status: status.as_u16(),
+            message: message.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn status(&self) -> u16 {
+        self.status
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1440,7 +1554,7 @@ fn provider_exhausted_attrs(
 
 fn is_context_turn_boundary(message: &ChatMessage) -> bool {
     message.role == "user"
-        && !crate::multimodal::is_prompt_tool_result_message(message)
+        && !zeroclaw_api::tool_carrier::is_tool_result_carrier(&message.role, &message.content)
         && !message.is_pruned_context_separator()
 }
 
@@ -2073,6 +2187,30 @@ impl ReliableModelProvider {
             .filter(|provider| !provider.is_empty())
     }
 
+    fn provider_allowed_for_turn(entry: &ReliableModelProviderEntry) -> bool {
+        provider_ref_allowed_for_turn(entry.candidate_name())
+    }
+
+    fn eligible_provider_count(&self) -> usize {
+        self.model_providers
+            .iter()
+            .filter(|entry| Self::provider_allowed_for_turn(entry))
+            .count()
+    }
+
+    fn log_provider_policy_skip(entry: &ReliableModelProviderEntry) {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                .with_attrs(::serde_json::json!({
+                    "model_provider": entry.candidate_name(),
+                    "reason": "effort_routing_policy",
+                })),
+            "Skipping model_provider outside the turn routing policy"
+        );
+    }
+
     /// Default cooldown after a retryable 429 when Retry-After is absent.
     const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(10);
 
@@ -2099,23 +2237,15 @@ impl ReliableModelProvider {
     }
 
     fn provider_should_skip_for_cooldown(&self, entry: &ReliableModelProviderEntry) -> bool {
-        self.model_providers.len() > 1 && self.provider_cooldown_active(&entry.cooldown_key)
+        self.eligible_provider_count() > 1 && self.provider_cooldown_active(&entry.cooldown_key)
     }
 
     /// Admit an entry with its configured retry budget, except for the exact
-    /// stream-failed entry, which is skipped to avoid replaying it. Three
-    /// exceptions admit the failed entry anyway: the semantic-empty entry
-    /// (when the budget permits it, granted as a single attempt), a
-    /// connect-failed stream failure (the streaming adapter recorded a
-    /// typed `StreamError::ConnectFailed` from the transport; the exception
-    /// matches the non-streaming retry loop, which already retries connect
-    /// failures on the same entry, and the redirect limit on that variant
-    /// applies equally to both paths; it carries the full configured
-    /// budget), and the single-candidate case (no other candidate exists,
-    /// so a non-stream retry of the same entry is recovery, not replay,
-    /// and it carries the full configured budget). When two
-    /// exceptions apply to the same entry, semantic-empty wins and its grant
-    /// stays a single attempt, never two.
+    /// stream-failed entry, which is skipped to avoid replaying it. Image
+    /// replacement and semantic-empty (with budget) each permit one atomic
+    /// non-stream attempt. A typed connect failure and the single-candidate
+    /// case instead carry the full configured budget. An explicit one-attempt
+    /// grant takes precedence when these exceptions overlap.
     fn effective_retry_limit(
         &self,
         model_slot: usize,
@@ -2142,6 +2272,7 @@ impl ReliableModelProvider {
                     exact_failed_entry,
                     connect_failed,
                     accounting.stream_recovery_semantic_empty_permission,
+                    accounting.stream_recovery_image_replacement_permission,
                     has_other_candidate,
                 );
                 match decision {
@@ -2150,11 +2281,12 @@ impl ReliableModelProvider {
                             // Consume one-shot recovery grants so each fires at
                             // most once. Clearing the resume marker merges the
                             // single-candidate and connect-failed grants into
-                            // the semantic-empty attempt when more than one
-                            // applies, and keeps the connect-failed grant
-                            // from firing twice in one call. The next
-                            // candidate keeps its own ordinary budget.
+                            // an explicit one-attempt recovery when more than
+                            // one applies, and keeps connect-failed from firing
+                            // twice in one call. The next candidate keeps its
+                            // own ordinary budget.
                             accounting.stream_recovery_semantic_empty_permission = false;
+                            accounting.stream_recovery_image_replacement_permission = false;
                             if !has_other_candidate || connect_failed {
                                 accounting.stream_resume_after = None;
                             }
@@ -2176,17 +2308,15 @@ impl ReliableModelProvider {
         exact_failed_entry: bool,
         connect_failed: bool,
         semantic_empty_permission: bool,
+        image_replacement_permission: bool,
         has_other_candidate: bool,
     ) -> RetryDecision {
         if !exact_failed_entry {
             return RetryDecision::Admit(max_retries);
         }
-        // Semantic-empty wins when more than one exception applies (a
-        // semantic-empty failure came from a completed response, so it can
-        // never be a connect failure; it stays first so the order reads
-        // right). See `effective_retry_limit` for the merged single-attempt
-        // consumption.
-        if max_retries > 0 && semantic_empty_permission {
+        // Explicit one-attempt recovery wins when exceptions overlap. See
+        // `effective_retry_limit` for the merged one-shot consumption.
+        if image_replacement_permission || (max_retries > 0 && semantic_empty_permission) {
             return RetryDecision::Admit(0);
         }
         // Connect failure on the stream send: the exception matches the
@@ -2342,6 +2472,25 @@ impl ModelProvider for ReliableModelProvider {
             .is_some_and(|entry| entry.provider().has_stable_request_identity(model))
     }
 
+    fn supports_exact_request_replay(&self, request: ChatRequest<'_>, model: &str) -> bool {
+        if self.max_retries != 0
+            || !self.api_keys.is_empty()
+            || self.model_providers.len() != 1
+            || self
+                .model_fallbacks
+                .get(model)
+                .is_some_and(|fallbacks| !fallbacks.is_empty())
+        {
+            return false;
+        }
+
+        self.model_providers.first().is_some_and(|entry| {
+            entry
+                .provider()
+                .supports_exact_request_replay(request, entry.served_model(model))
+        })
+    }
+
     async fn warmup(&self) -> anyhow::Result<()> {
         for entry in &self.model_providers {
             let provider_name = entry.display_name.as_str();
@@ -2391,6 +2540,10 @@ impl ModelProvider for ReliableModelProvider {
         // retryable error, sleep with exponential backoff and retry.
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
+                if !Self::provider_allowed_for_turn(entry) {
+                    Self::log_provider_policy_skip(entry);
+                    continue;
+                }
                 if terminal_provider_keys.contains(&entry.cooldown_key) {
                     continue;
                 }
@@ -2653,7 +2806,7 @@ impl ModelProvider for ReliableModelProvider {
             }
         }
 
-        Err(reliable_terminal_error_with_cause(
+        Err(provider_exhausted(reliable_terminal_error_with_cause(
             final_cause_provider
                 .as_deref()
                 .or_else(|| self.configured_provider_identity()),
@@ -2661,7 +2814,7 @@ impl ModelProvider for ReliableModelProvider {
             rejected_attempt_usage,
             final_cause_is_semantic_empty,
             final_cause,
-        ))
+        )))
     }
 
     async fn chat_with_history(
@@ -2684,6 +2837,10 @@ impl ModelProvider for ReliableModelProvider {
 
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
+                if !Self::provider_allowed_for_turn(entry) {
+                    Self::log_provider_policy_skip(entry);
+                    continue;
+                }
                 if terminal_provider_keys.contains(&entry.cooldown_key) {
                     continue;
                 }
@@ -2959,7 +3116,7 @@ impl ModelProvider for ReliableModelProvider {
             }
         }
 
-        Err(reliable_terminal_error_with_cause(
+        Err(provider_exhausted(reliable_terminal_error_with_cause(
             final_cause_provider
                 .as_deref()
                 .or_else(|| self.configured_provider_identity()),
@@ -2967,28 +3124,42 @@ impl ModelProvider for ReliableModelProvider {
             rejected_attempt_usage,
             final_cause_is_semantic_empty,
             final_cause,
-        ))
+        )))
+    }
+
+    fn supports_single_tool_rounds(&self, model: &str) -> bool {
+        !self.model_providers.is_empty()
+            && self.model_chain(model).iter().all(|model| {
+                self.model_providers.iter().all(|entry| {
+                    entry
+                        .provider()
+                        .supports_single_tool_rounds(entry.served_model(model))
+                })
+            })
     }
 
     fn capabilities(&self) -> crate::traits::ProviderCapabilities {
         let mut capabilities = self
             .model_providers
-            .first()
+            .iter()
+            .find(|entry| Self::provider_allowed_for_turn(entry))
             .map(|entry| entry.provider().capabilities())
             .unwrap_or_default();
         // A request may advance past the primary after a retryable failure.
         // Report vision only when every reachable provider can accept images;
         // otherwise the turn engine must select a dedicated vision route before
         // dispatch instead of admitting an image that a fallback could reject.
-        capabilities.vision = !self.model_providers.is_empty()
+        capabilities.vision = self.eligible_provider_count() > 0
             && self
                 .model_providers
                 .iter()
+                .filter(|entry| Self::provider_allowed_for_turn(entry))
                 .all(|entry| entry.provider().supports_vision());
-        capabilities.native_tool_calling = !self.model_providers.is_empty()
+        capabilities.native_tool_calling = self.eligible_provider_count() > 0
             && self
                 .model_providers
                 .iter()
+                .filter(|entry| Self::provider_allowed_for_turn(entry))
                 .all(|entry| entry.provider().supports_native_tools());
         capabilities
     }
@@ -2996,21 +3167,27 @@ impl ModelProvider for ReliableModelProvider {
     fn capabilities_for_model(&self, model: &str) -> crate::traits::ProviderCapabilities {
         let mut capabilities = self
             .model_providers
-            .first()
+            .iter()
+            .find(|entry| Self::provider_allowed_for_turn(entry))
             .map(|entry| entry.provider().capabilities_for_model(model))
             .unwrap_or_default();
-        capabilities.vision = !self.model_providers.is_empty()
+        capabilities.vision = self.eligible_provider_count() > 0
             && self
                 .model_providers
                 .iter()
+                .filter(|entry| Self::provider_allowed_for_turn(entry))
                 .all(|entry| entry.provider().capabilities_for_model(model).vision);
-        capabilities.native_tool_calling = !self.model_providers.is_empty()
-            && self.model_providers.iter().all(|entry| {
-                entry
-                    .provider()
-                    .capabilities_for_model(model)
-                    .native_tool_calling
-            });
+        capabilities.native_tool_calling = self.eligible_provider_count() > 0
+            && self
+                .model_providers
+                .iter()
+                .filter(|entry| Self::provider_allowed_for_turn(entry))
+                .all(|entry| {
+                    entry
+                        .provider()
+                        .capabilities_for_model(model)
+                        .native_tool_calling
+                });
         capabilities
     }
 
@@ -3023,6 +3200,7 @@ impl ModelProvider for ReliableModelProvider {
         // the primary's own limitation as a fallback's.
         self.model_providers
             .iter()
+            .filter(|entry| Self::provider_allowed_for_turn(entry))
             .enumerate()
             .find(|(_, entry)| !entry.provider().capabilities_for_model(model).vision)
             .and_then(|(index, entry)| (index != 0).then(|| entry.candidate_name().to_string()))
@@ -3032,7 +3210,11 @@ impl ModelProvider for ReliableModelProvider {
         let mut has_native = false;
         let mut has_text_only = false;
 
-        for entry in &self.model_providers {
+        for entry in self
+            .model_providers
+            .iter()
+            .filter(|entry| Self::provider_allowed_for_turn(entry))
+        {
             let provider = entry.provider();
             if provider.has_mixed_native_tool_support_for_model(model) {
                 return true;
@@ -3054,10 +3236,11 @@ impl ModelProvider for ReliableModelProvider {
         // The turn loop selects one tool protocol before Reliable chooses a
         // candidate. A native request is therefore safe only when every
         // candidate the request may reach accepts native tool specifications.
-        !self.model_providers.is_empty()
+        self.eligible_provider_count() > 0
             && self
                 .model_providers
                 .iter()
+                .filter(|entry| Self::provider_allowed_for_turn(entry))
                 .all(|entry| entry.provider().supports_native_tools())
     }
 
@@ -3084,10 +3267,14 @@ impl ModelProvider for ReliableModelProvider {
         let mut final_cause = None;
         let mut final_cause_provider = None;
 
-        let has_other_candidate = models.len().saturating_mul(self.model_providers.len()) > 1;
+        let has_other_candidate = models.len().saturating_mul(self.eligible_provider_count()) > 1;
 
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
+                if !Self::provider_allowed_for_turn(entry) {
+                    Self::log_provider_policy_skip(entry);
+                    continue;
+                }
                 let Some(retry_limit) =
                     self.effective_retry_limit(model_slot, entry_index, has_other_candidate)
                 else {
@@ -3378,7 +3565,7 @@ impl ModelProvider for ReliableModelProvider {
             }
         }
 
-        Err(reliable_terminal_error_with_cause(
+        Err(provider_exhausted(reliable_terminal_error_with_cause(
             final_cause_provider
                 .as_deref()
                 .or_else(|| self.configured_provider_identity()),
@@ -3386,7 +3573,7 @@ impl ModelProvider for ReliableModelProvider {
             rejected_attempt_usage,
             final_cause_is_semantic_empty,
             final_cause,
-        ))
+        )))
     }
 
     async fn chat(
@@ -3394,6 +3581,22 @@ impl ModelProvider for ReliableModelProvider {
         request: ChatRequest<'_>,
         model: &str,
         temperature: Option<f64>,
+    ) -> anyhow::Result<ChatResponse> {
+        self.chat_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+        .await
+    }
+
+    async fn chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
     ) -> anyhow::Result<ChatResponse> {
         mark_current_dispatch_composite();
         let models = self.model_chain(model);
@@ -3416,10 +3619,14 @@ impl ModelProvider for ReliableModelProvider {
             .as_ref()
             .and_then(|refusal| refusal.attempted_candidate.clone());
 
-        let has_other_candidate = models.len().saturating_mul(self.model_providers.len()) > 1;
+        let has_other_candidate = models.len().saturating_mul(self.eligible_provider_count()) > 1;
 
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
+                if !Self::provider_allowed_for_turn(entry) {
+                    Self::log_provider_policy_skip(entry);
+                    continue;
+                }
                 let skip_streamed_refusal = streamed_refusal.as_ref().is_some_and(|refusal| {
                     refusal.requested_model == *current_model
                         && model_slot == 0
@@ -3471,10 +3678,11 @@ impl ModelProvider for ReliableModelProvider {
                     match with_exact_dispatch_route(
                         entry.cooldown_key.clone(),
                         entry.served_model(current_model).to_string(),
-                        ProviderDispatch::from_ref(entry.provider()).chat(
+                        ProviderDispatch::from_ref(entry.provider()).chat_with_tool_round_policy(
                             req,
                             current_model,
                             temperature,
+                            policy,
                         ),
                     )
                     .await
@@ -3738,7 +3946,7 @@ impl ModelProvider for ReliableModelProvider {
             }
         }
 
-        Err(reliable_terminal_error_with_cause(
+        Err(provider_exhausted(reliable_terminal_error_with_cause(
             final_cause_provider
                 .as_deref()
                 .or_else(|| self.configured_provider_identity()),
@@ -3746,27 +3954,23 @@ impl ModelProvider for ReliableModelProvider {
             rejected_attempt_usage,
             final_cause_is_semantic_empty,
             final_cause,
-        ))
+        )))
     }
 
     fn supports_streaming(&self) -> bool {
-        // Aggregation stays any(): a streaming-capable fallback may serve a
-        // turn whose selected primary disclaims streaming, surfacing the
-        // standard fallback notice (runtime contract, verified by
-        // streamed_turn_surfaces_streaming_provider_fallback_notice). The
-        // audit's stream-into-disclaiming-route hazard is closed at the
-        // dispatch layer instead: RouterModelProvider never streams a
-        // resolved route that disclaims streaming, and the passthrough
-        // leaf's streaming builders never attach thinking params to the
-        // streamed wire (unverified SSE frames, no signed capture there).
+        // A streaming-capable fallback may serve a turn whose selected
+        // primary disclaims streaming, but effort routing narrows that set.
+        // Capability discovery and dispatch must inspect the same candidates.
         self.model_providers
             .iter()
+            .filter(|entry| Self::provider_allowed_for_turn(entry))
             .any(|entry| entry.provider().supports_streaming())
     }
 
     fn supports_streaming_tool_events(&self) -> bool {
         self.model_providers
             .iter()
+            .filter(|entry| Self::provider_allowed_for_turn(entry))
             .any(|entry| entry.provider().supports_streaming_tool_events())
     }
 
@@ -3777,11 +3981,32 @@ impl ModelProvider for ReliableModelProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        self.stream_chat_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            options,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+    }
+
+    fn stream_chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         mark_current_dispatch_composite();
         commit_safeguard_fallback(None);
         let needs_tool_events = request.tools.is_some_and(|tools| !tools.is_empty());
 
         for (entry_index, entry) in self.model_providers.iter().enumerate() {
+            if !Self::provider_allowed_for_turn(entry) {
+                Self::log_provider_policy_skip(entry);
+                continue;
+            }
             let provider_name = entry.display_name.as_str();
             let model_provider = entry.provider();
             if !model_provider.supports_streaming() || !options.enabled {
@@ -3828,11 +4053,12 @@ impl ModelProvider for ReliableModelProvider {
             let stream = stream_with_exact_dispatch_route(
                 entry.cooldown_key.clone(),
                 served_model.clone(),
-                ProviderDispatch::from_ref(model_provider).stream_chat(
+                ProviderDispatch::from_ref(model_provider).stream_chat_with_tool_round_policy(
                     req,
                     &served_model,
                     temperature,
                     options,
+                    policy,
                 ),
             );
             let stream = stream
@@ -3887,6 +4113,10 @@ impl ModelProvider for ReliableModelProvider {
         // Try each model_provider/model combination for streaming
         // For streaming, we use the first model_provider that supports it and has streaming enabled
         for (provider_index, entry) in self.model_providers.iter().enumerate() {
+            if !Self::provider_allowed_for_turn(entry) {
+                Self::log_provider_policy_skip(entry);
+                continue;
+            }
             let provider_name = entry.display_name.as_str();
             let model_provider = entry.provider();
             if !model_provider.supports_streaming() || !options.enabled {
@@ -3973,6 +4203,10 @@ impl ModelProvider for ReliableModelProvider {
         // Mirrors stream_chat_with_system but delegates to the underlying
         // model_provider's stream_chat_with_history, preserving the full conversation.
         for (provider_index, entry) in self.model_providers.iter().enumerate() {
+            if !Self::provider_allowed_for_turn(entry) {
+                Self::log_provider_policy_skip(entry);
+                continue;
+            }
             let provider_name = entry.display_name.as_str();
             let model_provider = entry.provider();
             if !model_provider.supports_streaming() || !options.enabled {
@@ -4070,6 +4304,156 @@ mod tests {
     use futures_util::StreamExt;
     use std::sync::Arc;
     use zeroclaw_api::tool::ToolSpec;
+
+    struct PolicyProbeProvider {
+        fail: bool,
+        stream_calls: Arc<AtomicUsize>,
+        chat_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for PolicyProbeProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.chat_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                anyhow::bail!("provider unavailable");
+            }
+            Ok("cloud response".into())
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                stream::once(async { Err(StreamError::ModelProvider("stream unavailable".into())) })
+                    .boxed()
+            } else {
+                stream::iter(vec![Ok(StreamChunk::final_chunk())]).boxed()
+            }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for PolicyProbeProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "PolicyProbeProvider"
+        }
+    }
+
+    fn effort_policy_probe_provider() -> (
+        ReliableModelProvider,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+    ) {
+        let local_stream = Arc::new(AtomicUsize::new(0));
+        let local_chat = Arc::new(AtomicUsize::new(0));
+        let cloud_stream = Arc::new(AtomicUsize::new(0));
+        let cloud_chat = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "effort",
+            vec![
+                (
+                    "ollama.local".into(),
+                    Box::new(PolicyProbeProvider {
+                        fail: true,
+                        stream_calls: Arc::clone(&local_stream),
+                        chat_calls: Arc::clone(&local_chat),
+                    }),
+                ),
+                (
+                    "openai.backup".into(),
+                    Box::new(PolicyProbeProvider {
+                        fail: false,
+                        stream_calls: Arc::clone(&cloud_stream),
+                        chat_calls: Arc::clone(&cloud_chat),
+                    }),
+                ),
+            ],
+            0,
+            1,
+        );
+        (provider, local_stream, local_chat, cloud_stream, cloud_chat)
+    }
+
+    #[tokio::test]
+    async fn effort_policy_blocks_cloud_fallback_and_stream_recovery() {
+        let (provider, local_stream, local_chat, cloud_stream, cloud_chat) =
+            effort_policy_probe_provider();
+        let allowed = Arc::new(HashSet::from(["ollama.local".to_string()]));
+        let messages = vec![ChatMessage::user("private prompt")];
+
+        scope_provider_attempt_allowlist(Some(allowed), async {
+            let mut stream = provider.stream_chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "local-model",
+                None,
+                StreamOptions::new(true),
+            );
+            assert!(stream.next().await.unwrap().is_err());
+            assert!(
+                provider
+                    .chat(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        "local-model",
+                        None,
+                    )
+                    .await
+                    .is_err()
+            );
+        })
+        .await;
+
+        assert_eq!(local_stream.load(Ordering::SeqCst), 1);
+        assert_eq!(local_chat.load(Ordering::SeqCst), 1);
+        assert_eq!(cloud_stream.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            cloud_chat.load(Ordering::SeqCst),
+            0,
+            "a local decision must not disclose the prompt through fallback"
+        );
+
+        assert_eq!(
+            provider
+                .chat_with_system(None, "ordinary prompt", "local-model", None)
+                .await
+                .expect("unrestricted reliability still reaches fallback"),
+            "cloud response"
+        );
+        assert_eq!(cloud_chat.load(Ordering::SeqCst), 1);
+    }
 
     fn drain_captured_events(
         rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>,
@@ -7184,6 +7568,63 @@ mod tests {
         assert!(!msg.contains("p1 error"));
         assert!(!msg.contains("p2 error"));
         assert!(msg.contains("retryable"));
+        assert_eq!(
+            turn_stop(&err).expect("exhaustion must be typed").code,
+            TurnStopCode::ProviderUnavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn exhaustion_after_an_auth_failure_is_typed_as_auth() {
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "p1".into(),
+                Box::new(MockModelProvider {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    fail_until_attempt: usize::MAX,
+                    response: "never",
+                    error: "401 Unauthorized: invalid api key",
+                }),
+            )],
+            0,
+            1,
+        );
+
+        let err = model_provider
+            .simple_chat("hello", "test", Some(0.0))
+            .await
+            .expect_err("the only model_provider fails");
+        let stop = turn_stop(&err).expect("exhaustion must be typed");
+        assert_eq!(stop.code, TurnStopCode::ProviderAuth);
+        assert!(is_auth_error(&err), "typed auth must reach is_auth_error");
+        // Tagging is invisible: the aggregate still says what it always said,
+        // and still redacts the raw provider body.
+        assert!(
+            err.to_string()
+                .contains("All model providers/models failed"),
+            "got: {err}"
+        );
+        assert!(!err.to_string().contains("invalid api key"), "got: {err}");
+    }
+
+    #[test]
+    fn a_typed_context_overflow_classifies_without_its_message() {
+        let err = zeroclaw_api::turn_stop::tag(
+            anyhow::Error::msg("upstream said something unhelpful"),
+            TurnStop::fatal(TurnStopCode::ContextOverflow, "context overflow"),
+        );
+        assert!(is_context_window_exceeded(&err));
+        assert!(!is_non_retryable(&err), "overflow stays retryable");
+    }
+
+    #[test]
+    fn an_untyped_string_error_still_classifies_through_the_fallback() {
+        let err = anyhow::Error::msg("prompt is too long for this model");
+        assert!(turn_stop(&err).is_none(), "external errors stay untyped");
+        assert!(is_context_window_exceeded(&err));
+        assert!(!is_non_retryable(&err));
+        assert!(is_auth_error(&anyhow::Error::msg("401 Unauthorized")));
     }
 
     #[tokio::test]
@@ -9692,6 +10133,20 @@ mod tests {
     }
 
     #[test]
+    fn is_context_window_exceeded_detects_snake_case_error_code() {
+        // The reply arrives nested under the fallback wrapper, so the detector
+        // must look through the cause chain; a spaced-prose-only list misses it
+        // and the turn fails instead of trimming the oldest turns and retrying.
+        let err = anyhow::Error::msg(
+            "Custom API error (400 Bad Request): {\"error\":{\"message\":\"context_length_exceeded: prompt is 32866 tokens, over the configured 32768-token prompt-plus-reply window.\",\"code\":\"context_length_exceeded\"}}",
+        )
+        .context("All model providers/models failed after 1 failure event(s)");
+
+        assert!(!err.to_string().contains("context_length_exceeded"));
+        assert!(is_context_window_exceeded(&err));
+    }
+
+    #[test]
     fn is_context_window_exceeded_detects_nested_provider_cause() {
         let err = anyhow::Error::msg("maximum context length exceeded")
             .context("provider request failed after retry recovery");
@@ -11859,21 +12314,21 @@ mod tests {
     fn single_candidate_recovery_decision_boundaries() {
         // Non-failed entries always admit the configured budget.
         assert_eq!(
-            ReliableModelProvider::stream_recovery_decision(0, false, false, false, true),
+            ReliableModelProvider::stream_recovery_decision(0, false, false, false, false, true),
             RetryDecision::Admit(0)
         );
         assert_eq!(
-            ReliableModelProvider::stream_recovery_decision(2, false, false, false, false),
+            ReliableModelProvider::stream_recovery_decision(2, false, false, false, false, false),
             RetryDecision::Admit(2)
         );
         // Semantic-empty wins with budget; without budget it stays skipped
         // when another candidate exists.
         assert_eq!(
-            ReliableModelProvider::stream_recovery_decision(2, true, false, true, true),
+            ReliableModelProvider::stream_recovery_decision(2, true, false, true, false, true),
             RetryDecision::Admit(0)
         );
         assert_eq!(
-            ReliableModelProvider::stream_recovery_decision(0, true, false, true, true),
+            ReliableModelProvider::stream_recovery_decision(0, true, false, true, false, true),
             RetryDecision::Skip
         );
         // Single-candidate stream failure: recovery is not replay, so the
@@ -11881,24 +12336,24 @@ mod tests {
         // when that budget is zero). Merges with semantic-empty into the
         // same single attempt when both grants apply at a zero budget.
         assert_eq!(
-            ReliableModelProvider::stream_recovery_decision(0, true, false, false, false),
+            ReliableModelProvider::stream_recovery_decision(0, true, false, false, false, false),
             RetryDecision::Admit(0)
         );
         assert_eq!(
-            ReliableModelProvider::stream_recovery_decision(0, true, false, true, false),
+            ReliableModelProvider::stream_recovery_decision(0, true, false, false, true, false),
             RetryDecision::Admit(0)
         );
         assert_eq!(
-            ReliableModelProvider::stream_recovery_decision(2, true, false, false, false),
+            ReliableModelProvider::stream_recovery_decision(2, true, false, false, false, false),
             RetryDecision::Admit(2)
         );
         assert_eq!(
-            ReliableModelProvider::stream_recovery_decision(2, true, false, true, false),
+            ReliableModelProvider::stream_recovery_decision(2, true, false, false, true, false),
             RetryDecision::Admit(0)
         );
         // Multi-candidate without permission: skip the failed entry.
         assert_eq!(
-            ReliableModelProvider::stream_recovery_decision(0, true, false, false, true),
+            ReliableModelProvider::stream_recovery_decision(0, true, false, false, false, true),
             RetryDecision::Skip
         );
     }
@@ -11909,28 +12364,31 @@ mod tests {
         // candidate exists, exactly as the single-candidate case does (a
         // zero budget still means exactly one attempt).
         assert_eq!(
-            ReliableModelProvider::stream_recovery_decision(0, true, true, false, true),
+            ReliableModelProvider::stream_recovery_decision(0, true, true, false, false, true),
             RetryDecision::Admit(0)
         );
         assert_eq!(
-            ReliableModelProvider::stream_recovery_decision(2, true, true, false, true),
+            ReliableModelProvider::stream_recovery_decision(2, true, true, false, false, true),
             RetryDecision::Admit(2)
         );
         assert_eq!(
-            ReliableModelProvider::stream_recovery_decision(2, true, true, false, false),
+            ReliableModelProvider::stream_recovery_decision(2, true, true, false, false, false),
             RetryDecision::Admit(2)
         );
         // A failure that reached the upstream keeps the multi-candidate
         // skip when no other exception applies.
         assert_eq!(
-            ReliableModelProvider::stream_recovery_decision(2, true, false, false, true),
+            ReliableModelProvider::stream_recovery_decision(2, true, false, false, false, true),
             RetryDecision::Skip
         );
-        // Semantic-empty still wins over the connect-failed grant and
-        // keeps its single attempt (a semantic-empty failure came from a
-        // completed response, so it can never be a connect failure).
+        // Explicit one-attempt grants win over connect-failed and retain
+        // their single attempt.
         assert_eq!(
-            ReliableModelProvider::stream_recovery_decision(2, true, true, true, true),
+            ReliableModelProvider::stream_recovery_decision(2, true, true, true, false, true),
+            RetryDecision::Admit(0)
+        );
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(2, true, true, false, true, true),
             RetryDecision::Admit(0)
         );
     }
@@ -12544,6 +13002,47 @@ mod tests {
             assert_eq!(provider.effective_retry_limit(9, 10, true), None);
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn image_stream_recovery_permissions_merge_into_one_exact_attempt() {
+        for max_retries in [0, 2] {
+            for has_other_candidate in [false, true] {
+                let provider = ReliableModelProvider::new("test", Vec::new(), max_retries, 1);
+                scope_reliable_call_accounting(async {
+                    activate_stream_recovery_after_first_poll(3, 4);
+                    mark_stream_recovery_semantic_empty();
+                    permit_exact_image_recovery();
+
+                    // Other entries keep their normal budget and cannot consume
+                    // the recovery permissions belonging to the failed entry.
+                    assert_eq!(
+                        provider.effective_retry_limit(3, 3, true),
+                        Some(max_retries)
+                    );
+                    assert_eq!(
+                        provider.effective_retry_limit(2, 4, true),
+                        Some(max_retries)
+                    );
+                    assert_eq!(
+                        provider.effective_retry_limit(3, 4, has_other_candidate),
+                        Some(0)
+                    );
+                    assert_eq!(
+                        provider.effective_retry_limit(3, 4, has_other_candidate),
+                        if has_other_candidate {
+                            None
+                        } else {
+                            Some(max_retries)
+                        }
+                    );
+                    // Re-arming an identity must not resurrect either grant.
+                    activate_stream_recovery_after_first_poll(3, 4);
+                    assert_eq!(provider.effective_retry_limit(3, 4, true), None);
+                })
+                .await;
+            }
+        }
     }
 
     #[tokio::test]
@@ -13482,6 +13981,97 @@ mod tests {
             0,
         );
         assert!(provider.supports_vision());
+    }
+
+    #[tokio::test]
+    async fn capabilities_ignore_candidates_excluded_by_turn_policy() {
+        struct CapabilityMock {
+            vision: bool,
+            native_tools: bool,
+            streaming: bool,
+            streaming_tool_events: bool,
+        }
+
+        #[async_trait]
+        impl ModelProvider for CapabilityMock {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+
+            fn supports_vision(&self) -> bool {
+                self.vision
+            }
+
+            fn supports_native_tools(&self) -> bool {
+                self.native_tools
+            }
+
+            fn supports_streaming(&self) -> bool {
+                self.streaming
+            }
+
+            fn supports_streaming_tool_events(&self) -> bool {
+                self.streaming_tool_events
+            }
+        }
+
+        impl ::zeroclaw_api::attribution::Attributable for CapabilityMock {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+
+            fn alias(&self) -> &str {
+                "CapabilityMock"
+            }
+        }
+
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "custom.local".into(),
+                    Box::new(CapabilityMock {
+                        vision: true,
+                        native_tools: true,
+                        streaming: false,
+                        streaming_tool_events: false,
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "custom.cloud".into(),
+                    Box::new(CapabilityMock {
+                        vision: false,
+                        native_tools: false,
+                        streaming: true,
+                        streaming_tool_events: true,
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            0,
+        );
+
+        let allowed = Arc::new(HashSet::from(["custom.local".to_string()]));
+        scope_provider_attempt_allowlist(Some(allowed), async {
+            assert!(provider.supports_vision());
+            assert!(provider.supports_native_tools());
+            assert!(!provider.supports_streaming());
+            assert!(!provider.supports_streaming_tool_events());
+            assert!(provider.capabilities_for_model("model").vision);
+            assert!(provider.capabilities_for_model("model").native_tool_calling);
+            assert_eq!(provider.vision_limited_by("model"), None);
+        })
+        .await;
     }
 
     // `vision_limited_by` names the entry an error site should blame for a

@@ -85,7 +85,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, default_agent: Option
     let server = if let Some(store) = store {
         Arc::new(
             AcpServer::new_with_live_config_and_writer_and_store(
-                Arc::clone(&state.config),
+                state.config.clone(),
                 state.agent_lifecycle.clone(),
                 acp_config,
                 output_tx,
@@ -98,7 +98,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, default_agent: Option
     } else {
         Arc::new(
             AcpServer::new_with_live_config_and_writer(
-                Arc::clone(&state.config),
+                state.config.clone(),
                 state.agent_lifecycle.clone(),
                 acp_config,
                 output_tx,

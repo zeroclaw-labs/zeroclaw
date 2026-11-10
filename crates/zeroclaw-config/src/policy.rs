@@ -1,6 +1,6 @@
 use anyhow::Context as _;
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use zeroclaw_api::runtime_traits::ShellDialect;
@@ -885,6 +885,29 @@ fn resolve_symlinked_path(path: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Whether `path` is the host's discard-only null device.
+///
+/// This helper short-circuits filesystem authorization (`is_path_allowed`,
+/// `is_resolved_path_*`, `resolve_policy_target`), so it recognizes only the
+/// spelling that names the null device on the host evaluating policy:
+///
+/// - Unix: `/dev/null` is always allowed, before filesystem resolution and
+///   regardless of workspace or `forbidden_paths` config (including a
+///   forbidden `/dev`). The exception does not depend on the device node
+///   resolving where policy is evaluated.
+/// - Windows: `nul` / `\\.\nul`, case-insensitive. Here `/dev/null` is an
+///   ordinary file at `\dev\null` on the current drive, so it gets normal
+///   forbidden-path checks.
+///
+/// Each host's foreign spelling is an ordinary filename on that host and may be
+/// a regular file or a symlink to a forbidden target, so it must go through
+/// normal resolution and policy checks. Whether a *shell* treats a redirect
+/// target as discard-only is a separate, dialect-aware decision
+/// (`is_safe_device_redirect_target`): a POSIX `2>/dev/null` redirect is still
+/// accepted on a Windows host, and a `cmd.exe` `2>nul` redirect on a Unix host.
+///
+/// Matching is exact. `nul.txt`, `/dev/null/extra`, and `/dev/zero` are not the
+/// null device.
 fn is_null_device(path: &Path) -> bool {
     #[cfg(not(target_os = "windows"))]
     {
@@ -1020,31 +1043,673 @@ enum QuoteState {
     Double,
 }
 
+/// A heredoc queued on a command line, waiting for its body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HeredocDelimiter {
+    /// The terminator line, or `None` when it cannot be proven.
+    terminator: Option<String>,
+    /// `<<-`: leading tabs are removed from the start of each logical line
+    /// before it is compared.
+    strip_tabs: bool,
+    /// The delimiter word was unquoted, so the body is expanded: a line
+    /// ending in an odd number of backslashes continues onto the next one.
+    joins_lines: bool,
+}
+
+/// Whether a heredoc body line ends in a backslash that continues it onto the
+/// next line: an odd number of trailing backslashes (`\\` is an escaped one).
+fn ends_with_line_continuation(line: &str) -> bool {
+    line.bytes().rev().take_while(|&byte| byte == b'\\').count() % 2 == 1
+}
+
+/// What closes an open [`SegmentFrame`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentFrameKind {
+    /// `$(`, `<(`, `>(`, or a grouping `(`; closed by an unquoted `)`.
+    Paren,
+    /// Old-style command substitution; closed by the next unescaped backtick.
+    Backtick,
+}
+
+/// A POSIX substitution or subshell that is open while splitting segments.
+struct SegmentFrame {
+    kind: SegmentFrameKind,
+    /// The enclosing segment to resume when this frame closes, with a
+    /// placeholder (`$()`, `<()`, `>()`, or ``` `` ```) standing in for the
+    /// inner command. `None` for a grouping subshell, which is itself a segment
+    /// boundary.
+    resume: Option<String>,
+    /// Quote state of the enclosing word: command substitution also opens
+    /// inside double quotes.
+    resume_quote: QuoteState,
+    /// Inside `$((...))`, where `<<` is a shift rather than a heredoc.
+    arithmetic: bool,
+    /// Syntax state of the commands inside this frame.
+    nest: SegmentNest,
+    /// The enclosing heredoc queue, set aside while a substitution is open.
+    /// Bash and dash parse `$(...)` and backticks (and Bash `<(...)`) with
+    /// their own heredoc list: a newline inside starts only heredocs opened
+    /// inside, and the enclosing ones start at the first newline after the
+    /// substitution closes. A newline inside `$((...))` starts none either. A shared queue started the outer heredoc at the inner newline,
+    /// swallowed the inner terminator, and then skipped the commands after the
+    /// real outer terminator as the inner body. `None` for a grouping
+    /// subshell, which shares the enclosing queue just as both shells do.
+    outer_heredocs: Option<VecDeque<HeredocDelimiter>>,
+    /// For a `$((` frame: text of the expression, held back until the frame
+    /// closes. It runs no command only if the expression is confirmed.
+    arithmetic_text: Vec<String>,
+    /// For a `$((` frame: whether its first inner group has closed yet.
+    first_group_closed: bool,
+    /// For a `$((` frame: the second `(` closed with `)` right after it.
+    /// Bash then reads arithmetic, and dash reads `$((` as arithmetic always,
+    /// so neither runs the text as commands.
+    arithmetic_confirmed: bool,
+    /// A grouping `(` followed at once by `(`. Bash reads `((...))` as an
+    /// arithmetic command and dash as nested subshells, so a `<<` inside is a
+    /// shift to one and a heredoc to the other.
+    double_paren: bool,
+}
+
+/// Per-frame syntax that changes what a `)` means. Bash parses a whole
+/// substitution before running it, so a `case` pattern's `)` or a `)` inside
+/// `${...}` does not close `$(...)`. Treating either as the closer would
+/// restore the enclosing quote state and hide the rest of the inner command
+/// inside one quoted argument.
+#[derive(Debug, Default, Clone, Copy)]
+struct SegmentNest {
+    /// Open `case` statements, whose pattern terminators are `)`.
+    case_depth: usize,
+    /// Open `${...}` parameter expansions, where `(` and `)` are literal.
+    param_depth: usize,
+}
+
+fn segment_nest_mut<'a>(
+    frames: &'a mut [SegmentFrame],
+    top: &'a mut SegmentNest,
+) -> &'a mut SegmentNest {
+    match frames.last_mut() {
+        Some(frame) => &mut frame.nest,
+        None => top,
+    }
+}
+
+/// Track `case`/`esac` keywords as the word in `current` ends. A keyword only
+/// counts in command position: first in the simple command, or after words
+/// that can precede a command (`then case`, `coproc case`, `time -p case`).
+/// A lone `&` ends a command without ending the segment, so the word after it
+/// is in command position too (`true & case`). `esac` also closes an empty
+/// `case x in esac`. Missing a `case` lets its pattern `)` close the
+/// substitution early, and missing an `esac` hides the real closer. Either
+/// restores the enclosing quote over commands the shell runs.
+fn note_case_keyword(current: &str, nest: &mut SegmentNest) {
+    if !current.ends_with(|c: char| !c.is_whitespace()) {
+        return;
+    }
+    let words: Vec<&str> = current[background_command_start(current)..]
+        .split_whitespace()
+        .collect();
+    let Some((&last, before)) = words.split_last() else {
+        return;
+    };
+    let prefix = match (last, before) {
+        ("esac", [prefix @ .., "case", _, "in"]) => prefix,
+        _ => before,
+    };
+    if !is_command_prefix(prefix) {
+        return;
+    }
+    match last {
+        "case" => nest.case_depth += 1,
+        "esac" => nest.case_depth = nest.case_depth.saturating_sub(1),
+        _ => {}
+    }
+}
+
+/// Whether every word is a reserved word or prefix after which the next word
+/// is still in command position.
+fn is_command_prefix(words: &[&str]) -> bool {
+    let mut previous = None;
+    words.iter().all(|&word| {
+        let prefix = match word {
+            "!" | "{" | "coproc" | "do" | "elif" | "else" | "if" | "then" | "time" | "until"
+            | "while" => true,
+            // `time -p` and `time -p --` still time a pipeline.
+            "-p" | "--" => matches!(previous, Some("time" | "-p")),
+            _ => false,
+        };
+        previous = Some(word);
+        prefix
+    })
+}
+
+/// Byte offset just past the last `&` in `current` that ends a command,
+/// rather than one in a redirection (`>&`, `<&`, `&>`) or escaped. A quoted
+/// `&` can be mistaken for one, but its closing quote then sits in a word
+/// before the keyword, and no command prefix contains a quote.
+fn background_command_start(current: &str) -> usize {
+    let bytes = current.as_bytes();
+    let mut start = 0;
+    for (index, &byte) in bytes.iter().enumerate() {
+        if byte != b'&' {
+            continue;
+        }
+        let before = index.checked_sub(1).and_then(|i| bytes.get(i));
+        let backslashes = bytes[..index]
+            .iter()
+            .rev()
+            .take_while(|&&b| b == b'\\')
+            .count();
+        if matches!(before, Some(b'>' | b'<'))
+            || bytes.get(index + 1) == Some(&b'>')
+            || backslashes % 2 == 1
+        {
+            continue;
+        }
+        start = index + 1;
+    }
+    start
+}
+
+fn push_segment(segments: &mut Vec<String>, current: &mut String) {
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        segments.push(trimmed.to_string());
+    }
+    current.clear();
+}
+
+fn open_segment_frame(
+    frames: &mut Vec<SegmentFrame>,
+    segments: &mut Vec<String>,
+    current: &mut String,
+    quote: &mut QuoteState,
+    pending_heredocs: &mut VecDeque<HeredocDelimiter>,
+    kind: SegmentFrameKind,
+    placeholder: Option<&str>,
+    arithmetic: bool,
+) {
+    let resume = match placeholder {
+        Some(placeholder) => {
+            let mut resume = std::mem::take(current);
+            resume.push_str(placeholder);
+            Some(resume)
+        }
+        None => {
+            emit_segment(frames, segments, current);
+            None
+        }
+    };
+    // Arithmetic carries into the parentheses of an arithmetic expression,
+    // but a command substitution or backtick inside it is ordinary shell
+    // syntax again (heredocs included).
+    let arithmetic = arithmetic
+        || (placeholder.is_none() && frames.last().is_some_and(|frame| frame.arithmetic));
+    frames.push(SegmentFrame {
+        kind,
+        resume,
+        resume_quote: *quote,
+        arithmetic,
+        nest: SegmentNest::default(),
+        outer_heredocs: placeholder
+            .is_some()
+            .then(|| std::mem::take(pending_heredocs)),
+        arithmetic_text: Vec::new(),
+        first_group_closed: false,
+        arithmetic_confirmed: false,
+        double_paren: false,
+    });
+    *quote = QuoteState::None;
+}
+
+/// End a segment of text. Inside a `$((` expression the text is held on that
+/// frame until the expression is confirmed (see
+/// [`SegmentFrame::arithmetic_confirmed`]); everywhere else it is a segment.
+fn emit_segment(frames: &mut [SegmentFrame], segments: &mut Vec<String>, current: &mut String) {
+    let root = if frames.last().is_some_and(|frame| frame.arithmetic) {
+        frames
+            .iter_mut()
+            .rev()
+            .find(|frame| frame.arithmetic && frame.resume.is_some())
+    } else {
+        None
+    };
+    match root {
+        Some(root) => push_segment(&mut root.arithmetic_text, current),
+        None => push_segment(segments, current),
+    }
+}
+
+/// Pop the innermost frame. A `$((` frame's held text becomes segments unless
+/// the expression was confirmed as arithmetic.
+fn pop_segment_frame(
+    frames: &mut Vec<SegmentFrame>,
+    segments: &mut Vec<String>,
+) -> Option<SegmentFrame> {
+    let mut frame = frames.pop()?;
+    if !frame.arithmetic_confirmed {
+        segments.append(&mut frame.arithmetic_text);
+    }
+    Some(frame)
+}
+
+fn close_segment_frame(
+    frames: &mut Vec<SegmentFrame>,
+    segments: &mut Vec<String>,
+    current: &mut String,
+    quote: &mut QuoteState,
+    pending_heredocs: &mut VecDeque<HeredocDelimiter>,
+) {
+    emit_segment(frames, segments, current);
+    if let Some(frame) = pop_segment_frame(frames, segments) {
+        *current = frame.resume.unwrap_or_default();
+        *quote = frame.resume_quote;
+        // Heredocs still pending here were opened inside the substitution with
+        // no newline after them before it closed, so they have no body. Dash
+        // reads them as empty and drops them. Bash carries them out to the
+        // next line, so dropping them can only scan lines Bash treats as body,
+        // never skip lines it runs.
+        if let Some(outer) = frame.outer_heredocs {
+            *pending_heredocs = outer;
+        }
+    }
+}
+
+/// Open a backtick substitution. Closing one is handled before quote and
+/// comment state, because the shell finds the closer first (see the backtick
+/// check in [`split_unquoted_segments_checked`]).
+fn open_backtick_frame(
+    frames: &mut Vec<SegmentFrame>,
+    segments: &mut Vec<String>,
+    current: &mut String,
+    quote: &mut QuoteState,
+    pending_heredocs: &mut VecDeque<HeredocDelimiter>,
+) {
+    open_segment_frame(
+        frames,
+        segments,
+        current,
+        quote,
+        pending_heredocs,
+        SegmentFrameKind::Backtick,
+        Some("``"),
+        false,
+    );
+}
+
+/// Read the delimiter word after `<<` (or `<<-`), copying its raw text into
+/// `current` and returning it with quotes and escapes removed.
+///
+/// The delimiter is one shell word: it ends at unquoted whitespace or a
+/// metacharacter, and the rest of the line (`| wc -l`, more redirects, a
+/// second `<<B`) is scanned as ordinary command text. Reading to the end of the
+/// line instead made a delimiter like `EOF | wc -l` that never matches, so every
+/// later command was skipped as heredoc body.
+///
+/// `None` means this is not a heredoc (`<<$(cmd)`). `Some(Err(()))` means it is
+/// a heredoc whose delimiter this scanner cannot prove. Callers must not skip
+/// lines in that case: a wrong terminator hides every command after the body.
+/// `Some(Ok(delimiter))` is a one-line terminator the body matcher can compare
+/// exactly. `strip_tabs` is the `<<-` operator: bash removes leading
+/// tabs from the body and from the terminator line before comparing it.
+///
+/// `in_backtick` means a backtick substitution is open. The shell cuts its
+/// text at the next unescaped backtick before parsing it, so that backtick
+/// ends the delimiter word. The backslash removal done while cutting is not
+/// modeled, so a delimiter with a backslash or backtick there is unproven.
+fn read_heredoc_delimiter(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    current: &mut String,
+    backslash_is_literal: bool,
+    in_backtick: bool,
+) -> Option<Result<HeredocDelimiter, ()>> {
+    let strip_tabs = if let Some(dash) = chars.next_if_eq(&'-') {
+        current.push(dash);
+        true
+    } else {
+        false
+    };
+    while let Some(blank) = chars.next_if(|ch| matches!(ch, ' ' | '\t')) {
+        current.push(blank);
+    }
+    let mut raw = String::new();
+    let mut quote = QuoteState::None;
+    let mut ansi_c = false;
+    while let Some(&ch) = chars.peek() {
+        // Leave the closing backtick to the caller. A quote still open here is
+        // reported below as an unfinished delimiter.
+        if in_backtick && ch == '`' {
+            break;
+        }
+        // An escape is part of the word, including when the escaped character
+        // is itself a word boundary. Checking the boundary first turned
+        // `<<E\ OF` into the delimiter `E\` (the space ended the word), which
+        // never matches the terminator `E OF` and hides every later command.
+        // Inside `$'...'` the backslash is an ANSI-C escape, not a shell
+        // escape, so it does not protect the following character from ending
+        // the quote.
+        if quote == QuoteState::None && ch == '\\' && !backslash_is_literal && !ansi_c {
+            chars.next();
+            current.push(ch);
+            raw.push(ch);
+            match chars.peek() {
+                // A backslash-newline joins the delimiter (`<<E\<newline>OF`
+                // is `EOF`). Record the newline and keep reading the word.
+                Some('\n') => {
+                    let newline = chars.next().expect("peeked newline");
+                    current.push(newline);
+                    raw.push(newline);
+                }
+                // Any other escaped character is part of the word, even when
+                // it would otherwise end it (`<<E\ OF` is `E OF`).
+                Some(_) => {
+                    let escaped = chars.next().expect("peeked escape");
+                    current.push(escaped);
+                    raw.push(escaped);
+                }
+                // A backslash at the end of the input is not a join. Leave it
+                // in the word so the body scanner does not treat the following
+                // line as part of the delimiter.
+                None => {}
+            }
+            continue;
+        }
+        if quote == QuoteState::None
+            && (ch.is_whitespace() || matches!(ch, ';' | '|' | '&' | '<' | '>' | '(' | ')'))
+        {
+            break;
+        }
+        chars.next();
+        current.push(ch);
+        raw.push(ch);
+        match (quote, ch) {
+            // Recognize `$'...'` / `$"..."` to find where the word ends, even
+            // though such a delimiter is refused afterwards. Otherwise
+            // `<<$'E\'OF'` is read as an ordinary single-quoted word whose `\'`
+            // closes it, and the rest of the command is swallowed into it.
+            (QuoteState::None, '$') if matches!(chars.peek(), Some('\'' | '"')) => {
+                let opener = chars.next().expect("peeked quote");
+                current.push(opener);
+                raw.push(opener);
+                quote = if opener == '\'' {
+                    ansi_c = true;
+                    QuoteState::Single
+                } else {
+                    QuoteState::Double
+                };
+            }
+            (QuoteState::Single, '\'') if !ansi_c => quote = QuoteState::None,
+            (QuoteState::Single, '\'') => {
+                quote = QuoteState::None;
+                ansi_c = false;
+            }
+            // An escaped `"`, `$`, `` ` ``, or `\` inside double quotes is part
+            // of the word, not its closer. Stopping at `\"` turned `<<"E\" F"`
+            // into the delimiter `E"`, which never matches `E" F`.
+            (QuoteState::Double, '\\') if !backslash_is_literal => {
+                if let Some(escaped) = chars.next_if(|next| matches!(next, '$' | '`' | '"' | '\\'))
+                {
+                    current.push(escaped);
+                    raw.push(escaped);
+                }
+            }
+            (QuoteState::Double, '"') => quote = QuoteState::None,
+            (QuoteState::None, '\'') => quote = QuoteState::Single,
+            (QuoteState::None, '"') => quote = QuoteState::Double,
+            // Inside `$'...'`, `\'` is an escaped apostrophe, not the closer.
+            (QuoteState::Single, '\\') if ansi_c => {
+                if let Some(escaped) = chars.next() {
+                    current.push(escaped);
+                    raw.push(escaped);
+                }
+            }
+            // A backslash-newline joins the delimiter word before quote removal,
+            // quoted or not. Other escapes stay in the raw word for quote
+            // removal afterwards.
+            (QuoteState::None | QuoteState::Double, '\\')
+                if !backslash_is_literal && chars.next_if_eq(&'\n').is_some() =>
+            {
+                current.push('\n');
+                raw.push('\n');
+            }
+            _ => {}
+        }
+    }
+    if chars.peek() == Some(&'(') {
+        // `<<$(cmd)` is a command substitution, not a heredoc.
+        return None;
+    }
+    if quote != QuoteState::None {
+        // The opener is a heredoc, but its quote never closed. Do not skip a
+        // body against a delimiter this scanner did not finish reading.
+        return Some(Err(()));
+    }
+    if in_backtick && raw.contains(['\\', '`']) {
+        return Some(Err(()));
+    }
+    let Some(delimiter) = remove_heredoc_delimiter_quotes(&raw) else {
+        // `$'...'`, `$"..."`, and any other form whose terminator depends on
+        // the shell. The opener is still a heredoc. Skipping its lines against a guessed
+        // terminator is the bypass, so the caller scans them instead.
+        return Some(Err(()));
+    };
+    // A newline in the delimiter is not a one-line terminator. An empty delimiter is the blank line after `<<''`, and a
+    // carriage return can end a physical line. Both are matched before the
+    // body line is trimmed.
+    if delimiter.contains('\n') {
+        return Some(Err(()));
+    }
+    // A backslash-newline is removed before the word is read, so it is not
+    // quoting. `<<E\<newline>OF` is the unquoted delimiter `EOF`, and its body
+    // still joins continued lines. Counting that backslash as quoting left the
+    // body literal: the scanner waited for a later physical `EOF` and skipped
+    // the command bash runs after the joined terminator. A quote, or a
+    // backslash that survives the removal, still leaves the body literal.
+    let without_continuations = raw.replace("\\\n", "");
+    let joins_lines = !without_continuations.contains(['\'', '"', '\\']);
+    Some(Ok(HeredocDelimiter {
+        terminator: Some(delimiter),
+        strip_tabs,
+        joins_lines,
+    }))
+}
+
+/// Apply shell quote removal to a heredoc delimiter word. `None` means the
+/// word's terminator depends on the shell or is not modeled, so no body may be
+/// skipped against it.
+///
+/// `$'...'` and `$"..."` are refused. Bash expands `$'...'` (and translates
+/// `$"..."` through the locale catalog) before matching the terminator, but
+/// dash, the usual `sh`, has neither: `<<$'EOF'` ends at a literal `$EOF`
+/// line there, and the commands after that line run while a bash reading
+/// still treats them as body. Modeling either shell hides commands from the
+/// other, and the bash expansion was also byte-oriented (`\0` truncation,
+/// `\xc3`) in ways a `String` cannot represent.
+fn remove_heredoc_delimiter_quotes(raw: &str) -> Option<String> {
+    let mut delimiter = String::new();
+    let mut chars = raw.chars().peekable();
+    let mut quote = QuoteState::None;
+    while let Some(ch) = chars.next() {
+        match (quote, ch) {
+            (QuoteState::Single, '\'') | (QuoteState::Double, '"') => quote = QuoteState::None,
+            (QuoteState::None, '\'') => quote = QuoteState::Single,
+            (QuoteState::None, '"') => quote = QuoteState::Double,
+            (QuoteState::None, '$') if matches!(chars.peek(), Some('\'' | '"')) => return None,
+            // A bare `$` or backtick in a heredoc delimiter is literal. Neither
+            // shell expands `<<$EOF`, `<<"$EOF"`, or `<<`echo EOF``. Treating
+            // every `$` as an unsupported expansion opened no heredoc, so a
+            // quote in the body swallowed the following command.
+            (QuoteState::None | QuoteState::Double, '\\') => match chars.next() {
+                Some('\n') => {}
+                Some(escaped)
+                    if quote == QuoteState::None || matches!(escaped, '$' | '`' | '"' | '\\') =>
+                {
+                    delimiter.push(escaped);
+                }
+                Some(escaped) => {
+                    delimiter.push('\\');
+                    delimiter.push(escaped);
+                }
+                None => delimiter.push('\\'),
+            },
+            _ => delimiter.push(ch),
+        }
+    }
+    Some(delimiter)
+}
+
+/// Split a command into the simple commands a shell would run, so each one
+/// can be checked on its own.
+///
+/// Segments end at unquoted `;`, newlines, `|`, `||`, and `&&`. Under the
+/// POSIX dialect, command substitution (`$(...)`, `` `...` ``), process
+/// substitution (`<(...)`, `>(...)`), and subshells (`(...)`) are boundaries
+/// too: the inner command becomes its own segment, and the enclosing word keeps
+/// a `$()`-style placeholder. Otherwise the closing `)` or backtick sticks to
+/// the last inner word (`$(ls 2>/dev/null)` yields a `/dev/null)` redirect
+/// target), and the inner command hides behind the outer one.
+///
+/// Every character other than those delimiters lands in a segment, except
+/// heredoc bodies and confirmed `$((...))` arithmetic, which both bash and
+/// dash read as data. That alone does not mean the checks see the rest. If the
+/// scanner closes a substitution where the shell does not, it restores the
+/// enclosing quote state, and commands the shell runs end up inside one quoted
+/// argument that the checks never look into. The scanner therefore follows
+/// the shell where a `)` or backtick is ambiguous (`case` patterns, `${...}`,
+/// comments, backtick closers). As a backstop, a scan that ends with a frame,
+/// quote, `case`, or `${` still open, or that meets a `)` closing nothing,
+/// also returns the flat split that ignores substitutions, the split this
+/// function made before it modeled them. That only adds segments to check,
+/// so it refuses nothing the flat split accepted. It is not a proof: input
+/// crafted to rebalance a misparse is only as safe as the specific rules.
+/// Where the shells disagree or no split can bound a heredoc body (`<<` in a
+/// bare `((`, a body running to the end inside an open substitution), the
+/// split is refused instead.
+/// Segments are returned in the order they end, so an inner command comes
+/// before the command containing it.
+fn split_unquoted_segments_checked(
+    command: &str,
+    dialect: ShellDialect,
+) -> Result<Vec<String>, UnreadableHeredoc> {
+    let (mut segments, balanced) = scan_unquoted_segments(command, dialect, true)?;
+    if !balanced {
+        let (flat, _) = scan_unquoted_segments(command, dialect, false)?;
+        segments.extend(flat);
+    }
+    Ok(segments)
+}
+
+/// A heredoc whose delimiter this scanner cannot prove. Its body is data, but
+/// the commands after the real terminator still run. Skipping them hides a
+/// forbidden path, and parsing them lets a quote in the body swallow the next
+/// command. Either guess is a bypass, so the command is refused.
+struct UnreadableHeredoc;
+
 fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> {
+    split_unquoted_segments_checked(command, dialect).unwrap_or_default()
+}
+
+/// One pass of [`split_unquoted_segments_checked`]. `model_substitutions`
+/// enables the POSIX substitution, subshell, `case`, and comment model. The
+/// returned flag is `false` when that model ended unbalanced.
+fn scan_unquoted_segments(
+    command: &str,
+    dialect: ShellDialect,
+    model_substitutions: bool,
+) -> Result<(Vec<String>, bool), UnreadableHeredoc> {
     let mut segments = Vec::new();
     let mut current = String::new();
     let mut quote = QuoteState::None;
     let mut escaped = false;
     let backslash_is_literal = shell_uses_windows_path_syntax(dialect);
     let single_quotes_are_syntax = shell_uses_single_quote_syntax(dialect);
-    // Heredoc state: Some(delim) while inside a heredoc body.
-    let mut heredoc_delimiter: Option<String> = None;
+    // `cmd.exe` has no command substitution, and its parenthesized blocks are
+    // not modeled here, so only the POSIX dialect splits at these boundaries.
+    let posix_substitution = model_substitutions && matches!(dialect, ShellDialect::Posix);
+    // A `)` that closed nothing and was not a `case` pattern terminator.
+    let mut stray_closer = false;
+    let mut frames: Vec<SegmentFrame> = Vec::new();
+    // The previous character if it was unescaped syntax outside single quotes,
+    // so `(` can tell `$(`, `<(`, and `>(` from a grouping subshell.
+    let mut last_syntax_char: Option<char> = None;
+    // `case` and `${...}` state outside every frame.
+    let mut top_nest = SegmentNest::default();
+    // Inside a `#` comment, until the next newline.
+    let mut in_comment = false;
+    // Heredoc state: Some(delim) while inside a heredoc body. `None` in the
+    // pair means the opener is a heredoc whose delimiter this scanner cannot
+    // prove. Its body runs to the end of the command, so the text stays data
+    // instead of being parsed as shell.
+    let mut heredoc_delimiter: Option<HeredocDelimiter> = None;
+    // The command-frame depth that owns an unproven heredoc body. The body
+    // ends when that frame closes, so it cannot hide the command after a
+    // substitution. `None` means the opener was at top level: its body has no
+    // frame to close it, so the following lines are scanned with quotes
+    // disabled instead of being discarded.
+    let mut heredoc_owner: Option<usize> = None;
+    // After a top-level heredoc whose delimiter cannot be proven, quotes in
+    // the remainder are not syntax. A quote in the body must not join the
+    // following command into one word.
+    let mut quotes_are_literal = false;
     // Accumulates the current line while inside a heredoc body, for terminator detection.
     let mut heredoc_line_buf = String::new();
-    // True while reading the delimiter word that follows `<<`.
-    let mut reading_heredoc_word = false;
-    let mut heredoc_word_buf = String::new();
+    // The joined text of a logical body line whose physical lines so far each
+    // ended in a line continuation (unquoted delimiters only).
+    // A logical body line in progress (unquoted delimiters only): the joined
+    // text of its physical lines so far, each of which ended in a line
+    // continuation, and whether dash is still at the start of the line
+    // (every line so far was exactly `\`). `None` at the start of a line.
+    let mut heredoc_logical_line: Option<(String, bool)> = None;
+    // Delimiters of heredocs opened on the current command line, in order.
+    // Their bodies start at the next unquoted newline.
+    // A substitution sets this queue aside and starts its own (see
+    // `SegmentFrame::outer_heredocs`).
+    let mut pending_heredocs: VecDeque<HeredocDelimiter> = VecDeque::new();
+    // Backslash state for finding a backtick's closer, which ignores quotes,
+    // comments, and heredoc bodies (see the backtick check below).
+    let mut backtick_escaped = false;
     let mut chars = command.chars().peekable();
 
-    let push_segment = |segments: &mut Vec<String>, current: &mut String| {
-        let trimmed = current.trim();
-        if !trimmed.is_empty() {
-            segments.push(trimmed.to_string());
-        }
-        current.clear();
-    };
-
     while let Some(ch) = chars.next() {
+        let opener = last_syntax_char.take();
+        // Bash and dash find the end of a backtick substitution before they
+        // parse the text inside: the next backtick not escaped by a backslash
+        // closes it, inside a comment, a heredoc body, or a `$(` opened within
+        // it. Bash does so inside quotes too, where dash rejects the whole
+        // script. Following the inner syntax instead let a comment or quote
+        // swallow the closer, so the next backtick restored the enclosing
+        // double quote over commands the shell runs.
+        if posix_substitution
+            && let Some(backtick) = frames
+                .iter()
+                .rposition(|frame| frame.kind == SegmentFrameKind::Backtick)
+        {
+            if backtick_escaped {
+                backtick_escaped = false;
+            } else if ch == '\\' && !backslash_is_literal {
+                backtick_escaped = true;
+            } else if ch == '`' {
+                while frames.len() > backtick {
+                    close_segment_frame(
+                        &mut frames,
+                        &mut segments,
+                        &mut current,
+                        &mut quote,
+                        &mut pending_heredocs,
+                    );
+                }
+                // Comments, heredoc bodies, and escapes inside the backticks
+                // end with them.
+                in_comment = false;
+                escaped = false;
+                heredoc_delimiter = None;
+                heredoc_logical_line = None;
+                heredoc_line_buf.clear();
+                if heredoc_owner.is_some_and(|owner| owner >= frames.len()) {
+                    heredoc_owner = None;
+                }
+                continue;
+            }
+        }
         match quote {
             QuoteState::Single => {
                 if ch == '\'' {
@@ -1063,89 +1728,251 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
                     current.push(ch);
                     continue;
                 }
+                if posix_substitution && ch == '(' && opener == Some('$') {
+                    let arithmetic = chars.peek() == Some(&'(');
+                    open_segment_frame(
+                        &mut frames,
+                        &mut segments,
+                        &mut current,
+                        &mut quote,
+                        &mut pending_heredocs,
+                        SegmentFrameKind::Paren,
+                        Some("()"),
+                        arithmetic,
+                    );
+                    continue;
+                }
+                // No backtick substitution is open here (the check at the top
+                // of the loop closes one), so this backtick opens one.
+                if posix_substitution && ch == '`' {
+                    open_backtick_frame(
+                        &mut frames,
+                        &mut segments,
+                        &mut current,
+                        &mut quote,
+                        &mut pending_heredocs,
+                    );
+                    continue;
+                }
                 if ch == '"' {
                     quote = QuoteState::None;
+                } else if ch == '$' {
+                    last_syntax_char = Some(ch);
                 }
                 current.push(ch);
             }
             QuoteState::None => {
+                // Heredoc bodies and comments are line-based and come first. A
+                // backslash cannot extend a comment past its newline. In the
+                // body of an unquoted delimiter it can: the terminator is
+                // compared against logical lines (see below).
+                if let Some(HeredocDelimiter {
+                    terminator: delim,
+                    strip_tabs,
+                    joins_lines,
+                }) = heredoc_delimiter.as_ref()
+                {
+                    // An unproven delimiter has no terminator this scanner can
+                    // match. Bash still treats the following text as body, so
+                    // keep it data through the end of the command. Parsing it
+                    // lets a quote in the body swallow the next command.
+                    if delim.is_none() {
+                        match heredoc_owner {
+                            // The body belongs to the command frame that was
+                            // open when it started. A `)` that closes that
+                            // frame is the end of the body, not more body text.
+                            Some(owner)
+                                if ch == ')'
+                                    && frames.len() > owner
+                                    && frames.last().is_some_and(|frame| {
+                                        frame.kind == SegmentFrameKind::Paren
+                                    }) =>
+                            {
+                                heredoc_delimiter = None;
+                                heredoc_logical_line = None;
+                                heredoc_line_buf.clear();
+                                heredoc_owner = None;
+                                close_segment_frame(
+                                    &mut frames,
+                                    &mut segments,
+                                    &mut current,
+                                    &mut quote,
+                                    &mut pending_heredocs,
+                                );
+                            }
+                            // At top level there is no frame to close the body.
+                            // Discarding the rest hides commands bash runs
+                            // after the real terminator. End the opaque line at
+                            // the next newline and scan what follows, but do
+                            // not let a quote in the body join those words.
+                            None if ch == '\n' => {
+                                heredoc_delimiter = None;
+                                heredoc_logical_line = None;
+                                heredoc_line_buf.clear();
+                                quotes_are_literal = true;
+                                push_segment(&mut segments, &mut current);
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    if ch == '\n' {
+                        // `<<-` removes leading tabs before the comparison, and
+                        // nothing else. A tab-only line is therefore the blank
+                        // terminator of `<<-''`. Trimming spaces, or ignoring
+                        // the dash, misses that terminator and hides the
+                        // following command. A carriage return stays part of
+                        // the line (`<<$'E\rF'` ends at `E<CR>F`).
+                        //
+                        // An unquoted delimiter's body is expanded, so a line
+                        // ending in an odd number of backslashes continues onto
+                        // the next one, and the shells find the terminator
+                        // differently (both checked against bash 3.2 to 5.3 and
+                        // dash 0.5.12):
+                        // - Bash joins the physical lines and compares the
+                        //   logical line. `<<-` strips leading tabs from each
+                        //   physical line while the joined text is still empty.
+                        // - Dash, at the start of a line, skips lines that are
+                        //   exactly `\`, strips tabs, and compares the rest of
+                        //   that one physical line. It joins nothing else.
+                        // Both end at `\` then `EOF`, and neither at `body \`
+                        // then `EOF`, where ending let a quote in the real body
+                        // swallow a later command. Where only one ends (`EO\`
+                        // then `F`), either guess hides the following commands
+                        // from the other shell, so the command is refused.
+                        let physical = std::mem::take(&mut heredoc_line_buf);
+                        let (prefix, dash_at_line_start) =
+                            heredoc_logical_line.take().unwrap_or((String::new(), true));
+                        let strip = |line: &'_ str| -> String {
+                            if *strip_tabs {
+                                line.trim_start_matches('\t').to_string()
+                            } else {
+                                line.to_string()
+                            }
+                        };
+                        let bash_line = if prefix.is_empty() {
+                            strip(&physical)
+                        } else {
+                            physical.clone()
+                        };
+                        if *joins_lines && ends_with_line_continuation(&bash_line) {
+                            let joined = format!("{prefix}{}", &bash_line[..bash_line.len() - 1]);
+                            heredoc_logical_line =
+                                Some((joined, dash_at_line_start && physical == "\\"));
+                            continue;
+                        }
+                        let bash_ends =
+                            delim.as_deref() == Some(format!("{prefix}{bash_line}").as_str());
+                        let dash_ends = dash_at_line_start
+                            && delim.as_deref() == Some(strip(&physical).as_str());
+                        if bash_ends != dash_ends {
+                            return Err(UnreadableHeredoc);
+                        }
+                        let ends = bash_ends;
+                        if ends {
+                            // Terminator line reached. Start the next queued
+                            // heredoc body from the same command line, if any.
+                            heredoc_delimiter = pending_heredocs.pop_front();
+                            push_segment(&mut segments, &mut current);
+                        }
+                    } else {
+                        heredoc_line_buf.push(ch);
+                    }
+                    continue;
+                }
+
+                // A comment runs to the newline. Its text stays in the segment,
+                // and separators still split (conservative), but `)`, quotes,
+                // backticks, backslashes, and `$(` inside it are not syntax, so
+                // a comment cannot close a substitution early or continue past
+                // its newline.
+                if in_comment {
+                    if ch == '\n' {
+                        in_comment = false;
+                    } else if !matches!(ch, ';' | '|' | '&') {
+                        current.push(ch);
+                        continue;
+                    }
+                }
+
                 if escaped {
                     escaped = false;
-                    if heredoc_delimiter.is_some() {
-                        heredoc_line_buf.push(ch);
-                    } else {
-                        current.push(ch);
-                    }
+                    current.push(ch);
                     continue;
                 }
                 if ch == '\\' && !backslash_is_literal {
                     escaped = true;
-                    if heredoc_delimiter.is_some() {
-                        heredoc_line_buf.push(ch);
-                    } else {
-                        current.push(ch);
-                    }
+                    current.push(ch);
                     continue;
                 }
 
-                // Reading the delimiter word that follows `<<`.
-                if reading_heredoc_word {
-                    if ch == '\n' {
-                        // Finalise the delimiter and enter the heredoc body.
-                        let raw = heredoc_word_buf.trim().trim_start_matches('-');
-                        let delim = raw
-                            .trim_matches(|c| c == '\'' || c == '"' || c == '\\')
-                            .to_string();
-                        if !delim.is_empty() {
-                            heredoc_delimiter = Some(delim);
-                        }
-                        heredoc_word_buf.clear();
-                        reading_heredoc_word = false;
-                        // The newline after `<<WORD` belongs to the same segment.
-                        current.push(ch);
-                    } else {
-                        heredoc_word_buf.push(ch);
-                        current.push(ch);
-                    }
-                    continue;
+                let in_arithmetic = frames.last().is_some_and(|frame| frame.arithmetic);
+                // Arithmetic has no commands, so `case` there is a name.
+                if posix_substitution
+                    && !in_comment
+                    && !in_arithmetic
+                    && (ch.is_whitespace() || matches!(ch, ';' | '|' | '&' | ')'))
+                {
+                    note_case_keyword(&current, segment_nest_mut(&mut frames, &mut top_nest));
                 }
-
-                if let Some(delim) = heredoc_delimiter.as_deref() {
-                    if ch == '\n' {
-                        if heredoc_line_buf.trim() == delim {
-                            // Terminator line reached — end of heredoc body.
-                            heredoc_delimiter = None;
-                            heredoc_line_buf.clear();
-                            push_segment(&mut segments, &mut current);
-                        } else {
-                            heredoc_line_buf.clear();
-                        }
-                    } else {
-                        heredoc_line_buf.push(ch);
-                    }
-                    continue;
-                }
+                let SegmentNest {
+                    case_depth,
+                    param_depth,
+                } = *segment_nest_mut(&mut frames, &mut top_nest);
 
                 match ch {
-                    '\'' if single_quotes_are_syntax => {
+                    '#' if posix_substitution
+                        && !in_comment
+                        && !in_arithmetic
+                        && param_depth == 0
+                        && (current.trim().is_empty()
+                            || opener.is_some_and(char::is_whitespace)) =>
+                    {
+                        in_comment = true;
+                        current.push(ch);
+                    }
+                    '{' if posix_substitution && opener == Some('$') => {
+                        segment_nest_mut(&mut frames, &mut top_nest).param_depth += 1;
+                        current.push(ch);
+                    }
+                    '}' if posix_substitution && param_depth > 0 => {
+                        segment_nest_mut(&mut frames, &mut top_nest).param_depth -= 1;
+                        current.push(ch);
+                    }
+                    '\'' if single_quotes_are_syntax && !quotes_are_literal => {
                         quote = QuoteState::Single;
                         current.push(ch);
                     }
-                    '"' => {
+                    '"' if !quotes_are_literal => {
                         quote = QuoteState::Double;
                         current.push(ch);
                     }
-                    ';' | '\n' => push_segment(&mut segments, &mut current),
+                    // Separators inside `$((...))` (`&&`, `||`, newlines) end
+                    // text held for the expression, not command segments.
+                    ';' => emit_segment(&mut frames, &mut segments, &mut current),
+                    '\n' => {
+                        emit_segment(&mut frames, &mut segments, &mut current);
+                        heredoc_delimiter = pending_heredocs.pop_front();
+                        heredoc_owner = match heredoc_delimiter.as_ref() {
+                            // Top level has no frame. `saturating_sub(1)` on an
+                            // empty stack is `Some(0)`, which cannot be told
+                            // apart from a body owned by the outermost frame.
+                            Some(HeredocDelimiter {
+                                terminator: None, ..
+                            }) if !frames.is_empty() => Some(frames.len() - 1),
+                            _ => None,
+                        };
+                    }
                     '|' => {
                         if chars.next_if_eq(&'|').is_some() {
                             // Consume full `||`; both characters are separators.
                         }
-                        push_segment(&mut segments, &mut current);
+                        emit_segment(&mut frames, &mut segments, &mut current);
                     }
                     '&' => {
                         if chars.next_if_eq(&'&').is_some() {
                             // `&&` is a separator; single `&` is handled separately.
-                            push_segment(&mut segments, &mut current);
+                            emit_segment(&mut frames, &mut segments, &mut current);
                         } else {
                             current.push(ch);
                         }
@@ -1153,28 +1980,199 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
                     '<' => {
                         current.push(ch);
                         // Detect `<<` (heredoc) but not `<<<` (here-string).
+                        // Inside `$((...))`, `<<` is a left shift.
                         if chars.peek() == Some(&'<') {
                             if let Some(second) = chars.next() {
                                 current.push(second);
                             }
-                            if chars.peek() != Some(&'<') {
-                                reading_heredoc_word = true;
+                            if chars.peek() != Some(&'<') && !in_arithmetic {
+                                // Inside a bare `((`, `<<` is a shift to bash and a
+                                // heredoc to dash. Either reading hides the lines
+                                // after it from the other shell.
+                                if frames
+                                    .iter()
+                                    .rev()
+                                    .take_while(|frame| frame.resume.is_none())
+                                    .any(|frame| frame.double_paren)
+                                {
+                                    return Err(UnreadableHeredoc);
+                                }
+                                let in_backtick = frames
+                                    .iter()
+                                    .any(|frame| frame.kind == SegmentFrameKind::Backtick);
+                                match read_heredoc_delimiter(
+                                    &mut chars,
+                                    &mut current,
+                                    backslash_is_literal,
+                                    in_backtick,
+                                ) {
+                                    // A proven one-line delimiter. Its body is
+                                    // data, so it is safe to skip.
+                                    Some(Ok(delimiter)) => pending_heredocs.push_back(delimiter),
+                                    // The opener is a heredoc, but its delimiter
+                                    // uses syntax this scanner cannot prove
+                                    // (`$"..."`, an unclosed quote, a newline
+                                    // inside the word). There is no safe body
+                                    // boundary to guess, so refuse the command.
+                                    Some(Err(())) => return Err(UnreadableHeredoc),
+                                    // Not a heredoc (`<<$(cmd)`). The following
+                                    // text is ordinary command text.
+                                    None => {}
+                                }
                             }
                             // `<<<` falls through with no heredoc tracking.
+                        } else {
+                            last_syntax_char = Some(ch);
                         }
                     }
-                    _ => current.push(ch),
+                    // Inside `${...}` only `$(` opens a frame; other parentheses
+                    // are literal pattern text (`${x/)/y}`).
+                    '(' if posix_substitution && (param_depth == 0 || opener == Some('$')) => {
+                        match opener {
+                            Some('$') => {
+                                let arithmetic = chars.peek() == Some(&'(');
+                                open_segment_frame(
+                                    &mut frames,
+                                    &mut segments,
+                                    &mut current,
+                                    &mut quote,
+                                    &mut pending_heredocs,
+                                    SegmentFrameKind::Paren,
+                                    Some("()"),
+                                    arithmetic,
+                                );
+                            }
+                            Some('<' | '>') => open_segment_frame(
+                                &mut frames,
+                                &mut segments,
+                                &mut current,
+                                &mut quote,
+                                &mut pending_heredocs,
+                                SegmentFrameKind::Paren,
+                                Some("()"),
+                                false,
+                            ),
+                            // A subshell, or other `(` syntax (`f()`, `arr=(...)`)
+                            // that is still a word boundary.
+                            _ => {
+                                let in_arithmetic_group =
+                                    frames.last().is_some_and(|frame| frame.arithmetic);
+                                open_segment_frame(
+                                    &mut frames,
+                                    &mut segments,
+                                    &mut current,
+                                    &mut quote,
+                                    &mut pending_heredocs,
+                                    SegmentFrameKind::Paren,
+                                    None,
+                                    false,
+                                );
+                                if !in_arithmetic_group
+                                    && chars.peek() == Some(&'(')
+                                    && let Some(frame) = frames.last_mut()
+                                {
+                                    frame.double_paren = true;
+                                }
+                            }
+                        }
+                    }
+                    ')' if posix_substitution && param_depth == 0 => {
+                        if case_depth == 0
+                            && frames
+                                .last()
+                                .is_some_and(|frame| frame.kind == SegmentFrameKind::Paren)
+                        {
+                            // Closing the first group of a `$((` frame. If `)`
+                            // follows at once, the expression is arithmetic.
+                            let group_of_root = frames.len() >= 2
+                                && frames.last().is_some_and(|frame| {
+                                    frame.arithmetic && frame.resume.is_none()
+                                });
+                            if group_of_root
+                                && let Some(root) = frames.iter_mut().rev().nth(1)
+                                && root.arithmetic
+                                && root.resume.is_some()
+                                && !root.first_group_closed
+                            {
+                                root.first_group_closed = true;
+                                root.arithmetic_confirmed = chars.peek() == Some(&')');
+                            }
+                            close_segment_frame(
+                                &mut frames,
+                                &mut segments,
+                                &mut current,
+                                &mut quote,
+                                &mut pending_heredocs,
+                            );
+                            // An unproven heredoc body belongs to the command
+                            // frame that was just closed. Continuing it would
+                            // hide the command after the substitution.
+                            if heredoc_owner == Some(frames.len()) {
+                                heredoc_delimiter = None;
+                                heredoc_logical_line = None;
+                                heredoc_line_buf.clear();
+                                heredoc_owner = None;
+                            }
+                        } else {
+                            // A `case` pattern terminator, or an unmatched `)`,
+                            // ends the word before it without closing a frame.
+                            stray_closer |= case_depth == 0;
+                            push_segment(&mut segments, &mut current);
+                        }
+                    }
+                    // No backtick substitution is open here (the check at the
+                    // top of the loop closes one), so this backtick opens one.
+                    '`' if posix_substitution => {
+                        open_backtick_frame(
+                            &mut frames,
+                            &mut segments,
+                            &mut current,
+                            &mut quote,
+                            &mut pending_heredocs,
+                        );
+                    }
+                    _ => {
+                        last_syntax_char = Some(ch);
+                        current.push(ch);
+                    }
                 }
             }
         }
     }
 
-    let trimmed = current.trim();
-    if !trimmed.is_empty() {
-        segments.push(trimmed.to_string());
+    // A keyword at the very end (`...; esac`) has no delimiter after it.
+    if posix_substitution
+        && quote == QuoteState::None
+        && !in_comment
+        && !escaped
+        && heredoc_delimiter.is_none()
+    {
+        note_case_keyword(&current, segment_nest_mut(&mut frames, &mut top_nest));
+    }
+    push_segment(&mut segments, &mut current);
+    // Valid shell ends with every substitution, quote, `case`, and `${`
+    // closed. Anything else means this model diverged from the shell's.
+    let balanced = !posix_substitution
+        || (!stray_closer
+            && frames.is_empty()
+            && quote == QuoteState::None
+            && top_nest.case_depth == 0
+            && top_nest.param_depth == 0);
+    // A heredoc body that runs to the end inside an open substitution may
+    // have swallowed its closer: bash ends a body at `EOF)` there and runs the
+    // rest. Neither split can tell where commands resume, so refuse.
+    if posix_substitution && heredoc_delimiter.is_some() && !frames.is_empty() {
+        return Err(UnreadableHeredoc);
+    }
+    // Flush the enclosing text of any substitution left open, so an
+    // unterminated `$(` cannot hide the command around it.
+    while let Some(frame) = pop_segment_frame(&mut frames, &mut segments) {
+        if let Some(mut resume) = frame.resume {
+            push_segment(&mut segments, &mut resume);
+        }
     }
 
-    segments
+    Ok((segments, balanced))
 }
 
 #[derive(Clone, Copy)]
@@ -3137,7 +4135,12 @@ impl SecurityPolicy {
     ) -> CommandRiskLevel {
         let mut saw_medium = false;
 
-        for segment in split_unquoted_segments(command, dialect) {
+        let Ok(segments) = split_unquoted_segments_checked(command, dialect) else {
+            // The body boundary cannot be proven, so the risk of the commands
+            // after it cannot be proven either.
+            return CommandRiskLevel::High;
+        };
+        for segment in segments {
             let cmd_part = skip_env_assignments(&segment);
             let normalized = normalized_shell_command(&segment, dialect);
             if normalized.has_ambiguous_redirection {
@@ -3374,7 +4377,10 @@ impl SecurityPolicy {
     }
 
     fn is_command_explicitly_allowed(&self, command: &str, dialect: ShellDialect) -> bool {
-        let segments = split_unquoted_segments(command, dialect);
+        // A split that refuses a heredoc proves no command is listed.
+        let Ok(segments) = split_unquoted_segments_checked(command, dialect) else {
+            return false;
+        };
         for segment in &segments {
             let normalized = normalized_shell_command(segment, dialect);
             if normalized.has_ambiguous_redirection {
@@ -3511,7 +4517,10 @@ impl SecurityPolicy {
         // $(), heredocs, etc. in trusted environments.
         let has_wildcard = self.allowed_commands.iter().any(|c| c.trim() == "*");
         if has_wildcard && !self.block_high_risk_commands {
-            return true;
+            // The opt-out skips syntax restrictions, but not a heredoc whose
+            // body boundary cannot be proven. The path and risk checks refuse
+            // that command for the same reason.
+            return split_unquoted_segments_checked(command, dialect).is_ok();
         }
 
         if command.contains('`')
@@ -3519,6 +4528,20 @@ impl SecurityPolicy {
             || contains_unmodeled_shell_word_expansion(command, dialect)
             || command.contains("<(")
             || command.contains(">(")
+        {
+            return false;
+        }
+
+        // POSIX subshells split into their own segments below, so `(git status)`
+        // would be checked as plain `git status`. Keep rejecting unquoted
+        // grouping syntax here so the segment split does not widen the strict
+        // allowlist; `$(`, `<(`, `>(`, and backticks are rejected above.
+        // `contains_unmodeled_shell_word_expansion` already rejects unquoted
+        // `(` and `)` as extended-glob syntax, so this duplicates that check on
+        // purpose: the allowlist must not rely on the glob rule staying broad.
+        if matches!(dialect, ShellDialect::Posix)
+            && (contains_unquoted_char(command, '(', dialect)
+                || contains_unquoted_char(command, ')', dialect))
         {
             return false;
         }
@@ -3553,7 +4576,11 @@ impl SecurityPolicy {
         }
 
         // Split on unquoted command separators and validate each sub-command.
-        let segments = split_unquoted_segments(command, dialect);
+        // An unreadable heredoc yields no segments, which must not read as
+        // "every segment is allowed".
+        let Ok(segments) = split_unquoted_segments_checked(command, dialect) else {
+            return false;
+        };
         for segment in &segments {
             let normalized = normalized_shell_command(segment, dialect);
             if normalized.has_ambiguous_redirection || normalized.has_leading_env_assignment {
@@ -3695,6 +4722,11 @@ impl SecurityPolicy {
         dialect: ShellDialect,
         resolve_workspace: bool,
     ) -> Option<String> {
+        if split_unquoted_segments_checked(command, dialect).is_err() {
+            // Name the opener rather than a path. The shell wrapper refuses
+            // any `Some`, and guessing which later command runs is the bypass.
+            return Some("unreadable heredoc delimiter".into());
+        }
         let forbidden_candidate = |raw: &str| {
             let candidate = strip_wrapping_quotes(raw).trim();
             if candidate.is_empty() || candidate.contains("://") {
@@ -4029,8 +5061,9 @@ impl SecurityPolicy {
         // Expand "~" for consistent matching with forbidden paths and allowlists.
         let expanded_path = expand_user_path(path);
 
-        // The null device is always permitted regardless of workspace or
-        // forbidden-path config; the rest of /dev remains blocked as usual.
+        // The host null device is always permitted regardless of workspace or
+        // forbidden-path config (`/dev/null` on Unix, `nul` on Windows); the
+        // rest of /dev remains blocked as usual.
         if is_null_device(&expanded_path) {
             return true;
         }
@@ -4097,9 +5130,10 @@ impl SecurityPolicy {
 
     pub fn is_resolved_path_readable(&self, resolved: &Path) -> bool {
         // Preserve the unconditional null-device exception before attempting
-        // filesystem resolution: Windows spellings such as `nul` are not
-        // canonicalizable paths.
-        if cfg!(windows) && is_null_device(resolved) {
+        // filesystem resolution: on Unix `/dev/null` is always readable even if
+        // the device node does not resolve; on Windows `nul` / `\\.\nul` are
+        // not canonicalizable paths. See `is_null_device`.
+        if is_null_device(resolved) {
             return true;
         }
         // Keep the target in the same filesystem namespace as every policy
@@ -4256,7 +5290,11 @@ impl SecurityPolicy {
     /// the path cannot be resolved (a symlink cycle, or a target whose parents
     /// do not exist); the caller MUST fail closed.
     pub fn resolve_policy_target(&self, path: &Path) -> Option<PathBuf> {
-        if cfg!(windows) && is_null_device(path) {
+        // The host null device may not be canonicalizable (`/dev/null` on Unix
+        // when the device node does not resolve, `nul` on Windows). Return it
+        // as-is so callers that resolve before checking still see the
+        // exception instead of failing closed.
+        if is_null_device(path) {
             return Some(path.to_path_buf());
         }
         resolve_symlinked_path(path)
@@ -4274,9 +5312,10 @@ impl SecurityPolicy {
 
     pub fn is_resolved_path_allowed(&self, resolved: &Path) -> bool {
         // Preserve the unconditional null-device exception before attempting
-        // filesystem resolution: Windows spellings such as `nul` are not
-        // canonicalizable paths.
-        if cfg!(windows) && is_null_device(resolved) {
+        // filesystem resolution: on Unix `/dev/null` is always writable even if
+        // the device node does not resolve; on Windows `nul` / `\\.\nul` are
+        // not canonicalizable paths. See `is_null_device`.
+        if is_null_device(resolved) {
             return true;
         }
         // See `is_resolved_path_readable`: authorization compares the target,
@@ -8157,6 +9196,793 @@ mod tests {
         );
     }
 
+    /// POSIX command substitution, process substitution, subshells, and
+    /// backticks close with a character that is not whitespace. The scanner
+    /// must end the inner command there instead of gluing `)` or `` ` `` onto
+    /// the last word, which turned `$(cmd 2>/dev/null)` into a blocked
+    /// `/dev/null)` redirect target.
+    #[test]
+    fn forbidden_path_argument_allows_safe_devices_inside_posix_substitutions() {
+        let p = unix_forbidden_path_policy();
+        let posix =
+            |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::Posix);
+        for command in [
+            "x=$(echo a 2>/dev/null)",
+            "x=$(echo a 2>/dev/null); echo \"$x\"",
+            "x=\"$(echo a 2>/dev/null)\"",
+            "echo \"$(ls 2>/dev/null)\" \"$(ls 2> /dev/null)\"",
+            "x=$(echo $(echo a 2>/dev/null) 2>/dev/null)",
+            "x=$(cat </dev/null)",
+            "x=$(cat</dev/null)",
+            "(echo a 2>/dev/null)",
+            "(cd sub && ls 2>/dev/null) | wc -l",
+            "(echo a) 2>/dev/null",
+            "x=`echo a 2>/dev/null`",
+            "echo \"`echo a 2>/dev/null`\"",
+            "diff <(sort a 2>/dev/null) <(sort b 2>/dev/null)",
+            "for b in $(which -a zeroclaw 2>/dev/null); do echo $b; done",
+            "find . \\( -name a -o -name b \\) 2>/dev/null",
+            "echo $((1 + 2)) 2>/dev/null",
+            "grep -E '(a|b)' file 2>/dev/null",
+            "echo ')' 2>/dev/null",
+            // A command substitution inside arithmetic uses ordinary shell
+            // syntax, so its quoted heredoc body is data, not a command.
+            "echo \"$(( $(cat <<'EOF' | wc -l\n/etc/passwd\nEOF\n) + 1 ))\"",
+            "x=\"$(case a in a) echo a 2>/dev/null;; esac)\"",
+            // Heredoc bodies stay data, including with more text after the
+            // delimiter and several heredocs on one line.
+            "cat <<'EOF' | wc -l\n/etc/passwd\nEOF",
+            "cat <<A - <<B\n/etc/passwd\nA\n/etc/shadow\nB",
+            "cat <<-EOF\n\t/etc/passwd\n\tEOF",
+            "cat <<\"E F\"\n/etc/passwd\nE F",
+            // Delimiter quote removal follows the shell: inside double quotes
+            // a backslash before an ordinary character stays, before `$`
+            // it goes, and a backslash-newline joins the word either way.
+            "cat <<\"E\\OF\"\n/etc/passwd\nE\\OF",
+            "cat <<\"E\\$F\"\n/etc/passwd\nE$F",
+            "cat <<E\\\nOF\n/etc/passwd\nEOF",
+            // A trailing backslash joins the next line into the delimiter, so
+            // the line after it is body, not a command. Bash warns that it
+            // wanted `Ehello` and never runs a command placed after that line.
+            "cat <<E\\\n/etc/passwd\nEpasswd",
+            // An escaped space or metacharacter is part of the delimiter word.
+            "cat <<E\\ OF\n/etc/passwd\nE OF",
+            "cat <<$EOF\necho 'https://example.invalid\n$EOF",
+            "cat <<\"E\\\" F\"\necho 'https://example.invalid\nE\" F",
+            "cat <<E\\;OF\n/etc/passwd\nE;OF",
+            // A heredoc opened inside a substitution reads its body there; the
+            // outer heredoc's body starts after the line the substitution
+            // closes on. A subshell shares the enclosing heredoc queue.
+            "cat <<A $(cat <<B\n/etc/passwd\nB\n)\n/etc/shadow\nA",
+            "echo \"$(cat <<OUT $(cat <<IN\n/etc/passwd\nIN\n)\n/etc/shadow\nOUT\n)\"",
+            "cat <<A && (echo s\n/etc/passwd\nA\necho t)",
+        ] {
+            assert_eq!(posix(command), None, "{command}");
+        }
+    }
+
+    /// Splitting at substitution boundaries must expose the inner command to
+    /// the scan, never hide it: lookalike devices and forbidden paths inside a
+    /// substitution stay blocked and are reported without the closing `)`.
+    #[test]
+    fn forbidden_path_argument_scans_inside_posix_substitutions() {
+        let p = unix_forbidden_path_policy();
+        let posix =
+            |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::Posix);
+        for (command, blocked) in [
+            ("x=$(echo a 2>/dev/nullx)", "/dev/nullx"),
+            (
+                "x=$(echo a 2>/dev/null/../../etc/passwd)",
+                "/dev/null/../../etc/passwd",
+            ),
+            ("x=$(cat /etc/passwd)", "/etc/passwd"),
+            ("x=$(cat /etc/passwd 2>/dev/null)", "/etc/passwd"),
+            // Double quotes do not stop command substitution, so the inner
+            // command is scanned too.
+            ("x=\"$(cat /etc/passwd)\"", "/etc/passwd"),
+            ("echo \"`cat /etc/shadow`\"", "/etc/shadow"),
+            ("x=`cat /etc/passwd`", "/etc/passwd"),
+            ("(cat /etc/passwd)", "/etc/passwd"),
+            ("(echo a) >/etc/passwd", "/etc/passwd"),
+            ("diff <(cat /etc/passwd) b", "/etc/passwd"),
+            ("x=$(echo $(cat /etc/passwd))", "/etc/passwd"),
+            // Unbalanced or `case`-style closers are boundaries, not hiding
+            // places.
+            ("case x in a) cat /etc/passwd;; esac", "/etc/passwd"),
+            ("echo a) cat /etc/passwd", "/etc/passwd"),
+            // Arithmetic `<<` is a shift, not a heredoc that swallows the rest.
+            ("echo $((8 << 1)); cat /etc/passwd", "/etc/passwd"),
+            ("echo $((8<<1))\ncat /etc/passwd\n1", "/etc/passwd"),
+            // A `)` that bash does not treat as the substitution's closer must
+            // not end it early. Closing early would restore the outer double
+            // quote and hide the rest of the command inside one argument.
+            (
+                "echo \"$(case x in x) cat /etc/passwd;; esac)\"",
+                "/etc/passwd",
+            ),
+            ("echo $(case x in x) cat /etc/passwd;; esac)", "/etc/passwd"),
+            (
+                "echo \"$(case x in (x) cat /etc/passwd;; esac)\"",
+                "/etc/passwd",
+            ),
+            (
+                "echo \"$(case x in a) (cd a) ;; x) cat /etc/passwd;; esac)\"",
+                "/etc/passwd",
+            ),
+            (
+                "echo \"$(if true; then case x in x) cat /etc/passwd;; esac; fi)\"",
+                "/etc/passwd",
+            ),
+            (
+                "echo \"`case x in x) cat /etc/passwd;; esac`\"",
+                "/etc/passwd",
+            ),
+            ("echo \"$(echo ${x/)/y}; cat /etc/passwd)\"", "/etc/passwd"),
+            ("echo \"${x:-$(cat /etc/passwd)}\"", "/etc/passwd"),
+            (
+                "echo \"$(echo a # comment )\ncat /etc/passwd\n)\"",
+                "/etc/passwd",
+            ),
+            // The heredoc delimiter is one word; the rest of its line and every
+            // command after the terminator are still scanned.
+            (
+                "echo \"$(( $(cat <<'EOF' | wc -l\nhello\nEOF\n) + 1 ))\"; cat /etc/passwd",
+                "/etc/passwd",
+            ),
+            (
+                "cat <<'EOF' | wc -l\nhello\nEOF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            ("cat <<EOF >out\nhello\nEOF\ncat /etc/passwd", "/etc/passwd"),
+            ("cat <<'EOF' /etc/passwd\nhello\nEOF", "/etc/passwd"),
+            (
+                "cat <<A - <<B\none\nA\ntwo\nB\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            ("cat <<-EOF\n\thello\n\tEOF\ncat /etc/passwd", "/etc/passwd"),
+            // A delimiter that is not a plain word opens no heredoc.
+            ("cat <<$(echo E)\nE\ncat /etc/passwd", "/etc/passwd"),
+            // A backslash does not continue a comment past its newline.
+            ("cat \"$(echo ok # \\\n)\" /etc/passwd", "/etc/passwd"),
+            ("echo ok # \\\ncat /etc/passwd", "/etc/passwd"),
+            // Inside double quotes a backslash before an ordinary character is
+            // part of the delimiter, so the body ends at `E\OF`, not `EOF`.
+            (
+                "cat <<\"E\\OF\"\nhello\nE\\OF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            (
+                "cat <<\"E\\$F\"\nhello\nE$F\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            // A backslash-newline inside the delimiter joins it into one word.
+            ("cat <<E\\\nOF\nhello\nEOF\ncat /etc/passwd", "/etc/passwd"),
+            // An escaped space or metacharacter stays inside the delimiter.
+            // Stopping at it made a terminator that never matches, so the
+            // trailing command was skipped as body.
+            ("cat <<E\\ OF\nhello\nE OF\ncat /etc/passwd", "/etc/passwd"),
+            (
+                "cat <<E\\ \\ OF\nhello\nE  OF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            (
+                "cat <<E\\\tOF\nhello\nE\tOF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            ("cat <<E\\;OF\nhello\nE;OF\ncat /etc/passwd", "/etc/passwd"),
+            ("cat <<E\\|OF\nhello\nE|OF\ncat /etc/passwd", "/etc/passwd"),
+            ("cat <<E\\&OF\nhello\nE&OF\ncat /etc/passwd", "/etc/passwd"),
+            ("cat <<E\\<OF\nhello\nE<OF\ncat /etc/passwd", "/etc/passwd"),
+            ("cat <<E\\>OF\nhello\nE>OF\ncat /etc/passwd", "/etc/passwd"),
+            ("cat <<E\\(OF\nhello\nE(OF\ncat /etc/passwd", "/etc/passwd"),
+            ("cat <<E\\)OF\nhello\nE)OF\ncat /etc/passwd", "/etc/passwd"),
+            ("cat <<E\\#OF\nhello\nE#OF\ncat /etc/passwd", "/etc/passwd"),
+            (
+                "cat <<E\\\"OF\nhello\nE\"OF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            ("cat <<E\\'OF\nhello\nE'OF\ncat /etc/passwd", "/etc/passwd"),
+            ("cat <<E\\$OF\nhello\nE$OF\ncat /etc/passwd", "/etc/passwd"),
+            ("cat <<E\\`OF\nhello\nE`OF\ncat /etc/passwd", "/etc/passwd"),
+            (
+                "cat <<E\\\\OF\nhello\nE\\OF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            (
+                "cat <<E\\\\\\ OF\nhello\nE\\ OF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            (
+                "cat <<\"E\\\nOF\"\nhello\nEOF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            // Each command substitution has its own heredoc queue, so an inner
+            // newline starts only the inner heredoc. A shared queue started the
+            // outer one first and skipped the trailing command.
+            (
+                "echo \"$(cat <<OUT $(cat <<IN\n\nIN\n)\nouter\nOUT\n)\"; cat /etc/passwd",
+                "/etc/passwd",
+            ),
+            (
+                "cat <<A $(cat <<B\nb\nB\n)\na\nA\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            (
+                "cat <<A `cat <<B\nb\nB\n`\na\nA\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            (
+                "cat <<A <(cat <<B\nb\nB\n)\na\nA\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            (
+                "cat <<A - $(cat <<B\nb\nB\n) <<C\na\nA\nc\nC\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            ("cat <<A $(echo x\n)\na\nA\ncat /etc/passwd", "/etc/passwd"),
+            // A subshell is not a substitution: its newline starts the
+            // enclosing heredoc, so the body ends inside the subshell.
+            (
+                "cat <<A && (echo s\na\nA\necho t)\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            ("cat <<A && (echo s\na\nA\ncat /etc/passwd)", "/etc/passwd"),
+            // An inner heredoc whose substitution closes before a newline has
+            // no body inside it and is dropped, so the lines after are scanned.
+            ("echo \"$(cat <<B)\"\ncat /etc/passwd\nB", "/etc/passwd"),
+            // An expansion the scanner cannot model (`$(...)`) opens no
+            // heredoc, so the following lines stay scanned.
+            // A bare `$` in a delimiter is literal. Opening no heredoc let the
+            // quote in the body swallow the trailing read.
+            (
+                "cat <<$EOF\necho 'https://example.invalid\n$EOF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            (
+                "cat <<E$HOME\necho 'https://example.invalid\nE$HOME\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            // `$"..."` depends on the locale catalog, so its terminator cannot
+            // be proven. The body is still data through the end of the command.
+            // Parsing it lets the quote swallow the following path.
+            // `\"` inside a double-quoted delimiter is part of the word.
+            (
+                "echo \"$(cat <<\"E\\\" F\"\nhello\nE\" F\n)\"; cat /etc/passwd",
+                "/etc/passwd",
+            ),
+            // `<<''` ends at the next completely blank line. A quote in that
+            // body is data, so it cannot swallow the command after the blank.
+            (
+                "cat <<''\necho 'https://example.invalid\n\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            // `<<-` strips leading tabs before comparing the terminator. A
+            // tab-only line ends `<<-''`; leaving the tab in the comparison
+            // never matches and hides the following command.
+            (
+                "cat <<-''\necho 'https://example.invalid\n\t\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            (
+                "echo \"$(cat <<$\"EOF\"\necho 'https://example.invalid\nEOF\n)\"; cat /etc/passwd",
+                "unreadable heredoc delimiter",
+            ),
+            // At top level the unproven body has no frame to close it. The
+            // opener line stays data, and the lines after it are scanned
+            // without treating a quote in the body as syntax.
+            (
+                "cat <<$\"EOF\"\necho 'https://example.invalid\nEOF\ncat /etc/passwd",
+                "unreadable heredoc delimiter",
+            ),
+            // A leading backslash is quote removal, so the terminator is
+            // `EOF`, not `\EOF`.
+            ("cat <<\\EOF\nhello\nEOF\ncat /etc/passwd", "/etc/passwd"),
+            (
+                "cat <<$(echo EOF)\nhello\nEOF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+        ] {
+            assert_eq!(posix(command), Some(blocked.into()), "{command}");
+        }
+    }
+
+    /// `cmd.exe` has no `$(...)` or backtick substitution, so those characters
+    /// stay ordinary word characters under the Windows command dialect.
+    #[test]
+    fn windows_cmd_does_not_split_posix_substitution_syntax() {
+        assert_eq!(
+            split_unquoted_segments("echo `a` $(b)", ShellDialect::WindowsCmd),
+            vec!["echo `a` $(b)".to_string()]
+        );
+    }
+
+    #[test]
+    fn posix_segments_split_at_substitution_boundaries() {
+        let split = |command: &str| split_unquoted_segments(command, ShellDialect::Posix);
+        // Segments are returned in the order they end: inner commands first.
+        assert_eq!(split("x=$(echo a)"), vec!["echo a", "x=$()"]);
+        assert_eq!(split("x=\"$(echo a)\""), vec!["echo a", "x=\"$()\""]);
+        assert_eq!(split("x=`echo a`"), vec!["echo a", "x=``"]);
+        assert_eq!(split("(echo a) && b"), vec!["echo a", "b"]);
+        assert_eq!(split("diff <(a) >(b)"), vec!["a", "b", "diff <() >()"]);
+        assert_eq!(split("x=$(a $(b) c) d"), vec!["b", "a $() c", "x=$() d"]);
+        assert_eq!(split("x=$(a; b)"), vec!["a", "b", "x=$()"]);
+        // Confirmed `$((...))` arithmetic runs no command, so its text is not
+        // a segment, and its `<<` is a shift rather than a heredoc.
+        assert_eq!(split("echo $((1 << 2))"), vec!["echo $()"]);
+        assert_eq!(split("echo $(( (a + b) / 2 ))"), vec!["echo $()"]);
+        // Without `))` right after the second `(`'s match, bash runs a
+        // subshell, so the text is scanned as commands.
+        assert_eq!(split("x=$((echo a) )"), vec!["echo a", "x=$()"]);
+        assert_eq!(split("x=$((a)+(b))"), vec!["a", "+", "b", "x=$()"]);
+        // A bare `((` is scanned as commands: dash runs it as subshells.
+        assert_eq!(split("((echo a))"), vec!["echo a"]);
+        // Unbalanced input keeps every word: an unterminated substitution
+        // still flushes the command around it, and a stray `)` is a boundary.
+        // Because the model diverged from the shell's, the flat split that
+        // ignores substitutions is checked as well.
+        assert_eq!(
+            split("cat a $(echo b"),
+            vec!["echo b", "cat a $()", "cat a $(echo b"]
+        );
+        assert_eq!(
+            split("cat a `echo b"),
+            vec!["echo b", "cat a ``", "cat a `echo b"]
+        );
+        assert_eq!(split("echo a) b"), vec!["echo a", "b", "echo a) b"]);
+        // A balanced command gets no flat split, including a trailing `esac`
+        // and an empty `case`.
+        assert_eq!(
+            split("case x in x) a;; esac"),
+            vec!["case x in x", "a", "esac"]
+        );
+        assert_eq!(
+            split("x=$(case x in esac)"),
+            vec!["case x in esac", "x=$()"]
+        );
+        // Quoted and escaped parentheses and backticks are literal.
+        assert_eq!(split("echo '$(a)' '`b`'"), vec!["echo '$(a)' '`b`'"]);
+        assert_eq!(
+            split("echo \\$\\(a\\) \\`b\\`"),
+            vec!["echo \\$\\(a\\) \\`b\\`"]
+        );
+        assert_eq!(split("echo \"(a)\""), vec!["echo \"(a)\""]);
+        // A quote inside a substitution does not leak into the outer word.
+        assert_eq!(
+            split("x=\"$(echo \")\")\""),
+            vec!["echo \")\"", "x=\"$()\""]
+        );
+        // `case` pattern terminators end a segment inside the substitution
+        // without closing it; `esac` lets the next `)` close it again.
+        assert_eq!(
+            split("x=\"$(case a in a) b;; esac)\""),
+            vec!["case a in a", "b", "esac", "x=\"$()\""]
+        );
+        // Inside `${...}`, `(` and `)` are literal, but `$(` still nests.
+        assert_eq!(split("x=$(echo ${y/)/z})"), vec!["echo ${y/)/z}", "x=$()"]);
+        assert_eq!(
+            split("echo \"${y:-$(b)}\""),
+            vec!["b", "echo \"${y:-$()}\""]
+        );
+        // A comment's `)` does not close the substitution, and the comment
+        // ends at the newline. Mid-word `#` and `${#x}` are not comments.
+        assert_eq!(split("x=$(a # c )\nb\n)"), vec!["a # c )", "b", "x=$()"]);
+        assert_eq!(split("x=$(a#b) ${#y}"), vec!["a#b", "x=$() ${#y}"]);
+        // A command substitution inside arithmetic recognizes heredocs again.
+        assert_eq!(
+            split("echo $(( $(cat <<'E'\n)\nE\n) + 1 ))"),
+            vec!["cat <<'E'", "echo $()"]
+        );
+        // The heredoc delimiter is one word, and the body starts at the next
+        // newline, so the rest of the line is its own segment.
+        assert_eq!(
+            split("cat <<'E' | wc -l\nbody\nE\nnext"),
+            vec!["cat <<'E'", "wc -l", "next"]
+        );
+        // An inner heredoc's body is read inside its substitution, and the
+        // outer heredoc's body starts after the line the substitution closes on.
+        assert_eq!(
+            split("cat <<A $(cat <<B\nb\nB\n)\na\nA\nnext"),
+            vec!["cat <<B", "cat <<A $()", "next"]
+        );
+        // A comment ends at its newline even after a trailing backslash.
+        assert_eq!(
+            split("x=\"$(a # c \\\n)\" b"),
+            vec!["a # c \\", "x=\"$()\" b"]
+        );
+        // An escaped space is part of the delimiter, not the end of the word.
+        assert_eq!(
+            split("cat <<E\\ OF | wc -l\nbody\nE OF\nnext"),
+            vec!["cat <<E\\ OF", "wc -l", "next"]
+        );
+        // `$"..."` is locale-dependent, so the split refuses rather than
+        // guessing which of the following lines are commands.
+        assert!(
+            split_unquoted_segments_checked("cat <<$\"EOF\"\nbody\nEOF\nnext", ShellDialect::Posix)
+                .is_err()
+        );
+    }
+
+    /// Commands inside substitutions and subshells carry their own risk.
+    #[test]
+    fn command_risk_level_sees_commands_inside_posix_substitutions() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        };
+        for command in [
+            "x=$(rm -rf ./build)",
+            "x=\"$(rm -rf ./build)\"",
+            "x=`rm -rf ./build`",
+            "echo \"`rm -rf ./build`\"",
+            "(rm -rf ./build)",
+            "echo ok && (cd sub; rm -rf ./build)",
+            "diff <(rm -rf ./build) b",
+            "echo \"$(case x in x) rm -rf ./build;; esac)\"",
+            "echo $(case x in x) rm -rf ./build;; esac)",
+            "echo \"$(echo ${x/)/y}; rm -rf ./build)\"",
+            "echo \"$(echo a # )\nrm -rf ./build\n)\"",
+            // An apostrophe in a comment is not a quote, so it cannot swallow
+            // the next line's command.
+            "ls # don't\nrm -rf ./build",
+            "ls # don't; rm -rf ./build",
+            "echo \"$(( $(cat <<'EOF' | wc -l\nhello\nEOF\n) + 1 ))\"; rm -rf ./build",
+            "cat <<'EOF' | wc -l\nhello\nEOF\nrm -rf ./build",
+            "echo ok # \\\nrm -rf ./build",
+            "cat <<\"E\\OF\"\nhello\nE\\OF\nrm -rf ./build",
+            "cat <<E\\\nOF\nhello\nEOF\nrm -rf ./build",
+            "cat <<E\\ OF\nhello\nE OF\nrm -rf ./build",
+            "cat <<E\\;OF\nhello\nE;OF\nrm -rf ./build",
+            "cat <<E\\|OF\nhello\nE|OF\nrm -rf ./build",
+            "cat <<E\\(OF\nhello\nE(OF\nrm -rf ./build",
+            "echo \"$(cat <<OUT $(cat <<IN\n\nIN\n)\nouter\nOUT\n)\"; rm -rf ./build",
+            "cat <<A && (echo s\na\nA\necho t)\nrm -rf ./build",
+            "echo \"$(cat <<$'EOF'\nhello\nEOF\n)\"; rm -rf ./build",
+            "cat <<$'E\\x4fF'\nhello\nEOF\nrm -rf ./build",
+            "cat <<$'E\\101F'\nhello\nEAF\nrm -rf ./build",
+            concat!("cat <<$'E", r"\077", "F'\nhello\nE?F\nrm -rf ./build"),
+            concat!("cat <<$'E", r"\501", "F'\nhello\nEAF\nrm -rf ./build"),
+            "cat <<$EOF\necho 'https://example.invalid\n$EOF\nrm -rf ./build",
+            concat!(
+                "echo \"$(cat <<$'E",
+                r"\0",
+                "F'\nhello\nE\n)\"; rm -rf ./build"
+            ),
+            concat!(
+                "echo \"$(cat <<$'E",
+                r"\0",
+                "F'X\nhello\nEX\n)\"; rm -rf ./build"
+            ),
+            // `$"..."` is not a proven delimiter, so its body is scanned too.
+            "echo \"$(cat <<\"E\\\" F\"\nhello\nE\" F\n)\"; rm -rf ./build",
+            "cat <<''\necho 'https://example.invalid\n\nrm -rf ./build",
+            "cat <<-''\necho 'https://example.invalid\n\t\nrm -rf ./build",
+            "echo \"$(cat <<$\"EOF\"\necho 'https://example.invalid\nEOF\n)\"; rm -rf ./build",
+            "cat <<$\"EOF\"\necho 'https://example.invalid\nEOF\nrm -rf ./build",
+            "cat <<$'E\\rF'\necho 'https://example.invalid\nE\rF\nrm -rf ./build",
+            "cat <<\\EOF\nhello\nEOF\nrm -rf ./build",
+            "cat <<$'E\\ OF'\nhello\nE\\ OF\nrm -rf ./build",
+        ] {
+            assert_eq!(
+                p.command_risk_level(command),
+                CommandRiskLevel::High,
+                "{command}"
+            );
+        }
+        assert_eq!(
+            p.command_risk_level("x=$(git rev-parse HEAD 2>/dev/null)"),
+            CommandRiskLevel::Low
+        );
+    }
+
+    /// Where the scanner and the shell disagree on which `)` or backtick ends
+    /// a substitution, the scan restores the enclosing double quote over text
+    /// the shell runs. In each command here, bash runs the forbidden command
+    /// (dash runs it too, or rejects the whole script).
+    #[test]
+    fn posix_substitution_closers_follow_the_shell() {
+        let p = unix_forbidden_path_policy();
+        let posix =
+            |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::Posix);
+        let risk = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        };
+        for command in [
+            // A lone `&`, `coproc`, and `time -p` leave the next word in
+            // command position, so its `case` pattern `)` does not close.
+            "echo \"$(echo \"$(true & case x in x) wc -l /etc/passwd;; esac)\")\"",
+            "echo \"$(true&case x in x) wc -l /etc/passwd;; esac)\"",
+            "echo \"$(coproc case x in x) wc -l /etc/passwd;; esac)\"",
+            "echo \"$(time -p case x in x) wc -l /etc/passwd;; esac)\"",
+            // An empty `case` is closed by its `esac`, so the next `)` closes
+            // the substitution.
+            "echo \"$(case x in esac)\"; wc -l /etc/passwd",
+            // `case` inside arithmetic is a name, not a statement, so it does
+            // not hold the real closer open.
+            "echo \"$($((case x in (x) echo a)))\"; wc -l /etc/passwd",
+            // The next unescaped backtick closes a backtick substitution, even
+            // inside a comment, a quote, or a `(` opened within it.
+            "echo \"`#x`\"\necho `wc -l /etc/passwd`",
+            "echo `echo 'a`; wc -l /etc/passwd #'`",
+            "x=\"`x=1 (case x in x) echo a)`\"; wc -l /etc/passwd",
+            // A heredoc opened inside backticks ends with them.
+            "echo `cat <<EOF`\nwc -l /etc/passwd\nEOF",
+            // Dash runs `((...))` as nested subshells, not arithmetic.
+            "((wc -l /etc/passwd))",
+        ] {
+            assert_eq!(posix(command), Some("/etc/passwd".into()), "{command}");
+            let high = command.replace("wc -l /etc/passwd", "rm -rf ./build");
+            assert_eq!(
+                risk.command_risk_level(&high),
+                CommandRiskLevel::High,
+                "{high}"
+            );
+        }
+        // An unterminated `case` in backticks: the shell reports the error
+        // when it runs the substitution, then runs the rest.
+        assert_eq!(
+            risk.command_risk_level("x=\"`x=1 (case x in x) git status)`\"; rm -rf ./build"),
+            CommandRiskLevel::High
+        );
+        // Balanced, valid commands are not refused by the closer rules.
+        for command in [
+            "case x in esac",
+            "x=$(case x in esac)",
+            "case x in x) echo a;; esac",
+            "echo \"`echo a`\" `date`",
+            "true & case x in x) echo a;; esac",
+        ] {
+            assert_eq!(posix(command), None, "{command}");
+            assert!(risk.is_command_allowed(command), "{command}");
+        }
+    }
+
+    /// `$((...))` whose second `(` closes right before `)` is arithmetic in
+    /// both bash and dash, so its text names no file and runs no command.
+    /// Substitutions inside it still run and are still scanned. Any other
+    /// `$((` or a bare `((` is scanned as commands.
+    #[test]
+    fn posix_confirmed_arithmetic_is_not_a_command() {
+        let p = unix_forbidden_path_policy();
+        let posix =
+            |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::Posix);
+        for command in [
+            "echo \"$(( total / count ))\"",
+            "echo $((10 / 2))",
+            "echo $(( (a + b) / 2 ))",
+            "x=$(( $(wc -l < input.txt) / 2 ))",
+            // Separators inside the expression do not end a command there.
+            "echo \"$(( total /\n count ))\"",
+            "echo $(( a / 2 || b / 2 ))",
+            "echo $(( a / 2 && b / 2 ))",
+        ] {
+            assert_eq!(posix(command), None, "{command}");
+            assert_eq!(
+                p.command_risk_level(command),
+                CommandRiskLevel::Low,
+                "{command}"
+            );
+        }
+        for command in [
+            "echo $(( $(wc -l < /etc/passwd) / 2 ))",
+            "echo \"$(( `wc -l < /etc/passwd` / 2 ))\"",
+            // Bash reads these as command substitutions holding a subshell.
+            "x=$((cat /etc/passwd) )",
+            "x=$((true) ; cat /etc/passwd)",
+            "x=\"$((true)|cat /etc/passwd)\"",
+            "((cat /etc/passwd))",
+            // Unconfirmed text keeps every separated command.
+            "x=$((true) ; cat /etc/passwd\n)",
+            "x=$((true) && cat /etc/passwd)",
+        ] {
+            assert_eq!(posix(command), Some("/etc/passwd".into()), "{command}");
+        }
+    }
+
+    /// Heredoc forms whose body boundary differs between shells, or that
+    /// neither split can bound, are refused rather than guessed.
+    #[test]
+    fn ambiguous_heredoc_boundaries_are_refused() {
+        let p = unix_forbidden_path_policy();
+        let risk = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        };
+        for command in [
+            // Bash ends a body inside `$(` at `EOF)`, then runs the rest.
+            "x=$(cat <<EOF\nhello\nEOF); wc -l /etc/passwd",
+            "echo \"$(cat <<EOF\nhello\nEOF)\"; wc -l /etc/passwd",
+            // Bash shifts inside `((`, so the next line runs. Dash reads a
+            // subshell with a heredoc whose body is that line.
+            "((x=8<<1))\nwc -l /etc/passwd\n1",
+            "(( x = 8 << 1 ))\nwc -l /etc/passwd",
+        ] {
+            assert_eq!(
+                p.forbidden_path_argument_for_shell(command, ShellDialect::Posix),
+                Some("unreadable heredoc delimiter".into()),
+                "{command}"
+            );
+            let high = command.replace("wc -l /etc/passwd", "rm -rf ./build");
+            assert_eq!(
+                risk.command_risk_level(&high),
+                CommandRiskLevel::High,
+                "{high}"
+            );
+            assert!(!risk.is_command_allowed(command), "{command}");
+        }
+        // A heredoc in a spaced subshell means the same to both shells.
+        assert_eq!(
+            p.forbidden_path_argument_for_shell(
+                "( (cat <<EOF\nhello\nEOF\n) )\nwc -l /etc/passwd",
+                ShellDialect::Posix
+            ),
+            Some("/etc/passwd".into())
+        );
+    }
+
+    /// `$'...'` heredoc delimiters mean different things to bash and dash, the
+    /// usual `sh`. Bash expands them (bytewise, with NUL truncation) before
+    /// matching the terminator. Dash has no `$'...'` and ends `<<$'EOF'` at a
+    /// literal `$EOF` line. Either model hides commands from the other shell,
+    /// so the delimiter is unproven and the command is refused.
+    #[test]
+    fn ansi_c_heredoc_delimiters_are_refused() {
+        let p = unix_forbidden_path_policy();
+        let risk = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        };
+        for command in [
+            // Dash ends the body at `$EOF` and runs the next line.
+            "cat <<$'EOF'\nx\n$EOF\nwc -l /etc/passwd\nEOF",
+            // Bash ends at `X` (the NUL truncates the quoted part, escaped
+            // quote included), not `BX`.
+            concat!(
+                "echo \"$(cat <<$'",
+                r"\0A\'B",
+                "'X\nhello\nX\nwc -l /etc/passwd\nBX\n)\"\n)\""
+            ),
+            // Bash builds bytes, so this ends at `EéF`, not `EÃ©F`.
+            concat!(
+                "echo \"$(cat <<$'E",
+                r"\xc3\xa9",
+                "F'\nhello\nEéF\nwc -l /etc/passwd\nEÃ©F\n)\"\n)\""
+            ),
+            "cat <<$'E\\101F'\nhello\nEAF\nwc -l /etc/passwd",
+            "cat <<E$'O'F\nhello\nEOF\nwc -l /etc/passwd",
+        ] {
+            assert_eq!(
+                p.forbidden_path_argument_for_shell(command, ShellDialect::Posix),
+                Some("unreadable heredoc delimiter".into()),
+                "{command}"
+            );
+            let high = command.replace("wc -l /etc/passwd", "rm -rf ./build");
+            assert_eq!(
+                risk.command_risk_level(&high),
+                CommandRiskLevel::High,
+                "{high}"
+            );
+            assert!(!risk.is_command_allowed(command), "{command}");
+        }
+    }
+
+    /// The body of an unquoted heredoc is expanded, so a line ending in an odd
+    /// number of backslashes continues onto the next one. Bash compares the
+    /// joined line, stripping `<<-` tabs while it is still empty. Dash skips
+    /// lines that are exactly `\` at the start of a line and compares the
+    /// next physical line alone. Each case was run in bash 3.2 through 5.3
+    /// and dash 0.5.12.
+    #[test]
+    fn heredoc_terminators_follow_line_continuation() {
+        let p = unix_forbidden_path_policy();
+        let posix =
+            |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::Posix);
+        let risk = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        };
+        // Bash joins these into the terminator and runs the next line; dash
+        // reads on. The shells disagree, so the command is refused.
+        for command in [
+            "cat <<EOF\nEO\\\nF\nwc -l /etc/passwd\nEOF",
+            "cat <<EOF\nE\\\nO\\\nF\nwc -l /etc/passwd\nEOF",
+            "cat <<EOF\nEOF\\\n\nwc -l /etc/passwd\nEOF",
+            "cat <<-EOF\n\tEO\\\nF\nwc -l /etc/passwd\nEOF",
+            "echo \"$(cat <<EOF\nEO\\\nF\n)\"; wc -l /etc/passwd\nEOF\n)\"",
+            // A backslash-newline in the delimiter is removed before the word
+            // is read, so `<<E\<newline>OF` is the unquoted delimiter `EOF`.
+            // The body still joins. Counting that backslash as quoting waited
+            // for the later physical `EOF` and skipped the read bash runs
+            // after the joined line. The closing text after that `EOF` also
+            // rebalanced the substitution, so no fallback ran.
+            "cat <<E\\\nOF\nEO\\\nF\nwc -l /etc/passwd\nEOF",
+            "echo \"$(cat <<E\\\nOF\nEO\\\nF\n)\"; wc -l /etc/passwd\nEOF\n)\"",
+            "cat <<EOF\nE\\\n\\\nOF\nwc -l /etc/passwd\nEOF",
+            // Bash strips the tab before an empty continuation and ends at
+            // `EOF`; dash does not skip a tab-indented `\` line.
+            "cat <<-EOF\n\t\\\nEOF\nwc -l /etc/passwd\nEOF",
+            "cat <<-EOF\n\t\\\n\tEOF\nwc -l /etc/passwd\nEOF",
+            "cat <<-EOF\n\\\n\tEO\\\nF\nwc -l /etc/passwd\nEOF",
+        ] {
+            assert_eq!(
+                posix(command),
+                Some("unreadable heredoc delimiter".into()),
+                "{command:?}"
+            );
+            let high = command.replace("wc -l /etc/passwd", "rm -rf ./build");
+            assert_eq!(
+                risk.command_risk_level(&high),
+                CommandRiskLevel::High,
+                "{high:?}"
+            );
+            assert!(!risk.is_command_allowed(command), "{command:?}");
+        }
+        // Both shells end at a terminator after lines that are exactly `\`,
+        // with `<<-` tabs stripped from it, and run the read that follows.
+        for command in [
+            "cat <<-EOF\n\\\n\tEOF\nwc -l /etc/passwd",
+            "cat <<EOF\n\\\nEOF\nwc -l /etc/passwd",
+            "cat <<EOF\n\\\n\\\nEOF\nwc -l /etc/passwd",
+        ] {
+            assert_eq!(posix(command), Some("/etc/passwd".into()), "{command:?}");
+        }
+        // Both shells read on past a physical `EOF` that continues a line, so
+        // the quote in the real body is data and the read after it runs.
+        assert_eq!(
+            posix("cat <<EOF\nbody \\\nEOF\necho 'x\nEOF\nwc -l /etc/passwd #'"),
+            Some("/etc/passwd".into())
+        );
+        // No join: the whole read is body in both shells.
+        for command in [
+            // Quoted delimiters leave backslash-newlines literal. A
+            // continuation inside an otherwise quoted word is still quoting,
+            // so the body does not join and the read stays data.
+            "cat <<'EOF'\nEO\\\nF\nwc -l /etc/passwd\nEOF",
+            "cat <<\"EOF\"\nEO\\\nF\nwc -l /etc/passwd\nEOF",
+            "cat <<\\EOF\nEO\\\nF\nwc -l /etc/passwd\nEOF",
+            "cat <<\"E\\\nOF\"\nEO\\\nF\nwc -l /etc/passwd\nEOF",
+            "cat <<E\\\n'OF'\nEO\\\nF\nwc -l /etc/passwd\nEOF",
+            // An even number of backslashes is an escaped backslash.
+            "cat <<EOF\nEO\\\\\nF\nwc -l /etc/passwd\nEOF",
+            // `<<-` strips tabs only at the start of the logical line.
+            "cat <<-EOF\n\tEO\\\n\tF\nwc -l /etc/passwd\nEOF",
+            // A continued line that does not spell the terminator.
+            "cat <<EOF\nE\\\n OF\nwc -l /etc/passwd\nEOF",
+            "cat <<EOF\n \\\nEOF\nwc -l /etc/passwd\nEOF",
+        ] {
+            assert_eq!(posix(command), None, "{command:?}");
+        }
+    }
+
+    /// The strict allowlist decision for grouping and substitution syntax is
+    /// unchanged: segment splitting must not turn a previously rejected
+    /// `(git status)` into an accepted one.
+    #[test]
+    fn strict_allowlist_still_rejects_posix_grouping_and_substitution() {
+        let p = default_policy();
+        assert!(p.is_command_allowed("git status 2>/dev/null"));
+        // Escaped and quoted parentheses are literal, not grouping syntax.
+        assert!(p.is_command_allowed("find . \\( -name a -o -name b \\)"));
+        assert!(p.is_command_allowed("grep -E '(a|b)' file"));
+        for command in [
+            "(git status)",
+            "(git status 2>/dev/null)",
+            "(git status) 2>/dev/null",
+            "git status && (git log)",
+            "x=$(git status)",
+            "git status `git log`",
+            "git status )",
+        ] {
+            assert!(!p.is_command_allowed(command), "{command}");
+        }
+    }
+
     /// The dialect divergence that broke the host-defaulting tests on Windows,
     /// pinned as intended behavior: under `cmd.exe` the safe null device is
     /// `nul`, while `/dev/null` is an ordinary forbidden-prefix path, and a
@@ -8532,8 +10358,265 @@ mod tests {
             ..SecurityPolicy::default()
         };
 
-        assert!(policy.is_resolved_path_readable(Path::new("nul")));
-        assert!(policy.is_resolved_path_allowed(Path::new("nul")));
+        for spelling in ["nul", "NUL", "Nul", r"\\.\nul", r"\\.\NUL"] {
+            let device = Path::new(spelling);
+            assert!(
+                policy.is_path_allowed(spelling),
+                "native null device {spelling:?} must be allowed"
+            );
+            assert!(
+                policy.is_resolved_path_readable(device),
+                "native null device {spelling:?} must be readable before resolution"
+            );
+            assert!(
+                policy.is_resolved_path_allowed(device),
+                "native null device {spelling:?} must be writable before resolution"
+            );
+            assert_eq!(
+                policy.resolve_policy_target(device),
+                Some(device.to_path_buf()),
+                "native null device {spelling:?} is not canonicalizable and is returned as-is"
+            );
+        }
+    }
+
+    /// On Windows, `/dev/null` is the ordinary file `\dev\null` on the current
+    /// drive, not the null device. With workspace confinement disabled, an
+    /// explicit operator deny on `/dev` must still reject it (for example a
+    /// native PowerShell `Get-Content '/dev/null'` cron job), while native
+    /// `NUL` stays usable and a POSIX-dialect `2>/dev/null` redirect keeps its
+    /// separate, dialect-aware exception.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_dev_null_is_an_ordinary_file_under_explicit_deny() {
+        let policy = SecurityPolicy {
+            workspace_dir: PathBuf::from(r"C:\workspace"),
+            workspace_only: false,
+            forbidden_paths: vec!["/dev".into()],
+            ..SecurityPolicy::default()
+        };
+
+        assert!(
+            !policy.is_path_allowed("/dev/null"),
+            "/dev/null is an ordinary file on Windows and must honor the explicit /dev deny"
+        );
+        assert!(
+            policy
+                .forbidden_path_argument_for_shell(
+                    "Get-Content '/dev/null'",
+                    ShellDialect::PowerShell
+                )
+                .is_some(),
+            "a native PowerShell read of /dev/null must be rejected under the explicit deny"
+        );
+
+        for spelling in ["NUL", "nul", r"\\.\NUL"] {
+            let device = Path::new(spelling);
+            assert!(policy.is_path_allowed(spelling), "{spelling:?}");
+            assert!(
+                policy.is_resolved_path_readable(device),
+                "{spelling:?} read"
+            );
+            assert!(
+                policy.is_resolved_path_allowed(device),
+                "{spelling:?} write"
+            );
+        }
+
+        assert_eq!(
+            policy.forbidden_path_argument_for_shell("ls missing 2>/dev/null", ShellDialect::Posix),
+            None,
+            "POSIX /dev/null redirects keep their dialect-aware exception on Windows"
+        );
+    }
+
+    /// On Unix, `nul`, `NUL`, and `\\.\nul` are ordinary filenames, not the
+    /// null device. The Windows discard spelling must not short-circuit
+    /// filesystem authorization: an alias with one of those names is resolved
+    /// like any other path and denied when its target is forbidden or outside
+    /// every allowed root. `/dev/null` and its aliases stay usable.
+    #[cfg(unix)]
+    #[test]
+    fn unix_foreign_null_spellings_get_no_filesystem_exception() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let workspace = root.join("ws");
+        let secret_dir = workspace.join("secret");
+        let outside_dir = root.join("outside");
+        std::fs::create_dir_all(&secret_dir).unwrap();
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let secret = secret_dir.join("key");
+        let outside = outside_dir.join("key");
+        let notes = workspace.join("notes.txt");
+        for file in [&secret, &outside, &notes] {
+            std::fs::write(file, "x").unwrap();
+        }
+
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            workspace_only: true,
+            // The forbidden directory sits inside the workspace, so every
+            // alias below is lexically in-workspace: only resolution of the
+            // alias to its target can deny it. `/dev` is forbidden to show
+            // the `/dev/null` exception survives a forbidden parent.
+            forbidden_paths: vec![secret_dir.to_string_lossy().into_owned(), "/dev".into()],
+            ..SecurityPolicy::default()
+        };
+
+        // Control: an ordinary in-workspace alias is authorized, so the
+        // denials below come from the target, not from the fixture location.
+        let ok_alias = workspace.join("ok-alias");
+        symlink(&notes, &ok_alias).unwrap();
+        assert!(policy.is_resolved_path_readable(&ok_alias));
+        assert!(policy.is_resolved_path_allowed(&ok_alias));
+
+        for (name, target) in [
+            ("nul", &secret),
+            ("NUL", &outside),
+            (r"\\.\nul", &secret),
+            (r"\\.\NUL", &outside),
+        ] {
+            let alias = workspace.join(name);
+            symlink(target, &alias).unwrap();
+            assert_eq!(
+                policy.resolve_policy_target(&alias),
+                Some(target.clone()),
+                "{name:?} is an ordinary Unix filename and must resolve to its target"
+            );
+            assert!(
+                !policy.is_resolved_path_readable(&alias),
+                "{name:?} alias to {target:?} must not be readable"
+            );
+            assert!(
+                !policy.is_resolved_path_allowed(&alias),
+                "{name:?} alias to {target:?} must not be writable"
+            );
+        }
+
+        // A bare foreign spelling gains nothing from its name: it is resolved
+        // against the process CWD (never returned raw) and, because that CWD
+        // is outside this workspace, authorization is denied.
+        for name in ["nul", "NUL", r"\\.\nul"] {
+            let bare = Path::new(name);
+            let target = policy.resolve_policy_target(bare);
+            assert_ne!(
+                target.as_deref(),
+                Some(bare),
+                "{name:?} must not be returned as an unresolved device spelling"
+            );
+            assert!(
+                target.as_deref().is_none_or(Path::is_absolute),
+                "{name:?} must resolve to an absolute target or fail closed, got {target:?}"
+            );
+            assert!(!policy.is_resolved_path_readable(bare), "{name:?} read");
+            assert!(!policy.is_resolved_path_allowed(bare), "{name:?} write");
+        }
+
+        // `/dev/null` and an alias to it remain usable even though `/dev` is
+        // forbidden.
+        let null_alias = workspace.join("null-alias");
+        symlink("/dev/null", &null_alias).unwrap();
+        for device in [Path::new("/dev/null"), null_alias.as_path()] {
+            assert!(policy.is_resolved_path_readable(device), "{device:?} read");
+            assert!(policy.is_resolved_path_allowed(device), "{device:?} write");
+        }
+    }
+
+    /// The generic null-device exception is host-native. On Unix, `/dev/null`
+    /// is always allowed: before filesystem resolution, even when `/dev` is
+    /// forbidden, with or without workspace confinement. On Windows it is an
+    /// ordinary file (see `windows_dev_null_is_an_ordinary_file_under_explicit_deny`).
+    /// Shell redirects stay dialect-aware on every host: a POSIX
+    /// `2>/dev/null` and a `cmd.exe` `2>nul` both pass their own scans.
+    #[test]
+    fn null_device_exception_is_host_native() {
+        let confined = SecurityPolicy {
+            workspace_dir: PathBuf::from("/workspace"),
+            workspace_only: true,
+            forbidden_paths: vec!["/dev".into(), "/etc".into()],
+            ..SecurityPolicy::default()
+        };
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            // Same shape as the Windows regression: no workspace confinement,
+            // an explicit operator deny on `/dev`. Unix `/dev/null` still wins.
+            let unconfined = SecurityPolicy {
+                workspace_dir: PathBuf::from("/workspace"),
+                workspace_only: false,
+                forbidden_paths: vec!["/dev".into()],
+                ..SecurityPolicy::default()
+            };
+            let dev_null = Path::new("/dev/null");
+            for policy in [&confined, &unconfined] {
+                assert!(
+                    policy.is_path_allowed("/dev/null"),
+                    "/dev/null must always be allowed on Unix, even with /dev forbidden"
+                );
+                assert!(
+                    policy.is_resolved_path_readable(dev_null),
+                    "/dev/null must stay readable before filesystem resolution"
+                );
+                assert!(
+                    policy.is_resolved_path_allowed(dev_null),
+                    "/dev/null must stay writable before filesystem resolution"
+                );
+                assert_eq!(
+                    policy.resolve_policy_target(dev_null),
+                    Some(dev_null.to_path_buf()),
+                    "/dev/null must be returned as-is, not resolved and re-checked"
+                );
+            }
+        }
+
+        // The exception is exact. These sit outside the workspace under the
+        // forbidden `/dev` prefix and must not match the null device.
+        for spelling in ["/dev/zero", "/dev/null/extra", "/dev/null.txt"] {
+            assert!(
+                !confined.is_path_allowed(spelling),
+                "non-null path {spelling:?} must not inherit the null-device exception"
+            );
+            assert!(
+                !confined.is_resolved_path_allowed(Path::new(spelling)),
+                "non-null path {spelling:?} must not be writable via the null-device exception"
+            );
+        }
+
+        // Redirect safety is decided by the shell dialect, not the host's
+        // filesystem exception, so these hold on every host.
+        let policy = &confined;
+        assert_eq!(
+            policy.forbidden_path_argument_for_shell("ls missing 2>/dev/null", ShellDialect::Posix),
+            None,
+            "POSIX /dev/null redirect must be allowed on every host"
+        );
+        assert_eq!(
+            policy.forbidden_workspace_path_argument_for_shell(
+                "ls missing 2>/dev/null",
+                ShellDialect::Posix,
+            ),
+            None,
+            "workspace scan must not re-block a POSIX /dev/null redirect"
+        );
+        assert_eq!(
+            policy.forbidden_path_argument_for_shell("dir missing 2>nul", ShellDialect::WindowsCmd),
+            None,
+            "cmd.exe nul redirect must be allowed on every host"
+        );
+        assert_eq!(
+            policy.forbidden_path_argument_for_shell("dir missing 2>NUL", ShellDialect::WindowsCmd),
+            None
+        );
+        assert_eq!(
+            policy.forbidden_workspace_path_argument_for_shell(
+                r"dir missing 2>\\.\nul",
+                ShellDialect::WindowsCmd,
+            ),
+            None,
+            "workspace scan must not re-block a cmd.exe \\\\.\\\\nul redirect"
+        );
     }
 
     #[test]

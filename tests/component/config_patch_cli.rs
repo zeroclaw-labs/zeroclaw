@@ -7,8 +7,6 @@
 #[cfg(feature = "gateway")]
 use axum::{Router, routing::patch};
 #[cfg(feature = "gateway")]
-use parking_lot::RwLock;
-#[cfg(feature = "gateway")]
 use std::collections::HashMap;
 use std::process::{Command, Output, Stdio};
 #[cfg(feature = "gateway")]
@@ -62,12 +60,13 @@ impl Attributable for MockModelProvider {
 
 #[cfg(feature = "gateway")]
 fn test_state(config: Config) -> AppState {
+    let authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
     let memory: Arc<dyn zeroclaw_memory::Memory> =
         Arc::new(NoneMemory::new("config-patch-cli-test"));
     AppState {
-        config: Arc::new(RwLock::new(config)),
-        config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-        agent_lifecycle: Default::default(),
+        config: authority.live_handle(),
+        config_authority: authority.clone(),
+        agent_lifecycle: authority.agent_lifecycle(),
         model_provider: Arc::new(MockModelProvider),
         model: "test-model".into(),
         temperature: None,
@@ -121,7 +120,6 @@ fn test_state(config: Config) -> AppState {
         session_backend: None,
         session_queue: Arc::new(gateway::session_queue::SessionActorQueue::new(8, 30, 600)),
         device_registry: None,
-        pending_pairings: None,
         canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
         #[cfg(feature = "webauthn")]
         webauthn: None,

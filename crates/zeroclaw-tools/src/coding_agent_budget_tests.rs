@@ -61,15 +61,9 @@ fn wrapped_tool<T: Tool + 'static>(inner: T, security: Arc<SecurityPolicy>) -> B
 }
 
 #[cfg(unix)]
-fn write_successful_tmux(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::write(path, "#!/bin/sh\nexit 0\n").expect("write tmux fixture");
-    let mut permissions = std::fs::metadata(path)
-        .expect("tmux fixture metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(path, permissions).expect("make tmux fixture executable");
+fn link_successful_tmux(path: &Path) {
+    let executable = which::which("true").expect("installed true executable");
+    std::os::unix::fs::symlink(executable, path).expect("link tmux fixture");
 }
 
 #[cfg(unix)]
@@ -156,7 +150,7 @@ fn coding_agent_cases(
 async fn coding_agent_wrappers_charge_one_action_each() {
     let workspace = tempfile::TempDir::new().expect("workspace");
     let tmux_binary = workspace.path().join("tmux");
-    write_successful_tmux(&tmux_binary);
+    link_successful_tmux(&tmux_binary);
 
     for (security, tool) in
         coding_agent_cases(AutonomyLevel::Full, 2, workspace.path(), &tmux_binary)

@@ -503,7 +503,11 @@ pub fn active_log_query_scope() -> Option<(PathBuf, bool)> {
         .map(|s| (s.policy.path.clone(), s.policy.storage.reads_archives()))
 }
 
-pub fn flush_for_test() -> Result<()> {
+/// Wait for the active persistence writer's ordered flush acknowledgement.
+///
+/// Disabled persistence is a no-op. The final sync and worker errors are
+/// reported; this is not a successful-delivery receipt for each queued event.
+pub fn flush() -> Result<()> {
     let Some(state) = current_state() else {
         return Ok(());
     };
@@ -521,6 +525,11 @@ pub fn flush_for_test() -> Result<()> {
     ack_rx
         .recv()
         .context("log writer worker disconnected before reporting flush result")?
+}
+
+/// Compatibility entry point for callers using the original test helper.
+pub fn flush_for_test() -> Result<()> {
+    flush()
 }
 
 /// Resolved LLM-request-payload capture policy + the truncate cap, for the

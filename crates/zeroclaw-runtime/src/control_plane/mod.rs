@@ -18,5 +18,7 @@ pub use goal_task::{
     GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState, GoalTaskRecord,
     GoalTaskRegistry, TaskContinuationContext, TaskContinuationConversationScope, TaskGoal,
 };
-pub use task_registry::{TaskKind, TaskRecord, TaskRegistry, TaskSnapshot, TaskStatus};
+pub use task_registry::{
+    TaskKind, TaskProgress, TaskProgressTool, TaskRecord, TaskRegistry, TaskSnapshot, TaskStatus,
+};
 pub use task_store_sqlite::SqliteTaskStore;

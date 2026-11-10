@@ -8,12 +8,13 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use super::authority::is_authoritative;
 use super::task_registry::{
-    TaskKind, TaskRecord, TaskRegistry, TaskSnapshot, TaskStatus, TerminalSettlementIntent,
+    TaskKind, TaskProgress, TaskRecord, TaskRegistry, TaskSnapshot, TaskStatus,
+    TerminalSettlementIntent,
 };
 
 mod goal;
 
-const CONTROL_PLANE_SCHEMA_VERSION: i64 = 9;
+const CONTROL_PLANE_SCHEMA_VERSION: i64 = 10;
 
 pub struct SqliteTaskStore {
     conn: Mutex<Connection>,
@@ -90,7 +91,8 @@ impl SqliteTaskStore {
                  started_at      TEXT NOT NULL,
                  finished_at     TEXT,
                  output          TEXT,
-                 error           TEXT
+                 error           TEXT,
+                 progress        TEXT
              );
              CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
              CREATE INDEX IF NOT EXISTS idx_tasks_agent  ON tasks(agent);
@@ -161,6 +163,16 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
         )?;
         conn.execute_batch("PRAGMA user_version = 9;")
             .context("apply control-plane schema v9")?;
+    }
+    if version < 10 {
+        add_column_if_missing(
+            conn,
+            "tasks",
+            "progress",
+            "ALTER TABLE tasks ADD COLUMN progress TEXT",
+        )?;
+        conn.execute_batch("PRAGMA user_version = 10;")
+            .context("apply control-plane schema v10")?;
     }
     if version > CONTROL_PLANE_SCHEMA_VERSION {
         ::zeroclaw_log::record!(
@@ -284,7 +296,31 @@ fn row_to_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskSnapshot> {
         task: row_to_record(row)?,
         output: row.get("output")?,
         error: row.get("error")?,
+        progress: progress_from_row(row)?,
     })
+}
+
+/// Progress is advisory: a value that does not parse reads as absent rather
+/// than failing the snapshot that carries the task's lifecycle and output.
+fn progress_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<TaskProgress>> {
+    let Some(raw) = row.get::<_, Option<String>>("progress")? else {
+        return Ok(None);
+    };
+    match serde_json::from_str(&raw) {
+        Ok(progress) => Ok(Some(progress)),
+        Err(_) => {
+            let task_id: String = row.get("id")?;
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "task_id": task_id,
+                    })),
+                "control-plane: task progress is unreadable and was ignored"
+            );
+            Ok(None)
+        }
+    }
 }
 
 fn row_to_settlement_intent(row: &rusqlite::Row<'_>) -> rusqlite::Result<TerminalSettlementIntent> {
@@ -754,6 +790,31 @@ impl TaskRegistry for SqliteTaskStore {
         )
         .context("heartbeat task")?;
         Ok(())
+    }
+
+    async fn record_progress(
+        &self,
+        id: &str,
+        owner_boot_id: &str,
+        progress: &TaskProgress,
+    ) -> Result<bool> {
+        let encoded = serde_json::to_string(progress).context("encode task progress")?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let conn = self.conn.lock();
+        let changed = conn
+            .execute(
+                "UPDATE tasks SET progress = ?1, heartbeat_at = ?2
+                 WHERE id = ?3 AND owner_boot_id = ?4 AND status = ?5",
+                params![
+                    encoded,
+                    now,
+                    id,
+                    owner_boot_id,
+                    status_to_db(TaskStatus::Running)
+                ],
+            )
+            .context("record task progress")?;
+        Ok(changed == 1)
     }
 
     async fn update_status(
@@ -1360,6 +1421,114 @@ mod tests {
         assert!(s.get("a").await.unwrap().unwrap().heartbeat_at.is_none());
         s.heartbeat("a", "boot-1").await.unwrap(); // owner: stamps
         assert!(s.get("a").await.unwrap().unwrap().heartbeat_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn record_progress_is_owner_gated_and_running_only() {
+        use super::super::task_registry::{TaskProgress, TaskProgressTool};
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        s.create(rec("a", "main", 1, "boot-1")).await.unwrap();
+        let progress = TaskProgress {
+            last_activity_at: Some("2026-06-18T00:00:05Z".into()),
+            iterations: 2,
+            tools_completed: 1,
+            last_tool: Some(TaskProgressTool {
+                name: "shell".into(),
+                started_at: Some("2026-06-18T00:00:04Z".into()),
+                finished_at: Some("2026-06-18T00:00:05Z".into()),
+                success: Some(true),
+            }),
+            timeout_budget_secs: Some(300),
+            recent_tools: vec![TaskProgressTool {
+                name: "shell".into(),
+                ..TaskProgressTool::default()
+            }],
+            receipt_tail: vec!["zc-receipt:x".into()],
+        };
+
+        // Wrong boot: nothing written, heartbeat untouched.
+        assert!(
+            !s.record_progress("a", "boot-OTHER", &progress)
+                .await
+                .unwrap()
+        );
+        let snap = s.get_snapshot("a").await.unwrap().unwrap();
+        assert!(snap.progress.is_none());
+        assert!(snap.task.heartbeat_at.is_none());
+
+        // Owner: round-trips and stamps the heartbeat.
+        assert!(s.record_progress("a", "boot-1", &progress).await.unwrap());
+        let snap = s.get_snapshot("a").await.unwrap().unwrap();
+        assert_eq!(snap.progress.as_ref(), Some(&progress));
+        assert!(snap.task.heartbeat_at.is_some());
+
+        // Terminal row: no write, the last running-state progress stays.
+        s.update_status("a", TaskStatus::Completed, Some("done".into()), None)
+            .await
+            .unwrap();
+        let mut later = progress.clone();
+        later.iterations = 99;
+        assert!(!s.record_progress("a", "boot-1", &later).await.unwrap());
+        let snap = s.get_snapshot("a").await.unwrap().unwrap();
+        assert_eq!(snap.progress.as_ref().map(|p| p.iterations), Some(2));
+        assert_eq!(snap.output.as_deref(), Some("done"));
+
+        // A malformed value reads as absent, never as a snapshot error.
+        {
+            let conn = s.conn.lock();
+            conn.execute(
+                "UPDATE tasks SET progress = 'not json' WHERE id = ?1",
+                params!["a"],
+            )
+            .unwrap();
+        }
+        let snap = s.get_snapshot("a").await.unwrap().unwrap();
+        assert!(snap.progress.is_none());
+        assert_eq!(snap.output.as_deref(), Some("done"));
+    }
+
+    #[tokio::test]
+    async fn progress_column_migrates_from_v9() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteTaskStore::new(dir.path()).unwrap();
+        {
+            let conn = store.conn.lock();
+            conn.execute_batch(
+                "ALTER TABLE tasks DROP COLUMN progress;
+                 PRAGMA user_version = 9;",
+            )
+            .unwrap();
+        }
+        drop(store);
+
+        let reopened = SqliteTaskStore::new(dir.path()).unwrap();
+        {
+            let conn = reopened.conn.lock();
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, CONTROL_PLANE_SCHEMA_VERSION);
+            let has_column: i64 = conn
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM pragma_table_info('tasks')
+                         WHERE name = 'progress'
+                    )",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                has_column, 1,
+                "the v10 migration must add progress to an existing tasks table"
+            );
+        }
+        reopened
+            .create(rec("migrated", "main", 1, "boot-1"))
+            .await
+            .unwrap();
+        let snap = reopened.get_snapshot("migrated").await.unwrap().unwrap();
+        assert!(snap.progress.is_none());
     }
 
     #[tokio::test]
