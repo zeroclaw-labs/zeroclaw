@@ -3865,8 +3865,7 @@ enroll_url = \"https://gateway.example/zeroclaw\"
         let sidebar = std::thread::spawn(move || {
             sidebar_barrier.wait();
             for i in 0..20 {
-                persist_sidebar_visible(&sidebar_dir, i != 19)
-                    .expect("concurrent sidebar save");
+                persist_sidebar_visible(&sidebar_dir, i != 19).expect("concurrent sidebar save");
             }
         });
         theme.join().expect("theme persist thread");
