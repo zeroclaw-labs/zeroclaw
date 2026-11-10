@@ -4,7 +4,7 @@ use crate::xmpp_omemo::{
     inbox::{self, InboxCipher, Phase},
     private_store::PrivateStore,
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{os::unix::fs::MetadataExt, path::Path, sync::Arc};
 pub fn run(args: &[String]) -> Result<Value> {
@@ -171,7 +171,7 @@ fn inspect_session(
     let associated = store::load(tx, &format!("{prefix}associated_data"))?;
     let encoded = associated
         .as_str()
-        .ok_or_else(|| anyhow::anyhow!("Missing session identities"))?;
+        .context("Missing session identities")?;
     let bytes = URL_SAFE
         .decode(encoded)
         .or_else(|_| URL_SAFE_NO_PAD.decode(encoded))?;
@@ -292,7 +292,6 @@ fn recover_session(
 mod tests {
     use super::*;
     use crate::xmpp_omemo::channel_state::ChannelState;
-    use anyhow::Context;
     use std::os::unix::fs::PermissionsExt;
     #[test]
     fn reviewed_session_reset_preserves_identity_replay_and_uncertain_work() -> Result<()> {
