@@ -1,6 +1,6 @@
 # Provider registry dashboard evidence
 
-Captured on the reviewed fixes at `32fc34b4e0` (the exact revision and Web tree are recorded in `browser-results.json`).
+Captured on the reviewed fixes at `130f5f025e` (the exact revision and Web tree are recorded in `browser-results.json`).
 The follow-up evidence commit changes only these artifacts; the rendered Web
 source is identical. The app is the actual Vite dashboard at
 `/config/providers.registry?model=chat.fast.us`, rendered with headless Chromium
