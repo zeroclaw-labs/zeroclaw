@@ -123,6 +123,7 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
       return;
     }
     if (listening) { stopCapture(); return; }
+    if (silenceSeconds === null) return;
     stopSpeech(); setError('');
     const Constructor = recognitionConstructor();
     if (!Constructor || !window.isSecureContext) { setError(t('voice.unsupported')); return; }
@@ -216,7 +217,7 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
   const css = 'inline-flex h-10 w-10 shrink-0 items-center justify-center touch-manipulation select-none p-2 rounded-lg border border-pc-border hover:bg-pc-hover text-pc-text-secondary disabled:opacity-40';
   if (!ready || (!prefs.dictation && !prefs.reading)) return null;
   return <div ref={root} className="flex shrink-0 flex-wrap items-center gap-2 max-w-48">
-    {prefs.dictation && <button type="button" className={listening ? css + ' bg-pc-accent/20 ring-2 ring-pc-accent' : css} aria-label={t('voice.microphone')} title={t('voice.microphone')} aria-pressed={listening} onClick={() => void toggleMicrophone()}>{listening ? <Mic size={20} /> : <MicOff size={20} />}</button>}
+    {prefs.dictation && <button type="button" className={listening ? css + ' bg-pc-accent/20 ring-2 ring-pc-accent' : css} disabled={silenceSeconds === null} aria-label={t('voice.microphone')} title={t('voice.microphone')} aria-pressed={listening} onClick={() => void toggleMicrophone()}>{listening ? <Mic size={20} /> : <MicOff size={20} />}</button>}
     {prefs.reading && <button type="button" className={`${css} ${speaking || continuous ? 'bg-pc-accent/20 ring-2 ring-pc-accent' : ''}`} aria-label={t('voice.speaker')} title={t('voice.gesture')} aria-pressed={continuous} aria-busy={speaking}
       onPointerDown={event => {
         if (event.button !== 0) return;

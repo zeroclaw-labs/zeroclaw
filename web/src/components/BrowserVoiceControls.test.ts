@@ -677,3 +677,26 @@ test('global voice refresh is shared and disabled subscribers do not poll', asyn
     assert.equal(reads(), stopped);
   } finally { if (renderer) await act(async () => { renderer.unmount(); }); context.mock.timers.reset(); }
 });
+
+
+test('microphone waits for the initial global timeout before capture can start', async () => {
+  const originalFetch = globalThis.fetch;
+  let resolve!: (response: Response) => void;
+  const pending = new Promise<Response>(done => { resolve = done; });
+  globalThis.fetch = async (input, init) => String(input).startsWith('/api/config/prop') ? pending : originalFetch(input, init);
+  let renderer!: ReactTestRenderer;
+  try {
+    renderer = await mount();
+    const mic = () => renderer.root.findAllByType('button')[0]!;
+    assert.equal(mic().props.disabled, true);
+    await act(async () => { await mic().props.onClick(); });
+    assert.equal(mic().props['aria-pressed'], false);
+    await act(async () => { resolve(new Response(JSON.stringify({value:'15'}), {headers:{'Content-Type':'application/json'}})); });
+    assert.equal(mic().props.disabled, false);
+    await act(async () => { await mic().props.onClick(); });
+    assert.equal(mic().props['aria-pressed'], true);
+  } finally {
+    if (renderer) await act(async () => { renderer.unmount(); });
+    globalThis.fetch = originalFetch;
+  }
+});
