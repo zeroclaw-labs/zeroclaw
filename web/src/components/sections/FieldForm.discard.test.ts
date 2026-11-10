@@ -41,7 +41,7 @@ async function withForm(
     button: (text: string) => HTMLButtonElement;
     editField: (path: string, value: string) => Promise<void>;
     fieldValue: (path: string) => string;
-    holdListResponses: () => void;
+    holdListResponses: (opts?: { snapshot?: boolean }) => void;
     releaseListResponses: (order: "oldest-first" | "newest-first") => Promise<void>;
     pendingListResponses: () => number;
     failNextListResponses: (count?: number) => void;
@@ -91,8 +91,19 @@ async function withForm(
     "browser.native_webdriver_url": "http://127.0.0.1:9515",
   };
   let holdList = false;
+  let snapshotHeldList = false;
   let heldList: Array<() => void> = [];
   let listFailuresRemaining = 0;
+  const listPayload = (source: Record<string, string>) => ({
+    entries: Object.entries(source).map(([path, value]) => ({
+      path,
+      value,
+      populated: true,
+      is_secret: false,
+      kind: path.endsWith("enabled") ? "bool" : "string",
+      type_hint: path.endsWith("enabled") ? "bool" : "string",
+    })),
+  });
   globalThis.fetch = async (input, init) => {
     const url = String(input);
     if (url === "/api/config" && init?.method === "OPTIONS") {
@@ -109,18 +120,13 @@ async function withForm(
         return new Response("list failed", { status: 503 });
       }
       if (holdList) {
+        const snapshot = snapshotHeldList ? { ...values } : null;
         await new Promise<void>((resolve) => heldList.push(resolve));
+        if (snapshot) {
+          return Response.json(listPayload(snapshot));
+        }
       }
-      return Response.json({
-        entries: Object.entries(values).map(([path, value]) => ({
-          path,
-          value,
-          populated: true,
-          is_secret: false,
-          kind: path.endsWith("enabled") ? "bool" : "string",
-          type_hint: path.endsWith("enabled") ? "bool" : "string",
-        })),
-      });
+      return Response.json(listPayload(values));
     }
     assert.equal(url, "/api/config");
     assert.equal(init?.method, "PATCH");
@@ -173,8 +179,9 @@ async function withForm(
         await flushEffects();
       });
     };
-    const holdListResponses = () => {
+    const holdListResponses = (opts?: { snapshot?: boolean }) => {
       holdList = true;
+      snapshotHeldList = opts?.snapshot === true;
     };
     const pendingListResponses = () => heldList.length;
     const failNextListResponses = (count = 1) => {
@@ -514,6 +521,47 @@ test("Discard all keeps mounted fields visible while the refresh is pending", as
       assert.equal(document.getElementById("browser.session_name"), input);
       assert.equal(fieldValue("browser.session_name"), "discard-saved");
       assert.equal(button("Save").disabled, true);
+    },
+  );
+});
+
+test("Discard all does not let a pending refresh overwrite a saved toggle", async () => {
+  await withForm(
+    async ({
+      button,
+      editField,
+      holdListResponses,
+      releaseListResponses,
+      pendingListResponses,
+      patches,
+    }) => {
+      assert.equal(button("enabled").getAttribute("aria-pressed"), "true");
+      await editField("browser.session_name", "discarded-edit");
+      holdListResponses({ snapshot: true });
+      await act(async () => {
+        button("Discard all").click();
+        await flushEffects();
+      });
+      assert.ok(pendingListResponses() >= 1);
+      await act(async () => {
+        button("enabled").click();
+        await flushEffects();
+      });
+      assert.deepEqual(patches, [
+        [{ op: "replace", path: "browser.enabled", value: false }],
+      ]);
+      assert.equal(button("disabled").getAttribute("aria-pressed"), "false");
+      await releaseListResponses("oldest-first");
+      assert.equal(button("disabled").getAttribute("aria-pressed"), "false");
+      await act(async () => {
+        button("disabled").click();
+        await flushEffects();
+      });
+      assert.deepEqual(patches, [
+        [{ op: "replace", path: "browser.enabled", value: false }],
+        [{ op: "replace", path: "browser.enabled", value: true }],
+      ]);
+      assert.equal(button("enabled").getAttribute("aria-pressed"), "true");
     },
   );
 });

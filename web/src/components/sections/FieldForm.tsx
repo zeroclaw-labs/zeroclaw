@@ -1544,6 +1544,11 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
                 enabled={entryValue(enabledEntry) === "true"}
                 onChange={(next) => {
                   const nextStr = next ? "true" : "false";
+                  // Discard all may still have a background list request in
+                  // flight. Bump the load generation so that stale GET cannot
+                  // replace the just-persisted toggle (or a later click would
+                  // send the old value again).
+                  loadGeneration.current += 1;
                   setEntries((prev) =>
                     prev.map((e) =>
                       e.path === enabledEntry.path
