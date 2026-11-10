@@ -22,7 +22,9 @@ export function useConversationCost(
     pollerRef.current?.setVisible(visible && document.visibilityState !== 'hidden');
   }, [visible]);
   const blocked = useRef<'unsupported' | 'denied' | null>(null);
-  useEffect(() => { blocked.current = null; }, [connected, load]);
+  useEffect(() => {
+    if (blocked.current === 'unsupported') blocked.current = null;
+  }, [connected, load]);
   useEffect(() => {
     const resume = () => {
       if (blocked.current === 'denied') blocked.current = null;
