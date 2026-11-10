@@ -11467,6 +11467,8 @@ mod tool_lifecycle_abandonment_tests {
         let mut crumb_present = false;
         let mut injected_preamble = None;
         let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel(1);
+        let multimodal_config = zeroclaw_config::schema::MultimodalConfig::default();
+        let knobs = LoopKnobs::default();
         let mut turn = Box::pin(run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
             sop_reassembly: None,
@@ -11483,7 +11485,7 @@ mod tool_lifecycle_abandonment_tests {
                 observer,
                 silent: true,
                 approval: None,
-                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                multimodal_config: &multimodal_config,
                 config: None,
                 max_tool_iterations: 3,
                 hooks,
@@ -11502,7 +11504,7 @@ mod tool_lifecycle_abandonment_tests {
                 },
                 context_limits_resolver: None,
                 receipt_generator: None,
-                knobs: &LoopKnobs::default(),
+                knobs: &knobs,
                 security: None,
             },
             history: &mut history,
