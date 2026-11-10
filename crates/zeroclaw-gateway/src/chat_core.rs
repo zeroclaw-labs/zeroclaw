@@ -460,8 +460,14 @@ impl Chat {
                     return refusal(sender, &error).await;
                 };
                 match self.approve(request_id, decision).await {
-                    Ok(true) => None,
-                    Ok(false) => refusal(sender, &unacknowledged_approval()).await,
+                    Ok(result) if result.acknowledged => None,
+                    Ok(result) => {
+                        refusal(
+                            sender,
+                            &unacknowledged_approval(result.retryable == Some(true)),
+                        )
+                        .await
+                    }
                     Err(code) => Some(Stop::Close(code)),
                 }
             }
@@ -772,14 +778,16 @@ impl Chat {
                             } else if let Some((request_id, decision)) = approval_decision(&parsed) {
                                 let shown = turn.approval_receipts.remove(request_id);
                                 match self.approve(request_id, decision).await {
-                                    Ok(true) => {}
-                                    Ok(false) => {
-                                        // The core retains an unacknowledged request. Re-show
-                                        // its original preview because clients clear it on reply.
+                                    Ok(result) if result.acknowledged => {}
+                                    Ok(result) => {
+                                        // Only the core can establish whether the bound
+                                        // request was still pending when it refused an action.
+                                        let retryable = result.retryable == Some(true);
+                                        let shown = shown.filter(|_| retryable);
                                         if let Some(ref frame) = shown {
                                             turn.approval_receipts.insert(request_id.to_string(), frame.clone());
                                         }
-                                        if send(sender, &unacknowledged_approval()).await.is_err()
+                                        if send(sender, &unacknowledged_approval(retryable)).await.is_err()
                                             || if let Some(frame) = shown {
                                                 send(sender, &frame).await.is_err()
                                             } else {
@@ -829,7 +837,11 @@ impl Chat {
     /// when it no longer does; the answer was not sent.
     // `&mut self`: a shared borrow held across the call would need `Chat:
     // Sync`, which the session watch's pending recheck is not.
-    async fn approve(&mut self, request_id: &str, decision: &str) -> Result<bool, u16> {
+    async fn approve(
+        &mut self,
+        request_id: &str,
+        decision: &str,
+    ) -> Result<zeroclaw_rpc_proto::types::SessionApproveResult, u16> {
         let session_id = self.core.core_id.clone();
         let answer = json!({
             "session_id": session_id,
@@ -844,7 +856,7 @@ impl Chat {
             )
             .await
         {
-            Ok(Sent::Answered(result)) => Ok(result.acknowledged),
+            Ok(Sent::Answered(result)) => Ok(result),
             Ok(Sent::Renewed) => {
                 crate::dashboard_session::session_admits_now(&mut self.watch, &self.state).await?;
                 self.core
@@ -853,19 +865,18 @@ impl Chat {
                         answer,
                     )
                     .await
-                    .map(|result| result.acknowledged)
             }
             Err(failure) => Err(failure),
         };
         match delivered {
-            Ok(acknowledged) => {
-                if !acknowledged {
+            Ok(result) => {
+                if !result.acknowledged {
                     // The request may have waited while access was revoked.
                     // Do not redisplay its preview without rechecking access.
                     crate::dashboard_session::session_admits_now(&mut self.watch, &self.state)
                         .await?;
                 }
-                Ok(acknowledged)
+                Ok(result)
             }
             Err(failure) => {
                 ::zeroclaw_log::record!(
@@ -1168,10 +1179,10 @@ fn sop_approval_refusal() -> Value {
     })
 }
 
-fn unacknowledged_approval() -> Value {
+fn unacknowledged_approval(retryable: bool) -> Value {
     json!({
         "type": "error",
-        "message": "The approval action was not accepted; choose an available action",
+        "message": if retryable { "The approval action was not accepted; choose an available action" } else { "The approval request could not be confirmed; the turn may need to be retried" },
         "code": "APPROVAL_ACTION_UNAVAILABLE",
     })
 }

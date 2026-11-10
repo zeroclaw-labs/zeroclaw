@@ -206,6 +206,13 @@ events:
 Event types: `agent_message_chunk`, `agent_thought_chunk`, `tool_call`,
 `tool_result`, `approval_request`.
 
+For `session/approve`, `acknowledged` indicates whether the response was
+consumed. A refused persistent action on a still-pending strict request may
+also return `retryable: true`, allowing the owner to answer once instead.
+The field is omitted when retryability is unknown, including for expired or
+unmatched requests and older servers. It describes the request at response
+time; it can still expire before a subsequent answer.
+
 ### ACP durable lifecycle
 
 Native RPC keeps the original visible transcript separate from the retained provider context. Automatic trimming does not delete or renumber original transcript rows. A trim notification is sent only after its retained-context snapshot and covered checkpoint boundary have committed together; a failed write suppresses that notification. The snapshot excludes runtime system prompts, recalled-memory injection, and hidden reasoning. On interruption, recovery appends visible checkpoint progress once while restoring the model from the latest retained snapshot plus later checkpoint events. An explicitly empty retained snapshot remains authoritative. Sessions without a snapshot keep the legacy provider-safe replay path.

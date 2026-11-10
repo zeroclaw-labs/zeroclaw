@@ -136,6 +136,15 @@ impl ApprovalPendingMap {
             entry.strict_session_prompt_approval
                 && matches!(response, ChannelApprovalResponse::AlwaysApprove)
         }) {
+            // A timed-out receiver can close before its registration guard
+            // removes the entry. It cannot accept a later one-time answer.
+            if guard
+                .get(request_id)
+                .is_some_and(|entry| entry.tx.is_closed())
+            {
+                guard.remove(request_id);
+                return ApprovalResolution::Unknown;
+            }
             return ApprovalResolution::Rejected;
         }
         let entry = guard.remove(request_id);
@@ -907,6 +916,19 @@ mod tests {
             map.resolve_status("nonexistent", "sess-1", ChannelApprovalResponse::Deny),
             ApprovalResolution::Unknown
         );
+    }
+
+    #[test]
+    fn closed_strict_approval_is_not_retryable() {
+        let map = ApprovalPendingMap::default();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        map.insert_with_policy("expired".into(), "session".into(), tx, true);
+        drop(rx);
+        assert_eq!(
+            map.resolve_status("expired", "session", ChannelApprovalResponse::AlwaysApprove),
+            ApprovalResolution::Unknown
+        );
+        assert!(!map.contains("expired"));
     }
 
     #[test]

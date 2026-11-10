@@ -3346,6 +3346,13 @@
           "request_id": {
             "type": "string"
           },
+          "retryable": {
+            "description": "The bound request rejected this action and was still pending when\nthe response was produced. Missing means retryability is unknown.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "session_id": {
             "type": "string"
           }

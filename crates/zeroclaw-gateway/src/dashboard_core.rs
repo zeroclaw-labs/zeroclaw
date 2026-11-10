@@ -5703,6 +5703,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_stale_dashboard_approval_is_not_redisplayed() {
+        let fixture = Fixture::with_config(|config| {
+            config.channels.session_prompts_enabled = true;
+            config.channels.session_persistence = true;
+            config.tools.optional.extend(
+                zeroclaw_api::SESSION_PROMPT_TOOL_NAMES
+                    .iter()
+                    .map(|name| (*name).to_string()),
+            );
+            let chatters = config.permission_profiles.get_mut("chat-user").unwrap();
+            chatters.allowed_tools = vec!["session_prompt_set".to_string()];
+            chatters.grants.insert(Resource::Tools, vec![Verb::Execute]);
+        })
+        .await;
+        fixture._model.reset().await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/chat/completions"))
+            .and(body_string_contains("remember this task"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": {"role": "assistant", "content": null,
+                    "tool_calls": [{"id": "call_session_prompt_fixture", "type": "function",
+                        "function": {"name": "session_prompt_set",
+                            "arguments": "{\"id\":\"task\",\"content\":\"finish the report\"}"}}]},
+                    "finish_reason": "tool_calls"}]
+            })))
+            .with_priority(2)
+            .mount(&fixture._model)
+            .await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/chat/completions"))
+            .and(body_string_contains("remember this task"))
+            .and(body_string_contains("call_session_prompt_fixture"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(2))
+                    .set_body_json(
+                        json!({"choices":[{"message":{"role":"assistant","content":"done"}}]}),
+                    ),
+            )
+            .with_priority(1)
+            .mount(&fixture._model)
+            .await;
+        let addr = serve(fixture.router()).await;
+        let (alice, session) = fixture.sign_in("alice").await;
+        let mut socket = open_chat(addr, &alice, "support", "web-1").await.unwrap();
+        let start = await_frame(&mut socket, "session_start").await;
+        let core_id = start["session_id"].as_str().unwrap().to_string();
+        socket
+            .send(ClientMessage::Text(
+                json!({"type":"message", "content":"remember this task"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let approval = await_frame(&mut socket, "approval_request").await;
+        let request_id = approval["request_id"].as_str().unwrap();
+        let binding = fixture.auth.core_binding(&session).unwrap();
+        let (client, _) = binding.reach(&core_id).unwrap();
+        let result = client
+            .call::<Value>(
+                Method::SessionApprove,
+                json!({
+                    "session_id": core_id, "request_id": request_id, "decision": "reject"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["acknowledged"], true);
+        socket
+            .send(ClientMessage::Text(
+                json!({"type":"approval_response", "request_id":request_id, "decision":"always"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let refused = await_frame(&mut socket, "error").await;
+        assert_eq!(refused["code"], "APPROVAL_ACTION_UNAVAILABLE");
+        assert!(
+            refused["message"]
+                .as_str()
+                .unwrap()
+                .contains("could not be confirmed")
+        );
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(10), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if let ClientMessage::Text(text) = frame {
+                let value: Value = serde_json::from_str(&text).unwrap();
+                assert_ne!(
+                    value["type"], "approval_request",
+                    "stale preview was redisplayed: {value}"
+                );
+                if value["type"] == "done" {
+                    break;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn each_tabs_approval_reaches_that_tab() {
         let fixture = Fixture::with_config(asking_file_read).await;
         let addr = serve(fixture.router()).await;

@@ -10024,15 +10024,19 @@ impl RpcDispatcher {
             }
         };
 
-        let acknowledged =
+        let resolution =
             self.ctx
                 .approval_pending
-                .resolve(&p.request_id, &p.session_id, response);
+                .resolve_status(&p.request_id, &p.session_id, response);
+        let acknowledged = matches!(resolution, super::context::ApprovalResolution::Resolved);
+        let retryable =
+            matches!(resolution, super::context::ApprovalResolution::Rejected).then_some(true);
 
         to_result(SessionApproveResult {
             session_id: p.session_id,
             request_id: p.request_id,
             acknowledged,
+            retryable,
         })
     }
 
@@ -32383,7 +32387,54 @@ mod tests {
         assert_eq!(result["session_id"], "sess-1");
         assert_eq!(result["request_id"], "timed-out-req");
         assert_eq!(result["acknowledged"], false);
+        assert!(result.get("retryable").is_none());
         assert!(!dispatcher.ctx.approval_pending.contains("timed-out-req"));
+    }
+
+    #[tokio::test]
+    async fn strict_approval_only_reports_retry_for_its_bound_live_request() {
+        let dispatcher = make_approval_test_dispatcher();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        dispatcher.ctx.approval_pending.insert_with_policy(
+            "strict".into(),
+            "owner".into(),
+            tx,
+            true,
+        );
+        let answer = |session: &str, decision: &str| {
+            json!({
+                "session_id": session, "request_id": "strict", "decision": decision
+            })
+        };
+        let foreign = dispatcher
+            .handle_session_approve(&answer("other", "allow_always"))
+            .await
+            .unwrap();
+        assert_eq!(foreign["acknowledged"], false);
+        assert!(foreign.get("retryable").is_none());
+        let refused = dispatcher
+            .handle_session_approve(&answer("owner", "allow_always"))
+            .await
+            .unwrap();
+        assert_eq!(refused["acknowledged"], false);
+        assert_eq!(refused["retryable"], true);
+        assert!(rx.try_recv().is_err());
+        let accepted = dispatcher
+            .handle_session_approve(&answer("owner", "allow_once"))
+            .await
+            .unwrap();
+        assert_eq!(accepted["acknowledged"], true);
+        assert!(accepted.get("retryable").is_none());
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            zeroclaw_api::channel::ChannelApprovalResponse::Approve
+        );
+        let expired = dispatcher
+            .handle_session_approve(&answer("owner", "allow_always"))
+            .await
+            .unwrap();
+        assert_eq!(expired["acknowledged"], false);
+        assert!(expired.get("retryable").is_none());
     }
 
     #[tokio::test]

@@ -1533,6 +1533,10 @@ rpc_type! {
         pub session_id: String,
         pub request_id: String,
         pub acknowledged: bool,
+        /// The bound request rejected this action and was still pending when
+        /// the response was produced. Missing means retryability is unknown.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub retryable: Option<bool>,
     }
 }
 
@@ -2146,6 +2150,18 @@ mod tests {
             serde_json::to_value(TurnCompletionOutcome::Completed).unwrap(),
             json!("completed")
         );
+    }
+
+    #[test]
+    fn approval_result_retry_status_is_optional_on_the_wire() {
+        let old = serde_json::json!({"session_id":"s", "request_id":"r", "acknowledged":false});
+        let parsed: SessionApproveResult = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(parsed.retryable, None);
+        assert_eq!(serde_json::to_value(parsed).unwrap(), old);
+        let retry = serde_json::json!({"session_id":"s", "request_id":"r", "acknowledged":false, "retryable":true});
+        let parsed: SessionApproveResult = serde_json::from_value(retry.clone()).unwrap();
+        assert_eq!(parsed.retryable, Some(true));
+        assert_eq!(serde_json::to_value(parsed).unwrap(), retry);
     }
 
     #[test]

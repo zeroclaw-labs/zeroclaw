@@ -116,7 +116,7 @@ without losing these tools or their attached prompts. That option disables
 long-term memory, not durable Chat-session metadata. ACP sessions remain
 unsupported regardless of their memory setting.
 
-Gateway WebSocket chat also requires gateway session persistence:
+The gateway's operator WebSocket chat also requires gateway session persistence:
 
 ```toml
 [gateway]
@@ -125,11 +125,22 @@ session_persistence = true
 
 If `channels.session_prompts_enabled = true` but
 `gateway.session_persistence = false`, WebSocket chat turns fail closed with
-`SESSION_PROMPT_LOAD_FAILED` before provider dispatch; they do not proceed
-without the attached prompts. This combination is not rejected globally:
+`SESSION_PROMPT_LOAD_FAILED` before provider dispatch on that path; they do not
+proceed without the attached prompts. This combination is not rejected globally:
 channel-only deployments, such as Matrix, can use persistent session prompts
 without gateway session persistence. Enable gateway persistence and restart
-the gateway before using the feature through WebSocket chat.
+the gateway before using the operator WebSocket path.
+
+Scoped signed-in dashboard chats use the daemon's RPC Chat path instead. They
+use its configured session backend and refresh their configuration at each
+turn; the gateway persistence setting above does not select their backend.
+Each scoped chat opens a fresh core session and closes it when the socket
+closes. Closing does not delete its durable history or prompt attachments,
+but a later scoped chat uses a different session. Scoped dashboard accounts
+cannot reset or delete those sessions through the dashboard session endpoints.
+Remove an attachment with `session_prompt_delete` while its chat is open, or
+have an authorized operator remove the session. Expiry cleanup also removes it
+when that cleanup is configured and runs; do not assume expiry is enabled.
 
 An enabled configuration with another session backend is rejected. Prompt
 attachments are not available to cron jobs, delegates, subagents, one-shot
@@ -265,11 +276,12 @@ inbound message can then persist in later system prompts across daemon
 restarts until the attachment or owning session is removed.
 
 Approval-policy changes follow the existing configuration-generation boundary:
-RPC sessions refresh their configuration at turn entry; existing WebSocket
-connections retain their construction generation until reconnect, and channel
-runtimes require restart. Reconnect or restart the affected surface after
-tightening this policy. WebSocket feature availability is checked separately
-on each turn; that check does not refresh its approval policy. Update Web and
+RPC sessions, including scoped signed-in dashboard chats, refresh their
+configuration at turn entry; operator WebSocket connections retain their
+construction generation until reconnect, and channel runtimes require restart.
+Reconnect or restart the affected surface after tightening this policy. Operator
+WebSocket feature availability is checked separately on each turn; that check
+does not refresh its approval policy. Update Web and
 ZeroCode clients together with the daemon so strict requests do not display an
 obsolete "always approve" action. The daemon rejects that action from older
 clients without granting or consuming the pending one-time confirmation.
