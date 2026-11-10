@@ -219,6 +219,13 @@ jobs:
       - name: Test docs stable metadata promotion
         run: python3 scripts/docs/promote_stable_test.py
 
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: '.nvmrc'
+
+      - name: Test docs version selector and root 404 redirect
+        run: node --test scripts/docs/version_selector_test.mjs scripts/docs/root_404_test.mjs
+
   relay-container-smoke-changes:
     name: Detect Relay Container Smoke changes
     # Ordering note: this detector only runs `git diff` and never compiles, so it
