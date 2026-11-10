@@ -7,8 +7,11 @@
 //! a map of it:
 //!
 //! - every page gets a `<link rel="canonical">`: the stable copy of the same
-//!   page when one exists, itself otherwise (stable pages and master-only
-//!   pages);
+//!   page when one exists, itself otherwise (master-only pages). The stable
+//!   copy is named by its version-less URL under `stable/`, which
+//!   `gen-stable-alias` fills from the release dir after this step, so a new
+//!   release updates the canonical pages in place instead of moving all of
+//!   them to a new `/vX.Y.Z/` path;
 //! - pages of old versions that no longer exist in stable get
 //!   `<meta name="robots" content="noindex">`, because they describe removed
 //!   behaviour;
@@ -18,7 +21,7 @@
 //!   paragraph, so each page describes itself;
 //! - Open Graph and Twitter tags mirror the title, description and canonical;
 //! - `robots.txt` and `sitemap.xml` are written at the root, the sitemap
-//!   listing every stable page in every locale;
+//!   listing every stable page in every locale under `stable/`;
 //! - the shared rustdoc tree under `api/` and mdBook's per-locale `404.html`
 //!   get `noindex` and nothing else. The API reference is for readers who
 //!   follow a link from the book, not a search landing page: the umbrella
@@ -34,7 +37,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::versions::{is_version_dir, resolve_stable_in};
+use super::versions::{STABLE_ALIAS, is_version_dir, resolve_stable_in};
 
 const SEO_START: &str = "<!-- seo:start -->";
 const SEO_END: &str = "<!-- seo:end -->";
@@ -88,7 +91,7 @@ fn run_in(root: &Path) -> anyhow::Result<()> {
                     patched += 1;
                 }
                 if is_stable {
-                    sitemap.push(page_url(&site, version, locale, &rel));
+                    sitemap.push(page_url(&site, STABLE_ALIAS, locale, &rel));
                 }
             }
             let not_found = locale_root.join(NOT_FOUND_PAGE);
@@ -119,7 +122,8 @@ fn run_in(root: &Path) -> anyhow::Result<()> {
 /// Where a page's canonical points and whether it should be indexed.
 #[derive(Debug, PartialEq, Eq)]
 struct Placement {
-    /// `(version, locale, relative path)` of the canonical copy.
+    /// `(version path segment, locale, relative path)` of the canonical copy.
+    /// The segment is [`STABLE_ALIAS`] for the stable copy.
     canonical: (String, String, String),
     noindex: bool,
 }
@@ -135,15 +139,22 @@ fn classify(
     rel: &str,
 ) -> Placement {
     let this = (version.to_string(), locale.to_string(), rel.to_string());
+    let alias = || {
+        (
+            STABLE_ALIAS.to_string(),
+            locale.to_string(),
+            rel.to_string(),
+        )
+    };
     if is_stable {
         return Placement {
-            canonical: this,
+            canonical: alias(),
             noindex: false,
         };
     }
     let stable_copy = stable
         .filter(|s| root.join(s).join(locale).join(rel).is_file())
-        .map(|s| (s.to_string(), locale.to_string(), rel.to_string()));
+        .map(|_| alias());
     match stable_copy {
         Some(target) => Placement {
             canonical: target,
@@ -555,7 +566,7 @@ mod tests {
         fs::write(root.join("v0.8.5/en/kept.html"), "x").unwrap();
 
         let dup = classify(root, "master", false, Some("v0.8.5"), "en", "kept.html");
-        assert_eq!(dup.canonical.0, "v0.8.5");
+        assert_eq!(dup.canonical.0, STABLE_ALIAS);
         assert!(!dup.noindex);
 
         let fresh = classify(root, "master", false, Some("v0.8.5"), "en", "new.html");
@@ -567,7 +578,11 @@ mod tests {
         assert!(dropped.noindex, "pages the release removed are hidden");
 
         let stable = classify(root, "v0.8.5", true, Some("v0.8.5"), "en", "kept.html");
-        assert_eq!(stable.canonical.0, "v0.8.5");
+        assert_eq!(stable.canonical.0, STABLE_ALIAS);
+
+        let older = classify(root, "v0.8.4", false, Some("v0.8.5"), "fr", "kept.html");
+        assert_eq!(older.canonical.0, "v0.8.4", "no fr copy in stable");
+        assert!(older.noindex);
     }
 
     #[test]
@@ -657,12 +672,12 @@ mod tests {
         }
         let index = fs::read_to_string(root.join("v0.8.5/en/index.html")).unwrap();
         assert!(index.contains(
-            "<link rel=\"canonical\" href=\"https://docs.example/v0.8.5/en/index.html\">"
+            "<link rel=\"canonical\" href=\"https://docs.example/stable/en/index.html\">"
         ));
         assert!(!index.contains(noindex));
 
         let sitemap = fs::read_to_string(root.join("sitemap.xml")).unwrap();
-        assert!(sitemap.contains("<loc>https://docs.example/v0.8.5/en/index.html</loc>"));
+        assert!(sitemap.contains("<loc>https://docs.example/stable/en/index.html</loc>"));
         assert!(!sitemap.contains("404.html"));
         assert!(!sitemap.contains("/api/"));
 
@@ -680,6 +695,65 @@ mod tests {
             snapshot("v0.8.5/en/index.html"),
         ];
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn every_copy_of_a_stable_page_names_the_version_less_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("CNAME"), "docs.example\n").unwrap();
+        fs::write(root.join("stable-version.txt"), "v0.8.6\n").unwrap();
+        for page in [
+            "master/en/intro.html",
+            "master/en/index.html",
+            "master/en/new.html",
+            "v0.8.6/en/intro.html",
+            "v0.8.6/en/index.html",
+            "v0.8.6/fr/intro.html",
+            "v0.8.6/fr/index.html",
+            "v0.8.5/en/intro.html",
+            "v0.8.5/en/index.html",
+            "v0.8.5/en/gone.html",
+        ] {
+            fs::create_dir_all(root.join(page).parent().unwrap()).unwrap();
+            fs::write(root.join(page), PAGE).unwrap();
+        }
+
+        run_in(root).unwrap();
+
+        let read = |p: &str| fs::read_to_string(root.join(p)).unwrap();
+        let canonical =
+            "<link rel=\"canonical\" href=\"https://docs.example/stable/en/intro.html\">";
+        for copy in [
+            "master/en/intro.html",
+            "v0.8.6/en/intro.html",
+            "v0.8.5/en/intro.html",
+        ] {
+            assert!(read(copy).contains(canonical), "{copy}");
+        }
+        let stable = read("v0.8.6/en/intro.html");
+        assert!(
+            stable.contains("hreflang=\"fr\" href=\"https://docs.example/stable/fr/intro.html\"")
+        );
+        assert!(
+            stable.contains(
+                "hreflang=\"x-default\" href=\"https://docs.example/stable/en/intro.html\""
+            )
+        );
+        assert!(
+            !stable.contains("/v0.8.6/"),
+            "no release-pinned URL on the stable copy"
+        );
+        // Pages stable does not have keep their own URL.
+        assert!(
+            read("master/en/new.html").contains("href=\"https://docs.example/master/en/new.html\"")
+        );
+        assert!(read("v0.8.5/en/gone.html").contains("<meta name=\"robots\" content=\"noindex\">"));
+
+        let sitemap = read("sitemap.xml");
+        assert_eq!(sitemap.matches("<loc>").count(), 5, "{sitemap}");
+        assert!(sitemap.contains("<loc>https://docs.example/stable/fr/intro.html</loc>"));
+        assert!(!sitemap.contains("/v0.8.6/"));
     }
 
     #[test]
