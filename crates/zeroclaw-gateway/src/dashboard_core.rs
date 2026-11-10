@@ -571,6 +571,11 @@ pub(crate) struct CoreChat {
     /// The connection the conversation was created or last rebound on: the
     /// one its turns' updates and approval requests reach.
     bound: Arc<RpcClient>,
+    /// How many times [`Self::renew`] has replaced `client`, counted here
+    /// and nowhere else. A renewal can wait on the identity provider, so a
+    /// caller that checked the session before a call compares this to tell
+    /// whether one came between.
+    renewals: u64,
     identity: TuiIdentity,
     credential: CoreCredential,
     closing: Option<Closing>,
@@ -803,8 +808,14 @@ impl CoreChat {
             self.client.shutdown();
         }
         self.client = fresh;
+        self.renewals += 1;
         self.caller.binding.moved(&self.core_id, &self.client);
         Ok(())
+    }
+
+    /// How many times the chat's connection has been renewed.
+    pub(crate) fn renewals(&self) -> u64 {
+        self.renewals
     }
 
     /// Before a turn: make sure the conversation is bound to the connection
@@ -1417,6 +1428,7 @@ impl CoreCaller {
             cwd: cwd.map(str::to_string),
             client: Arc::clone(&client),
             bound: client,
+            renewals: 0,
             identity,
             credential,
             closing: Some(closing),
@@ -6839,6 +6851,117 @@ mod tests {
         an_approval_renewed_across_a_narrowed_grant_is_not_sent(|profile| {
             profile.allowed_agents = vec!["other".into()];
         })
+        .await;
+    }
+
+    /// Send a message on alice's chat while the handshake it leads to is
+    /// held at the identity provider, narrow her profile by `change` for the
+    /// gateway and the core alike once the core is verifying it, and release
+    /// it. The core takes a prompt without `sessions:read` or
+    /// `sessions:update`, so only the chat's own check can stop it: the chat
+    /// must close with `4403`, and the message must never reach the model.
+    async fn a_prompt_across_a_narrowed_grant_is_not_sent(
+        fixture: &Fixture,
+        socket: &mut ChatSocket,
+        change: impl Fn(&mut PermissionProfileConfig),
+    ) {
+        let marker = "sent across the narrowing";
+        slow_introspections(fixture, "alice", "chatters", HELD_HANDSHAKE, (1, 1)).await;
+        let before = introspections_of(&fixture._idp, "tok-alice").await;
+        let message = json!({ "type": "message", "content": marker });
+        socket
+            .send(ClientMessage::Text(message.to_string().into()))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while introspections_of(&fixture._idp, "tok-alice").await <= before {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the handshake reaches the identity provider");
+        fixture.narrow_profile_everywhere("chat-user", change);
+
+        // Past the held handshake's end, the prompt never reached the model.
+        tokio::time::sleep(HELD_HANDSHAKE + Duration::from_secs(1)).await;
+        assert_eq!(
+            model_requests_with(&fixture._model, marker).await,
+            0,
+            "the prompt reached the core after the account lost the chat"
+        );
+        let (frames, code) = read_to_close(socket).await;
+        assert_eq!(
+            code,
+            Some(crate::dashboard_session::WS_CLOSE_ACCESS_LOST),
+            "{frames:?}"
+        );
+    }
+
+    /// [`a_prompt_across_a_narrowed_grant_is_not_sent`] past the chat's
+    /// connection's deadline: the core refuses the prompt before its turn
+    /// runs, and the turn renews the connection.
+    async fn a_prompt_renewed_across_a_narrowed_grant_is_not_sent(
+        change: impl Fn(&mut PermissionProfileConfig),
+    ) -> Fixture {
+        let fixture = revalidating_fixture(|_| {}).await;
+        let addr = serve(fixture.router()).await;
+        let (alice, _) = fixture.sign_in("alice").await;
+        let (mut socket, _) = chat_in(addr, &alice, "web-1").await;
+        tokio::time::sleep(PAST_THE_REVALIDATION).await;
+        a_prompt_across_a_narrowed_grant_is_not_sent(&fixture, &mut socket, change).await;
+        fixture
+    }
+
+    /// [`a_prompt_across_a_narrowed_grant_is_not_sent`] after the chat's
+    /// connection drops between turns: the next turn's rebind renews it.
+    async fn a_prompt_rebound_across_a_narrowed_grant_is_not_sent(
+        change: impl Fn(&mut PermissionProfileConfig),
+    ) -> Fixture {
+        let fixture = Fixture::new().await;
+        let addr = serve(fixture.router()).await;
+        let (alice, alice_session) = fixture.sign_in("alice").await;
+        let (mut socket, core_id) = chat_in(addr, &alice, "web-1").await;
+        let binding = fixture
+            .auth
+            .core_binding(&alice_session)
+            .expect("signed in");
+        let (client, _) = binding.reach(&core_id).expect("the chat is open");
+        client.shutdown();
+        tokio::time::timeout(Duration::from_secs(5), client.closed())
+            .await
+            .expect("the connection closes");
+        a_prompt_across_a_narrowed_grant_is_not_sent(&fixture, &mut socket, change).await;
+        fixture
+    }
+
+    #[tokio::test]
+    async fn a_prompt_renewed_after_its_account_loses_sessions_read_is_not_sent() {
+        a_prompt_renewed_across_a_narrowed_grant_is_not_sent(|profile| {
+            without_session_verb(profile, Verb::Read);
+        })
+        .await
+        .assert_nothing_live("the chat closed when its account lost it")
+        .await;
+    }
+
+    /// Closing the conversation takes `sessions:update` too, which the core
+    /// no longer grants the account, so the close fails and the conversation
+    /// stays charged to it, as any failed close leaves it.
+    #[tokio::test]
+    async fn a_prompt_renewed_after_its_account_loses_sessions_update_is_not_sent() {
+        a_prompt_renewed_across_a_narrowed_grant_is_not_sent(|profile| {
+            without_session_verb(profile, Verb::Update);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_prompt_rebound_after_its_account_loses_sessions_read_is_not_sent() {
+        a_prompt_rebound_across_a_narrowed_grant_is_not_sent(|profile| {
+            without_session_verb(profile, Verb::Read);
+        })
+        .await
+        .assert_nothing_live("the chat closed when its account lost it")
         .await;
     }
 

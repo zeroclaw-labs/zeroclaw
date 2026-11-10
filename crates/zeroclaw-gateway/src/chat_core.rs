@@ -473,6 +473,12 @@ impl Chat {
 
     /// Run one turn. A connection whose binding lapsed before the turn ran
     /// is replaced once, and the conversation rebound on the new one.
+    ///
+    /// A renewal can wait on the identity provider, and the core takes a
+    /// prompt without `sessions:read` or `sessions:update`. So after a
+    /// renewal the session is checked again, as [`Self::on_frame`] checks
+    /// it, before the rebind and before the prompt. A session that no longer
+    /// admits the chat closes it, and no prompt is sent.
     async fn turn(
         &mut self,
         sender: &mut Sender,
@@ -482,14 +488,24 @@ impl Chat {
         content: &str,
     ) -> Option<Stop> {
         let mut renewed = false;
+        // The session was checked as the frame arrived, after every renewal
+        // so far.
+        let mut checked = self.core.renewals();
         loop {
+            if let Err(code) = self.admits_after_renewal(&mut checked).await {
+                return Some(Stop::Close(code));
+            }
             // A new handshake may have replaced the chat's connection since
             // the conversation was bound; rebind it there first, so its
-            // approval requests reach this socket.
+            // approval requests reach this socket. The rebind renews a
+            // connection that dropped, or whose binding lapsed.
             match self.core.rebind().await {
                 Ok(()) => {}
                 Err(CoreFailure::NotFound) => return conversation_closed(sender).await,
                 Err(failure) => return turn_failed(sender, failure).await,
+            }
+            if let Err(code) = self.admits_after_renewal(&mut checked).await {
+                return Some(Stop::Close(code));
             }
             match self
                 .relay_turn(sender, receiver, ping, stopping, content)
@@ -509,6 +525,18 @@ impl Chat {
                 }
             }
         }
+    }
+
+    /// Check the session again if the chat's connection was renewed since
+    /// `checked`, the renewals it was last checked after. `Err` carries the
+    /// close code when it no longer admits the chat.
+    async fn admits_after_renewal(&mut self, checked: &mut u64) -> Result<(), u16> {
+        let renewals = self.core.renewals();
+        if renewals != *checked {
+            crate::dashboard_session::session_admits_now(&mut self.watch, &self.state).await?;
+            *checked = renewals;
+        }
+        Ok(())
     }
 
     /// Prompt the core and relay the turn to the socket.
