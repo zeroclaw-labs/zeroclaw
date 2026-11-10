@@ -930,6 +930,12 @@ pub struct RpcDispatcher {
     /// The transport-intrinsic credential (kernel peer uid on local
     /// sockets), presented during `initialize` when no explicit token is.
     transport_credential: crate::security::auth_provider::Credential,
+    /// The signed-in principal and the OIDC provider as configured at sign-in,
+    /// that this connection's bearer is bound to. Set by the side that opens
+    /// the connection, never by the client: every `initialize` on it is
+    /// verified with [`crate::rpc::auth::RpcInboundAuth::authenticate_bound`],
+    /// so a provider repointed since then never receives the bearer.
+    auth_binding: Option<super::inproc::OidcSessionBinding>,
     /// TUI session UID assigned during `initialize`. Used for registry
     /// cleanup on disconnect.
     tui_id: Option<String>,
@@ -1119,6 +1125,7 @@ impl RpcDispatcher {
             auth: None,
             transport_kind: crate::rpc::transport::TransportKind::Local,
             transport_credential: crate::security::auth_provider::Credential::None,
+            auth_binding: None,
             tui_id: None,
             tui_epoch: None,
             peer_label,
@@ -1184,6 +1191,14 @@ impl RpcDispatcher {
     ) -> Self {
         self.transport_kind = kind;
         self.transport_credential = credential;
+        self
+    }
+
+    /// Bind this connection's bearer to one OIDC provider; see the
+    /// `auth_binding` field.
+    #[must_use]
+    pub fn with_auth_binding(mut self, binding: Option<super::inproc::OidcSessionBinding>) -> Self {
+        self.auth_binding = binding;
         self
     }
 
@@ -2094,6 +2109,14 @@ impl RpcDispatcher {
         std::collections::HashMap::new()
     }
 
+    /// A caller that is not this host's local IPC: the WSS listener, or the
+    /// in-process seam, which relays a remote browser. Local-only behaviour
+    /// that keys on the peer keys on this, never on the peer label alone.
+    fn is_remote_caller(&self) -> bool {
+        self.peer_label.starts_with("wss:")
+            || self.transport_kind == crate::rpc::transport::TransportKind::Inproc
+    }
+
     fn may_use_forwarded_environment(
         &self,
         grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
@@ -2986,6 +3009,7 @@ impl RpcDispatcher {
             auth: self.auth.clone(),
             transport_kind: self.transport_kind,
             transport_credential: self.transport_credential.clone(),
+            auth_binding: self.auth_binding.clone(),
             tui_id: self.tui_id.clone(),
             // Same connection, so the same registration: this handle shares the
             // parent's epoch rather than claiming one of its own. It never runs
@@ -3746,20 +3770,52 @@ impl RpcDispatcher {
         // authority — a credential is re-presented on every initialize, so
         // reconnect can never outlive or bypass the authentication that
         // created it.
-        let connection_auth = match self
-            .ctx
-            .auth
-            .authenticate(
-                self.transport_kind,
-                self.transport_credential.clone(),
-                req.auth_token.as_deref(),
-                req.auth_provider.as_deref(),
-            )
-            .await
-        {
+        let verified = match (
+            &self.auth_binding,
+            req.auth_token.as_deref(),
+            req.auth_provider.as_deref(),
+        ) {
+            // A bound connection presents its bearer only to the provider it
+            // is bound to, and nothing else.
+            (Some(binding), Some(token), Some(provider)) => {
+                self.ctx
+                    .auth
+                    .authenticate_bound(self.transport_kind, token, provider, &binding.provider)
+                    .await
+            }
+            (Some(_), _, _) => {
+                return Err(rpc_err(
+                    AUTH_REQUIRED,
+                    "This connection requires its bound bearer and provider",
+                ));
+            }
+            (None, token, provider) => {
+                self.ctx
+                    .auth
+                    .authenticate(
+                        self.transport_kind,
+                        self.transport_credential.clone(),
+                        token,
+                        provider,
+                    )
+                    .await
+            }
+        };
+        let connection_auth = match verified {
             Ok(auth) => auth,
             Err(denied) => return Err(rpc_err(denied.code, denied.message)),
         };
+
+        if self
+            .auth_binding
+            .as_ref()
+            .is_some_and(|binding| binding.principal_id != connection_auth.principal.id)
+        {
+            return Err(rpc_err(
+                AUTH_REQUIRED,
+                crate::i18n::get_required_cli_string("rpc-auth-credential-rejected"),
+            ));
+        }
 
         // TUI identity: reconnect with previous credentials or generate new
         let tui_id = if let (Some(claimed_id), Some(sig)) =
@@ -7139,12 +7195,13 @@ impl RpcDispatcher {
                 .agent_workspace_dir(&agent_alias)
                 .to_string_lossy()
                 .to_string();
-            let is_wss = self.peer_label.starts_with("wss:");
+            let is_remote = self.is_remote_caller();
             // Resolve + authorize attachment sources once; the returned slots
             // are index-aligned with req.attachments and carry the exact
-            // canonical target each read must bind to. On WSS, path sources are
-            // rejected inside process_file_entry, so no resolution is needed.
-            let attachment_sources = if is_wss {
+            // canonical target each read must bind to. For a remote caller,
+            // path sources are rejected inside process_file_entry, so no
+            // resolution is needed.
+            let attachment_sources = if is_remote {
                 Vec::new()
             } else {
                 match self.authorize_attachment_sources(
@@ -7178,7 +7235,7 @@ impl RpcDispatcher {
                         entry,
                         sid,
                         &upload_root,
-                        is_wss,
+                        is_remote,
                         source,
                         &self.ctx.sessions,
                     ) => result?,
@@ -12743,11 +12800,11 @@ impl RpcDispatcher {
             .upload_target(Method::FileAttach, &req.session_id)
             .await?;
 
-        let is_wss = self.peer_label.starts_with("wss:");
+        let is_remote = self.is_remote_caller();
         // Resolve + authorize once; the returned slots are index-aligned with
-        // req.files and carry the exact canonical target each read binds to. On
-        // WSS, path sources are rejected in load_file_entry.
-        let attachment_sources = if is_wss {
+        // req.files and carry the exact canonical target each read binds to.
+        // For a remote caller, path sources are rejected in load_file_entry.
+        let attachment_sources = if is_remote {
             Vec::new()
         } else {
             self.authorize_attachment_sources(
@@ -12763,7 +12820,7 @@ impl RpcDispatcher {
 
         for (idx, entry) in req.files.iter().enumerate() {
             let source = attachment_sources.get(idx).and_then(|s| s.as_ref());
-            let (bytes, filename) = load_file_entry(entry, is_wss, source).await?;
+            let (bytes, filename) = load_file_entry(entry, is_remote, source).await?;
             total_bytes += bytes.len() as u64;
             if total_bytes > MAX_REQUEST_BYTES {
                 return Err(rpc_err(
@@ -13454,7 +13511,7 @@ impl RpcDispatcher {
         // itself, which is the entitlement this method relies on. Lift the
         // refusal once there is a principal to authorize run contents against,
         // and replace it with that check rather than simply removing it.
-        if self.peer_label.starts_with("wss:") {
+        if self.is_remote_caller() {
             return Err(rpc_err(
                 AUTH_REQUIRED,
                 "sops/run-detail is not served over remote WSS: the transport has no \
@@ -13749,7 +13806,7 @@ impl RpcDispatcher {
         // socket itself. Checked before the params are parsed so a refused
         // caller learns nothing about which SOPs exist. Replace this with a
         // principal check once there is one, rather than removing it.
-        if self.peer_label.starts_with("wss:") {
+        if self.is_remote_caller() {
             return Err(rpc_err(
                 AUTH_REQUIRED,
                 "sops/rename is not served over remote WSS: the transport has no \

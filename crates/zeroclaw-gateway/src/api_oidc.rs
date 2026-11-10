@@ -1172,6 +1172,7 @@ fn pair_first() -> Response {
 async fn handle_auth_session(
     State(state): State<AppState>,
     caller: Option<Extension<DashboardCaller>>,
+    core: Option<Extension<crate::core_rpc::CoreRpc>>,
     headers: HeaderMap,
 ) -> Response {
     if let Some(token) = crate::api::extract_bearer_token(&headers).filter(|t| !t.is_empty()) {
@@ -1184,17 +1185,37 @@ async fn handle_auth_session(
     match caller {
         Some(Extension(DashboardCaller::Session(session))) => {
             let admin = session.is_admin();
+            // Inside the daemon a scoped account's chat and conversations go
+            // through the core, which applies its grants. An administrator
+            // keeps the in-process chat and its history, which is also the
+            // only chat outside the daemon, where there is no core to reach.
+            let core_sessions = !admin
+                && core
+                    .as_ref()
+                    .is_some_and(|Extension(core)| core.connector().is_some());
+            // Chat through the core also needs the grants to use and close a
+            // conversation; see `dashboard_core::may_chat`.
+            let chat = admin || (core_sessions && crate::dashboard_core::may_chat(&session.grants));
+            // On the core path the session ends a little before its token
+            // expires, while its conversations can still be closed.
+            let expires_at = if core_sessions {
+                session
+                    .expires_at
+                    .saturating_sub(crate::dashboard_core::CLOSE_BEFORE_EXPIRY.as_secs())
+            } else {
+                session.expires_at
+            };
             Json(serde_json::json!({
                 "kind": "oidc",
                 "provider": format!("oidc.{}", session.alias),
                 "principal_id": session.principal().id.as_str(),
                 "display_name": session.display_name,
                 "admin": admin,
-                "expires_at": session.expires_at,
+                "expires_at": expires_at,
                 "csrf_token": session.csrf,
                 "features": {
-                    // Chat for other accounts needs the core session path.
-                    "chat": admin,
+                    "chat": chat,
+                    "core_sessions": core_sessions,
                     "operator_pages": admin,
                     // The config routes' own read rule; an administrator's
                     // grants permit everything, so it covers them too.

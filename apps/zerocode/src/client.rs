@@ -639,6 +639,18 @@ impl fmt::Display for DaemonRpcTimeout {
     }
 }
 
+/// The daemon's reason when it refused an RPC for the caller's permissions
+/// (`FORBIDDEN`): the principal lacks the method's grant, or the method is
+/// limited to administrators. Read from the structured error, never from its
+/// text. Like a stalled call, one pane's refusal is not a reason to exit the
+/// TUI: a pane that only reads shows the reason and stays open.
+pub(crate) fn forbidden_reason(error: &anyhow::Error) -> Option<&str> {
+    error
+        .downcast_ref::<crate::jsonrpc::JsonRpcError>()
+        .filter(|error| error.code == crate::jsonrpc::error_codes::FORBIDDEN)
+        .map(|error| error.message.as_str())
+}
+
 impl std::error::Error for DaemonRpcTimeout {}
 
 #[derive(Debug)]

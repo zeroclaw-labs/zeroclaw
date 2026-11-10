@@ -14188,6 +14188,8 @@ dependencies = [
  "zeroclaw-memory",
  "zeroclaw-plugins",
  "zeroclaw-providers",
+ "zeroclaw-rpc-client",
+ "zeroclaw-rpc-proto",
  "zeroclaw-runtime",
  "zeroclaw-spawn",
  "zeroclaw-tls",
@@ -14422,6 +14424,17 @@ version = "0.8.7"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "zeroclaw-rpc-client"
+version = "0.8.7"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+ "zeroclaw-api",
+ "zeroclaw-rpc-proto",
 ]
 
 [[package]]
