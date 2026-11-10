@@ -12,6 +12,7 @@ import type {
   Session,
   ChannelDetail,
   SessionMessagesResponse,
+  SessionStateResponse,
   TuiEntry,
 } from "../types/api";
 import type { components } from "./api-generated";
@@ -2250,6 +2251,21 @@ export function getSessionMessages(
 ): Promise<SessionMessagesResponse> {
   return apiFetch<SessionMessagesResponse>(
     `/api/sessions/${encodeURIComponent(id)}/messages`,
+  );
+}
+
+/**
+ * Whether a persisted session's turn is still running on the gateway. The
+ * signal lets a caller that stops watching cancel the request rather than
+ * leave it to finish unobserved.
+ */
+export function getSessionState(
+  id: string,
+  signal?: AbortSignal,
+): Promise<SessionStateResponse> {
+  return apiFetch<SessionStateResponse>(
+    `/api/sessions/${encodeURIComponent(id)}/state`,
+    signal ? { signal } : {},
   );
 }
 
