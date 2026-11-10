@@ -15,7 +15,7 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
 }) {
   const { preferences: prefs, ready } = useVoicePreferences();
   const voices = useBrowserVoices();
-  const { seconds: silenceSeconds } = useGlobalVoiceTimeout();
+  const { seconds: silenceSeconds } = useGlobalVoiceTimeout(ready && prefs.dictation);
   const silenceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const autoSubmit = useRef(false);
   const submitCancellation = useRef(0);

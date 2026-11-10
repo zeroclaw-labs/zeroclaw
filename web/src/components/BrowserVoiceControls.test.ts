@@ -654,3 +654,26 @@ test('visible clients refresh the global timeout without a focus event', async (
     context.mock.timers.reset(); globalSilenceSeconds = previous;
   }
 });
+
+
+test('global voice refresh is shared and disabled subscribers do not poll', async (context) => {
+  const { useGlobalVoiceTimeout } = await import('../lib/browserVoice.ts');
+  context.mock.timers.enable({ apis: ['setInterval'] });
+  function Probe({ enabled }: { enabled: boolean }) { useGlobalVoiceTimeout(enabled); return null; }
+  let renderer!: ReactTestRenderer;
+  const reads = () => requests.filter(request => request.path.includes('/api/config/') && request.method === 'GET').length;
+  try {
+    await act(async () => { renderer = create(createElement(Probe, { enabled: false })); });
+    const initial = reads();
+    await act(async () => { context.mock.timers.tick(6000); });
+    assert.equal(reads(), initial);
+    await act(async () => { renderer.update(createElement('div', null, createElement(Probe, { enabled: true }), createElement(Probe, { enabled: true }))); });
+    const before = reads();
+    await act(async () => { context.mock.timers.tick(2000); });
+    assert.equal(reads(), before + 1);
+    await act(async () => { renderer.unmount(); });
+    const stopped = reads();
+    await act(async () => { context.mock.timers.tick(6000); });
+    assert.equal(reads(), stopped);
+  } finally { if (renderer) await act(async () => { renderer.unmount(); }); context.mock.timers.reset(); }
+});

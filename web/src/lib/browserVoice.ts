@@ -159,28 +159,60 @@ export async function readGlobalVoiceTimeout(): Promise<number> {
   return value;
 }
 
-export function useGlobalVoiceTimeout() {
-  const [seconds, setSeconds] = useState<number | null>(null);
-  const [error, setError] = useState(false);
-  useEffect(() => {
+type GlobalVoiceState = { seconds: number | null; error: boolean };
+let globalVoiceState: GlobalVoiceState = { seconds: null, error: false };
+const globalVoiceListeners = new Set<(state: GlobalVoiceState) => void>();
+let stopGlobalVoiceRefresh: (() => void) | undefined;
+
+function subscribeGlobalVoice(listener: (state: GlobalVoiceState) => void) {
+  globalVoiceListeners.add(listener);
+  listener(globalVoiceState);
+  if (!stopGlobalVoiceRefresh) {
     let active = true;
     let version = 0;
+    let pending = false;
     const refresh = async () => {
+      if (pending || document.visibilityState !== 'visible') return;
+      pending = true;
       const current = ++version;
-      try {
-        const value = await readGlobalVoiceTimeout();
-        if (active && current === version) { setSeconds(value); setError(false); }
-      } catch { if (active && current === version) { setSeconds(null); setError(true); } }
+      let next: GlobalVoiceState;
+      try { next = { seconds: await readGlobalVoiceTimeout(), error: false }; }
+      catch { next = { seconds: null, error: true }; }
+      pending = false;
+      if (active && current === version && (next.seconds !== globalVoiceState.seconds || next.error !== globalVoiceState.error)) {
+        globalVoiceState = next;
+        for (const notify of globalVoiceListeners) notify(next);
+      }
     };
-    const visible = () => { if (document.visibilityState === 'visible') void refresh(); };
     window.addEventListener('focus', refresh);
     window.addEventListener('zeroclaw-config-mutated', refresh);
-    document.addEventListener('visibilitychange', visible);
-    const poll = setInterval(visible, 2000);
+    document.addEventListener('visibilitychange', refresh);
+    const poll = setInterval(() => void refresh(), 2000);
+    stopGlobalVoiceRefresh = () => {
+      active = false;
+      clearInterval(poll);
+      window.removeEventListener('focus', refresh);
+      window.removeEventListener('zeroclaw-config-mutated', refresh);
+      document.removeEventListener('visibilitychange', refresh);
+    };
     void refresh();
-    return () => { active = false; clearInterval(poll); window.removeEventListener('focus', refresh); window.removeEventListener('zeroclaw-config-mutated', refresh); document.removeEventListener('visibilitychange', visible); };
-  }, []);
-  return { seconds, error };
+  }
+  return () => {
+    globalVoiceListeners.delete(listener);
+    if (!globalVoiceListeners.size) {
+      stopGlobalVoiceRefresh?.(); stopGlobalVoiceRefresh = undefined;
+      globalVoiceState = { seconds: null, error: false };
+    }
+  };
+}
+
+export function useGlobalVoiceTimeout(enabled = true) {
+  const [state, setState] = useState<GlobalVoiceState>({ seconds: null, error: false });
+  useEffect(() => {
+    if (!enabled) { setState({ seconds: null, error: false }); return; }
+    return subscribeGlobalVoice(setState);
+  }, [enabled]);
+  return state;
 }
 
 export async function saveGlobalVoiceTimeout(seconds: number) {
