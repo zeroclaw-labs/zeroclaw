@@ -120,7 +120,7 @@ class PromotionTest(unittest.TestCase):
         self.promote()
         after = self.snapshot()
         changed = {name for name in before.keys() | after.keys() if before.get(name) != after.get(name)}
-        self.assertEqual(changed, {"stable-version.txt", "versions.json", "index.html",
+        self.assertEqual(changed, {"stable-version.txt", "versions.json", "index.html", "sitemap.xml",
                                    "stable/.docs-source-commit", "stable/en/index.html",
                                    "stable/fr/index.html"})
         self.assertEqual(self.tree("stable"), self.tree(TAG))
@@ -185,6 +185,43 @@ class PromotionTest(unittest.TestCase):
         before = self.snapshot()
         self.promote(check_only=True)
         self.assertEqual(self.snapshot(), before)
+
+    def test_sitemap_lists_the_promoted_release_under_the_alias(self):
+        self.write("CNAME", "docs.example.com\n")
+        # The old stable release had a page this release removes.
+        self.write("v0.9.0/en/removed.html", "dropped in v0.10.0")
+        self.write("stable/en/removed.html", "dropped in v0.10.0")
+        self.write("sitemap.xml", "<urlset><url><loc>https://docs.example.com/stable/en/removed.html</loc></url></urlset>\n")
+        # A page new in this release, nested pages, and the files gen-seo skips.
+        for name in ["en/new/page.html", "en/a/b.html", "en/a-b.html", "en/print.html",
+                     "en/toc.html", "en/404.html", "en/guide/print.html", "fr/a&b.html"]:
+            self.write(f"{TAG}/{name}", name)
+        self.write(f"{TAG}/en/notes.txt", "not a page")
+        self.promote()
+        site = "https://docs.example.com"
+        pages = ["en/a/b.html", "en/a-b.html", "en/chapter.html", "en/index.html", "en/new/page.html",
+                 "fr/a&amp;b.html", "fr/chapter.html", "fr/index.html"]
+        expected = ('<?xml version="1.0" encoding="UTF-8"?>\n'
+                    '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+                    f"  <url><loc>{site}/</loc></url>\n"
+                    + "".join(f"  <url><loc>{site}/stable/{page}</loc></url>\n" for page in pages)
+                    + "</urlset>\n")
+        self.assertEqual((self.pages / "sitemap.xml").read_text(), expected)
+        self.assertFalse((self.pages / "stable/en/removed.html").exists())
+        before = self.snapshot()
+        self.promote()  # Retry is idempotent.
+        self.assertEqual(self.snapshot(), before)
+
+    def test_check_only_leaves_the_sitemap_alone(self):
+        self.write("CNAME", "docs.example.com\n")
+        self.write(f"{TAG}/en/new.html", "new in v0.10.0")
+        before = self.snapshot()
+        self.promote(check_only=True)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_empty_cname_rejected_before_any_write(self):
+        self.write("CNAME", "\n")
+        self.rejected("CNAME is empty")
 
     def test_check_only_validates_without_writes(self):
         before = self.snapshot()
@@ -444,7 +481,7 @@ class PromotionTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(git(remote, "rev-list", "--count", "gh-pages"), "1")
         changed = git(remote, "diff", "--name-only", before_sha, "gh-pages").splitlines()
-        self.assertEqual(changed, ["index.html", "llms-full.txt", "llms.txt",
+        self.assertEqual(changed, ["index.html", "llms-full.txt", "llms.txt", "sitemap.xml",
                                    "stable-version.txt", "stable/.docs-source-commit",
                                    "stable/en/index.html", "stable/en/llms-full.txt",
                                    "stable/en/llms.txt", "stable/fr/index.html",
