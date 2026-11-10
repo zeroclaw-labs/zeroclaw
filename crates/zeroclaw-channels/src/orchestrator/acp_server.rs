@@ -6348,7 +6348,7 @@ mod tests {
             }],
             reasoning_content: None,
         };
-        let replay = history_notifications_for_message("sid", &history);
+        let replay = history_notifications_for_message("sid", &history, &mut HashMap::new());
         let replay = serde_json::to_value(&replay[0]).unwrap();
         assert!(replay["params"]["update"].get("content").is_none());
         assert_eq!(replay["params"]["update"]["rawInput"], *raw);
