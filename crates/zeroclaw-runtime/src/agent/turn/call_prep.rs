@@ -697,14 +697,17 @@ mod tests {
             &prepared.executable_indices,
             &prepared.executable_calls,
             &prepared.stream_calls,
-            vec![ToolExecutionOutcome {
-                output: "ok".to_string(),
-                attachments: Vec::new(),
-                output_data: None,
-                success: true,
-                error_reason: None,
-                duration: Duration::ZERO,
-                receipt: None,
+            vec![crate::agent::tool_execution::CompletedToolExecution {
+                executed_tool_name: Some("test_tool".into()),
+                outcome: ToolExecutionOutcome {
+                    output: "ok".to_string(),
+                    attachments: Vec::new(),
+                    output_data: None,
+                    success: true,
+                    error_reason: None,
+                    duration: Duration::ZERO,
+                    receipt: None,
+                },
             }],
             &mut prepared.ordered_results,
             0,
@@ -956,14 +959,17 @@ mod tests {
             &prepared.executable_indices,
             &prepared.executable_calls,
             &prepared.stream_calls,
-            vec![ToolExecutionOutcome {
-                output: "ok".to_string(),
-                attachments: Vec::new(),
-                output_data: None,
-                success: true,
-                error_reason: None,
-                duration: Duration::ZERO,
-                receipt: None,
+            vec![crate::agent::tool_execution::CompletedToolExecution {
+                executed_tool_name: Some("test_tool".into()),
+                outcome: ToolExecutionOutcome {
+                    output: "ok".to_string(),
+                    attachments: Vec::new(),
+                    output_data: None,
+                    success: true,
+                    error_reason: None,
+                    duration: Duration::ZERO,
+                    receipt: None,
+                },
             }],
             &mut prepared.ordered_results,
             0,
@@ -980,6 +986,78 @@ mod tests {
             ],
             "the duplicate is abandoned once; the surviving call correlates to its after hook"
         );
+    }
+
+    #[tokio::test]
+    async fn dispatch_refusal_abandons_context_but_retains_result() {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let (tx, _rx) = mpsc::channel(16);
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut runner = crate::hooks::HookRunner::new();
+        runner.register(Box::new(LifecycleRecorder {
+            events: Arc::clone(&events),
+            cancel_before_for: Vec::new(),
+        }));
+        let ctx = lifecycle_ctx(&observer, &pacing, &tx, None, Some(&runner));
+        let calls = [
+            parsed_call("attempted", serde_json::json!({}), "a"),
+            parsed_call("refused", serde_json::json!({}), "b"),
+        ];
+        let mut seen = HashSet::new();
+        let mut prompt_seen = HashSet::new();
+        let mut prepared = prepare_tool_calls(
+            &ctx,
+            &[],
+            None,
+            &[],
+            &calls,
+            &mut seen,
+            &mut prompt_seen,
+            0,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        let outcomes = [Some("attempted"), None]
+            .into_iter()
+            .map(
+                |name| crate::agent::tool_execution::CompletedToolExecution {
+                    executed_tool_name: name.map(str::to_owned),
+                    outcome: ToolExecutionOutcome {
+                        output: "failed or refused".into(),
+                        attachments: Vec::new(),
+                        output_data: None,
+                        success: false,
+                        error_reason: Some("failed or refused".into()),
+                        duration: Duration::ZERO,
+                        receipt: None,
+                    },
+                },
+            )
+            .collect();
+        record_executed_outcomes(
+            &ctx,
+            &prepared.executable_indices,
+            &prepared.executable_calls,
+            &prepared.stream_calls,
+            outcomes,
+            &mut prepared.ordered_results,
+            0,
+        )
+        .await;
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                "before:attempted:test-turn:0:0",
+                "before:refused:test-turn:0:1",
+                "after:attempted:test-turn:0:0",
+                "abandoned:refused:test-turn:0:1",
+            ]
+        );
+        assert!(prepared.ordered_results.iter().all(Option::is_some));
+        assert!(!prepared.ordered_results[1].as_ref().unwrap().2.success);
     }
 
     #[tokio::test]
