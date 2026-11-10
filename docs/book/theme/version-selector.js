@@ -1,22 +1,26 @@
 // Version selector injected into mdBook's menu bar.
 //
-// Detects the current version from the URL path (e.g., /v0.7.5/, /main/),
-// fetches /versions.json from the domain root to list all available versions,
-// then renders a dropdown linking to the same page in each version.
+// Detects the current version from the URL path (e.g., /v0.7.5/, /master/,
+// /stable/), fetches /versions.json from the domain root to list all available
+// versions, then renders a dropdown linking to the same page in each version.
 (function () {
   // Parse the current version from URL path.
-  // Expected formats: /v0.7.5/en/..., /master/en/...
+  // Expected formats: /v0.7.5/en/..., /master/en/..., /stable/en/...
   const pathSegments = window.location.pathname.split("/").filter((s) => s);
   if (pathSegments.length < 2) return; // Not in a versioned docs path
 
   const versionPattern = /^v\d+\.\d+\.\d+(-[a-z0-9.-]+)?$/i;
+  // Version-less copy of the stable release (STABLE_ALIAS in
+  // xtask/src/cmd/mdbook/versions.rs). Search engines index this URL, so the
+  // Stable entry links here rather than to the release's own directory.
+  const STABLE_ALIAS = "stable";
 
   let currentVersion = null;
   let versionIndex = -1;
 
   for (let i = 0; i < pathSegments.length; i++) {
     const seg = pathSegments[i];
-    if (seg === "master" || versionPattern.test(seg)) {
+    if (seg === "master" || seg === STABLE_ALIAS || versionPattern.test(seg)) {
       currentVersion = seg;
       versionIndex = i;
       break;
@@ -39,14 +43,19 @@
       const menuRight = document.querySelector(".menu-bar .right-buttons");
       if (!menuRight) return;
 
-      // Find the label for the current version
-      const currentVersionObj = versions.find((v) => v.tag === currentVersion);
-      const currentLabel = currentVersionObj?.label || currentVersion;
+      // The alias is the release versions.json names as stable.
+      const shownVersion =
+        currentVersion === STABLE_ALIAS ? data.stable || currentVersion : currentVersion;
 
-      // Build URL for another version by replacing the version segment
+      // Find the label for the current version
+      const currentVersionObj = versions.find((v) => v.tag === shownVersion);
+      const currentLabel = currentVersionObj?.label || shownVersion;
+
+      // Build URL for another version by replacing the version segment. The
+      // stable release is linked at its version-less alias.
       const urlForVersion = (tag) => {
         const next = pathSegments.slice();
-        next[versionIndex] = tag;
+        next[versionIndex] = data.stable && tag === data.stable ? STABLE_ALIAS : tag;
         return "/" + next.join("/") + window.location.hash;
       };
 
@@ -90,7 +99,7 @@
       for (const version of versions) {
         const li = document.createElement("li");
         li.setAttribute("role", "none");
-        if (version.tag === currentVersion) {
+        if (version.tag === shownVersion) {
           li.classList.add("theme-selected");
         }
 

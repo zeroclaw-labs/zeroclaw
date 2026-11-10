@@ -38,6 +38,11 @@ class WorkflowTest(unittest.TestCase):
         for build_tool in ["cargo ", "rust-toolchain", "rust-cache", "apt-get", "mdbook build"]:
             self.assertNotIn(build_tool, promotion)
 
+    def test_build_rebuilds_the_stable_alias_after_seo_tags(self):
+        workflow = (REPO / ".github/workflows/docs-deploy.yml").read_text()
+        seo = workflow.index("$MDBOOK_XTASK gen-seo\n")
+        self.assertLess(seo, workflow.index("$MDBOOK_XTASK gen-stable-alias\n"))
+
     def test_build_receipt_records_the_actual_checkout(self):
         workflow = (REPO / ".github/workflows/docs-deploy.yml").read_text()
         self.assertIn('git rev-parse HEAD > "$TAG_SRC/.docs-source-commit"', workflow)
@@ -56,6 +61,8 @@ class PromotionTest(unittest.TestCase):
         for name in ["_shared/theme.js", "api/index.html", "sitemap.xml", "robots.txt", "CNAME", ".nojekyll"]:
             self.write(name, f"preserve {name}")
         self.write(f"{TAG}/.docs-source-commit", TAG_SHA + "\n")
+        for name in ["en/index.html", "en/chapter.html", "fr/index.html", "fr/chapter.html"]:
+            self.write(f"stable/{name}", (self.pages / "v0.9.0" / name).read_text())
         self.write("stable-version.txt", "v0.9.0\n")
         self.write("index.html", "old redirect")
         self.metadata = {
@@ -104,17 +111,25 @@ class PromotionTest(unittest.TestCase):
             self.promote(**overrides)
         self.assertEqual(self.snapshot(), before, "rejected promotion changed site files")
 
+    def tree(self, top):
+        base = self.pages / top
+        return {str(p.relative_to(base)): p.read_bytes() for p in base.rglob("*") if p.is_file()}
+
     def test_promotes_ten_over_nine_and_preserves_payload_and_chrome(self):
         before = self.snapshot()
         self.promote()
         after = self.snapshot()
         changed = {name for name in before.keys() | after.keys() if before.get(name) != after.get(name)}
-        self.assertEqual(changed, {"stable-version.txt", "versions.json", "index.html"})
+        self.assertEqual(changed, {"stable-version.txt", "versions.json", "index.html", "sitemap.xml",
+                                   "stable/.docs-source-commit", "stable/en/index.html",
+                                   "stable/fr/index.html"})
+        self.assertEqual(self.tree("stable"), self.tree(TAG))
+        self.assertFalse((self.pages / "stable.tmp").exists())
         self.assertEqual(after["stable-version.txt"], b"v0.10.0\n")
         self.assertEqual(after["index.html"].decode(),
                          '<!doctype html>\n<meta charset="utf-8">\n'
-                         '<meta http-equiv="refresh" content="0; url=./v0.10.0/en/">\n'
-                         '<link rel="canonical" href="./v0.10.0/en/">\n<title>ZeroClaw Docs</title>\n')
+                         '<meta http-equiv="refresh" content="0; url=./stable/en/">\n'
+                         '<link rel="canonical" href="./stable/en/">\n<title>ZeroClaw Docs</title>\n')
         metadata = json.loads(after["versions.json"])
         self.assertEqual(metadata["stable"], TAG)
         self.assertEqual(metadata["versions"], [
@@ -171,10 +186,81 @@ class PromotionTest(unittest.TestCase):
         self.promote(check_only=True)
         self.assertEqual(self.snapshot(), before)
 
+    def test_sitemap_lists_the_promoted_release_under_the_alias(self):
+        self.write("CNAME", "docs.example.com\n")
+        # The old stable release had a page this release removes.
+        self.write("v0.9.0/en/removed.html", "dropped in v0.10.0")
+        self.write("stable/en/removed.html", "dropped in v0.10.0")
+        self.write("sitemap.xml", "<urlset><url><loc>https://docs.example.com/stable/en/removed.html</loc></url></urlset>\n")
+        # A page new in this release, nested pages, and the files gen-seo skips.
+        for name in ["en/new/page.html", "en/a/b.html", "en/a-b.html", "en/print.html",
+                     "en/toc.html", "en/404.html", "en/guide/print.html", "fr/a&b.html"]:
+            self.write(f"{TAG}/{name}", name)
+        self.write(f"{TAG}/en/notes.txt", "not a page")
+        self.promote()
+        site = "https://docs.example.com"
+        pages = ["en/a/b.html", "en/a-b.html", "en/chapter.html", "en/index.html", "en/new/page.html",
+                 "fr/a&amp;b.html", "fr/chapter.html", "fr/index.html"]
+        expected = ('<?xml version="1.0" encoding="UTF-8"?>\n'
+                    '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+                    f"  <url><loc>{site}/</loc></url>\n"
+                    + "".join(f"  <url><loc>{site}/stable/{page}</loc></url>\n" for page in pages)
+                    + "</urlset>\n")
+        self.assertEqual((self.pages / "sitemap.xml").read_text(), expected)
+        self.assertFalse((self.pages / "stable/en/removed.html").exists())
+        before = self.snapshot()
+        self.promote()  # Retry is idempotent.
+        self.assertEqual(self.snapshot(), before)
+
+    def test_check_only_leaves_the_sitemap_alone(self):
+        self.write("CNAME", "docs.example.com\n")
+        self.write(f"{TAG}/en/new.html", "new in v0.10.0")
+        before = self.snapshot()
+        self.promote(check_only=True)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_empty_cname_rejected_before_any_write(self):
+        self.write("CNAME", "\n")
+        self.rejected("CNAME is empty")
+
     def test_check_only_validates_without_writes(self):
         before = self.snapshot()
         self.promote(check_only=True)
         self.assertEqual(self.snapshot(), before)
+
+    def root_404(self, target, locales):
+        # The shape xtask's gen-root-404 writes (root_404_html in versions.rs):
+        # the two data lines, then the redirect script.
+        script = (REPO / "xtask/src/cmd/mdbook/root_404.js").read_text()
+        return ("<!doctype html>\n<script>\n"
+                f"var target = {json.dumps(target)};\n"
+                f"var locales = {json.dumps(locales, separators=(',', ':'))};\n"
+                f"{script}</script>\n<h1>Page not found</h1>\n")
+
+    def test_promotion_refreshes_the_root_404_for_the_release(self):
+        # Built before any pointer resolved, when only English was published.
+        self.write("404.html", self.root_404("master", ["en"]))
+        self.promote()
+        self.assertEqual((self.pages / "404.html").read_text(), self.root_404("stable", ["en", "fr"]))
+
+    def test_promotion_without_a_root_404_creates_none(self):
+        self.promote()
+        self.assertFalse((self.pages / "404.html").exists())
+
+    def test_check_only_leaves_the_root_404_alone(self):
+        self.write("404.html", self.root_404("stable", ["en"]))
+        before = self.snapshot()
+        self.promote(check_only=True)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_root_404_of_another_shape_rejected_before_any_write(self):
+        self.write("404.html", "<h1>Page not found</h1>\n")
+        self.rejected("unexpected shape")
+
+    def test_symlinked_root_404_rejected(self):
+        self.write("elsewhere.html", self.root_404("stable", ["en"]))
+        (self.pages / "404.html").symlink_to(self.pages / "elsewhere.html")
+        self.rejected("must not be a symlink")
 
     def test_final_tags_only(self):
         for tag in ["v0.10.0-rc.1", "master", "v01.2.3", "v1.2.3+build", "../../bad"]:
@@ -299,6 +385,15 @@ class PromotionTest(unittest.TestCase):
         (self.pages / "index.html").symlink_to(self.pages / "api/index.html")
         self.rejected("regular file")
 
+    def test_symlinked_alias_rejected(self):
+        shutil.rmtree(self.pages / "stable")
+        (self.pages / "stable").symlink_to(self.pages / "v0.9.0")
+        self.rejected("stable alias must not be a symlink")
+
+    def test_symlink_inside_release_rejected(self):
+        (self.pages / TAG / "en/escape.html").symlink_to(self.pages / "CNAME")
+        self.rejected("must not contain symlinks")
+
     def test_symlinked_locale_rejected(self):
         self.pages.joinpath(TAG, "fr").rename(self.pages / "locale-backup")
         self.pages.joinpath(TAG, "fr").symlink_to(self.pages / "locale-backup")
@@ -386,8 +481,11 @@ class PromotionTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(git(remote, "rev-list", "--count", "gh-pages"), "1")
         changed = git(remote, "diff", "--name-only", before_sha, "gh-pages").splitlines()
-        self.assertEqual(changed, ["index.html", "llms-full.txt", "llms.txt",
-                                   "stable-version.txt", "versions.json"])
+        self.assertEqual(changed, ["index.html", "llms-full.txt", "llms.txt", "sitemap.xml",
+                                   "stable-version.txt", "stable/.docs-source-commit",
+                                   "stable/en/index.html", "stable/en/llms-full.txt",
+                                   "stable/en/llms.txt", "stable/fr/index.html",
+                                   "versions.json"])
         self.assertEqual(git(remote, "show", "gh-pages:stable-version.txt"), TAG)
         self.assertEqual(git(remote, "show", "gh-pages:llms.txt"), "v0.10.0 llms")
         self.assertEqual(git(remote, "show", "gh-pages:llms-full.txt"), "v0.10.0 llms-full")

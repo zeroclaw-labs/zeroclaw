@@ -1129,6 +1129,40 @@ mod tests {
         }
     }
 
+    /// Reported regression: with the default forbidden `/dev`, the workspace
+    /// path scan glued the closing `)` or backtick of a substitution onto a
+    /// `2>/dev/null` redirect and refused `/dev/null)`. The commands must run,
+    /// and a forbidden path inside a substitution must still be refused under
+    /// its own name.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_allows_null_redirects_inside_posix_substitutions() {
+        let tool = wrapped_shell(unrestricted_shell_test_security());
+        for (cmd, expected) in [
+            ("x=$(echo zc-subst 2>/dev/null); echo \"$x\"", "zc-subst"),
+            ("(echo zc-group 2>/dev/null)", "zc-group"),
+            ("echo \"`echo zc-tick 2>/dev/null`\"", "zc-tick"),
+        ] {
+            let result = tool
+                .execute(json!({ "command": cmd }))
+                .await
+                .expect("command should return a result");
+            assert!(result.success, "{cmd} must run, got: {result:?}");
+            assert!(result.output.contains(expected), "{cmd}: {result:?}");
+        }
+
+        let result = tool
+            .execute(json!({ "command": "x=$(cat /etc/passwd 2>/dev/null)" }))
+            .await
+            .expect("command should return a result");
+        assert_path_argument_blocked(&result, "forbidden path inside $(...)");
+        let error = result.error.as_deref().unwrap_or("");
+        assert!(
+            error.ends_with("/etc/passwd"),
+            "the blocked path must not carry the closing `)`: {error:?}"
+        );
+    }
+
     #[tokio::test]
     async fn shell_reports_invalid_docker_workspace_root() {
         let workspace = tempfile::tempdir().expect("workspace tempdir should be created");

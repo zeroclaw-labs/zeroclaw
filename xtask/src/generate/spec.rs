@@ -589,6 +589,13 @@ pub fn container_excluded_features(pkg: &cargo_metadata::Package) -> Vec<String>
     read_registry_list(pkg, "container_excluded_features")
 }
 
+/// Features left out of the CLI-only build (`Selection::CliOnly`): the
+/// dashboard, the web gateway and what depends on it. Read from
+/// `[package.metadata.zeroclaw] cli_excluded_features`; never shadowed.
+pub fn cli_excluded_features(pkg: &cargo_metadata::Package) -> anyhow::Result<Vec<String>> {
+    required_registry_list(pkg, "cli_excluded_features")
+}
+
 fn read_registry_list(pkg: &cargo_metadata::Package, key: &str) -> Vec<String> {
     pkg.metadata
         .get("zeroclaw")
@@ -850,12 +857,14 @@ fn resolve_feature_list_from_package(
     let non_row = non_row_features(meta, root);
     let dist_extra = dist_extra_features(root)?;
     let container_excluded = container_excluded_features(root);
+    let cli_excluded = cli_excluded_features(root)?;
     let ctx = FeatureCtx {
         graph: &root.features,
         all: &all_features,
         non_row: &non_row,
         dist_extra: &dist_extra,
         container_excluded: &container_excluded,
+        cli_excluded: &cli_excluded,
     };
     selection.to_feature_list(&ctx)
 }
@@ -880,7 +889,7 @@ pub fn resolve_feature_list_for_target(
     anyhow::ensure!(
         matches!(
             selection,
-            Selection::Dist | Selection::DistBroad | Selection::DistCompat
+            Selection::Dist | Selection::DistBroad | Selection::DistCompat | Selection::CliOnly
         ),
         "target-specific exclusions are only defined for distribution selections"
     );
@@ -931,6 +940,7 @@ pub fn resolve(manifest_dir: &Path, selection: &Selection) -> anyhow::Result<Res
     let non_row = non_row_features(&meta, root);
     let dist_extra = dist_extra_features(root)?;
     let container_excluded = container_excluded_features(root);
+    let cli_excluded = cli_excluded_features(root)?;
     let default_features = expand_default(&root.features, &non_row);
 
     let ctx = FeatureCtx {
@@ -939,6 +949,7 @@ pub fn resolve(manifest_dir: &Path, selection: &Selection) -> anyhow::Result<Res
         non_row: &non_row,
         dist_extra: &dist_extra,
         container_excluded: &container_excluded,
+        cli_excluded: &cli_excluded,
     };
     let cargo_flags = selection.to_cargo_flags(&ctx)?;
 
@@ -994,6 +1005,9 @@ pub enum Selection {
     DistBroad,
     /// Compatibility alias for the standard distribution.
     DistCompat,
+    /// The standard distribution without the dashboard and web gateway:
+    /// `Dist` minus the registry's `cli_excluded_features`.
+    CliOnly,
     /// Every selectable feature (all − non_row − pure-alias). The docker
     /// `:all-features` kitchen sink.
     All,
@@ -1011,6 +1025,7 @@ impl Selection {
             Selection::Dist => "dist",
             Selection::DistBroad => "dist-broad",
             Selection::DistCompat => "dist-compat",
+            Selection::CliOnly => "cli-only",
             Selection::All => "all",
             Selection::Features(_) => "custom",
         }
@@ -1025,6 +1040,7 @@ impl Selection {
             Selection::Dist => "standard distribution, minimal/full tools (recommended)",
             Selection::DistBroad => "broad-channel distribution measurement build",
             Selection::DistCompat => "standard distribution compatibility alias",
+            Selection::CliOnly => "standard distribution without the dashboard (CLI-only)",
             Selection::All => "every feature including hardware and browser",
             Selection::Features(_) => "custom feature selection",
         }
@@ -1037,6 +1053,7 @@ impl Selection {
             Selection::Dist,
             Selection::DistBroad,
             Selection::DistCompat,
+            Selection::CliOnly,
             Selection::Full,
             Selection::All,
         ]
@@ -1046,7 +1063,12 @@ impl Selection {
     pub fn menu() -> Vec<Selection> {
         Self::named()
             .into_iter()
-            .filter(|selection| !matches!(selection, Selection::DistBroad | Selection::DistCompat))
+            .filter(|selection| {
+                !matches!(
+                    selection,
+                    Selection::DistBroad | Selection::DistCompat | Selection::CliOnly
+                )
+            })
             .collect()
     }
 
@@ -1090,6 +1112,19 @@ impl Selection {
                 }
                 s
             }
+            Selection::CliOnly => {
+                for feature in ctx.cli_excluded {
+                    anyhow::ensure!(
+                        ctx.all.contains(feature),
+                        "unknown cli_excluded_features entry `{feature}` (not in [features])"
+                    );
+                }
+                Selection::Dist
+                    .to_feature_list(ctx)?
+                    .into_iter()
+                    .filter(|feature| !ctx.cli_excluded.contains(feature))
+                    .collect()
+            }
             Selection::All => ctx
                 .all
                 .iter()
@@ -1132,6 +1167,7 @@ pub struct FeatureCtx<'a> {
     pub non_row: &'a [String],
     pub dist_extra: &'a [String],
     pub container_excluded: &'a [String],
+    pub cli_excluded: &'a [String],
 }
 
 impl FeatureCtx<'_> {
@@ -1568,12 +1604,14 @@ mod tests {
         let non_row = non_row_features(&meta, pkg);
         let dist_extra = dist_extra_features(pkg).unwrap();
         let container_excluded = container_excluded_features(pkg);
+        let cli_excluded = cli_excluded_features(pkg).unwrap();
         let ctx = FeatureCtx {
             graph: &pkg.features,
             all: &all_features,
             non_row: &non_row,
             dist_extra: &dist_extra,
             container_excluded: &container_excluded,
+            cli_excluded: &cli_excluded,
         };
 
         let mut expected = resolve_feature_list(&root(), &Selection::Dist).unwrap();
@@ -1599,6 +1637,44 @@ mod tests {
             Selection::menu()
                 .iter()
                 .all(|selection| selection.id() != Selection::DistBroad.id())
+        );
+    }
+
+    #[test]
+    fn cli_only_is_dist_without_the_cli_excluded_features() {
+        let dist = resolve_feature_list(&root(), &Selection::Dist).unwrap();
+        let cli_only = resolve_feature_list(&root(), &Selection::CliOnly).unwrap();
+
+        let excluded = ["gateway", "embedded-web", "acp-bridge"];
+        for feature in excluded {
+            assert!(
+                !cli_only.contains(&feature.to_string()),
+                "the CLI-only build must leave out `{feature}`"
+            );
+        }
+        let mut expected: Vec<String> = dist
+            .into_iter()
+            .filter(|feature| !excluded.contains(&feature.as_str()))
+            .collect();
+        expected.sort();
+        assert_eq!(
+            cli_only, expected,
+            "otherwise the CLI-only build is the standard distribution"
+        );
+        assert!(cli_only.contains(&"agent-runtime".to_string()));
+    }
+
+    #[test]
+    fn cli_only_is_named_but_not_offered_in_installer_menus() {
+        assert_eq!(Selection::CliOnly.id(), "cli-only");
+        assert!(matches!(
+            Selection::from_id("cli-only"),
+            Some(Selection::CliOnly)
+        ));
+        assert!(
+            Selection::menu()
+                .iter()
+                .all(|selection| selection.id() != Selection::CliOnly.id())
         );
     }
 
