@@ -123,6 +123,27 @@ def replace_alias(target, alias):
     staged.replace(alias)
 
 
+def refreshed_root_404(pages, locales):
+    """The root 404.html retargeted at the stable alias and the promoted
+    release's locales, or None when the site has no 404 page yet (the next
+    normal deploy writes one). Only the two lines xtask's gen-root-404 writes
+    for these values change: `var target = "...";` and `var locales = [...];`
+    (root_404_html in xtask/src/cmd/mdbook/versions.rs)."""
+    path = pages / "404.html"
+    if not path.exists():
+        return None
+    require(not path.is_symlink(), "The root 404 page must not be a symlink")
+    text = read_file(path)
+    target_line = f"var target = {json.dumps(STABLE_ALIAS)};"
+    # Sorted and compact, as gen-root-404 lists them.
+    locales_line = "var locales = " + json.dumps(sorted(locales), separators=(",", ":")) + ";"
+    text, targets = re.subn(r'^var target = "[^"\n]*";$', lambda _: target_line, text, flags=re.M)
+    text, lists = re.subn(r"^var locales = \[[^\n]*\];$", lambda _: locales_line, text, flags=re.M)
+    require(targets == 1 and lists == 1,
+            "The root 404 page has an unexpected shape; run a normal docs deploy first")
+    return text
+
+
 def promote(*, pages, repo, master_sha, tag, workflow_ref, minimum, check_only=False):
     version = final_version(tag)
     require(workflow_ref == "refs/heads/master", "Promotion must run on master")
@@ -191,11 +212,16 @@ def promote(*, pages, repo, master_sha, tag, workflow_ref, minimum, check_only=F
     index = ('<!doctype html>\n<meta charset="utf-8">\n'
              f'<meta http-equiv="refresh" content="0; url={destination}">\n'
              f'<link rel="canonical" href="{destination}">\n<title>ZeroClaw Docs</title>\n')
+    # The 404 page sends links to pruned releases to the stable alias, for the
+    # locales it lists: refresh them for the release being promoted.
+    root_404 = refreshed_root_404(pages, locales)
     if not check_only:
         (pages / "stable-version.txt").write_text(tag + "\n", encoding="utf-8")
         (pages / "sitemap.xml").write_text(sitemap, encoding="utf-8")
         (pages / "versions.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         (pages / "index.html").write_text(index, encoding="utf-8")
+        if root_404 is not None:
+            (pages / "404.html").write_text(root_404, encoding="utf-8")
         for name, text in llms.items():
             published = pages / name
             if text is None:
