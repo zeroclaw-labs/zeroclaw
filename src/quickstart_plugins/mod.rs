@@ -2992,7 +2992,7 @@ hosts = ["api.example.com"]
                 provider_type: "anthropic".to_string(),
                 alias: "anthropic".to_string(),
                 model: "claude-sonnet-4-5".to_string(),
-                fields: HashMap::from([("api_key".to_string(), "sk-test".to_string())]),
+                fields: HashMap::from([("auth.api_key".to_string(), "sk-test".to_string())]),
             }),
             risk_profile: SelectorChoice::Fresh("balanced".to_string()),
             runtime_profile: SelectorChoice::Fresh("balanced".to_string()),

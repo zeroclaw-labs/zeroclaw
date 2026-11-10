@@ -1821,6 +1821,21 @@ fn quickstart_runtime_profile_for_provider(
         .to_string()
 }
 
+#[cfg(feature = "agent-runtime")]
+fn quickstart_prefill_provider_fields(
+    codex_auth: bool,
+    api_key: Option<&str>,
+) -> std::collections::HashMap<String, String> {
+    let mut fields = std::collections::HashMap::new();
+    if codex_auth {
+        fields.insert("auth.mode".to_string(), "codex".to_string());
+    }
+    if let Some(key) = api_key.filter(|key| !key.is_empty()) {
+        fields.insert("auth.api_key".to_string(), key.to_string());
+    }
+    fields
+}
+
 /// `zeroclaw quickstart` CLI entry — checklist UX, not a wizard.
 ///
 /// Mirrors the TUI Quickstart pane's structure: a single screen
@@ -1988,17 +2003,7 @@ async fn run_quickstart_cli(
     {
         let needs_key = !found.local && api_key.is_none() && !codex_auth;
         if !needs_key {
-            let mut fields: std::collections::HashMap<String, String> =
-                std::collections::HashMap::new();
-            if codex_auth {
-                fields.insert("auth_mode".to_string(), "codex".to_string());
-            }
-            if let Some(key) = api_key.as_deref().filter(|s| !s.is_empty()) {
-                // Submission field keys are snake_case (`api_key`) — the apply
-                // path round-trips them verbatim into `set_prop_persistent`,
-                // which rejects kebab-case with "Unknown property".
-                fields.insert("api_key".to_string(), key.to_string());
-            }
+            let fields = quickstart_prefill_provider_fields(codex_auth, api_key.as_deref());
             form.provider = Some(ProviderChoice::Fresh {
                 kind: found.kind.clone(),
                 display_name: found.display_name.clone(),
@@ -2346,13 +2351,13 @@ async fn run_quickstart_cli(
                     std::collections::HashMap::new();
                 let mut aborted = false;
                 for d in &descriptors {
-                    if d.key == "api_key" {
+                    if d.key == "auth.api_key" {
                         let skips_api_key =
-                            quickstart_field_value_eq(&field_buf, "auth_mode", "codex")
+                            quickstart_field_value_eq(&field_buf, "auth.mode", "codex")
                                 || (chosen.kind == "anthropic"
                                     && quickstart_field_value_eq(
                                         &field_buf,
-                                        "auth_mode",
+                                        "auth.mode",
                                         "setup_token",
                                     ));
                         if skips_api_key {
@@ -2985,10 +2990,9 @@ async fn run_quickstart_cli(
     let provider = form.provider.expect("provider satisfied");
     let provider_type = match &provider {
         ProviderChoice::Fresh { kind, .. } => kind.as_str(),
-        ProviderChoice::Existing { alias_ref } => alias_ref
-            .split_once('.')
-            .map(|(provider_type, _)| provider_type)
-            .unwrap_or(alias_ref),
+        // Exact model keys carry no provider-type information. Existing
+        // selections use the shared state default, as Web and Zerocode do.
+        ProviderChoice::Existing { .. } => "",
     };
     let runtime_profile = SelectorChoice::Fresh(quickstart_runtime_profile_for_provider(
         provider_type,
@@ -15235,10 +15239,10 @@ fn quickstart_inline_auth(
     alias: &str,
     fields: &std::collections::HashMap<String, String>,
 ) -> Option<InlineProviderAuth> {
-    if kind == "openai" && quickstart_field_value_eq(fields, "auth_mode", "codex") {
+    if kind == "openai" && quickstart_field_value_eq(fields, "auth.mode", "codex") {
         return Some(InlineProviderAuth::Codex);
     }
-    if kind == "anthropic" && quickstart_field_value_eq(fields, "auth_mode", "setup_token") {
+    if kind == "anthropic" && quickstart_field_value_eq(fields, "auth.mode", "setup_token") {
         return Some(InlineProviderAuth::AnthropicSetupToken {
             alias: alias.to_string(),
         });
@@ -15349,8 +15353,7 @@ async fn run_anthropic_setup_token_inline(alias: &str, config: &mut Config) -> R
         bail!("Token cannot be empty");
     }
 
-    let path = format!("providers.models.anthropic.{alias}.api_key");
-    config.set_prop_persistent(&path, token.trim())?;
+    set_quickstart_anthropic_token(config, alias, token.trim())?;
     Box::pin(config.save_dirty()).await?;
     println!(
         "{}",
@@ -15360,6 +15363,26 @@ async fn run_anthropic_setup_token_inline(alias: &str, config: &mut Config) -> R
             "  Saved Claude setup token.",
         )
     );
+    Ok(())
+}
+
+#[cfg(feature = "agent-runtime")]
+fn set_quickstart_anthropic_token(config: &mut Config, alias: &str, token: &str) -> Result<()> {
+    use zeroclaw_config::provider_registry::{ApiKeyAuth, ProviderConnection};
+
+    let connection_ref = format!("anthropic.{alias}");
+    let connection = config
+        .providers
+        .connections
+        .get_mut(connection_ref.as_str())
+        .with_context(|| format!("Anthropic connection `{connection_ref}` does not exist"))?;
+    let ProviderConnection::Anthropic(connection) = connection else {
+        bail!("connection `{connection_ref}` is not an Anthropic connection");
+    };
+    connection.auth = Some(ApiKeyAuth::ApiKey {
+        api_key: Some(token.to_owned()),
+    });
+    config.mark_dirty("providers");
     Ok(())
 }
 
@@ -18958,16 +18981,16 @@ mod tests {
 
     #[test]
     #[cfg(feature = "agent-runtime")]
-    fn quickstart_inline_auth_uses_auth_mode_field() {
+    fn quickstart_inline_auth_uses_canonical_auth_mode_field() {
         let fields =
-            std::collections::HashMap::from([("auth_mode".to_string(), " codex ".to_string())]);
+            std::collections::HashMap::from([("auth.mode".to_string(), " codex ".to_string())]);
         assert_eq!(
             quickstart_inline_auth("openai", "codex", &fields),
             Some(InlineProviderAuth::Codex)
         );
 
         let fields =
-            std::collections::HashMap::from([("auth_mode".to_string(), "setup_token".to_string())]);
+            std::collections::HashMap::from([("auth.mode".to_string(), "setup_token".to_string())]);
         assert_eq!(
             quickstart_inline_auth("anthropic", "max", &fields),
             Some(InlineProviderAuth::AnthropicSetupToken {
@@ -18976,6 +18999,58 @@ mod tests {
         );
 
         assert_eq!(quickstart_inline_auth("openai", "api", &fields), None);
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn quickstart_flag_prefills_match_canonical_field_descriptors() {
+        let fields = quickstart_prefill_provider_fields(false, Some("quickstart-test-key"));
+        assert_eq!(fields["auth.api_key"], "quickstart-test-key");
+        let codex = quickstart_prefill_provider_fields(true, None);
+        assert_eq!(codex["auth.mode"], "codex");
+        assert_eq!(
+            quickstart_inline_auth("openai", "default", &codex),
+            Some(InlineProviderAuth::Codex)
+        );
+        let descriptors = zeroclaw_runtime::quickstart::field_shape(
+            zeroclaw_runtime::quickstart::FieldSection::ModelProvider,
+            "openai",
+        );
+        for field in fields.keys().chain(codex.keys()) {
+            assert!(
+                descriptors
+                    .iter()
+                    .any(|descriptor| &descriptor.key == field),
+                "CLI prefills must use the backend's field contract: {field}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn quickstart_anthropic_token_updates_exact_canonical_connection() {
+        let mut config = Config {
+            providers: serde_json::from_value(serde_json::json!({
+                "connections": {
+                    "anthropic.prod.us": {"kind": "anthropic"},
+                    "anthropic.prod": {"kind": "anthropic"},
+                },
+                "models": {"chat.fast.us": {
+                    "capability": "chat", "provider": "anthropic.prod.us", "model": "claude-test",
+                }},
+            }))
+            .unwrap(),
+            ..Config::default()
+        };
+        set_quickstart_anthropic_token(&mut config, "prod.us", "setup-test-token").unwrap();
+        let registry = serde_json::to_value(config.provider_registry().unwrap()).unwrap();
+        assert_eq!(
+            registry["connections"]["anthropic.prod.us"]["auth"]["api_key"],
+            "setup-test-token"
+        );
+        assert!(registry["connections"]["anthropic.prod"]["auth"].is_null());
+        assert!(config.providers.models.anthropic.is_empty());
+        assert!(set_quickstart_anthropic_token(&mut config, "missing", "other-token").is_err());
     }
 
     #[test]
