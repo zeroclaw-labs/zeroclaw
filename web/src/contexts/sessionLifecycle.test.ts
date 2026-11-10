@@ -88,6 +88,10 @@ let configListEntries: Array<{ path: string }> = [];
 // `focusedNode()` so TypeScript doesn't narrow it after a reset.
 let lastFocused: { type: unknown; props: Record<string, unknown> } | null = null;
 const focusedNode = () => lastFocused;
+// Nodes a test treats as inside a mounted element: every node mock's
+// `contains()` answers from this set, so it shows a containment check ran,
+// not which element it ran on.
+const containedNodes = new Set<unknown>();
 
 // Every request URL, for tests that check what was (not) asked of the gateway.
 const requestedUrls: string[] = [];
@@ -323,7 +327,7 @@ async function mountChat(
           : {
             focus: () => { lastFocused = element as typeof lastFocused; },
             scrollIntoView: () => {},
-            contains: () => false,
+            contains: (node: unknown) => containedNodes.has(node),
           },
       },
     );
@@ -392,6 +396,7 @@ beforeEach(() => {
   lastFocused = null;
   documentListeners.clear();
   delete fakeDocument.activeElement;
+  containedNodes.clear();
   sessionsResponder = null;
   storage.setItem('zeroclaw_active_session.ops', 'A');
   listedSessions = [
@@ -2112,6 +2117,16 @@ for (const { keepCollapsed, label, whileThinking, afterChunk } of thinkingBoxCas
   });
 }
 
+// The model button is the header button with `aria-expanded` and no title
+// (the conversation picker's trigger has one).
+function isModelButton(props: Record<string, unknown>): boolean {
+  return 'aria-expanded' in props && props.title === undefined;
+}
+
+function modelButtonIn(renderer: ReactTestRenderer): ReactTestInstance | undefined {
+  return renderer.root.findAllByType('button').find((button) => isModelButton(button.props));
+}
+
 test('Escape closes the model menu and returns focus to its button', async () => {
   configListEntries = [
     { path: 'providers.models.openai.fast.model' },
@@ -2122,12 +2137,7 @@ test('Escape closes the model menu and returns focus to its button', async () =>
   await openSocket(runtime, 0);
   await settle();
 
-  // The model button is the header button with `aria-expanded` and no title
-  // (the conversation picker's trigger has one).
-  const isModelButton = (props: Record<string, unknown>) =>
-    'aria-expanded' in props && props.title === undefined;
-  const modelButton = () => mounted.renderer.root.findAllByType('button')
-    .find((button) => isModelButton(button.props));
+  const modelButton = () => modelButtonIn(mounted.renderer);
   assert.ok(modelButton());
   assert.equal(modelButton()!.props['aria-expanded'], false);
 
@@ -2167,5 +2177,53 @@ test('Escape closes the model menu and returns focus to its button', async () =>
   await act(async () => { dispatchDocumentEvent('keydown', { key: 'Escape' }); });
   assert.equal(modelButton()!.props['aria-expanded'], false);
   assert.ok(focusedNode() === null, 'Escape moved focus away from the composer');
+
+  // With focus on a menu item, Escape returns it to the model button.
+  await act(async () => { modelButton()!.props.onClick(); });
+  const menuItem = { type: 'button' };
+  containedNodes.add(menuItem);
+  fakeDocument.activeElement = menuItem;
+  lastFocused = null;
+  await act(async () => { dispatchDocumentEvent('keydown', { key: 'Escape' }); });
+  assert.equal(modelButton()!.props['aria-expanded'], false);
+  assert.ok(isModelButton(focusedNode()?.props ?? {}), 'focus did not return to the model button');
+  await unmount(mounted.renderer);
+});
+
+test('Escape in the composer closes the command hint, not the model menu', async () => {
+  configListEntries = [
+    { path: 'providers.models.openai.fast.model' },
+    { path: 'providers.models.openai.smart.model' },
+  ];
+  const runtime = new FakeSessionRuntime();
+  const mounted = await mountChat(runtime, true);
+  await openSocket(runtime, 0);
+  await settle();
+
+  const modelButton = () => modelButtonIn(mounted.renderer);
+  await act(async () => { modelButton()!.props.onClick(); });
+  assert.equal(modelButton()!.props['aria-expanded'], true);
+
+  // The command hint's rows are the buttons that apply a command on mousedown.
+  const hintRows = () => mounted.renderer.root.findAll((node) =>
+    node.type === 'button' && typeof node.props.onMouseDown === 'function');
+  await typeInComposer(mounted.renderer, '/');
+  assert.ok(hintRows().length > 0, 'the command hint did not open');
+
+  // The browser runs the textarea's React handler first, then document
+  // listeners with whatever it did to the event.
+  let prevented = false;
+  await act(async () => {
+    textarea(mounted.renderer).props.onKeyDown({
+      key: 'Escape',
+      shiftKey: false,
+      nativeEvent: { isComposing: false },
+      preventDefault: () => { prevented = true; },
+    });
+    dispatchDocumentEvent('keydown', { key: 'Escape', defaultPrevented: prevented });
+  });
+  assert.equal(prevented, true);
+  assert.equal(hintRows().length, 0);
+  assert.equal(modelButton()!.props['aria-expanded'], true);
   await unmount(mounted.renderer);
 });
