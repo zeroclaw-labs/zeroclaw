@@ -189,12 +189,24 @@ pub enum UsagePeriod {
     Month,
 }
 
+/// Provider observation provenance, persisted so gaps survive a restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageCompleteness {
+    Complete,
+    LowerBound,
+    Unavailable,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CostRecord {
     /// Unique identifier
     pub id: String,
     /// Token usage details
     pub usage: TokenUsage,
+    /// None on historical records whose usage coverage was not recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_completeness: Option<UsageCompleteness>,
     /// Tracker identifier: one random UUID per daemon process, grouping every
     /// record this daemon emits. This is NOT the chat session — attribute
     /// per-conversation spend through `conversation_id`.
@@ -225,6 +237,7 @@ impl CostRecord {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             usage,
+            usage_completeness: None,
             session_id: session_id.into(),
             conversation_id: None,
             agent_alias: None,
@@ -241,6 +254,7 @@ impl CostRecord {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             usage,
+            usage_completeness: None,
             session_id: session_id.into(),
             conversation_id: None,
             agent_alias,
@@ -258,6 +272,7 @@ impl CostRecord {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             usage,
+            usage_completeness: None,
             session_id: session_id.into(),
             conversation_id: None,
             agent_alias,
@@ -271,6 +286,16 @@ impl CostRecord {
     pub fn with_conversation_id(mut self, conversation_id: Option<String>) -> Self {
         self.conversation_id = conversation_id;
         self
+    }
+
+    pub fn with_usage_completeness(mut self, completeness: UsageCompleteness) -> Self {
+        self.usage_completeness = Some(completeness);
+        self
+    }
+
+    /// Coverage-only rows carry no billable usage and do not count as requests.
+    pub fn is_coverage_only(&self) -> bool {
+        self.usage_completeness == Some(UsageCompleteness::Unavailable)
     }
 }
 

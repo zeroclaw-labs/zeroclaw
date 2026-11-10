@@ -23,6 +23,36 @@ Local-bound by default. Over-the-network access requires TLS termination at
 the gateway or in front of it; the per-property and PATCH endpoints are not
 safe to expose unauthenticated regardless of TLS posture.
 
+## Conversation cost
+
+`GET /api/sessions/{id}/cost` returns the estimated recorded cost of one
+conversation under the same operator authentication boundary as session
+history. Bare gateway IDs and existing full session keys use the normal session
+resolver. Knowing an ID does not grant access.
+
+```json
+{
+  "estimated_cost_usd": 3.42,
+  "status": "estimated",
+  "reasons": []
+}
+```
+
+`status` is `estimated`, `partial`, or `unavailable`. The amount is `null` when
+no useful estimate is available. Reasons distinguish missing usage, missing
+prices, unverified history, disabled/unavailable tracking, no recorded usage,
+ledger integrity problems, and uncertain persistence. Storage read failures
+return HTTP 500 instead of a zero-valued estimate.
+
+The corresponding JSON-RPC method is `session/cost`, with
+`{"session_id":"conversation-id"}`. It requires both `Sessions:Read` and
+`Cost:Read`, plus the existing session ownership checks. Ownership and grants
+are rechecked before the response is published. The read does not wait for the
+agent turn to finish. Both interfaces read the same ledger projection.
+
+See [Cost tracking](../ops/cost-tracking.md#conversation-estimates) for delegation,
+refresh behavior, and historical coverage limits.
+
 ## Channel-plugin webhook ingress
 
 Builds with WASM plugin support expose `GET` and `POST /plugin/{path}` when a running,

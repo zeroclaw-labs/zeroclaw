@@ -215,6 +215,14 @@ impl Acp {
         self.inner.handle_paste(text);
     }
 
+    pub(crate) fn tick_conversation_cost(&mut self, visible: bool) {
+        self.inner.tick_conversation_cost(visible);
+    }
+
+    pub(crate) fn conversation_cost_label(&self) -> Option<String> {
+        self.inner.conversation_cost_label()
+    }
+
     pub(crate) fn ctx_tokens(&self) -> (Option<u64>, Option<String>, Option<u64>, Option<u64>) {
         self.inner.ctx_tokens()
     }

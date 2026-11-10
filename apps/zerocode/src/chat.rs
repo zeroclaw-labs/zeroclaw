@@ -517,6 +517,7 @@ fn classify_turn_failure(content: &str) -> SessionError {
 const MAX_TRACKED_SESSIONS_PER_PANE: usize = 8;
 
 pub(crate) struct Chat {
+    conversation_cost: crate::conversation_cost::ConversationCost,
     rpc: Arc<RpcClient>,
     rpc_out: Arc<RpcOutbound>,
     notif_rx: broadcast::Receiver<RpcNotification>,
@@ -903,6 +904,7 @@ impl Chat {
         let (prompt_completion_tx, prompt_completion_rx) =
             mpsc::channel(MAX_TRACKED_SESSIONS_PER_PANE);
         Self {
+            conversation_cost: Default::default(),
             rpc: rpc.clone(),
             rpc_out: rpc.rpc.clone(),
             notif_rx: rpc.subscribe_notifications(),
@@ -5880,6 +5882,25 @@ impl Chat {
         }
     }
 
+    pub(crate) fn tick_conversation_cost(&mut self, visible: bool) {
+        let active = visible
+            && matches!(
+                self.rpc.connection_state(),
+                crate::client::ConnectionState::Connected
+            );
+        let (session, running) = match &self.phase {
+            ChatPhase::Active(state) if active => {
+                (Some(state.session_id.as_str()), state.turn_in_flight)
+            }
+            _ => (None, false),
+        };
+        self.conversation_cost.tick(session, running, &self.rpc);
+    }
+
+    pub(crate) fn conversation_cost_label(&self) -> Option<String> {
+        matches!(self.phase, ChatPhase::Active(_)).then(|| self.conversation_cost.label())
+    }
+
     /// Returns `(input_tokens, input_tokens_source, trim_budget, model_window)`
     /// for the context bar.
     pub(crate) fn ctx_tokens(&self) -> (Option<u64>, Option<String>, Option<u64>, Option<u64>) {
@@ -6260,6 +6281,7 @@ impl crate::widgets::HelpContext for Chat {
                     let mut cancel_keys = action_key_labels(C::CancelTurn);
                     cancel_keys.extend(action_key_labels(C::BrowseExitSelection));
                     let mut entries = vec![
+                        E::desc(self.conversation_cost.detail()),
                         E::new(cancel_keys, crate::i18n::t("zc-chat-help-cancel-turn")),
                         E::new(
                             action_key_labels(crate::keymap::InputBarAction::Submit),
@@ -6282,6 +6304,7 @@ impl crate::widgets::HelpContext for Chat {
                 }
                 // Idle: compose pane-level bindings + input bar as child.
                 let mut pane_entries = vec![
+                    E::desc(self.conversation_cost.detail()),
                     // Browse-mode bindings rendered from the registry so
                     // rebinds always stay in sync — see also the browse-mode
                     // dispatch code in `handle_key`.

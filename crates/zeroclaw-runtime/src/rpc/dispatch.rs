@@ -116,6 +116,7 @@ pub enum Method {
     SessionList,
     SessionListAcp,
     SessionMessages,
+    SessionCost,
     SessionState,
     SessionDelete,
     SessionApprove,
@@ -255,6 +256,7 @@ impl Method {
         (Method::SessionList, "session/list"),
         (Method::SessionListAcp, "session/list-acp"),
         (Method::SessionMessages, "session/messages"),
+        (Method::SessionCost, "session/cost"),
         (Method::SessionState, "session/state"),
         (Method::SessionDelete, "session/delete"),
         (Method::SessionApprove, "session/approve"),
@@ -418,6 +420,7 @@ impl Method {
             M::SessionList
             | M::SessionListAcp
             | M::SessionMessages
+            | M::SessionCost
             | M::SessionState
             | M::SessionGitBranch => (Resource::Sessions, Verb::Read),
             M::SessionClose | M::SessionCancel => (Resource::Sessions, Verb::Update),
@@ -2986,6 +2989,7 @@ impl RpcDispatcher {
                 | Method::SessionCancel
                 | Method::SessionGitBranch
                 | Method::SessionMessages
+                | Method::SessionCost
                 | Method::SessionState
                 | Method::SessionDelete
                 | Method::SessionApprove
@@ -3656,8 +3660,8 @@ impl RpcDispatcher {
     ) {
         // Keep the exhaustive handler future behind one fixed-size pointer so
         // adding a handler cannot enlarge every RPC transport worker's stack.
-        if method == Method::SessionMessages && !is_notification {
-            self.commit_session_messages(req_id, params).await;
+        if matches!(method, Method::SessionMessages | Method::SessionCost) && !is_notification {
+            self.commit_session_read(method, req_id, params).await;
             return;
         }
         let result = match method {
@@ -3699,6 +3703,7 @@ impl RpcDispatcher {
             Method::SessionList => self.handle_session_list(params).await,
             Method::SessionListAcp => self.handle_session_list_acp(params).await,
             Method::SessionMessages => self.handle_session_messages(params).await,
+            Method::SessionCost => self.handle_session_cost(params).await,
             Method::SessionState => self.handle_session_state(params).await,
             Method::SessionDelete => self.handle_session_delete(params).await,
             Method::SessionApprove => self.handle_session_approve(params).await,
@@ -4375,6 +4380,16 @@ impl RpcDispatcher {
             .map(|auth| current_authority_under(&lease, auth, method))
             .transpose()
             .map_err(|denied| rpc_err(denied.code, denied.message))?;
+        if method == Method::SessionCost
+            && grants.as_ref().is_some_and(|g| {
+                !g.permits(
+                    zeroclaw_api::grants::Resource::Cost,
+                    zeroclaw_api::grants::Verb::Read,
+                )
+            })
+        {
+            return Err(rpc_err(FORBIDDEN, "Principal is not granted Cost:Read"));
+        }
         if self
             .scoped_principal_id_from(grants.as_ref())
             .as_deref()
@@ -9050,6 +9065,72 @@ impl RpcDispatcher {
         to_result(SessionListResult { sessions })
     }
 
+    async fn handle_session_cost(&self, params: &Value) -> RpcResult {
+        let (value, record) = self.handle_session_cost_record(params).await?;
+        let _authority = self.session_effect_lease(
+            Method::SessionCost,
+            record.as_ref().and_then(|r| r.owner.as_deref()),
+        )?;
+        Ok(value)
+    }
+
+    async fn handle_session_cost_record(
+        &self,
+        params: &Value,
+    ) -> Result<(Value, Option<super::session::SessionRecord>), JsonRpcError> {
+        use zeroclaw_api::cost::{ConversationCostReason, ConversationCostSummary};
+        let req: SessionIdParams = parse_params(params)?;
+        self.require_additional_grant(
+            Method::SessionCost,
+            zeroclaw_api::grants::Resource::Cost,
+            zeroclaw_api::grants::Verb::Read,
+        )?;
+        let authorized = self
+            .authorize_session_owner(&req.session_id, Method::SessionCost)
+            .await?
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+        let expected_generation = self.capture_session_access(&req.session_id).await?;
+        let key = match &authorized.durable {
+            // RPC turns scope their public id; only their transcript uses
+            // rpc_<id>. Match this authorized mapping exactly, so a supplied
+            // storage-key alias cannot select another conversation's ledger.
+            Some(DurableSession::Chat { key }) if key == &format!("rpc_{}", req.session_id) => {
+                req.session_id.clone()
+            }
+            Some(DurableSession::Chat { key }) => key.clone(),
+            // Native Code and live-only RPC turns also scope their public id.
+            Some(DurableSession::Acp) | None => req.session_id.clone(),
+        };
+        let summary = if let Some(tracker) = &self.ctx.cost_tracker {
+            let tracker = Arc::clone(tracker);
+            run_blocking_rpc(
+                move || tracker.get_summary_for_conversation(&key),
+                "Failed to read conversation cost",
+            )
+            .await?
+        } else {
+            ConversationCostSummary::unavailable(if self.ctx.config.read().cost.enabled {
+                ConversationCostReason::TrackingUnavailable
+            } else {
+                ConversationCostReason::TrackingDisabled
+            })
+        };
+        let grants = self.recheck_authority_after_admission(Method::SessionCost)?;
+        let current = self
+            .revalidate_admitted_session(
+                &req.session_id,
+                Some(&authorized),
+                self.scoped_principal_id_from(grants.as_ref()).as_deref(),
+            )
+            .await?;
+        if current.as_ref() != Some(&authorized) {
+            return Err(self.stale_session_incarnation_error());
+        }
+        self.ensure_session_incarnation(&req.session_id, expected_generation)
+            .await?;
+        to_result(summary).map(|value| (value, current))
+    }
+
     async fn handle_session_messages(&self, params: &Value) -> RpcResult {
         let (value, record) = self.handle_session_messages_record(params).await?;
         let _authority = self.session_effect_lease(
@@ -9059,20 +9140,21 @@ impl RpcDispatcher {
         Ok(value)
     }
 
-    async fn commit_session_messages(&self, id: Value, params: &Value) {
-        let prepared =
-            self.handle_session_messages_record(params)
-                .await
-                .and_then(|(value, record)| {
-                    serde_json::to_string(&JsonRpcResponse {
-                        jsonrpc: JSONRPC_VERSION,
-                        id: id.clone(),
-                        result: Some(value),
-                        error: None,
-                    })
-                    .map(|frame| (frame, record))
-                    .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))
-                });
+    async fn commit_session_read(&self, method: Method, id: Value, params: &Value) {
+        let result = match method {
+            Method::SessionCost => self.handle_session_cost_record(params).await,
+            _ => self.handle_session_messages_record(params).await,
+        };
+        let prepared = result.and_then(|(value, record)| {
+            serde_json::to_string(&JsonRpcResponse {
+                jsonrpc: JSONRPC_VERSION,
+                id: id.clone(),
+                result: Some(value),
+                error: None,
+            })
+            .map(|frame| (frame, record))
+            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))
+        });
         self.ctx
             .sessions
             .wait_test_effect_pause("messages-frame")
@@ -9113,8 +9195,7 @@ impl RpcDispatcher {
                         }
                         let owner = record.as_ref().and_then(|r| r.owner.as_deref());
                         let mut commit = |actual: Option<&str>| -> anyhow::Result<()> {
-                            let _authority =
-                                self.durable_effect_lease(Method::SessionMessages, owner, actual)?;
+                            let _authority = self.durable_effect_lease(method, owner, actual)?;
                             if let (Some(permit), Some(frame)) = (permit.take(), frame.take()) {
                                 permit.send(frame);
                             }
@@ -9143,7 +9224,7 @@ impl RpcDispatcher {
                             None => commit(owner),
                         }
                         .map_err(|error| {
-                            session_effect_error(error, "Failed to commit session messages")
+                            session_effect_error(error, "Failed to commit session read")
                         })
                     })
                     .await
@@ -29476,6 +29557,150 @@ mod tests {
         let ctx = RpcContext::minimal_with_cost_tracker(config, sessions, tracker);
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         RpcDispatcher::new(ctx, tx, "test-peer-costquery:pid=1".into())
+    }
+
+    fn conversation_cost_fixture(tmp: &tempfile::TempDir) -> RpcDispatcher {
+        use zeroclaw_api::grants::{Resource, Verb};
+        let mut config = two_user_config(tmp);
+        config.cost.enabled = true;
+        config
+            .permission_profiles
+            .get_mut("member")
+            .unwrap()
+            .grants
+            .insert(Resource::Cost, vec![Verb::Read]);
+        let data_dir = config.data_dir.clone();
+        let tracker =
+            Arc::new(crate::cost::CostTracker::new(config.cost.clone(), &data_dir).unwrap());
+        let (mut fixture, _, _, _) = make_persistence_test_dispatcher(config, &data_dir);
+        Arc::get_mut(&mut fixture.ctx).unwrap().cost_tracker = Some(tracker);
+        fixture
+    }
+
+    #[tokio::test]
+    async fn conversation_cost_reads_owned_chat_and_code_without_waiting_for_turn() {
+        use crate::cost::{TokenUsage, UsageCompleteness};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fixture = conversation_cost_fixture(&tmp);
+        let ctx = &fixture.ctx;
+        let owner = scoped_dispatcher(ctx, 4242).await;
+        let other = scoped_dispatcher(ctx, 4343).await;
+        for (sid, mode) in [("owned-chat", "chat"), ("owned-code", "acp")] {
+            owner.handle_session_new_for_test(&json!({"agent_alias":"test-agent", "session_id":sid, "chat_mode":mode, "keep_siblings":true})).await.unwrap();
+            ctx.cost_tracker
+                .as_ref()
+                .unwrap()
+                .record_observed_usage(
+                    TokenUsage::new("model", 1_000_000, 0, 0, 3.0, 0.0, 0.0),
+                    UsageCompleteness::Complete,
+                    Some("test-agent"),
+                    Some(sid.to_owned()),
+                )
+                .unwrap();
+            let agent = ctx.sessions.get_agent(sid).await.unwrap();
+            let turn_lock = agent.lock().await;
+            let value = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                owner.handle_session_cost(&json!({"session_id":sid})),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(value["estimated_cost_usd"], 3.0);
+            assert_eq!(value["status"], "estimated");
+            drop(turn_lock);
+            assert_eq!(
+                other
+                    .handle_session_cost(&json!({"session_id":sid}))
+                    .await
+                    .unwrap_err()
+                    .code,
+                FORBIDDEN
+            );
+            ctx.sessions.remove(sid).await;
+            let reopened = owner
+                .handle_session_cost(&json!({"session_id":sid}))
+                .await
+                .unwrap();
+            assert_eq!(reopened["estimated_cost_usd"], 3.0);
+        }
+        assert_eq!(
+            other
+                .handle_session_cost(&json!({"session_id":"unknown"}))
+                .await
+                .unwrap_err()
+                .code,
+            FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn conversation_cost_requires_both_read_grants() {
+        use zeroclaw_api::grants::Resource;
+        for resource in [Resource::Cost, Resource::Sessions] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let fixture = conversation_cost_fixture(&tmp);
+            let (mut owner, mut frames) = roster_peer(&fixture.ctx, 4242).await;
+            owner
+                .handle_session_new_for_test(
+                    &json!({"agent_alias":"test-agent", "session_id":"owned"}),
+                )
+                .await
+                .unwrap();
+            let mut config = fixture.ctx.config_authority.snapshot_config();
+            config
+                .permission_profiles
+                .get_mut("member")
+                .unwrap()
+                .grants
+                .remove(&resource);
+            fixture.ctx.auth.refresh_from_config(&config).unwrap();
+            fixture.ctx.config_authority.publish_for_test(config);
+            owner.process_line(&json!({"jsonrpc":"2.0", "id":99, "method":"session/cost", "params":{"session_id":"owned"}}).to_string()).await;
+            let response: Value = serde_json::from_str(&frames.recv().await.unwrap()).unwrap();
+            assert_eq!(response["error"]["code"], FORBIDDEN, "{response}");
+        }
+    }
+
+    #[tokio::test]
+    async fn conversation_cost_frame_rechecks_grants_and_session_after_read() {
+        for revoke in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let fixture = conversation_cost_fixture(&tmp);
+            let ctx = Arc::clone(&fixture.ctx);
+            let (mut owner, mut frames) = roster_peer(&ctx, 4242).await;
+            owner
+                .handle_session_new_for_test(
+                    &json!({"agent_alias":"test-agent", "session_id":"owned"}),
+                )
+                .await
+                .unwrap();
+            let (arrived, release) = ctx.sessions.set_test_effect_pause("messages-frame");
+            let pending = zeroclaw_spawn::spawn!(async move {
+                owner.process_line(&json!({"jsonrpc":"2.0", "id":100, "method":"session/cost", "params":{"session_id":"owned"}}).to_string()).await;
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), arrived.notified())
+                .await
+                .unwrap();
+            if revoke {
+                let mut config = ctx.config_authority.snapshot_config();
+                config
+                    .permission_profiles
+                    .get_mut("member")
+                    .unwrap()
+                    .grants
+                    .remove(&zeroclaw_api::grants::Resource::Cost);
+                ctx.auth.refresh_from_config(&config).unwrap();
+                ctx.config_authority.publish_for_test(config);
+            } else {
+                ctx.sessions.remove("owned").await;
+            }
+            release.notify_one();
+            pending.await.unwrap();
+            let response: Value = serde_json::from_str(&frames.recv().await.unwrap()).unwrap();
+            assert!(response.get("result").is_none(), "{response}");
+            assert_eq!(response["error"]["code"], FORBIDDEN, "{response}");
+        }
     }
 
     #[test]

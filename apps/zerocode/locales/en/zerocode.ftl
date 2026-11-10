@@ -900,3 +900,17 @@ zc-config-setup-required-missing = missing
 zc-config-setup-no-filter-matches = No matches. Clear filter.
 
 zc-chat-tool-question = question
+
+## Recorded conversation spending
+zc-cost-estimate = Est. { $amount }
+zc-cost-incomplete = { $estimate } · incomplete
+zc-cost-unavailable = Cost unavailable
+zc-cost-detail = Estimate of recorded conversation usage, including attributed delegates; not a provider invoice.
+zc-cost-missing-usage = Some provider usage was missing or incomplete.
+zc-cost-missing-prices = Prices were unavailable for some usage.
+zc-cost-unverified-history = Older records do not verify full usage coverage.
+zc-cost-tracking-disabled = Cost tracking is disabled.
+zc-cost-tracking-unavailable = Cost tracking is unavailable.
+zc-cost-no-recorded-usage = No usage has been recorded for this conversation.
+zc-cost-ledger-integrity = Some ledger records could not be read reliably.
+zc-cost-persistence-uncertain = A ledger write failed; saved spending is uncertain.

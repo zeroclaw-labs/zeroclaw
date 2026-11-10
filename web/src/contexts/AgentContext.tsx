@@ -1,3 +1,5 @@
+import { useConversationCost } from '@/hooks/useConversationCost';
+import type { ConversationCostSummary } from '@/lib/api';
 import { createContext, useContext, useEffect, useRef, useState, useCallback } from 'react';
 import type {
   ApprovalDecision,
@@ -18,6 +20,7 @@ import {
   listProps,
   getStatus,
   getSessionMessages,
+  getSessionCost,
   abortSession,
   deleteSession,
   renameSession,
@@ -128,6 +131,7 @@ export interface AgentContextValue {
   pendingApproval: PendingApproval | null;
   respondToApproval: (decision: ApprovalDecision) => void;
   // Context window tracking (from "done" WS frames). See #7311.
+  conversationCost: ConversationCostSummary | null;
   contextMaxTokens: number | null;
   contextModelWindow: number | null;
   contextInputTokens: number | null;
@@ -162,6 +166,8 @@ export interface AgentProviderProps {
   /** Configured agent alias this provider is bound to. The WebSocket
    * connection, session ID, and chat history are all scoped to this alias. */
   agentAlias: string;
+  /** The workspace keeps hidden panes connected; only visible panes poll cost. */
+  visible?: boolean;
   /**
    * Conversation to open. Omit to resume the alias's last one. The workspace
    * passes it per pane so the same agent can be open twice on two different
@@ -201,6 +207,7 @@ export interface AgentSessionRuntime {
   delete(sessionId: string): Promise<{ deleted: boolean }>;
   rename(sessionId: string, name: string): Promise<{ session_id: string; name: string }>;
   mintId(): string;
+  getCost?: typeof getSessionCost;
 }
 
 const defaultSessionRuntime: AgentSessionRuntime = {
@@ -209,12 +216,15 @@ const defaultSessionRuntime: AgentSessionRuntime = {
   delete: deleteSession,
   rename: renameSession,
   mintId: newSessionId,
+  getCost: getSessionCost,
 };
 
 /** Shared empty array so panes with no siblings keep a stable context value. */
 const NO_RESERVED_SESSIONS: readonly string[] = [];
+const unavailableConversationCost: typeof getSessionCost = async () => ({ estimated_cost_usd: null, status: 'unavailable', reasons: ['tracking_unavailable'] });
 
 export function AgentProvider({
+  visible = true,
   agentAlias,
   initialSessionId,
   reservedSessionIds,
@@ -245,6 +255,7 @@ export function AgentProvider({
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [typing, setTyping] = useState(false);
+  const conversationCost = useConversationCost(sessionId, connected, typing, sessionRuntime.getCost ?? unavailableConversationCost, visible);
   const [streamingContent, setStreamingContent] = useState('');
   const [streamingThinking, setStreamingThinking] = useState('');
   const [currentModel, setCurrentModel] = useState<string | null>(null);
@@ -1302,6 +1313,7 @@ export function AgentProvider({
     pendingApproval,
     respondToApproval,
     // Context window tracking (from "done" WS frames). See #7311.
+    conversationCost,
     contextMaxTokens: contextLimits.maxTokens,
     contextModelWindow: contextLimits.modelWindow,
     contextInputTokens,

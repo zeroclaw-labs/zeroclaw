@@ -1,5 +1,5 @@
 use crate::cost::CostTracker;
-use crate::cost::types::{BudgetCheck, TokenUsage as CostTokenUsage};
+use crate::cost::types::{BudgetCheck, TokenUsage as CostTokenUsage, UsageCompleteness};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
@@ -366,8 +366,8 @@ pub fn compute_cost_usd(
 /// pricing context and price its usage, without touching any accumulator or
 /// tracker. Shared by the settlement path and the rejected-attempt projection
 /// so both derive the same cost from the same usage. Returns `None` when no
-/// cost-tracking context is scoped or the usage carries no input/output
-/// tokens.
+/// cost-tracking context is scoped. Explicitly reported zero usage remains
+/// a valid zero-valued observation.
 fn price_usage(
     model_provider_name: &str,
     model: &str,
@@ -377,10 +377,6 @@ fn price_usage(
     let input_tokens = usage.input_tokens.unwrap_or(0);
     let output_tokens = usage.output_tokens.unwrap_or(0);
     let cached_input_tokens = usage.cached_input_tokens.unwrap_or(0);
-    let total_tokens = input_tokens.saturating_add(output_tokens);
-    if total_tokens == 0 {
-        return None;
-    }
 
     let ctx = TOOL_LOOP_COST_TRACKING_CONTEXT
         .try_with(Clone::clone)
@@ -452,7 +448,6 @@ fn price_usage(
 /// billable; accepted context-window fill remains a property of the selected
 /// final leaf rather than the aggregate.
 pub(crate) struct BillableProviderAttempt<'a> {
-    pub index: usize,
     pub attempt: &'a zeroclaw_providers::dispatch::AccountedAttempt,
     pub usage: &'a zeroclaw_providers::traits::TokenUsage,
 }
@@ -465,7 +460,7 @@ pub(crate) fn billable_provider_attempts(
 ) -> impl Iterator<Item = BillableProviderAttempt<'_>> {
     use zeroclaw_providers::dispatch::AttemptUsageOutcome;
 
-    attempts.iter().enumerate().filter_map(|(index, attempt)| {
+    attempts.iter().filter_map(|attempt| {
         let usage = match attempt.outcome() {
             AttemptUsageOutcome::Complete(usage) => Some(usage),
             AttemptUsageOutcome::OutcomeUnknown {
@@ -475,11 +470,7 @@ pub(crate) fn billable_provider_attempts(
             | AttemptUsageOutcome::Invalid { .. }
             | AttemptUsageOutcome::OutcomeUnknown { observed: None } => None,
         };
-        usage.map(|usage| BillableProviderAttempt {
-            index,
-            attempt,
-            usage,
-        })
+        usage.map(|usage| BillableProviderAttempt { attempt, usage })
     })
 }
 
@@ -487,14 +478,94 @@ pub(crate) fn settle_provider_attempts(
     attempts: &[zeroclaw_providers::dispatch::AccountedAttempt],
     accepted_attempt: Option<usize>,
 ) {
-    for event in billable_provider_attempts(attempts) {
-        let updates_context_window_fill = accepted_attempt == Some(event.index);
-        let _ = record_tool_loop_cost_usage_inner(
-            event.attempt.provider_ref(),
-            event.attempt.model(),
-            event.usage,
-            updates_context_window_fill,
+    for (index, attempt) in attempts.iter().enumerate() {
+        record_attempt_outcome(
+            attempt.provider_ref(),
+            attempt.model(),
+            attempt.outcome(),
+            accepted_attempt == Some(index),
         );
+    }
+}
+
+/// Accepted and rejected paths share provenance without sharing settlement ownership.
+fn record_attempt_outcome(
+    provider: &str,
+    model: &str,
+    outcome: &zeroclaw_providers::dispatch::AttemptUsageOutcome,
+    accepted: bool,
+) -> Option<(u64, f64)> {
+    use zeroclaw_providers::dispatch::AttemptUsageOutcome;
+    match outcome {
+        AttemptUsageOutcome::Complete(usage) => record_usage_observation(
+            provider,
+            model,
+            usage,
+            accepted,
+            None,
+            UsageCompleteness::Complete,
+        ),
+        AttemptUsageOutcome::OutcomeUnknown {
+            observed: Some(usage),
+        } => record_usage_observation(
+            provider,
+            model,
+            usage,
+            accepted,
+            None,
+            UsageCompleteness::LowerBound,
+        ),
+        _ => {
+            record_usage_gap(provider, model);
+            None
+        }
+    }
+}
+
+pub(crate) fn record_accepted_tool_loop_cost_usage(
+    provider: &str,
+    model: &str,
+    usage: Option<&zeroclaw_providers::traits::TokenUsage>,
+    outcome: Option<&zeroclaw_providers::dispatch::AttemptUsageOutcome>,
+) -> Option<(u64, f64)> {
+    if let Some(outcome) = outcome {
+        return record_attempt_outcome(provider, model, outcome, true);
+    }
+    match usage {
+        Some(usage) => record_tool_loop_cost_usage(provider, model, usage),
+        None => {
+            record_usage_gap(provider, model);
+            None
+        }
+    }
+}
+
+fn record_usage_gap(provider: &str, model: &str) {
+    let Some(ctx) = TOOL_LOOP_COST_TRACKING_CONTEXT
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+    else {
+        return;
+    };
+    let Some(tracker) = &ctx.tracker else {
+        return;
+    };
+    let conversation = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+        .try_with(Clone::clone)
+        .ok()
+        .flatten();
+    let usage = CostTokenUsage::new(model, 0, 0, 0, 0.0, 0.0, 0.0);
+    if let Err(error) = tracker.record_observed_usage(
+        usage,
+        UsageCompleteness::Unavailable,
+        ctx.agent_alias.as_deref(),
+        conversation,
+    ) {
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({"model_provider": provider, "model": model, "error": error.to_string()})),
+            "Failed to record cost usage coverage");
     }
 }
 
@@ -519,6 +590,32 @@ fn record_tool_loop_cost_usage_inner_with_live(
     usage: &zeroclaw_providers::traits::TokenUsage,
     updates_context_window_fill: bool,
     live_override: Option<ModelRates>,
+) -> Option<(u64, f64)> {
+    let completeness = if usage.input_tokens.is_some() && usage.output_tokens.is_some() {
+        UsageCompleteness::Complete
+    } else if usage.input_tokens.is_some() || usage.output_tokens.is_some() {
+        UsageCompleteness::LowerBound
+    } else {
+        record_usage_gap(model_provider_name, model);
+        return None;
+    };
+    record_usage_observation(
+        model_provider_name,
+        model,
+        usage,
+        updates_context_window_fill,
+        live_override,
+        completeness,
+    )
+}
+
+fn record_usage_observation(
+    model_provider_name: &str,
+    model: &str,
+    usage: &zeroclaw_providers::traits::TokenUsage,
+    updates_context_window_fill: bool,
+    live_override: Option<ModelRates>,
+    completeness: UsageCompleteness,
 ) -> Option<(u64, f64)> {
     let input_tokens = usage.input_tokens.unwrap_or(0);
     let output_tokens = usage.output_tokens.unwrap_or(0);
@@ -575,10 +672,10 @@ fn record_tool_loop_cost_usage_inner_with_live(
         .ok()
         .flatten();
     if let Some(tracker) = &ctx.tracker
-        && let Err(error) = tracker.record_usage_attributed(
+        && let Err(error) = tracker.record_observed_usage(
             cost_usage.clone(),
+            completeness,
             ctx.agent_alias.as_deref(),
-            None,
             conversation_id,
         )
     {
@@ -657,6 +754,89 @@ mod tests {
     use zeroclaw_config::schema::{Config, DeepseekModelProviderConfig, ModelProviderConfig};
     use zeroclaw_providers::ProviderDispatch;
     use zeroclaw_providers::dispatch::{AccountedChatScope, with_exact_dispatch_route};
+
+    #[tokio::test]
+    async fn conversation_cost_records_missing_invalid_and_interrupted_observations() {
+        use zeroclaw_api::cost::{ConversationCostReason, ConversationCostStatus};
+        use zeroclaw_providers::dispatch::{AttemptUsageOutcome, InvalidUsageReason};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+                tmp.path(),
+            )
+            .unwrap(),
+        );
+        let context = ToolLoopCostTrackingContext::new(
+            Arc::clone(&tracker),
+            Arc::new(HashMap::from([(
+                "test".into(),
+                HashMap::from([("fixture-model.input".into(), 1.0)]),
+            )])),
+        );
+        let usage = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(1_000_000),
+            output_tokens: Some(0),
+            ..Default::default()
+        };
+        zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(
+                Some("rpc_chat".into()),
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(context), async {
+                    record_accepted_tool_loop_cost_usage(
+                        "test",
+                        "fixture-model",
+                        Some(&usage),
+                        Some(&AttemptUsageOutcome::Complete(usage.clone())),
+                    );
+                    record_attempt_outcome(
+                        "test",
+                        "fixture-model",
+                        &AttemptUsageOutcome::OutcomeUnknown {
+                            observed: Some(usage.clone()),
+                        },
+                        false,
+                    );
+                    record_attempt_outcome(
+                        "test",
+                        "fixture-model",
+                        &AttemptUsageOutcome::Missing,
+                        false,
+                    );
+                    record_attempt_outcome(
+                        "test",
+                        "fixture-model",
+                        &AttemptUsageOutcome::Invalid {
+                            observed: usage.clone(),
+                            reason: InvalidUsageReason::MissingOutput,
+                        },
+                        false,
+                    );
+                    record_accepted_tool_loop_cost_usage("test", "fixture-model", None, None);
+                }),
+            )
+            .await;
+        let summary = tracker.get_summary_for_conversation("rpc_chat").unwrap();
+        assert_eq!(summary.estimated_cost_usd, Some(2.0));
+        assert_eq!(summary.status, ConversationCostStatus::Partial);
+        assert_eq!(summary.reasons, vec![ConversationCostReason::MissingUsage]);
+        assert_eq!(tracker.get_summary().unwrap().request_count, 2);
+        let rows: Vec<crate::cost::CostRecord> =
+            std::fs::read_to_string(tmp.path().join("state/costs.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        assert_eq!(rows.len(), 5);
+        assert!(
+            rows.iter()
+                .all(|row| row.conversation_id.as_deref() == Some("rpc_chat"))
+        );
+        assert_eq!(rows.iter().filter(|row| row.is_coverage_only()).count(), 3);
+    }
 
     struct ResetGlobalPricingCatalog;
 

@@ -1,3 +1,4 @@
+import { ConversationCost } from '@/components/ConversationCost';
 import { memo, useState, useEffect, useRef, useCallback } from 'react';
 import { Link, Navigate, useParams } from 'react-router-dom';
 import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench, Brain, BarChart2, FolderOpen, ImagePlus, Loader2 } from 'lucide-react';
@@ -124,6 +125,7 @@ export function AgentChatInner({
     abortSession,
     pendingApproval,
     respondToApproval,
+    conversationCost,
     contextMaxTokens,
     contextModelWindow,
     contextInputTokens,
@@ -861,7 +863,7 @@ export function AgentChatInner({
             </Button>
           )}
         </div>
-        <div className="flex items-center justify-between mt-2 gap-2 max-w-4xl mx-auto">
+        <div className="flex flex-wrap items-center justify-between mt-2 gap-2 max-w-4xl mx-auto">
           <div className="flex items-center gap-2">
             <span
               className="status-dot"
@@ -880,6 +882,7 @@ export function AgentChatInner({
                   : t('agent.disconnected_status')}
             </span>
           </div>
+          <ConversationCost summary={conversationCost} />
           <ContextBar contextMaxTokens={contextMaxTokens} contextModelWindow={contextModelWindow} contextInputTokens={contextInputTokens} />
         </div>
       </div>

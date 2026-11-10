@@ -2241,6 +2241,12 @@ export function getSession(id: string): Promise<Session> {
   return apiFetch<Session>(`/api/sessions/${encodeURIComponent(id)}`);
 }
 
+export type ConversationCostSummary = components["schemas"]["ConversationCostSummary"];
+
+export function getSessionCost(id: string, signal?: AbortSignal): Promise<ConversationCostSummary> {
+  return apiFetch<ConversationCostSummary>(`/api/sessions/${encodeURIComponent(id)}/cost`, { signal });
+}
+
 /** Load persisted gateway WebSocket chat transcript for the dashboard Agent Chat. */
 export function getSessionMessages(
   id: string,

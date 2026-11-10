@@ -28,6 +28,7 @@ mod color_depth;
 mod config;
 mod config_application;
 mod config_manager;
+mod conversation_cost;
 mod dashboard;
 mod diff;
 mod display_width;
