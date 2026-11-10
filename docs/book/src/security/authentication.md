@@ -244,8 +244,8 @@ size-capped, and a token response is accepted only when it carries a
 non-empty `Bearer` access token. A confidential client (an entry with a
 `client_secret`) authenticates with HTTP Basic on device-grant and
 `client_credentials` requests, and sends the secret in the form body for the
-authorization-code exchange (`--browser` and dashboard sign-in); a public
-client sends its `client_id` in the form.
+authorization-code exchange (`--browser`, the gateway's browser flow and
+dashboard sign-in); a public client sends its `client_id` in the form.
 
 `--browser` opens the system browser for you on macOS and Linux, and on
 every platform it also prints the sign-in URL so you can open it by
@@ -874,8 +874,9 @@ Things to know before turning it on:
   sooner, take the provider off `gateway.dashboard_sign_in.oidc`.
 - An identity provider that cannot be reached, or answers with an error,
   when a session's token is verified again ends that session (it fails
-  closed). That happens at each introspection revalidation deadline and
-  after a configuration reload in either validation mode. The dashboard
+  closed). That happens at each introspection revalidation deadline, and
+  in either validation mode after a configuration reload or a change to
+  the OIDC, user or permission-profile configuration. The dashboard
   reports the session as expired; users sign in again once the provider is
   back (#12096).
 
