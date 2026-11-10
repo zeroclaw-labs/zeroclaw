@@ -68,13 +68,19 @@ importantly, what changes for existing remote connections.
    narrowed or its credential expired is refused when its turn comes.
 
 Authorization is **live** for edits made through the daemon's RPC config
-methods, which is what zerocode's config editor uses: editing
-`[permission_profiles]`, `[users]`, `[oidc]`, or `security.trust_daemon_uid`
-that way re-compiles the policy at save time. Established native-token and
+methods (used by zerocode's config editor) and its supervised gateway's
+configuration API (used by the web dashboard). Both share the daemon
+generation's live configuration, config write lock, and accepted authorization
+authority. Editing `[permission_profiles]`, `[users]`, `[oidc]`, or
+`security.trust_daemon_uid` through either surface compiles and publishes the
+policy at save time, before the write returns success. Established native-token and
 local connections re-resolve at their next operation, with no reconnect or
-restart, and an OIDC connection must initialize again. Edits made
-outside the daemon, directly in `config.toml`, through the web dashboard, or
-with `zeroclaw config set`, apply at the next daemon reload or restart.
+restart, and an OIDC connection must initialize again. The dashboard's
+pending-reload flag still covers daemon-owned subsystems that need rebuilding;
+it does not delay this authorization publication. Edits made outside the
+daemon, directly in `config.toml` or with `zeroclaw config set`, still apply
+at the next daemon reload or restart. These authorization CLI writes save to disk without
+publishing to the running daemon or triggering its reload.
 Revoking a gateway pairing token through the gateway's pairing controls
 invalidates connections authenticated with it before their next operation.
 Removing a token from `gateway.paired_tokens` by editing config, over RPC
@@ -280,6 +286,22 @@ they only relay what the IdP grants after the user approves. Design
 rationale and failure-mode table:
 `docs/security/oidc-browser-pkce-design-8289.md` in the repository.
 
+The gateway browser flow also requires a short-lived `HttpOnly` binding
+cookie from the browser that started it. The cookie grants no session or
+API access. A callback with no matching cookie is refused before code
+exchange and consumes the pending flow; open a new login in the intended
+browser instead of forwarding a callback URL between browsers. Each tab
+has its own flow cookie. A relay-capacity refusal retains a valid flow and
+cookie for retry within the original ten-minute deadline.
+
+Binding cookies use `SameSite=Lax` for the identity provider's top-level
+GET redirect. They have no `Domain` attribute and use `Path=/`, including
+behind a gateway path prefix; HTTPS also uses `Secure` and the `__Host-`
+name prefix. Serve remote enrollment over HTTPS. Plain-HTTP cookie scope
+still spans ports on the same host; this is not isolation from another
+application running on that host. Cookie blocking prevents browser
+enrollment; the device flow remains available.
+
 The rate limiting works in layers. Requests that start a flow
 (`POST /api/oidc/{alias}/device/start`, `GET /oidc/login/{alias}`, and
 `GET /oidc/callback`) count against an enrollment-specific instance of
@@ -318,7 +340,18 @@ the store away from everyone else for the ten minutes those flows live. Loopback
 exempt from the per-client budgets, as they are from every other gateway
 auth limit, so a reverse proxy sitting on the same host must enable
 `trust_forwarded_headers` for the per-client limits to apply to the real
-callers behind it. Every enrollment response carries
+callers behind it. When that setting is on, the gateway takes the
+rightmost address from `X-Forwarded-For` (the hop the immediate proxy
+added) or else `X-Real-IP`. Configure the proxy to append or overwrite
+rather than forward a client-supplied list unchanged, for example nginx
+`proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`.
+If you set only `X-Real-IP`, also clear the higher-priority list with
+`proxy_set_header X-Forwarded-For "";` together with
+`proxy_set_header X-Real-IP $remote_addr;`; otherwise a client-supplied
+`X-Forwarded-For` still wins. A forwarded loopback address is skipped so
+it cannot claim the local-only limiter exemption; when the chain is
+loopback-only the gateway uses a non-exempt key rather than the loopback
+peer. Every enrollment response carries
 `Cache-Control: no-store` and `Pragma: no-cache` on top of the gateway's
 `no-referrer` policy, because device codes and access tokens travel in
 those bodies.
@@ -342,8 +375,21 @@ it refuses an advertised lifetime above one hour or a polling interval
 above five minutes rather than sleeping on a hostile answer. An
 advertised interval of `0` or `1` is floored at RFC 8628's five-second
 default, so a gateway answer cannot put zerocode on a once-a-second
-poll the per-client budget would only refuse. The token it receives is
-held in memory for that session only.
+poll the per-client budget would only refuse. The legacy automatic enrollment
+path holds the token in memory for that session only. For URL-scoped persistent login, use
+`zerocode login <alias> <wss-url> --gateway-url <https-origin>`; see
+[Remote setup](../zerocode/remote.md#sign-in-with-oidc-recommended-for-oidc-deployments).
+That command starts from an empty client directory: OIDC sign-in authorizes
+issuance of its first device certificate through the gateway, with no pre-created
+device, local user, daemon pairing code, SAS, or separate enrollment listener.
+The daemon verifies the bearer through the same accepted OIDC policy as RPC,
+requires a human with `sessions:create` and an allowed agent (or
+`system:execute` / admin), signs only the CSR's public key, and
+records the new device in the existing certificate ledger and audit trail.
+Static client-certificate pins still require out-of-band provisioning. WSS still
+requires both mTLS and a valid OIDC access token on every initialize.
+The command saves the accepted access token in the owner-only local
+`zerocode-config.toml` and re-authenticates when startup needs a fresh token.
 
 ## Permission profiles
 
@@ -465,10 +511,22 @@ the shared resolver's grants at prompt admission.
 
 That composition does not cover every route to an agent's tools. Cron jobs
 and SOP authoring check only the agent selector. A constrained principal
-holding cron grants can create a shell job for its agent, though agent jobs
-are refused to it as described above, and one holding SOP create or update
+holding cron grants can create or edit a shell job for its agent with RPC
+`cron/add` and `cron/patch`. The command meets the agent's approval policy
+there, as it does from the CLI and the dashboard, so under supervised
+autonomy a command that needs approval is refused rather than stored. Agent
+jobs are refused to it as described above. One holding SOP create or update
 grants can save a procedure whose trigger runs it later. Treat cron and SOP
 authoring grants as grants of the agent's tools.
+
+These checks run again when the job is written, not only when the request
+arrives. A grant withdrawn, or a paired device revoked, while a cron write
+waits for the database either stops that write or waits for it to finish.
+
+A tool called from a `pipeline` step or through a skill alias never inherits
+an approval. The runtime approves only the call it dispatched, so under
+supervised autonomy a command that needs approval is refused there; call the
+tool directly to be asked.
 
 Principal-owned sessions may use synchronous and parallel delegation when
 their grants allow it. Background delegation and its `check_result`,
@@ -559,6 +617,29 @@ provider registry and resolver:
   always has. Any other method outside GET, HEAD, POST, PUT, PATCH and
   DELETE is refused.
 
+Verifying an OIDC bearer is work an unauthenticated caller makes the
+gateway do, and with `validation = "introspection"` each verification
+is one authenticated round trip to the identity provider under the
+daemon's own client credentials. Two limits bound it. A refused
+credential counts against a per-client ledger with the same thresholds
+as a bad pairing token (10 in a minute, then a 5-minute lockout, with
+loopback exempt), kept on its own ledger, so a client replaying a token
+past its expiry never locks its operator out of pairing, and a pairing
+lockout never blocks a bearer. The bearer ledger reads
+`gateway.trust_forwarded_headers` from the live configuration for each
+request, so a saved proxy-trust change applies without rebuilding the
+router. A transport failure on the gateway's own
+leg to the identity provider, and a verified identity the policy grants
+nothing, say nothing about the caller and are not billed to it. At most
+16 bearer verifications are in flight at once across all clients,
+loopback included, which bounds what the gateway will do to the
+identity provider on everyone's behalf; the slot is held for the
+verification alone, never across the request it admits. A locked-out
+client gets HTTP 429 and a verification refused for capacity gets HTTP
+503, each with a `Retry-After` naming the delay in seconds. Dashboard
+sessions are verified by their own layer and never compete for these
+limits.
+
 A scoped principal's `Config` grants are enforced in two steps. The
 route layer applies a coarse floor per HTTP method: a read needs
 `read`, anything else needs at least one of `create`, `update` or
@@ -588,9 +669,11 @@ against the accepted snapshot as it stands. Nothing on the request
 path recompiles policy, so a request that read the configuration
 before a concurrent persist can never reinstall the older policy over
 the newer one; a persisted change to a provider's verification
-settings, a roster or a profile takes effect on the next request. The
-daemon's own RPC surface holds a separate live configuration and
-reaches the same state through the reload the gateway write flags.
+settings, a roster or a profile takes effect on the next request. In a
+supervised run, the gateway and RPC surface share the live configuration,
+write lock, and accepted policy authority, so a save through either surface
+publishes to both. A standalone gateway has its own authority; it does not
+publish changes to a separately running daemon.
 Other gateway surfaces keep the pairing check per handler and adopt the
 layer in follow-ups; a [dashboard sign-in](#dashboard-sign-in) session
 also satisfies that check when its account is an administrator.
@@ -618,9 +701,16 @@ Turning it on needs:
   The official Docker image writes `require_pairing = false` into its
   default config; set it to `true` there, or with
   `ZEROCLAW_gateway__require_pairing=true`.
-- HTTPS (`[gateway.tls]`, or a reverse proxy with
-  `trust_forwarded_headers`). Sign-in is refused over plain HTTP unless
-  the browser runs on the gateway's own machine.
+- HTTPS (`[gateway.tls]`, a reverse proxy with
+  `trust_forwarded_headers`, or a relay-served dashboard with
+  `[relay.dashboard]`, which is relay-terminated: see
+  [secure transport, 3e](../zerocode/secure-transport.md)). Sign-in is
+  refused over plain HTTP unless the browser runs on the gateway's own
+  machine. A relay-served dashboard offers sign-in alone: the relay would
+  see a pairing code or token, so pairing and paired tokens are refused
+  there. An administrator signed in through the relay gives the relay
+  administrator power, including lasting changes, so administer the daemon
+  over a direct connection or with `zerocode`.
 - Behind a reverse proxy, the browser's `Host` passed through unchanged
   (for example `proxy_set_header Host $host;` in nginx). The callback URI
   and the dashboard's own origin are both taken from it, so a proxy that
@@ -633,6 +723,8 @@ Turning it on needs:
   gateway checks the URI against a configured dashboard origin (#12048),
   it builds it from the request's `Host`, and the identity provider's
   exact match is what keeps a sign-in code from going to another address.
+  Through a relay-served dashboard it is always that dashboard's own
+  address, which the daemon logs at startup.
   Its client must be listed in `interactive_clients` (or classified by
   `actor_claim`), and its access tokens must carry the configured
   `audience`.
@@ -672,8 +764,50 @@ What a signed-in account can do follows its permission profile:
   do.
 - Any other account reaches the configuration pages its `Config` grants
   allow. Other pages answer 403 with `"reason": "operator_required"`, and
-  the dashboard hides them. Use zerocode for that account's own chat
-  sessions.
+  the dashboard hides them.
+- When the gateway runs inside the daemon, an account without `admin` can
+  also chat in the dashboard, with the agents its grants allow, if its
+  profile grants `sessions` create, read, execute and update. The agent
+  uses only the tools the profile grants (`allowed_tools`, with
+  `tools = ["execute"]`). A disabled agent takes no new chat, and a chat
+  already open with it answers each message with an error until the agent
+  is enabled again. Its conversations are its own: the daemon runs
+  them as that account, under its grants, and nobody else's dashboard
+  lists them. Image upload is not offered. Each chat is one conversation,
+  and the conversation lasts only as long as the chat:
+  - Closing or reloading the page, leaving the chat, or a dropped
+    connection ends the conversation, and stops a reply under way. So do
+    signing out, the session expiring, and a daemon reload or restart. A
+    new chat starts a new conversation; none is reopened.
+  - A sign-in has at most four chats open at once (four tabs, say), and
+    an account at most 32 across all its sign-ins. A conversation still
+    being created, or not yet closed after its chat ended, counts too, so
+    signing out and in again frees nothing until it is closed. A chat
+    past either limit is refused until one closes.
+  - Each chat presents the token to the daemon bound to the identity
+    provider that issued it. If the provider's configuration is changed
+    to another issuer or client meanwhile, the chat is refused and the
+    token is not sent to the new one.
+  - If the account's access is revoked while it is signed in, its open
+    conversations can't be closed with its own authority, and nobody else
+    can reach them. The daemon closes such a conversation once its chat
+    has been gone for `wss.orphaned_session_timeout_secs` (30 minutes by
+    default), if it is idle, has no reply or approval pending, and its
+    saved transcript is up to date. Setting the timeout to `0` turns this
+    off, and what the dashboard could not close then stays live until the
+    daemon restarts.
+  - If the daemon takes more than ten minutes to create a chat's
+    conversation, the chat gives up, but the dashboard keeps waiting for
+    the daemon's answer, and the creation counts against the account's 32
+    until it comes. A conversation created after all is closed when it
+    arrives, and then no longer counts, whatever the timeout above. A
+    conversation the dashboard could not close, or whose creation lost its
+    connection to the daemon before the answer came, counts until the next
+    daemon reload or restart, since the dashboard can't tell when the
+    daemon lets it go.
+  - A closed conversation's transcript is kept, but the dashboard can't
+    open it. Use zerocode when an account needs history that outlasts its
+    chat.
 
 Sign-out ends the session in this ZeroClaw and drops its cookie, also
 when the session had already ended; it does not sign the user out of the
@@ -691,7 +825,8 @@ that finishes later ends the other, and sign-out ends every session
 that shares a marker with the browser. A request admitted
 before its session ended that has not yet taken effect, such as a
 configuration change whose body is still arriving, is refused. A chat
-turn already running finishes unattended, as when a viewer leaves, and a
+turn already running finishes unattended, as when a viewer leaves (a
+scoped account's stops instead, since its conversation is closed), and a
 tool approval it was waiting on is refused; nothing the closed socket
 sent afterwards is acted on. A
 reload also closes the sockets a session opened, and the dashboard
@@ -936,3 +1071,15 @@ A principal without operator grants may list it only through an enabled
 agent whose policy lets it read `/`, such as one that is not workspace-only.
 For any other such principal the picker reports a refusal there until it
 opens inside an allowed root instead.
+
+### Keycloak access-token client attribution
+
+JWKS verification accepts a signed `azp` as the OAuth client identifier when a
+typed access token has no `client_id` and the configured client declaration or
+`actor_claim` establishes a human actor. The issuer, signature, token purpose,
+audience, lifetime and actor-classification checks still apply. An `azp`-only
+token cannot authenticate a service, including one classified by `actor_claim`;
+service actors still require `client_id`. A blank `client_id`, contradictory
+`client_id` and `azp`, or a client with no declaration or configured actor-claim
+evidence fails closed. Introspection still requires its `client_id` response
+field.
