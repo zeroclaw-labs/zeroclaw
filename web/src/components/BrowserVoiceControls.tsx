@@ -77,7 +77,7 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
       baseline.current = ids;
       return;
     }
-    if (typing) return;
+    if (typing || !ready || listening || speaking) return;
     const unseen = replies.filter(m => !m.fromHistory && !baseline.current!.has(m.id));
     // Formatting-only replies and a signature are not queue barriers.
     const next = unseen.find(reply => {
@@ -88,7 +88,7 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
     // Only consume the reply whose playback actually started. Later replies
     // stay pending until the current utterance ends.
     if (next) {
-      if (!ready || listening || speaking || !speak(next)) return;
+      if (!speak(next)) return;
       baseline.current.add(next.id);
     }
   });

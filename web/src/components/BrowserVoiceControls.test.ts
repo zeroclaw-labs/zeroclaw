@@ -279,6 +279,39 @@ test('continuous reading plays every waiting reply in order without replaying hi
   await act(async () => { renderer.unmount(); });
 });
 
+test('waiting replies are not converted again while playback is busy', async () => {
+  const Parser = globalThis.DOMParser;
+  let conversions = 0;
+  class CountingParser extends Parser {
+    override parseFromString(...args: Parameters<DOMParser['parseFromString']>) {
+      conversions++;
+      return super.parseFromString(...args);
+    }
+  }
+  globalThis.DOMParser = CountingParser;
+  const renderer = await mount();
+  try {
+    const speaker = () => renderer.root.findAllByType('button')[1]!;
+    await act(async () => { speaker().props.onKeyDown({ key: 'Enter', shiftKey: true, preventDefault() {} }); });
+    const messages = [reply('old', 'Historical reply'), reply('first', 'First reply')];
+    await act(async () => { renderer.update(createElement(Controls, { messages, hydrated: true, typing: false, onTranscript() {} })); });
+    assert.deepEqual(spoken, ['First reply']);
+    const before = conversions;
+    const waiting = [...messages, reply('waiting', '**Waiting** reply\n\n' + 'Long paragraph.\n'.repeat(1000))];
+    for (let n = 0; n < 5; n++) {
+      await act(async () => { renderer.update(createElement(Controls, { messages: waiting, hydrated: true, typing: false, onTranscript() {} })); });
+    }
+    assert.equal(conversions, before, 'composer rerenders must not repeatedly render/parse waiting Markdown');
+    await act(async () => { spokenUtterance?.onend?.(); });
+    assert.equal(spoken.length, 2);
+    assert.match(spoken[1]!, /^Waiting reply/);
+    assert.ok(conversions > before, 'the queued reply is prepared when playback becomes available');
+  } finally {
+    await act(async () => { renderer.unmount(); });
+    globalThis.DOMParser = Parser;
+  }
+});
+
 test('reloaded history with regenerated IDs is never treated as a live reply', async () => {
   const renderer = await mount();
   const speaker = () => renderer.root.findAllByType('button')[1]!;
