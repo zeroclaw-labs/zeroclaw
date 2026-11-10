@@ -4,7 +4,7 @@ import { Mic, MicOff, Volume2, VolumeX } from 'lucide-react';
 import type { ChatMessage } from '@/contexts/AgentContext';
 import { t } from '@/lib/i18n';
 import { speechText } from '@/lib/speechText';
-import { useGlobalVoiceTimeout, localRecognitionStatus, recognitionConstructor, shortPressAction, useBrowserVoices, useVoicePreferences, type Recognition } from '@/lib/browserVoice';
+import { useGlobalVoiceTimeout, readGlobalVoiceTimeout, localRecognitionStatus, recognitionConstructor, shortPressAction, useBrowserVoices, useVoicePreferences, type Recognition } from '@/lib/browserVoice';
 
 const readableMessage = (message: ChatMessage) => speechText(displayMessageText(message));
 
@@ -18,6 +18,7 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
   const { seconds: silenceSeconds } = useGlobalVoiceTimeout();
   const silenceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const autoSubmit = useRef(false);
+  const submitCancellation = useRef(0);
   const clearSilence = () => { if (silenceTimer.current) clearTimeout(silenceTimer.current); silenceTimer.current = null; };
   const [override, setOverride] = useState<boolean | null>(null);
   const continuous = override ?? prefs.automatic;
@@ -112,6 +113,7 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
   }, [prefs.dictation, prefs.reading]);
   const toggleMicrophone = async () => {
     if (recognition.current) {
+      submitCancellation.current++;
       clearSilence(); autoSubmit.current = false;
       if (finishing.current) return;
       finishing.current = true;
@@ -145,6 +147,14 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
       setListening(false); setError(t('voice.local_unavailable')); return;
     }
     capture.lang = prefs.language; capture.continuous = true; capture.interimResults = true;
+    const submissionEpoch = submitCancellation.current;
+    const submitAfterRevalidation = async () => {
+      try {
+        const currentTimeout = await readGlobalVoiceTimeout();
+        if (generation.current === version && submitCancellation.current === submissionEpoch
+            && currentTimeout > 0 && currentTimeout === silenceSeconds && visible()) onSilence?.();
+      } catch { /* Configuration cannot be confirmed: keep the draft, never auto-send. */ }
+    };
     let captureEnded = false;
     let speechActive = false;
     const armSilence = () => {
@@ -153,7 +163,7 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
       silenceTimer.current = setTimeout(() => {
         if (generation.current !== version) return;
         if (!visible()) { stopCapture(); return; }
-        if (captureEnded) { clearSilence(); if (receivedText) onSilence?.(); return; }
+        if (captureEnded) { clearSilence(); if (receivedText) void submitAfterRevalidation(); return; }
         autoSubmit.current = true; finishing.current = true;
         try { capture.stop(); } catch { stopCapture(); setError(t('voice.capture_error')); }
       }, silenceSeconds * 1000);
@@ -192,7 +202,7 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
       finishing.current = false;
       setListening(false);
       if (!receivedText && visible()) setError(t('voice.no_transcript'));
-      if (shouldSubmit) onSilence?.();
+      if (shouldSubmit) void submitAfterRevalidation();
     };
     recognition.current = capture;
     try { capture.start(); armSilence(); } catch { stopCapture(); setError(t('voice.capture_error')); }

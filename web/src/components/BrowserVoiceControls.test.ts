@@ -614,3 +614,43 @@ test('manual stop cancels an automatic stop still awaiting final recognition', a
     assert.equal(submitted, 0);
   } finally { context.mock.timers.reset(); await act(async () => { renderer.unmount(); }); }
 });
+
+
+test('a remote global disable prevents a pending automatic send without focus events', async (context) => {
+  let submitted = 0;
+  const previous = globalSilenceSeconds;
+  globalSilenceSeconds = 15;
+  let renderer!: ReactTestRenderer;
+  await act(async () => { renderer = create(createElement(Controls, { messages: [], hydrated: true, typing: false, onTranscript() {}, onSilence() { submitted++; } }), options); });
+  context.mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    await act(async () => { await renderer.root.findAllByType('button')[0]!.props.onClick(); });
+    capture.onresult!({ resultIndex: 0, results: [{ isFinal: true, 0: { transcript: 'Keep this draft' } }] });
+    globalSilenceSeconds = 0;
+    await act(async () => { context.mock.timers.tick(15000); });
+    assert.equal(submitted, 0);
+  } finally {
+    await act(async () => { renderer.unmount(); });
+    context.mock.timers.reset(); globalSilenceSeconds = previous;
+  }
+});
+
+
+test('visible clients refresh the global timeout without a focus event', async (context) => {
+  const { useGlobalVoiceTimeout } = await import('../lib/browserVoice.ts');
+  const previous = globalSilenceSeconds;
+  globalSilenceSeconds = 15;
+  context.mock.timers.enable({ apis: ['setInterval'] });
+  function Probe() { return createElement('output', null, useGlobalVoiceTimeout().seconds); }
+  let renderer!: ReactTestRenderer;
+  try {
+    await act(async () => { renderer = create(createElement(Probe)); });
+    assert.equal(renderer.root.findByType('output').children[0], '15');
+    globalSilenceSeconds = 0;
+    await act(async () => { context.mock.timers.tick(2000); });
+    assert.equal(renderer.root.findByType('output').children[0], '0');
+  } finally {
+    await act(async () => { renderer.unmount(); });
+    context.mock.timers.reset(); globalSilenceSeconds = previous;
+  }
+});

@@ -152,6 +152,13 @@ export function shortPressAction(continuous: boolean, speaking: boolean): 'off' 
 }
 
 
+export async function readGlobalVoiceTimeout(): Promise<number> {
+  const result = await getProp('gateway.voice_silence_timeout_secs');
+  const value = typeof result.value === 'string' && /^\d+$/.test(result.value.trim()) ? Number(result.value) : result.value;
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0 || value > 300) throw new Error('Invalid global voice timeout');
+  return value;
+}
+
 export function useGlobalVoiceTimeout() {
   const [seconds, setSeconds] = useState<number | null>(null);
   const [error, setError] = useState(false);
@@ -160,11 +167,8 @@ export function useGlobalVoiceTimeout() {
     let version = 0;
     const refresh = async () => {
       const current = ++version;
-      setSeconds(null);
       try {
-        const result = await getProp('gateway.voice_silence_timeout_secs');
-        const value = typeof result.value === 'string' && /^\d+$/.test(result.value.trim()) ? Number(result.value) : result.value;
-        if (typeof value !== 'number' || !Number.isInteger(value) || value < 0 || value > 300) throw new Error('Invalid global voice timeout');
+        const value = await readGlobalVoiceTimeout();
         if (active && current === version) { setSeconds(value); setError(false); }
       } catch { if (active && current === version) { setSeconds(null); setError(true); } }
     };
@@ -172,8 +176,9 @@ export function useGlobalVoiceTimeout() {
     window.addEventListener('focus', refresh);
     window.addEventListener('zeroclaw-config-mutated', refresh);
     document.addEventListener('visibilitychange', visible);
+    const poll = setInterval(visible, 2000);
     void refresh();
-    return () => { active = false; window.removeEventListener('focus', refresh); window.removeEventListener('zeroclaw-config-mutated', refresh); document.removeEventListener('visibilitychange', visible); };
+    return () => { active = false; clearInterval(poll); window.removeEventListener('focus', refresh); window.removeEventListener('zeroclaw-config-mutated', refresh); document.removeEventListener('visibilitychange', visible); };
   }, []);
   return { seconds, error };
 }
