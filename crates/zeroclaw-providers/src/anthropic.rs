@@ -184,8 +184,8 @@ struct NativeThinkingConfig {
     #[serde(rename = "type")]
     kind: &'static str,
     /// Fixed token budget for `enabled` thinking. Absent for `adaptive`
-    /// thinking, which lets the model pace itself — adaptive-only models
-    /// (Opus 4.7, Fable 5.1) reject `enabled` with HTTP 400.
+    /// thinking, which lets the model pace itself — models numbered 4.7 or
+    /// later reject `enabled` with HTTP 400.
     #[serde(skip_serializing_if = "Option::is_none")]
     budget_tokens: Option<u32>,
     /// Anthropic's `thinking.display` beta field. `None` leaves the key out
@@ -268,9 +268,9 @@ fn anthropic_beta_features(
     }
 }
 
-/// Anthropic thinking request styles. Adaptive-only models (Opus 4.7, the
-/// whole Fable 5 family) reject the fixed-budget `enabled` shape with HTTP
-/// 400 and require `adaptive`; budget-based models require `enabled`.
+/// Anthropic thinking request styles. Models numbered 4.7 or later reject
+/// the fixed-budget `enabled` shape with HTTP 400 and require `adaptive`;
+/// earlier models, and IDs with no such version, require `enabled`.
 ///
 /// Shared crate-wide: the OpenAI-compatible passthrough builder resolves the
 /// same style so gateway requests match the native provider's shapes.
@@ -280,97 +280,54 @@ pub(crate) enum AnthropicThinkingStyle {
     Adaptive,
 }
 
-/// Substring matching on purpose: gateway model IDs may carry routing
-/// prefixes (`claude-group/claude-opus-4-7`) that must resolve to the same
-/// style as the bare model name. The whole Fable 5 family is adaptive-only,
-/// so the bare `claude-fable-5` substring intentionally covers `fable-5` and
-/// `fable-5-1` alike; a hypothetical future budget-shaped member of the
-/// family would need this matcher revisited.
+/// Adaptive thinking for every Claude model numbered 4.7 or later, whatever
+/// the family. Anthropic rejects `enabled` + `budget_tokens` with HTTP 400
+/// on those models. 4.6 and earlier, and IDs that carry no such version
+/// (Mythos Preview, non-Claude models), keep the budget shape.
 ///
-/// Adaptive-only models (Opus 4.7+, Fable 5+, Mythos 5+) reject the
-/// fixed-budget `enabled` shape with HTTP 400 and require `adaptive`.
-/// The version floor is enforced by checking the major.minor version
-/// against the known adaptive-only minimums per family.
+/// The version is the first `claude-<family>-<major>[-<minor>]` token.
+/// Text before it (gateway prefixes, `anthropic.`, `us.`) and after it
+/// (snapshot dates, `-v1:0`, `@...`, `-latest`, `-fast`) is ignored, so a
+/// decorated ID resolves the same way as the bare name.
 pub(crate) fn anthropic_thinking_style(model: &str) -> AnthropicThinkingStyle {
-    // Extract the version suffix from the model name. Model IDs look like
-    // `claude-opus-4-7`, `claude-fable-5-1`, `claude-mythos-5-2`, etc.
-    // We parse the trailing `X-Y` version pair and compare against the
-    // minimum adaptive-only version for each family.
-    if let Some(version) = extract_model_version(model) {
-        if is_adaptive_only_family(model, version) {
-            return AnthropicThinkingStyle::Adaptive;
-        }
+    match claude_model_version(model) {
+        Some(version) if version >= (4, 7) => AnthropicThinkingStyle::Adaptive,
+        _ => AnthropicThinkingStyle::Budget,
     }
-    AnthropicThinkingStyle::Budget
 }
 
-/// Extract the trailing version pair (major, minor) from a model name.
-/// Returns `None` if no version suffix is found.
-///
-/// Model IDs may carry a date suffix (e.g. `claude-opus-4-7-20260101`),
-/// so we scan from the end and skip any trailing non-numeric segments
-/// that are clearly dates or build identifiers.
-///
-/// Version formats:
-/// - `claude-opus-4-7` → (4, 7)
-/// - `claude-fable-5` → (5, 0)
-/// - `claude-fable-5-1` → (5, 1)
-/// - `claude-opus-4-7-20260101` → (4, 7)
-fn extract_model_version(model: &str) -> Option<(u32, u32)> {
-    let trimmed = model.trim_end_matches('/').trim();
-    let parts: Vec<&str> = trimmed.split('-').collect();
-    if parts.len() < 2 {
-        return None;
-    }
-    // Scan from the end, skipping segments that look like dates
-    // (8+ digit numbers) or other non-version suffixes.
-    let mut idx = parts.len() - 1;
-    while idx > 0 {
-        let segment = parts[idx];
-        if segment.len() >= 8 && segment.chars().all(|c| c.is_ascii_digit()) {
-            // Likely a date suffix like 20260101 — skip it.
-            idx -= 1;
-            continue;
-        }
-        break;
-    }
-    if idx == 0 {
-        return None;
-    }
-    let minor = parts[idx].parse::<u32>().ok()?;
-    // Check if there's a major version before the minor.
-    // If the segment before minor is numeric, it's the major version.
-    // If it's not numeric (e.g. "fable"), the minor is actually the
-    // major version with minor=0.
-    if idx >= 2 {
-        if let Ok(major) = parts[idx - 1].parse::<u32>() {
-            return Some((major, minor));
-        }
-    }
-    // Single version number: treat as major with minor=0.
-    Some((minor, 0))
+/// `(major, minor)` of the first `claude-<family>-<major>[-<minor>]` token
+/// in a model ID. A missing minor is `0`.
+fn claude_model_version(model: &str) -> Option<(u32, u32)> {
+    const FAMILIES: [&str; 5] = ["opus", "sonnet", "haiku", "fable", "mythos"];
+    model.match_indices("claude-").find_map(|(at, token)| {
+        let rest = &model[at + token.len()..];
+        let family = FAMILIES
+            .iter()
+            .copied()
+            .find(|family| rest.starts_with(family))?;
+        let rest = rest[family.len()..].strip_prefix('-')?;
+        let (major, rest) = leading_version_number(rest)?;
+        // A minor is one or two digits after `-` or `.`. An eight-digit
+        // snapshot date is not a minor, and neither is a later component
+        // such as the `2` in `claude-opus-4-5-2`.
+        let minor = rest
+            .strip_prefix('-')
+            .or_else(|| rest.strip_prefix('.'))
+            .and_then(leading_version_number)
+            .map_or(0, |(minor, _)| minor);
+        Some((major, minor))
+    })
 }
 
-/// Determine whether a model family + version combination is adaptive-only.
-///
-/// Adaptive-only families and their minimum versions:
-/// - Opus: 4.7+ (claude-opus-4-7, claude-opus-5-5, etc.)
-/// - Fable: 5+ (claude-fable-5, claude-fable-5-1, etc.)
-/// - Mythos: 5+ (claude-mythos-5, claude-mythos-5-2, etc.)
-fn is_adaptive_only_family(model: &str, version: (u32, u32)) -> bool {
-    let (major, minor) = version;
-    if model.contains("claude-opus") {
-        // Opus 4.7+ is adaptive-only
-        major > 4 || (major == 4 && minor >= 7)
-    } else if model.contains("claude-fable") {
-        // Fable 5+ is adaptive-only
-        major >= 5
-    } else if model.contains("claude-mythos") {
-        // Mythos 5+ is adaptive-only
-        major >= 5
-    } else {
-        false
+/// Splits a leading run of one or two ASCII digits off `s`. A longer run is
+/// a date or build number, not a version component.
+fn leading_version_number(s: &str) -> Option<(u32, &str)> {
+    let digits = s.bytes().take_while(u8::is_ascii_digit).count();
+    if !(1..=2).contains(&digits) {
+        return None;
     }
+    Some((s[..digits].parse().ok()?, &s[digits..]))
 }
 
 /// Characters legal between `data:` and `;base64,` in a data URI header: the
@@ -4696,58 +4653,55 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn anthropic_thinking_style_matrix() {
-        // Adaptive-only families: fixed-budget `enabled` returns 400.
-        assert_eq!(
-            anthropic_thinking_style("claude-opus-4-7"),
-            AnthropicThinkingStyle::Adaptive
-        );
-        assert_eq!(
-            anthropic_thinking_style("claude-opus-4-7-20260101"),
-            AnthropicThinkingStyle::Adaptive
-        );
-        assert_eq!(
-            anthropic_thinking_style("claude-opus-5-5"),
-            AnthropicThinkingStyle::Adaptive
-        );
-        assert_eq!(
-            anthropic_thinking_style("claude-opus-5-5-20260101"),
-            AnthropicThinkingStyle::Adaptive
-        );
-        assert_eq!(
-            anthropic_thinking_style("claude-fable-5-1"),
-            AnthropicThinkingStyle::Adaptive
-        );
-        assert_eq!(
-            anthropic_thinking_style("claude-fable-5-1-20260815"),
-            AnthropicThinkingStyle::Adaptive
-        );
-        assert_eq!(
-            anthropic_thinking_style("claude-mythos-5-2"),
-            AnthropicThinkingStyle::Adaptive
-        );
-        // The whole Fable 5 family is adaptive-only: bare fable-5 and
-        // gateway-prefixed IDs resolve like fable-5-1.
-        assert_eq!(
-            anthropic_thinking_style("claude-fable-5"),
-            AnthropicThinkingStyle::Adaptive
-        );
-        assert_eq!(
-            anthropic_thinking_style("claude-group/claude-fable-5"),
-            AnthropicThinkingStyle::Adaptive
-        );
-        // Budget-based families keep the `enabled` shape.
-        assert_eq!(
-            anthropic_thinking_style("claude-opus-4-6"),
-            AnthropicThinkingStyle::Budget
-        );
-        assert_eq!(
-            anthropic_thinking_style("claude-sonnet-4-6"),
-            AnthropicThinkingStyle::Budget
-        );
-        assert_eq!(
-            anthropic_thinking_style("claude-haiku-4-5"),
-            AnthropicThinkingStyle::Budget
-        );
+        // Models numbered 4.7 or later reject `enabled`. Prefixes and
+        // suffixes must not change the answer; 4.6 and earlier, and IDs
+        // with no version, keep the budget shape.
+        let cases = [
+            ("claude-opus-4-7", AnthropicThinkingStyle::Adaptive),
+            ("claude-opus-4-7-20260101", AnthropicThinkingStyle::Adaptive),
+            ("claude-opus-4-7@20260101", AnthropicThinkingStyle::Adaptive),
+            ("claude-opus-4.7", AnthropicThinkingStyle::Adaptive),
+            ("claude-opus-5", AnthropicThinkingStyle::Adaptive),
+            ("claude-opus-5-5", AnthropicThinkingStyle::Adaptive),
+            ("claude-opus-5-5-20260101", AnthropicThinkingStyle::Adaptive),
+            ("claude-opus-5-5-fast", AnthropicThinkingStyle::Adaptive),
+            (
+                "anthropic.claude-opus-4-7-v1:0",
+                AnthropicThinkingStyle::Adaptive,
+            ),
+            ("claude-fable-5", AnthropicThinkingStyle::Adaptive),
+            ("claude-fable-5-1", AnthropicThinkingStyle::Adaptive),
+            (
+                "claude-fable-5-1-20260815",
+                AnthropicThinkingStyle::Adaptive,
+            ),
+            ("claude-fable-5-2-fast", AnthropicThinkingStyle::Adaptive),
+            (
+                "claude-group/claude-fable-5",
+                AnthropicThinkingStyle::Adaptive,
+            ),
+            ("claude-mythos-5-2", AnthropicThinkingStyle::Adaptive),
+            ("claude-sonnet-5", AnthropicThinkingStyle::Adaptive),
+            ("claude-sonnet-5-5", AnthropicThinkingStyle::Adaptive),
+            ("claude-haiku-5-5", AnthropicThinkingStyle::Adaptive),
+            (
+                "us.anthropic.claude-haiku-5-5",
+                AnthropicThinkingStyle::Adaptive,
+            ),
+            ("claude-opus-4-6", AnthropicThinkingStyle::Budget),
+            // A trailing component is not the version. Reading from the end
+            // would misread this as 5.2.
+            ("claude-opus-4-5-2", AnthropicThinkingStyle::Budget),
+            ("claude-opus-4-20250514", AnthropicThinkingStyle::Budget),
+            ("claude-sonnet-4-6", AnthropicThinkingStyle::Budget),
+            ("claude-sonnet-4-6-latest", AnthropicThinkingStyle::Budget),
+            ("claude-haiku-4-5", AnthropicThinkingStyle::Budget),
+            ("claude-mythos-preview", AnthropicThinkingStyle::Budget),
+            ("gpt-4o", AnthropicThinkingStyle::Budget),
+        ];
+        for (model, expected) in cases {
+            assert_eq!(anthropic_thinking_style(model), expected, "{model}");
+        }
     }
 
     #[test]
@@ -4770,6 +4724,52 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(config.display, None);
         assert_eq!(temp, Some(1.0));
         assert_eq!(max_tokens, provider.max_tokens);
+    }
+
+    #[test]
+    fn resolve_thinking_emits_adaptive_shape_for_4_7_families_and_decorated_ids() {
+        // The config this returns is what the messages request serializes.
+        // Qualified and fast-mode IDs must not fall back to `enabled`.
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build();
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 10_000,
+            display: None,
+        };
+        for model in [
+            "claude-opus-5-5",
+            "claude-fable-5-2-fast",
+            "anthropic.claude-opus-4-7-v1:0",
+            "claude-sonnet-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+        ] {
+            let (temp, config, max_tokens) =
+                provider.resolve_thinking(Some(params), Some(0.7_f64), model);
+            let config = config.unwrap_or_else(|| panic!("thinking config for {model}"));
+            assert_eq!(
+                serde_json::to_value(&config).unwrap(),
+                serde_json::json!({"type": "adaptive"}),
+                "{model} must emit adaptive with no budget"
+            );
+            assert_eq!(temp, Some(1.0), "{model}");
+            assert_eq!(max_tokens, provider.max_tokens, "{model}");
+        }
+
+        for model in [
+            "claude-opus-4-20250514",
+            "claude-mythos-preview",
+            "claude-sonnet-4-6",
+        ] {
+            let (_, config, _) = provider.resolve_thinking(Some(params), Some(0.7_f64), model);
+            let config = config.unwrap_or_else(|| panic!("thinking config for {model}"));
+            assert_eq!(
+                serde_json::to_value(&config).unwrap(),
+                serde_json::json!({"type": "enabled", "budget_tokens": 10_000}),
+                "{model} must keep the budget shape"
+            );
+        }
     }
 
     #[test]
