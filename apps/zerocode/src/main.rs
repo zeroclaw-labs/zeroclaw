@@ -2582,6 +2582,64 @@ mod connection_tests {
         );
     }
 
+    /// The migration warning runs before startup's `i18n::init`. It must still
+    /// use the saved language and downloaded catalogue from this config
+    /// directory. A fresh process proves the cache was not already set.
+    #[test]
+    fn migration_lock_warning_uses_the_saved_language() {
+        if std::env::var_os("ZEROCODE_MIGRATION_LOCALE_CHILD").is_some() {
+            let dir = std::path::PathBuf::from(
+                std::env::var("ZEROCODE_MIGRATION_LOCALE_DIR").expect("child config dir"),
+            );
+            let _ = crate::config::ensure_and_load(&dir);
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            crate::config::config_path(dir.path()),
+            "locale = \"fr\"\n\n[keybindings]\n\"input_bar.clear_input\" = \"ctrl+u\"\n",
+        )
+        .unwrap();
+        let catalogue = dir.path().join("data/ftl/fr");
+        std::fs::create_dir_all(&catalogue).unwrap();
+        std::fs::write(
+            catalogue.join("zerocode.ftl"),
+            "zc-config-migration-lock-skipped = SAVED-LOCALE-MARKER { $path }\n",
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join(".zerocode-config.lock")).unwrap();
+
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("current zerocode test binary path"),
+        )
+        .args([
+            "connection_tests::migration_lock_warning_uses_the_saved_language",
+            "--exact",
+            "--nocapture",
+        ])
+        .env("ZEROCODE_MIGRATION_LOCALE_CHILD", "1")
+        .env("ZEROCODE_MIGRATION_LOCALE_DIR", dir.path())
+        .env_remove("ZEROCLAW_CONFIG_DIR")
+        .env_remove("ZEROCODE_LOCALE_DIR")
+        .output()
+        .expect("spawn locale child");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "child failed: {stderr}\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            stderr.contains("SAVED-LOCALE-MARKER"),
+            "the warning must use the saved config directory's language, got: {stderr}"
+        );
+        assert!(
+            !stderr.contains("Could not lock"),
+            "the English warning must not replace the saved language: {stderr}"
+        );
+    }
+
     #[test]
     fn explicit_relay_enroll_uses_relay_route() {
         let cli = Cli::parse_from([

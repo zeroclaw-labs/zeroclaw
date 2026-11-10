@@ -1061,28 +1061,35 @@ pub(crate) fn load_persisted(config_dir: &Path) -> Result<ZerocodeConfig> {
                 // The first read ran without the lock. Do not publish that
                 // snapshot: a login saved after it would be discarded. Re-read
                 // under the same lock every other writer holds.
-                None => match ConfigWriteLock::acquire_within(config_dir, migration_lock_wait()) {
-                    Ok(lock) => {
-                        write_lock = Some(lock);
-                        continue;
+                None => {
+                    // Startup has not called `i18n::init` yet. A warning or
+                    // lock error here would cache the default directory's
+                    // language for the process, and the later init cannot
+                    // replace it. Use this config directory first.
+                    crate::i18n::init_from_config_dir(config_dir);
+                    match ConfigWriteLock::acquire_within(config_dir, migration_lock_wait()) {
+                        Ok(lock) => {
+                            write_lock = Some(lock);
+                            continue;
+                        }
+                        // Contention and a filesystem that refuses locks take the
+                        // same path. The snapshot already parsed is the saved
+                        // config, including its remote target. Rewriting is
+                        // optional; failing the load would make startup drop that
+                        // target and dial the local socket.
+                        Err(error) => {
+                            let path_label = path.display().to_string();
+                            eprintln!(
+                                "{}",
+                                crate::i18n::t_args(
+                                    "zc-config-migration-lock-skipped",
+                                    &[("path", &path_label), ("error", &format!("{error:#}"))],
+                                )
+                            );
+                            return Ok(config);
+                        }
                     }
-                    // Contention and a filesystem that refuses locks take the
-                    // same path. The snapshot already parsed is the saved
-                    // config, including its remote target. Rewriting is
-                    // optional; failing the load would make startup drop that
-                    // target and dial the local socket.
-                    Err(error) => {
-                        let path_label = path.display().to_string();
-                        eprintln!(
-                            "{}",
-                            crate::i18n::t_args(
-                                "zc-config-migration-lock-skipped",
-                                &[("path", &path_label), ("error", &format!("{error:#}"))],
-                            )
-                        );
-                        return Ok(config);
-                    }
-                },
+                }
                 Some(lock) => write_document(&path, &doc, lock)?,
             }
         }
