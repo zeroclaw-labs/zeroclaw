@@ -1043,9 +1043,14 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
     latestConfigDraft.current = configDraft;
     const loadGeneration = useRef(0);
 
-    const reload = async () => {
+    const reload = async (opts?: { background?: boolean }) => {
       const generation = ++loadGeneration.current;
-      setLoading(true);
+      // Initial mount / prefix changes replace the form with a spinner.
+      // Discard all must keep mounted FieldRows in place so focus and
+      // row-local UI survive the refresh.
+      if (!opts?.background) {
+        setLoading(true);
+      }
       setTopError(null);
       try {
         const resp = await listProps(prefix);
@@ -1083,16 +1088,28 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
 
     // Discard-all clears the shared store but leaves this form's local draft
     // and comment maps untouched. Without a reset, the inputs stay dirty and a
-    // later section Save would persist the discarded values (#12288). Reload
-    // from the server instead of resetting to `entries`: those can predate a
-    // Save all, and a load may still be in flight.
+    // later section Save would persist the discarded values (#12288). Reset
+    // local state from the last loaded `entries` immediately so a failed
+    // refresh cannot leave discarded edits saveable, then refresh from the
+    // server in the background (entries can predate a Save all; a load may
+    // still be in flight). A background refresh must not set `loading`, or
+    // the form would unmount every FieldRow and flash a spinner.
     const seenDiscardGeneration = useRef(configDraft.discardGeneration);
     useEffect(() => {
       if (configDraft.discardGeneration === seenDiscardGeneration.current) {
         return;
       }
       seenDiscardGeneration.current = configDraft.discardGeneration;
-      void reload();
+      const restored: Record<string, string> = {};
+      for (const e of entries) {
+        restored[e.path] = defaultInputValue(e);
+      }
+      setDraft(restored);
+      setComments({});
+      setTopError(null);
+      setFieldErrors({});
+      setSavedAt(null);
+      void reload({ background: true });
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [configDraft.discardGeneration]);
 

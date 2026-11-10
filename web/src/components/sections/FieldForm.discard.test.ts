@@ -44,6 +44,7 @@ async function withForm(
     holdListResponses: () => void;
     releaseListResponses: (order: "oldest-first" | "newest-first") => Promise<void>;
     pendingListResponses: () => number;
+    failNextListResponses: (count?: number) => void;
     setFormMounted: (mounted: boolean) => Promise<void>;
   }) => Promise<void>,
 ) {
@@ -91,6 +92,7 @@ async function withForm(
   };
   let holdList = false;
   let heldList: Array<() => void> = [];
+  let listFailuresRemaining = 0;
   globalThis.fetch = async (input, init) => {
     const url = String(input);
     if (url === "/api/config" && init?.method === "OPTIONS") {
@@ -102,6 +104,10 @@ async function withForm(
       });
     }
     if (url === "/api/config/list?prefix=browser") {
+      if (listFailuresRemaining > 0) {
+        listFailuresRemaining -= 1;
+        return new Response("list failed", { status: 503 });
+      }
       if (holdList) {
         await new Promise<void>((resolve) => heldList.push(resolve));
       }
@@ -171,6 +177,9 @@ async function withForm(
       holdList = true;
     };
     const pendingListResponses = () => heldList.length;
+    const failNextListResponses = (count = 1) => {
+      listFailuresRemaining = count;
+    };
     const releaseListResponses = async (
       order: "oldest-first" | "newest-first",
     ) => {
@@ -224,6 +233,7 @@ async function withForm(
       holdListResponses,
       releaseListResponses,
       pendingListResponses,
+      failNextListResponses,
       setFormMounted,
     });
   } finally {
@@ -433,3 +443,77 @@ for (const order of ["oldest-first", "newest-first"] as const) {
     );
   });
 }
+
+test("Discard all clears local edits even when the refresh fails", async () => {
+  await withForm(
+    async ({
+      container,
+      patches,
+      button,
+      editField,
+      fieldValue,
+      failNextListResponses,
+    }) => {
+      await editField("browser.session_name", "discarded-edit");
+      assert.equal(button("Save").disabled, false);
+      failNextListResponses();
+      await act(async () => {
+        button("Discard all").click();
+        await flushEffects();
+      });
+      assert.equal(fieldValue("browser.session_name"), "discard-saved");
+      assert.equal(button("Save").disabled, true);
+      assert.match(container.textContent ?? "", /list failed|503|load/i);
+
+      await editField(
+        "browser.native_webdriver_url",
+        "http://127.0.0.1:9516",
+      );
+      await act(async () => {
+        button("Save").click();
+        await flushEffects();
+      });
+      assert.deepEqual(patches, [
+        [
+          {
+            op: "replace",
+            path: "browser.native_webdriver_url",
+            value: "http://127.0.0.1:9516",
+          },
+        ],
+      ]);
+    },
+  );
+});
+
+test("Discard all keeps mounted fields visible while the refresh is pending", async () => {
+  await withForm(
+    async ({
+      button,
+      editField,
+      fieldValue,
+      holdListResponses,
+      releaseListResponses,
+    }) => {
+      await editField("browser.session_name", "discarded-edit");
+      const input = document.getElementById("browser.session_name");
+      assert.ok(input, "expected session name input before discard");
+      holdListResponses();
+      await act(async () => {
+        button("Discard all").click();
+        await flushEffects();
+      });
+      assert.equal(
+        document.getElementById("browser.session_name"),
+        input,
+        "Discard all must not replace mounted FieldRows with a spinner",
+      );
+      assert.equal(fieldValue("browser.session_name"), "discard-saved");
+      assert.equal(button("Save").disabled, true);
+      await releaseListResponses("oldest-first");
+      assert.equal(document.getElementById("browser.session_name"), input);
+      assert.equal(fieldValue("browser.session_name"), "discard-saved");
+      assert.equal(button("Save").disabled, true);
+    },
+  );
+});
