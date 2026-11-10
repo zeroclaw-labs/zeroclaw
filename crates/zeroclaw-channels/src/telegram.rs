@@ -3432,6 +3432,18 @@ impl TelegramChannel {
             .or_else(|| update.get("edited_message"))
     }
 
+    /// Update types the long-poll subscribes to. `edited_message` joins the
+    /// stream only when the alias opted in (`edited_messages`); without the
+    /// subscription Telegram never delivers edits at all, so the wire stays
+    /// byte-identical to before for everyone else.
+    fn allowed_updates(&self) -> serde_json::Value {
+        if self.edited_messages {
+            serde_json::json!(["message", "callback_query", "edited_message"])
+        } else {
+            serde_json::json!(["message", "callback_query"])
+        }
+    }
+
     fn extract_update_message_target(update: &serde_json::Value) -> Option<(String, i64)> {
         let message = Self::update_message(update)?;
         let chat_id = message
@@ -8635,7 +8647,7 @@ impl Channel for TelegramChannel {
                 "offset": offset,
                 "limit": TELEGRAM_POLL_LIMIT,
                 "timeout": 0,
-                "allowed_updates": ["message", "callback_query"]
+                "allowed_updates": self.allowed_updates()
             });
             match self.http_client().post(&url).json(&probe).send().await {
                 Err(e) => {
@@ -8763,7 +8775,7 @@ impl Channel for TelegramChannel {
                 "offset": offset,
                 "limit": TELEGRAM_POLL_LIMIT,
                 "timeout": poll_timeout_secs,
-                "allowed_updates": ["message", "callback_query"]
+                "allowed_updates": self.allowed_updates()
             });
 
             let resp = match self.http_client().post(&url).json(&body).send().await {
@@ -18474,6 +18486,28 @@ mod tests {
             .parse_update_message(&update)
             .expect("unaddressed edit must be recorded as passive context");
         assert!(parsed.passive_context);
+    }
+
+    #[test]
+    fn allowed_updates_subscribes_to_edited_message_only_when_enabled() {
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+        assert_eq!(
+            ch.allowed_updates(),
+            serde_json::json!(["message", "callback_query"]),
+            "without the opt-in the wire stream must stay unchanged"
+        );
+
+        let ch = ch.with_edited_messages(true);
+        assert_eq!(
+            ch.allowed_updates(),
+            serde_json::json!(["message", "callback_query", "edited_message"]),
+            "the opt-in must subscribe to edits or Telegram never delivers them"
+        );
     }
 
     #[test]
