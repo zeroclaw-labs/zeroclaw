@@ -411,7 +411,7 @@ export function AgentChatInner({
     const trimmed = input.trim();
     if (!trimmed) return;
     const command = isSlashCommand(trimmed);
-    if (!command && !connected) return;
+    if (!command && !canSend) return;
     cancelVoiceCapture.current?.();
 
     // Slash commands are dispatched BEFORE the connectivity check so purely
@@ -439,7 +439,7 @@ export function AgentChatInner({
     if (!voiceSubmitRequested) return;
     setVoiceSubmitRequested(null);
     // A voice timeout submits a normal ready draft, never a local slash command.
-    if (voiceSubmitRequested === draftKey && connected && hydrated && !typing && input.trim() && !isSlashCommand(input.trim())) handleSend();
+    if (voiceSubmitRequested === draftKey && canSend && (hydrated || startsConversationOnSend) && !typing && input.trim() && !isSlashCommand(input.trim())) handleSend();
   });
 
   const isComposingRef = useRef(false);
@@ -931,9 +931,7 @@ export function AgentChatInner({
           </div>
         )}
         <div className="flex items-end gap-3 max-w-4xl mx-auto">
-          {canSend && (
-            <BrowserVoiceControls key={draftKey} captureRef={cancelVoiceCapture} onSilence={() => setVoiceSubmitRequested(draftKey)} messages={messages} hydrated={hydrated} typing={typing} onTranscript={text => applyInput(prev => `${prev}${prev && !/\s$/.test(prev) ? ' ' : ''}${text}`)} />
-          )}
+          <BrowserVoiceControls key={draftKey} captureRef={cancelVoiceCapture} onSilence={() => setVoiceSubmitRequested(draftKey)} messages={messages} hydrated={hydrated} typing={typing} onTranscript={text => applyInput(prev => `${prev}${prev && !/\s$/.test(prev) ? ' ' : ''}${text}`)} />
           {operator && (
             <>
               <input
