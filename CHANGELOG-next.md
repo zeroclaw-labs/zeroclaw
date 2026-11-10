@@ -129,6 +129,8 @@ Plus the dashboard through ZeroRelay, a CLI-only server build, and tighter isola
 
 - **A new [Identity providers](https://docs.zeroclaw.com/v0.9.0/en/security/identity-providers.html) page** lists what a provider needs for sign-in, the providers tested with v0.9.0 and their settings, those known not to work yet, and the v0.9.0 limitations (#12365).
 - **The generated API reference and the per-language "page not found" pages** are kept out of search engines, so they no longer compete with the docs pages (#12327, closes #12324).
+- **The stable docs have a permanent `/stable/` address,** so links and search results no longer move with each release, and links to removed doc versions open the same page under `/stable/` (#12328, closes #12325; #12329, closes #12326).
+- **The zerocode remote guide** now says that every device grant sends a PKCE challenge, and where manual `[connection.wss]` credentials still apply once a login is saved (#12364, closes #12340). It also covers how a device certificate ends, how to revoke it by device, and how `azp` attributes a client under JWKS validation (#12370, closes #12332).
 - Email approval routes start the IMAP listener (#12243, closes #12217).
 - Gateway policy publication guidance (#11268) and a `call_channel!` correction (#11686).
 - Community links (#11639, #11415).
