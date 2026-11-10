@@ -14689,6 +14689,7 @@ name = "zerocode"
 version = "0.8.7"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "crossterm",
@@ -14722,6 +14723,7 @@ dependencies = [
  "url",
  "webpki-roots 0.26.11",
  "wiremock",
+ "x509-parser 0.16.0",
  "zeroclaw-api",
  "zeroize",
 ]
