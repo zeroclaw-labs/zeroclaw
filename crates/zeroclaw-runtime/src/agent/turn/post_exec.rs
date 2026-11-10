@@ -113,8 +113,10 @@ pub(crate) async fn record_executed_outcomes(
                 .await;
         }
 
-        // Capture into the innermost live SOP step scope (no-op otherwise).
-        if was_executed && crate::sop::executor::step_capture_active() {
+        // The SOP ledger retains attempted calls too, including denied or
+        // unknown calls with their failed outcomes. This is separate from
+        // completion hooks, which require actual dispatch provenance.
+        if crate::sop::executor::step_capture_active() {
             crate::sop::executor::record_step_tool_call(
                 &call.name,
                 &call.arguments,
