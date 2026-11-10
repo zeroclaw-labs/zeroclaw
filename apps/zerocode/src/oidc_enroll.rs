@@ -4,9 +4,8 @@
 //! crate dependencies, so it enrolls through the gateway's cross-surface
 //! enrollment API (`/api/oidc/{alias}/device/*`), which proxies the
 //! RFC 8628 device grant with the `[oidc.<alias>]` entry's credentials.
-//! The resulting access token is held in memory for this session only
-//! and presented as `auth_token` in the RPC handshake; nothing is
-//! stored.
+//! The resulting access token is presented in the RPC handshake. The caller
+//! owns persistence: explicit `login` saves it, legacy enrollment does not.
 //!
 //! A device code travels out on this leg and a bearer token comes back, so
 //! it is held to the same transport rules as the WSS leg it precedes:
@@ -23,7 +22,10 @@
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
+use base64::Engine as _;
 use serde::Deserialize;
+use sha2::{Digest as _, Sha256};
+use zeroize::Zeroize as _;
 
 /// Longest device-code lifetime this client will wait out. RFC 8628 sets no
 /// ceiling on `expires_in`, so an IdP or gateway advertising hours would
@@ -88,9 +90,30 @@ struct PollResponse {
     token: Option<PollToken>,
 }
 
-#[derive(Deserialize)]
-struct PollToken {
-    access_token: String,
+#[derive(Deserialize, PartialEq, Eq)]
+pub(crate) struct PollToken {
+    pub access_token: String,
+    #[serde(default)]
+    pub expires_in: Option<u64>,
+}
+
+impl std::fmt::Debug for PollToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PollToken")
+            .field("access_token", &"<redacted>")
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+impl From<&str> for PollToken {
+    fn from(token: &str) -> Self {
+        Self {
+            access_token: token.into(),
+            expires_in: None,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -106,7 +129,7 @@ struct GatewayError {
 /// token on the wire in the clear, or in a place they can be logged: a
 /// non-`https` scheme (except to a loopback gateway), embedded credentials,
 /// a query string, or a fragment.
-fn validate_enroll_url(base: &str) -> Result<String> {
+pub(crate) fn validate_enroll_url(base: &str) -> Result<String> {
     let url = url::Url::parse(base)
         .with_context(|| format!("the enrollment URL is not a valid URL: {base}"))?;
     let Some(host) = url.host() else {
@@ -166,6 +189,42 @@ impl GatewayEnrollment {
         })
     }
 
+    /// Credential-free TLS preflight. The enrollment routes still perform
+    /// their own validation; even a 404 suffices to prove this transport.
+    pub async fn probe(&self) -> Result<()> {
+        self.http
+            .get(format!("{}/api/oidc/providers", self.base))
+            .send()
+            .await
+            .context("cannot reach the gateway enrollment API")?;
+        Ok(())
+    }
+
+    /// Issue a transport certificate for this previously unknown device. The
+    /// daemon independently verifies the bearer and its current grants.
+    pub async fn certificate<T: serde::de::DeserializeOwned>(
+        &self,
+        alias: &str,
+        token: &str,
+        csr: &str,
+    ) -> Result<T> {
+        let response = self
+            .http
+            .post(format!("{}/api/oidc/{alias}/certificate", self.base))
+            .bearer_auth(token)
+            .json(&serde_json::json!({"csr_pem": csr}))
+            .send()
+            .await
+            .with_context(|| crate::i18n::t("zc-login-device-bootstrap-failed"))?;
+        if !response.status().is_success() {
+            return Err(Self::gateway_error(response).await);
+        }
+        response
+            .json()
+            .await
+            .with_context(|| crate::i18n::t("zc-login-invalid-certificate-bootstrap-response"))
+    }
+
     async fn gateway_error(response: reqwest::Response) -> anyhow::Error {
         let status = response.status();
         match response.json::<GatewayError>().await {
@@ -174,10 +233,16 @@ impl GatewayEnrollment {
         }
     }
 
+    #[cfg(test)]
     pub async fn device_start(&self, alias: &str) -> Result<DeviceStart> {
+        self.device_start_s256(alias, None).await
+    }
+
+    async fn device_start_s256(&self, alias: &str, challenge: Option<&str>) -> Result<DeviceStart> {
         let response = self
             .http
             .post(format!("{}/api/oidc/{alias}/device/start", self.base))
+            .json(&serde_json::json!({ "code_challenge": challenge }))
             .send()
             .await
             .context("cannot reach the gateway enrollment API")?;
@@ -209,11 +274,21 @@ impl GatewayEnrollment {
     /// would throw away an approval that is about to land. Only an answer that
     /// says something about *this* grant, or a body that cannot be read at
     /// all, ends the flow.
+    #[cfg(test)]
     pub async fn device_poll(&self, alias: &str, device_code: &str) -> Result<DevicePoll> {
+        self.device_poll_s256(alias, device_code, None).await
+    }
+
+    async fn device_poll_s256(
+        &self,
+        alias: &str,
+        device_code: &str,
+        verifier: Option<&str>,
+    ) -> Result<DevicePoll> {
         let response = match self
             .http
             .post(format!("{}/api/oidc/{alias}/device/poll", self.base))
-            .json(&serde_json::json!({ "device_code": device_code }))
+            .json(&serde_json::json!({ "device_code": device_code, "code_verifier": verifier }))
             .send()
             .await
         {
@@ -252,7 +327,10 @@ impl GatewayEnrollment {
             .context("device poll response is not valid JSON")?;
         match poll.status.as_str() {
             "granted" => match poll.token {
-                Some(token) => Ok(DevicePoll::Granted(token.access_token)),
+                Some(token) if !token.access_token.trim().is_empty() => {
+                    Ok(DevicePoll::Granted(token))
+                }
+                Some(_) => bail!("gateway reported a grant with an empty token"),
                 None => bail!("gateway reported a grant without a token"),
             },
             "pending" => Ok(DevicePoll::Pending),
@@ -306,7 +384,7 @@ fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<u64> {
 /// `authorization_pending` differently, so the two must stay distinct.
 #[derive(PartialEq, Eq)]
 pub(crate) enum DevicePoll {
-    Granted(String),
+    Granted(PollToken),
     Pending,
     /// `retry_after` is the gateway's `Retry-After` in seconds when the
     /// throttling came from the gateway's own budget or lockout, and `None`
@@ -409,7 +487,7 @@ fn validate_device_start(start: &DeviceStart) -> Result<()> {
 async fn poll_until_granted(
     start: &DeviceStart,
     mut poll: impl AsyncFnMut(&str) -> Result<DevicePoll>,
-) -> Result<String> {
+) -> Result<PollToken> {
     validate_device_start(start)?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(start.expires_in);
     // RFC 8628's default interval is the floor, not one second: an advertised
@@ -484,13 +562,17 @@ fn verification_is_disabled(base: &str, tls: &crate::client::ClientTls) -> bool 
     tls.skip_verify && base.starts_with("https://")
 }
 
+fn pkce_randomness_unavailable() -> anyhow::Error {
+    anyhow::Error::msg(crate::i18n::t("zc-login-pkce-randomness-unavailable"))
+}
+
 pub(crate) async fn run_device_flow(
     base: &str,
     tls: &crate::client::ClientTls,
     alias: &str,
     on_prompt: impl Fn(&DeviceStart),
     consent: impl FnOnce(&str) -> Result<()>,
-) -> Result<String> {
+) -> Result<PollToken> {
     let gateway = GatewayEnrollment::new(base, tls)?;
     // The device code goes out on this leg and the access token comes back
     // on it. If nothing checks the certificate, the operator decides that
@@ -502,13 +584,24 @@ pub(crate) async fn run_device_flow(
     if verification_is_disabled(&gateway.base, tls) {
         consent(&gateway.base)?;
     }
-    let start = gateway.device_start(alias).await?;
+    // Keep the verifier only on this client. A public IdP client enforcing
+    // PKCE must not require a secret or weaker IdP policy to use device login.
+    let mut random = [0u8; 32];
+    rustls::crypto::ring::default_provider()
+        .secure_random
+        .fill(&mut random)
+        .map_err(|_| pkce_randomness_unavailable())?;
+    let verifier = zeroize::Zeroizing::new(hex::encode(random));
+    random.zeroize();
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(Sha256::digest(verifier.as_bytes()));
+    let start = gateway.device_start_s256(alias, Some(&challenge)).await?;
     // Bounds first: an unusable lifetime or interval must not reach the user
     // as a prompt they would wait on for nothing.
     validate_device_start(&start)?;
     on_prompt(&start);
     poll_until_granted(&start, async |code: &str| {
-        gateway.device_poll(alias, code).await
+        gateway.device_poll_s256(alias, code, Some(&verifier)).await
     })
     .await
 }
@@ -591,7 +684,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(token, "at-enrolled");
+        assert_eq!(token.access_token, "at-enrolled");
         assert!(!asked, "a verified leg presents nothing to confirm");
     }
 
@@ -620,7 +713,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(token, "at-enrolled");
+        assert_eq!(token.access_token, "at-enrolled");
         assert!(!asked, "plain http on loopback carries no certificate");
     }
 
@@ -670,6 +763,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn certificate_bootstrap_errors_use_fluent_messages() {
+        let transport_gateway =
+            GatewayEnrollment::new("http://127.0.0.1:1", &ClientTls::default()).unwrap();
+        let transport_error = transport_gateway
+            .certificate::<serde_json::Value>("corp", "access-token", "csr")
+            .await
+            .unwrap_err();
+        let transport_key = "zc-login-device-bootstrap-failed";
+        let transport_message = crate::i18n::t(transport_key);
+        assert_ne!(transport_message, format!("{{{transport_key}}}"));
+        assert_eq!(transport_error.to_string(), transport_message);
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/oidc/corp/certificate"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not JSON"))
+            .mount(&server)
+            .await;
+        let gateway = GatewayEnrollment::new(&server.uri(), &ClientTls::default()).unwrap();
+        let response_error = gateway
+            .certificate::<serde_json::Value>("corp", "access-token", "csr")
+            .await
+            .unwrap_err();
+        let response_key = "zc-login-invalid-certificate-bootstrap-response";
+        let response_message = crate::i18n::t(response_key);
+        assert_ne!(response_message, format!("{{{response_key}}}"));
+        assert_eq!(response_error.to_string(), response_message);
+    }
+
+    #[test]
+    fn pkce_randomness_failure_uses_fluent_message() {
+        let key = "zc-login-pkce-randomness-unavailable";
+        let message = crate::i18n::t(key);
+        assert_ne!(message, format!("{{{key}}}"));
+        assert_eq!(pkce_randomness_unavailable().to_string(), message);
+    }
+
+    #[tokio::test]
     async fn device_poll_maps_pending_and_granted() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -714,7 +845,10 @@ mod tests {
         );
         assert_eq!(
             gateway.device_poll("corp", "done").await.unwrap(),
-            DevicePoll::Granted("at-tui".into())
+            DevicePoll::Granted(PollToken {
+                access_token: "at-tui".into(),
+                expires_in: Some(3600)
+            })
         );
     }
 
@@ -1034,7 +1168,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(token, "tok");
+        assert_eq!(token.access_token, "tok");
         assert_eq!(calls.get(), 2);
         assert_eq!(began.elapsed(), Duration::from_secs(15));
     }
@@ -1061,7 +1195,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(token, "tok");
+        assert_eq!(token.access_token, "tok");
         assert_eq!(calls.get(), 2);
         // 5s to the throttled poll, then the gateway's own 300s.
         assert_eq!(began.elapsed(), Duration::from_secs(305));
@@ -1109,7 +1243,7 @@ mod tests {
             })
             .await
             .unwrap();
-            assert_eq!(token, "tok");
+            assert_eq!(token.access_token, "tok");
             assert_eq!(calls.get(), 2);
             assert_eq!(
                 began.elapsed(),
@@ -1145,7 +1279,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(token, "tok");
+        assert_eq!(token.access_token, "tok");
         assert_eq!(calls.get(), 3);
         // 5s to each of the two refusals and 5s to the grant.
         assert_eq!(began.elapsed(), Duration::from_secs(15));
@@ -1172,7 +1306,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(token, "tok");
+        assert_eq!(token.access_token, "tok");
         assert_eq!(calls.get(), 4);
         // 5 to the slow_down, 10 to the refusal, the gateway's own 30 to the
         // pending poll, then back to the 10s cadence rather than 30.
@@ -1197,7 +1331,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(token, "tok");
+        assert_eq!(token.access_token, "tok");
         assert_eq!(began.elapsed(), Duration::from_secs(60));
     }
 
@@ -1246,7 +1380,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(token, "tok");
+        assert_eq!(token.access_token, "tok");
         assert_eq!(calls.get(), 2 * MAX_CONSECUTIVE_UNAVAILABLE - 1);
     }
 
@@ -1570,5 +1704,40 @@ mod tests {
             .expect("request recording is on");
         assert_eq!(seen.len(), 1, "the redirect target was called");
         assert_eq!(seen[0].url.path(), "/api/oidc/corp/device/start");
+    }
+    #[tokio::test]
+    async fn device_flow_keeps_verifier_on_client_and_relays_s256_challenge() {
+        let server = granted_gateway().await;
+        run_device_flow(
+            &server.uri(),
+            &ClientTls::default(),
+            "corp",
+            |_| {},
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let start: serde_json::Value = requests
+            .iter()
+            .find(|r| r.url.path().ends_with("/start"))
+            .unwrap()
+            .body_json()
+            .unwrap();
+        let poll: serde_json::Value = requests
+            .iter()
+            .find(|r| r.url.path().ends_with("/poll"))
+            .unwrap()
+            .body_json()
+            .unwrap();
+        let verifier = poll["code_verifier"].as_str().unwrap();
+        assert!((43..=128).contains(&verifier.len()));
+        assert!(start.get("code_verifier").is_none());
+        assert_eq!(
+            start["code_challenge"].as_str().unwrap(),
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(Sha256::digest(verifier.as_bytes()))
+        );
+        assert_ne!(start["code_challenge"].as_str().unwrap(), verifier);
     }
 }
