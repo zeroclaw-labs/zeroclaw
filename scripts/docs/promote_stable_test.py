@@ -191,6 +191,40 @@ class PromotionTest(unittest.TestCase):
         self.promote(check_only=True)
         self.assertEqual(self.snapshot(), before)
 
+    def root_404(self, target, locales):
+        # The shape xtask's gen-root-404 writes (root_404_html in versions.rs):
+        # the two data lines, then the redirect script.
+        script = (REPO / "xtask/src/cmd/mdbook/root_404.js").read_text()
+        return ("<!doctype html>\n<script>\n"
+                f"var target = {json.dumps(target)};\n"
+                f"var locales = {json.dumps(locales, separators=(',', ':'))};\n"
+                f"{script}</script>\n<h1>Page not found</h1>\n")
+
+    def test_promotion_refreshes_the_root_404_for_the_release(self):
+        # Built before any pointer resolved, when only English was published.
+        self.write("404.html", self.root_404("master", ["en"]))
+        self.promote()
+        self.assertEqual((self.pages / "404.html").read_text(), self.root_404("stable", ["en", "fr"]))
+
+    def test_promotion_without_a_root_404_creates_none(self):
+        self.promote()
+        self.assertFalse((self.pages / "404.html").exists())
+
+    def test_check_only_leaves_the_root_404_alone(self):
+        self.write("404.html", self.root_404("stable", ["en"]))
+        before = self.snapshot()
+        self.promote(check_only=True)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_root_404_of_another_shape_rejected_before_any_write(self):
+        self.write("404.html", "<h1>Page not found</h1>\n")
+        self.rejected("unexpected shape")
+
+    def test_symlinked_root_404_rejected(self):
+        self.write("elsewhere.html", self.root_404("stable", ["en"]))
+        (self.pages / "404.html").symlink_to(self.pages / "elsewhere.html")
+        self.rejected("must not be a symlink")
+
     def test_final_tags_only(self):
         for tag in ["v0.10.0-rc.1", "master", "v01.2.3", "v1.2.3+build", "../../bad"]:
             with self.subTest(tag=tag):
