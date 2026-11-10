@@ -118,6 +118,17 @@ if a token expires during an active TUI session, restart zerocode to sign in
 again. You can also rerun `zerocode login corp <url>` explicitly. A saved
 custom gateway URL is reused when omitted on a subsequent login.
 
+Login issues a device client certificate valid for 30 days. `cert/renew` is
+authenticated by the presented client certificate, not by an OIDC principal,
+so 30 days is not an absolute device lifetime: an unrevoked device can renew
+past that date. Removing a user's OIDC mapping stops principal-authorized
+operations, but it does not retire the device or stop renewal. Revoking the
+device is a separate operator step (`zeroclaw security revoke-client-cert`);
+the issued-cert ledger's `actor` field identifies a user's certificates. The
+CRL is checked at the next TLS handshake, so a revoke does not drop an
+already established connection. A leaked access token can be used to obtain
+a device certificate, and that certificate remains valid until it is revoked.
+
 Startup renewal and a rejected-token retry honor the current `--tls-ca-cert`,
 `--tls-client-cert`, `--tls-client-key`, and `--tls-skip-verify` choices. Those
 one-run flags are not copied into the saved login during automatic renewal;
