@@ -626,6 +626,27 @@ impl ProviderDispatch {
         .await
     }
 
+    pub async fn chat_with_attempt_budget(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+        budget: &zeroclaw_api::model_provider::GenerationAttemptBudget,
+    ) -> anyhow::Result<ChatResponse> {
+        use zeroclaw_log::Instrument;
+        let span = zeroclaw_log::attribution_span!(&*self.inner);
+        accounted_chat_call(&*self.inner, model, async move {
+            zeroclaw_log::scope!(
+                model: model,
+                => self.inner.chat_with_attempt_budget(request, model, temperature, policy, budget)
+            )
+            .await
+        })
+        .instrument(span)
+        .await
+    }
+
     /// Like [`Self::chat`], while retaining rejected Reliable-attempt usage in
     /// a separate accounting sidecar.
     pub async fn chat_accounted(
@@ -980,6 +1001,27 @@ impl<'a> ProviderDispatchRef<'a> {
             zeroclaw_log::scope!(
                 model: model,
                 => self.inner.chat_with_tool_round_policy(request, model, temperature, policy)
+            )
+            .await
+        })
+        .instrument(span)
+        .await
+    }
+
+    pub async fn chat_with_attempt_budget(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+        budget: &zeroclaw_api::model_provider::GenerationAttemptBudget,
+    ) -> anyhow::Result<ChatResponse> {
+        use zeroclaw_log::Instrument;
+        let span = zeroclaw_log::attribution_span!(self.inner);
+        accounted_chat_call(self.inner, model, async move {
+            zeroclaw_log::scope!(
+                model: model,
+                => self.inner.chat_with_attempt_budget(request, model, temperature, policy, budget)
             )
             .await
         })

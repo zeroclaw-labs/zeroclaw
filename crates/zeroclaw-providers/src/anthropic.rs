@@ -2835,6 +2835,153 @@ impl AnthropicModelProvider {
     }
 }
 
+impl AnthropicModelProvider {
+    async fn chat_inner(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+        budget: Option<&zeroclaw_api::model_provider::GenerationAttemptBudget>,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        if let Some(budget) = budget {
+            budget.ensure_available()?;
+        }
+        commit_safeguard_fallback(None);
+        if let Some(refusal) = crate::reliable::take_stream_refusal_recovery() {
+            crate::dispatch::accounting::suppress_current_attempt();
+            return Err(anyhow::Error::new(refusal));
+        }
+        let credential = self.credential.as_ref().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"missing": "credentials"})),
+                "anthropic: no credentials configured"
+            );
+            anyhow::Error::msg(
+                "Anthropic credentials not set. Run `zeroclaw quickstart` or `zeroclaw config set` to configure.",
+            )
+        })?;
+
+        let (system_prompt, mut messages) =
+            Self::convert_messages(request.messages, self.cache_ttl);
+
+        // Auto-cache last message if conversation is long
+        if Self::should_cache_conversation(request.messages) {
+            Self::apply_cache_to_last_message(&mut messages, self.cache_ttl);
+        }
+
+        // Check for tool_choice override from the agent loop (e.g. "any"
+        // to force tool use for hardware requests).
+        let tool_choice_override = zeroclaw_api::TOOL_CHOICE_OVERRIDE
+            .try_with(Clone::clone)
+            .ok()
+            .flatten();
+        let native_tools = self.convert_tools(request.tools);
+        let tools_count = native_tools.as_ref().map_or(0, Vec::len);
+        let tool_choice = if tools_count > 0
+            && policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single
+            && self.supports_single_tool_rounds(model)
+        {
+            Some(serde_json::json!({
+                "type": tool_choice_override.as_deref().unwrap_or("auto"),
+                "disable_parallel_tool_use": true,
+            }))
+        } else if native_tools.is_some() {
+            tool_choice_override.map(|tc| serde_json::json!({ "type": tc }))
+        } else {
+            None
+        };
+
+        // For OAuth tokens, prepend Claude Code identity to system prompt
+        let system_prompt = if Self::is_setup_token(credential) {
+            Self::apply_oauth_system_prompt(system_prompt, self.cache_ttl)
+        } else {
+            system_prompt
+        };
+
+        let (effective_temperature, thinking_config, effective_max_tokens) =
+            self.resolve_thinking(request.thinking, temperature, model);
+        let thinking_display_beta = thinking_config
+            .as_ref()
+            .is_some_and(|config| config.display.is_some());
+
+        if ::zeroclaw_log::debug_enabled() {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "provider": "anthropic",
+                        "alias": &self.alias,
+                        "request_api": "messages",
+                        "model": model,
+                        "stream": false,
+                        "max_tokens": effective_max_tokens,
+                        "tools_count": tools_count,
+                        "tool_choice": tool_choice.as_ref().and_then(|value| value.get("type")).and_then(|value| value.as_str()),
+                        "thinking_enabled": thinking_config.is_some(),
+                    })),
+                "anthropic provider request prepared"
+            );
+        }
+        // Non-streaming: opt into server-side fallback when configured, unless
+        // native thinking is active on this request.
+        let fallbacks = self.server_fallbacks_for(model, thinking_config.as_ref());
+        let extra_betas: &[&str] = if fallbacks.is_some() {
+            &[ANTHROPIC_SERVER_FALLBACK_BETA]
+        } else {
+            &[]
+        };
+        let native_request = NativeChatRequest {
+            model: model.to_string(),
+            max_tokens: effective_max_tokens,
+            system: system_prompt,
+            messages,
+            temperature: effective_temperature,
+            tools: native_tools,
+            tool_choice,
+            stream: None,
+            thinking: thinking_config,
+            fallbacks,
+        };
+
+        let client = match budget {
+            Some(_) => {
+                crate::bounded::timeout_client("model_provider.anthropic", self.timeout_secs)?
+            }
+            None => self.http_client(),
+        };
+        let req = client
+            .post(format!("{}/v1/messages", self.base_url))
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&native_request);
+
+        let req = self.apply_auth(req, credential, thinking_display_beta, extra_betas);
+        let response = crate::bounded::send(req, budget, None).await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let error = super::api_error("Anthropic", response).await;
+            return Err(anyhow::Error::new(crate::reliable::ProviderHttpError::new(
+                status,
+                error.to_string(),
+            )));
+        }
+
+        let native_response: NativeChatResponse = response.json().await?;
+        commit_safeguard_fallback(None);
+        Self::check_refusal(&native_response, model)?;
+        let safeguard_notice = Self::server_fallback_notice(&native_response, model);
+        let parsed = Self::parse_native_response(native_response);
+        if !parsed.is_semantically_empty_terminal() {
+            commit_safeguard_fallback(safeguard_notice);
+        }
+        Ok(parsed)
+    }
+}
+
 #[async_trait]
 impl ModelProvider for AnthropicModelProvider {
     fn supports_single_tool_rounds(&self, _model: &str) -> bool {
@@ -2972,135 +3119,20 @@ impl ModelProvider for AnthropicModelProvider {
         temperature: Option<f64>,
         policy: zeroclaw_api::model_provider::ToolRoundPolicy,
     ) -> anyhow::Result<ProviderChatResponse> {
-        commit_safeguard_fallback(None);
-        if let Some(refusal) = crate::reliable::take_stream_refusal_recovery() {
-            crate::dispatch::accounting::suppress_current_attempt();
-            return Err(anyhow::Error::new(refusal));
-        }
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"missing": "credentials"})),
-                "anthropic: no credentials configured"
-            );
-            anyhow::Error::msg(
-                "Anthropic credentials not set. Run `zeroclaw quickstart` or `zeroclaw config set` to configure.",
-            )
-        })?;
+        self.chat_inner(request, model, temperature, policy, None)
+            .await
+    }
 
-        let (system_prompt, mut messages) =
-            Self::convert_messages(request.messages, self.cache_ttl);
-
-        // Auto-cache last message if conversation is long
-        if Self::should_cache_conversation(request.messages) {
-            Self::apply_cache_to_last_message(&mut messages, self.cache_ttl);
-        }
-
-        // Check for tool_choice override from the agent loop (e.g. "any"
-        // to force tool use for hardware requests).
-        let tool_choice_override = zeroclaw_api::TOOL_CHOICE_OVERRIDE
-            .try_with(Clone::clone)
-            .ok()
-            .flatten();
-        let native_tools = self.convert_tools(request.tools);
-        let tools_count = native_tools.as_ref().map_or(0, Vec::len);
-        let tool_choice = if tools_count > 0
-            && policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single
-            && self.supports_single_tool_rounds(model)
-        {
-            Some(serde_json::json!({
-                "type": tool_choice_override.as_deref().unwrap_or("auto"),
-                "disable_parallel_tool_use": true,
-            }))
-        } else if native_tools.is_some() {
-            tool_choice_override.map(|tc| serde_json::json!({ "type": tc }))
-        } else {
-            None
-        };
-
-        // For OAuth tokens, prepend Claude Code identity to system prompt
-        let system_prompt = if Self::is_setup_token(credential) {
-            Self::apply_oauth_system_prompt(system_prompt, self.cache_ttl)
-        } else {
-            system_prompt
-        };
-
-        let (effective_temperature, thinking_config, effective_max_tokens) =
-            self.resolve_thinking(request.thinking, temperature, model);
-        let thinking_display_beta = thinking_config
-            .as_ref()
-            .is_some_and(|config| config.display.is_some());
-
-        if ::zeroclaw_log::debug_enabled() {
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({
-                        "provider": "anthropic",
-                        "alias": &self.alias,
-                        "request_api": "messages",
-                        "model": model,
-                        "stream": false,
-                        "max_tokens": effective_max_tokens,
-                        "tools_count": tools_count,
-                        "tool_choice": tool_choice.as_ref().and_then(|value| value.get("type")).and_then(|value| value.as_str()),
-                        "thinking_enabled": thinking_config.is_some(),
-                    })),
-                "anthropic provider request prepared"
-            );
-        }
-        // Non-streaming: opt into server-side fallback when configured, unless
-        // native thinking is active on this request.
-        let fallbacks = self.server_fallbacks_for(model, thinking_config.as_ref());
-        let extra_betas: &[&str] = if fallbacks.is_some() {
-            &[ANTHROPIC_SERVER_FALLBACK_BETA]
-        } else {
-            &[]
-        };
-        let native_request = NativeChatRequest {
-            model: model.to_string(),
-            max_tokens: effective_max_tokens,
-            system: system_prompt,
-            messages,
-            temperature: effective_temperature,
-            tools: native_tools,
-            tool_choice,
-            stream: None,
-            thinking: thinking_config,
-            fallbacks,
-        };
-
-        let req = self
-            .http_client()
-            .post(format!("{}/v1/messages", self.base_url))
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&native_request);
-
-        let response = self
-            .apply_auth(req, credential, thinking_display_beta, extra_betas)
-            .send()
-            .await?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let error = super::api_error("Anthropic", response).await;
-            return Err(anyhow::Error::new(crate::reliable::ProviderHttpError::new(
-                status,
-                error.to_string(),
-            )));
-        }
-
-        let native_response: NativeChatResponse = response.json().await?;
-        commit_safeguard_fallback(None);
-        Self::check_refusal(&native_response, model)?;
-        let safeguard_notice = Self::server_fallback_notice(&native_response, model);
-        let parsed = Self::parse_native_response(native_response);
-        if !parsed.is_semantically_empty_terminal() {
-            commit_safeguard_fallback(safeguard_notice);
-        }
-        Ok(parsed)
+    async fn chat_with_attempt_budget(
+        &self,
+        request: crate::traits::ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+        budget: &zeroclaw_api::model_provider::GenerationAttemptBudget,
+    ) -> anyhow::Result<crate::traits::ChatResponse> {
+        self.chat_inner(request, model, temperature, policy, Some(budget))
+            .await
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -11255,5 +11287,24 @@ data: {\"type\":\"message_stop\"}\n\n";
             vec![0, 2, 4],
             "the fifth image must rewrite only the three oldest image messages"
         );
+    }
+}
+
+#[cfg(test)]
+mod attempt_budget_tests {
+    use super::*;
+    use crate::bounded::tests as fixture;
+
+    #[tokio::test]
+    async fn anthropic_shares_budget_across_calls() {
+        let server = fixture::server(vec![
+            fixture::Reply::json(200, fixture::ANTHROPIC_OK),
+            fixture::Reply::json(200, fixture::ANTHROPIC_OK),
+        ])
+        .await;
+        let provider = AnthropicModelProvider::builder("fixture")
+            .credential(Some("fixture-key"))
+            .build();
+        fixture::assert_two_requests(&provider, &server).await;
     }
 }
