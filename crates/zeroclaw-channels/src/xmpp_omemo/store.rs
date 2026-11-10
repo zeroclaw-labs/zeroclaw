@@ -84,7 +84,7 @@ pub(crate) fn identity(tx: &Transaction<'_>, account: &str) -> Result<([u8; 32],
     Ok((private, fingerprint, id))
 }
 
-fn session_identity(
+pub(crate) fn session_identity(
     tx: &Transaction<'_>,
     prefix: &str,
     own: [u8; 32],

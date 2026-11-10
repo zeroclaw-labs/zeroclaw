@@ -240,3 +240,30 @@ consume queue slots. Authorized pings wait for the active discovery exchange
 before the reader answers them. A full queue drops excess messages before admission and
 logs the overload without disconnecting the alias; it does not report those
 messages as accepted.
+
+
+### Peer resets an OMEMO session
+
+If a pinned contact resets its session while retaining the same identity and
+device ID, its new base key is deliberately rejected by the established-session
+adapter. Recover through the supported offline operator path. Stop the owning
+daemon, run as the vault/state owner, and use the same canonical paths described
+above:
+
+```sh
+zeroclaw channel xmpp-inbox inspect-session VAULT_ROOT STATE_DIR ALIAS ACCOUNT PEER DEVICE_ID
+zeroclaw channel xmpp-inbox reset-session VAULT_ROOT STATE_DIR ALIAS ACCOUNT PEER DEVICE_ID REVIEW_TOKEN EVIDENCE_REFERENCE
+```
+
+Confirm the displayed fingerprint with the contact and review why the client
+reset its session. The token binds the exact current session, account, device
+and identity. Reset refuses stale reviews, unreturned peer ingress, and any
+pending outbox reservation. Settle those records through their normal reviewed
+workflow first; reset never discards or marks uncertain work as completed.
+
+Only the selected peer/device session metadata is removed. The local identity,
+fingerprint policy, inbox records, outbox records and replay markers remain
+unchanged, and an encrypted identity-bound operator receipt is retained. Resume
+the daemon and ask the contact to send a fresh OMEMO prekey handshake. The live
+allowlist, pin, bundle-signature and payload-authentication checks still apply.
+This operation is not an agent tool and never runs automatically.
