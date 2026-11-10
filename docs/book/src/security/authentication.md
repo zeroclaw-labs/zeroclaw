@@ -375,8 +375,21 @@ it refuses an advertised lifetime above one hour or a polling interval
 above five minutes rather than sleeping on a hostile answer. An
 advertised interval of `0` or `1` is floored at RFC 8628's five-second
 default, so a gateway answer cannot put zerocode on a once-a-second
-poll the per-client budget would only refuse. The token it receives is
-held in memory for that session only.
+poll the per-client budget would only refuse. The legacy automatic enrollment
+path holds the token in memory for that session only. For URL-scoped persistent login, use
+`zerocode login <alias> <wss-url> --gateway-url <https-origin>`; see
+[Remote setup](../zerocode/remote.md#sign-in-with-oidc-recommended-for-oidc-deployments).
+That command starts from an empty client directory: OIDC sign-in authorizes
+issuance of its first device certificate through the gateway, with no pre-created
+device, local user, daemon pairing code, SAS, or separate enrollment listener.
+The daemon verifies the bearer through the same accepted OIDC policy as RPC,
+requires a human with `sessions:create` and an allowed agent (or
+`system:execute` / admin), signs only the CSR's public key, and
+records the new device in the existing certificate ledger and audit trail.
+Static client-certificate pins still require out-of-band provisioning. WSS still
+requires both mTLS and a valid OIDC access token on every initialize.
+The command saves the accepted access token in the owner-only local
+`zerocode-config.toml` and re-authenticates when startup needs a fresh token.
 
 ## Permission profiles
 
@@ -751,8 +764,50 @@ What a signed-in account can do follows its permission profile:
   do.
 - Any other account reaches the configuration pages its `Config` grants
   allow. Other pages answer 403 with `"reason": "operator_required"`, and
-  the dashboard hides them. Use zerocode for that account's own chat
-  sessions.
+  the dashboard hides them.
+- When the gateway runs inside the daemon, an account without `admin` can
+  also chat in the dashboard, with the agents its grants allow, if its
+  profile grants `sessions` create, read, execute and update. The agent
+  uses only the tools the profile grants (`allowed_tools`, with
+  `tools = ["execute"]`). A disabled agent takes no new chat, and a chat
+  already open with it answers each message with an error until the agent
+  is enabled again. Its conversations are its own: the daemon runs
+  them as that account, under its grants, and nobody else's dashboard
+  lists them. Image upload is not offered. Each chat is one conversation,
+  and the conversation lasts only as long as the chat:
+  - Closing or reloading the page, leaving the chat, or a dropped
+    connection ends the conversation, and stops a reply under way. So do
+    signing out, the session expiring, and a daemon reload or restart. A
+    new chat starts a new conversation; none is reopened.
+  - A sign-in has at most four chats open at once (four tabs, say), and
+    an account at most 32 across all its sign-ins. A conversation still
+    being created, or not yet closed after its chat ended, counts too, so
+    signing out and in again frees nothing until it is closed. A chat
+    past either limit is refused until one closes.
+  - Each chat presents the token to the daemon bound to the identity
+    provider that issued it. If the provider's configuration is changed
+    to another issuer or client meanwhile, the chat is refused and the
+    token is not sent to the new one.
+  - If the account's access is revoked while it is signed in, its open
+    conversations can't be closed with its own authority, and nobody else
+    can reach them. The daemon closes such a conversation once its chat
+    has been gone for `wss.orphaned_session_timeout_secs` (30 minutes by
+    default), if it is idle, has no reply or approval pending, and its
+    saved transcript is up to date. Setting the timeout to `0` turns this
+    off, and what the dashboard could not close then stays live until the
+    daemon restarts.
+  - If the daemon takes more than ten minutes to create a chat's
+    conversation, the chat gives up, but the dashboard keeps waiting for
+    the daemon's answer, and the creation counts against the account's 32
+    until it comes. A conversation created after all is closed when it
+    arrives, and then no longer counts, whatever the timeout above. A
+    conversation the dashboard could not close, or whose creation lost its
+    connection to the daemon before the answer came, counts until the next
+    daemon reload or restart, since the dashboard can't tell when the
+    daemon lets it go.
+  - A closed conversation's transcript is kept, but the dashboard can't
+    open it. Use zerocode when an account needs history that outlasts its
+    chat.
 
 Sign-out ends the session in this ZeroClaw and drops its cookie, also
 when the session had already ended; it does not sign the user out of the
@@ -770,7 +825,8 @@ that finishes later ends the other, and sign-out ends every session
 that shares a marker with the browser. A request admitted
 before its session ended that has not yet taken effect, such as a
 configuration change whose body is still arriving, is refused. A chat
-turn already running finishes unattended, as when a viewer leaves, and a
+turn already running finishes unattended, as when a viewer leaves (a
+scoped account's stops instead, since its conversation is closed), and a
 tool approval it was waiting on is refused; nothing the closed socket
 sent afterwards is acted on. A
 reload also closes the sockets a session opened, and the dashboard
@@ -1015,3 +1071,15 @@ A principal without operator grants may list it only through an enabled
 agent whose policy lets it read `/`, such as one that is not workspace-only.
 For any other such principal the picker reports a refusal there until it
 opens inside an allowed root instead.
+
+### Keycloak access-token client attribution
+
+JWKS verification accepts a signed `azp` as the OAuth client identifier when a
+typed access token has no `client_id` and the configured client declaration or
+`actor_claim` establishes a human actor. The issuer, signature, token purpose,
+audience, lifetime and actor-classification checks still apply. An `azp`-only
+token cannot authenticate a service, including one classified by `actor_claim`;
+service actors still require `client_id`. A blank `client_id`, contradictory
+`client_id` and `azp`, or a client with no declaration or configured actor-claim
+evidence fails closed. Introspection still requires its `client_id` response
+field.

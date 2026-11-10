@@ -38,6 +38,7 @@ LICENSE* text eol=lf
 
 # Rust-specific
 Cargo.lock text eol=lf linguist-generated
+docs/book/src/architecture/zeroclaw-rpc.openrpc.json linguist-generated
 Cargo.toml text eol=lf
 
 # Declare files that will always have CRLF line endings on checkout
