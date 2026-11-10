@@ -360,6 +360,7 @@ export default function ChatWorkspace({ initialAlias, allowedAliases }: ChatWork
                   twice — and so a conversation switch inside a pane does not
                   remount the provider and drop its socket. */}
               <AgentProvider
+                visible={visible}
                 key={tab.key}
                 agentAlias={tab.alias}
                 initialSessionId={tab.sessionId}

@@ -477,6 +477,8 @@ mod tests {
         config.data_dir = tmp.path().join("data");
         config.config_path = tmp.path().join("config.toml");
         config.memory.backend = "none".to_string();
+        config.cost.enabled = true;
+        let ledger_dir = config.data_dir.clone();
         config.providers.models.openai.insert(
             "alpha".to_string(),
             OpenAIModelProviderConfig {
@@ -505,10 +507,13 @@ mod tests {
             Some(principal.clone()),
         );
 
-        let result = tool
-            .execute(json!({ "prompt": "Summarize this private task" }))
-            .await
-            .expect("execute returns a result");
+        let result = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(Some("rpc_parent".into()), async {
+                tool.execute(json!({ "prompt": "Summarize this private task" }))
+                    .await
+                    .expect("execute returns a result")
+            })
+            .await;
 
         assert!(result.success, "child failed: {:?}", result.error);
         assert!(result.output.contains(STUB_REPLY));
@@ -517,6 +522,18 @@ mod tests {
         assert_eq!(seen[0].agent_alias, "alpha");
         assert_eq!(seen[0].principal, Some(principal));
         assert!(memory.agents.lock().iter().any(|alias| alias == "alpha"));
+        let rows: Vec<crate::cost::CostRecord> =
+            std::fs::read_to_string(ledger_dir.join("state/costs.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].conversation_id.as_deref(), Some("rpc_parent"));
+        assert!(
+            rows[0].is_coverage_only(),
+            "the stub omits usage; never report it as free"
+        );
     }
 
     #[tokio::test]

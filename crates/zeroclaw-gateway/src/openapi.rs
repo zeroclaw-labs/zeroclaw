@@ -82,6 +82,7 @@ pub fn build_spec() -> serde_json::Value {
 
     let components = serde_json::json!({
         "schemas": {
+            "ConversationCostSummary": response_schema_value::<zeroclaw_api::cost::ConversationCostSummary>(),
             "ConfigApiError":   schema_value::<ConfigApiError>(),
             "PropPutBody":      schema_value::<PropPutBody>(),
             "PropResponse":     schema_value::<PropResponse>(),
@@ -677,7 +678,19 @@ pub fn build_spec() -> serde_json::Value {
             "version": env!("CARGO_PKG_VERSION"),
             "description": "OpenAPI generation requires the `schema-export` feature; this build was compiled without it.",
         },
-        "paths": {},
+        "paths": {
+            "/api/sessions/{id}/cost": {
+                "get": {
+                    "summary": "Estimated recorded conversation cost",
+                    "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+                    "responses": {
+                        "200": {"description": "Estimate, incomplete estimate, or unavailable coverage", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ConversationCostSummary"}}}},
+                        "401": {"description": "Authentication required"},
+                        "403": {"description": "Operator access required"},
+                        "500": {"description": "Ledger could not be read"}
+                    }
+                }
+            },},
     })
 }
 
