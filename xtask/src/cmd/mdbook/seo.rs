@@ -54,7 +54,14 @@ pub fn run() -> anyhow::Result<()> {
                     .map_err(|e| anyhow::Error::msg(format!("{}: {e}", page.display())))?
                     .to_string_lossy()
                     .replace('\\', "/");
-                let placement = classify(version, is_stable, stable.as_deref(), &locale, &rel);
+                let placement = classify(
+                    Path::new("."),
+                    version,
+                    is_stable,
+                    stable.as_deref(),
+                    &locale,
+                    &rel,
+                );
                 let alternates = if is_stable {
                     locales(Path::new(version))?
                         .into_iter()
@@ -90,7 +97,10 @@ struct Placement {
     noindex: bool,
 }
 
+/// Place one page of `version`, looking for its stable copy under `root`, the
+/// gh-pages clone root that holds the version dirs.
 fn classify(
+    root: &Path,
     version: &str,
     is_stable: bool,
     stable: Option<&str>,
@@ -105,7 +115,7 @@ fn classify(
         };
     }
     let stable_copy = stable
-        .filter(|s| Path::new(s).join(locale).join(rel).is_file())
+        .filter(|s| root.join(s).join(locale).join(rel).is_file())
         .map(|s| (s.to_string(), locale.to_string(), rel.to_string()));
     match stable_copy {
         Some(target) => Placement {
@@ -485,27 +495,27 @@ mod tests {
 
     #[test]
     fn classify_points_duplicates_at_stable_and_hides_dropped_pages() {
+        // An explicit root, not `set_current_dir`: the cwd is shared by every
+        // test thread, and sibling tests spawn `cargo metadata` from it.
         let dir = tempfile::tempdir().unwrap();
-        let cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
-        fs::create_dir_all("v0.8.5/en").unwrap();
-        fs::write("v0.8.5/en/kept.html", "x").unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("v0.8.5/en")).unwrap();
+        fs::write(root.join("v0.8.5/en/kept.html"), "x").unwrap();
 
-        let dup = classify("master", false, Some("v0.8.5"), "en", "kept.html");
+        let dup = classify(root, "master", false, Some("v0.8.5"), "en", "kept.html");
         assert_eq!(dup.canonical.0, "v0.8.5");
         assert!(!dup.noindex);
 
-        let fresh = classify("master", false, Some("v0.8.5"), "en", "new.html");
+        let fresh = classify(root, "master", false, Some("v0.8.5"), "en", "new.html");
         assert_eq!(fresh.canonical.0, "master");
         assert!(!fresh.noindex, "master-only pages stay indexable");
 
-        let dropped = classify("v0.8.2", false, Some("v0.8.5"), "en", "gone.html");
+        let dropped = classify(root, "v0.8.2", false, Some("v0.8.5"), "en", "gone.html");
         assert_eq!(dropped.canonical.0, "v0.8.2");
         assert!(dropped.noindex, "pages the release removed are hidden");
 
-        let stable = classify("v0.8.5", true, Some("v0.8.5"), "en", "kept.html");
+        let stable = classify(root, "v0.8.5", true, Some("v0.8.5"), "en", "kept.html");
         assert_eq!(stable.canonical.0, "v0.8.5");
-        std::env::set_current_dir(cwd).unwrap();
     }
 
     #[test]

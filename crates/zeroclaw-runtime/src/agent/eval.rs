@@ -1,4 +1,8 @@
-pub use zeroclaw_config::scattered_types::{AutoClassifyConfig, EvalConfig};
+use std::collections::HashSet;
+pub use zeroclaw_config::scattered_types::{
+    AutoClassifyConfig, CloudEscalationPolicy, EffortRoutingConfig, EvalConfig,
+};
+use zeroclaw_config::schema::ModelRouteConfig;
 
 // ── Complexity estimation ───────────────────────────────────────
 
@@ -55,6 +59,102 @@ pub fn estimate_complexity(message: &str) -> ComplexityTier {
     }
 
     ComplexityTier::Standard
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffortRouteTarget {
+    Local,
+    Cloud,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffortRoutingDecision<'a> {
+    pub hint: &'a str,
+    pub target: EffortRouteTarget,
+    pub complexity: ComplexityTier,
+}
+
+#[derive(Debug)]
+pub struct ResolvedEffortRoute<'a> {
+    pub route: &'a ModelRouteConfig,
+    pub allowed_provider_refs: HashSet<String>,
+    pub target: EffortRouteTarget,
+    pub complexity: ComplexityTier,
+    pub cloud_escalation: CloudEscalationPolicy,
+}
+
+/// Resolve an opted-in effort route without making a model or network call.
+/// Standard (ambiguous) turns intentionally stay local.
+pub fn effort_routing_decision<'a>(
+    policy: &'a EffortRoutingConfig,
+    message: &str,
+) -> EffortRoutingDecision<'a> {
+    let complexity = estimate_complexity(message);
+    let target = if complexity == ComplexityTier::Complex
+        && policy.cloud_escalation == CloudEscalationPolicy::Auto
+    {
+        EffortRouteTarget::Cloud
+    } else {
+        EffortRouteTarget::Local
+    };
+    let hint = match target {
+        EffortRouteTarget::Local => policy.local_hint.trim(),
+        EffortRouteTarget::Cloud => policy.cloud_hint.trim(),
+    };
+    EffortRoutingDecision {
+        hint,
+        target,
+        complexity,
+    }
+}
+
+/// Resolve the selected route and the complete physical-provider boundary for
+/// one opted-in turn. Hint matching is exact, matching config validation and
+/// `ModelRouteResolver` semantics.
+pub fn resolve_effort_route<'a>(
+    policy: &EffortRoutingConfig,
+    routes: &'a [ModelRouteConfig],
+    message: &str,
+) -> Option<ResolvedEffortRoute<'a>> {
+    let decision = effort_routing_decision(policy, message);
+    let final_route = |hint: &str| routes.iter().rev().find(|route| route.hint == hint);
+    let local_route = final_route(policy.local_hint.trim())?;
+    let cloud_route = final_route(policy.cloud_hint.trim())?;
+    let route = match decision.target {
+        EffortRouteTarget::Local => local_route,
+        EffortRouteTarget::Cloud => cloud_route,
+    };
+    let mut allowed_provider_refs = HashSet::from([local_route.model_provider.clone()]);
+    if decision.target == EffortRouteTarget::Cloud {
+        allowed_provider_refs.insert(cloud_route.model_provider.clone());
+    }
+    Some(ResolvedEffortRoute {
+        route,
+        allowed_provider_refs,
+        target: decision.target,
+        complexity: decision.complexity,
+        cloud_escalation: policy.cloud_escalation,
+    })
+}
+
+pub fn log_effort_route_selection(
+    selection: &ResolvedEffortRoute<'_>,
+    message_length: usize,
+    surface: &'static str,
+) {
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            ::serde_json::json!({
+                "target": format!("{:?}", selection.target).to_lowercase(),
+                "complexity": format!("{:?}", selection.complexity),
+                "cloud_escalation": format!("{:?}", selection.cloud_escalation).to_lowercase(),
+                "message_length": message_length,
+                "surface": surface,
+            }),
+        ),
+        "Selected effort-based model route"
+    );
 }
 
 // ── Auto-classify extension ─────────────────────────────────────
@@ -262,6 +362,95 @@ mod tests {
         assert_eq!(ac.hint_for(ComplexityTier::Simple), Some("fast"));
         assert_eq!(ac.hint_for(ComplexityTier::Standard), None);
         assert_eq!(ac.hint_for(ComplexityTier::Complex), Some("reasoning"));
+    }
+
+    #[test]
+    fn effort_routing_keeps_ambiguous_local_and_requires_auto_for_cloud() {
+        let mut policy = EffortRoutingConfig {
+            local_hint: "local".into(),
+            cloud_hint: "cloud".into(),
+            cloud_escalation: CloudEscalationPolicy::Never,
+        };
+        let ambiguous = effort_routing_decision(
+            &policy,
+            "Can you help me find a good restaurant in this area please?",
+        );
+        assert_eq!(ambiguous.complexity, ComplexityTier::Standard);
+        assert_eq!(ambiguous.target, EffortRouteTarget::Local);
+        assert_eq!(ambiguous.hint, "local");
+
+        let complex = "a".repeat(201);
+        assert_eq!(
+            effort_routing_decision(&policy, &complex).target,
+            EffortRouteTarget::Local
+        );
+        policy.cloud_escalation = CloudEscalationPolicy::Auto;
+        let escalated = effort_routing_decision(&policy, &complex);
+        assert_eq!(escalated.target, EffortRouteTarget::Cloud);
+        assert_eq!(escalated.hint, "cloud");
+    }
+
+    #[test]
+    fn effort_route_resolution_is_exact_and_matches_resolver_final_entry() {
+        use zeroclaw_providers::router::{ModelRouteResolver, Route};
+
+        let mut policy = EffortRoutingConfig {
+            local_hint: "local".into(),
+            cloud_hint: "cloud".into(),
+            cloud_escalation: CloudEscalationPolicy::Never,
+        };
+        let route = |hint: &str, provider: &str, model: &str| ModelRouteConfig {
+            hint: hint.into(),
+            model_provider: provider.into(),
+            model: model.into(),
+            api_key: None,
+        };
+        let exact = vec![
+            route("LOCAL", "custom.wrong", "wrong-model"),
+            route("local", "custom.first", "first-local-model"),
+            route("cloud", "custom.cloud-first", "first-cloud-model"),
+            route("local", "custom.final", "final-local-model"),
+            route("cloud", "custom.cloud-final", "final-cloud-model"),
+        ];
+        let local = resolve_effort_route(&policy, &exact, "hello").unwrap();
+        assert_eq!(local.route.model_provider, "custom.final");
+        assert_eq!(local.route.model, "final-local-model");
+        assert_eq!(
+            local.allowed_provider_refs,
+            HashSet::from(["custom.final".to_string()])
+        );
+
+        let resolver = ModelRouteResolver::new(
+            exact
+                .iter()
+                .map(|route| {
+                    (
+                        route.hint.clone(),
+                        Route {
+                            provider_name: route.model_provider.clone(),
+                            model: route.model.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            "custom.default".into(),
+            "default-model".into(),
+        );
+        let resolved_local = resolver.resolve("hint:local");
+        assert_eq!(local.route.model_provider, resolved_local.provider_name);
+        assert_eq!(local.route.model, resolved_local.model);
+
+        policy.cloud_escalation = CloudEscalationPolicy::Auto;
+        let cloud = resolve_effort_route(&policy, &exact, &"a".repeat(201)).unwrap();
+        assert_eq!(cloud.route.model_provider, "custom.cloud-final");
+        assert_eq!(cloud.route.model, "final-cloud-model");
+        assert_eq!(
+            cloud.allowed_provider_refs,
+            HashSet::from(["custom.final".to_string(), "custom.cloud-final".to_string(),])
+        );
+        let resolved_cloud = resolver.resolve("hint:cloud");
+        assert_eq!(cloud.route.model_provider, resolved_cloud.provider_name);
+        assert_eq!(cloud.route.model, resolved_cloud.model);
     }
 
     // ── evaluate_response ───────────────────────────────────────

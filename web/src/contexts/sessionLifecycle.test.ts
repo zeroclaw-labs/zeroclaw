@@ -70,12 +70,16 @@ let missingSessions = new Set<string>();
 let deleteFailures = new Set<string>();
 let configPutHandler: ((request: ConfigPutRequest) => Promise<Response>) | null = null;
 
+// Every request URL, for tests that check what was (not) asked of the gateway.
+const requestedUrls: string[] = [];
+
 globalThis.fetch = async (input, init) => {
   const url = typeof input === 'string'
     ? input
     : input instanceof URL
       ? input.toString()
       : input.url;
+  requestedUrls.push(`${init?.method ?? 'GET'} ${url.replace(/^.*?(\/api\/)/, '/api/')}`);
   let body: unknown;
   if (url.includes('/api/config/catalog')) body = { providers: [] };
   else if (url.includes('/api/status')) body = { model: 'test-model' };
@@ -115,6 +119,8 @@ const { deleteSession, HttpError, ApiError } = await import('../lib/api.ts');
 const { DraftContext } = await import('../hooks/useDraft.ts');
 const { AgentChatInner } = await import('../pages/AgentChat.tsx');
 const { MemoryRouter } = await import('react-router-dom');
+const { setOidcSession } = await import('../lib/auth.ts');
+const { loadChatHistory, saveChatHistory } = await import('../lib/chatHistoryStorage.ts');
 
 class Deferred<T> {
   readonly promise: Promise<T>;
@@ -146,6 +152,7 @@ class FakeSocket implements SessionSocket {
   constructor(
     readonly agentAlias: string,
     readonly sessionId: string,
+    readonly autoReconnect: boolean | undefined = undefined,
   ) {}
 
   connect(): void { this.connectCalls += 1; }
@@ -159,6 +166,8 @@ class FakeSocket implements SessionSocket {
     this.approvalResponses.push({ requestId, decision });
   }
   emitOpen(): void { this.open = true; this.onOpen?.(); }
+  /** The close frame arrived, but its event hasn't been delivered yet. */
+  beginClosing(): void { this.open = false; }
   emitClose(code = 1006): void {
     this.open = false;
     this.onClose?.({ code } as CloseEvent);
@@ -179,8 +188,12 @@ class FakeSessionRuntime implements AgentSessionRuntime {
   readonly renameDeferred = new Map<string, Deferred<{ session_id: string; name: string }>>();
   mintedIds: string[] = [];
 
-  createSocket({ agentAlias, sessionId }: { agentAlias: string; sessionId: string }): FakeSocket {
-    const socket = new FakeSocket(agentAlias, sessionId);
+  createSocket({ agentAlias, sessionId, autoReconnect }: {
+    agentAlias: string;
+    sessionId: string;
+    autoReconnect?: boolean;
+  }): FakeSocket {
+    const socket = new FakeSocket(agentAlias, sessionId, autoReconnect);
     this.sockets.push(socket);
     return socket;
   }
@@ -347,6 +360,7 @@ async function unmount(renderer: ReactTestRenderer): Promise<void> {
 
 beforeEach(() => {
   storage.clear();
+  requestedUrls.length = 0;
   configPutCalls = [];
   missingSessions = new Set();
   deleteFailures = new Set();
@@ -1005,3 +1019,1068 @@ test('session switch disconnects both the effect-owned and replacement sockets',
     message.content === 'stale replacement'), false);
   await unmount(mounted.renderer);
 });
+
+// A signed-in account without the operator dashboard (scoped dashboard chat).
+const scopedSession = {
+  kind: 'oidc' as const,
+  provider: 'oidc.corp',
+  principal_id: 'principal-a',
+  display_name: 'Ada',
+  admin: false,
+  expires_at: 4_102_444_800,
+  csrf_token: 'csrf-1',
+  features: { chat: true, operator_pages: false },
+};
+
+function chatControls(renderer: ReactTestRenderer) {
+  const buttons = renderer.root.findAllByType('button');
+  return {
+    attach: buttons.some((button) => button.props['aria-label'] === 'Attach image'),
+    workspaceLink: renderer.root.findAll((node) =>
+      typeof node.props.to === 'string' && node.props.to.endsWith('/workspace')).length > 0,
+    modelReadOnly: renderer.root.findAll((node) =>
+      node.type === 'span' && node.props['data-model-readonly'] !== undefined),
+  };
+}
+
+async function openPicker(renderer: ReactTestRenderer): Promise<void> {
+  const trigger = renderer.root.findAllByType('button')
+    .find((button) => button.props.title === 'Conversations');
+  assert.ok(trigger);
+  await act(async () => { trigger.props.onClick(); });
+  await settle();
+}
+
+test('a paired browser keeps model switching, upload and the workspace link', async () => {
+  const runtime = new FakeSessionRuntime();
+  const mounted = await mountChat(runtime, true);
+  await openSocket(runtime, 0);
+  await settle();
+  const controls = chatControls(mounted.renderer);
+  assert.equal(controls.attach, true);
+  assert.equal(controls.workspaceLink, true);
+  assert.equal(controls.modelReadOnly.length, 0);
+  await unmount(mounted.renderer);
+});
+
+test('a scoped account chats without model switching, upload or the workspace link', async () => {
+  setOidcSession(scopedSession);
+  try {
+    const runtime = new FakeSessionRuntime();
+    const mounted = await mountChat(runtime, true);
+    await settle();
+
+    const controls = chatControls(mounted.renderer);
+    assert.equal(controls.attach, false);
+    assert.equal(controls.workspaceLink, false);
+    assert.equal(controls.modelReadOnly.length, 1);
+    assert.ok(nodeText(controls.modelReadOnly[0]!).includes('test-model'));
+    // Model info comes from the agent's status only, with no config reads.
+    assert.deepEqual(mounted.context().availableModels, []);
+
+    await typeInComposer(mounted.renderer, '/model other');
+    const send = mounted.renderer.root.findAllByType('button')
+      .find((button) => button.props['aria-label'] === 'Send');
+    assert.ok(send);
+    await act(async () => { send.props.onClick(); });
+    assert.ok(mounted.context().messages.some((message) =>
+      message.content === 'Not available for your account'));
+    assert.equal(configPutCalls.length, 0);
+    await unmount(mounted.renderer);
+  } finally {
+    setOidcSession(null);
+  }
+});
+
+test('a paired browser still keeps terminal sessions out of the picker', async () => {
+  listedSessions = [
+    {
+      session_id: 'R1', session_key: 'rpc_R1', name: 'Terminal chat', message_count: 2,
+      last_activity: '2026-10-19T00:00:00Z', created_at: '2026-10-19T00:00:00Z',
+      agent_alias: 'ops', channel_id: null,
+    },
+  ];
+  const runtime = new FakeSessionRuntime();
+  const mounted = await mountChat(runtime, true);
+  await openSocket(runtime, 0);
+  await settle();
+  await openPicker(mounted.renderer);
+  const labels = mounted.renderer.root.findAllByType('button').map(nodeText);
+  assert.equal(labels.some((label) => label.includes('Terminal chat')), false);
+  await unmount(mounted.renderer);
+});
+
+test('CAPABILITY_MISSING refuses the request but keeps the running turn', async () => {
+  const runtime = new FakeSessionRuntime();
+  const mounted = await mountChat(runtime);
+  await openSocket(runtime, 0);
+  await settle();
+  await act(async () => { mounted.context().sendMessage('hello'); });
+  assert.equal(mounted.context().typing, true);
+
+  await act(async () => {
+    runtime.sockets[0]!.emitMessage({
+      type: 'error', code: 'CAPABILITY_MISSING', message: 'Steering is not available here',
+    } as WsMessage);
+  });
+  assert.equal(mounted.context().typing, true);
+  assert.ok(mounted.context().messages.some((message) =>
+    message.content.includes('Steering is not available here')));
+
+  await act(async () => {
+    runtime.sockets[0]!.emitMessage({
+      type: 'error', code: 'AGENT_ERROR', message: 'The turn failed',
+    } as WsMessage);
+  });
+  assert.equal(mounted.context().typing, false);
+  await unmount(mounted.renderer);
+});
+
+
+function seedLocalTranscript(sessionId: string): void {
+  saveChatHistory(sessionId, [
+    { id: 'm1', role: 'user', content: 'an earlier question', timestamp: '2026-10-18T00:00:00Z', local: true },
+    { id: 'm2', role: 'agent', content: 'an earlier answer', timestamp: '2026-10-18T00:00:01Z' },
+  ]);
+}
+
+test('a paired browser falls back to its local transcript when the gateway has none', async () => {
+  seedLocalTranscript('A');
+  const runtime = new FakeSessionRuntime();
+  runtime.queueMessages('A', () => Promise.reject(new Error('Session not found')));
+  const mounted = await mountChat(runtime);
+  await openSocket(runtime, 0);
+  await settle();
+  assert.ok(mounted.context().messages.some((m) => m.content === 'an earlier answer'));
+  await unmount(mounted.renderer);
+});
+
+test('a socket closed mid-turn stops the turn and reloads the transcript when it reopens', async () => {
+  const runtime = new FakeSessionRuntime();
+  const mounted = await mountChat(runtime);
+  await openSocket(runtime, 0);
+  await settle();
+  await act(async () => { mounted.context().sendMessage('hello'); });
+  assert.equal(mounted.context().typing, true);
+
+  // The session ends mid-turn (4401); the turn finishes on the server.
+  runtime.queueMessages('A', () => Promise.resolve({
+    session_id: 'A',
+    session_persistence: true,
+    messages: [
+      { role: 'user', content: 'hello', created_at: null },
+      { role: 'assistant', content: 'finished while away', created_at: null },
+    ],
+  }));
+  const callsBefore = runtime.messageCalls.length;
+  await act(async () => { runtime.sockets[0]!.emitClose(4401); });
+  assert.equal(mounted.context().typing, false);
+  // A session close code is the auth layer's to explain, not a config error.
+  assert.equal(mounted.context().error, null);
+
+  // The client reconnects (after re-auth) and the transcript catches up.
+  await openSocket(runtime, 0);
+  await settle();
+  assert.equal(runtime.messageCalls.length, callsBefore + 1);
+  assert.ok(mounted.context().messages.some((m) => m.content === 'finished while away'));
+  await unmount(mounted.renderer);
+});
+
+test('a socket closed while idle reconnects without reloading the transcript', async () => {
+  const runtime = new FakeSessionRuntime();
+  const mounted = await mountChat(runtime);
+  await openSocket(runtime, 0);
+  await settle();
+  const callsBefore = runtime.messageCalls.length;
+  await act(async () => { runtime.sockets[0]!.emitClose(1001); });
+  await openSocket(runtime, 0);
+  await settle();
+  assert.equal(runtime.messageCalls.length, callsBefore);
+  await unmount(mounted.renderer);
+});
+
+test('F5 while a detached turn is still running keeps the prompt the browser already showed', async () => {
+  // First page load: conversation A is empty on the server.
+  const runtime1 = new FakeSessionRuntime();
+  runtime1.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  const first = await mountChat(runtime1, false);
+  await openSocket(runtime1, 0);
+  await settle();
+
+  await act(async () => { first.context().sendMessage('long task'); });
+  await act(async () => {
+    runtime1.sockets[0]!.emitMessage({ type: 'chunk', content: 'partial' });
+  });
+  assert.ok(
+    first.context().messages.some((m) => m.content === 'long task' && m.local === true),
+    'the optimistic prompt is on screen before F5',
+  );
+  await settle();
+
+  // F5: the React tree dies, localStorage survives, nothing is sent to the server.
+  await unmount(first.renderer);
+  assert.ok(
+    storage.getItem('zeroclaw_chat_history_v1:A')?.includes('long task'),
+    'the mirror effect saved the prompt before the reload',
+  );
+
+  // Second page load: the gateway is still running the turn, so its transcript
+  // has not committed the prompt yet (ws.rs persists only when the turn ends).
+  const runtime2 = new FakeSessionRuntime();
+  runtime2.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  const second = await mountChat(runtime2, false);
+  await openSocket(runtime2, 0);
+  await settle();
+
+  assert.equal(second.context().hydrated, true);
+  assert.ok(
+    second.context().messages.some((m) => m.content === 'long task'),
+    'hydration must not drop a locally-sent prompt the server has not committed yet',
+  );
+  assert.ok(
+    storage.getItem('zeroclaw_chat_history_v1:A')?.includes('long task'),
+    'the browser copy must not be overwritten by the stale snapshot',
+  );
+  await unmount(second.renderer);
+});
+
+test('F5 after the detached turn committed shows the prompt once, with its answer', async () => {
+  const runtime1 = new FakeSessionRuntime();
+  runtime1.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  const first = await mountChat(runtime1, false);
+  await openSocket(runtime1, 0);
+  await settle();
+  await act(async () => { first.context().sendMessage('long task'); });
+  await settle();
+  await unmount(first.renderer);
+
+  const runtime2 = new FakeSessionRuntime();
+  runtime2.queueMessages('A', () => Promise.resolve({
+    session_id: 'A',
+    session_persistence: true,
+    messages: [
+      {
+        role: 'user',
+        content: '[CURRENT DATE & TIME: 2026-10-01 10:00:00 UTC]\n\nlong task',
+        created_at: null,
+      },
+      { role: 'assistant', content: 'finished', created_at: null },
+    ],
+  }));
+  const second = await mountChat(runtime2, false);
+  await openSocket(runtime2, 0);
+  await settle();
+
+  const contents = second.context().messages.map((m) => m.content);
+  assert.equal(
+    contents.filter((c) => c.endsWith('long task')).length,
+    1,
+    `the committed prompt must appear once: ${JSON.stringify(contents)}`,
+  );
+  // `Array.prototype.at` is ES2022; web/tsconfig.app.json:6 has lib ES2020.
+  assert.equal(contents[contents.length - 1], 'finished');
+  await unmount(second.renderer);
+});
+
+test('an uncommitted prompt does not follow the operator into another conversation', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  runtime.queueMessages('B', () => Promise.resolve(messagesResponse('B', true, ['from B'])));
+  // The turn in A is still running when the operator comes back: same snapshot.
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  const mounted = await mountChat(runtime, false);
+  await openSocket(runtime, 0);
+  await settle();
+  await act(async () => { mounted.context().sendMessage('long task'); });
+  await settle();
+  assert.ok(storage.getItem('zeroclaw_chat_history_v1:A')?.includes('long task'));
+
+  assert.equal(await goToSession(mounted, 'B'), true);
+  await openSocket(runtime, 1);
+  await settle();
+
+  assert.equal(mounted.context().sessionId, 'B');
+  assert.deepEqual(mounted.context().messages.map((m) => m.content), ['from B']);
+  assert.equal(
+    storage.getItem('zeroclaw_chat_history_v1:B')?.includes('long task') ?? false,
+    false,
+    'conversation B must not inherit the prompt of conversation A',
+  );
+
+  // Back in A the turn is still uncommitted, so its prompt is still ours.
+  assert.equal(await goToSession(mounted, 'A'), true);
+  await openSocket(runtime, 2);
+  await settle();
+  assert.equal(mounted.context().sessionId, 'A');
+  assert.ok(
+    mounted.context().messages.some((m) => m.content === 'long task'),
+    'returning to A must not drop its uncommitted prompt',
+  );
+  assert.ok(
+    storage.getItem('zeroclaw_chat_history_v1:A')?.includes('long task'),
+    'the browser copy of A must survive the round trip',
+  );
+  assert.equal(
+    mounted.context().messages.some((m) => m.content === 'from B'),
+    false,
+    'A must not inherit the transcript of B',
+  );
+  await unmount(mounted.renderer);
+});
+
+test('returning to a conversation whose turn committed meanwhile shows the prompt once', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  runtime.queueMessages('B', () => Promise.resolve(messagesResponse('B', true, ['from B'])));
+  runtime.queueMessages('A', () => Promise.resolve({
+    session_id: 'A',
+    session_persistence: true,
+    messages: [
+      {
+        role: 'user',
+        content: '[CURRENT DATE & TIME: 2026-10-01 10:00:00 UTC]\n\nlong task',
+        created_at: null,
+      },
+      { role: 'assistant', content: 'finished', created_at: null },
+    ],
+  }));
+  const mounted = await mountChat(runtime, false);
+  await openSocket(runtime, 0);
+  await settle();
+  await act(async () => { mounted.context().sendMessage('long task'); });
+  await settle();
+
+  assert.equal(await goToSession(mounted, 'B'), true);
+  await openSocket(runtime, 1);
+  await settle();
+  assert.equal(await goToSession(mounted, 'A'), true);
+  await openSocket(runtime, 2);
+  await settle();
+
+  const contents = mounted.context().messages.map((m) => m.content);
+  assert.equal(
+    contents.filter((c) => c.endsWith('long task')).length,
+    1,
+    `the committed prompt must appear once: ${JSON.stringify(contents)}`,
+  );
+  assert.equal(contents[contents.length - 1], 'finished');
+  await unmount(mounted.renderer);
+});
+
+test('reloading twice while the same detached turn is still running keeps the prompt each time', async () => {
+  const runtime1 = new FakeSessionRuntime();
+  runtime1.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  const first = await mountChat(runtime1, false);
+  await openSocket(runtime1, 0);
+  await settle();
+  await act(async () => { first.context().sendMessage('long task'); });
+  await settle();
+  await unmount(first.renderer);
+
+  // Two reloads in a row; the gateway has committed nothing in between.
+  for (const reload of [1, 2]) {
+    const runtime = new FakeSessionRuntime();
+    runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+    const mounted = await mountChat(runtime, false);
+    await openSocket(runtime, 0);
+    await settle();
+
+    const kept = mounted.context().messages.filter((m) => m.content === 'long task');
+    assert.equal(kept.length, 1, `reload ${reload}: the prompt must appear once`);
+    assert.equal(kept[0]!.local, true, `reload ${reload}: it must still count as locally composed`);
+    assert.ok(
+      storage.getItem('zeroclaw_chat_history_v1:A')?.includes('long task'),
+      `reload ${reload}: the browser copy must survive`,
+    );
+    await unmount(mounted.renderer);
+  }
+});
+
+test('a second prompt queued behind a running turn does not displace the first one on the next reload', async () => {
+  const runtime1 = new FakeSessionRuntime();
+  runtime1.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  const first = await mountChat(runtime1, false);
+  await openSocket(runtime1, 0);
+  await settle();
+  await act(async () => { first.context().sendMessage('first'); });
+  await settle();
+  await unmount(first.renderer);
+
+  // After the reload the composer is usable, so a follow-up can be sent while the
+  // first turn is still running; the gateway queues it behind that turn.
+  const runtime2 = new FakeSessionRuntime();
+  runtime2.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  const second = await mountChat(runtime2, false);
+  await openSocket(runtime2, 0);
+  await settle();
+  await act(async () => { second.context().sendMessage('second'); });
+  await settle();
+  await unmount(second.renderer);
+
+  // Neither prompt is committed yet when the page is reloaded again.
+  const runtime3 = new FakeSessionRuntime();
+  runtime3.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  const third = await mountChat(runtime3, false);
+  await openSocket(runtime3, 0);
+  await settle();
+
+  assert.deepEqual(third.context().messages.map((m) => m.content), ['first', 'second']);
+  assert.ok(
+    storage.getItem('zeroclaw_chat_history_v1:A')?.includes('first'),
+    'the browser copy must keep the first prompt too',
+  );
+  await unmount(third.renderer);
+});
+
+test('known limit: a conversation deleted elsewhere keeps its last exchange in this browser', async () => {
+  // The gateway answers 200 with no messages both for a turn it has not committed
+  // yet and for a session that no longer exists, so the client cannot tell them
+  // apart (`GET /state` can, but this path does not consult it). Only the last
+  // exchange comes back, never the whole cached chat. Pinned so it is not changed
+  // by accident.
+  const runtime1 = new FakeSessionRuntime();
+  runtime1.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  const first = await mountChat(runtime1, false);
+  await openSocket(runtime1, 0);
+  await settle();
+  await act(async () => { first.context().sendMessage('one'); });
+  await settle();
+  await act(async () => {
+    runtime1.sockets[0]!.emitMessage({ type: 'done', full_response: 'answer one' });
+  });
+  await settle();
+  await act(async () => { first.context().sendMessage('two'); });
+  await settle();
+  await act(async () => {
+    runtime1.sockets[0]!.emitMessage({ type: 'done', full_response: 'answer two' });
+  });
+  await settle();
+  assert.deepEqual(
+    first.context().messages.map((m) => m.content),
+    ['one', 'answer one', 'two', 'answer two'],
+  );
+  await unmount(first.renderer);
+
+  const runtime2 = new FakeSessionRuntime();
+  runtime2.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  const second = await mountChat(runtime2, false);
+  await openSocket(runtime2, 0);
+  await settle();
+  assert.deepEqual(second.context().messages.map((m) => m.content), ['two', 'answer two']);
+  await unmount(second.renderer);
+});
+
+test('at the conversation limit the chat says so, without a config error, and Retry reconnects', async () => {
+  const runtime = new FakeSessionRuntime();
+  const mounted = await mountChat(runtime, true);
+  await openSocket(runtime, 0);
+  await settle();
+  const socket = runtime.sockets[0]!;
+  await act(async () => {
+    socket.emitMessage({
+      type: 'error', code: 'CONVERSATION_LIMIT', message: 'All your conversations are busy',
+    } as WsMessage);
+    socket.emitClose(4409);
+  });
+  assert.equal(mounted.context().conversationLimited, true);
+  assert.equal(mounted.context().error, null);
+  assert.ok(mounted.context().messages.some((m) => m.content.includes('All your conversations are busy')));
+  const line = mounted.renderer.root.findAll((node) =>
+    node.type === 'div' && node.props['data-conversation-limit'] !== undefined);
+  assert.equal(line.length, 1);
+
+  const connectsBefore = socket.connectCalls;
+  const retry = line[0]!.findAllByType('button').find((b) => nodeText(b) === 'Retry');
+  assert.ok(retry);
+  await act(async () => { retry.props.onClick(); });
+  assert.equal(socket.connectCalls, connectsBefore + 1);
+  await openSocket(runtime, 0);
+  assert.equal(mounted.context().conversationLimited, false);
+  await unmount(mounted.renderer);
+});
+
+test('a conversation closed under the socket (4410) shows the frame, not a config error', async () => {
+  const runtime = new FakeSessionRuntime();
+  const mounted = await mountChat(runtime);
+  await openSocket(runtime, 0);
+  await settle();
+  await act(async () => {
+    runtime.sockets[0]!.emitMessage({
+      type: 'error', code: 'CONVERSATION_CLOSED', message: 'This conversation was closed',
+    } as WsMessage);
+    runtime.sockets[0]!.emitClose(4410);
+  });
+  assert.equal(mounted.context().error, null);
+  assert.equal(mounted.context().conversationLimited, false);
+  assert.ok(mounted.context().messages.some((m) => m.content.includes('This conversation was closed')));
+  await unmount(mounted.renderer);
+});
+
+function sessionStart(messageCount: number): WsMessage {
+  return {
+    type: 'session_start',
+    session_id: 'A',
+    resumed: messageCount > 0,
+    message_count: messageCount,
+  } as WsMessage;
+}
+
+const notFound = () => Promise.reject(new HttpError(404, '{"error":"Session not found"}'));
+
+async function startSocket(runtime: FakeSessionRuntime, messageCount: number): Promise<void> {
+  await openSocket(runtime, 0);
+  await act(async () => { runtime.sockets[0]!.emitMessage(sessionStart(messageCount)); });
+  await settle();
+}
+
+async function assertConversationControls(mounted: MountedChat, runtime: FakeSessionRuntime): Promise<void> {
+  assert.equal(mounted.context().sessionPersistence, true);
+  await act(async () => { await mounted.context().renameConversation('A', 'Renamed'); });
+  assert.deepEqual(runtime.renameCalls, [{ id: 'A', name: 'Renamed' }]);
+  runtime.mintedIds = ['C'];
+  let started = false;
+  await act(async () => { started = mounted.context().startNewSession(); });
+  assert.equal(started, true);
+  assert.equal(mounted.context().sessionId, 'C');
+}
+
+test('a transcript that failed to load loads again when the socket opens its conversation', async () => {
+  {
+    const runtime = new FakeSessionRuntime();
+    runtime.queueMessages('A', notFound);
+    const mounted = await mountChat(runtime);
+    await settle();
+    assert.equal(mounted.context().sessionPersistence, null);
+
+    await startSocket(runtime, 0);
+    assert.deepEqual(runtime.messageCalls, ['A', 'A']);
+    await assertConversationControls(mounted, runtime);
+    await unmount(mounted.renderer);
+  }
+});
+
+test('a transcript request that failed while the socket opened its conversation is retried', async () => {
+  {
+    const runtime = new FakeSessionRuntime();
+    const first = new Deferred<SessionMessagesResponse>();
+    runtime.queueMessages('A', () => first.promise);
+    const mounted = await mountChat(runtime);
+    await startSocket(runtime, 0);
+    // The request was sent before the conversation existed, and answers after.
+    await act(async () => { first.reject(new HttpError(404, '{"error":"Session not found"}')); });
+    await settle();
+    assert.deepEqual(runtime.messageCalls, ['A', 'A']);
+    await assertConversationControls(mounted, runtime);
+    await unmount(mounted.renderer);
+  }
+});
+
+const earlier = ['an earlier question', 'an earlier answer'];
+
+async function mountWithHistory(runtime: FakeSessionRuntime): Promise<MountedChat> {
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true, earlier)));
+  const mounted = await mountChat(runtime);
+  await startSocket(runtime, earlier.length);
+  assert.ok(mounted.context().messages.some((m) => m.content === 'an earlier answer'));
+  return mounted;
+}
+
+function assertStartedOver(mounted: MountedChat): void {
+  const messages = mounted.context().messages;
+  assert.equal(messages.some((m) => earlier.includes(m.content)), false);
+  const notices = messages.filter((m) => m.notice);
+  assert.equal(notices.length, 1);
+  assert.ok(notices[0]!.content.includes('started over'));
+  assert.equal(notices[0]!.ephemeral, true);
+  assert.equal(mounted.context().error, null);
+}
+
+test('an idle reload that ended the conversation drops the old transcript on reconnect', async () => {
+  {
+    const runtime = new FakeSessionRuntime();
+    const mounted = await mountWithHistory(runtime);
+    await act(async () => { runtime.sockets[0]!.emitClose(1001); });
+    await startSocket(runtime, 0);
+    assertStartedOver(mounted);
+    await unmount(mounted.renderer);
+  }
+});
+
+test('a reload in the middle of a turn that ended the conversation keeps only the notice', async () => {
+  {
+    const runtime = new FakeSessionRuntime();
+    const mounted = await mountWithHistory(runtime);
+    await act(async () => { mounted.context().sendMessage('one more'); });
+    const reload = new Deferred<SessionMessagesResponse>();
+    runtime.queueMessages('A', () => reload.promise);
+    await act(async () => { runtime.sockets[0]!.emitClose(1001); });
+    // The reopen reloads the transcript; the conversation is new before that answers.
+    await startSocket(runtime, 0);
+    assertStartedOver(mounted);
+    await act(async () => { reload.resolve(messagesResponse('A', true)); });
+    await settle();
+    assertStartedOver(mounted);
+    assert.equal(mounted.context().messages.some((m) => m.content === 'one more'), false);
+    assert.equal(mounted.context().sessionPersistence, true);
+    await unmount(mounted.renderer);
+  }
+});
+
+test('a reconnect that resumes the conversation keeps its transcript and loads nothing again', async () => {
+  {
+    const runtime = new FakeSessionRuntime();
+    const mounted = await mountWithHistory(runtime);
+    await act(async () => { runtime.sockets[0]!.emitClose(1001); });
+    await startSocket(runtime, earlier.length);
+    assert.deepEqual(mounted.context().messages.map((m) => m.content), earlier);
+    assert.deepEqual(runtime.messageCalls, ['A']);
+    await unmount(mounted.renderer);
+  }
+});
+
+test('a gateway that stores no conversations keeps the local transcript on reconnect', async () => {
+  seedLocalTranscript('A');
+  const runtime = new FakeSessionRuntime();
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', false)));
+  const mounted = await mountChat(runtime);
+  await startSocket(runtime, 0);
+  await act(async () => { runtime.sockets[0]!.emitClose(1006); });
+  await startSocket(runtime, 0);
+  assert.ok(mounted.context().messages.some((m) => m.content === 'an earlier answer'));
+  assert.equal(mounted.context().messages.some((m) => m.notice), false);
+  assert.deepEqual(runtime.messageCalls, ['A']);
+  await unmount(mounted.renderer);
+});
+
+// ---------------------------------------------------------------------------
+// One conversation per chat socket (a signed-in account chatting through the
+// core): no socket until a message, no history, nothing to resume.
+// ---------------------------------------------------------------------------
+
+const coreAdminSession = {
+  ...scopedSession,
+  admin: true,
+  features: { chat: true, operator_pages: true, core_sessions: true },
+};
+
+async function withSession<T>(session: typeof scopedSession, run: () => Promise<T>): Promise<T> {
+  setOidcSession(session);
+  try {
+    return await run();
+  } finally {
+    setOidcSession(null);
+  }
+}
+
+function conversationStart(id: string): WsMessage {
+  return { type: 'session_start', session_id: id, resumed: false, message_count: 0 } as WsMessage;
+}
+
+/** Send the first message, open its socket and let the conversation start. */
+async function startConversation(
+  mounted: MountedChat,
+  runtime: FakeSessionRuntime,
+  content: string,
+  conversationId: string,
+): Promise<FakeSocket> {
+  const before = runtime.sockets.length;
+  await act(async () => { mounted.context().sendMessage(content); });
+  assert.equal(runtime.sockets.length, before + 1);
+  const socket = runtime.sockets[before]!;
+  await act(async () => { socket.emitOpen(); });
+  await act(async () => { socket.emitMessage(conversationStart(conversationId)); });
+  return socket;
+}
+
+async function answer(socket: FakeSocket, text: string): Promise<void> {
+  await act(async () => {
+    socket.emitMessage({ type: 'done', full_response: text } as WsMessage);
+  });
+}
+
+const endedNotice = (mounted: MountedChat) =>
+  mounted.context().messages.filter((m) => m.notice && m.content.includes('This conversation has ended'));
+
+test('a lost turn result leaves the scoped conversation available', async () => {
+  await withSession(scopedSession, async () => {
+    const runtime = new FakeSessionRuntime();
+    const mounted = await mountChat(runtime, true);
+    const socket = await startConversation(mounted, runtime, 'hello', 'chat-1');
+    await act(async () => {
+      socket.emitMessage({ type: 'error', code: 'TURN_RESULT_LOST', message: 'upstream text' } as WsMessage);
+    });
+    assert.ok(mounted.context().messages.some((msg) =>
+      msg.content.includes('You can continue this conversation.')));
+    await act(async () => { mounted.context().sendMessage('follow up'); });
+    assert.equal(runtime.sockets.length, 1);
+    assert.deepEqual(runtime.messageCalls, []);
+    await unmount(mounted.renderer);
+  });
+});
+
+for (const [label, session] of [['a scoped account', scopedSession], ['an administrator on the core path', coreAdminSession]] as const) {
+  test(`${label}: no socket, history or conversation list until the first message`, async () => {
+    await withSession(session, async () => {
+      const runtime = new FakeSessionRuntime();
+      const mounted = await mountChat(runtime, true);
+      await settle();
+      assert.equal(runtime.sockets.length, 0);
+      assert.deepEqual(runtime.messageCalls, []);
+      assert.equal(requestedUrls.some((u) => u.includes('/api/sessions')), false);
+      assert.equal(
+        mounted.renderer.root.findAllByType('button').some((b) => b.props.title === 'Conversations'),
+        false,
+      );
+      // The composer is usable: the first message starts the conversation.
+      assert.equal(mounted.context().startsConversationOnSend, true);
+      assert.equal(textarea(mounted.renderer).props.disabled, false);
+      // Said up front: the conversation ends with the page.
+      const note = mounted.renderer.root.findAll((node) =>
+        node.type === 'p' && node.props['data-conversation-scope-note'] !== undefined);
+      assert.equal(note.length, 1);
+      assert.ok(nodeText(note[0]!).includes('This conversation ends when you leave or reload this page, or sign out.'));
+      await unmount(mounted.renderer);
+    });
+  });
+}
+
+test('the first message opens one socket, which never reconnects, and goes out once the conversation exists', async () => {
+  await withSession(scopedSession, async () => {
+    const runtime = new FakeSessionRuntime();
+    const mounted = await mountChat(runtime);
+    await act(async () => { mounted.context().sendMessage('hello'); });
+    // Shown at once; nothing sent before the gateway says the conversation exists.
+    assert.ok(mounted.context().messages.some((m) => m.content === 'hello' && m.local));
+    assert.equal(runtime.sockets.length, 1);
+    const socket = runtime.sockets[0]!;
+    assert.equal(socket.autoReconnect, false);
+    assert.equal(mounted.context().startsConversationOnSend, false);
+    await act(async () => { socket.emitOpen(); });
+    assert.deepEqual(socket.sent, []);
+    await act(async () => { socket.emitMessage(conversationStart('core-1')); });
+    assert.deepEqual(socket.sent, ['hello']);
+    assert.equal(mounted.context().typing, true);
+
+    // Stop aborts the conversation by the gateway's id, not the page's.
+    await act(async () => { await mounted.context().abortSession(); });
+    assert.ok(requestedUrls.includes('POST /api/sessions/core-1/abort'));
+    assert.deepEqual(runtime.messageCalls, []);
+    await unmount(mounted.renderer);
+  });
+});
+
+for (const [label, session] of [['a scoped account', scopedSession], ['an administrator on the core path', coreAdminSession]] as const) {
+  test(`${label}: transport open cannot send ahead of the pending first message`, async () => {
+    await withSession(session, async () => {
+      const runtime = new FakeSessionRuntime();
+      const mounted = await mountChat(runtime, true);
+      const sendButton = () => {
+        const button = mounted.renderer.root.findAllByType('button')
+          .find((item) => item.props['aria-label'] === 'Send');
+        assert.ok(button);
+        return button;
+      };
+      await typeInComposer(mounted.renderer, 'first');
+      await act(async () => { sendButton().props.onClick(); });
+      const socket = runtime.sockets[0]!;
+      // The transport is open, but the initial application frame is delayed.
+      await act(async () => { socket.emitOpen(); });
+      // Even a draft update and submit handler invoked while disabled must
+      // preserve the unsent text instead of sending it ahead or clearing it.
+      await typeInComposer(mounted.renderer, 'second draft');
+      const disabled = textarea(mounted.renderer).props.disabled;
+      const sendDisabled = sendButton().props.disabled;
+      await act(async () => { sendButton().props.onClick(); });
+      assert.deepEqual({
+        disabled,
+        sendDisabled,
+        sent: socket.sent,
+        input: textarea(mounted.renderer).props.value,
+        draft: mounted.drafts.get('agent-chat.ops.A'),
+      }, {
+        disabled: true,
+        sendDisabled: true,
+        sent: [],
+        input: 'second draft',
+        draft: 'second draft',
+      });
+      // Context callers cannot bypass the same pending-message boundary.
+      await act(async () => { mounted.context().sendMessage('overtake'); });
+      assert.deepEqual(socket.sent, []);
+      assert.equal(mounted.context().messages.some((m) => m.content === 'overtake'), false);
+
+      await act(async () => { socket.emitMessage(conversationStart('core-1')); });
+      assert.deepEqual(socket.sent, ['first']);
+      assert.equal(mounted.context().typing, true);
+      assert.equal(textarea(mounted.renderer).props.value, 'second draft');
+      await answer(socket, 'first answer');
+      assert.equal(sendButton().props.disabled, false);
+      await act(async () => { sendButton().props.onClick(); });
+      assert.deepEqual(socket.sent, ['first', 'second draft']);
+      assert.deepEqual(mounted.context().messages.filter((m) => m.local).map((m) => m.content), ['first', 'second draft']);
+      await unmount(mounted.renderer);
+    });
+  });
+}
+
+test('a legacy socket still accepts a hydrated composer message on transport open', async () => {
+  const runtime = new FakeSessionRuntime();
+  const mounted = await mountChat(runtime, true);
+  await openSocket(runtime, 0);
+  assert.equal(textarea(mounted.renderer).props.disabled, false);
+  await typeInComposer(mounted.renderer, 'legacy first');
+  const send = mounted.renderer.root.findAllByType('button')
+    .find((button) => button.props['aria-label'] === 'Send');
+  assert.ok(send);
+  await act(async () => { send.props.onClick(); });
+  assert.deepEqual(runtime.sockets[0]!.sent, ['legacy first']);
+  await unmount(mounted.renderer);
+});
+
+for (const code of [1001, 4410, 4401, 4403, 1006]) {
+  test(`a close (${code}) ends the conversation: the transcript stays with a notice, and nothing reconnects`, async () => {
+    await withSession(scopedSession, async () => {
+      const runtime = new FakeSessionRuntime();
+      const mounted = await mountChat(runtime, true);
+      const socket = await startConversation(mounted, runtime, 'hello', 'core-1');
+      await answer(socket, 'hi there');
+      if (code === 4410) {
+        await act(async () => {
+          socket.emitMessage({
+            type: 'error', code: 'CONVERSATION_CLOSED', message: 'This conversation was closed',
+          } as WsMessage);
+        });
+      }
+      await act(async () => { socket.emitClose(code); });
+      await settle();
+
+      const contents = mounted.context().messages.map((m) => m.content);
+      assert.ok(contents.includes('hello'));
+      assert.ok(contents.includes('hi there'));
+      assert.equal(endedNotice(mounted).length, 1);
+      const lastMessage = mounted.context().messages[mounted.context().messages.length - 1];
+      assert.equal(lastMessage?.content.includes('This conversation has ended'), true);
+      assert.equal(mounted.context().error, null);
+      assert.equal(mounted.context().startsConversationOnSend, true);
+      assert.equal(runtime.sockets.length, 1);
+      assert.equal(socket.connectCalls, 1);
+      assert.equal(textarea(mounted.renderer).props.disabled, false);
+      await unmount(mounted.renderer);
+    });
+  });
+}
+
+test('after a conversation ends, the next message starts a new one on a new socket', async () => {
+  await withSession(scopedSession, async () => {
+    const runtime = new FakeSessionRuntime();
+    const mounted = await mountChat(runtime);
+    const first = await startConversation(mounted, runtime, 'hello', 'core-1');
+    await answer(first, 'hi there');
+    await act(async () => { first.emitClose(1001); });
+
+    const second = await startConversation(mounted, runtime, 'again', 'core-2');
+    assert.deepEqual(second.sent, ['again']);
+    assert.deepEqual(first.sent, ['hello']);
+    // The ended conversation stays above, marked, with the new one after it.
+    const contents = mounted.context().messages.map((m) => m.content);
+    const notice = contents.findIndex((c) => c.includes('This conversation has ended'));
+    assert.ok(notice > contents.indexOf('hi there'));
+    assert.ok(contents.indexOf('again') > notice);
+    await act(async () => { await mounted.context().abortSession(); });
+    assert.ok(requestedUrls.includes('POST /api/sessions/core-2/abort'));
+    await unmount(mounted.renderer);
+  });
+});
+
+test('a conversation refused at the limit keeps its message, and Retry sends it', async () => {
+  await withSession(scopedSession, async () => {
+    const runtime = new FakeSessionRuntime();
+    const mounted = await mountChat(runtime, true);
+    await act(async () => { mounted.context().sendMessage('hello'); });
+    const socket = runtime.sockets[0]!;
+    await act(async () => {
+      socket.emitOpen();
+      socket.emitMessage({
+        type: 'error',
+        code: 'CONVERSATION_LIMIT',
+        message: 'This sign-in already has 4 conversations open; close one to start another',
+      } as WsMessage);
+      socket.emitClose(4409);
+    });
+    assert.equal(mounted.context().conversationLimited, true);
+    assert.deepEqual(socket.sent, []);
+    assert.equal(endedNotice(mounted).length, 0);
+    // The limit line says it once; no chat bubble repeats it.
+    assert.equal(mounted.context().messages.some((m) => m.content.startsWith('[Error]')), false);
+    const line = mounted.renderer.root.findAll((node) =>
+      node.type === 'div' && node.props['data-conversation-limit'] !== undefined);
+    assert.equal(line.length, 1);
+    assert.ok(nodeText(line[0]!).includes('All your conversations are open in other tabs or panes.'));
+
+    const retry = line[0]!.findAllByType('button').find((b) => nodeText(b) === 'Retry');
+    assert.ok(retry);
+    await act(async () => { retry.props.onClick(); });
+    assert.equal(socket.connectCalls, 2);
+    await act(async () => { socket.emitOpen(); });
+    assert.equal(textarea(mounted.renderer).props.disabled, true);
+    await act(async () => { mounted.context().sendMessage('overtake retry'); });
+    assert.deepEqual(socket.sent, []);
+    await act(async () => { socket.emitMessage(conversationStart('core-1')); });
+    assert.deepEqual(socket.sent, ['hello']);
+    assert.equal(mounted.context().conversationLimited, false);
+    await unmount(mounted.renderer);
+  });
+});
+
+for (const code of [1006, 1001, 4410]) {
+  test(`a close (${code}) before the conversation starts gives the message back to the composer`, async () => {
+    await withSession(scopedSession, async () => {
+      const runtime = new FakeSessionRuntime();
+      const mounted = await mountChat(runtime, true);
+      await typeInComposer(mounted.renderer, 'hello');
+      const send = mounted.renderer.root.findAllByType('button')
+        .find((button) => button.props['aria-label'] === 'Send');
+      assert.ok(send);
+      await act(async () => { send.props.onClick(); });
+      assert.equal(textarea(mounted.renderer).props.value, '');
+      const socket = runtime.sockets[0]!;
+      await act(async () => { socket.emitOpen(); });
+      await act(async () => { socket.emitClose(code); });
+      await settle();
+
+      // Never sent, so not shown as sent: it is back in the composer.
+      assert.deepEqual(socket.sent, []);
+      assert.equal(mounted.context().messages.some((m) => m.content === 'hello'), false);
+      assert.equal(endedNotice(mounted).length, 0);
+      assert.equal(textarea(mounted.renderer).props.value, 'hello');
+      assert.equal(mounted.context().error, 'Failed to send message. Please try again.');
+      assert.equal(mounted.context().startsConversationOnSend, true);
+      assert.equal(socket.connectCalls, 1);
+
+      // Sending it again starts a conversation on a new socket.
+      const again = mounted.renderer.root.findAllByType('button')
+        .find((button) => button.props['aria-label'] === 'Send');
+      assert.ok(again);
+      await act(async () => { again.props.onClick(); });
+      assert.equal(runtime.sockets.length, 2);
+      const second = runtime.sockets[1]!;
+      await act(async () => { second.emitOpen(); });
+      await act(async () => { second.emitMessage(conversationStart('core-1')); });
+      assert.deepEqual(second.sent, ['hello']);
+      assert.equal(mounted.context().error, null);
+      await unmount(mounted.renderer);
+    });
+  });
+}
+
+test('a socket already closing when its conversation start is handled gives the message back', async () => {
+  await withSession(scopedSession, async () => {
+    const runtime = new FakeSessionRuntime();
+    const mounted = await mountChat(runtime, true);
+    await typeInComposer(mounted.renderer, 'hello');
+    const send = mounted.renderer.root.findAllByType('button')
+      .find((button) => button.props['aria-label'] === 'Send');
+    assert.ok(send);
+    await act(async () => { send.props.onClick(); });
+    const socket = runtime.sockets[0]!;
+    await act(async () => { socket.emitOpen(); });
+    // The gateway's close is already in behind the queued start, so the
+    // start's send throws, and the close is delivered after it.
+    await act(async () => {
+      socket.beginClosing();
+      socket.emitMessage(conversationStart('core-1'));
+    });
+    assert.deepEqual(socket.sent, []);
+    assert.equal(mounted.context().typing, false);
+    await act(async () => { socket.emitClose(1006); });
+    await settle();
+
+    // Never sent, so not shown as sent: it is back in the composer.
+    assert.equal(mounted.context().messages.some((m) => m.content === 'hello'), false);
+    assert.equal(endedNotice(mounted).length, 0);
+    assert.equal(textarea(mounted.renderer).props.value, 'hello');
+    assert.equal(mounted.context().error, 'Failed to send message. Please try again.');
+    assert.equal(mounted.context().startsConversationOnSend, true);
+    await unmount(mounted.renderer);
+  });
+});
+
+test('a new conversation closes this one, clears the page, and deletes nothing', async () => {
+  await withSession(scopedSession, async () => {
+    const runtime = new FakeSessionRuntime();
+    const mounted = await mountChat(runtime);
+    const socket = await startConversation(mounted, runtime, 'hello', 'core-1');
+    await answer(socket, 'hi there');
+    let started = false;
+    await act(async () => { started = mounted.context().startNewSession(); });
+    await settle();
+    assert.equal(started, true);
+    assert.deepEqual(mounted.context().messages, []);
+    assert.equal(socket.disconnectCalls > 0, true);
+    assert.equal(runtime.sockets.length, 1);
+    assert.equal(mounted.context().startsConversationOnSend, true);
+    assert.deepEqual(runtime.deleteCalls, []);
+    assert.equal(requestedUrls.some((u) => u.startsWith('DELETE')), false);
+    // The next message starts the next conversation.
+    await startConversation(mounted, runtime, 'fresh', 'core-2');
+    assert.equal(runtime.sockets.length, 2);
+    await unmount(mounted.renderer);
+  });
+});
+
+test('a scoped chat never shows or keeps a local transcript copy', async () => {
+  seedLocalTranscript('A');
+  await withSession(scopedSession, async () => {
+    const runtime = new FakeSessionRuntime();
+    const mounted = await mountChat(runtime);
+    await settle();
+    assert.equal(mounted.context().messages.some((m) => m.content === 'an earlier answer'), false);
+    storage.clear();
+    const socket = await startConversation(mounted, runtime, 'hello', 'core-1');
+    await answer(socket, 'hi there');
+    await settle();
+    assert.ok(mounted.context().messages.some((m) => m.content === 'hi there'));
+    assert.deepEqual(loadChatHistory('A'), []);
+    await unmount(mounted.renderer);
+  });
+});
+
+// The live Thinking box's `open` prop: controlled by the stream by default,
+// handed to the reader (`undefined`) when "Keep thinking collapsed" is on.
+const thinkingBoxCases = [
+  { keepCollapsed: false, label: 'follows the stream', whileThinking: true, afterChunk: false },
+  { keepCollapsed: true, label: 'is left to the reader', whileThinking: undefined, afterChunk: undefined },
+];
+for (const { keepCollapsed, label, whileThinking, afterChunk } of thinkingBoxCases) {
+  test(`live Thinking box ${label} (keep collapsed ${keepCollapsed ? 'on' : 'off'})`, async () => {
+    const runtime = new FakeSessionRuntime();
+    runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true, ['earlier'])));
+    const mounted = await mountChat(runtime, true);
+    await openSocket(runtime, 0);
+    await settle();
+
+    const toggle = () => mounted.renderer.root.findAllByType('button')
+      .find((button) => nodeText(button).includes('Keep thinking collapsed'));
+    assert.equal(toggle()?.props['aria-pressed'], false);
+    if (keepCollapsed) {
+      await act(async () => { toggle()!.props.onClick(); });
+      assert.equal(toggle()?.props['aria-pressed'], true);
+      assert.equal(storage.getItem('zeroclaw_keep_thinking_collapsed'), '1');
+    }
+
+    const liveOpen = () => {
+      const boxes = mounted.renderer.root.findAllByType('details');
+      assert.equal(boxes.length, 1);
+      return boxes[0]!.props.open;
+    };
+    await act(async () => {
+      runtime.sockets[0]!.emitMessage({ type: 'thinking', content: 'weighing it up' });
+    });
+    assert.equal(liveOpen(), whileThinking);
+    await act(async () => {
+      runtime.sockets[0]!.emitMessage({ type: 'chunk', content: 'The answer' });
+    });
+    assert.equal(liveOpen(), afterChunk);
+    await unmount(mounted.renderer);
+  });
+}

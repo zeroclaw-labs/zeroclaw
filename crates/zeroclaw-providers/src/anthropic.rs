@@ -89,6 +89,7 @@ pub struct AnthropicModelProvider {
     alias: String,
     credential: Option<String>,
     base_url: String,
+    single_tool_rounds_supported: bool,
     max_tokens: u32,
     timeout_secs: u64,
     /// Opt-in Anthropic server-side fallback targets, sent as the native
@@ -630,6 +631,7 @@ pub struct AnthropicBuilder {
     alias: String,
     credential: Option<String>,
     base_url: Option<String>,
+    single_tool_rounds_supported: bool,
     max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
     server_fallback_models: Vec<String>,
@@ -637,6 +639,11 @@ pub struct AnthropicBuilder {
 }
 
 impl AnthropicBuilder {
+    pub(crate) fn single_tool_rounds_supported(mut self, supported: bool) -> Self {
+        self.single_tool_rounds_supported = supported;
+        self
+    }
+
     /// Explicit API credential. Whitespace-only inputs are normalized
     /// to `None` so a stray `Some("   ")` from config cannot produce a
     /// bogus `Bearer    ` header.
@@ -689,6 +696,7 @@ impl AnthropicBuilder {
             alias: self.alias,
             credential: self.credential,
             base_url: self.base_url.unwrap_or_else(|| BASE_URL.to_string()),
+            single_tool_rounds_supported: self.single_tool_rounds_supported,
             max_tokens: self
                 .max_tokens
                 .unwrap_or(zeroclaw_api::model_provider::BASELINE_MAX_TOKENS),
@@ -710,6 +718,7 @@ impl AnthropicModelProvider {
             alias: alias.to_string(),
             credential: None,
             base_url: None,
+            single_tool_rounds_supported: false,
             max_tokens: None,
             timeout_secs: None,
             server_fallback_models: Vec::new(),
@@ -2828,6 +2837,10 @@ impl AnthropicModelProvider {
 
 #[async_trait]
 impl ModelProvider for AnthropicModelProvider {
+    fn supports_single_tool_rounds(&self, _model: &str) -> bool {
+        self.single_tool_rounds_supported
+    }
+
     fn supports_exact_request_replay(
         &self,
         request: crate::traits::ChatRequest<'_>,
@@ -2943,6 +2956,22 @@ impl ModelProvider for AnthropicModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
+        self.chat_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+        .await
+    }
+
+    async fn chat_with_tool_round_policy(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> anyhow::Result<ProviderChatResponse> {
         commit_safeguard_fallback(None);
         if let Some(refusal) = crate::reliable::take_stream_refusal_recovery() {
             crate::dispatch::accounting::suppress_current_attempt();
@@ -2977,7 +3006,15 @@ impl ModelProvider for AnthropicModelProvider {
             .flatten();
         let native_tools = self.convert_tools(request.tools);
         let tools_count = native_tools.as_ref().map_or(0, Vec::len);
-        let tool_choice = if native_tools.is_some() {
+        let tool_choice = if tools_count > 0
+            && policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single
+            && self.supports_single_tool_rounds(model)
+        {
+            Some(serde_json::json!({
+                "type": tool_choice_override.as_deref().unwrap_or("auto"),
+                "disable_parallel_tool_use": true,
+            }))
+        } else if native_tools.is_some() {
             tool_choice_override.map(|tc| serde_json::json!({ "type": tc }))
         } else {
             None
@@ -3170,6 +3207,23 @@ impl ModelProvider for AnthropicModelProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        self.stream_chat_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            options,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+    }
+
+    fn stream_chat_with_tool_round_policy(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         commit_safeguard_fallback(None);
         if !options.enabled {
             return stream::once(async { Ok(StreamEvent::Final) }).boxed();
@@ -3200,7 +3254,15 @@ impl ModelProvider for AnthropicModelProvider {
             .flatten();
         let native_tools = self.convert_tools(request.tools);
         let tools_count = native_tools.as_ref().map_or(0, Vec::len);
-        let tool_choice = if native_tools.is_some() {
+        let tool_choice = if tools_count > 0
+            && policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single
+            && self.supports_single_tool_rounds(model)
+        {
+            Some(serde_json::json!({
+                "type": tool_choice_override.as_deref().unwrap_or("auto"),
+                "disable_parallel_tool_use": true,
+            }))
+        } else if native_tools.is_some() {
             tool_choice_override.map(|tc| serde_json::json!({ "type": tc }))
         } else {
             None

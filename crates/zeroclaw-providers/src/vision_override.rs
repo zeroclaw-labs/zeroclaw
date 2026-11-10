@@ -53,6 +53,10 @@ impl ModelProvider for VisionOverrideProvider {
             .unwrap_or_else(|| self.inner.has_stable_request_identity(model))
     }
 
+    fn supports_single_tool_rounds(&self, model: &str) -> bool {
+        self.inner.supports_single_tool_rounds(model)
+    }
+
     fn capabilities(&self) -> super::traits::ProviderCapabilities {
         // Patch the canonical `vision` capability; the default
         // `supports_vision()` reads this, and so does anything that inspects
@@ -190,9 +194,25 @@ impl ModelProvider for VisionOverrideProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
+        self.chat_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+        .await
+    }
+
+    async fn chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> anyhow::Result<ChatResponse> {
         mark_current_dispatch_composite();
         ProviderDispatch::from_ref(&*self.inner)
-            .chat(request, model, temperature)
+            .chat_with_tool_round_policy(request, model, temperature, policy)
             .await
     }
 
@@ -252,12 +272,32 @@ impl ModelProvider for VisionOverrideProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamEvent>> {
-        stream_as_dispatch_composite(ProviderDispatch::from_ref(&*self.inner).stream_chat(
+        self.stream_chat_with_tool_round_policy(
             request,
             model,
             temperature,
             options,
-        ))
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+    }
+
+    fn stream_chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+        stream_as_dispatch_composite(
+            ProviderDispatch::from_ref(&*self.inner).stream_chat_with_tool_round_policy(
+                request,
+                model,
+                temperature,
+                options,
+                policy,
+            ),
+        )
     }
 }
 

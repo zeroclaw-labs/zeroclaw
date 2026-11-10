@@ -220,6 +220,7 @@ mod tests {
             run_id: "run".into(),
             sop_name: "test".into(),
             initiating_agent: None,
+            memory_owner: None,
             trigger_event: SopEvent {
                 source: SopTriggerSource::Manual,
                 topic: None,

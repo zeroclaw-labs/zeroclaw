@@ -27,6 +27,13 @@ skip_paths=(
     "scripts/ci/comment_hygiene_gate.test.sh"
     ".cargo/audit.toml"
     "deny.toml"
+    # Preserve comments copied unchanged from the released dependency. The
+    # locally patched Unix event source remains subject to this gate.
+    "vendor/crossterm-0.29.0/src/event/sys/unix/parse.rs"
+    "vendor/crossterm-0.29.0/src/terminal.rs"
+    "vendor/crossterm-0.29.0/src/clipboard.rs"
+    "vendor/crossterm-0.29.0/src/style/types/attribute.rs"
+    "vendor/crossterm-0.29.0/src/command.rs"
 )
 
 globs=(--hidden -g '*.rs' -g '*.toml' -g '*.sh' -g '*.py' -g '*.nix'
