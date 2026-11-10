@@ -1042,8 +1042,17 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
     const latestConfigDraft = useRef(configDraft);
     latestConfigDraft.current = configDraft;
     const loadGeneration = useRef(0);
+    // Monotonic clock so a list request that started before a successful
+    // enable-toggle can still apply, while the just-saved pill is preserved.
+    const loadClock = useRef(0);
+    const enabledOverride = useRef<{
+      path: string;
+      value: string;
+      savedAt: number;
+    } | null>(null);
 
     const reload = async (opts?: { background?: boolean }) => {
+      const startedAt = ++loadClock.current;
       const generation = ++loadGeneration.current;
       // Initial mount / prefix changes replace the form with a spinner.
       // Discard all must keep mounted FieldRows in place so focus and
@@ -1056,10 +1065,21 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
         const resp = await listProps(prefix);
         if (generation !== loadGeneration.current) return;
         const store = latestConfigDraft.current;
-        setEntries(resp.entries);
+        const override = enabledOverride.current;
+        let nextEntries = resp.entries;
+        if (override && startedAt < override.savedAt) {
+          nextEntries = nextEntries.map((e) =>
+            e.path === override.path
+              ? { ...e, populated: true, value: override.value }
+              : e,
+          );
+        } else if (override && startedAt >= override.savedAt) {
+          enabledOverride.current = null;
+        }
+        setEntries(nextEntries);
         const seed: Record<string, string> = {};
         const commentSeed: Record<string, string> = {};
-        for (const e of resp.entries) {
+        for (const e of nextEntries) {
           const staged = store.drafts[e.path];
           seed[e.path] = staged?.input ?? defaultInputValue(e);
           const stagedComment = store.comments[e.path];
@@ -1544,11 +1564,17 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
                 enabled={entryValue(enabledEntry) === "true"}
                 onChange={(next) => {
                   const nextStr = next ? "true" : "false";
-                  // Discard all may still have a background list request in
-                  // flight. Bump the load generation so that stale GET cannot
-                  // replace the just-persisted toggle (or a later click would
-                  // send the old value again).
-                  loadGeneration.current += 1;
+                  // Do not bump loadGeneration or start a new list request:
+                  // an in-flight Discard all (or section Save) GET must still
+                  // finish so other fields update and loading can clear. A
+                  // GET that started before this save would otherwise restore
+                  // the old pill; remember the saved value and re-apply it
+                  // when that response arrives.
+                  enabledOverride.current = {
+                    path: enabledEntry.path,
+                    value: nextStr,
+                    savedAt: ++loadClock.current,
+                  };
                   setEntries((prev) =>
                     prev.map((e) =>
                       e.path === enabledEntry.path

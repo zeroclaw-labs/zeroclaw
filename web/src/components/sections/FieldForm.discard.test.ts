@@ -46,6 +46,8 @@ async function withForm(
     pendingListResponses: () => number;
     failNextListResponses: (count?: number) => void;
     setFormMounted: (mounted: boolean) => Promise<void>;
+    holdEnabledPatch: () => void;
+    finishEnabledPatch: () => Promise<void>;
   }) => Promise<void>,
 ) {
   const domWindow = new Window();
@@ -94,6 +96,8 @@ async function withForm(
   let snapshotHeldList = false;
   let heldList: Array<() => void> = [];
   let listFailuresRemaining = 0;
+  let holdEnabled = false;
+  let finishEnabled: (() => void) | undefined;
   const listPayload = (source: Record<string, string>) => ({
     entries: Object.entries(source).map(([path, value]) => ({
       path,
@@ -132,6 +136,11 @@ async function withForm(
     assert.equal(init?.method, "PATCH");
     const ops = JSON.parse(String(init.body)) as PatchOp[];
     patches.push(ops);
+    if (holdEnabled && ops.some((op) => op.path === "browser.enabled")) {
+      await new Promise<void>((resolve) => {
+        finishEnabled = resolve;
+      });
+    }
     for (const op of ops) values[op.path] = String(op.value);
     return Response.json({ saved: true, results: ops, warnings: [] });
   };
@@ -186,6 +195,19 @@ async function withForm(
     const pendingListResponses = () => heldList.length;
     const failNextListResponses = (count = 1) => {
       listFailuresRemaining = count;
+    };
+    const holdEnabledPatch = () => {
+      holdEnabled = true;
+    };
+    const finishEnabledPatch = async () => {
+      assert.ok(finishEnabled, "expected a held enable-toggle PATCH");
+      holdEnabled = false;
+      const resolve = finishEnabled;
+      finishEnabled = undefined;
+      await act(async () => {
+        resolve?.();
+        await flushEffects();
+      });
     };
     const releaseListResponses = async (
       order: "oldest-first" | "newest-first",
@@ -242,6 +264,8 @@ async function withForm(
       pendingListResponses,
       failNextListResponses,
       setFormMounted,
+      holdEnabledPatch,
+      finishEnabledPatch,
     });
   } finally {
     await act(async () => {
@@ -562,6 +586,113 @@ test("Discard all does not let a pending refresh overwrite a saved toggle", asyn
         [{ op: "replace", path: "browser.enabled", value: true }],
       ]);
       assert.equal(button("enabled").getAttribute("aria-pressed"), "true");
+    },
+  );
+});
+
+test("A saved toggle keeps a pending Discard all refresh so earlier server values are not left stale", async () => {
+  await withForm(
+    async ({
+      button,
+      editField,
+      fieldValue,
+      values,
+      holdListResponses,
+      releaseListResponses,
+      pendingListResponses,
+      patches,
+    }) => {
+      assert.equal(fieldValue("browser.session_name"), "discard-saved");
+      await editField("browser.native_webdriver_url", "http://127.0.0.1:9516");
+      values["browser.session_name"] = "written-by-save-all";
+      holdListResponses({ snapshot: true });
+      await act(async () => {
+        button("Discard all").click();
+        await flushEffects();
+      });
+      assert.ok(pendingListResponses() >= 1);
+      assert.equal(fieldValue("browser.session_name"), "discard-saved");
+      await act(async () => {
+        button("enabled").click();
+        await flushEffects();
+      });
+      assert.deepEqual(patches, [
+        [{ op: "replace", path: "browser.enabled", value: false }],
+      ]);
+      assert.equal(button("disabled").getAttribute("aria-pressed"), "false");
+      await releaseListResponses("oldest-first");
+      assert.equal(button("disabled").getAttribute("aria-pressed"), "false");
+      assert.equal(fieldValue("browser.session_name"), "written-by-save-all");
+    },
+  );
+});
+
+test("A saved toggle does not leave a pending section Save refresh spinning", async () => {
+  await withForm(
+    async ({
+      button,
+      editField,
+      fieldValue,
+      holdListResponses,
+      releaseListResponses,
+      pendingListResponses,
+      holdEnabledPatch,
+      finishEnabledPatch,
+      patches,
+    }) => {
+      await editField("browser.session_name", "saved-during-toggle");
+      holdEnabledPatch();
+      holdListResponses();
+      await act(async () => {
+        button("enabled").click();
+        await flushEffects();
+      });
+      assert.equal(pendingListResponses(), 0);
+      await act(async () => {
+        button("Save").click();
+        await flushEffects();
+      });
+      // The held enable PATCH is already recorded; Save's PATCH follows it.
+      assert.deepEqual(patches, [
+        [{ op: "replace", path: "browser.enabled", value: false }],
+        [
+          {
+            op: "replace",
+            path: "browser.session_name",
+            value: "saved-during-toggle",
+          },
+        ],
+      ]);
+      assert.ok(
+        pendingListResponses() >= 1,
+        "section Save should have started a list reload",
+      );
+      assert.equal(
+        document.getElementById("browser.session_name"),
+        null,
+        "section Save reload shows the form spinner",
+      );
+      await finishEnabledPatch();
+      assert.deepEqual(patches, [
+        [{ op: "replace", path: "browser.enabled", value: false }],
+        [
+          {
+            op: "replace",
+            path: "browser.session_name",
+            value: "saved-during-toggle",
+          },
+        ],
+      ]);
+      assert.equal(
+        document.getElementById("browser.session_name"),
+        null,
+        "Save's in-flight reload should still be the one clearing the spinner",
+      );
+      assert.ok(pendingListResponses() >= 1);
+      await releaseListResponses("oldest-first");
+      assert.equal(fieldValue("browser.session_name"), "saved-during-toggle");
+      assert.equal(button("disabled").getAttribute("aria-pressed"), "false");
+      assert.equal(button("Save").disabled, true);
     },
   );
 });
