@@ -375,8 +375,21 @@ it refuses an advertised lifetime above one hour or a polling interval
 above five minutes rather than sleeping on a hostile answer. An
 advertised interval of `0` or `1` is floored at RFC 8628's five-second
 default, so a gateway answer cannot put zerocode on a once-a-second
-poll the per-client budget would only refuse. The token it receives is
-held in memory for that session only.
+poll the per-client budget would only refuse. The legacy automatic enrollment
+path holds the token in memory for that session only. For URL-scoped persistent login, use
+`zerocode login <alias> <wss-url> --gateway-url <https-origin>`; see
+[Remote setup](../zerocode/remote.md#sign-in-with-oidc-recommended-for-oidc-deployments).
+That command starts from an empty client directory: OIDC sign-in authorizes
+issuance of its first device certificate through the gateway, with no pre-created
+device, local user, daemon pairing code, SAS, or separate enrollment listener.
+The daemon verifies the bearer through the same accepted OIDC policy as RPC,
+requires a human with `sessions:create` and an allowed agent (or
+`system:execute` / admin), signs only the CSR's public key, and
+records the new device in the existing certificate ledger and audit trail.
+Static client-certificate pins still require out-of-band provisioning. WSS still
+requires both mTLS and a valid OIDC access token on every initialize.
+The command saves the accepted access token in the owner-only local
+`zerocode-config.toml` and re-authenticates when startup needs a fresh token.
 
 ## Permission profiles
 
@@ -1015,3 +1028,15 @@ A principal without operator grants may list it only through an enabled
 agent whose policy lets it read `/`, such as one that is not workspace-only.
 For any other such principal the picker reports a refusal there until it
 opens inside an allowed root instead.
+
+### Keycloak access-token client attribution
+
+JWKS verification accepts a signed `azp` as the OAuth client identifier when a
+typed access token has no `client_id` and the configured client declaration or
+`actor_claim` establishes a human actor. The issuer, signature, token purpose,
+audience, lifetime and actor-classification checks still apply. An `azp`-only
+token cannot authenticate a service, including one classified by `actor_claim`;
+service actors still require `client_id`. A blank `client_id`, contradictory
+`client_id` and `azp`, or a client with no declaration or configured actor-claim
+evidence fails closed. Introspection still requires its `client_id` response
+field.

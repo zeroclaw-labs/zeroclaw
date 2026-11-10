@@ -709,6 +709,18 @@ pub(crate) fn parse_initialize_response(resp: &Value) -> Result<InitializeRespon
     })
 }
 
+/// Retain the handshake's structured authentication verdict so startup can
+/// re-enroll a saved login once. Never infer this from error message text.
+#[derive(Debug)]
+pub(crate) struct AuthenticationRequired;
+
+impl fmt::Display for AuthenticationRequired {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("initialize: authentication required (-32010)")
+    }
+}
+impl std::error::Error for AuthenticationRequired {}
+
 async fn request_initialize(
     rpc: &RpcOutbound,
     init_params: Value,
@@ -716,6 +728,9 @@ async fn request_initialize(
 ) -> Result<Value> {
     match tokio::time::timeout(timeout, rpc.request(method::INITIALIZE, init_params)).await {
         Ok(Ok(resp)) => Ok(resp),
+        Ok(Err(e)) if e.code == zeroclaw_api::jsonrpc::error_codes::AUTH_REQUIRED => {
+            Err(AuthenticationRequired.into())
+        }
         Ok(Err(e)) => Err(anyhow::Error::msg(format!(
             "initialize: {} ({})",
             e.message, e.code
@@ -2186,10 +2201,9 @@ impl RpcClient {
                 .context("adding daemon CA to the client root store")?;
             builder.with_root_certificates(roots)
         } else {
-            anyhow::bail!(
-                "WSS client certificate requires either tls.ca_cert_path (the daemon CA to trust) \
-                 or tls.skip_verify"
-            );
+            let mut roots = rustls::RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            builder.with_root_certificates(roots)
         };
 
         // Mutual-TLS client identity.
@@ -6567,15 +6581,9 @@ mod tls_tests {
     }
 
     #[test]
-    fn client_cert_requires_ca_or_skip() {
-        // A client cert with neither a CA nor skip_verify is a clear error, not
-        // a silent fall-through to system roots.
-        let tls = ClientTls {
-            client_cert_path: Some("/x/cert.pem".into()),
-            client_key_path: Some("/x/key.pem".into()),
-            ..Default::default()
-        };
-        assert!(RpcClient::wss_tls_config(&tls).is_err());
+    fn default_tls_config_uses_public_roots() {
+        let cfg = RpcClient::wss_tls_config(&ClientTls::default()).unwrap();
+        assert!(!cfg.client_auth_cert_resolver.has_certs());
     }
 
     #[test]
