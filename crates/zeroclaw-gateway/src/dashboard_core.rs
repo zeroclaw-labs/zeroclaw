@@ -3878,8 +3878,24 @@ mod tests {
         (reader, writer, core_id)
     }
 
+    /// A text frame the chat sent during a flood. Outside a turn the chat has
+    /// nothing to say to Binary and Pong frames. During one it may stream the
+    /// turn, but never its answer: the turn must not run on to its end once
+    /// the access is gone.
+    fn check_flood_text(text: &str, turn_running: bool) {
+        let frame: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+        assert!(turn_running, "the chat answered the flood: {text}");
+        assert!(
+            !matches!(frame["type"].as_str(), Some("chunk" | "done")),
+            "the turn streamed its answer after the change: {text}"
+        );
+    }
+
     /// Read a raw socket until the server's Close, and return its code.
-    async fn read_raw_close(mut reader: tokio::net::tcp::OwnedReadHalf) -> Option<u16> {
+    async fn read_raw_close(
+        mut reader: tokio::net::tcp::OwnedReadHalf,
+        turn_running: bool,
+    ) -> Option<u16> {
         loop {
             match read_raw_frame(&mut reader).await? {
                 (0x8, payload) => {
@@ -3888,10 +3904,7 @@ mod tests {
                         .map(|code| u16::from_be_bytes([code[0], code[1]]));
                 }
                 (0x1, payload) => {
-                    panic!(
-                        "the chat answered the flood: {}",
-                        String::from_utf8_lossy(&payload)
-                    );
+                    check_flood_text(&String::from_utf8_lossy(&payload), turn_running);
                 }
                 _ => {}
             }
@@ -3901,6 +3914,7 @@ mod tests {
     /// Read a client socket until the server's Close, and return its code.
     async fn read_framed_close(
         mut stream: futures_util::stream::SplitStream<ChatSocket>,
+        turn_running: bool,
     ) -> Option<u16> {
         loop {
             match stream.next().await {
@@ -3908,7 +3922,7 @@ mod tests {
                     return close.map(|close| u16::from(close.code));
                 }
                 Some(Ok(ClientMessage::Text(text))) => {
-                    panic!("the chat answered the flood: {text}");
+                    check_flood_text(&text, turn_running);
                 }
                 Some(Ok(_)) => {}
                 other => panic!("expected a close, got {other:?}"),
@@ -3944,15 +3958,37 @@ mod tests {
     /// the flood stops.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_first_frame_flood_cannot_hold_off_a_lost_grant_or_a_sign_out() {
-        flood_then_lose_access(false).await;
+        flood_then_lose_access(FloodPhase::FirstFrame).await;
     }
 
     /// The same once the socket's `connect` was acknowledged: the flood then
     /// reaches the loop between turns, which must let the recheck run too.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_flood_after_connect_cannot_hold_off_a_lost_grant_or_a_sign_out() {
-        flood_then_lose_access(true).await;
+        flood_then_lose_access(FloodPhase::AfterConnect).await;
     }
+
+    /// The same while a turn runs: the model holds its answer, the flood
+    /// reaches the turn's own loop, and that loop must let the recheck run
+    /// too, so the turn doesn't stream on to a client that lost its access.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_flood_during_a_turn_cannot_hold_off_a_lost_grant_or_a_sign_out() {
+        flood_then_lose_access(FloodPhase::MidTurn).await;
+    }
+
+    /// Where in the chat's life the flood arrives.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum FloodPhase {
+        /// Before the socket's first text frame.
+        FirstFrame,
+        /// Between turns, once `connect` was acknowledged.
+        AfterConnect,
+        /// During a turn whose model holds its answer (`slow please`, 4 s).
+        MidTurn,
+    }
+
+    /// The prompt [`model`] holds for a few seconds before it answers.
+    const HELD_PROMPT: &str = r#"{"type":"message","content":"slow please"}"#;
 
     /// Send a masked client text frame (key zero) on a raw socket.
     async fn write_raw_text(writer: &mut tokio::net::tcp::OwnedWriteHalf, text: &str) {
@@ -3964,16 +4000,19 @@ mod tests {
         writer.write_all(&frame).await.unwrap();
     }
 
-    /// Open a scoped chat, optionally complete its `connect`, flood it with
-    /// Binary and Pong frames, then take away its access (the agent, a
-    /// session verb, or the session itself) and check how soon it closes.
-    async fn flood_then_lose_access(after_connect: bool) {
+    /// Open a scoped chat, complete its `connect` or start a held turn as
+    /// `phase` asks, flood it with Binary and Pong frames, then take away its
+    /// access (the agent, a session verb, or the session itself) and check
+    /// how soon it closes.
+    async fn flood_then_lose_access(phase: FloodPhase) {
         use crate::dashboard_session::{WS_CLOSE_ACCESS_LOST, WS_CLOSE_SESSION_ENDED};
         const RECHECK: Duration = Duration::from_millis(50);
-        let phase = if after_connect {
-            "after connect"
-        } else {
-            "first frame"
+        let after_connect = phase == FloodPhase::AfterConnect;
+        let turn_running = phase == FloodPhase::MidTurn;
+        let phase = match phase {
+            FloodPhase::FirstFrame => "first frame",
+            FloodPhase::AfterConnect => "after connect",
+            FloodPhase::MidTurn => "mid-turn",
         };
         for flood in ["framed", "raw"] {
             for ending in ["agent", "read", "sign-out"] {
@@ -3995,11 +4034,20 @@ mod tests {
                             .unwrap();
                         await_frame(&mut socket, "connected").await;
                     }
+                    if turn_running {
+                        socket
+                            .send(ClientMessage::Text(HELD_PROMPT.into()))
+                            .await
+                            .unwrap();
+                        provider_received(&fixture, "slow please").await;
+                    }
                     let (sink, stream) = socket.split();
                     (
                         core_id,
                         zeroclaw_spawn::spawn!(async move { flood_framed(sink, flood_stop).await }),
-                        zeroclaw_spawn::spawn!(async move { read_framed_close(stream).await }),
+                        zeroclaw_spawn::spawn!(async move {
+                            read_framed_close(stream, turn_running).await
+                        }),
                     )
                 } else {
                     let (mut reader, mut writer, core_id) = open_raw_chat(addr, &alice).await;
@@ -4012,10 +4060,16 @@ mod tests {
                         let ack: Value = serde_json::from_slice(&payload).unwrap();
                         assert_eq!(ack["type"], "connected", "{case}: {ack}");
                     }
+                    if turn_running {
+                        write_raw_text(&mut writer, HELD_PROMPT).await;
+                        provider_received(&fixture, "slow please").await;
+                    }
                     (
                         core_id,
                         zeroclaw_spawn::spawn!(async move { flood_raw(writer, flood_stop).await }),
-                        zeroclaw_spawn::spawn!(async move { read_raw_close(reader).await }),
+                        zeroclaw_spawn::spawn!(async move {
+                            read_raw_close(reader, turn_running).await
+                        }),
                     )
                 };
                 // Several rechecks pass with access unchanged while the flood

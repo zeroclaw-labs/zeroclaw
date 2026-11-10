@@ -728,7 +728,13 @@ impl Chat {
                             }
                             continue;
                         }
-                        Some(Ok(Message::Pong(_) | Message::Binary(_))) => continue,
+                        // Ignored, but charged to the task's budget as in the
+                        // other loops, so a flood can't hold off the session's
+                        // recheck while the turn streams.
+                        Some(Ok(Message::Pong(_) | Message::Binary(_))) => {
+                            tokio::task::coop::consume_budget().await;
+                            continue;
+                        }
                         Some(Ok(Message::Close(_)) | Err(_)) | None => {
                             turn.disconnect().await;
                             continue;
