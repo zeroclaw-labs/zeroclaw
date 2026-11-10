@@ -381,7 +381,10 @@ above five minutes rather than sleeping on a hostile answer. An
 advertised interval of `0` or `1` is floored at RFC 8628's five-second
 default, so a gateway answer cannot put zerocode on a once-a-second
 poll the per-client budget would only refuse. The legacy automatic enrollment
-path holds the token in memory for that session only. For URL-scoped persistent login, use
+path holds the token in memory for that session only. That path uses the
+same device-grant helper as `zerocode login`, so it also sends an S256
+PKCE challenge; a provider that rejects `code_challenge` on its device
+authorization endpoint will fail here as well. For URL-scoped persistent login, use
 `zerocode login <alias> <wss-url> --gateway-url <https-origin>`; see
 [Remote setup](../zerocode/remote.md#sign-in-with-oidc-recommended-for-oidc-deployments).
 That command starts from an empty client directory: OIDC sign-in authorizes
