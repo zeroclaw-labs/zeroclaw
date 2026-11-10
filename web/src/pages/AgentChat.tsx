@@ -1,4 +1,4 @@
-import { memo, useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { memo, useState, useEffect, useRef, useCallback, useMemo, useId } from 'react';
 import { Link, Navigate, useParams } from 'react-router-dom';
 import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench, Brain, BarChart2, FolderOpen, ImagePlus, Loader2 } from 'lucide-react';
 import ReactMarkdown, { type Components } from 'react-markdown';
@@ -270,6 +270,10 @@ export function AgentChatInner({
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const modelDropdownRef = useRef<HTMLDivElement>(null);
+  const modelButtonRef = useRef<HTMLButtonElement>(null);
+  const modelMenuId = useId();
+  // The menu renders only when there are models to pick from.
+  const modelMenuOpen = showModelDropdown && availableModels.length > 0;
 
   // AgentChatInner stays mounted while the selected conversation changes.
   // Load that conversation's draft explicitly; useState's initializer only ran
@@ -312,6 +316,26 @@ export function AgentChatInner({
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
+
+  // Escape closes the model menu, as it does the conversation picker's, so
+  // keyboard users can dismiss it. An Escape that a React handler or an
+  // earlier `document` listener already took (`preventDefault`), or one that
+  // ends an IME composition, is left alone; dialogs listen on `window`, which
+  // runs after this. Focus goes back to the button only if it was in the
+  // picker (or nowhere), so Escape in the composer doesn't pull focus away.
+  useEffect(() => {
+    if (!modelMenuOpen) return;
+    function handleEscape(e: KeyboardEvent) {
+      if (e.key !== 'Escape' || e.defaultPrevented || e.isComposing) return;
+      setShowModelDropdown(false);
+      const active = document.activeElement;
+      if (!active || active === document.body || modelDropdownRef.current?.contains(active)) {
+        modelButtonRef.current?.focus();
+      }
+    }
+    document.addEventListener('keydown', handleEscape);
+    return () => document.removeEventListener('keydown', handleEscape);
+  }, [modelMenuOpen]);
 
   /**
    * Slash-command dispatcher (#7137). Returns true when `trimmed` was handled
@@ -432,6 +456,8 @@ export function AgentChatInner({
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Escape' && showCommandHint) {
+      // Taken here, so the same Escape doesn't also close the model menu.
+      e.preventDefault();
       setShowCommandHint(false);
       return;
     }
@@ -696,9 +722,11 @@ export function AgentChatInner({
           {operator ? (
             <div className="relative min-w-0" ref={modelDropdownRef}>
               <button
+                ref={modelButtonRef}
                 type="button"
                 onClick={() => setShowModelDropdown((v) => !v)}
-                aria-expanded={showModelDropdown && availableModels.length > 0}
+                aria-expanded={modelMenuOpen}
+                aria-controls={modelMenuOpen ? modelMenuId : undefined}
                 disabled={modelLoading || typing || (availableModels.length === 0 && currentModel === null)}
                 className="flex items-center gap-2 px-3 h-7 max-w-full rounded-[var(--radius-md)] text-xs font-medium border border-pc-border bg-pc-elevated text-pc-text-secondary transition-colors hover:text-pc-text hover:border-pc-border-strong disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
               >
@@ -710,8 +738,8 @@ export function AgentChatInner({
                 <ChevronDown className="h-3 w-3 shrink-0" />
               </button>
 
-              {showModelDropdown && availableModels.length > 0 && (
-                <div className="absolute end-0 mt-1.5 rounded-[var(--radius-md)] border border-pc-border bg-pc-elevated shadow-[var(--pc-shadow-md)] z-50 py-1 min-w-[200px] max-h-60 overflow-y-auto">
+              {modelMenuOpen && (
+                <div id={modelMenuId} className="absolute end-0 mt-1.5 rounded-[var(--radius-md)] border border-pc-border bg-pc-elevated shadow-[var(--pc-shadow-md)] z-50 py-1 min-w-[200px] max-h-60 overflow-y-auto">
                   {availableModels.map((model) => {
                     const isActive = model === currentModel;
                     return (
