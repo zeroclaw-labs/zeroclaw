@@ -225,9 +225,11 @@ async fn loader_keeps_legacy_plugin_recovery_in_each_install_layout() {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let owner = options.open(prelock.join("config-lifecycle.lock")).unwrap();
+        let lock_path = prelock.join(".lifecycle/config-lifecycle.lock");
+        std::fs::create_dir_all(prelock.join(".lifecycle")).unwrap();
+        let owner = options.open(&lock_path).unwrap();
         owner.try_lock().unwrap();
-        let rival = options.open(prelock.join("config-lifecycle.lock")).unwrap();
+        let rival = options.open(&lock_path).unwrap();
         assert!(rival.try_lock().is_err(), "concurrent owner admitted");
         let loaded = Box::pin(Config::load_or_init()).await.unwrap();
         assert_eq!(

@@ -2,6 +2,12 @@
 
 pub mod attribution;
 pub(crate) mod caller_ceiling;
+#[cfg(any(
+    feature = "tool-claude-code",
+    feature = "tool-codex-cli",
+    feature = "tool-gemini-cli",
+    feature = "tool-opencode-cli"
+))]
 pub(crate) mod coding_cli_executor;
 pub mod cron_add;
 pub(crate) mod cron_common;
@@ -45,24 +51,33 @@ pub use zeroclaw_tools::a2a_client::{
 pub use zeroclaw_tools::ask_user::AskUserTool;
 pub use zeroclaw_tools::ask_user::ChannelMapHandle;
 pub use zeroclaw_tools::backup_tool::BackupTool;
+#[cfg(feature = "tools-external")]
 pub use zeroclaw_tools::browser::{BrowserTool, ComputerUseConfig};
+#[cfg(feature = "tools-external")]
 pub use zeroclaw_tools::browser_delegate::BrowserDelegateTool;
+#[cfg(feature = "tools-external")]
 pub use zeroclaw_tools::browser_open::BrowserOpenTool;
 pub use zeroclaw_tools::calculator::CalculatorTool;
 pub use zeroclaw_tools::canvas::{ALLOWED_CONTENT_TYPES, MAX_CONTENT_SIZE};
 pub use zeroclaw_tools::canvas::{CanvasStore, CanvasTool};
 pub use zeroclaw_tools::channel_room::ChannelRoomTool;
+#[cfg(feature = "tool-claude-code")]
 pub use zeroclaw_tools::claude_code::ClaudeCodeTool;
+#[cfg(feature = "tool-claude-code-runner")]
 pub use zeroclaw_tools::claude_code_runner::ClaudeCodeRunnerTool;
 pub use zeroclaw_tools::cli_discovery::{DiscoveredCli, discover_cli_tools};
 pub use zeroclaw_tools::cloud_ops::CloudOpsTool;
 pub use zeroclaw_tools::cloud_patterns::CloudPatternsTool;
+#[cfg(feature = "tool-codex-cli")]
 pub use zeroclaw_tools::codex_cli::CodexCliTool;
+#[cfg(feature = "tool-composio")]
 pub use zeroclaw_tools::composio::ComposioTool;
 pub use zeroclaw_tools::content_search::ContentSearchTool;
 pub use zeroclaw_tools::data_management::DataManagementTool;
 pub use zeroclaw_tools::discord_search::DiscordSearchTool;
+#[cfg(feature = "tools-external")]
 pub use zeroclaw_tools::email_read::EmailReadTool;
+#[cfg(feature = "tools-external")]
 pub use zeroclaw_tools::email_search::EmailSearchTool;
 pub use zeroclaw_tools::escalate::EscalateToHumanTool;
 pub use zeroclaw_tools::file_download::{FileDownloadSsrfPolicy, FileDownloadTool};
@@ -70,19 +85,24 @@ pub use zeroclaw_tools::file_edit::FileEditTool;
 pub use zeroclaw_tools::file_upload::FileUploadTool;
 pub use zeroclaw_tools::file_upload_bundle::FileUploadBundleTool;
 pub use zeroclaw_tools::file_write::FileWriteTool;
+#[cfg(feature = "tool-gemini-cli")]
 pub use zeroclaw_tools::gemini_cli::GeminiCliTool;
 pub use zeroclaw_tools::git_forge::GitForgeTool;
 pub use zeroclaw_tools::git_operations::{GitCommandBoundary, GitOperationsTool};
 pub use zeroclaw_tools::glob_search::GlobSearchTool;
+#[cfg(feature = "tool-google-workspace")]
 pub use zeroclaw_tools::google_workspace::GoogleWorkspaceTool;
 pub use zeroclaw_tools::hardware_board_info::HardwareBoardInfoTool;
 pub use zeroclaw_tools::hardware_memory_map::HardwareMemoryMapTool;
 pub use zeroclaw_tools::hardware_memory_read::HardwareMemoryReadTool;
 pub use zeroclaw_tools::http_request::HttpRequestTool;
+#[cfg(feature = "tools-external")]
 pub use zeroclaw_tools::image_gen::ImageGenTool;
 pub use zeroclaw_tools::image_info::ImageInfoTool;
+#[cfg(feature = "tool-jira")]
 pub use zeroclaw_tools::jira_tool::JiraTool;
 pub use zeroclaw_tools::knowledge_tool::KnowledgeTool;
+#[cfg(feature = "tool-linkedin")]
 pub use zeroclaw_tools::linkedin::LinkedInTool;
 pub use zeroclaw_tools::llm_task::LlmTaskTool;
 pub use zeroclaw_tools::mcp_client::{McpRegistry, McpServer};
@@ -99,17 +119,24 @@ pub use zeroclaw_tools::memory_forget::MemoryForgetTool;
 pub use zeroclaw_tools::memory_purge::MemoryPurgeTool;
 pub use zeroclaw_tools::memory_recall::MemoryRecallTool;
 pub use zeroclaw_tools::memory_store::MemoryStoreTool;
+#[cfg(feature = "tool-microsoft365")]
 pub use zeroclaw_tools::microsoft365::Microsoft365Tool;
 pub use zeroclaw_tools::model_routing_config::ModelRoutingConfigTool;
+#[cfg(feature = "tool-notion")]
 pub use zeroclaw_tools::notion_tool::NotionTool;
+#[cfg(feature = "tool-opencode-cli")]
 pub use zeroclaw_tools::opencode_cli::OpenCodeCliTool;
 pub use zeroclaw_tools::pipeline::PipelineTool;
 pub use zeroclaw_tools::poll::PollTool;
+#[cfg(feature = "tool-project-intel")]
 pub use zeroclaw_tools::project_intel::ProjectIntelTool;
 pub use zeroclaw_tools::proxy_config::ProxyConfigTool;
+#[cfg(feature = "tools-external")]
 pub use zeroclaw_tools::pushover::PushoverTool;
 pub use zeroclaw_tools::reaction::ReactionTool;
+#[cfg(feature = "tool-project-intel")]
 pub use zeroclaw_tools::report_template_tool::ReportTemplateTool;
+#[cfg(feature = "tools-external")]
 pub use zeroclaw_tools::screenshot::ScreenshotTool;
 pub use zeroclaw_tools::send_via::{
     AgentPeerGroupResolver, SendViaTool, TURN_ROUTING, TurnRoutingHandle,
@@ -118,10 +145,13 @@ pub use zeroclaw_tools::sessions::{
     AcpSessionReadView, SessionDeleteTool, SessionResetTool, SessionsCurrentTool,
     SessionsHistoryTool, SessionsListTool, SessionsSendTool,
 };
+#[cfg(feature = "tools-external")]
 pub use zeroclaw_tools::text_browser::TextBrowserTool;
 pub use zeroclaw_tools::tool_search::ToolSearchTool;
+#[cfg(feature = "tools-external")]
 pub use zeroclaw_tools::weather_tool::WeatherTool;
 pub use zeroclaw_tools::web_fetch::WebFetchTool;
+#[cfg(feature = "tools-external")]
 pub use zeroclaw_tools::web_search_tool::WebSearchTool;
 pub use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
 
@@ -177,6 +207,10 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::sync::{Arc, Mutex};
+use zeroclaw_api::memory_traits::{
+    ExportFilter, MemoryCategory, MemoryEntry, MemoryStats, PrincipalScope, ProceduralMessage,
+    StoreOptions,
+};
 use zeroclaw_config::schema::{AliasedAgentConfig, Config};
 use zeroclaw_memory::Memory;
 
@@ -184,7 +218,10 @@ pub type PerToolChannelHandle =
     Arc<RwLock<HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>>>>;
 
 /// Shared handle to the delegate tool's parent-tools list.
-/// Callers can push additional tools (e.g. MCP wrappers) after construction.
+/// Assembly narrows the existing entries with its canonical context predicate
+/// at gate time, preserving surviving Arcs and their order. This remains a live
+/// handle: trusted later writers must apply the context relevant to their own
+/// additions. It is not a continuously filtered view or a native-origin proof.
 pub type DelegateParentToolsHandle = Arc<RwLock<Vec<Arc<dyn Tool>>>>;
 
 /// Thin wrapper that makes an `Arc<dyn Tool>` usable as `Box<dyn Tool>`.
@@ -249,6 +286,7 @@ impl Tool for ArcToolRef {
 /// active, in which case the tool keeps resolving `[web_search] serply_api_key`
 /// from `config.toml` at use time so rotation and removal take effect without a
 /// restart.
+#[cfg(feature = "tools-external")]
 fn serply_api_key_override(root_config: &Config) -> Option<Option<String>> {
     root_config
         .prop_is_env_overridden("web_search.serply_api_key")
@@ -256,10 +294,53 @@ fn serply_api_key_override(root_config: &Config) -> Option<Option<String>> {
 }
 
 fn any_coding_cli_tool_enabled(root_config: &Config) -> bool {
-    root_config.claude_code.enabled
-        || root_config.codex_cli.enabled
-        || root_config.gemini_cli.enabled
-        || root_config.opencode_cli.enabled
+    (cfg!(feature = "tool-claude-code") && root_config.claude_code.enabled)
+        || (cfg!(feature = "tool-codex-cli") && root_config.codex_cli.enabled)
+        || (cfg!(feature = "tool-gemini-cli") && root_config.gemini_cli.enabled)
+        || (cfg!(feature = "tool-opencode-cli") && root_config.opencode_cli.enabled)
+}
+
+/// Whether the Composio tool is registered for `config`: compiled in and
+/// enabled. Prompt builders consult this so the model is never told about a
+/// tool this build does not carry.
+pub fn composio_tool_available(config: &Config) -> bool {
+    cfg!(feature = "tool-composio")
+        && config.tools.is_enabled("composio")
+        && config.composio.enabled
+}
+
+/// An integration enabled in config whose tool this build was compiled
+/// without. Mirrors the channel orchestrator's "compiled without" notice, and
+/// carries the code `Config::collect_warnings` reports the same section under
+/// for `config/validate`, the config API and `doctor`.
+#[cfg(not(all(
+    feature = "tool-jira",
+    feature = "tool-notion",
+    feature = "tool-linkedin",
+    feature = "tool-composio",
+    feature = "tool-google-workspace",
+    feature = "tool-microsoft365",
+    feature = "tool-project-intel",
+    feature = "tool-claude-code",
+    feature = "tool-claude-code-runner",
+    feature = "tool-codex-cli",
+    feature = "tool-gemini-cli",
+    feature = "tool-opencode-cli"
+)))]
+fn warn_tool_compiled_out(root_config: &Config, tool: zeroclaw_config::opt_in_tools::OptInTool) {
+    if tool.enabled_in(root_config) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "code": zeroclaw_config::validation_warnings::TOOL_COMPILED_OUT,
+                    "section": tool.section(),
+                    "feature": tool.feature(),
+                })),
+            "a tool is enabled in config but this build was compiled without its feature; skipping it"
+        );
+    }
 }
 
 #[derive(Clone)]
@@ -335,8 +416,49 @@ impl Tool for ArcDelegatingTool {
     }
 }
 
-fn boxed_registry_from_arcs(tools: Vec<Arc<dyn Tool>>) -> Vec<Box<dyn Tool>> {
-    tools.into_iter().map(ArcDelegatingTool::boxed).collect()
+/// Run a constructor only after explicit built-in availability is resolved.
+/// Execution authorization remains the scoped registry's responsibility.
+/// Emit namespace ownership at the same declaration that selects construction.
+/// Selection remains the canonical `[tools].optional` decision; claiming a name
+/// does not construct a tool or grant permission to execute it.
+fn select_declared_builtin_tool(
+    selection: &zeroclaw_config::builtin_tools::BuiltinToolsConfig,
+    reserved_host_names: &mut std::collections::HashSet<String>,
+    name: &str,
+) -> bool {
+    reserved_host_names.insert(name.to_string());
+    selection.is_enabled(name)
+}
+
+fn register_builtin_tool(
+    selection: &zeroclaw_config::builtin_tools::BuiltinToolsConfig,
+    registry: &mut Vec<Arc<dyn Tool>>,
+    reserved_host_names: &mut std::collections::HashSet<String>,
+    name: &str,
+    constructor: impl FnOnce() -> Arc<dyn Tool>,
+) {
+    if select_declared_builtin_tool(selection, reserved_host_names, name) {
+        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+        late_tool_search_observer::record("constructor-enter", name, 0, 0);
+        registry.push(constructor());
+        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+        late_tool_search_observer::record("constructor-return", name, 0, 0);
+    }
+}
+
+/// These owners are declared here because their implementations are deferred
+/// or withdrawn by an execution context. Use the owning types' canonical names.
+pub(crate) fn reserve_deferred_host_names(
+    config: &Config,
+    reserved_host_names: &mut std::collections::HashSet<String>,
+) {
+    reserved_host_names.insert(ModelSwitchTool::NAME.to_string());
+    if config.pipeline.enabled {
+        reserved_host_names.insert(PipelineTool::NAME.to_string());
+    }
+    // The generic MCP capability tools ([`build_mcp_capability_tools`]) are
+    // minted during assembly, after plugin tools.
+    reserved_host_names.extend(["mcp_resources", "mcp_prompts"].map(String::from));
 }
 
 /// Create the default tool registry
@@ -758,6 +880,7 @@ pub(crate) fn data_management_tool(
 /// `all_tools_with_runtime` gates it (`root_config.linkedin.enabled`). `None`
 /// when disabled. See [`git_operations_tool`] for why `workspace_dir` is a
 /// separate parameter rather than read from `security.workspace_dir`.
+#[cfg(feature = "tool-linkedin")]
 pub(crate) fn linkedin_tool(
     security: Arc<SecurityPolicy>,
     workspace_dir: &std::path::Path,
@@ -781,6 +904,7 @@ pub(crate) fn linkedin_tool(
 /// production registration path). See [`git_operations_tool`] for why
 /// `workspace_dir` is a separate parameter rather than read from
 /// `security.workspace_dir`.
+#[cfg(feature = "tools-external")]
 pub(crate) fn image_gen_tool(
     security: Arc<SecurityPolicy>,
     workspace_dir: &std::path::Path,
@@ -817,6 +941,7 @@ pub(crate) fn image_gen_tool(
 /// returns a tool. `PushoverTool` reads `PUSHOVER_TOKEN`/`PUSHOVER_USER_KEY`
 /// from `workspace_dir/.env`, so a `Bounded` cross-profile target must get its
 /// own workspace here, not the caller's.
+#[cfg(feature = "tools-external")]
 pub(crate) fn pushover_tool(
     security: Arc<SecurityPolicy>,
     workspace_dir: &std::path::Path,
@@ -828,6 +953,7 @@ pub(crate) fn pushover_tool(
 /// (`all_tools_with_runtime` never gates it). `ScreenshotTool` writes its
 /// output under `security.workspace_dir`, so a `Bounded` cross-profile target
 /// must get a `security` bound to its own workspace here, not the caller's.
+#[cfg(feature = "tools-external")]
 pub(crate) fn screenshot_tool(security: Arc<SecurityPolicy>) -> Arc<dyn Tool> {
     Arc::new(ScreenshotTool::new(security))
 }
@@ -910,6 +1036,7 @@ pub(crate) fn file_download_tool(
 /// cross-profile target must get its own policy here, not the caller's.
 /// `browser_config` itself is not workspace-scoped (same config object for
 /// caller and target), unlike `security`.
+#[cfg(feature = "tools-external")]
 pub(crate) fn browser_tool(
     security: Arc<SecurityPolicy>,
     browser_config: &zeroclaw_config::schema::BrowserConfig,
@@ -1177,6 +1304,7 @@ pub const AUTONOMY_REBOUND_TOOL_NAMES: &[&str] = &[
 /// every call against whichever policy the wrapper was built with. Both the
 /// production registry and the `Bounded` delegate rebuild go through here, so
 /// the two cannot construct it differently.
+#[cfg(feature = "tools-external")]
 pub(crate) fn web_search_tool(
     security: Arc<SecurityPolicy>,
     root_config: &Config,
@@ -1284,6 +1412,7 @@ pub(crate) fn web_fetch_tool(
 
 /// Rebuilds `text_browser` bound to `security`, gated as
 /// `all_tools_with_runtime` gates it (`root_config.text_browser.enabled`).
+#[cfg(feature = "tools-external")]
 pub(crate) fn text_browser_tool(
     security: Arc<SecurityPolicy>,
     root_config: &Config,
@@ -1316,6 +1445,7 @@ pub(crate) fn text_browser_tool(
 /// `all_tools_with_runtime` gates it (`browser_config.enabled`).
 /// `browser_config` itself is not workspace-scoped (same config object for
 /// caller and target), unlike `security` - the same split as [`browser_tool`].
+#[cfg(feature = "tools-external")]
 pub(crate) fn browser_open_tool(
     security: Arc<SecurityPolicy>,
     browser_config: &zeroclaw_config::schema::BrowserConfig,
@@ -1344,6 +1474,7 @@ pub(crate) fn browser_open_tool(
 
 /// Rebuilds `browser_delegate` bound to `security`, gated as
 /// `all_tools_with_runtime` gates it (config plus runtime shell access).
+#[cfg(feature = "tools-external")]
 pub(crate) fn browser_delegate_tool(
     security: Arc<SecurityPolicy>,
     root_config: &Config,
@@ -1370,6 +1501,7 @@ pub(crate) fn browser_delegate_tool(
 /// Rebuilds `notion` bound to `security`. The API key is global
 /// (`root_config.notion.api_key`, or the `NOTION_API_KEY` env var), never
 /// per-agent, so only the policy differs between caller and target.
+#[cfg(feature = "tool-notion")]
 pub(crate) fn notion_tool(
     security: Arc<SecurityPolicy>,
     root_config: &Config,
@@ -1396,6 +1528,7 @@ pub(crate) fn notion_tool(
 
 /// Rebuilds `jira` bound to `security`. Base URL, credentials and allowed
 /// actions are global (`root_config.jira`), never per-agent.
+#[cfg(feature = "tool-jira")]
 pub(crate) fn jira_tool(
     security: Arc<SecurityPolicy>,
     root_config: &Config,
@@ -1459,6 +1592,7 @@ pub(crate) fn jira_tool(
 /// Rebuilds `composio` bound to `security`. The key and entity id are the
 /// global `root_config.composio` values every caller of
 /// `all_tools_with_runtime` passes down, not per-agent credentials.
+#[cfg(feature = "tool-composio")]
 pub(crate) fn composio_tool(
     security: Arc<SecurityPolicy>,
     composio_key: Option<&str>,
@@ -1474,6 +1608,7 @@ pub(crate) fn composio_tool(
 
 /// Rebuilds `google_workspace` bound to `security`, gated as
 /// `all_tools_with_runtime` gates it (config plus runtime shell access).
+#[cfg(feature = "tool-google-workspace")]
 pub(crate) fn google_workspace_tool(
     security: Arc<SecurityPolicy>,
     root_config: &Config,
@@ -1506,6 +1641,7 @@ pub(crate) fn google_workspace_tool(
 /// Outcome of building `microsoft365`, which unlike every other tool here can
 /// abort the whole registry: a `client_credentials` flow with no client secret
 /// is a fail-fast misconfiguration, not a tool to skip.
+#[cfg(feature = "tool-microsoft365")]
 pub(crate) enum Microsoft365Registration {
     /// Register this tool.
     Tool(Arc<dyn Tool>),
@@ -1519,6 +1655,7 @@ pub(crate) enum Microsoft365Registration {
 /// global (`root_config.microsoft365`); the token cache lives next to
 /// `config.toml`, falling back to `workspace_dir` only when the config path has
 /// no parent - which is why the caller passes the workspace it is building for.
+#[cfg(feature = "tool-microsoft365")]
 pub(crate) fn microsoft365_tool(
     security: Arc<SecurityPolicy>,
     root_config: &Config,
@@ -1882,6 +2019,7 @@ pub(crate) fn spawn_subagent_tool(
 /// `all_tools_with_runtime` gates it (`root_config.claude_code_runner.enabled`
 /// alone - unlike the 4 tools below, it never uses `coding_cli_executor`).
 /// `None` when disabled.
+#[cfg(feature = "tool-claude-code-runner")]
 pub(crate) fn claude_code_runner_tool(
     security: Arc<SecurityPolicy>,
     root_config: &zeroclaw_config::schema::Config,
@@ -1907,6 +2045,7 @@ pub(crate) fn claude_code_runner_tool(
 /// target-resolved) `executor`, gated like `all_tools_with_runtime` gates it
 /// (`register_coding_cli_tools && root_config.claude_code.enabled`). `None`
 /// when disabled.
+#[cfg(feature = "tool-claude-code")]
 pub(crate) fn claude_code_tool(
     security: Arc<SecurityPolicy>,
     root_config: &zeroclaw_config::schema::Config,
@@ -1928,6 +2067,7 @@ pub(crate) fn claude_code_tool(
 
 /// Rebuilds `codex_cli` - see [`claude_code_tool`] above for the shared
 /// gating/wiring rationale.
+#[cfg(feature = "tool-codex-cli")]
 pub(crate) fn codex_cli_tool(
     security: Arc<SecurityPolicy>,
     root_config: &zeroclaw_config::schema::Config,
@@ -1948,6 +2088,7 @@ pub(crate) fn codex_cli_tool(
 }
 
 /// Rebuilds `gemini_cli` - see [`claude_code_tool`] above.
+#[cfg(feature = "tool-gemini-cli")]
 pub(crate) fn gemini_cli_tool(
     security: Arc<SecurityPolicy>,
     root_config: &zeroclaw_config::schema::Config,
@@ -1968,6 +2109,7 @@ pub(crate) fn gemini_cli_tool(
 }
 
 /// Rebuilds `opencode_cli` - see [`claude_code_tool`] above.
+#[cfg(feature = "tool-opencode-cli")]
 pub(crate) fn opencode_cli_tool(
     security: Arc<SecurityPolicy>,
     root_config: &zeroclaw_config::schema::Config,
@@ -1986,6 +2128,12 @@ pub(crate) fn opencode_cli_tool(
         security,
     )))
 }
+/// The registered session-data tools that address other sessions. Each
+/// requires an unrestricted principal; tests use the names to check that a
+/// non-admin registry holds none of them.
+#[cfg(test)]
+pub(crate) const SESSION_DATA_TOOL_NAMES: &[&str] =
+    &["sessions_list", "sessions_history", "sessions_send"];
 
 #[cfg(test)]
 pub(crate) fn register_skill_tools(
@@ -2048,7 +2196,6 @@ pub(crate) fn register_skill_tools_with_context_and_runtime_optional_nat64(
         return;
     }
 
-    let before = tools_registry.len();
     let policy = Arc::clone(&security);
     let skill_tools = crate::skills::skills_to_tools_with_context_and_runtime_optional_nat64(
         skills,
@@ -2061,15 +2208,45 @@ pub(crate) fn register_skill_tools_with_context_and_runtime_optional_nat64(
         .iter()
         .map(|t| t.name().to_string())
         .collect();
+    register_prepared_skill_tools(
+        skill_tools,
+        &existing_names,
+        skills,
+        &policy,
+        |tool| tool.name(),
+        |tool| tools_registry.push(tool),
+    );
+}
+
+/// Apply the same fixed pre-batch snapshot to ordinary or prepared skills.
+/// This never admits a new name into the snapshot while iterating the batch.
+pub(crate) fn register_prepared_skill_tools<T>(
+    skill_tools: Vec<T>,
+    existing_names: &std::collections::HashSet<String>,
+    skills: &[crate::skills::Skill],
+    policy: &SecurityPolicy,
+    name: impl Fn(&T) -> &str,
+    mut register: impl FnMut(T),
+) {
+    #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+    late_tool_search_observer::record(
+        "skill-snapshot",
+        "batch",
+        existing_names.len(),
+        skill_tools.len(),
+    );
+    let mut registered = 0;
     for tool in skill_tools {
-        if existing_names.contains(tool.name()) {
+        if existing_names.contains(name(&tool)) {
+            #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+            late_tool_search_observer::record("skill-decision", "duplicate", 0, 0);
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                 &format!(
-                    "Skill tool '{}' shadows built-in tool, skipping",
-                    tool.name()
+                    "Skill tool '{}' has the name of a registered native tool, skipping",
+                    name(&tool)
                 )
             );
         } else if policy
@@ -2077,28 +2254,34 @@ pub(crate) fn register_skill_tools_with_context_and_runtime_optional_nat64(
             .as_ref()
             .is_some_and(|list| list.is_empty())
         {
+            #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+            late_tool_search_observer::record("skill-decision", "deny-all", 0, 0);
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                 &format!(
                     "Skill tool '{}' denied by empty allowed_tools (deny-all), skipping",
-                    tool.name()
+                    name(&tool)
                 )
             );
-        } else if policy.is_tool_excluded(tool.name()) {
+        } else if policy.is_tool_excluded(name(&tool)) {
+            #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+            late_tool_search_observer::record("skill-decision", "excluded", 0, 0);
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                 &format!(
                     "Skill tool '{}' denied by excluded_tools, skipping",
-                    tool.name()
+                    name(&tool)
                 )
             );
         } else {
-            tools_registry.push(tool);
+            #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+            late_tool_search_observer::record("skill-decision", "register", 0, 0);
+            register(tool);
+            registered += 1;
         }
     }
-    let registered = tools_registry.len() - before;
 
     ::zeroclaw_log::record!(
         INFO,
@@ -2170,6 +2353,9 @@ pub use shell_env::ForwardedEnvironment;
 /// to destructure across many callers.
 #[allow(clippy::type_complexity)]
 pub struct AllToolsResult {
+    /// Private creator identity and wrapper projections. External prebuilt
+    /// inputs use `from_prebuilt_tools` and begin with unknown provenance.
+    pub(crate) native_memory: NativeMemoryProjection,
     /// The eager registry retained by this factory, before the per-agent
     /// `allowed_tools`/`excluded_tools` filter.
     ///
@@ -2183,23 +2369,37 @@ pub struct AllToolsResult {
     /// filtered one, which has already misled readers into believing built-ins
     /// escaped `allowed_tools`.
     pub tools: Vec<Box<dyn Tool>>,
+    /// Structural namespace facts emitted by this registry's canonical builtin
+    /// declarations, including applicable tools whose constructors were omitted.
+    /// Created per registry build and consumed by binding/assembly; grants and
+    /// execution availability still resolve through their existing owners.
+    pub reserved_host_names: std::collections::HashSet<String>,
     pub delegate_handle: Option<DelegateParentToolsHandle>,
     pub ask_user_handle: Option<PerToolChannelHandle>,
     pub channel_room_handle: Option<PerToolChannelHandle>,
     pub reaction_handle: PerToolChannelHandle,
     pub poll_handle: Option<PerToolChannelHandle>,
     pub escalate_handle: Option<PerToolChannelHandle>,
+    /// The session memory route this factory's memory-starting tools share
+    /// (`spawn_subagent` here, and the pipeline `assemble` mints). The sealed
+    /// registry keeps it and pins it when its session is pinned to an owner.
+    /// `None` when the tool set was not built by this factory.
+    pub session_memory: Option<Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>>,
     /// Pre-boxed Arcs of every tool (before policy filter). Used by
     /// skill-scoped builtin elevation to resolve targets at registration.
     pub unfiltered_tool_arcs: Vec<Arc<dyn Tool>>,
+    /// The capability slots of the tools this factory registered that start
+    /// child operations (delegate, `spawn_subagent`, `send_message_to_peer`, `cron_run`),
+    /// so the entry point that owns the registry can bind its capabilities
+    /// and principal (`RuntimeCapabilities::prepare_registry`) and those
+    /// children run through them.
+    pub capability_slots: Vec<crate::composition::CapabilitySlot>,
     /// The exact `DelegateTool` this factory registered, in its concrete type.
     ///
-    /// Test-only. `tools`/`unfiltered_tool_arcs` erase the type behind
-    /// `dyn Tool`, so a regression cannot otherwise drive the *production*
-    /// delegate instance's nested-registry construction - it can only
-    /// re-derive the wiring by hand, which is exactly the thing that must not
-    /// be trusted. `None` when no agents are configured.
-    #[cfg(test)]
+    /// Retained so an owned session can bind its principal to the exact
+    /// registered delegate before any child memory tools are built, and so
+    /// callers can bind its child registries to their live RPC authority
+    /// resolver.
     pub(crate) delegate_tool: Option<Arc<DelegateTool>>,
 }
 
@@ -2207,9 +2407,10 @@ impl AllToolsResult {
     /// Wrap an already-built tool vector as `assemble` INPUT, with every
     /// side-channel handle empty. This mints an `AllToolsResult` (the input to
     /// [`crate::tools::scoped::ScopedToolRegistry::assemble`]), NOT a
-    /// `ScopedToolRegistry` - it does not touch the seal. (`AllToolsResult`'s
-    /// fields are all `pub`, so a caller could already hand-roll this literal;
-    /// the helper just centralizes the "all handles empty" shape.) Used by the
+    /// `ScopedToolRegistry` - it does not touch the seal. Prebuilt inputs have
+    /// unknown creator provenance. Use this constructor instead of an exhaustive
+    /// literal: the private provenance transport deliberately prevents external
+    /// callers from minting native creator identity. Used by the
     /// paths that already own a fixed / pre-filtered tool set (the skill-review
     /// harness, bounded delegation, and the `zeroclaw-eval` replay harness) and
     /// route it through `assemble` only to seal it: they pass `skills: &[]`,
@@ -2218,17 +2419,745 @@ impl AllToolsResult {
     /// out-of-crate `zeroclaw-eval` harness can reach it.
     pub fn from_prebuilt_tools(tools: Vec<Box<dyn Tool>>) -> Self {
         Self {
+            native_memory: NativeMemoryProjection::default(),
             tools,
+            reserved_host_names: std::collections::HashSet::new(),
             delegate_handle: None,
             ask_user_handle: None,
             channel_room_handle: None,
             reaction_handle: Arc::new(RwLock::new(HashMap::new())),
             poll_handle: None,
+            session_memory: None,
             escalate_handle: None,
             unfiltered_tool_arcs: Vec::new(),
-            #[cfg(test)]
+            capability_slots: Vec::new(),
             delegate_tool: None,
         }
+    }
+
+    pub(crate) fn from_inherited_tools(
+        tools: &[Arc<dyn Tool>],
+        origins: NativeMemoryOrigins,
+        binding: std::sync::Weak<NativeMemoryBinding>,
+    ) -> Self {
+        let mut built = Self::from_prebuilt_tools(Vec::new());
+        built.native_memory.origins = origins;
+        built.native_memory.binding = binding;
+        built.tools = built.native_memory.wrap_actual_tools(tools);
+        built
+    }
+}
+
+/// Supplied-only construction warms generic parsers on the existing bounded
+/// builder stack without constructing native tools or integrations.
+pub(crate) fn supplied_registry_base() -> anyhow::Result<AllToolsResult> {
+    // The parsers only need warming once per process. Two first builds may
+    // both warm them; that is harmless and keeps a failed warmup retryable.
+    static WARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARMED.load(std::sync::atomic::Ordering::Acquire) {
+        std::thread::Builder::new()
+            .stack_size(TOOL_REGISTRY_BUILD_STACK_BYTES)
+            .spawn(warm_lazy_regexes)?
+            .join()
+            .map_err(|_| anyhow::Error::msg("tool parser warmup panicked"))?;
+        WARMED.store(true, std::sync::atomic::Ordering::Release);
+    }
+    Ok(AllToolsResult::from_prebuilt_tools(Vec::new()))
+}
+
+/// Resource ownership for one canonical native-memory construction batch.
+/// The family origin ledger only holds Weak identity; it never owns this cell.
+/// A target is installed once, before any operation starts. Native Tool Arcs
+/// and all of their existing captures therefore keep their exact identities.
+/// `health_check` and `refresh_embedder` also start use; even an eager probe
+/// therefore makes later principal routing fail closed.
+pub(crate) struct NativeMemoryBinding {
+    original: Arc<dyn Memory>,
+    security: Arc<SecurityPolicy>,
+    routed: std::sync::OnceLock<Arc<dyn Memory>>,
+    operation_started: parking_lot::Mutex<bool>,
+}
+
+impl NativeMemoryBinding {
+    fn new(original: Arc<dyn Memory>, security: Arc<SecurityPolicy>) -> Self {
+        Self {
+            original,
+            security,
+            routed: std::sync::OnceLock::new(),
+            operation_started: parking_lot::Mutex::new(false),
+        }
+    }
+
+    fn selected(&self) -> &Arc<dyn Memory> {
+        self.routed.get().unwrap_or(&self.original)
+    }
+
+    fn begin_operation(&self) -> Arc<dyn Memory> {
+        let mut started = self.operation_started.lock();
+        *started = true;
+        Arc::clone(self.selected())
+    }
+
+    fn bind(
+        &self,
+        original: &Arc<dyn Memory>,
+        target: Arc<dyn Memory>,
+        security: &Arc<SecurityPolicy>,
+    ) -> anyhow::Result<()> {
+        let started = self.operation_started.lock();
+        anyhow::ensure!(
+            Arc::ptr_eq(original, &self.original) && Arc::ptr_eq(security, &self.security),
+            "native_memory_binding_owner_mismatch"
+        );
+        if let Some(current) = self.routed.get() {
+            anyhow::ensure!(
+                Arc::ptr_eq(current, &target),
+                "native_memory_binding_already_routed"
+            );
+            return Ok(());
+        }
+        anyhow::ensure!(!*started, "native_memory_binding_operation_already_started");
+        self.routed
+            .set(target)
+            .map_err(|_| anyhow::Error::msg("native_memory_binding_already_routed"))
+    }
+}
+
+impl zeroclaw_api::attribution::Attributable for NativeMemoryBinding {
+    fn role(&self) -> zeroclaw_api::attribution::Role {
+        self.selected().role()
+    }
+    fn alias(&self) -> &str {
+        self.selected().alias()
+    }
+    fn tool_provenance(&self) -> zeroclaw_api::attribution::ToolProvenance {
+        self.selected().tool_provenance()
+    }
+}
+
+// Explicitly forward every override. Relying on a Memory default here could
+// replace a backend's scoped lookup or refusal with a different operation.
+#[async_trait]
+impl Memory for NativeMemoryBinding {
+    fn name(&self) -> &str {
+        self.selected().name()
+    }
+
+    fn principal_scope(&self) -> Option<zeroclaw_api::memory_traits::PrincipalScope> {
+        self.selected().principal_scope()
+    }
+
+    async fn store(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let actual = self.begin_operation();
+        actual.store(key, content, category, session_id).await
+    }
+
+    async fn recall(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let actual = self.begin_operation();
+        actual.recall(query, limit, session_id, since, until).await
+    }
+
+    async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+        let actual = self.begin_operation();
+        actual.get(key).await
+    }
+
+    async fn get_for_agent(
+        &self,
+        key: &str,
+        agent_id: &str,
+    ) -> anyhow::Result<Option<MemoryEntry>> {
+        let actual = self.begin_operation();
+        actual.get_for_agent(key, agent_id).await
+    }
+
+    async fn list(
+        &self,
+        category: Option<&MemoryCategory>,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let actual = self.begin_operation();
+        actual.list(category, session_id).await
+    }
+
+    async fn forget(&self, key: &str) -> anyhow::Result<bool> {
+        let actual = self.begin_operation();
+        actual.forget(key).await
+    }
+
+    async fn forget_for_agent(&self, key: &str, agent_id: &str) -> anyhow::Result<bool> {
+        let actual = self.begin_operation();
+        actual.forget_for_agent(key, agent_id).await
+    }
+
+    async fn store_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let actual = self.begin_operation();
+        actual
+            .store_for_principal(scope, key, content, category, session_id)
+            .await
+    }
+
+    async fn recall_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let actual = self.begin_operation();
+        actual
+            .recall_for_principal(scope, query, limit, session_id, since, until)
+            .await
+    }
+
+    async fn list_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        category: Option<&MemoryCategory>,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let actual = self.begin_operation();
+        actual.list_for_principal(scope, category, session_id).await
+    }
+
+    async fn get_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        key: &str,
+    ) -> anyhow::Result<Option<MemoryEntry>> {
+        let actual = self.begin_operation();
+        actual.get_for_principal(scope, key).await
+    }
+
+    async fn forget_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        key: &str,
+    ) -> anyhow::Result<bool> {
+        let actual = self.begin_operation();
+        actual.forget_for_principal(scope, key).await
+    }
+
+    async fn count_for_principal(&self, scope: &PrincipalScope) -> anyhow::Result<usize> {
+        let actual = self.begin_operation();
+        actual.count_for_principal(scope).await
+    }
+
+    async fn export_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        filter: &ExportFilter,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let actual = self.begin_operation();
+        actual.export_for_principal(scope, filter).await
+    }
+
+    async fn purge_namespace_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        namespace: &str,
+    ) -> anyhow::Result<usize> {
+        let actual = self.begin_operation();
+        actual.purge_namespace_for_principal(scope, namespace).await
+    }
+
+    async fn purge_session_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        session_id: &str,
+    ) -> anyhow::Result<usize> {
+        let actual = self.begin_operation();
+        actual.purge_session_for_principal(scope, session_id).await
+    }
+
+    async fn purge_namespace(&self, namespace: &str) -> anyhow::Result<usize> {
+        let actual = self.begin_operation();
+        actual.purge_namespace(namespace).await
+    }
+
+    async fn purge_session(&self, session_id: &str) -> anyhow::Result<usize> {
+        let actual = self.begin_operation();
+        actual.purge_session(session_id).await
+    }
+
+    async fn purge_session_for_agent(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+    ) -> anyhow::Result<usize> {
+        let actual = self.begin_operation();
+        actual.purge_session_for_agent(session_id, agent_id).await
+    }
+
+    async fn purge_agent(&self, agent_alias: &str) -> anyhow::Result<usize> {
+        let actual = self.begin_operation();
+        actual.purge_agent(agent_alias).await
+    }
+
+    async fn export_agent(&self, agent_alias: &str) -> anyhow::Result<Vec<MemoryEntry>> {
+        let actual = self.begin_operation();
+        actual.export_agent(agent_alias).await
+    }
+
+    async fn rename_agent(&self, from: &str, to: &str) -> anyhow::Result<usize> {
+        let actual = self.begin_operation();
+        actual.rename_agent(from, to).await
+    }
+
+    async fn count_agent(&self, agent_alias: &str) -> anyhow::Result<usize> {
+        let actual = self.begin_operation();
+        actual.count_agent(agent_alias).await
+    }
+
+    async fn count(&self) -> anyhow::Result<usize> {
+        let actual = self.begin_operation();
+        actual.count().await
+    }
+
+    async fn health_check(&self) -> bool {
+        let actual = self.begin_operation();
+        actual.health_check().await
+    }
+
+    async fn supersede(&self, superseded_ids: &[String], new_id: &str) -> anyhow::Result<()> {
+        let actual = self.begin_operation();
+        actual.supersede(superseded_ids, new_id).await
+    }
+
+    async fn store_procedural(
+        &self,
+        messages: &[ProceduralMessage],
+        session_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let actual = self.begin_operation();
+        actual.store_procedural(messages, session_id).await
+    }
+
+    async fn count_in_scope(
+        &self,
+        namespace: Option<&str>,
+        category: Option<&MemoryCategory>,
+    ) -> anyhow::Result<u64> {
+        let actual = self.begin_operation();
+        actual.count_in_scope(namespace, category).await
+    }
+
+    async fn stats(&self) -> anyhow::Result<MemoryStats> {
+        let actual = self.begin_operation();
+        actual.stats().await
+    }
+
+    async fn reindex(&self) -> anyhow::Result<usize> {
+        let actual = self.begin_operation();
+        actual.reindex().await
+    }
+
+    fn refresh_embedder(
+        &self,
+        model_provider: &str,
+        api_key: Option<&str>,
+        model: &str,
+        dimensions: usize,
+    ) {
+        let actual = self.begin_operation();
+        actual.refresh_embedder(model_provider, api_key, model, dimensions)
+    }
+
+    async fn recall_namespaced(
+        &self,
+        namespace: &str,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let actual = self.begin_operation();
+        actual
+            .recall_namespaced(namespace, query, limit, session_id, since, until)
+            .await
+    }
+
+    async fn export(&self, filter: &ExportFilter) -> anyhow::Result<Vec<MemoryEntry>> {
+        let actual = self.begin_operation();
+        actual.export(filter).await
+    }
+
+    async fn store_with_metadata(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        namespace: Option<&str>,
+        importance: Option<f64>,
+    ) -> anyhow::Result<()> {
+        let actual = self.begin_operation();
+        actual
+            .store_with_metadata(key, content, category, session_id, namespace, importance)
+            .await
+    }
+
+    async fn store_with_options(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        options: StoreOptions,
+    ) -> anyhow::Result<()> {
+        let actual = self.begin_operation();
+        actual
+            .store_with_options(key, content, category, session_id, options)
+            .await
+    }
+
+    async fn store_with_options_and_agent(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        options: StoreOptions,
+        agent_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let actual = self.begin_operation();
+        actual
+            .store_with_options_and_agent(key, content, category, session_id, options, agent_id)
+            .await
+    }
+
+    async fn store_with_agent(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        namespace: Option<&str>,
+        importance: Option<f64>,
+        agent_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let actual = self.begin_operation();
+        actual
+            .store_with_agent(
+                key, content, category, session_id, namespace, importance, agent_id,
+            )
+            .await
+    }
+
+    async fn recall_for_agents(
+        &self,
+        allowed_agent_ids: &[&str],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let actual = self.begin_operation();
+        actual
+            .recall_for_agents(allowed_agent_ids, query, limit, session_id, since, until)
+            .await
+    }
+
+    async fn ensure_agent_uuid(&self, alias: &str) -> anyhow::Result<String> {
+        let actual = self.begin_operation();
+        actual.ensure_agent_uuid(alias).await
+    }
+}
+
+/// These kinds are stamped only by the actual fixed native constructors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum NativeMemoryKind {
+    Store,
+    Recall,
+    Forget,
+    Export,
+    Purge,
+}
+
+pub(crate) struct NativeMemoryOrigin {
+    binding: std::sync::Weak<NativeMemoryBinding>,
+    pub(crate) kind: NativeMemoryKind,
+    actual: std::sync::Weak<dyn Tool>,
+}
+
+type NativeMemorySnapshotEntry = (Arc<dyn Tool>, Option<Arc<NativeMemoryOrigin>>);
+
+#[derive(Default)]
+struct MemoryOriginRecords {
+    native: Vec<Arc<NativeMemoryOrigin>>,
+    supplied: Vec<std::sync::Weak<dyn Tool>>,
+    #[cfg(test)]
+    constructed: Vec<NativeMemoryKind>,
+    /// Observations only: weak actual constructor inputs add no policy lifetime.
+    #[cfg(test)]
+    constructed_policy_chains: Vec<(NativeMemoryKind, Vec<std::sync::Weak<SecurityPolicy>>)>,
+}
+
+/// Metadata shares the existing registry family's lifetime, never Tool ownership.
+#[derive(Clone, Default)]
+pub(crate) struct NativeMemoryOrigins(Arc<parking_lot::Mutex<MemoryOriginRecords>>);
+
+impl NativeMemoryOrigins {
+    /// Root-family construction only: there are no delegated ancestors yet.
+    /// Bounded replacements must use `construct_bounded` with their actual chain.
+    fn construct(
+        &self,
+        kind: NativeMemoryKind,
+        binding: &Arc<NativeMemoryBinding>,
+    ) -> Arc<dyn Tool> {
+        self.construct_with_bounded_policies(kind, binding, None)
+    }
+
+    pub(crate) fn construct_bounded(
+        &self,
+        kind: NativeMemoryKind,
+        binding: &Arc<NativeMemoryBinding>,
+        policies: Arc<delegate::BoundedMemoryPolicyChain>,
+    ) -> Arc<dyn Tool> {
+        self.construct_with_bounded_policies(kind, binding, Some(policies))
+    }
+
+    fn construct_with_bounded_policies(
+        &self,
+        kind: NativeMemoryKind,
+        binding: &Arc<NativeMemoryBinding>,
+        policies: Option<Arc<delegate::BoundedMemoryPolicyChain>>,
+    ) -> Arc<dyn Tool> {
+        let memory: Arc<dyn Memory> = Arc::clone(binding) as Arc<dyn Memory>;
+        let security = Arc::clone(&binding.security);
+        #[cfg(test)]
+        let observed_policies = policies
+            .as_ref()
+            .map(|chain| chain.weak_policy_observations());
+        let actual: Arc<dyn Tool> = match kind {
+            NativeMemoryKind::Store => Arc::new(MemoryStoreTool::new(memory, security)),
+            NativeMemoryKind::Recall => Arc::new(MemoryRecallTool::new(memory)),
+            NativeMemoryKind::Forget => Arc::new(MemoryForgetTool::new(memory, security)),
+            NativeMemoryKind::Export => Arc::new(MemoryExportTool::new(memory)),
+            NativeMemoryKind::Purge => Arc::new(MemoryPurgeTool::new(memory, security)),
+        };
+        // Only the sealed creator's actual mutating kinds gain this guard.
+        // Neither an arbitrary same-named tool nor a read is reclassified.
+        let actual = if matches!(
+            kind,
+            NativeMemoryKind::Store | NativeMemoryKind::Forget | NativeMemoryKind::Purge
+        ) && let Some(policies) = policies
+        {
+            policies.wrap_act_tool(actual)
+        } else {
+            actual
+        };
+        let witness = Arc::new(NativeMemoryOrigin {
+            kind,
+            actual: Arc::downgrade(&actual),
+            binding: Arc::downgrade(binding),
+        });
+        let mut records = self.0.lock();
+        records
+            .native
+            .retain(|entry| entry.actual.strong_count() != 0);
+        records.native.push(witness);
+        #[cfg(test)]
+        records.constructed.push(kind);
+        #[cfg(test)]
+        if let Some(chain) = observed_policies {
+            records.constructed_policy_chains.push((kind, chain));
+        }
+        actual
+    }
+
+    pub(crate) fn prove(&self, actual: &Arc<dyn Tool>) -> Option<Arc<NativeMemoryOrigin>> {
+        let mut records = self.0.lock();
+        records
+            .native
+            .retain(|entry| entry.actual.strong_count() != 0);
+        records
+            .native
+            .iter()
+            .find(|entry| {
+                entry.binding.upgrade().is_some()
+                    && entry
+                        .actual
+                        .upgrade()
+                        .is_some_and(|owned| Arc::ptr_eq(&owned, actual))
+            })
+            .cloned()
+    }
+
+    pub(crate) fn snapshot(&self, tools: &[Arc<dyn Tool>]) -> Vec<NativeMemorySnapshotEntry> {
+        let mut records = self.0.lock();
+        records
+            .native
+            .retain(|entry| entry.actual.strong_count() != 0);
+        tools
+            .iter()
+            .map(|actual| {
+                let witness = records
+                    .native
+                    .iter()
+                    .find(|entry| {
+                        entry.binding.upgrade().is_some()
+                            && entry
+                                .actual
+                                .upgrade()
+                                .is_some_and(|owned| Arc::ptr_eq(&owned, actual))
+                    })
+                    .cloned();
+                (Arc::clone(actual), witness)
+            })
+            .collect()
+    }
+
+    pub(crate) fn mark_supplied(&self, actual: &Arc<dyn Tool>) {
+        let mut records = self.0.lock();
+        records.supplied.retain(|entry| entry.strong_count() != 0);
+        if !records.supplied.iter().any(|entry| {
+            entry
+                .upgrade()
+                .is_some_and(|owned| Arc::ptr_eq(&owned, actual))
+        }) {
+            records.supplied.push(Arc::downgrade(actual));
+        }
+    }
+
+    pub(crate) fn is_supplied(&self, actual: &Arc<dyn Tool>) -> bool {
+        let mut records = self.0.lock();
+        records.supplied.retain(|entry| entry.strong_count() != 0);
+        records.supplied.iter().any(|entry| {
+            entry
+                .upgrade()
+                .is_some_and(|owned| Arc::ptr_eq(&owned, actual))
+        })
+    }
+}
+
+/// Per-view wrapper identity points to the SAME creator witness as the parent
+/// handle. The private pointer key never establishes native origin by itself.
+#[derive(Default)]
+pub(crate) struct NativeMemoryProjection {
+    pub(crate) origins: NativeMemoryOrigins,
+    wrappers: HashMap<usize, MemoryWrapperOrigin>,
+    binding: std::sync::Weak<NativeMemoryBinding>,
+}
+
+struct MemoryWrapperOrigin {
+    wrapper: std::sync::Weak<dyn Tool>,
+    actual: std::sync::Weak<dyn Tool>,
+    native_memory: Option<Arc<NativeMemoryOrigin>>,
+    supplied: bool,
+}
+
+impl NativeMemoryProjection {
+    fn key(tool: &dyn Tool) -> usize {
+        tool as *const dyn Tool as *const () as usize
+    }
+
+    pub(crate) fn wrap_actual_tools(&mut self, tools: &[Arc<dyn Tool>]) -> Vec<Box<dyn Tool>> {
+        tools
+            .iter()
+            .map(|actual| {
+                let witness = self.origins.prove(actual);
+                let supplied = self.origins.is_supplied(actual);
+                self.publish(Arc::clone(actual), witness, supplied)
+            })
+            .collect()
+    }
+
+    pub(crate) fn publish(
+        &mut self,
+        actual: Arc<dyn Tool>,
+        witness: Option<Arc<NativeMemoryOrigin>>,
+        supplied: bool,
+    ) -> Box<dyn Tool> {
+        if witness.is_none() && !supplied {
+            return ArcDelegatingTool::boxed(actual);
+        }
+        let wrapper: Arc<dyn Tool> = Arc::new(ArcToolRef(Arc::clone(&actual)));
+        let boxed: Box<dyn Tool> = Box::new(ArcToolRef(Arc::clone(&wrapper)));
+        self.wrappers.insert(
+            Self::key(boxed.as_ref()),
+            MemoryWrapperOrigin {
+                wrapper: Arc::downgrade(&wrapper),
+                actual: Arc::downgrade(&actual),
+                native_memory: witness,
+                supplied,
+            },
+        );
+        boxed
+    }
+
+    pub(crate) fn take(
+        &mut self,
+        tool: &dyn Tool,
+    ) -> (Option<Arc<dyn Tool>>, Option<Arc<NativeMemoryOrigin>>, bool) {
+        let Some(entry) = self.wrappers.remove(&Self::key(tool)) else {
+            return (None, None, false);
+        };
+        // The private wrapper is strongly owned only by the original Box.
+        // Removing that Box expires this witness, so allocator address reuse
+        // cannot promote a replacement Box or replay its creator metadata.
+        let (Some(wrapper), Some(actual)) = (entry.wrapper.upgrade(), entry.actual.upgrade())
+        else {
+            return (None, None, false);
+        };
+        drop(wrapper);
+        (Some(actual), entry.native_memory, entry.supplied)
+    }
+
+    /// Whether a sealed entry is the published view of a source-supplied tool.
+    pub(crate) fn is_supplied_entry(&self, tool: &dyn Tool) -> bool {
+        self.wrappers
+            .get(&Self::key(tool))
+            .is_some_and(|entry| entry.supplied && entry.wrapper.upgrade().is_some())
+    }
+
+    pub(crate) fn retains_source(
+        &self,
+        tools: &[Box<dyn Tool>],
+        candidate: &Arc<dyn Tool>,
+    ) -> bool {
+        tools.iter().any(|tool| {
+            self.wrappers
+                .get(&Self::key(tool.as_ref()))
+                .is_some_and(|entry| {
+                    entry.supplied
+                        && entry.wrapper.upgrade().is_some()
+                        && entry
+                            .actual
+                            .upgrade()
+                            .is_some_and(|actual| Arc::ptr_eq(&actual, candidate))
+                })
+        })
+    }
+
+    pub(crate) fn retain(&mut self, tools: &[Box<dyn Tool>]) {
+        let live: std::collections::HashSet<_> =
+            tools.iter().map(|tool| Self::key(tool.as_ref())).collect();
+        self.wrappers.retain(|key, _| live.contains(key));
     }
 }
 
@@ -2605,6 +3534,44 @@ fn plugin_config_values(
         })
 }
 
+/// Resolve one plugin instance's configuration from canonical config: the row
+/// under `config_entry_key`, validated by
+/// [`zeroclaw_plugins::config::resolve_plugin_config_from`] under `scope`, with
+/// the instance's TLS secret material reserved for the host and the TLS
+/// coherence witness of the same config view.
+///
+/// This is the runtime's whole per-instance config check. The host services'
+/// resolver runs it for every instance the runtime constructs, and
+/// [`crate::plugin_runtime::tool_instance_config_verdict`] runs it for a
+/// report, so the two cannot disagree. `read` yields the config view; it is
+/// called at most once, after the schema and grant checks that need no values.
+#[cfg(feature = "plugins-wasm")]
+pub(crate) fn resolve_instance_config<C: std::ops::Deref<Target = Config>>(
+    manifest: &zeroclaw_plugins::PluginManifest,
+    scope: &zeroclaw_plugins::instance::PluginInstanceScope,
+    config_entry_key: &str,
+    read: impl FnOnce() -> C,
+) -> Result<zeroclaw_plugins::config::ResolvedPluginConfig, zeroclaw_plugins::error::PluginError> {
+    let package = scope.id().package();
+    // Filled from the same config view the values come from, so the reserved
+    // set and the secrets it withholds share one revision.
+    let mut host_only = Vec::new();
+    let mut witness = None;
+    let resolved = zeroclaw_plugins::config::resolve_plugin_config_from(manifest, scope, || {
+        let config = read();
+        witness = Some(plugin_tls_config_witness(&config, config_entry_key)?);
+        host_only = plugin_tls_secret_properties(&config, config_entry_key);
+        plugin_config_values(&config, config_entry_key, package)
+    })?;
+    let resolved = resolved.reserve_for_host(host_only);
+    // A schema permitted to withhold config does not invoke the source
+    // closure. Preserve that empty view; it cannot materialize TLS secrets.
+    Ok(match witness {
+        Some(witness) => resolved.with_tls_config_witness(witness),
+        None => resolved,
+    })
+}
+
 #[cfg(feature = "plugins-wasm")]
 pub(crate) fn plugin_host_services(
     host: Arc<zeroclaw_plugins::host::PluginHost>,
@@ -2626,41 +3593,18 @@ pub(crate) fn plugin_host_services(
         let manifest = host
             .manifest(package)
             .ok_or_else(|| zeroclaw_plugins::error::PluginError::NotFound(package.to_string()))?;
-        // Filled from the same config view the values come from, so the
-        // reserved set and the secrets it withholds share one revision.
-        let mut host_only = Vec::new();
-        let mut witness = None;
-        let resolved = if let Some(live_config) = &live_config {
-            zeroclaw_plugins::config::resolve_plugin_config_from(manifest, scope, || {
-                // Transient per-call view: schema/grant checks happen before
-                // this access, and the global lock is released before guest
-                // setup.
-                let config = live_config.read();
-                witness = Some(plugin_tls_config_witness(&config, &config_entry_key)?);
-                host_only = plugin_tls_secret_properties(&config, &config_entry_key);
-                plugin_config_values(&config, &config_entry_key, package)
-            })
+        if let Some(live_config) = &live_config {
+            // Transient per-call view: schema/grant checks happen before this
+            // access, and the global lock is released before guest setup.
+            resolve_instance_config(manifest, scope, &config_entry_key, || live_config.read())
         } else {
             let config = fallback_config.as_ref().ok_or_else(|| {
                 zeroclaw_plugins::error::PluginError::InvalidConfig(
                     "plugin config source is unavailable".to_string(),
                 )
             })?;
-            zeroclaw_plugins::config::resolve_plugin_config_from(manifest, scope, || {
-                witness = Some(plugin_tls_config_witness(config, &config_entry_key)?);
-                host_only = plugin_tls_secret_properties(config, &config_entry_key);
-                plugin_config_values(config, &config_entry_key, package)
-            })
-        };
-        resolved.map(|resolved| {
-            let resolved = resolved.reserve_for_host(host_only);
-            // A schema permitted to withhold config does not invoke the source
-            // closure. Preserve that empty view; it cannot materialize TLS secrets.
-            match witness {
-                Some(witness) => resolved.with_tls_config_witness(witness),
-                None => resolved,
-            }
-        })
+            resolve_instance_config(manifest, scope, &config_entry_key, || &**config)
+        }
     });
     let state = zeroclaw_plugins::services::PluginStateService::new(
         crate::plugin_state::PluginStateStore::new(&data_dir, &config_dir),
@@ -2819,7 +3763,12 @@ pub(crate) fn all_tools_with_runtime_context(
     //   job, whose own turn is correctly filtered and whose child would not be.
     caller_ceiling: Option<caller_ceiling::CallerCeiling>,
 ) -> anyhow::Result<AllToolsResult> {
+    let owner = memory.principal_scope();
+    #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+    let late_trace = late_tool_search_observer::capture();
     let builder = move || {
+        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+        let _late_guard = late_tool_search_observer::enter_builder(late_trace);
         // Warm the lazy regexes BEFORE the registry build and BEFORE any
         // turn can start: LazyLock runs the initializer on whichever thread
         // reaches it first, so a turn racing an un-joined warmup would
@@ -2865,13 +3814,20 @@ pub(crate) fn all_tools_with_runtime_context(
                     "failed to spawn tool-registry builder thread: {error}"
                 ))
             })?;
-        match handle.join() {
+        let result = match handle.join() {
             Ok(result) => result,
             // Preserve the inline build's panic semantics: a builder panic is
             // resumed on the caller's thread exactly as if it had unwound
             // through the caller's frames.
             Err(panic) => std::panic::resume_unwind(panic),
+        }?;
+        // Child runs and cross-agent SOP steps arrive with already-private
+        // memory and never pass through Agent's later session routing. Bind
+        // the same delegate instance its canonical name and aliases retain.
+        if let (Some(owner), Some(delegate)) = (owner, result.delegate_tool.as_ref()) {
+            delegate.bind_principal_scope(owner)?;
         }
+        Ok(result)
     })
 }
 
@@ -3016,7 +3972,7 @@ fn all_tools_with_runtime_on_thread(
     memory: Arc<dyn Memory>,
     composio_key: Option<&str>,
     composio_entity_id: Option<&str>,
-    browser_config: &zeroclaw_config::schema::BrowserConfig,
+    _browser_config: &zeroclaw_config::schema::BrowserConfig,
     http_config: &zeroclaw_config::schema::HttpRequestConfig,
     web_fetch_config: &zeroclaw_config::schema::WebFetchConfig,
     workspace_dir: &std::path::Path,
@@ -3036,6 +3992,8 @@ fn all_tools_with_runtime_on_thread(
     // verbatim through the builder closure above.
     caller_ceiling: Option<caller_ceiling::CallerCeiling>,
 ) -> anyhow::Result<AllToolsResult> {
+    #[cfg(feature = "tools-external")]
+    let browser_config = _browser_config;
     let has_shell_access = runtime.has_shell_access();
     let persistent_writes = runtime.has_filesystem_access();
     let register_coding_cli_tools = has_shell_access && persistent_writes;
@@ -3047,6 +4005,12 @@ fn all_tools_with_runtime_on_thread(
         let context = format!("agents.{agent_alias}: {error}");
         anyhow::Error::new(error).context(context)
     })?;
+    #[cfg(any(
+        feature = "tool-claude-code",
+        feature = "tool-codex-cli",
+        feature = "tool-gemini-cli",
+        feature = "tool-opencode-cli"
+    ))]
     let coding_cli_executor = coding_cli_executor::RuntimeCodingCliExecutor::shared(
         runtime.clone(),
         sandbox.clone(),
@@ -3060,7 +4024,53 @@ fn all_tools_with_runtime_on_thread(
     // of each taking a full `Config` clone: registry construction (per agent
     // build and per channel-message turn) previously paid three deep copies.
     let root_config_shared = Arc::new(root_config.clone());
-    let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
+    // One route for the tools here that start memory work of their own; the
+    // sealed registry pins it when its session is pinned to an owner.
+    let session_memory = Arc::new(zeroclaw_tools::session_memory::SessionMemoryRoute::default());
+    // A registry built over memory that is already an owner's plane (a
+    // delegated target, a SOP step, or a child run of an owned session)
+    // belongs to that owner from the start. Pin its route now: nothing pins
+    // it later, and an empty route reads as an unowned session, so its
+    // spawner and pipeline would fall back to the agent's shared memory.
+    if memory.principal_scope().is_some() {
+        let pinned = session_memory.pin(Arc::clone(&memory), Arc::clone(security));
+        debug_assert!(pinned.is_ok(), "a fresh route holds no other handle");
+    }
+    let mut capability_slots = Vec::new();
+    let mut native_memory = NativeMemoryProjection::default();
+    let memory_origins = native_memory.origins.clone();
+    let memory_binding = std::sync::OnceLock::<Arc<NativeMemoryBinding>>::new();
+    let mut construct_memory = |kind| {
+        let binding = memory_binding.get_or_init(|| {
+            Arc::new(NativeMemoryBinding::new(
+                Arc::clone(&memory),
+                Arc::clone(security),
+            ))
+        });
+        native_memory.binding = Arc::downgrade(binding);
+        memory_origins.construct(kind, binding)
+    };
+    let mut tool_arcs: Vec<Arc<dyn Tool>> = Vec::new();
+    let mut reserved_host_names = std::collections::HashSet::new();
+    reserve_deferred_host_names(root_config, &mut reserved_host_names);
+    macro_rules! select_tool {
+        ($name:expr) => {
+            select_declared_builtin_tool(&root_config.tools, &mut reserved_host_names, $name)
+        };
+    }
+    macro_rules! register_tool {
+        ($name:expr, $constructor:expr) => {
+            register_builtin_tool(
+                &root_config.tools,
+                &mut tool_arcs,
+                &mut reserved_host_names,
+                $name,
+                || $constructor,
+            );
+        };
+    }
+    register_tool!(
+        "shell",
         Arc::new(RateLimitedTool::new(
             shell_tool
                 .with_timeout_secs(if security.shell_timeout_secs > 0 {
@@ -3071,145 +4081,207 @@ fn all_tools_with_runtime_on_thread(
                 .with_shared_tui_env(tui_env)
                 .with_persistent_writes(persistent_writes),
             security.clone(),
-        )),
+        ))
+    );
+    register_tool!(
+        "file_read",
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
                 FileReadTool::new_with_persistence(security.clone(), persistent_writes),
                 security.clone(),
             ),
             security.clone(),
-        )),
+        ))
+    );
+    register_tool!(
+        "deliver_file",
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(DeliverFileTool::new(security.clone()), security.clone()),
             security.clone(),
-        )),
+        ))
+    );
+    register_tool!(
+        "file_write",
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
                 FileWriteTool::new_with_persistence(security.clone(), persistent_writes),
                 security.clone(),
             ),
             security.clone(),
-        )),
+        ))
+    );
+    register_tool!(
+        "file_edit",
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
                 FileEditTool::new_with_persistence(security.clone(), persistent_writes),
                 security.clone(),
             ),
             security.clone(),
-        )),
+        ))
+    );
+    register_tool!(
+        "glob_search",
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(GlobSearchTool::new(security.clone()), security.clone()),
             security.clone(),
-        )),
+        ))
+    );
+    register_tool!(
+        "content_search",
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(ContentSearchTool::new(security.clone()), security.clone()),
             security.clone(),
-        )),
-        // The three scheduler tools carry the loop's own ceiling when it has
-        // one. The bounded delegate path rebuilds them with the sealed handle;
-        // every OTHER loop that runs under a ceiling — a spawned child, or any
-        // `run` given a per-run allowlist — reaches them through here, and the
-        // stored job is the only carrier that survives to the scheduler.
-        cron_add_tool(
+        ))
+    );
+    // The three scheduler tools carry the loop's own ceiling so a job a bounded
+    // chain stores cannot outlive it with a wider tool set than the chain held.
+    register_tool!(
+        "cron_add",
+        Arc::new(CronAddTool::new_with_runtime(
             config.clone(),
             security.clone(),
             agent_alias,
             runtime.clone(),
             caller_ceiling.clone(),
-        ),
-        cron_list_tool(config.clone(), agent_alias),
-        cron_remove_tool(config.clone(), security.clone(), agent_alias),
-        cron_update_tool(
+        ))
+    );
+    register_tool!(
+        "cron_list",
+        Arc::new(CronListTool::new(config.clone(), agent_alias))
+    );
+    register_tool!(
+        "cron_remove",
+        Arc::new(CronRemoveTool::new(
+            config.clone(),
+            security.clone(),
+            agent_alias,
+        ))
+    );
+    register_tool!(
+        "cron_update",
+        Arc::new(CronUpdateTool::new_with_runtime(
             config.clone(),
             security.clone(),
             agent_alias,
             runtime.clone(),
             caller_ceiling.clone(),
-        ),
-        cron_run_tool(
+        ))
+    );
+    register_tool!("cron_run", {
+        let tool = CronRunTool::new_with_runtime_and_capability(
             config.clone(),
             security.clone(),
             agent_alias,
             runtime.clone(),
             caller_ceiling.clone(),
             execution_capability.clone(),
-        ),
-        cron_runs_tool(config.clone(), agent_alias),
-        Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
-        Arc::new(MemoryRecallTool::new(memory.clone())),
-        Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())),
-        Arc::new(MemoryExportTool::new(memory.clone())),
-        Arc::new(MemoryPurgeTool::new(memory.clone(), security.clone())),
-        schedule_tool(
+        );
+        capability_slots.push(tool.capabilities_slot());
+        Arc::new(tool)
+    });
+    register_tool!(
+        "cron_runs",
+        Arc::new(CronRunsTool::new(config.clone(), agent_alias))
+    );
+    register_tool!("memory_store", construct_memory(NativeMemoryKind::Store));
+    register_tool!("memory_recall", construct_memory(NativeMemoryKind::Recall));
+    register_tool!("memory_forget", construct_memory(NativeMemoryKind::Forget));
+    register_tool!("memory_export", construct_memory(NativeMemoryKind::Export));
+    register_tool!("memory_purge", construct_memory(NativeMemoryKind::Purge));
+    register_tool!(
+        "schedule",
+        Arc::new(ScheduleTool::new_with_runtime(
             security.clone(),
             Arc::clone(&root_config_shared),
             agent_alias,
             runtime.clone(),
-            // Same sealed ceiling the cron tools and `spawn_subagent` receive:
-            // a replayed bounded job must not gain deferred shell execution
-            // here that its own turn was refused.
             caller_ceiling.clone(),
-        ),
-        spawn_subagent_tool(
-            config.clone(),
+        ))
+    );
+    // `spawn_subagent` and `send_message_to_peer` carry the ceiling as well:
+    // passing `None` here would cap what a bounded chain can persist and then
+    // hand the replay an uncapped way to spawn or relay out of it. Both take it
+    // through an optional builder, so the compiler does not force it.
+    register_tool!("spawn_subagent", {
+        let tool = SpawnSubagentTool::new(
+            Arc::clone(&root_config_shared),
             agent_alias,
             security.clone(),
-            is_subagent_caller,
-            // The ceiling has to reach here too, and for a reason that is easy to
-            // miss: a run can BE bounded without being a bounded delegate. A cron
-            // job stored under a ceiling is replayed by the scheduler through
-            // `agent::run` with that stored list, so the job's own first turn is
-            // filtered correctly — but the `spawn_subagent` in THIS registry is
-            // what that turn would use to escape, by assembling its child from the
-            // owning agent's full policy. Passing `None` here would cap what a
-            // bounded chain can persist and then hand the replay an uncapped way
-            // to spawn out of it.
-            caller_ceiling.clone(),
-            execution_capability.clone(),
-        ),
-        send_message_to_peer_tool(
-            config.clone(),
+        )
+        .with_caller_ceiling(caller_ceiling.clone())
+        .with_subagent_caller(is_subagent_caller)
+        .with_execution_capability(execution_capability.clone())
+        .with_session_memory(Arc::clone(&session_memory));
+        capability_slots.push(tool.capabilities_slot());
+        Arc::new(tool)
+    });
+    register_tool!("send_message_to_peer", {
+        let tool = SendMessageToPeerTool::new_with_live_config_and_capability(
+            Arc::clone(&root_config_shared),
             agent_alias,
             live_config.clone(),
             execution_capability.clone(),
-            caller_ceiling.clone(),
-        ),
-        model_routing_config_tool(security.clone(), config.clone()),
-        Arc::new(ModelSwitchTool::new(security.clone(), config.clone())),
-        proxy_config_tool(security.clone(), config.clone()),
-        // Sandboxed command boundary. A `Bounded` delegate target rebuilds this
-        // tool through `git_operations_tool` (`delegate.rs`'s
-        // `rebuild_target_git_operations_tool`), which builds the same boundary
-        // from the TARGET's own sandbox and runtime kind.
+        )
+        .with_caller_ceiling(caller_ceiling.clone());
+        capability_slots.push(tool.capabilities_slot());
+        Arc::new(tool)
+    });
+    register_tool!(
+        "model_routing_config",
+        Arc::new(ModelRoutingConfigTool::new(
+            config.clone(),
+            security.clone(),
+        ))
+    );
+    if !is_subagent_caller {
+        register_tool!(
+            "model_switch",
+            Arc::new(ModelSwitchTool::new(security.clone(), config.clone()))
+        );
+    }
+    register_tool!(
+        "proxy_config",
+        Arc::new(ProxyConfigTool::new(config.clone(), security.clone()))
+    );
+    register_tool!(
+        "git_operations",
         Arc::new(GitOperationsTool::new_with_command_boundary(
             security.clone(),
             Arc::new(RuntimeGitCommandBoundary {
                 sandbox: sandbox.clone(),
                 runtime_kind: root_config.runtime.kind,
             }),
-        )),
-        pushover_tool(security.clone(), workspace_dir),
-        Arc::new(CalculatorTool::new()),
-        Arc::new(WeatherTool::new()),
-        Arc::new(CanvasTool::new(canvas_store.unwrap_or_default())),
-        Arc::new(TodoWriteTool::new()),
-    ];
-
-    // A SubAgent runs as an ephemeral clone of its parent and inherits the
-    // parent's model verbatim; it must not be able to switch the active
-    // model out from under the parent (the switch signal is process-wide).
-    if is_subagent_caller {
-        tool_arcs.retain(|tool| tool.name() != ModelSwitchTool::NAME);
-    }
+        ))
+    );
+    #[cfg(feature = "tools-external")]
+    register_tool!(
+        "pushover",
+        Arc::new(PushoverTool::new(
+            security.clone(),
+            workspace_dir.to_path_buf(),
+        ))
+    );
+    register_tool!("calculator", Arc::new(CalculatorTool::new()));
+    #[cfg(feature = "tools-external")]
+    register_tool!("weather", Arc::new(WeatherTool::new()));
+    register_tool!(
+        "canvas",
+        Arc::new(CanvasTool::new(canvas_store.unwrap_or_default()))
+    );
+    register_tool!("TodoWrite", Arc::new(TodoWriteTool::new()));
 
     // Register discord_search if any configured Discord alias has
     // archive enabled. Multiple Discord aliases are supported (one per
     // bot/server set); the search tool reads from a shared archive DB
     // so it's enabled when at least one alias archives.
-    if root_config.channels.discord.values().any(|d| d.archive) {
+    if root_config.channels.discord.values().any(|d| d.archive) && select_tool!("discord_search") {
         match zeroclaw_memory::SqliteMemory::new_named("sqlite", &config.data_dir, "discord") {
             Ok(discord_mem) => {
-                tool_arcs.push(Arc::new(DiscordSearchTool::new(Arc::new(discord_mem))));
+                register_tool!(
+                    "discord_search",
+                    Arc::new(DiscordSearchTool::new(Arc::new(discord_mem)))
+                );
             }
             Err(e) => {
                 ::zeroclaw_log::record!(
@@ -3224,6 +4296,13 @@ fn all_tools_with_runtime_on_thread(
     }
 
     // email_search — registered when at least one email channel is enabled
+    #[cfg(feature = "tools-external")]
+    if root_config
+        .channels
+        .email
+        .values()
+        .any(|channel| channel.enabled)
+        && (select_tool!("email_search") | select_tool!("email_read"))
     {
         let email_configs: std::collections::HashMap<
             String,
@@ -3245,56 +4324,183 @@ fn all_tools_with_runtime_on_thread(
                 None
             };
             let configs = Arc::new(email_configs);
-            tool_arcs.push(Arc::new(EmailSearchTool::new(
-                Arc::clone(&configs),
-                auth_service.clone(),
-            )));
-            tool_arcs.push(Arc::new(EmailReadTool::new(
-                Arc::clone(&configs),
-                auth_service,
-            )));
+            register_tool!(
+                "email_search",
+                Arc::new(EmailSearchTool::new(
+                    Arc::clone(&configs),
+                    auth_service.clone(),
+                ))
+            );
+            register_tool!(
+                "email_read",
+                Arc::new(EmailReadTool::new(Arc::clone(&configs), auth_service,))
+            );
         }
     }
 
-    // LLM task tool — registered using the calling agent's provider. Built
-    // through the same `llm_task_tool` factory the bounded rebuild in
-    // `delegate.rs` uses, so alias-aware provider construction (preserving
-    // typed alias-specific config such as `requires_openai_auth`) can't drift
-    // between the two call sites the way a second inline copy would.
-    if let Some(tool) = llm_task_tool(security.clone(), &root_config_shared, agent_alias) {
-        tool_arcs.push(tool);
+    // LLM task tool — registered using the calling agent's provider.
+    // Preserves family + alias identity so alias-specific typed config
+    // (e.g. requires_openai_auth) survives into llm_task execution.
+    if let Some((family, alias, entry)) = root_config.resolved_model_provider_for_agent(agent_alias)
+        && select_tool!("llm_task")
+    {
+        let llm_task_model = entry
+            .model
+            .clone()
+            .unwrap_or_else(|| "openai/gpt-4o-mini".to_string());
+        let llm_task_runtime_options =
+            zeroclaw_providers::provider_runtime_options_for_alias(root_config, family, alias);
+        register_tool!(
+            "llm_task",
+            Arc::new(LlmTaskTool::new(
+                security.clone(),
+                config.clone(),
+                family.to_string(),
+                alias.to_string(),
+                llm_task_model,
+                entry.temperature,
+                entry.api_key.clone(),
+                llm_task_runtime_options,
+            ))
+        );
     }
 
-    // ReadSkillTool holds full config to support workspace skills,
-    // open-skills, agent-bound bundles, and plugin skills.
-    if let Some(tool) = read_skill_tool(config.clone(), agent_alias) {
-        tool_arcs.push(tool);
+    let effective_skills =
+        crate::skills::load_skills_for_agent_from_config(root_config, agent_alias);
+    if crate::skills::skills_require_read_tool(
+        &effective_skills,
+        root_config.effective_skills_prompt_mode(agent_alias),
+    ) && select_tool!("read_skill")
+    {
+        // ReadSkillTool holds full config to resolve the effective set again at
+        // call time: workspace skills, open-skills, agent-bound bundles,
+        // plugin skills, and embedded built-ins.
+        register_tool!(
+            "read_skill",
+            Arc::new(ReadSkillTool::new(config.clone(), agent_alias.to_string(),))
+        );
     }
 
-    // Both factories now carry their own gate internally (`browser_open_tool`
-    // on `enabled`, `browser_tool` on `automation_enabled` — see its own
-    // doc-comment for why that check moved into the shared factory rather
-    // than staying top-level-only).
-    if let Some(tool) = browser_open_tool(security.clone(), browser_config) {
-        tool_arcs.push(tool);
+    #[cfg(feature = "tools-external")]
+    if browser_config.enabled && select_tool!("browser_open") {
+        // Add legacy browser_open tool for simple URL opening
+        match BrowserOpenTool::new_with_private_hosts(
+            security.clone(),
+            browser_config.allowed_domains.clone(),
+            browser_config.allowed_private_hosts.clone(),
+        ) {
+            Ok(tool) => {
+                tool_arcs.push(Arc::new(tool));
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "browser_open: failed to construct tool, skipping registration"
+                );
+            }
+        }
     }
-    if let Some(tool) = browser_tool(security.clone(), browser_config) {
-        tool_arcs.push(tool);
+
+    // Full browser automation (pluggable backend) is a separate opt-in from
+    // `browser_open`: it drives a real Chrome/Chromium session that may
+    // already be logged in, so `[browser] enabled` alone must not grant it.
+    #[cfg(feature = "tools-external")]
+    if browser_config.automation_enabled && select_tool!("browser") {
+        match BrowserTool::new_with_backend(
+            security.clone(),
+            browser_config.allowed_domains.clone(),
+            browser_config.session_name.clone(),
+            browser_config.backend.clone(),
+            browser_config.headed,
+            browser_config.native_headless,
+            browser_config.native_webdriver_url.clone(),
+            browser_config.native_chrome_path.clone(),
+            ComputerUseConfig {
+                endpoint: browser_config.computer_use.endpoint.clone(),
+                api_key: browser_config.computer_use.api_key.clone(),
+                timeout_ms: browser_config.computer_use.timeout_ms,
+                allow_remote_endpoint: browser_config.computer_use.allow_remote_endpoint,
+                window_allowlist: browser_config.computer_use.window_allowlist.clone(),
+                max_coordinate_x: browser_config.computer_use.max_coordinate_x,
+                max_coordinate_y: browser_config.computer_use.max_coordinate_y,
+            },
+            browser_config.allowed_private_hosts.clone(),
+        ) {
+            Ok(tool) => {
+                tool_arcs.push(Arc::new(RateLimitedTool::new(tool, security.clone())));
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "browser: failed to construct tool, skipping registration"
+                );
+            }
+        }
     }
 
     // Browser delegation tool (conditionally registered; requires shell access)
-    if let Some(tool) = browser_delegate_tool(security.clone(), root_config, has_shell_access) {
-        tool_arcs.push(tool);
+    #[cfg(feature = "tools-external")]
+    if root_config.browser_delegate.enabled && select_tool!("browser_delegate") {
+        if has_shell_access {
+            register_tool!(
+                "browser_delegate",
+                Arc::new(BrowserDelegateTool::new(
+                    security.clone(),
+                    root_config.browser_delegate.clone(),
+                ))
+            );
+        } else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "browser_delegate: skipped registration because the current runtime does not allow shell access"
+            );
+        }
     }
 
-    if let Some(tool) = http_request_tool(security.clone(), http_config, root_config) {
-        tool_arcs.push(tool);
+    if http_config.enabled && select_tool!("http_request") {
+        match HttpRequestTool::new_with_config(
+            security.clone(),
+            http_config.allowed_domains.clone(),
+            http_config.max_response_size,
+            http_config.timeout_secs,
+            http_config.allow_private_hosts,
+            http_config.allowed_private_hosts.clone(),
+            root_config.security.nat64_prefixes.clone(),
+            root_config.config_path.clone(),
+            root_config.secrets.encrypt,
+        ) {
+            Ok(tool) => {
+                tool_arcs.push(Arc::new(RateLimitedTool::new(tool, security.clone())));
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "http_request: failed to construct tool, skipping registration"
+                );
+            }
+        }
     }
 
     // A2A outbound client (conditionally registered; opt-in via [a2a.client] enabled).
     // The four a2a_* tools share one client holding the live config handle, so
     // peer/credential/security resolution happens at call time (no stored peer Vec).
-    if root_config.a2a.client.enabled {
+    if root_config.a2a.client.enabled
+        && ["a2a_discover", "a2a_send", "a2a_get_task", "a2a_cancel"]
+            .iter()
+            .map(|name| select_tool!(name))
+            .fold(false, |selected, enabled| selected | enabled)
+    {
         let live = live_config.clone().unwrap_or_else(|| {
             zeroclaw_config::live::LiveConfig::new(root_config.clone()).handle()
         });
@@ -3328,10 +4534,10 @@ fn all_tools_with_runtime_on_thread(
                 // every successful network call (RateLimitedTool.record_action
                 // after success), and a post-I/O rate-limit failure could hide
                 // a successful remote result from the agent.
-                tool_arcs.push(Arc::new(A2aDiscoverTool::new(
-                    Arc::clone(&client),
-                    security.clone(),
-                )));
+                register_tool!(
+                    "a2a_discover",
+                    Arc::new(A2aDiscoverTool::new(Arc::clone(&client), security.clone(),))
+                );
                 // Act tools (send/cancel) are NOT wrapped in RateLimitedTool:
                 // they pre-charge the action budget via enforce_tool_operation(Act)
                 // before network I/O. RateLimitedTool would post-charge again,
@@ -3340,18 +4546,18 @@ fn all_tools_with_runtime_on_thread(
                 // which can cause the agent to retry an already-created/canceled
                 // task. The pre-charge in execute() covers both autonomy gating
                 // and rate limiting (record_action fails on budget exhaustion).
-                tool_arcs.push(Arc::new(A2aSendTool::new(
-                    Arc::clone(&client),
-                    security.clone(),
-                )));
-                tool_arcs.push(Arc::new(A2aGetTaskTool::new(
-                    Arc::clone(&client),
-                    security.clone(),
-                )));
-                tool_arcs.push(Arc::new(A2aCancelTool::new(
-                    Arc::clone(&client),
-                    security.clone(),
-                )));
+                register_tool!(
+                    "a2a_send",
+                    Arc::new(A2aSendTool::new(Arc::clone(&client), security.clone(),))
+                );
+                register_tool!(
+                    "a2a_get_task",
+                    Arc::new(A2aGetTaskTool::new(Arc::clone(&client), security.clone(),))
+                );
+                register_tool!(
+                    "a2a_cancel",
+                    Arc::new(A2aCancelTool::new(Arc::clone(&client), security.clone(),))
+                );
             }
             Err(e) => {
                 ::zeroclaw_log::record!(
@@ -3370,68 +4576,250 @@ fn all_tools_with_runtime_on_thread(
     }
 
     // Text browser tool (headless text-based browser rendering)
-    if let Some(tool) = text_browser_tool(security.clone(), root_config) {
-        tool_arcs.push(tool);
+    #[cfg(feature = "tools-external")]
+    if root_config.text_browser.enabled && select_tool!("text_browser") {
+        match TextBrowserTool::new_with_private_hosts(
+            security.clone(),
+            root_config.text_browser.preferred_browser.clone(),
+            root_config.text_browser.timeout_secs,
+            root_config.text_browser.allowed_private_hosts.clone(),
+            root_config.security.nat64_prefixes.clone(),
+        ) {
+            Ok(tool) => {
+                tool_arcs.push(Arc::new(tool));
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "text_browser: failed to construct tool, skipping registration"
+                );
+            }
+        }
     }
 
-    // Web search tool (enabled by default for GLM and other models)
-    if root_config.web_search.enabled {
+    // Web search requires explicit selection and provider configuration
+    #[cfg(feature = "tools-external")]
+    if root_config.web_search.enabled && select_tool!("web_search_tool") {
         // Rate-limited like every other outbound-network tool (see web_fetch
         // and http_request above): without the wrapper an agent loop could
         // issue unbounded searches against the configured provider — and
         // against the default DuckDuckGo scrape path, which gets the machine
         // blocked.
-        if let Some(tool) = web_search_tool(security.clone(), root_config) {
-            tool_arcs.push(tool);
-        }
+        register_tool!(
+            "web_search_tool",
+            Arc::new(RateLimitedTool::new(
+                WebSearchTool::new_with_config_and_anysearch_override(
+                root_config.web_search.search_provider.clone(),
+                root_config.web_search.brave_api_key.clone(),
+                root_config.web_search.tavily_api_key.clone(),
+                root_config.web_search.jina_api_key.clone(),
+                root_config
+                    .pre_override_snapshots
+                    .contains_key("web_search.anysearch_api_key")
+                    .then(|| root_config.web_search.anysearch_api_key.clone()),
+                root_config.web_search.searxng_instance_url.clone(),
+                root_config.web_search.max_results,
+                root_config.web_search.timeout_secs,
+                root_config.config_path.clone(),
+                root_config.secrets.encrypt,
+            )
+            .with_serply_api_key_override(serply_api_key_override(root_config))
+            // The loader applies `ZEROCLAW_web_search__keenable_api_key` in
+            // memory only. Without handing it over, the tool would reread
+            // `config.toml` and miss an env-only key, or send a stored key
+            // that a blank override was meant to suppress.
+            .with_keenable_api_key_override(WebSearchTool::keenable_api_key_override(
+                root_config,
+            )),
+                security.clone(),
+            ))
+        );
     }
 
     // Notion API tool (conditionally registered)
-    if let Some(tool) = notion_tool(security.clone(), root_config) {
-        tool_arcs.push(tool);
+    #[cfg(not(feature = "tool-notion"))]
+    warn_tool_compiled_out(
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::Notion,
+    );
+    #[cfg(feature = "tool-notion")]
+    if root_config.notion.enabled && select_tool!("notion") {
+        let notion_api_key = if root_config.notion.api_key.trim().is_empty() {
+            std::env::var("NOTION_API_KEY").unwrap_or_default()
+        } else {
+            root_config.notion.api_key.trim().to_string()
+        };
+        if notion_api_key.trim().is_empty() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "Notion tool enabled but no API key found (set notion.api_key or NOTION_API_KEY env var)"
+            );
+        } else {
+            register_tool!(
+                "notion",
+                Arc::new(NotionTool::new(notion_api_key, security.clone()))
+            );
+        }
     }
 
     // Jira integration (config-gated)
-    if let Some(tool) = jira_tool(security.clone(), root_config) {
-        tool_arcs.push(tool);
+    #[cfg(not(feature = "tool-jira"))]
+    warn_tool_compiled_out(root_config, zeroclaw_config::opt_in_tools::OptInTool::Jira);
+    #[cfg(feature = "tool-jira")]
+    if root_config.jira.enabled && select_tool!("jira") {
+        let api_token = if root_config.jira.api_token.trim().is_empty() {
+            std::env::var("JIRA_API_TOKEN").unwrap_or_default()
+        } else {
+            root_config.jira.api_token.trim().to_string()
+        };
+        if api_token.trim().is_empty() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "Jira tool enabled but no API token found (set jira.api_token or JIRA_API_TOKEN env var)"
+            );
+        } else if root_config.jira.base_url.trim().is_empty() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "Jira tool enabled but jira.base_url is empty — skipping registration"
+            );
+        } else {
+            let email = root_config
+                .jira
+                .email
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from);
+            if email.is_some() {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "Jira tool: Cloud mode (API v3, Basic auth)"
+                );
+            } else {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "Jira tool: Server/DC mode (API v2, Bearer auth)"
+                );
+            }
+            register_tool!(
+                "jira",
+                Arc::new(JiraTool::new(
+                    root_config.jira.base_url.trim().to_string(),
+                    email,
+                    api_token,
+                    root_config.jira.allowed_actions.clone(),
+                    security.clone(),
+                    root_config.jira.timeout_secs,
+                ))
+            );
+        }
     }
 
     // Project delivery intelligence
-    if root_config.project_intel.enabled {
-        tool_arcs.push(Arc::new(ProjectIntelTool::new(
-            root_config.project_intel.default_language.clone(),
-            root_config.project_intel.risk_sensitivity.clone(),
-        )));
+    #[cfg(not(feature = "tool-project-intel"))]
+    warn_tool_compiled_out(
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::ProjectIntel,
+    );
+    #[cfg(feature = "tool-project-intel")]
+    if root_config.project_intel.enabled
+        && (select_tool!("project_intel") | select_tool!("report_template"))
+    {
+        register_tool!(
+            "project_intel",
+            Arc::new(ProjectIntelTool::new(
+                root_config.project_intel.default_language.clone(),
+                root_config.project_intel.risk_sensitivity.clone(),
+            ))
+        );
         // Report template tool — direct access to template engine
-        tool_arcs.push(Arc::new(ReportTemplateTool::new()));
+        register_tool!("report_template", Arc::new(ReportTemplateTool::new()));
     }
 
     // MCSS Security Operations
     if root_config.security_ops.enabled {
-        tool_arcs.push(Arc::new(SecurityOpsTool::new(
-            root_config.security_ops.clone(),
-        )));
+        register_tool!(
+            "security_ops",
+            Arc::new(SecurityOpsTool::new(root_config.security_ops.clone(),))
+        );
     }
 
-    // Backup tool (enabled by default)
-    if let Some(tool) = backup_tool(&config.data_dir, security.clone(), root_config) {
-        tool_arcs.push(tool);
+    // Backup service config and model-visible selection are separate
+    if root_config.backup.enabled {
+        register_tool!(
+            "backup",
+            Arc::new(BackupTool::new_with_data_root_and_security(
+                config.data_dir.clone(),
+                root_config.backup.include_dirs.clone(),
+                root_config.backup.max_keep,
+                security.clone(),
+            ))
+        );
     }
 
     // Data management tool (disabled by default)
-    if let Some(tool) = data_management_tool(&config.data_dir, security.clone(), root_config) {
-        tool_arcs.push(tool);
+    if root_config.data_retention.enabled {
+        register_tool!(
+            "data_management",
+            Arc::new(DataManagementTool::new_with_data_root_and_security(
+                config.data_dir.clone(),
+                root_config.data_retention.retention_days,
+                security.clone(),
+            ),)
+        );
     }
 
     // Cloud operations advisory tools (read-only analysis)
     if root_config.cloud_ops.enabled {
-        tool_arcs.push(Arc::new(CloudOpsTool::new(root_config.cloud_ops.clone())));
-        tool_arcs.push(Arc::new(CloudPatternsTool::new()));
+        register_tool!(
+            "cloud_ops",
+            Arc::new(CloudOpsTool::new(root_config.cloud_ops.clone()))
+        );
+        register_tool!("cloud_patterns", Arc::new(CloudPatternsTool::new()));
     }
 
     // Google Workspace CLI (gws) integration — requires shell access
-    if let Some(tool) = google_workspace_tool(security.clone(), root_config, has_shell_access) {
-        tool_arcs.push(tool);
+    #[cfg(not(feature = "tool-google-workspace"))]
+    warn_tool_compiled_out(
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::GoogleWorkspace,
+    );
+    #[cfg(feature = "tool-google-workspace")]
+    if root_config.google_workspace.enabled && has_shell_access && select_tool!("google_workspace")
+    {
+        register_tool!(
+            "google_workspace",
+            Arc::new(GoogleWorkspaceTool::new(
+                security.clone(),
+                root_config.google_workspace.allowed_services.clone(),
+                root_config.google_workspace.allowed_operations.clone(),
+                root_config.google_workspace.credentials_path.clone(),
+                root_config.google_workspace.default_account.clone(),
+                root_config.google_workspace.rate_limit_per_minute,
+                root_config.google_workspace.timeout_secs,
+                root_config.google_workspace.audit_log,
+            ))
+        );
+    } else if root_config.tools.is_enabled("google_workspace")
+        && root_config.google_workspace.enabled
+    {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "google_workspace: skipped registration because shell access is unavailable"
+        );
     }
 
     if any_coding_cli_tool_enabled(root_config) && !register_coding_cli_tools {
@@ -3444,110 +4832,268 @@ fn all_tools_with_runtime_on_thread(
     }
 
     // Claude Code delegation tool
-    if let Some(tool) = claude_code_tool(
-        security.clone(),
+    #[cfg(not(feature = "tool-claude-code"))]
+    warn_tool_compiled_out(
         root_config,
-        register_coding_cli_tools,
-        &coding_cli_executor,
-    ) {
-        tool_arcs.push(tool);
+        zeroclaw_config::opt_in_tools::OptInTool::ClaudeCode,
+    );
+    #[cfg(feature = "tool-claude-code")]
+    if root_config.claude_code.enabled && register_coding_cli_tools && select_tool!("claude_code") {
+        register_tool!(
+            "claude_code",
+            Arc::new(RateLimitedTool::new(
+                ClaudeCodeTool::new_with_executor(
+                    security.clone(),
+                    root_config.claude_code.clone(),
+                    coding_cli_executor.clone(),
+                ),
+                security.clone(),
+            ))
+        );
     }
 
     // Claude Code task runner with Slack progress and SSH handoff
-    if let Some(tool) = claude_code_runner_tool(security.clone(), root_config) {
-        tool_arcs.push(tool);
+    #[cfg(not(feature = "tool-claude-code-runner"))]
+    warn_tool_compiled_out(
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::ClaudeCodeRunner,
+    );
+    #[cfg(feature = "tool-claude-code-runner")]
+    if root_config.claude_code_runner.enabled && select_tool!("claude_code_runner") {
+        let gateway_url = format!(
+            "http://{}:{}",
+            root_config.gateway.host, root_config.gateway.port
+        );
+        register_tool!(
+            "claude_code_runner",
+            Arc::new(RateLimitedTool::new(
+                ClaudeCodeRunnerTool::new(
+                    security.clone(),
+                    root_config.claude_code_runner.clone(),
+                    gateway_url,
+                ),
+                security.clone(),
+            ))
+        );
     }
 
     // Codex CLI delegation tool
-    if let Some(tool) = codex_cli_tool(
-        security.clone(),
+    #[cfg(not(feature = "tool-codex-cli"))]
+    warn_tool_compiled_out(
         root_config,
-        register_coding_cli_tools,
-        &coding_cli_executor,
-    ) {
-        tool_arcs.push(tool);
+        zeroclaw_config::opt_in_tools::OptInTool::CodexCli,
+    );
+    #[cfg(feature = "tool-codex-cli")]
+    if root_config.codex_cli.enabled && register_coding_cli_tools && select_tool!("codex_cli") {
+        register_tool!(
+            "codex_cli",
+            Arc::new(RateLimitedTool::new(
+                CodexCliTool::new_with_executor(
+                    security.clone(),
+                    root_config.codex_cli.clone(),
+                    coding_cli_executor.clone(),
+                ),
+                security.clone(),
+            ))
+        );
     }
 
     // Gemini CLI delegation tool
-    if let Some(tool) = gemini_cli_tool(
-        security.clone(),
+    #[cfg(not(feature = "tool-gemini-cli"))]
+    warn_tool_compiled_out(
         root_config,
-        register_coding_cli_tools,
-        &coding_cli_executor,
-    ) {
-        tool_arcs.push(tool);
+        zeroclaw_config::opt_in_tools::OptInTool::GeminiCli,
+    );
+    #[cfg(feature = "tool-gemini-cli")]
+    if root_config.gemini_cli.enabled && register_coding_cli_tools && select_tool!("gemini_cli") {
+        register_tool!(
+            "gemini_cli",
+            Arc::new(RateLimitedTool::new(
+                GeminiCliTool::new_with_executor(
+                    security.clone(),
+                    root_config.gemini_cli.clone(),
+                    coding_cli_executor.clone(),
+                ),
+                security.clone(),
+            ))
+        );
     }
 
     // OpenCode CLI delegation tool
-    if let Some(tool) = opencode_cli_tool(
-        security.clone(),
+    #[cfg(not(feature = "tool-opencode-cli"))]
+    warn_tool_compiled_out(
         root_config,
-        register_coding_cli_tools,
-        &coding_cli_executor,
-    ) {
-        tool_arcs.push(tool);
+        zeroclaw_config::opt_in_tools::OptInTool::OpenCodeCli,
+    );
+    #[cfg(feature = "tool-opencode-cli")]
+    if root_config.opencode_cli.enabled && register_coding_cli_tools && select_tool!("opencode_cli")
+    {
+        register_tool!(
+            "opencode_cli",
+            Arc::new(RateLimitedTool::new(
+                OpenCodeCliTool::new_with_executor(
+                    security.clone(),
+                    root_config.opencode_cli.clone(),
+                    coding_cli_executor.clone(),
+                ),
+                security.clone(),
+            ))
+        );
     }
 
-    // Vision tools are always available
-    tool_arcs.push(screenshot_tool(security.clone()));
-    tool_arcs.push(Arc::from(image_info_tool(security.clone())));
+    // Vision adapters require explicit selection
+    #[cfg(feature = "tools-external")]
+    register_tool!(
+        "screenshot",
+        Arc::new(ScreenshotTool::new(security.clone()))
+    );
+    register_tool!(
+        "image_info",
+        Arc::new(RateLimitedTool::new(
+            PathGuardedTool::new(ImageInfoTool::new(security.clone()), security.clone()),
+            security.clone(),
+        ))
+    );
 
-    if let Ok(backend) =
-        zeroclaw_infra::make_session_backend(&config.data_dir, &config.channels.session_backend)
+    if [
+        "sessions_current",
+        "sessions_list",
+        "sessions_history",
+        "sessions_send",
+    ]
+    .iter()
+    .map(|name| select_tool!(name))
+    .fold(false, |selected, enabled| selected | enabled)
+        && let Ok(backend) =
+            zeroclaw_infra::make_session_backend(&config.data_dir, &config.channels.session_backend)
     {
         if let Some(acp_sessions) = acp_sessions {
-            tool_arcs.push(Arc::new(SessionsCurrentTool::with_acp_sessions(
-                backend.clone(),
-                acp_sessions.clone(),
-            )));
-            tool_arcs.push(Arc::new(SessionsListTool::with_acp_sessions(
-                backend.clone(),
-                acp_sessions.clone(),
-            )));
-            tool_arcs.push(Arc::new(SessionsHistoryTool::with_acp_sessions(
-                backend.clone(),
-                security.clone(),
-                acp_sessions.clone(),
-            )));
-            tool_arcs.push(Arc::new(SessionsSendTool::with_acp_sessions(
-                backend,
-                security.clone(),
-                acp_sessions,
-            )));
+            register_tool!(
+                "sessions_current",
+                Arc::new(SessionsCurrentTool::with_acp_sessions(
+                    backend.clone(),
+                    acp_sessions.clone(),
+                ))
+            );
+            register_tool!(
+                "sessions_list",
+                Arc::new(SessionsListTool::with_acp_sessions(
+                    backend.clone(),
+                    acp_sessions.clone(),
+                ))
+            );
+            register_tool!(
+                "sessions_history",
+                Arc::new(SessionsHistoryTool::with_acp_sessions(
+                    backend.clone(),
+                    security.clone(),
+                    acp_sessions.clone(),
+                ))
+            );
+            register_tool!(
+                "sessions_send",
+                Arc::new(SessionsSendTool::with_acp_sessions(
+                    backend,
+                    security.clone(),
+                    acp_sessions,
+                ))
+            );
         } else {
-            tool_arcs.push(Arc::new(SessionsCurrentTool::new(backend.clone())));
-            tool_arcs.push(Arc::new(SessionsListTool::new(backend.clone())));
-            tool_arcs.push(Arc::new(SessionsHistoryTool::new(
-                backend.clone(),
-                security.clone(),
-            )));
-            tool_arcs.push(Arc::new(SessionsSendTool::new(backend, security.clone())));
+            register_tool!(
+                "sessions_current",
+                Arc::new(SessionsCurrentTool::new(backend.clone()))
+            );
+            register_tool!(
+                "sessions_list",
+                Arc::new(SessionsListTool::new(backend.clone()))
+            );
+            register_tool!(
+                "sessions_history",
+                Arc::new(SessionsHistoryTool::new(backend.clone(), security.clone(),))
+            );
+            register_tool!(
+                "sessions_send",
+                Arc::new(SessionsSendTool::new(backend, security.clone()))
+            );
         }
     }
 
     // LinkedIn integration (config-gated)
-    if let Some(tool) = linkedin_tool(security.clone(), workspace_dir, root_config) {
-        tool_arcs.push(tool);
+    #[cfg(not(feature = "tool-linkedin"))]
+    warn_tool_compiled_out(
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::LinkedIn,
+    );
+    #[cfg(feature = "tool-linkedin")]
+    if root_config.linkedin.enabled && select_tool!("linkedin") {
+        register_tool!(
+            "linkedin",
+            Arc::new(LinkedInTool::new(
+                security.clone(),
+                workspace_dir.to_path_buf(),
+                root_config.linkedin.api_version.clone(),
+                root_config.linkedin.content.clone(),
+                root_config.linkedin.image.clone(),
+            ))
+        );
     }
 
     // Standalone image generation tool (config-gated)
-    if let Some(tool) = image_gen_tool(
-        security.clone(),
-        workspace_dir,
-        root_config,
-        persistent_writes,
-    ) {
-        tool_arcs.push(tool);
+    #[cfg(feature = "tools-external")]
+    if root_config.image_gen.enabled && select_tool!("image_gen") {
+        match ImageGenTool::new_with_persistence(
+            security.clone(),
+            workspace_dir.to_path_buf(),
+            root_config.image_gen.default_model.clone(),
+            root_config.image_gen.api_key_env.clone(),
+            persistent_writes,
+            root_config.security.nat64_prefixes.clone(),
+        ) {
+            Ok(tool) => tool_arcs.push(Arc::new(tool)),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "image_gen: failed to construct tool, skipping registration"
+                );
+            }
+        }
     }
 
     // File upload tool — enabled iff [file_upload].url is set
-    if let Some(tool) = file_upload_tool(security.clone(), root_config) {
-        tool_arcs.push(tool);
+    if root_config
+        .file_upload
+        .url
+        .as_deref()
+        .is_some_and(|u| !u.trim().is_empty())
+        && select_tool!("file_upload")
+    {
+        register_tool!(
+            "file_upload",
+            Arc::new(FileUploadTool::new(
+                security.clone(),
+                root_config.file_upload.clone(),
+            ))
+        );
     }
 
     // File upload bundle tool — enabled iff [file_upload_bundle].url is set
-    if let Some(tool) = file_upload_bundle_tool(security.clone(), root_config) {
-        tool_arcs.push(tool);
+    if root_config
+        .file_upload_bundle
+        .url
+        .as_deref()
+        .is_some_and(|u| !u.trim().is_empty())
+        && select_tool!("file_upload_bundle")
+    {
+        register_tool!(
+            "file_upload_bundle",
+            Arc::new(FileUploadBundleTool::new(
+                security.clone(),
+                root_config.file_upload_bundle.clone(),
+            ))
+        );
     }
 
     // File download tool — enabled iff [file_download].url is set
@@ -3556,6 +5102,7 @@ fn all_tools_with_runtime_on_thread(
         .url
         .as_deref()
         .is_some_and(|u| !u.trim().is_empty())
+        && select_tool!("file_download")
     {
         let policy_resolver: Arc<dyn Fn() -> FileDownloadSsrfPolicy + Send + Sync> =
             if let Some(live) = live_config.clone() {
@@ -3573,23 +5120,30 @@ fn all_tools_with_runtime_on_thread(
                 };
                 Arc::new(move || snapshot.clone())
             };
-        tool_arcs.push(Arc::new(
-            FileDownloadTool::new_with_persistence_and_resolver(
+        register_tool!(
+            "file_download",
+            Arc::new(FileDownloadTool::new_with_persistence_and_resolver(
                 security.clone(),
                 root_config.file_download.clone(),
                 persistent_writes,
                 move || policy_resolver(),
-            ),
-        ));
+            ),)
+        );
     }
 
-    // Poll tool — always registered; owns its own late-bound channel map.
+    // Poll tool — opt-in; owns its own late-bound channel map.
     let poll_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
-    tool_arcs.push(poll_tool(security.clone(), Arc::clone(&poll_handle)));
+    register_tool!(
+        "poll",
+        Arc::new(PollTool::new(security.clone(), Arc::clone(&poll_handle),))
+    );
 
     // SOP tools (registered when engine handle is provided)
     if let Some(ref sop_engine) = sop_engine {
-        tool_arcs.push(Arc::new(SopListTool::new(Arc::clone(sop_engine))));
+        register_tool!(
+            "sop_list",
+            Arc::new(SopListTool::new(Arc::clone(sop_engine)))
+        );
         // Under a ceiling a run that would park is cancelled, so the initiating
         // agent (who a parked run resumes as, with its full policy and no
         // ceiling) is recorded only without one. `rebound_with_ceiling` does the
@@ -3609,137 +5163,279 @@ fn all_tools_with_runtime_on_thread(
             // gets that guard, not only the bounded delegate rebuild. A SOP
             // step turn never holds these two tools: `SOP_CONTROL_TOOLS`
             // excludes them by name.
-            tool_arcs.push(Arc::new(
-                SopExecuteTool::new(Arc::clone(sop_engine))
-                    .with_audit(Arc::clone(sop_audit))
-                    .with_initiator(sop_initiator)
-                    .with_caller_ceiling(caller_ceiling.clone()),
-            ));
-            tool_arcs.push(Arc::new(
-                SopAdvanceTool::new(Arc::clone(sop_engine))
-                    .with_audit(Arc::clone(sop_audit))
-                    .with_caller_ceiling(caller_ceiling.clone()),
-            ));
-            tool_arcs.push(Arc::new(
-                SopApproveTool::new(Arc::clone(sop_engine))
-                    .with_agent_alias(agent_alias)
-                    .with_audit(Arc::clone(sop_audit)),
-            ));
+            // The audit logger follows the session too: once it is pinned to an
+            // owner, run payloads and step outputs are audited on that owner's
+            // plane rather than through the shared logger captured here.
+            register_tool!(
+                "sop_execute",
+                Arc::new(
+                    SopExecuteTool::new(Arc::clone(sop_engine))
+                        .with_audit(Arc::clone(sop_audit))
+                        .with_session_memory(Arc::clone(&session_memory))
+                        .with_initiator(sop_initiator)
+                        .with_caller_ceiling(caller_ceiling.clone()),
+                )
+            );
+            register_tool!(
+                "sop_advance",
+                Arc::new(
+                    SopAdvanceTool::new(Arc::clone(sop_engine))
+                        .with_audit(Arc::clone(sop_audit))
+                        .with_session_memory(Arc::clone(&session_memory))
+                        .with_caller_ceiling(caller_ceiling.clone()),
+                )
+            );
+            register_tool!(
+                "sop_approve",
+                Arc::new(
+                    SopApproveTool::new(Arc::clone(sop_engine))
+                        .with_agent_alias(agent_alias)
+                        .with_audit(Arc::clone(sop_audit))
+                        .with_session_memory(Arc::clone(&session_memory)),
+                )
+            );
         } else {
-            tool_arcs.push(Arc::new(
-                SopExecuteTool::new(Arc::clone(sop_engine))
-                    .with_initiator(sop_initiator)
-                    .with_caller_ceiling(caller_ceiling.clone()),
-            ));
-            tool_arcs.push(Arc::new(
-                SopAdvanceTool::new(Arc::clone(sop_engine))
-                    .with_caller_ceiling(caller_ceiling.clone()),
-            ));
-            tool_arcs.push(Arc::new(
-                SopApproveTool::new(Arc::clone(sop_engine)).with_agent_alias(agent_alias),
-            ));
+            register_tool!(
+                "sop_execute",
+                Arc::new(
+                    SopExecuteTool::new(Arc::clone(sop_engine))
+                        .with_session_memory(Arc::clone(&session_memory))
+                        .with_initiator(sop_initiator)
+                        .with_caller_ceiling(caller_ceiling.clone()),
+                )
+            );
+            register_tool!(
+                "sop_advance",
+                Arc::new(
+                    SopAdvanceTool::new(Arc::clone(sop_engine))
+                        .with_session_memory(Arc::clone(&session_memory))
+                        .with_caller_ceiling(caller_ceiling.clone()),
+                )
+            );
+            register_tool!(
+                "sop_approve",
+                Arc::new(
+                    SopApproveTool::new(Arc::clone(sop_engine))
+                        .with_session_memory(Arc::clone(&session_memory))
+                        .with_agent_alias(agent_alias),
+                )
+            );
         }
-        tool_arcs.push(Arc::new(
-            SopStatusTool::new(Arc::clone(sop_engine))
-                .with_collector(crate::sop::SopMetricsCollector::shared()),
-        ));
+        register_tool!(
+            "sop_status",
+            Arc::new(
+                SopStatusTool::new(Arc::clone(sop_engine))
+                    .with_session_memory(Arc::clone(&session_memory))
+                    .with_collector(crate::sop::SopMetricsCollector::shared()),
+            )
+        );
         if root_config.sop.procedural_memory_enabled {
-            tool_arcs.push(Arc::new(
-                SopWorkshopTool::new(Arc::clone(sop_engine), root_config.install_root_dir())
-                    .with_caller_ceiling(caller_ceiling.clone()),
-            ));
+            register_tool!(
+                "sop_workshop",
+                Arc::new(
+                    SopWorkshopTool::new(Arc::clone(sop_engine), root_config.install_root_dir())
+                        .with_caller_ceiling(caller_ceiling.clone()),
+                )
+            );
         }
     }
 
-    if let Some(tool) = composio_tool(security.clone(), composio_key, composio_entity_id) {
-        tool_arcs.push(tool);
+    #[cfg(not(feature = "tool-composio"))]
+    {
+        // Reported whenever the section is enabled: the usual caller passes no
+        // key when the section has none, which is exactly when it matters.
+        let _ = (composio_key, composio_entity_id);
+        warn_tool_compiled_out(
+            root_config,
+            zeroclaw_config::opt_in_tools::OptInTool::Composio,
+        );
+    }
+    #[cfg(feature = "tool-composio")]
+    if let Some(key) = composio_key
+        && !key.is_empty()
+        && select_tool!("composio")
+    {
+        register_tool!(
+            "composio",
+            Arc::new(ComposioTool::new(key, composio_entity_id, security.clone(),))
+        );
     }
 
-    // Emoji reaction tool — always registered; owns its own late-bound channel map.
+    // Emoji reaction tool — opt-in; owns its own late-bound channel map.
     let reaction_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
-    tool_arcs.push(reaction_tool(
-        security.clone(),
-        Arc::clone(&reaction_handle),
-    ));
+    register_tool!(
+        "reaction",
+        Arc::new(ReactionTool::new(
+            security.clone(),
+            Arc::clone(&reaction_handle)
+        ))
+    );
 
     // Unified forge operations tool, routes through the git channel via the
     // same late-bound channel map as the reaction tool. Resource/action grid
     // plus a raw catch-all over the channel's single forge_request transport.
-    let forge_tool = git_forge_tool(security.clone(), Arc::clone(&reaction_handle));
-    tool_arcs.push(forge_tool);
+    register_tool!(
+        "git_forge",
+        Arc::new(GitForgeTool::new(
+            security.clone(),
+            Arc::clone(&reaction_handle)
+        ))
+    );
 
-    // Channel room-management tool — always registered; owns its own late-bound channel map.
-    // Factory functions (`channel_room_tool`/`ask_user_tool`/`send_via_tool`/
-    // `escalate_to_human_tool`) are this branch's own construction path,
-    // reused verbatim by `delegate.rs`'s `Bounded` rebuild (`channel_room_tool`
-    // at delegate.rs:4162, `ask_user_tool` at :4115, `send_via_tool` at :4127,
-    // `escalate_to_human_tool` at :4171) — kept, not master's inlined
-    // construction, which would orphan that reuse. `master`'s only real change
-    // here was avoiding an `Option`-wrap-then-`.unwrap()` round trip on the
-    // handle variables; folded in below without losing the factory calls.
+    // Channel room-management tool — opt-in; owns its own late-bound channel map.
     let channel_room_tool_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
-    let channel_room_handle = Some(Arc::clone(&channel_room_tool_handle));
-    tool_arcs.push(channel_room_tool(
-        security.clone(),
-        channel_room_tool_handle,
-    ));
+    let channel_room_handle =
+        select_tool!("channel_room").then(|| Arc::clone(&channel_room_tool_handle));
+    register_tool!(
+        "channel_room",
+        Arc::new(ChannelRoomTool::new(
+            security.clone(),
+            channel_room_tool_handle
+        ))
+    );
 
-    // Interactive ask_user tool — always registered; owns its own late-bound channel map.
+    // Interactive ask_user tool — opt-in; owns its own late-bound channel map.
     let ask_user_tool_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
-    let ask_user_handle = Some(Arc::clone(&ask_user_tool_handle));
-    tool_arcs.push(ask_user_tool(
-        security.clone(),
-        Arc::clone(&ask_user_tool_handle),
-    ));
+    let ask_user_handle = (select_tool!("ask_user") || select_tool!("send_via"))
+        .then(|| Arc::clone(&ask_user_tool_handle));
+    register_tool!(
+        "ask_user",
+        Arc::new(AskUserTool::new(
+            security.clone(),
+            Arc::clone(&ask_user_tool_handle)
+        ))
+    );
 
-    tool_arcs.push(send_via_tool(
-        security.clone(),
-        root_config,
-        live_config.clone(),
-        agent_alias,
-        ask_user_tool_handle,
-    ));
+    if select_tool!("send_via") {
+        let agent_peer_groups: AgentPeerGroupResolver = if let Some(live) = live_config.clone() {
+            let alias = agent_alias.to_string();
+            Arc::new(move || filter_agent_peer_groups(&live.read(), &alias))
+        } else {
+            let snapshot = filter_agent_peer_groups(root_config, agent_alias);
+            Arc::new(move || snapshot.clone())
+        };
+        register_tool!(
+            "send_via",
+            Arc::new(SendViaTool::new(
+                security.clone(),
+                ask_user_tool_handle,
+                agent_peer_groups,
+            ))
+        );
+    }
 
-    // Human escalation tool — always registered; owns its own late-bound channel map.
+    // Human escalation tool — opt-in; owns its own late-bound channel map.
     let escalate_tool_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
-    let escalate_handle = Some(Arc::clone(&escalate_tool_handle));
-    tool_arcs.push(escalate_to_human_tool(
-        security.clone(),
-        root_config.escalation.alert_channels.clone(),
-        escalate_tool_handle,
-    ));
+    let escalate_handle =
+        select_tool!("escalate_to_human").then(|| Arc::clone(&escalate_tool_handle));
+    register_tool!(
+        "escalate_to_human",
+        Arc::new(EscalateToHumanTool::new(
+            security.clone(),
+            root_config.escalation.alert_channels.clone(),
+            escalate_tool_handle,
+        ))
+    );
 
     // Microsoft 365 Graph API integration
-    match microsoft365_tool(security.clone(), root_config, workspace_dir) {
-        Microsoft365Registration::Tool(tool) => tool_arcs.push(tool),
-        Microsoft365Registration::Skip => {}
-        // Preserved fail-fast: a client_credentials flow with no secret
-        // aborts the whole registry rather than registering anything else.
-        Microsoft365Registration::AbortRegistry => {
-            return Ok(AllToolsResult {
-                unfiltered_tool_arcs: tool_arcs.clone(),
-                tools: boxed_registry_from_arcs(tool_arcs),
-                delegate_handle: None,
-                #[cfg(test)]
-                delegate_tool: None,
-                ask_user_handle,
-                channel_room_handle,
-                reaction_handle,
-                poll_handle: Some(poll_handle),
-                escalate_handle,
-            });
+    #[cfg(not(feature = "tool-microsoft365"))]
+    warn_tool_compiled_out(
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::Microsoft365,
+    );
+    #[cfg(feature = "tool-microsoft365")]
+    if root_config.microsoft365.enabled && select_tool!("microsoft365") {
+        let ms_cfg = &root_config.microsoft365;
+        let tenant_id = ms_cfg
+            .tenant_id
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let client_id = ms_cfg
+            .client_id
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if !tenant_id.is_empty() && !client_id.is_empty() {
+            // Fail fast: client_credentials flow requires a client_secret at registration time.
+            if ms_cfg.auth_flow.trim() == "client_credentials"
+                && ms_cfg
+                    .client_secret
+                    .as_deref()
+                    .is_none_or(|s| s.trim().is_empty())
+            {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "microsoft365: client_credentials auth_flow requires a non-empty client_secret"
+                );
+                let tools = native_memory.wrap_actual_tools(&tool_arcs);
+                return Ok(AllToolsResult {
+                    native_memory,
+                    unfiltered_tool_arcs: tool_arcs,
+                    tools,
+                    reserved_host_names,
+                    delegate_handle: None,
+                    capability_slots,
+                    delegate_tool: None,
+                    ask_user_handle,
+                    channel_room_handle,
+                    reaction_handle,
+                    poll_handle: root_config.tools.is_enabled("poll").then_some(poll_handle),
+                    session_memory: Some(session_memory),
+                    escalate_handle,
+                });
+            }
+
+            let resolved = zeroclaw_tools::microsoft365::types::Microsoft365ResolvedConfig {
+                tenant_id,
+                client_id,
+                client_secret: ms_cfg.client_secret.clone(),
+                auth_flow: ms_cfg.auth_flow.clone(),
+                scopes: ms_cfg.scopes.clone(),
+                token_cache_encrypted: ms_cfg.token_cache_encrypted,
+                user_id: ms_cfg.user_id.as_deref().unwrap_or("me").to_string(),
+            };
+            // Store token cache in the config directory (next to config.toml),
+            // not the workspace directory, to keep bearer tokens out of the
+            // project tree.
+            let cache_dir = root_config.config_path.parent().unwrap_or(workspace_dir);
+            match Microsoft365Tool::new(resolved, security.clone(), cache_dir) {
+                Ok(tool) => tool_arcs.push(Arc::new(tool)),
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "microsoft365: failed to initialize tool"
+                    );
+                }
+            }
+        } else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "microsoft365: skipped registration because tenant_id or client_id is empty"
+            );
         }
     }
 
     // Knowledge graph tool
-    if root_config.knowledge.enabled {
+    if root_config.knowledge.enabled && select_tool!("knowledge") {
+        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+        late_tool_search_observer::record("knowledge-open", "actual", 0, 0);
         let db_path = root_config.knowledge.resolved_db_path();
         match zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
             &db_path,
             root_config.knowledge.max_nodes,
         ) {
             Ok(graph) => {
-                tool_arcs.push(Arc::new(KnowledgeTool::new(Arc::new(graph))));
+                register_tool!("knowledge", Arc::new(KnowledgeTool::new(Arc::new(graph))));
             }
             Err(e) => {
                 ::zeroclaw_log::record!(
@@ -3764,23 +5460,32 @@ fn all_tools_with_runtime_on_thread(
     let provider_runtime_options =
         zeroclaw_providers::provider_runtime_options_for_agent(root_config, agent_alias);
 
-    #[cfg(test)]
     let mut built_delegate_tool: Option<Arc<DelegateTool>> = None;
-    let delegate_handle: Option<DelegateParentToolsHandle> = if agents.is_empty() {
-        None
-    } else {
-        let delegate_agents: HashMap<String, AliasedAgentConfig> = agents
-            .iter()
-            .map(|(name, cfg)| (name.clone(), cfg.clone()))
-            .collect();
-        let parent_tools = Arc::new(RwLock::new(tool_arcs.clone()));
-        let delegate_tool = DelegateTool::new_with_options(
+    let delegate_handle: Option<DelegateParentToolsHandle> =
+        if agents.is_empty() || !select_tool!("delegate") {
+            None
+        } else {
+            let delegate_agents: HashMap<String, AliasedAgentConfig> = agents
+                .iter()
+                .map(|(name, cfg)| (name.clone(), cfg.clone()))
+                .collect();
+            let parent_tools = Arc::new(RwLock::new(tool_arcs.clone()));
+            #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+            late_tool_search_observer::record(
+                "delegate-snapshot",
+                "original",
+                late_tool_search_observer::arc_id(&parent_tools),
+                tool_arcs.len(),
+            );
+            #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+            late_tool_search_observer::record("constructor-enter", "delegate", 0, 0);
+            let delegate_tool = DelegateTool::new_with_options(
             delegate_agents,
             delegate_global_credential.clone(),
             security.clone(),
             provider_runtime_options.clone(),
         )
-        .with_parent_tools(Arc::clone(&parent_tools))
+        .with_owned_parent_tools(Arc::clone(&parent_tools), memory_origins.clone())
         .with_runtime(runtime.clone())
         .with_multimodal_config(root_config.multimodal.clone())
         .with_delegate_config(root_config.delegate.clone())
@@ -3820,14 +5525,19 @@ fn all_tools_with_runtime_on_thread(
         })
         .with_execution_capability(execution_capability.clone())
         .with_caller_alias(agent_alias);
-        let delegate_tool = Arc::new(delegate_tool);
-        #[cfg(test)]
-        {
+            capability_slots.push(delegate_tool.capabilities_slot());
+            let delegate_tool = Arc::new(delegate_tool);
+            #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+            late_tool_search_observer::record(
+                "constructor-return",
+                "delegate",
+                late_tool_search_observer::arc_id(&delegate_tool),
+                0,
+            );
             built_delegate_tool = Some(Arc::clone(&delegate_tool));
-        }
-        tool_arcs.push(delegate_tool as Arc<dyn Tool>);
-        Some(parent_tools)
-    };
+            tool_arcs.push(delegate_tool as Arc<dyn Tool>);
+            Some(parent_tools)
+        };
 
     // `vi_verify` is deliberately absent while no chain verifier exists: it checked
     // caller-supplied constraints against a caller-supplied fulfillment with nothing
@@ -3858,13 +5568,8 @@ fn all_tools_with_runtime_on_thread(
                         Arc::clone(&config),
                         live_config.clone(),
                     );
-                    let mut registered_names: std::collections::HashSet<String> = tool_arcs
-                        .iter()
-                        .map(|tool| tool.name().to_string())
-                        .collect();
-                    if root_config.pipeline.enabled {
-                        registered_names.insert(PipelineTool::NAME.to_string());
-                    }
+                    let mut registered_names = reserved_host_names.clone();
+                    registered_names.extend(tool_arcs.iter().map(|tool| tool.name().to_string()));
                     let plugin_limits = crate::plugin_runtime::plugin_limits(&config);
                     let egress_service =
                         plugin_egress_service(Arc::clone(&config), live_config.clone());
@@ -3910,16 +5615,20 @@ fn all_tools_with_runtime_on_thread(
     // Pipeline construction waits for ScopedToolRegistry::assemble(), where the
     // effective per-agent policy and optional caller allowlist are both known.
 
+    let tools = native_memory.wrap_actual_tools(&tool_arcs);
     Ok(AllToolsResult {
-        unfiltered_tool_arcs: tool_arcs.clone(),
-        tools: boxed_registry_from_arcs(tool_arcs),
+        native_memory,
+        unfiltered_tool_arcs: tool_arcs,
+        tools,
+        reserved_host_names,
         delegate_handle,
+        capability_slots,
         ask_user_handle,
         channel_room_handle,
         reaction_handle,
-        poll_handle: Some(poll_handle),
+        poll_handle: root_config.tools.is_enabled("poll").then_some(poll_handle),
+        session_memory: Some(session_memory),
         escalate_handle,
-        #[cfg(test)]
         delegate_tool: built_delegate_tool,
     })
 }
@@ -4030,6 +5739,8 @@ fn register_plugin_tools(
             continue;
         }
 
+        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+        late_tool_search_observer::record("wasm-probe-enter", &package, 0, 0);
         let tool = zeroclaw_plugins::wasm_tool::WasmTool::from_wasm(
             component.clone(),
             scope,
@@ -4078,6 +5789,13 @@ fn register_plugin_tools(
                     }
                 }
                 tool_arcs.push(Arc::new(tool));
+                #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+                late_tool_search_observer::record(
+                    "wasm-admitted",
+                    &package,
+                    late_tool_search_observer::arc_id(tool_arcs.last().expect("just appended")),
+                    0,
+                );
                 registered_count += 1;
             }
             Err(e) => {
@@ -4334,6 +6052,27 @@ mod tests {
         assert!(!names.contains(&"mcp_prompts".to_string()));
     }
 
+    /// The capability tools register during assembly, after plugin tools, so
+    /// their names are reserved up front for the plugin loader.
+    #[tokio::test]
+    async fn mcp_capability_tool_names_are_reserved_before_plugins_load() {
+        let registry = std::sync::Arc::new(McpRegistry::connect_all(&[]).await.unwrap());
+        let mut reserved = std::collections::HashSet::new();
+        reserve_deferred_host_names(&Config::default(), &mut reserved);
+
+        let built: Vec<String> = build_mcp_capability_tools(&registry, None)
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        let mut names = built.clone();
+        names.sort();
+        assert_eq!(names, ["mcp_prompts", "mcp_resources"]);
+        // Every capability tool, including one added later, must be reserved.
+        for name in &built {
+            assert!(reserved.contains(name), "{name}");
+        }
+    }
+
     /// The Serply resolver only honours `ZEROCLAW_web_search__serply_api_key`
     /// if the runtime hands it the loader's override state. Pin the mapping for
     /// the three states the loader can produce (no override, non-empty
@@ -4341,6 +6080,7 @@ mod tests {
     /// uses, so a schema-mirror value wins for the process while on-disk
     /// rotation stays in force when no override is active.
     #[test]
+    #[cfg(feature = "tools-external")]
     fn serply_api_key_override_mirrors_env_override_state() {
         let mut cfg = Config::default();
 
@@ -4364,8 +6104,257 @@ mod tests {
         assert_eq!(serply_api_key_override(&cfg), Some(None));
     }
 
+    #[test]
+    fn optional_builtin_is_not_constructed_or_exposed_until_selected() {
+        let mut selection = zeroclaw_config::builtin_tools::BuiltinToolsConfig {
+            optional: Vec::new(),
+        };
+        let constructions = std::cell::Cell::new(0);
+        let mut registry = Vec::new();
+        let mut reserved = std::collections::HashSet::new();
+        register_builtin_tool(
+            &selection,
+            &mut registry,
+            &mut reserved,
+            "calculator",
+            || {
+                constructions.set(constructions.get() + 1);
+                Arc::new(CalculatorTool::new())
+            },
+        );
+        assert_eq!(constructions.get(), 0);
+        assert!(registry.is_empty());
+        assert!(reserved.contains("calculator"));
+        selection.optional.push("calculator".into());
+        register_builtin_tool(
+            &selection,
+            &mut registry,
+            &mut reserved,
+            "calculator",
+            || {
+                constructions.set(constructions.get() + 1);
+                Arc::new(CalculatorTool::new())
+            },
+        );
+        assert_eq!(constructions.get(), 1);
+        assert_eq!(registry[0].spec().name, "calculator");
+    }
+
+    #[tokio::test]
+    async fn minimal_assembly_exposes_eleven_and_does_not_open_optional_database() {
+        use crate::tools::scoped::{ScopedAssembly, ScopedToolRegistry};
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            tools: zeroclaw_config::builtin_tools::BuiltinToolsConfig {
+                optional: Vec::new(),
+            },
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config
+            .agents
+            .insert("lean".into(), AliasedAgentConfig::default());
+        config
+            .providers
+            .models
+            .openai
+            .insert("lean".into(), Default::default());
+        config.agents.get_mut("lean").unwrap().model_provider = "openai.lean".into();
+        config.knowledge.enabled = true;
+        config.knowledge.db_path = tmp.path().join("optional.db").display().to_string();
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: tmp.path().into(),
+            ..Default::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::new());
+        let memory: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("lean"));
+        let built = all_tools_with_runtime(
+            Arc::new(config.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "lean",
+            Arc::clone(&runtime),
+            memory,
+            None,
+            None,
+            &config.browser,
+            &config.http_request,
+            &config.web_fetch,
+            tmp.path(),
+            &config.agents,
+            None,
+            &config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!tmp.path().join("optional.db").exists());
+        assert!(built.delegate_handle.is_none());
+        assert!(built.poll_handle.is_none());
+        assert!(built.ask_user_handle.is_none());
+        let assembled = ScopedToolRegistry::assemble(ScopedAssembly {
+            config: &config,
+            agent_alias: "lean",
+            security: &security,
+            built,
+            skills: &[],
+            runtime,
+            caller_allowed: None,
+            connect_mcp: false,
+            connect_peripherals: false,
+            exclude_memory: false,
+            acp_delivery: false,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: false,
+            mcp_registry: None,
+        })
+        .await;
+        let mut names: Vec<_> = assembled
+            .registry
+            .iter()
+            .map(|tool| tool.spec().name)
+            .collect();
+        names.sort();
+        let mut core: Vec<_> = zeroclaw_config::builtin_tools::CORE_TOOL_NAMES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        core.sort();
+        assert_eq!(names, core);
+        assert_eq!(names.len(), 11);
+    }
+
+    /// The main registry hands the caller ceiling to the tools that start
+    /// another agent's turn or store work for later: `spawn_subagent` and
+    /// `send_message_to_peer` take it through an optional builder, and
+    /// `cron_update`, `cron_run` and `schedule` through an `Option` parameter,
+    /// so the compiler forces neither and a call site that passes `None` still
+    /// builds. Passing `None` there lets a bounded chain relay, spawn, or store
+    /// a job out of its ceiling. (`cron_add` is pinned end to end by
+    /// `bounded_delegate_cron_job_inherits_ceiling`.) Pinned by identity (the
+    /// very handle the caller supplied), with the no-ceiling registry as the
+    /// control that shows the accessor reads the tool's own field.
+    #[test]
+    fn main_registry_hands_its_caller_ceiling_to_every_tool_that_carries_one() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp);
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: tmp.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(
+                &MemoryConfig {
+                    backend: "markdown".into(),
+                    ..MemoryConfig::default()
+                },
+                tmp.path(),
+                None,
+            )
+            .unwrap(),
+        );
+        let risk = zeroclaw_config::schema::RiskProfileConfig::default();
+
+        let build = |ceiling: Option<caller_ceiling::CallerCeiling>| {
+            all_tools_with_runtime(
+                Arc::new(cfg.clone()),
+                &security,
+                &risk,
+                "test-agent",
+                Arc::new(NativeRuntime::new()),
+                Arc::clone(&mem),
+                None,
+                None,
+                &BrowserConfig::default(),
+                &zeroclaw_config::schema::HttpRequestConfig::default(),
+                &zeroclaw_config::schema::WebFetchConfig::default(),
+                tmp.path(),
+                &HashMap::new(),
+                None,
+                &cfg,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+                ceiling,
+            )
+            .expect("production registry must build")
+            .unfiltered_tool_arcs
+        };
+        let ceiling_of = |tools: &[Arc<dyn Tool>], name: &str| {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name() == name)
+                .unwrap_or_else(|| panic!("the main registry must install `{name}`"));
+            let any = tool
+                .as_any()
+                .unwrap_or_else(|| panic!("`{name}` must be inspectable in a test build"));
+            match name {
+                "spawn_subagent" => any
+                    .downcast_ref::<SpawnSubagentTool>()
+                    .expect("spawn_subagent downcasts")
+                    .caller_ceiling_for_test()
+                    .cloned(),
+                "send_message_to_peer" => any
+                    .downcast_ref::<SendMessageToPeerTool>()
+                    .expect("send_message_to_peer downcasts")
+                    .caller_ceiling_for_test()
+                    .cloned(),
+                "cron_update" => any
+                    .downcast_ref::<CronUpdateTool>()
+                    .expect("cron_update downcasts")
+                    .caller_ceiling_for_test()
+                    .cloned(),
+                "cron_run" => any
+                    .downcast_ref::<CronRunTool>()
+                    .expect("cron_run downcasts")
+                    .caller_ceiling_for_test()
+                    .cloned(),
+                "schedule" => any
+                    .downcast_ref::<ScheduleTool>()
+                    .expect("schedule downcasts")
+                    .caller_ceiling_for_test()
+                    .cloned(),
+                other => panic!("no ceiling accessor for `{other}`"),
+            }
+        };
+
+        let ceiling: caller_ceiling::CallerCeiling = Arc::new(std::sync::OnceLock::new());
+        let with_ceiling = build(Some(Arc::clone(&ceiling)));
+        let without_ceiling = build(None);
+        for name in [
+            "spawn_subagent",
+            "send_message_to_peer",
+            "cron_update",
+            "cron_run",
+            "schedule",
+        ] {
+            let carried = ceiling_of(&with_ceiling, name)
+                .unwrap_or_else(|| panic!("`{name}` was built without the caller ceiling"));
+            assert!(
+                Arc::ptr_eq(&carried, &ceiling),
+                "`{name}` must carry the very ceiling the registry was given"
+            );
+            assert!(
+                ceiling_of(&without_ceiling, name).is_none(),
+                "control: with no ceiling given, `{name}` carries none"
+            );
+        }
+    }
+
     fn test_config(tmp: &TempDir) -> Config {
         Config {
+            tools: zeroclaw_config::builtin_tools::BuiltinToolsConfig {
+                optional: vec!["*".into()],
+            },
             data_dir: tmp.path().join("data"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
@@ -5344,6 +7333,183 @@ permissions = ["http_client"]
         );
     }
 
+    /// Peripheral and skill tools register during assembly, after plugin
+    /// tools, so the loader cannot reserve their names. Assembly does: a guest
+    /// that declares a connected peripheral's tool name, or a skill tool's name
+    /// shortened past its `__` separator, is refused there and the host tool
+    /// keeps the name. The guest with an ordinary name is the control.
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    #[tokio::test]
+    async fn colliding_plugin_tools_taking_late_host_tool_names_are_refused_in_assembly() {
+        use crate::tools::scoped::{ScopedAssembly, ScopedToolRegistry};
+
+        let skill_name = "release-notes-assistant-for-the-quarterly-plugin-review-board";
+        let skill_tool_name = skill_tool::composed_tool_name(skill_name, "invoke");
+        assert!(
+            !skill_tool_name.contains(zeroclaw_tools::mcp_client::MCP_TOOL_NAME_SEPARATOR),
+            "the shortened skill tool name falls outside the MCP separator rule: \
+             {skill_tool_name}"
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let plugins = tmp.path().join("plugins");
+        install_tool_component(
+            &plugins,
+            "echo-tool",
+            &tool_fixture_component("default", &[]),
+        );
+        install_tool_component(
+            &plugins,
+            "peripheral-shaped-tool",
+            &tool_fixture_component("namespace-peripheral-tool", &["namespace-peripheral-tool"]),
+        );
+        install_tool_component(
+            &plugins,
+            "skill-shaped-tool",
+            &tool_fixture_component("namespace-skill-tool", &["namespace-skill-tool"]),
+        );
+        let mut config = plugin_activation_config(&plugins);
+        config.data_dir = tmp.path().join("data");
+        config.config_path = tmp.path().join("config.toml");
+        config
+            .agents
+            .insert("late".into(), AliasedAgentConfig::default());
+        config
+            .providers
+            .models
+            .openai
+            .insert("late".into(), Default::default());
+        config.agents.get_mut("late").unwrap().model_provider = "openai.late".into();
+        config.memory.backend = "none".into();
+        config.peripherals.enabled = true;
+        config.peripherals.boards = vec![zeroclaw_config::schema::PeripheralBoardConfig {
+            board: "native-trap-tool-gpio_read".into(),
+            ..Default::default()
+        }];
+        // The peripheral factory is process-wide; the shared trap builds a tool
+        // named after this test's board.
+        crate::composition::test_support::register_peripheral_trap();
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: tmp.path().into(),
+            ..Default::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::new());
+        let memory: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("late"));
+        let built = all_tools_with_runtime(
+            Arc::new(config.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "late",
+            Arc::clone(&runtime),
+            memory,
+            None,
+            None,
+            &config.browser,
+            &config.http_request,
+            &config.web_fetch,
+            tmp.path(),
+            &config.agents,
+            None,
+            &config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let is_guest = |tool: &dyn Tool| {
+            matches!(
+                tool.role(),
+                zeroclaw_api::attribution::Role::Tool(
+                    zeroclaw_api::attribution::ToolKind::WasmPlugin
+                )
+            )
+        };
+        let mut loaded: Vec<String> = built
+            .tools
+            .iter()
+            .filter(|tool| is_guest(tool.as_ref()))
+            .map(|tool| tool.name().to_string())
+            .collect();
+        loaded.sort();
+        let mut expected = vec![
+            "config-echo".to_string(),
+            "gpio_read".to_string(),
+            skill_tool_name.clone(),
+        ];
+        expected.sort();
+        assert_eq!(
+            loaded, expected,
+            "the loader registers all three guests: neither late name is registered yet"
+        );
+
+        let skill = crate::skills::Skill {
+            name: skill_name.into(),
+            description: "Drafts release notes".into(),
+            description_localizations: Default::default(),
+            version: "0.1.0".into(),
+            author: None,
+            tags: Vec::new(),
+            tools: vec![crate::skills::SkillTool {
+                name: "invoke".into(),
+                description: "Draft the notes".into(),
+                kind: "shell".into(),
+                command: "true".into(),
+                args: Default::default(),
+                target: None,
+                locked_args: Default::default(),
+                timeout_secs: None,
+            }],
+            prompts: Vec::new(),
+            slash_options: Vec::new(),
+            always: false,
+            location: None,
+        };
+        let assembled = ScopedToolRegistry::assemble(ScopedAssembly {
+            config: &config,
+            agent_alias: "late",
+            security: &security,
+            built,
+            skills: std::slice::from_ref(&skill),
+            runtime,
+            caller_allowed: None,
+            connect_mcp: false,
+            connect_peripherals: true,
+            exclude_memory: false,
+            acp_delivery: false,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: true,
+            mcp_registry: None,
+        })
+        .await;
+
+        // For each late name, whether each registered owner is a guest.
+        let owners = |name: &str| -> Vec<bool> {
+            assembled
+                .registry
+                .iter()
+                .filter(|tool| tool.name() == name)
+                .map(|tool| is_guest(tool.as_ref()))
+                .collect()
+        };
+        assert_eq!(
+            [owners("gpio_read"), owners(&skill_tool_name)],
+            [vec![false], vec![false]],
+            "each late name has exactly one owner, the host tool, not the guest \
+             that declared it"
+        );
+        assert!(
+            assembled
+                .registry
+                .iter()
+                .any(|tool| tool.name() == "config-echo" && is_guest(tool.as_ref())),
+            "a guest with an unrelated name still registers"
+        );
+    }
+
     /// A mixed channel/tool/skill candidate set that exceeds the shared
     /// `plugins.max_active_instances` ceiling, exercised through the two
     /// production loaders rather than the plan vector.
@@ -5589,6 +7755,7 @@ permissions = ["http_client"]
     ///   * unwrapped → `Err("SearXNG instance URL not configured…")` from the
     ///                 inner tool's own config resolution
     #[tokio::test]
+    #[cfg(feature = "tools-external")]
     async fn web_search_tool_is_registered_behind_the_rate_limiter() {
         let tmp = TempDir::new().unwrap();
 
@@ -5856,11 +8023,23 @@ permissions = ["http_client"]
         );
     }
 
+    #[cfg(all(
+        feature = "tool-claude-code",
+        feature = "tool-codex-cli",
+        feature = "tool-gemini-cli",
+        feature = "tool-opencode-cli"
+    ))]
     struct CapturingRuntime {
         seen_command: Arc<Mutex<Option<String>>>,
         filesystem_access: bool,
     }
 
+    #[cfg(all(
+        feature = "tool-claude-code",
+        feature = "tool-codex-cli",
+        feature = "tool-gemini-cli",
+        feature = "tool-opencode-cli"
+    ))]
     impl RuntimeAdapter for CapturingRuntime {
         fn name(&self) -> &str {
             "capturing-test"
@@ -5901,6 +8080,12 @@ permissions = ["http_client"]
         }
     }
 
+    #[cfg(all(
+        feature = "tool-claude-code",
+        feature = "tool-codex-cli",
+        feature = "tool-gemini-cli",
+        feature = "tool-opencode-cli"
+    ))]
     #[tokio::test]
     async fn registered_coding_cli_tools_use_configured_runtime_executor() {
         type EnableCodingCli = fn(&mut Config);
@@ -6016,6 +8201,12 @@ permissions = ["http_client"]
         }
     }
 
+    #[cfg(all(
+        feature = "tool-claude-code",
+        feature = "tool-codex-cli",
+        feature = "tool-gemini-cli",
+        feature = "tool-opencode-cli"
+    ))]
     #[tokio::test]
     async fn docker_without_workspace_mount_does_not_register_coding_cli_tools() {
         let tmp = TempDir::new().unwrap();
@@ -6083,6 +8274,88 @@ permissions = ["http_client"]
                 "{tool_name} must not register without runtime filesystem access"
             );
         }
+        assert!(
+            names.contains(&"shell"),
+            "positive control: ordinary tools should still register"
+        );
+    }
+
+    /// An integration enabled in config registers only when its feature is
+    /// compiled in. A compiled-out tool is absent from the registry and from
+    /// the prompt's tool descriptions, never listed as a name that fails.
+    #[tokio::test]
+    async fn enabled_integrations_register_only_when_compiled_in() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: crate::security::AutonomyLevel::Full,
+            workspace_dir: tmp.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let browser = BrowserConfig {
+            enabled: false,
+            ..BrowserConfig::default()
+        };
+        let mut cfg = test_config(&tmp);
+        cfg.notion.enabled = true;
+        cfg.notion.api_key = "secret_test".into();
+        cfg.jira.enabled = true;
+        cfg.jira.api_token = "token".into();
+        cfg.jira.base_url = "https://example.atlassian.net".into();
+        cfg.project_intel.enabled = true;
+        cfg.composio.enabled = true;
+
+        let tools = all_tools_with_runtime(
+            Arc::new(cfg.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            Some("composio-key"),
+            None,
+            &browser,
+            &zeroclaw_config::schema::HttpRequestConfig::default(),
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("tool registry builds")
+        .tools;
+        let names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
+
+        for (tool_name, compiled_in) in [
+            ("notion", cfg!(feature = "tool-notion")),
+            ("jira", cfg!(feature = "tool-jira")),
+            ("project_intel", cfg!(feature = "tool-project-intel")),
+            ("report_template", cfg!(feature = "tool-project-intel")),
+            ("composio", cfg!(feature = "tool-composio")),
+        ] {
+            assert_eq!(
+                names.contains(&tool_name),
+                compiled_in,
+                "{tool_name} must register exactly when its feature is compiled in"
+            );
+        }
+        assert_eq!(
+            composio_tool_available(&cfg),
+            cfg!(feature = "tool-composio"),
+            "the prompt must not describe a Composio tool this build lacks"
+        );
         assert!(
             names.contains(&"shell"),
             "positive control: ordinary tools should still register"
@@ -7028,6 +9301,21 @@ permissions = ["http_client"]
     /// a tool that no longer exists, using the SAME full-registry factory
     /// production uses, with every optional feature that gates one of these
     /// tools turned on.
+    #[cfg(all(
+        feature = "tools-external",
+        feature = "tool-linkedin",
+        feature = "tool-claude-code",
+        feature = "tool-claude-code-runner",
+        feature = "tool-codex-cli",
+        feature = "tool-gemini-cli",
+        feature = "tool-opencode-cli",
+        feature = "tool-notion",
+        feature = "tool-jira",
+        feature = "tool-composio",
+        feature = "tool-google-workspace",
+        feature = "tool-microsoft365",
+        feature = "tool-project-intel"
+    ))]
     #[test]
     fn workspace_bound_tool_names_beyond_default_are_actually_constructed() {
         let tmp = TempDir::new().unwrap();
@@ -7124,6 +9412,14 @@ permissions = ["http_client"]
             ("BOUNDED_DENIED_TOOL_NAMES", BOUNDED_DENIED_TOOL_NAMES),
         ]
     }
+
+    /// Classified names that are built OUTSIDE `all_tools_with_runtime`, so the
+    /// maximal registry never contains them.
+    const BUILT_OUTSIDE_THE_FACTORY: [&str; 2] = [
+        // `build_mcp_capability_tools`, registered by the assembly seam.
+        "mcp_resources",
+        "mcp_prompts",
+    ];
 
     /// Builds a registry with every config-gated integration switched on, so the
     /// inventory the completeness test walks is the widest one the production
@@ -7311,6 +9607,21 @@ permissions = ["http_client"]
     /// from `IDENTITY_BOUND_TOOL_NAMES` and re-running: this test names all
     /// three, while the three sync tests it complements stay green - which is
     /// the exact scenario that let them arrive unclassified in the first place.
+    #[cfg(all(
+        feature = "tools-external",
+        feature = "tool-linkedin",
+        feature = "tool-claude-code",
+        feature = "tool-claude-code-runner",
+        feature = "tool-codex-cli",
+        feature = "tool-gemini-cli",
+        feature = "tool-opencode-cli",
+        feature = "tool-notion",
+        feature = "tool-jira",
+        feature = "tool-composio",
+        feature = "tool-google-workspace",
+        feature = "tool-microsoft365",
+        feature = "tool-project-intel"
+    ))]
     #[test]
     fn every_constructed_tool_is_classified_for_bounded_delegation() {
         let tmp = TempDir::new().unwrap();
@@ -7366,11 +9677,7 @@ permissions = ["http_client"]
         // a tool that was deleted, and the fallback would never consult it. The
         // exceptions are the names built OUTSIDE `all_tools_with_runtime`, which
         // is the very reason they went unnoticed long enough to need classifying.
-        let built_elsewhere = [
-            // `build_mcp_capability_tools`, registered by the assembly seam.
-            "mcp_resources",
-            "mcp_prompts",
-        ];
+        let built_elsewhere = BUILT_OUTSIDE_THE_FACTORY;
         let mut stale: Vec<String> = Vec::new();
         for (list_name, list) in lists {
             for name in list {
@@ -7390,6 +9697,155 @@ permissions = ["http_client"]
         );
     }
 
+    /// Same completeness check as `every_constructed_tool_is_classified_for_bounded_delegation`,
+    /// but valid in ANY feature set, so the default build and the all-features
+    /// build are each held to it (the strict version above only exists when
+    /// every opt-in feature is on).
+    ///
+    /// What differs between feature sets is only which `cfg(feature)` branch of
+    /// `all_tools_with_runtime` registers a tool; the `cfg(not(feature))` branch
+    /// registers nothing. The classification lists are not feature-gated, so the
+    /// invariant is: a tool the build can construct is in exactly one category,
+    /// a tool whose compilation group is absent is never constructed, and a
+    /// classified inventory name whose group IS compiled is actually built.
+    #[test]
+    fn constructed_tools_are_classified_in_this_feature_set() {
+        let tmp = TempDir::new().unwrap();
+        let constructed = maximal_tool_registry(&tmp);
+        let inventory = zeroclaw_tools::inventory::BUILTIN_TOOLS;
+
+        let compiled_rows = inventory.iter().filter(|spec| spec.compiled()).count();
+        assert!(
+            constructed.len() * 2 >= compiled_rows,
+            "the maximal registry built {} tools for {compiled_rows} compiled inventory \
+             rows; the fixture has stopped enabling integrations and this test would \
+             check almost nothing: {constructed:?}",
+            constructed.len()
+        );
+
+        let compiled_out_but_built: Vec<&str> = inventory
+            .iter()
+            .filter(|spec| !spec.compiled())
+            .filter(|spec| constructed.iter().any(|built| built == spec.name))
+            .map(|spec| spec.name)
+            .collect();
+        assert!(
+            compiled_out_but_built.is_empty(),
+            "these tools are built although their compilation group is absent from \
+             this build: {compiled_out_but_built:?}"
+        );
+
+        let lists = bounded_classification_lists();
+        let mut unclassified: Vec<&str> = Vec::new();
+        let mut duplicated: Vec<String> = Vec::new();
+        for name in &constructed {
+            if name == crate::tools::delegate::DelegateTool::NAME {
+                continue;
+            }
+            let hits: Vec<&str> = lists
+                .iter()
+                .filter(|(_, list)| list.contains(&name.as_str()))
+                .map(|(list_name, _)| *list_name)
+                .collect();
+            match hits.len() {
+                0 => unclassified.push(name),
+                1 => {}
+                _ => duplicated.push(format!("{name} in {hits:?}")),
+            }
+        }
+        assert!(
+            unclassified.is_empty(),
+            "built in this feature set but in no bounded-delegation category: {unclassified:?}"
+        );
+        assert!(
+            duplicated.is_empty(),
+            "built in this feature set but in more than one category: {duplicated:?}"
+        );
+
+        let mut stale: Vec<String> = Vec::new();
+        for (list_name, list) in lists {
+            for name in list {
+                if BUILT_OUTSIDE_THE_FACTORY.contains(name) {
+                    continue;
+                }
+                let compiled_inventory_row = zeroclaw_tools::inventory::builtin_tool(name)
+                    .is_some_and(|spec| spec.compiled());
+                if compiled_inventory_row && !constructed.iter().any(|built| built == name) {
+                    stale.push(format!("{name} ({list_name})"));
+                }
+            }
+        }
+        assert!(
+            stale.is_empty(),
+            "classified, compiled into this build, and yet not built by the maximal \
+             registry: {stale:?}"
+        );
+    }
+
+    /// The feature-gated tests above only exist when every opt-in tool feature
+    /// is on, and a build with only some of them compiles them out without a
+    /// word. Fail loudly on that partial state instead.
+    ///
+    /// `tools-compat` (root `Cargo.toml`, run by the "Test (opt-in tools)" CI
+    /// job) turns all of them on at once, and a default build turns none on;
+    /// those are the two states the suite supports. The second assertion keeps
+    /// this list in step with the canonical set so a new opt-in feature cannot
+    /// be added without this guard (and the `cfg(all(...))` lists) learning of it.
+    #[test]
+    fn opt_in_tool_features_are_all_on_or_all_off() {
+        let gates: [(&str, bool); 13] = [
+            ("tools-external", cfg!(feature = "tools-external")),
+            ("tool-linkedin", cfg!(feature = "tool-linkedin")),
+            ("tool-claude-code", cfg!(feature = "tool-claude-code")),
+            (
+                "tool-claude-code-runner",
+                cfg!(feature = "tool-claude-code-runner"),
+            ),
+            ("tool-codex-cli", cfg!(feature = "tool-codex-cli")),
+            ("tool-gemini-cli", cfg!(feature = "tool-gemini-cli")),
+            ("tool-opencode-cli", cfg!(feature = "tool-opencode-cli")),
+            ("tool-notion", cfg!(feature = "tool-notion")),
+            ("tool-jira", cfg!(feature = "tool-jira")),
+            ("tool-composio", cfg!(feature = "tool-composio")),
+            (
+                "tool-google-workspace",
+                cfg!(feature = "tool-google-workspace"),
+            ),
+            ("tool-microsoft365", cfg!(feature = "tool-microsoft365")),
+            ("tool-project-intel", cfg!(feature = "tool-project-intel")),
+        ];
+
+        let mut canonical: Vec<&str> = zeroclaw_config::opt_in_tools::OptInTool::ALL
+            .iter()
+            .map(|tool| tool.feature())
+            .collect();
+        canonical.push("tools-external");
+        canonical.sort_unstable();
+        let mut guarded: Vec<&str> = gates.iter().map(|(name, _)| *name).collect();
+        guarded.sort_unstable();
+        assert_eq!(
+            guarded, canonical,
+            "the opt-in tool feature set changed: update this guard and the \
+             `cfg(all(feature = ...))` lists on the gated tests in this module"
+        );
+
+        let on: Vec<&str> = gates
+            .iter()
+            .filter(|(_, on)| *on)
+            .map(|(n, _)| *n)
+            .collect();
+        let off: Vec<&str> = gates
+            .iter()
+            .filter(|(_, on)| !*on)
+            .map(|(n, _)| *n)
+            .collect();
+        assert!(
+            on.is_empty() || off.is_empty(),
+            "only some opt-in tool features are enabled, so the tests gated on all of \
+             them were compiled out without running. enabled: {on:?}; missing: {off:?}. \
+             Enable all of them (the root crate's `tools-compat`) or none."
+        );
+    }
     /// The categories must cover the compiled inventory
     /// (`zeroclaw_tools::inventory::BUILTIN_TOOLS`), not only whatever
     /// `maximal_tool_registry` happens to build: a tool whose gate that fixture
@@ -7632,7 +10088,10 @@ permissions = ["http_client"]
         assert!(!names.contains(&"browser"));
         assert!(names.contains(&"schedule"));
         assert!(names.contains(&"model_routing_config"));
-        assert!(names.contains(&"pushover"));
+        assert_eq!(
+            names.contains(&"pushover"),
+            cfg!(feature = "tools-external")
+        );
         assert!(names.contains(&"proxy_config"));
     }
 
@@ -7691,6 +10150,7 @@ permissions = ["http_client"]
     }
 
     #[test]
+    #[cfg(feature = "tools-external")]
     fn all_tools_includes_browser_when_enabled() {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
@@ -7740,13 +10200,17 @@ permissions = ["http_client"]
         );
         assert!(names.contains(&"content_search"));
         assert!(names.contains(&"model_routing_config"));
-        assert!(names.contains(&"pushover"));
+        assert_eq!(
+            names.contains(&"pushover"),
+            cfg!(feature = "tools-external")
+        );
         assert!(names.contains(&"proxy_config"));
     }
 
     /// Opting into `[browser] automation_enabled` registers the full
     /// `browser` automation tool alongside `browser_open`.
     #[test]
+    #[cfg(feature = "tools-external")]
     fn all_tools_includes_browser_automation_when_opted_in() {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
@@ -7797,6 +10261,7 @@ permissions = ["http_client"]
     /// without `browser_open`, proving `automation_enabled` is the only
     /// thing standing between an operator and the automation tool.
     #[test]
+    #[cfg(feature = "tools-external")]
     fn all_tools_registers_automation_without_browser_open() {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
@@ -8148,7 +10613,7 @@ permissions = ["http_client"]
     }
 
     #[test]
-    fn all_tools_excludes_read_skill_for_explicit_global_full() {
+    fn all_tools_includes_read_skill_for_on_demand_builtin_in_full_mode() {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
         let mem_cfg = MemoryConfig {
@@ -8162,6 +10627,56 @@ permissions = ["http_client"]
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
         let mut cfg = test_config(&tmp);
         cfg.skills.prompt_injection_mode = zeroclaw_config::schema::SkillsPromptInjectionMode::Full;
+
+        let tools = all_tools(
+            Arc::new(cfg.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+        )
+        .expect("tool registry builds")
+        .tools;
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"read_skill"));
+    }
+
+    #[test]
+    fn all_tools_excludes_read_skill_for_operator_override_in_full_mode() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig::default();
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let mut cfg = test_config(&tmp);
+        cfg.skills.prompt_injection_mode = zeroclaw_config::schema::SkillsPromptInjectionMode::Full;
+        let override_dir = cfg
+            .agent_workspace_dir("test-agent")
+            .join("skills/zeroclaw-docs");
+        std::fs::create_dir_all(&override_dir).unwrap();
+        std::fs::write(
+            override_dir.join("SKILL.md"),
+            "---\nname: zeroclaw-docs\ndescription: Operator override\n---\n\n# Override\n",
+        )
+        .unwrap();
 
         let tools = all_tools(
             Arc::new(cfg.clone()),
@@ -8361,7 +10876,7 @@ permissions = ["http_client"]
     }
 
     #[test]
-    fn all_tools_omits_read_skill_for_full_agent_override_over_global_compact() {
+    fn all_tools_keeps_read_skill_for_on_demand_builtin_with_full_agent_override() {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
         let mem_cfg = MemoryConfig {
@@ -8419,8 +10934,8 @@ permissions = ["http_client"]
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(
-            !names.contains(&"read_skill"),
-            "full runtime-profile override should omit read_skill even when global is compact"
+            names.contains(&"read_skill"),
+            "the on-demand built-in should register read_skill even when the effective mode is full"
         );
     }
 
@@ -8514,6 +11029,7 @@ permissions = ["http_client"]
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        config.tools.optional = vec!["llm_task".into()];
         config.agents.insert(
             "test-agent".to_string(),
             AliasedAgentConfig {
@@ -8717,6 +11233,7 @@ permissions = ["http_client"]
             Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
 
         let mut cfg = test_config(tmp);
+        cfg.tools.optional = vec!["*".into()];
         std::fs::create_dir_all(&cfg.data_dir).unwrap();
         // Plugin tools are outside the inventory, so plugins stay off, and the
         // plugin directory points under `tmp` as well.
@@ -8906,6 +11423,17 @@ permissions = ["http_client"]
             "the registry registers tools missing from BUILTIN_TOOLS in \
              crates/zeroclaw-tools/src/inventory.rs; add each one there and to the \
              tier tables in docs/book/src/developing/tool-inventory.md: {uninventoried:?}"
+        );
+
+        let uncompiled: Vec<&String> = registered
+            .iter()
+            .filter(|name| {
+                zeroclaw_tools::inventory::builtin_tool(name).is_some_and(|spec| !spec.compiled())
+            })
+            .collect();
+        assert!(
+            uncompiled.is_empty(),
+            "the registry registers tools outside their canonical compilation groups: {uncompiled:?}"
         );
     }
 
@@ -9101,6 +11629,7 @@ permissions = ["http_client"]
         let registered = maximal_registry_names(&tmp).await;
         let missing: Vec<&str> = zeroclaw_tools::inventory::BUILTIN_TOOLS
             .iter()
+            .filter(|spec| spec.compiled())
             .map(|spec| spec.name)
             .filter(|name| !unconstructible.contains_key(name) && !registered.contains(*name))
             .collect();
@@ -9226,6 +11755,1068 @@ mod wrapper_spec_forwarding_tests {
             Arc::ptr_eq(&boxed.spec().parameters, &inner_params),
             "ArcDelegatingTool must forward spec() so the inner Arc-shared \
              schema survives; the trait default deep-clones it every call"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+mod r5_namespace_tests;
+
+// Test evidence follows the actual case through the existing registry thread.
+// It owns no executable, policy, schema, or alternate registry.
+#[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+pub(crate) mod late_tool_search_observer {
+    use std::cell::RefCell;
+    use std::future::Future;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Debug, serde::Serialize)]
+    pub(crate) struct Event {
+        pub kind: &'static str,
+        pub label: String,
+        pub first: usize,
+        pub second: usize,
+    }
+
+    #[derive(Default)]
+    struct Events {
+        rows: Vec<Event>,
+        overflow: bool,
+    }
+
+    #[derive(Clone, Default)]
+    pub(crate) struct CaseTrace(Arc<Mutex<Events>>);
+
+    tokio::task_local! {
+        static CASE: CaseTrace;
+    }
+    thread_local! {
+        static BUILDER: RefCell<Option<CaseTrace>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) struct TraceGuard(Option<CaseTrace>);
+
+    impl Drop for TraceGuard {
+        fn drop(&mut self) {
+            BUILDER.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+
+    pub(crate) fn capture() -> Option<CaseTrace> {
+        CASE.try_with(Clone::clone)
+            .ok()
+            .or_else(|| BUILDER.with(|slot| slot.borrow().clone()))
+    }
+
+    pub(crate) fn enter_builder(trace: Option<CaseTrace>) -> TraceGuard {
+        TraceGuard(BUILDER.with(|slot| slot.replace(trace)))
+    }
+
+    pub(crate) async fn scope_case<T>(trace: CaseTrace, body: impl Future<Output = T>) -> T {
+        CASE.scope(trace, body).await
+    }
+
+    pub(crate) fn record(kind: &'static str, label: &str, first: usize, second: usize) {
+        let Some(trace) = capture() else { return };
+        let mut state = trace.0.lock().unwrap_or_else(|error| error.into_inner());
+        if state.rows.len() >= 4096 || label.len() > 128 {
+            state.overflow = true;
+            return;
+        }
+        state.rows.push(Event {
+            kind,
+            label: label.to_owned(),
+            first,
+            second,
+        });
+    }
+
+    pub(crate) fn arc_id<T: ?Sized>(value: &Arc<T>) -> usize {
+        Arc::as_ptr(value) as *const () as usize
+    }
+
+    pub(crate) fn borrowed_id<T: ?Sized>(value: &T) -> usize {
+        value as *const T as *const () as usize
+    }
+
+    impl CaseTrace {
+        pub(crate) fn events(&self) -> Vec<Event> {
+            let state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+            assert!(!state.overflow, "late ToolSearch trace overflow");
+            state.rows.clone()
+        }
+
+        pub(crate) fn count(&self, kind: &str, label: &str) -> usize {
+            self.events()
+                .iter()
+                .filter(|row| row.kind == kind && row.label == label)
+                .count()
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_memory_binding_tests {
+    use super::*;
+    use zeroclaw_api::attribution::{Attributable, MemoryKind, Role, ToolProvenance};
+
+    #[derive(Default)]
+    struct ForwardingProbe {
+        calls: parking_lot::Mutex<Vec<&'static str>>,
+        backing: Option<Arc<dyn Memory>>,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    fn assert_default_export_filter(filter: &ExportFilter) {
+        assert!(filter.namespace.is_none());
+        assert!(filter.session_id.is_none());
+        assert!(filter.category.is_none());
+        assert!(filter.since.is_none());
+        assert!(filter.until.is_none());
+    }
+
+    impl Attributable for ForwardingProbe {
+        fn role(&self) -> Role {
+            Role::Memory(MemoryKind::None)
+        }
+        fn alias(&self) -> &str {
+            "forwarded-alias"
+        }
+        fn tool_provenance(&self) -> ToolProvenance {
+            ToolProvenance::Native
+        }
+    }
+
+    #[async_trait]
+    impl Memory for ForwardingProbe {
+        fn name(&self) -> &str {
+            self.calls.lock().push("name");
+            "forwarded-backend"
+        }
+
+        async fn store(
+            &self,
+            key: &str,
+            content: &str,
+            category: MemoryCategory,
+            session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            assert_eq!(key, "sentinel");
+            assert_eq!(content, "sentinel");
+            assert_eq!(category, MemoryCategory::Core);
+            assert_eq!(
+                session_id,
+                if self.backing.is_some() {
+                    None
+                } else {
+                    Some("sentinel")
+                }
+            );
+            self.calls.lock().push("store");
+            if let Some(backing) = &self.backing {
+                self.entered.notify_one();
+                self.release.notified().await;
+                return backing.store(key, content, category, session_id).await;
+            }
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            query: &str,
+            limit: usize,
+            session_id: Option<&str>,
+            since: Option<&str>,
+            until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            assert_eq!(query, "sentinel");
+            assert_eq!(limit, 3);
+            assert_eq!(session_id, Some("sentinel"));
+            assert_eq!(since, Some("sentinel"));
+            assert_eq!(until, Some("sentinel"));
+            self.calls.lock().push("recall");
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            assert_eq!(key, "sentinel");
+            self.calls.lock().push("get");
+            Ok(None)
+        }
+
+        async fn get_for_agent(
+            &self,
+            key: &str,
+            agent_id: &str,
+        ) -> anyhow::Result<Option<MemoryEntry>> {
+            assert_eq!(key, "sentinel");
+            assert_eq!(agent_id, "sentinel");
+            self.calls.lock().push("get_for_agent");
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            category: Option<&MemoryCategory>,
+            session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            assert_eq!(category, Some(&MemoryCategory::Core));
+            assert_eq!(session_id, Some("sentinel"));
+            self.calls.lock().push("list");
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, key: &str) -> anyhow::Result<bool> {
+            assert_eq!(key, "sentinel");
+            self.calls.lock().push("forget");
+            Ok(true)
+        }
+
+        async fn forget_for_agent(&self, key: &str, agent_id: &str) -> anyhow::Result<bool> {
+            assert_eq!(key, "sentinel");
+            assert_eq!(agent_id, "sentinel");
+            self.calls.lock().push("forget_for_agent");
+            Ok(true)
+        }
+
+        async fn store_for_principal(
+            &self,
+            scope: &PrincipalScope,
+            key: &str,
+            content: &str,
+            category: MemoryCategory,
+            session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            assert_eq!(scope.principal_id, "owner:sentinel");
+            assert_eq!(key, "sentinel");
+            assert_eq!(content, "sentinel");
+            assert_eq!(category, MemoryCategory::Core);
+            assert_eq!(session_id, Some("sentinel"));
+            self.calls.lock().push("store_for_principal");
+            Ok(())
+        }
+
+        async fn recall_for_principal(
+            &self,
+            scope: &PrincipalScope,
+            query: &str,
+            limit: usize,
+            session_id: Option<&str>,
+            since: Option<&str>,
+            until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            assert_eq!(scope.principal_id, "owner:sentinel");
+            assert_eq!(query, "sentinel");
+            assert_eq!(limit, 3);
+            assert_eq!(session_id, Some("sentinel"));
+            assert_eq!(since, Some("sentinel"));
+            assert_eq!(until, Some("sentinel"));
+            self.calls.lock().push("recall_for_principal");
+            Ok(Vec::new())
+        }
+
+        async fn list_for_principal(
+            &self,
+            scope: &PrincipalScope,
+            category: Option<&MemoryCategory>,
+            session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            assert_eq!(scope.principal_id, "owner:sentinel");
+            assert_eq!(category, Some(&MemoryCategory::Core));
+            assert_eq!(session_id, Some("sentinel"));
+            self.calls.lock().push("list_for_principal");
+            Ok(Vec::new())
+        }
+
+        async fn get_for_principal(
+            &self,
+            scope: &PrincipalScope,
+            key: &str,
+        ) -> anyhow::Result<Option<MemoryEntry>> {
+            assert_eq!(scope.principal_id, "owner:sentinel");
+            assert_eq!(key, "sentinel");
+            self.calls.lock().push("get_for_principal");
+            Ok(None)
+        }
+
+        async fn forget_for_principal(
+            &self,
+            scope: &PrincipalScope,
+            key: &str,
+        ) -> anyhow::Result<bool> {
+            assert_eq!(scope.principal_id, "owner:sentinel");
+            assert_eq!(key, "sentinel");
+            self.calls.lock().push("forget_for_principal");
+            Ok(true)
+        }
+
+        async fn count_for_principal(&self, scope: &PrincipalScope) -> anyhow::Result<usize> {
+            assert_eq!(scope.principal_id, "owner:sentinel");
+            self.calls.lock().push("count_for_principal");
+            Ok(7)
+        }
+
+        async fn export_for_principal(
+            &self,
+            scope: &PrincipalScope,
+            filter: &ExportFilter,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            assert_eq!(scope.principal_id, "owner:sentinel");
+            assert_default_export_filter(filter);
+            self.calls.lock().push("export_for_principal");
+            Ok(Vec::new())
+        }
+
+        async fn purge_namespace_for_principal(
+            &self,
+            scope: &PrincipalScope,
+            namespace: &str,
+        ) -> anyhow::Result<usize> {
+            assert_eq!(scope.principal_id, "owner:sentinel");
+            assert_eq!(namespace, "sentinel");
+            self.calls.lock().push("purge_namespace_for_principal");
+            Ok(7)
+        }
+
+        async fn purge_session_for_principal(
+            &self,
+            scope: &PrincipalScope,
+            session_id: &str,
+        ) -> anyhow::Result<usize> {
+            assert_eq!(scope.principal_id, "owner:sentinel");
+            assert_eq!(session_id, "sentinel");
+            self.calls.lock().push("purge_session_for_principal");
+            Ok(7)
+        }
+
+        async fn purge_namespace(&self, namespace: &str) -> anyhow::Result<usize> {
+            assert_eq!(namespace, "sentinel");
+            self.calls.lock().push("purge_namespace");
+            Ok(7)
+        }
+
+        async fn purge_session(&self, session_id: &str) -> anyhow::Result<usize> {
+            assert_eq!(session_id, "sentinel");
+            self.calls.lock().push("purge_session");
+            Ok(7)
+        }
+
+        async fn purge_session_for_agent(
+            &self,
+            session_id: &str,
+            agent_id: &str,
+        ) -> anyhow::Result<usize> {
+            assert_eq!(session_id, "sentinel");
+            assert_eq!(agent_id, "sentinel");
+            self.calls.lock().push("purge_session_for_agent");
+            Ok(7)
+        }
+
+        async fn purge_agent(&self, agent_alias: &str) -> anyhow::Result<usize> {
+            assert_eq!(agent_alias, "sentinel");
+            self.calls.lock().push("purge_agent");
+            Ok(7)
+        }
+
+        async fn export_agent(&self, agent_alias: &str) -> anyhow::Result<Vec<MemoryEntry>> {
+            assert_eq!(agent_alias, "sentinel");
+            self.calls.lock().push("export_agent");
+            Ok(Vec::new())
+        }
+
+        async fn rename_agent(&self, from: &str, to: &str) -> anyhow::Result<usize> {
+            assert_eq!(from, "sentinel");
+            assert_eq!(to, "sentinel");
+            self.calls.lock().push("rename_agent");
+            Ok(7)
+        }
+
+        async fn count_agent(&self, agent_alias: &str) -> anyhow::Result<usize> {
+            assert_eq!(agent_alias, "sentinel");
+            self.calls.lock().push("count_agent");
+            Ok(7)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            self.calls.lock().push("count");
+            Ok(7)
+        }
+
+        async fn health_check(&self) -> bool {
+            self.calls.lock().push("health_check");
+            true
+        }
+
+        async fn supersede(&self, superseded_ids: &[String], new_id: &str) -> anyhow::Result<()> {
+            assert_eq!(superseded_ids[0], "sentinel");
+            assert_eq!(new_id, "sentinel");
+            self.calls.lock().push("supersede");
+            Ok(())
+        }
+
+        async fn store_procedural(
+            &self,
+            messages: &[ProceduralMessage],
+            session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            assert_eq!(messages[0].content, "sentinel");
+            assert_eq!(session_id, Some("sentinel"));
+            self.calls.lock().push("store_procedural");
+            Ok(())
+        }
+
+        async fn count_in_scope(
+            &self,
+            namespace: Option<&str>,
+            category: Option<&MemoryCategory>,
+        ) -> anyhow::Result<u64> {
+            assert_eq!(namespace, Some("sentinel"));
+            assert_eq!(category, Some(&MemoryCategory::Core));
+            self.calls.lock().push("count_in_scope");
+            Ok(9)
+        }
+
+        async fn stats(&self) -> anyhow::Result<MemoryStats> {
+            self.calls.lock().push("stats");
+            Ok(MemoryStats {
+                total_rows: 7,
+                ..Default::default()
+            })
+        }
+
+        async fn reindex(&self) -> anyhow::Result<usize> {
+            self.calls.lock().push("reindex");
+            Ok(7)
+        }
+
+        fn refresh_embedder(
+            &self,
+            model_provider: &str,
+            api_key: Option<&str>,
+            model: &str,
+            dimensions: usize,
+        ) {
+            assert_eq!(model_provider, "sentinel");
+            assert_eq!(api_key, Some("sentinel"));
+            assert_eq!(model, "sentinel");
+            assert_eq!(dimensions, 3);
+            self.calls.lock().push("refresh_embedder");
+        }
+
+        async fn recall_namespaced(
+            &self,
+            namespace: &str,
+            query: &str,
+            limit: usize,
+            session_id: Option<&str>,
+            since: Option<&str>,
+            until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            assert_eq!(namespace, "sentinel");
+            assert_eq!(query, "sentinel");
+            assert_eq!(limit, 3);
+            assert_eq!(session_id, Some("sentinel"));
+            assert_eq!(since, Some("sentinel"));
+            assert_eq!(until, Some("sentinel"));
+            self.calls.lock().push("recall_namespaced");
+            Ok(Vec::new())
+        }
+
+        async fn export(&self, filter: &ExportFilter) -> anyhow::Result<Vec<MemoryEntry>> {
+            assert_default_export_filter(filter);
+            self.calls.lock().push("export");
+            Ok(Vec::new())
+        }
+
+        async fn store_with_metadata(
+            &self,
+            key: &str,
+            content: &str,
+            category: MemoryCategory,
+            session_id: Option<&str>,
+            namespace: Option<&str>,
+            importance: Option<f64>,
+        ) -> anyhow::Result<()> {
+            assert_eq!(key, "sentinel");
+            assert_eq!(content, "sentinel");
+            assert_eq!(category, MemoryCategory::Core);
+            assert_eq!(session_id, Some("sentinel"));
+            assert_eq!(namespace, Some("sentinel"));
+            assert_eq!(importance, Some(0.75));
+            self.calls.lock().push("store_with_metadata");
+            Ok(())
+        }
+
+        async fn store_with_options(
+            &self,
+            key: &str,
+            content: &str,
+            category: MemoryCategory,
+            session_id: Option<&str>,
+            options: StoreOptions,
+        ) -> anyhow::Result<()> {
+            assert_eq!(key, "sentinel");
+            assert_eq!(content, "sentinel");
+            assert_eq!(category, MemoryCategory::Core);
+            assert_eq!(session_id, Some("sentinel"));
+            assert_eq!(options.namespace.as_deref(), Some("sentinel"));
+            self.calls.lock().push("store_with_options");
+            Ok(())
+        }
+
+        async fn store_with_options_and_agent(
+            &self,
+            key: &str,
+            content: &str,
+            category: MemoryCategory,
+            session_id: Option<&str>,
+            options: StoreOptions,
+            agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            assert_eq!(key, "sentinel");
+            assert_eq!(content, "sentinel");
+            assert_eq!(category, MemoryCategory::Core);
+            assert_eq!(session_id, Some("sentinel"));
+            assert_eq!(options.namespace.as_deref(), Some("sentinel"));
+            assert_eq!(agent_id, Some("sentinel"));
+            self.calls.lock().push("store_with_options_and_agent");
+            Ok(())
+        }
+
+        async fn store_with_agent(
+            &self,
+            key: &str,
+            content: &str,
+            category: MemoryCategory,
+            session_id: Option<&str>,
+            namespace: Option<&str>,
+            importance: Option<f64>,
+            agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            assert_eq!(key, "sentinel");
+            assert_eq!(content, "sentinel");
+            assert_eq!(category, MemoryCategory::Core);
+            assert_eq!(session_id, Some("sentinel"));
+            assert_eq!(namespace, Some("sentinel"));
+            assert_eq!(importance, Some(0.75));
+            assert_eq!(agent_id, Some("sentinel"));
+            self.calls.lock().push("store_with_agent");
+            Ok(())
+        }
+
+        async fn recall_for_agents(
+            &self,
+            allowed_agent_ids: &[&str],
+            query: &str,
+            limit: usize,
+            session_id: Option<&str>,
+            since: Option<&str>,
+            until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            assert_eq!(allowed_agent_ids[0], "sentinel");
+            assert_eq!(query, "sentinel");
+            assert_eq!(limit, 3);
+            assert_eq!(session_id, Some("sentinel"));
+            assert_eq!(since, Some("sentinel"));
+            assert_eq!(until, Some("sentinel"));
+            self.calls.lock().push("recall_for_agents");
+            Ok(Vec::new())
+        }
+
+        async fn ensure_agent_uuid(&self, alias: &str) -> anyhow::Result<String> {
+            assert_eq!(alias, "sentinel");
+            self.calls.lock().push("ensure_agent_uuid");
+            Ok("forwarded-value".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn native_memory_binding_forwards_the_principal_scope() {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        let shared: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("none"));
+        let security = Arc::new(SecurityPolicy::default());
+        let binding = NativeMemoryBinding::new(Arc::clone(&shared), Arc::clone(&security));
+        assert!(binding.principal_scope().is_none());
+        let scope = PrincipalScope::new("user:alice");
+        let routed: Arc<dyn Memory> = Arc::new(zeroclaw_memory::PrincipalPlaneMemory::new(
+            Arc::clone(&shared),
+            scope.clone(),
+        ));
+        binding.bind(&shared, routed, &security).unwrap();
+        assert_eq!(binding.principal_scope(), Some(scope));
+    }
+
+    #[tokio::test]
+    async fn native_memory_binding_forwards_all_actual_overrides_and_arguments() {
+        let actual = Arc::new(ForwardingProbe::default());
+        let original: Arc<dyn Memory> = actual.clone();
+        let binding = NativeMemoryBinding::new(original, Arc::new(SecurityPolicy::default()));
+        assert_eq!(binding.role(), actual.role());
+        assert_eq!(binding.alias(), "forwarded-alias");
+        assert_eq!(binding.tool_provenance(), actual.tool_provenance());
+        assert_eq!(binding.name(), "forwarded-backend");
+        binding
+            .store(
+                "sentinel",
+                "sentinel",
+                MemoryCategory::Core,
+                Some("sentinel"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            binding
+                .recall(
+                    "sentinel",
+                    3,
+                    Some("sentinel"),
+                    Some("sentinel"),
+                    Some("sentinel")
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(binding.get("sentinel").await.unwrap().is_none());
+        assert!(
+            binding
+                .get_for_agent("sentinel", "sentinel")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            binding
+                .list(Some(&MemoryCategory::Core), Some("sentinel"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(binding.forget("sentinel").await.unwrap());
+        assert!(
+            binding
+                .forget_for_agent("sentinel", "sentinel")
+                .await
+                .unwrap()
+        );
+        binding
+            .store_for_principal(
+                &PrincipalScope::new("owner:sentinel"),
+                "sentinel",
+                "sentinel",
+                MemoryCategory::Core,
+                Some("sentinel"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            binding
+                .recall_for_principal(
+                    &PrincipalScope::new("owner:sentinel"),
+                    "sentinel",
+                    3,
+                    Some("sentinel"),
+                    Some("sentinel"),
+                    Some("sentinel")
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            binding
+                .list_for_principal(
+                    &PrincipalScope::new("owner:sentinel"),
+                    Some(&MemoryCategory::Core),
+                    Some("sentinel")
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            binding
+                .get_for_principal(&PrincipalScope::new("owner:sentinel"), "sentinel")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            binding
+                .forget_for_principal(&PrincipalScope::new("owner:sentinel"), "sentinel")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            binding
+                .count_for_principal(&PrincipalScope::new("owner:sentinel"))
+                .await
+                .unwrap(),
+            7
+        );
+        assert!(
+            binding
+                .export_for_principal(
+                    &PrincipalScope::new("owner:sentinel"),
+                    &ExportFilter::default()
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            binding
+                .purge_namespace_for_principal(&PrincipalScope::new("owner:sentinel"), "sentinel")
+                .await
+                .unwrap(),
+            7
+        );
+        assert_eq!(
+            binding
+                .purge_session_for_principal(&PrincipalScope::new("owner:sentinel"), "sentinel")
+                .await
+                .unwrap(),
+            7
+        );
+        assert_eq!(binding.purge_namespace("sentinel").await.unwrap(), 7);
+        assert_eq!(binding.purge_session("sentinel").await.unwrap(), 7);
+        assert_eq!(
+            binding
+                .purge_session_for_agent("sentinel", "sentinel")
+                .await
+                .unwrap(),
+            7
+        );
+        assert_eq!(binding.purge_agent("sentinel").await.unwrap(), 7);
+        assert!(binding.export_agent("sentinel").await.unwrap().is_empty());
+        assert_eq!(
+            binding.rename_agent("sentinel", "sentinel").await.unwrap(),
+            7
+        );
+        assert_eq!(binding.count_agent("sentinel").await.unwrap(), 7);
+        assert_eq!(binding.count().await.unwrap(), 7);
+        assert!(binding.health_check().await);
+        binding
+            .supersede(&["sentinel".to_owned()], "sentinel")
+            .await
+            .unwrap();
+        binding
+            .store_procedural(
+                &[ProceduralMessage {
+                    role: "sentinel".into(),
+                    content: "sentinel".into(),
+                    name: None,
+                }],
+                Some("sentinel"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            binding
+                .count_in_scope(Some("sentinel"), Some(&MemoryCategory::Core))
+                .await
+                .unwrap(),
+            9
+        );
+        assert_eq!(binding.stats().await.unwrap().total_rows, 7);
+        assert_eq!(binding.reindex().await.unwrap(), 7);
+        binding.refresh_embedder("sentinel", Some("sentinel"), "sentinel", 3);
+        assert!(
+            binding
+                .recall_namespaced(
+                    "sentinel",
+                    "sentinel",
+                    3,
+                    Some("sentinel"),
+                    Some("sentinel"),
+                    Some("sentinel")
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            binding
+                .export(&ExportFilter::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        binding
+            .store_with_metadata(
+                "sentinel",
+                "sentinel",
+                MemoryCategory::Core,
+                Some("sentinel"),
+                Some("sentinel"),
+                Some(0.75),
+            )
+            .await
+            .unwrap();
+        binding
+            .store_with_options(
+                "sentinel",
+                "sentinel",
+                MemoryCategory::Core,
+                Some("sentinel"),
+                StoreOptions::default().with_namespace("sentinel"),
+            )
+            .await
+            .unwrap();
+        binding
+            .store_with_options_and_agent(
+                "sentinel",
+                "sentinel",
+                MemoryCategory::Core,
+                Some("sentinel"),
+                StoreOptions::default().with_namespace("sentinel"),
+                Some("sentinel"),
+            )
+            .await
+            .unwrap();
+        binding
+            .store_with_agent(
+                "sentinel",
+                "sentinel",
+                MemoryCategory::Core,
+                Some("sentinel"),
+                Some("sentinel"),
+                Some(0.75),
+                Some("sentinel"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            binding
+                .recall_for_agents(
+                    &["sentinel"],
+                    "sentinel",
+                    3,
+                    Some("sentinel"),
+                    Some("sentinel"),
+                    Some("sentinel")
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            binding.ensure_agent_uuid("sentinel").await.unwrap(),
+            "forwarded-value"
+        );
+        assert_eq!(
+            *actual.calls.lock(),
+            vec![
+                "name",
+                "store",
+                "recall",
+                "get",
+                "get_for_agent",
+                "list",
+                "forget",
+                "forget_for_agent",
+                "store_for_principal",
+                "recall_for_principal",
+                "list_for_principal",
+                "get_for_principal",
+                "forget_for_principal",
+                "count_for_principal",
+                "export_for_principal",
+                "purge_namespace_for_principal",
+                "purge_session_for_principal",
+                "purge_namespace",
+                "purge_session",
+                "purge_session_for_agent",
+                "purge_agent",
+                "export_agent",
+                "rename_agent",
+                "count_agent",
+                "count",
+                "health_check",
+                "supersede",
+                "store_procedural",
+                "count_in_scope",
+                "stats",
+                "reindex",
+                "refresh_embedder",
+                "recall_namespaced",
+                "export",
+                "store_with_metadata",
+                "store_with_options",
+                "store_with_options_and_agent",
+                "store_with_agent",
+                "recall_for_agents",
+                "ensure_agent_uuid"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn native_memory_binding_refuses_after_use_and_preserves_failed_owner() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let original: Arc<dyn Memory> =
+            Arc::new(zeroclaw_memory::SqliteMemory::new("old", tmp.path()).unwrap());
+        let other: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("other"));
+        let security = Arc::new(SecurityPolicy::default());
+        let binding = NativeMemoryBinding::new(Arc::clone(&original), Arc::clone(&security));
+        assert_eq!(
+            binding
+                .bind(&other, Arc::clone(&other), &security)
+                .unwrap_err()
+                .to_string(),
+            "native_memory_binding_owner_mismatch"
+        );
+        assert!(binding.routed.get().is_none());
+        assert_eq!(
+            binding
+                .bind(
+                    &original,
+                    Arc::clone(&other),
+                    &Arc::new(SecurityPolicy::default())
+                )
+                .unwrap_err()
+                .to_string(),
+            "native_memory_binding_owner_mismatch"
+        );
+        assert!(
+            binding.routed.get().is_none(),
+            "same-valued policy is not the actual creator's Arc"
+        );
+        binding
+            .store("used", "old-store", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            binding
+                .bind(&original, Arc::clone(&other), &security)
+                .unwrap_err()
+                .to_string(),
+            "native_memory_binding_operation_already_started"
+        );
+        assert!(binding.routed.get().is_none());
+        assert_eq!(
+            original.get("used").await.unwrap().unwrap().content,
+            "old-store"
+        );
+        // The synchronous mutator must also make later rebinding ineligible.
+        let fresh = NativeMemoryBinding::new(Arc::clone(&original), Arc::clone(&security));
+        fresh.refresh_embedder("none", None, "none", 0);
+        assert_eq!(
+            fresh
+                .bind(&original, other, &security)
+                .unwrap_err()
+                .to_string(),
+            "native_memory_binding_operation_already_started"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_memory_inflight_operation_refuses_binding_without_holding_a_lock_across_await()
+    {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backing: Arc<dyn Memory> =
+            Arc::new(zeroclaw_memory::SqliteMemory::new("inflight", tmp.path()).unwrap());
+        let actual = Arc::new(ForwardingProbe {
+            backing: Some(Arc::clone(&backing)),
+            ..Default::default()
+        });
+        let original: Arc<dyn Memory> = actual.clone();
+        let security = Arc::new(SecurityPolicy::default());
+        let binding = Arc::new(NativeMemoryBinding::new(
+            Arc::clone(&original),
+            Arc::clone(&security),
+        ));
+        let origins = NativeMemoryOrigins::default();
+        let running = origins.construct(NativeMemoryKind::Store, &binding);
+        assert!(origins.prove(&running).is_some());
+        let task = ::zeroclaw_spawn::spawn!(async move {
+            running
+                .execute(serde_json::json!({"key":"sentinel", "content":"sentinel"}))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), actual.entered.notified())
+            .await
+            .unwrap();
+        let target: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("private"));
+        assert_eq!(
+            binding
+                .bind(&original, target, &security)
+                .unwrap_err()
+                .to_string(),
+            "native_memory_binding_operation_already_started",
+            "do not wait for or retarget an in-flight operation"
+        );
+        assert!(binding.routed.get().is_none());
+        actual.release.notify_one();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(result.success);
+        assert_eq!(
+            backing.get("sentinel").await.unwrap().unwrap().content,
+            "sentinel"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_memory_bind_before_use_preserves_override_refusal_and_weak_lifetime() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let original: Arc<dyn Memory> =
+            Arc::new(zeroclaw_memory::SqliteMemory::new("old", tmp.path()).unwrap());
+        let security = Arc::new(SecurityPolicy::default());
+        let binding = Arc::new(NativeMemoryBinding::new(
+            Arc::clone(&original),
+            Arc::clone(&security),
+        ));
+        let weak = Arc::downgrade(&binding);
+        let origins = NativeMemoryOrigins::default();
+        let native = origins.construct(NativeMemoryKind::Store, &binding);
+        let witness = origins.prove(&native).unwrap();
+        let scope = PrincipalScope::new("owner:one");
+        let routed: Arc<dyn Memory> = Arc::new(zeroclaw_memory::PrincipalPlaneMemory::new(
+            Arc::clone(&original),
+            scope.clone(),
+        ));
+        binding
+            .bind(&original, Arc::clone(&routed), &security)
+            .unwrap();
+        binding
+            .bind(&original, Arc::clone(&routed), &security)
+            .unwrap();
+        let foreign: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("foreign"));
+        assert!(binding.bind(&original, foreign, &security).is_err());
+        binding
+            .store("private", "bound-store", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        assert!(original.get("private").await.unwrap().is_none());
+        assert_eq!(
+            original
+                .get_for_principal(&scope, "private")
+                .await
+                .unwrap()
+                .unwrap()
+                .content,
+            "bound-store"
+        );
+        assert!(
+            binding.purge_agent("any").await.is_err(),
+            "forward the actual private-plane refusal"
+        );
+        drop(binding);
+        assert!(
+            weak.upgrade().is_some(),
+            "actual native Tool owns its Memory binding"
+        );
+        drop(native);
+        assert!(witness.actual.upgrade().is_none());
+        assert!(witness.binding.upgrade().is_none());
+        assert!(
+            weak.upgrade().is_none(),
+            "origin metadata must not own the resource"
         );
     }
 }

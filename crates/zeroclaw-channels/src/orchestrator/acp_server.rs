@@ -1452,6 +1452,7 @@ impl AcpServer {
         // from replay too, and each surviving one replays as the live
         // client-cancel update rather than a verbatim assistant message.
         let mut replayed_messages = 0;
+        let mut tool_titles: HashMap<String, String> = HashMap::new();
         for (original_index, msg) in stored_messages.iter().enumerate() {
             if original_index < replay_from {
                 continue;
@@ -1462,7 +1463,9 @@ impl AcpServer {
                     .await;
                 continue;
             }
-            for notification in history_notifications_for_message(&session_id, msg) {
+            for notification in
+                history_notifications_for_message(&session_id, msg, &mut tool_titles)
+            {
                 self.write_notification(&notification).await;
             }
         }
@@ -2222,6 +2225,10 @@ impl AcpServer {
 
         let mut accumulated_text = String::new();
         let mut tool_call_count: u32 = 0;
+        // Titles announced on `tool_call` must be restated on `tool_call_update`.
+        // ACP clients replace the displayed title with the update's title, and
+        // the result event does not carry the original arguments.
+        let mut tool_titles: HashMap<String, String> = HashMap::new();
         // Latest whole-list plan emitted this turn (TodoWrite). Persisted
         // durably after the turn so external ACP clients get the same
         // resume/restart replay the daemon RPC bridge already provides.
@@ -2246,6 +2253,7 @@ impl AcpServer {
             match &event {
                 TurnEvent::ToolCall { id, name, args } => {
                     tool_call_count += 1;
+                    tool_titles.insert(id.clone(), acp_tool_title(name, args));
                     ::zeroclaw_log::record!(
                         DEBUG,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start).with_category(::zeroclaw_log::EventCategory::Channel)
@@ -2282,7 +2290,15 @@ impl AcpServer {
                 }
                 _ => {}
             }
-            if let Some(notification) = notification_for_turn_event(&session_id, &event) {
+            let remembered_title = match &event {
+                TurnEvent::ToolResult { id, .. } => tool_titles.get(id).cloned(),
+                _ => None,
+            };
+            if let Some(notification) = notification_for_turn_event_titled(
+                &session_id,
+                &event,
+                remembered_title.as_deref(),
+            ) {
                 self.write_notification(&notification).await;
             }
         }
@@ -3479,7 +3495,47 @@ async fn persist_acp_usage_snapshot_ordered(
     }
 }
 
+/// ACP `title` is what clients render as the tool call. The tool name is a
+/// poor label for `shell`: the command is what the tool is doing.
+const ACP_TOOL_TITLE_MAX_CHARS: usize = 160;
+
+fn acp_tool_title(name: &str, args: &Value) -> String {
+    let descriptive = match name {
+        "shell" => args.get("command").and_then(Value::as_str),
+        _ => None,
+    };
+    match descriptive
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+    {
+        Some(command) => truncate_acp_title(&collapse_title_whitespace(command)),
+        None => name.to_string(),
+    }
+}
+
+fn collapse_title_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn truncate_acp_title(text: &str) -> String {
+    if text.chars().count() <= ACP_TOOL_TITLE_MAX_CHARS {
+        return text.to_string();
+    }
+    let keep = ACP_TOOL_TITLE_MAX_CHARS.saturating_sub(1);
+    let mut out: String = text.chars().take(keep).collect();
+    out.push('…');
+    out
+}
+
 fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<JsonRpcNotification> {
+    notification_for_turn_event_titled(session_id, event, None)
+}
+
+fn notification_for_turn_event_titled(
+    session_id: &str,
+    event: &TurnEvent,
+    remembered_title: Option<&str>,
+) -> Option<JsonRpcNotification> {
     Some(match event {
         TurnEvent::Chunk { delta } => JsonRpcNotification {
             jsonrpc: "2.0",
@@ -3501,7 +3557,7 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
                 "sessionUpdate": "tool_call",
                 "toolCallId": id,
                 "name": name,
-                "title": name,
+                "title": acp_tool_title(name, args),
                 "kind": map_tool_kind(name),
                 "rawInput": to_acp_raw_input(name, args),
                 "status": "pending"
@@ -3544,13 +3600,21 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
             });
             // `deliver_file` carries a caller-supplied chat label in its typed
             // artifact; surface it as the standard ACP `title` so the client can
-            // render a human-readable name for the delivered file. Falls back to
-            // the tool name (which is what every other tool uses).
+            // render a human-readable name for the delivered file. Otherwise
+            // restate the title from the matching `tool_call` (the shell
+            // command, not the tool name). A bare tool name is only the
+            // fallback when neither is available.
             let title = artifact
                 .as_ref()
                 .filter(|_| name == "deliver_file")
                 .map(|a| a.title.clone())
                 .filter(|t| !t.is_empty())
+                .or_else(|| {
+                    remembered_title
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty())
+                        .map(str::to_string)
+                })
                 .unwrap_or_else(|| name.to_string());
             let status = if delivery_failed {
                 "failed"
@@ -3663,6 +3727,7 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
 fn history_notifications_for_message(
     session_id: &str,
     msg: &ConversationMessage,
+    tool_titles: &mut HashMap<String, String>,
 ) -> Vec<JsonRpcNotification> {
     match msg {
         ConversationMessage::Chat(chat) => {
@@ -3724,12 +3789,14 @@ fn history_notifications_for_message(
             for tc in tool_calls {
                 let args: serde_json::Value =
                     serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null);
+                let title = acp_tool_title(&tc.name, &args);
+                tool_titles.insert(tc.id.clone(), title.clone());
                 let acp_content = to_acp_content(&tc.name, &args);
                 let mut update = serde_json::json!({
                     "sessionUpdate": "tool_call",
                     "toolCallId": &tc.id,
                     "name": &tc.name,
-                    "title": &tc.name,
+                    "title": title,
                     "kind": map_tool_kind(&tc.name),
                     "rawInput": to_acp_raw_input(&tc.name, &args),
                     "status": "completed"
@@ -3753,23 +3820,32 @@ fn history_notifications_for_message(
         }
         ConversationMessage::ToolResults(results) => results
             .iter()
-            .map(|r| JsonRpcNotification {
-                jsonrpc: "2.0",
-                method: "session/update",
-                params: serde_json::json!({
-                    "sessionId": session_id,
-                    "update": {
-                        "sessionUpdate": "tool_call_update",
-                        "toolCallId": &r.tool_call_id,
-                        "status": "completed",
-                        "rawOutput": &r.content,
-                        "body": &r.content,
-                        "content": [{
-                            "type": "content",
-                            "content": { "type": "text", "text": &r.content }
-                        }]
-                    }
-                }),
+            .map(|r| {
+                let mut update = serde_json::json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": &r.tool_call_id,
+                    "status": "completed",
+                    "rawOutput": &r.content,
+                    "body": &r.content,
+                    "content": [{
+                        "type": "content",
+                        "content": { "type": "text", "text": &r.content }
+                    }]
+                });
+                // Restate the call's title. A completion update that omits it
+                // leaves clients that replace (rather than merge) showing the
+                // tool name in place of the command.
+                if let Some(title) = tool_titles.get(&r.tool_call_id) {
+                    update["title"] = serde_json::Value::String(title.clone());
+                }
+                JsonRpcNotification {
+                    jsonrpc: "2.0",
+                    method: "session/update",
+                    params: serde_json::json!({
+                        "sessionId": session_id,
+                        "update": update
+                    }),
+                }
             })
             .collect(),
     }
@@ -5686,6 +5762,8 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(32);
         let mut config = make_test_config(workspace.path());
+        // This transcript exercises selected delivery on the minimal ACP catalog plus deliver_file.
+        config.tools.optional = vec!["deliver_file".into()];
         config
             .risk_profiles
             .get_mut("default")
@@ -6330,6 +6408,63 @@ mod tests {
     }
 
     #[test]
+    fn shell_tool_title_is_the_command_not_the_tool_name() {
+        assert_eq!(
+            acp_tool_title("shell", &serde_json::json!({"command": "  git   status\n"})),
+            "git status"
+        );
+        assert_eq!(
+            acp_tool_title("shell", &serde_json::json!({})),
+            "shell",
+            "a shell call with no command still falls back to the tool name"
+        );
+        assert_eq!(
+            acp_tool_title("file_read", &serde_json::json!({"path": "src/main.rs"})),
+            "file_read"
+        );
+
+        // `format!` rather than `String + &String`: under `ci-all`, decancer's
+        // `impl Add<Translation> for String` blocks that coercion.
+        let long = format!("echo {}", "a".repeat(200));
+        let title = acp_tool_title("shell", &serde_json::json!({"command": long}));
+        assert_eq!(title.chars().count(), ACP_TOOL_TITLE_MAX_CHARS);
+        assert!(title.ends_with('…'));
+    }
+
+    #[test]
+    fn history_replay_restates_shell_command_as_title() {
+        use zeroclaw_api::model_provider::ToolResultMessage;
+
+        let mut titles = HashMap::new();
+        let call = ConversationMessage::AssistantToolCalls {
+            text: None,
+            tool_calls: vec![ToolCall {
+                id: "tc-replay".into(),
+                name: "shell".into(),
+                arguments: r#"{"command":"git status --short"}"#.into(),
+                extra_content: None,
+            }],
+            reasoning_content: None,
+        };
+        let call_notes = history_notifications_for_message("sid", &call, &mut titles);
+        assert_eq!(
+            call_notes[0].params["update"]["title"], "git status --short",
+            "replayed shell calls must show the command, not the tool name"
+        );
+
+        let result = ConversationMessage::ToolResults(vec![ToolResultMessage {
+            tool_call_id: "tc-replay".into(),
+            content: " M acp_server.rs".into(),
+            tool_name: "shell".into(),
+        }]);
+        let result_notes = history_notifications_for_message("sid", &result, &mut titles);
+        assert_eq!(
+            result_notes[0].params["update"]["title"], "git status --short",
+            "the completion update must restate the command so clients that replace titles do not fall back to the tool name"
+        );
+    }
+
+    #[test]
     fn turn_tool_events_include_client_visible_tool_fields() {
         let call = notification_for_turn_event(
             "test-sid",
@@ -6345,14 +6480,14 @@ mod tests {
         assert_eq!(call_value["params"]["update"]["sessionUpdate"], "tool_call");
         assert_eq!(call_value["params"]["update"]["toolCallId"], "tc-12345");
         assert_eq!(call_value["params"]["update"]["name"], "shell");
-        assert_eq!(call_value["params"]["update"]["title"], "shell");
+        assert_eq!(call_value["params"]["update"]["title"], "ls -la");
         assert_eq!(call_value["params"]["update"]["kind"], "execute");
         assert_eq!(
             call_value["params"]["update"]["rawInput"],
             serde_json::json!({"command": "ls -la"})
         );
 
-        let result = notification_for_turn_event(
+        let result = notification_for_turn_event_titled(
             "test-sid",
             &TurnEvent::ToolResult {
                 id: "tc-12345".to_string(),
@@ -6360,6 +6495,7 @@ mod tests {
                 output: "file1.txt\nfile2.txt".to_string(),
                 artifact: None,
             },
+            Some("ls -la"),
         );
         let result_value =
             serde_json::to_value(result.expect("ToolResult maps to a notification")).unwrap();
@@ -6369,7 +6505,7 @@ mod tests {
         );
         assert_eq!(result_value["params"]["update"]["toolCallId"], "tc-12345");
         assert_eq!(result_value["params"]["update"]["name"], "shell");
-        assert_eq!(result_value["params"]["update"]["title"], "shell");
+        assert_eq!(result_value["params"]["update"]["title"], "ls -la");
         assert_eq!(result_value["params"]["update"]["kind"], "execute");
         assert_eq!(result_value["params"]["update"]["status"], "completed");
         assert_eq!(

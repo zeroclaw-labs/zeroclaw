@@ -20,15 +20,24 @@ For the build order, tracked-output rules, and drift checks that turn the typed 
 | Generated reference | `cargo mdbook refs` / `markdown-schema` | `docs/book/src/reference/config.md` at build time | Documentation only |
 | Bootstrap location | `ZEROCLAW_CONFIG_DIR`, `ZEROCLAW_DATA_DIR`, deprecated `ZEROCLAW_WORKSPACE` | Environment only | Before `Config` exists |
 | Schema-mirror overrides | `ZEROCLAW_<lowercase_path>` with `__` for dots | In-memory only | Each `Config::load_or_init()` |
-| CLI config writes | `zeroclaw config set`, `config patch`, aliases, model helpers | `save_dirty()` to `config.toml` | Next load/reload unless the current command uses the new in-memory value |
-| RPC and TUI config writes | `config/*` RPC methods used by zerocode | Admitted config commit: `save_dirty()` then publish | Published pair updates immediately; daemon-owned subsystems need reload |
+| Disk-only CLI config writes | Config and alias writes outside daemon-routed agent-alias paths, including authorization sections | `save_dirty()` to `config.toml` | Next load/reload unless the current command uses the new in-memory value |
+| Daemon-routed CLI agent mutations | With `agent-runtime`, agent-targeting `config set` / `config init` and agent-alias create, rename, and delete | Daemon RPC (`config/*` and `agents/delete*`) while running; guarded disk writes when offline | The daemon coordinates the mutation; agent-targeting `config patch` refuses while the daemon owns config |
+| RPC and TUI config writes | `config/*` RPC methods used by zerocode | Admitted config commit: `save_dirty()` then publish | Published config pair and accepted authorization policy update before success; daemon-owned subsystems that need rebuilding still need reload |
 | Quickstart apply | Shared web, CLI, and zerocode apply path | Staged apply completed as a config commit (supervised surfaces) | Web and RPC can signal daemon reload; standalone CLI applies on next load/reload |
-| Gateway config writes | Config API handlers through `persist_and_swap()` | Admitted config commit: `save_dirty()` then publish | Published pair updates immediately; daemon subsystems apply after reload |
+| Gateway config writes | Config API handlers through `persist_and_swap()` | Admitted config commit: `save_dirty()` then publish | Published config pair and accepted authorization policy update before success; shared with RPC in a supervised run; other daemon subsystems apply after reload |
 | Daemon reload | `/admin/reload`, RPC `config/reload`, or the in-process reload channel | Re-reads `config.toml` | Recreates daemon subsystems in the same PID |
 
 Do not hand-edit the generated config reference. If a field, enum, alias
 section, secret marker, or description is wrong there, fix the schema or the
 generator and regenerate the reference.
+
+## Setup guidance
+
+The `config/list` RPC exposes optional per-field setup metadata from the current typed `Config`. A present `setup` entry identifies a required field under a covered contract; `missing` reports whether that contract considers its value empty. An absent entry means unknown requiredness, not optionality or readiness. The metadata is derived during introspection and is never persisted.
+
+Route guidance shares the required-value checks used by `Config::validate`. Cloud TTS key guidance shares the trimmed-key accessor used by its constructors. Missing secret values are checked against typed values before display masking. Model-provider authentication remains conditional on the provider and authentication mode; setup metadata does not check external logins, executables, connectivity, or provider readiness.
+
+In ZeroCode Config, confirming an alias name saves the entry before opening its fields. Cancelling the name form does not create an entry. Leaving the field editor afterward keeps the saved entry, and field edits retain their existing persistence behavior.
 
 ## Load order
 
@@ -114,7 +123,24 @@ and cost wiring. `POST /admin/reload` signals the daemon loop, which re-reads
 `config.toml` and re-instantiates those subsystems in the same process. The PID
 stays the same, but listeners briefly rebind.
 
-Gateway config writes call `persist_and_swap()`: save to disk inside an admitted, serialized config commit, then publish the saved config as the new published pair and set `pending_reload`. This makes the config editor reflect the write immediately, while the reload banner tells the operator that channels, providers, scheduler, or other daemon-owned components may still be running from the previous subsystem instance.
+Gateway config writes call `persist_and_swap()`: validate the staged authorization
+policy, save to disk inside an admitted, serialized config commit, publish that
+policy, publish the saved config and its revision as the new pair, and set
+`pending_reload`. In a supervised run, the gateway and RPC context share the
+daemon generation's config, accepted authorization authority, and process-wide
+config write lock. A policy edit through either surface therefore reaches both
+before the write returns success, without a daemon reload. See
+[Authentication & principals](../security/authentication.md#the-model-in-one-pass)
+for connection revalidation and the separate pairing-token revocation boundary.
+
+The reload banner still tells the operator that channels, providers, scheduler,
+or other daemon-owned components may be running from the previous subsystem
+instance. Direct file edits, and CLI writes outside daemon-routed agent-alias
+paths (including authorization sections), do not use that in-process publication
+path: they take effect at the next load, reload, or restart. These disk-only CLI
+writes do not trigger a daemon reload after saving. With `agent-runtime`, supported
+agent-alias mutations use the running daemon's RPC; agent-targeting
+`config patch` refuses while the daemon owns config.
 
 Standalone `zeroclaw gateway start` has no daemon supervisor. Its reload
 endpoint returns a restart-required response because there is no outer daemon
@@ -167,6 +193,23 @@ When replacing an existing file, the writer creates a same-directory
 `config.toml.bak` during the replace and removes it after a successful write.
 Gateway writes also snapshot the pre-write file and best-effort restore it if
 persistence fails before publishing the new pair.
+
+The CLI's `zeroclaw config migrate` keeps the pre-migration file as
+`config.toml.backup`, which the next CLI migration replaces. Dashboard migration
+instead writes `config.toml.bak`; the next save can replace that copy, so it is
+not a lasting downgrade backup. The first rewrite of a file at an older schema
+version, whether a migration or a save from any surface, also copies it to
+`config.toml.v<version>.backup` (for example `config.toml.v3.backup`). That
+copy is owner-only, is written once and never replaced, and is the downgrade
+path: an older binary reads it as is. A file already at that name counts only
+when it holds exactly the bytes about to be rewritten; anything else there is
+left alone and the copy goes to the first free numbered name
+(`config.toml.v3-1.backup`, and so on). A copy an older build left readable
+by others is made owner-only before it counts. On a filesystem without hard
+links the copy is kept under a name of its own instead
+(`config.toml.v3-<random>.backup`). It still holds every key the upgrade
+retired, including plaintext secrets, so delete it once a downgrade is no
+longer needed.
 
 There is no general transactional rollback for a valid but undesired config
 change after it has been saved and applied. Restore the previous `config.toml`

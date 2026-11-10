@@ -2337,15 +2337,6 @@ mod tests {
         );
     }
 
-    /// Serializes tests that mutate the process-global runtime proxy config.
-    /// Those tests call `set_runtime_proxy_config`, and Rust runs tests in
-    /// parallel, so without this lock one test's reset could clobber another's
-    /// setup mid-run.
-    fn with_global_proxy_lock() -> parking_lot::MutexGuard<'static, ()> {
-        static PROXY_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-        PROXY_TEST_LOCK.lock()
-    }
-
     #[test]
     #[serial(a2a)]
     fn resolve_token_passes_literal_through() {
@@ -3340,14 +3331,14 @@ mod tests {
         );
     }
 
-    #[test]
+    #[tokio::test]
     #[serial(a2a)]
-    fn runtime_proxy_active_detects_every_proxy_mode() {
+    async fn runtime_proxy_active_detects_every_proxy_mode() {
         // B1: every proxy mode (http/https/socks/socks5h) forwards the target
         // hostname to the proxy, so none can preserve the local DNS pin. The
         // guard must fail closed on any active proxy and allow only direct
         // (non-proxied) connections.
-        let _lock = with_global_proxy_lock();
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
         use zeroclaw_config::schema::{ProxyConfig, set_runtime_proxy_config};
 
         // No proxy → not active.
@@ -3416,13 +3407,13 @@ mod tests {
         set_runtime_proxy_config(ProxyConfig::default());
     }
 
-    #[test]
+    #[tokio::test]
     #[serial(a2a)]
-    fn pinned_client_fails_closed_on_any_proxy() {
+    async fn pinned_client_fails_closed_on_any_proxy() {
         // B1: with any active proxy, pinned_client must reject a hostname peer
         // (no local pin can constrain the proxy-side destination). Covers the
         // HTTP/HTTPS CONNECT modes that the previous socks5h-only check missed.
-        let _lock = with_global_proxy_lock();
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
         use zeroclaw_config::schema::{ProxyConfig, set_runtime_proxy_config};
 
         for (proxy_url, scheme) in [
@@ -3455,9 +3446,9 @@ mod tests {
         set_runtime_proxy_config(ProxyConfig::default());
     }
 
-    #[test]
+    #[tokio::test]
     #[serial(a2a)]
-    fn pinned_client_direct_path_disables_inherited_env_proxy() {
+    async fn pinned_client_direct_path_disables_inherited_env_proxy() {
         // B1: reqwest enables system/environment proxies by default. Even when
         // the runtime ProxyConfig reports no active proxy, an inherited
         // HTTP_PROXY/HTTPS_PROXY/ALL_PROXY would receive the target hostname
@@ -3467,7 +3458,7 @@ mod tests {
         // still builds a direct (non-failing) pinned client, i.e. the env
         // proxy does not turn the path into a proxied connection that the
         // guard would have to reject.
-        let _lock = with_global_proxy_lock();
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
         // Ensure runtime config has no proxy (env is the only possible source).
         zeroclaw_config::schema::set_runtime_proxy_config(
             zeroclaw_config::schema::ProxyConfig::default(),
@@ -3504,14 +3495,14 @@ mod tests {
         }
     }
 
-    #[test]
+    #[tokio::test]
     #[serial(a2a)]
-    fn pinned_client_literal_ip_follows_live_proxy_policy() {
+    async fn pinned_client_literal_ip_follows_live_proxy_policy() {
         // B4: a literal-IP URL must not use a stale construction-time proxy. When
         // a runtime proxy is active, the literal-IP path fails closed (consistent
         // with the hostname path); when no proxy is active it builds a direct
         // no-proxy client. The two branches below exercise both cases.
-        let _lock = with_global_proxy_lock();
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
         use zeroclaw_config::schema::{ProxyConfig, set_runtime_proxy_config};
 
         // Proxy active → literal-IP must fail closed.

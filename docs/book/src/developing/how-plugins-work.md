@@ -201,14 +201,24 @@ one twice:
    after plugin tools. That refusal carries `error_key`
    `plugin_tool_name_reserved`.
 
-The names checked are the tools that registry build has already registered,
-including plugin tools accepted earlier in the same pass, plus
-`execute_pipeline` when `[pipeline] enabled = true`. This is not a fixed list
-of every built-in name: a built-in that a build does not register, for example
-because its config section is disabled, is not reserved in that build. Apart
-from the MCP namespace, tools that join the registry after plugin registration
-are outside this check. Give plugin packages and tools names that are unique
-outright rather than relying on it.
+The names checked are the host's built-in tools, including ones the current
+tool selection leaves out of the agent, plus plugin tools accepted earlier in
+the same pass. Some host tools are only added later in setup; their names are
+reserved up front, for example `mcp_resources` and `mcp_prompts` always, even
+on a host with no MCP servers, and `execute_pipeline` when
+`[pipeline] enabled = true`. The set still depends on the build and its
+config, so do not treat it as a fixed list of every built-in name: a name that
+loads on one host can be refused on another.
+
+Tools that a connected peripheral or a skill contributes join the registry
+later, when the agent's tool set is assembled. They own their names too: a
+plugin tool with such a name is dropped at that point, and the host logs a
+`WARN` event with `error_key` `plugin_tool_name_conflict` naming the tool.
+A peripheral's tool names are known only once its board is connected, so
+while a board is absent, and wherever tools are assembled without connecting
+hardware, such as tool listings, a plugin tool with one of those names can
+still appear. Give plugin packages and tools names that are unique outright
+rather than relying on these checks.
 
 ## Capabilities and permissions
 
@@ -270,6 +280,80 @@ manifest that declares destinations and holds a transport that can reach them
 instance still needs before it can start. It never sets `plugins.enabled` and
 never edits an agent's `channels`. See
 [Binding a channel instance](../plugins/index.md#binding-a-channel-instance).
+
+## Running plugins from a release binary
+
+The plugin system is experimental: the `wit/v0` contract is unstable, so a
+plugin must be built against the WIT shipped with the release that runs it, and
+a mismatch surfaces at the install-time load check rather than in the manifest.
+Within that limit, the release archives for the 64-bit desktop and server
+targets carry the plugin host and the compiler that loads `.wasm` components,
+and every release executes a plugin from each of those archives before it
+publishes. The 32-bit ARM
+archives, the experimental Android archive, and source builds with Cargo
+defaults carry no plugin host; the
+[protocol page](./plugin-protocol.md#plugin-support-per-release-artifact)
+lists every artifact. Running a plugin on a release binary takes four operator
+decisions, each of them off by default:
+
+1. **Install the package.** `zeroclaw plugin install <directory>` for a local
+   package, or `zeroclaw plugin install <name>` for one from the plugin
+   registry. Install validates the manifest, runs the signature policy, checks
+   the payload digest when the manifest declares one, and instantiates the
+   component against this host's WIT (skipped with `--no-verify`); a package
+   that fails any of these is not installed. Install (unless `--no-verify`),
+   `zeroclaw plugin info <name>`, and `zeroclaw plugin list --verify` compile
+   and instantiate the component whether or not the plugin system is enabled.
+   Instantiation calls none of its exports, but it does run any start function
+   the component's core modules carry, in a store with no files, no network,
+   and the per-call fuel, memory, and time limits.
+2. **Turn the plugin system on.** `zeroclaw config set plugins.enabled true`,
+   then `zeroclaw config set plugins.auto_discover true` so tool and skill
+   plugins are enumerated. An installed tool or skill package contributes
+   nothing until both are set. Once they are, every build of the tool
+   registry compiles and instantiates each admitted tool component and asks
+   it for its name, description, and parameter schema; that is guest code
+   running under the package's declared permissions and egress policy, before
+   any approval, and the tool is then offered to the model. A channel package
+   needs `plugins.enabled`, a `[channels.plugin.<alias>]` declaration, and an
+   enabled agent that lists `plugin.<alias>` among its channels;
+   `auto_discover` plays no part in it. For a package that mirrors a native
+   channel through `provides`, activation under
+   `[channels.<provides>.<alias>]` is recorded but not constructed yet; the
+   same package bound under `[channels.plugin.<alias>]` runs.
+3. **Approve each tool call.** A plugin tool call needs operator approval like
+   any other tool that is not pre-approved: the CLI prompts on the terminal,
+   channels send their approval card. To let an agent call a plugin tool
+   unattended, add the tool to that agent's risk profile `auto_approve` list,
+   for example
+   `zeroclaw config set risk_profiles.default.auto_approve '["<tool-name>"]'`.
+   `config set` replaces the whole list: the built-in defaults are merged back
+   into `risk_profiles.default` when the config loads, but any entry you added
+   yourself must be repeated, and a profile with another name keeps only what
+   you pass. `level = "full"` and the `*` wildcard pre-approve every tool that
+   is not in `always_ask`, and an Always answer pre-approves the tool for the
+   rest of that CLI session or channel turn, except for tools in
+   `always_ask`, which prompt every time. Without an approver the call is
+   denied and does not run.
+4. **Choose a signature policy.** `signature_mode` stays `disabled` by default
+   so a plugin you built yourself installs without key management. Under
+   `strict`, only packages signed by a key in `trusted_publisher_keys` load,
+   and because the official registry publishes unsigned packages today, none
+   of them install in `strict` mode until their publishers sign them.
+
+Compiling a component needs memory that becomes executable after it is
+written. A host that forbids that, such as a systemd unit with
+`MemoryDenyWriteExecute=yes` (the Nix module's default), refuses every plugin
+load because the compiler cannot map code as executable; the rest of the
+daemon needs no such mappings and keeps running.
+
+To roll back, remove the package with `zeroclaw plugin remove <name>`, or set
+`plugins.enabled = false` to stop loading any plugin without uninstalling. To
+return to a release without the plugin host, pin the binary with
+`zeroclaw update --version <previous> --force`; without `--force` the updater
+refuses to move to an older version. The updater resolves Linux musl hosts to
+the glibc archive, so a musl install, like one that came from a package
+manager, rolls back by reinstalling the previous archive or package.
 
 ## What a plugin still cannot do
 

@@ -949,8 +949,9 @@ pub fn field_shape(section: FieldSection, type_key: &str) -> Vec<FieldDescriptor
 /// Essentials per section kind. Kept in one place so adding a
 /// provider type or channel kind lights up Quickstart for free,
 /// while keeping the modal focused on what an agent cannot start
-/// without.
-const MODEL_PROVIDER_ESSENTIALS: &[&str] = &["model", QUICKSTART_AUTH_MODE_FIELD, "api_key", "uri"];
+/// without. `model` comes last for model providers: the model catalog
+/// is listed from the endpoint and credentials asked before it.
+const MODEL_PROVIDER_ESSENTIALS: &[&str] = &[QUICKSTART_AUTH_MODE_FIELD, "api_key", "uri", "model"];
 const CHANNEL_ESSENTIALS: &[&str] = &["bot_token", "token", "webhook_url", "allowed_users"];
 const WEBHOOK_CHANNEL_ESSENTIALS: &[&str] = &[
     "bot_token",
@@ -2349,6 +2350,42 @@ pub async fn model_catalog(
     model_catalog_with_config(None, model_provider).await
 }
 
+/// Catalog for a model provider Quickstart has not written yet. A `uri` or
+/// `api_key` already entered in `fields` is used for the listing, so a
+/// self-hosted server is asked at the address the operator gave rather than
+/// at the family default. With neither, this is [`model_catalog`].
+pub async fn model_catalog_for_fields(
+    type_key: &str,
+    fields: &std::collections::HashMap<String, String>,
+) -> (
+    Vec<String>,
+    Option<std::collections::HashMap<String, zeroclaw_api::model_provider::ModelPricing>>,
+    bool,
+) {
+    const PROBE_ALIAS: &str = "quickstart";
+    let entered = |key: &str| {
+        fields
+            .get(key)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty() && *value != zeroclaw_config::traits::UNSET_DISPLAY)
+            .map(str::to_string)
+    };
+    let (uri, api_key) = (entered("uri"), entered("api_key"));
+    if uri.is_none() && api_key.is_none() {
+        return model_catalog(type_key).await;
+    }
+    let Some((provider_type, _)) = resolve_model_provider_type(type_key) else {
+        return model_catalog(type_key).await;
+    };
+    let mut probe = Config::default();
+    let Some(entry) = probe.providers.models.ensure(provider_type, PROBE_ALIAS) else {
+        return model_catalog(type_key).await;
+    };
+    entry.uri = uri;
+    entry.api_key = api_key;
+    model_catalog_with_config(Some(&probe), &format!("{provider_type}.{PROBE_ALIAS}")).await
+}
+
 /// Backward-compatible catalog projection for callers that intentionally treat
 /// discovery failure as an unavailable catalog. Configured-profile surfaces
 /// should call [`model_catalog_with_config_result`] to preserve actionable errors.
@@ -2936,6 +2973,24 @@ mod tests {
             assert!(
                 keys.contains(&"api_key"),
                 "field_shape for `{kind}` is missing `api_key` row; got {keys:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn field_shape_asks_endpoint_and_credentials_before_model() {
+        for kind in ["llamacpp", "openai", "anthropic"] {
+            let rows = super::field_shape(super::FieldSection::ModelProvider, kind);
+            let keys: Vec<&str> = rows.iter().map(|r| r.key.as_str()).collect();
+            assert!(
+                keys.contains(&"uri") && keys.contains(&"api_key"),
+                "field_shape for `{kind}` must ask for the endpoint and key; got {keys:?}",
+            );
+            assert_eq!(
+                keys.last(),
+                Some(&"model"),
+                "`{kind}` must ask for the model after its endpoint and credentials, \
+                 so the catalog is listed from them; got {keys:?}",
             );
         }
     }
@@ -3991,6 +4046,37 @@ mod tests {
             bare_models.iter().any(|m| m == "grok-named-alias-native"),
             "unique bare alias selector must resolve the same configured endpoint; \
              got {bare_models:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_catalog_for_fields_lists_from_the_entered_uri() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A llama.cpp server away from the family default, entered at the
+        // Quickstart `uri` prompt before the model is picked.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "served-at-the-entered-uri"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let fields =
+            std::collections::HashMap::from([("uri".to_string(), format!("{}/v1", server.uri()))]);
+
+        let (models, _pricing, live) = model_catalog_for_fields("llamacpp", &fields).await;
+
+        assert!(
+            live,
+            "the entered endpoint answered, so the catalog is live"
+        );
+        assert!(
+            models.iter().any(|m| m == "served-at-the-entered-uri"),
+            "the catalog must come from the entered uri; got {models:?}"
         );
     }
 

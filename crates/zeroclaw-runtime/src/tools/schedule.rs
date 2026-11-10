@@ -44,6 +44,15 @@ impl ScheduleTool {
         }
     }
 
+    /// The ceiling this instance was built with, for tests that pin which
+    /// registry handed it over.
+    #[cfg(test)]
+    pub(crate) fn caller_ceiling_for_test(
+        &self,
+    ) -> Option<&crate::tools::caller_ceiling::CallerCeiling> {
+        self.caller_ceiling.as_ref()
+    }
+
     #[cfg(test)]
     pub fn new(
         security: Arc<SecurityPolicy>,
@@ -60,6 +69,16 @@ impl ScheduleTool {
 
 #[async_trait]
 impl Tool for ScheduleTool {
+    #[cfg(test)]
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
+    fn requires_unrestricted_principal(&self) -> bool {
+        // This path uses agent authority without carrying the session owner.
+        true
+    }
+
     fn name(&self) -> &str {
         "schedule"
     }

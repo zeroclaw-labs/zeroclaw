@@ -17,6 +17,9 @@ pub struct SopExecuteTool {
     /// `audit` handles are shared with the target rather than rebuilt — so
     /// this is the one piece that IS per-instance: see `rebound_with_ceiling`.
     caller_ceiling: Option<crate::tools::caller_ceiling::CallerCeiling>,
+    /// The session memory of the registry this tool was assembled into; once
+    /// that session is pinned, audit rows go to its owner's plane.
+    session_memory: Option<Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>>,
     /// The agent this tool instance belongs to. Recorded on runs it starts, so a
     /// procedure that parks at an approval can still resume as the agent that
     /// started it once the turn is gone.
@@ -29,6 +32,7 @@ impl SopExecuteTool {
             engine,
             audit: None,
             caller_ceiling: None,
+            session_memory: None,
             initiator: None,
         }
     }
@@ -81,6 +85,9 @@ impl SopExecuteTool {
             engine: Arc::clone(&self.engine),
             audit: self.audit.clone(),
             caller_ceiling: Some(ceiling),
+            // The session the registry was assembled into follows the target too,
+            // so audit rows keep going to the owner's plane once it is pinned.
+            session_memory: self.session_memory.clone(),
             // Deliberately not the caller's initiator. The initiator lets the
             // headless driver resume a parked run as that agent, with its full
             // policy and no ceiling. Bounded runs are cancelled before they can
@@ -89,12 +96,33 @@ impl SopExecuteTool {
             initiator: None,
         }
     }
+
+    /// Share the session memory route of the registry this tool is
+    /// assembled into.
+    #[must_use]
+    pub fn with_session_memory(
+        mut self,
+        route: Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>,
+    ) -> Self {
+        self.session_memory = Some(route);
+        self
+    }
+
+    /// The audit logger this call writes through (see `session_audit`).
+    fn audit(&self) -> Option<Arc<SopAuditLogger>> {
+        crate::sop::audit::session_audit(self.audit.as_ref(), self.session_memory.as_ref())
+    }
 }
 
 #[async_trait]
 impl Tool for SopExecuteTool {
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
+    }
+
+    fn requires_unrestricted_principal(&self) -> bool {
+        // The SOP engine does not carry the caller's ceilings into its steps.
+        true
     }
 
     fn name(&self) -> &str {
@@ -161,7 +189,14 @@ impl Tool for SopExecuteTool {
                 anyhow::Error::msg(format!("Engine lock poisoned: {e}"))
             })?;
 
-            match engine.start_run_owned(sop_name, event, self.initiator.as_deref()) {
+            // A run started in a session pinned to its owner belongs to that
+            // owner, and keeps its owner once it leaves this turn.
+            let memory_owner = self
+                .session_memory
+                .as_ref()
+                .and_then(|route| route.routed())
+                .and_then(|routed| routed.memory.principal_scope());
+            match engine.start_run_for(sop_name, event, self.initiator.as_deref(), memory_owner) {
                 Ok(action) => {
                     // A bounded caller must never leave a run parked: nothing
                     // in ITS turn will ever drive it past this point (see
@@ -232,8 +267,10 @@ impl Tool for SopExecuteTool {
             }
         };
 
-        // Audit log (engine lock dropped, safe to await)
-        if let Some(ref audit) = self.audit
+        // Audit log (engine lock dropped, safe to await). The same logger
+        // records the run start here and the steps the queued run executes.
+        let audit = self.audit();
+        if let Some(ref audit) = audit
             && let Some(ref run) = run_snapshot
             && let Err(e) = audit.log_run_start(run).await
         {
@@ -272,7 +309,7 @@ impl Tool for SopExecuteTool {
         if let Ok(ref action) = action {
             crate::sop::executor::enqueue_live_action(
                 Arc::clone(&self.engine),
-                self.audit.clone(),
+                audit,
                 action,
                 self.caller_ceiling.is_some(),
             );

@@ -131,6 +131,12 @@ impl Tool for SopWorkshopTool {
         Some(self)
     }
 
+    fn requires_unrestricted_principal(&self) -> bool {
+        // Applying shared SOP proposals persists instructions whose later
+        // execution does not carry the caller's principal ceilings.
+        true
+    }
+
     fn name(&self) -> &str {
         "sop_workshop"
     }

@@ -70,13 +70,42 @@ mod component {
 
     impl Tool for FixtureTool {
         fn name() -> String {
+            #[cfg(feature = "namespace-tool-search")]
+            {
+                "tool_search".to_string()
+            }
             // An MCP-shaped `<server>__<tool>` name, for the host's namespace
             // refusal test.
-            #[cfg(feature = "namespace-mcp-tool")]
+            #[cfg(all(feature = "namespace-mcp-tool", not(feature = "namespace-tool-search")))]
             {
                 "filesystem__read_file".to_string()
             }
-            #[cfg(not(feature = "namespace-mcp-tool"))]
+            // A peripheral tool's name, and a skill tool's name shortened past
+            // its `__` separator, for the host's late-name refusal test.
+            #[cfg(all(
+                feature = "namespace-peripheral-tool",
+                not(any(feature = "namespace-tool-search", feature = "namespace-mcp-tool"))
+            ))]
+            {
+                "gpio_read".to_string()
+            }
+            #[cfg(all(
+                feature = "namespace-skill-tool",
+                not(any(
+                    feature = "namespace-tool-search",
+                    feature = "namespace-mcp-tool",
+                    feature = "namespace-peripheral-tool"
+                ))
+            ))]
+            {
+                "release-notes-assistant-for-the-quarterly-plugi_65860daa7f0c9ba1".to_string()
+            }
+            #[cfg(not(any(
+                feature = "namespace-tool-search",
+                feature = "namespace-mcp-tool",
+                feature = "namespace-peripheral-tool",
+                feature = "namespace-skill-tool"
+            )))]
             {
                 "config-echo".to_string()
             }
