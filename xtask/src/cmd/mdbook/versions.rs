@@ -327,8 +327,8 @@ fn root_index_html(target: &str) -> String {
     )
 }
 
-/// Rebuild [`STABLE_ALIAS`] as a copy of the stable-pointer target, or remove
-/// it when no pointer resolves. Run after `gen-seo`: the release dir then
+/// Rebuild the `stable/` alias as a copy of the stable-pointer target, or
+/// remove it when no pointer resolves. Run after `gen-seo`: the release dir then
 /// already carries canonical tags that name the alias, so the copy is
 /// byte-identical to it and git stores each file once.
 pub fn gen_stable_alias() -> anyhow::Result<()> {
