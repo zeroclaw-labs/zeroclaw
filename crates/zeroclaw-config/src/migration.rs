@@ -7802,6 +7802,14 @@ mention_only = false
     /// Serde aliases in this crate that are not keys of the file, with why.
     const ALIASES_THAT_ARE_NOT_FILE_KEYS: &[(&str, &str)] = &[
         (
+            "allowed_roots",
+            "a compat spelling of `sandbox_policy.allow_read`, not a file key",
+        ),
+        (
+            "forbidden_paths",
+            "a compat spelling of `sandbox_policy.deny_read`, not a file key",
+        ),
+        (
             "model_provider",
             "`V1Config`'s spelling, in the legacy catalog",
         ),

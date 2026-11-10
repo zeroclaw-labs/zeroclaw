@@ -66,6 +66,10 @@ Plus five plugin known-issue fixes, Telegram rate-limit handling, ZeroCode cost 
 - Apply a risk profile's `firejail_args` to the Firejail wrapper. Entries that would undo ZeroClaw's own Firejail hardening, or are not single `--option` / `--option=value` flags, are rejected, and the sandbox then refuses every command rather than running without them (#11656, closes #11594).
 - Name the cause when a requested bubblewrap backend is rejected: a missing or broken launcher, or a build without `sandbox-bubblewrap` (#11559).
 - Correct the sandboxing documentation's description of Linux `auto` backend selection and its fallbacks to match the selector (#11591).
+- Ratify and implement the canonical `sandbox_policy` filesystem contract (RFC #6996, #7821): one resolver feeding application-layer path guards, legacy-field compatibility mapping, always-on default write guardrails with per-entry exceptions, subagent/bounded-delegation narrowing over effective capability sets, and removal of inert network fields. Legacy `allowed_roots` now derives a real write allowlist under unrestricted profiles, with a one-time upgrade warning naming the affected profile and the restoring edit.
+- Apply a risk profile's `firejail_args` to the Firejail wrapper. Entries that would undo ZeroClaw's own Firejail hardening, or are not single `--option` / `--option=value` flags, are rejected, and the sandbox then refuses every command rather than running without them (#11656, closes #11594).
+- Name the cause when a requested bubblewrap backend is rejected: a missing or broken launcher, or a build without `sandbox-bubblewrap` (#11559).
+- Correct the sandboxing documentation's description of Linux `auto` backend selection and its fallbacks to match the selector (#11591).
 - Narrow the memory threat scanner's credential-URL check to URL user info and credential query or fragment parameters, so text that merely contains a link and an unrelated credential word is no longer flagged (#11144).
 
 ### Memory
@@ -119,6 +123,12 @@ Plus five plugin known-issue fixes, Telegram rate-limit handling, ZeroCode cost 
 
 ## Breaking Changes
 
+- **Sandbox policy is now enforced at the application layer immediately (RFC #6996, #7821).** `sandbox_policy` on a risk profile is the canonical filesystem model: `deny_read`/`allow_read`/`deny_write` are checked by file, search, and Git tools even when no OS sandbox backend is active. Three intentional narrowing changes ship with it:
+  - **Default write guardrails are always on.** A default deny-write list (shell configs, Git control surfaces, `.env`, `.mcp.json`, editor/agent control directories, and ZeroClaw's own `config.toml`, `.secret_key`, `auth-profiles.json`, `IDENTITY.md`, `SOUL.md`, `shared/skills/`) blocks writes that previously succeeded. There is deliberately no switch that disables the whole list; relax one entry at a time with `sandbox_policy.guardrail_exceptions = [".vscode/settings.json"]` (a non-empty list emits a WARN).
+  - **Legacy `allowed_roots` now derives a write allowlist.** A profile with `workspace_only = false` (including `Full` autonomy) and a non-empty `allowed_roots` previously meant "extra roots, writes unrestricted elsewhere"; the canonical resolver now confines writes to the workspace, `/tmp`, and the listed roots. The first start after upgrade warns once, naming the profile; to restore the old behavior, remove `allowed_roots` or set an explicit `sandbox_policy.allow_write`.
+  - **Explicit `allow_write` is authoritative over `workspace_only`.** `workspace_only` now scopes only the implicit workspace grant; an explicit canonical `allow_write` (including an explicit `[]`) replaces it — name `"."` in the list to keep the workspace writable.
+  - Network-shaped `sandbox_policy` fields (`allowed_domains`, `denied_domains`, `allow_unix_sockets`, raw `bubblewrap_args`) are rejected at parse time instead of being silently ignored; they return with the separately reviewed network-policy RFC.
+  - Rollback for a blocked write: add the specific path to `guardrail_exceptions`, or revert the deployment — no persisted-data migration is involved.
 - **Rebuild precompiled plugin components.** `.cwasm` files compiled for an earlier Wasmtime must be rebuilt for 48.0.7 (#11924).
 - **MQTT `keep_alive_secs` must be 0 to 65535.** A larger value now fails listener startup instead of being silently truncated to the protocol's 16-bit field (#11924).
 - **MQTT credentials:** when both `username` and `password` are set, empty strings are now sent as explicit empty credentials with their CONNECT flags, instead of being left out. For anonymous access, leave both unset (#11924).

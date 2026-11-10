@@ -964,6 +964,7 @@ cli-security-status-autonomy = Autonomy:   {$v}
 cli-security-status-approvals = Approvals:  medium-risk approval required: {$medium}, high-risk commands blocked: {$high}
 cli-security-status-sandbox = Sandbox:    requested {$requested}, active {$active} ({$description})
 cli-security-status-sandbox-description-docker-runtime = Docker runtime container isolation (runtime.kind = "docker"; no additional sandbox wrapper)
+cli-security-status-filesystem = Filesystem: application-layer enforcement active for {$covered}; backend consumes canonical policy: {$backend}; guardrails: {$guardrails} ({$exceptions} exception(s))
 cli-security-status-sandbox-description-firejail-args-rejected = Firejail selected, but firejail_args were rejected; commands are blocked ({$reason})
 cli-security-firejail-args-error-empty = firejail_args rejected: an entry is empty
 cli-security-firejail-args-error-whitespace = firejail_args rejected: {$arg} has leading or trailing whitespace
@@ -979,6 +980,7 @@ cli-security-status-warning-agent-disabled = agent is disabled
 cli-security-status-warning-sandbox-disabled = sandboxing is disabled for this agent risk profile
 cli-security-status-warning-optional-sandbox-disabled-docker-runtime = additional OS sandboxing is disabled; Docker runtime containment remains active
 cli-security-status-warning-sandbox-none = active sandbox is application-layer only
+cli-security-status-warning-filesystem-app-layer-only = filesystem policy is enforced at the application layer for the covered file/repository tools only; arbitrary shell or child-process I/O is not confined, and no OS sandbox backend consumes sandbox_policy yet (RFC 6996 Phase 2)
 cli-security-status-warning-sandbox-fallback = requested sandbox backend `{$requested}` fell back to `{$active}`
 cli-security-status-warning-workspace-not-restricted = workspace-only filesystem policy is disabled
 cli-security-status-warning-shell-env-passthrough = {$count} shell environment variable(s) are passed through

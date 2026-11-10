@@ -79,7 +79,7 @@ impl BackupTool {
         let name = format!("backup-{ts}");
         let (workspace_path, workspace) = self.open_workspace()?;
         let backups_path = workspace_path.join("backups");
-        self.authorize_write(&backups_path)?;
+        self.authorize_write(&backups_path, WriteTarget::Archive)?;
 
         // Validate every source tree before creating the backup directory so
         // a stable symlink rejection cannot leave a partial backup behind.
@@ -124,10 +124,10 @@ impl BackupTool {
         }
 
         let backup_path = backups_path.join(&name);
-        self.authorize_write(&backup_path)?;
-        self.authorize_write(&backup_path.join("manifest.json"))?;
+        self.authorize_write(&backup_path, WriteTarget::Archive)?;
+        self.authorize_write(&backup_path.join("manifest.json"), WriteTarget::Archive)?;
         for (relative, src) in &sources {
-            self.authorize_write_prefixes(&backup_path, relative)?;
+            self.authorize_write_prefixes(&backup_path, relative, WriteTarget::Archive)?;
             validate_copy_destination(
                 src,
                 None,
@@ -135,6 +135,7 @@ impl BackupTool {
                 &workspace_path.join(relative),
                 &backup_path.join(relative),
                 &self.security,
+                WriteTarget::Archive,
             )?;
         }
 
@@ -147,7 +148,7 @@ impl BackupTool {
         for (relative, src) in sources {
             cancellation.checkpoint()?;
             let destination_path = backup_path.join(&relative);
-            self.authorize_write_prefixes(&backup_path, &relative)?;
+            self.authorize_write_prefixes(&backup_path, &relative, WriteTarget::Archive)?;
             cancellation.checkpoint()?;
             let dst = create_dir_path_nofollow(&backup, &relative)?;
             copy_dir_recursive(
@@ -156,6 +157,7 @@ impl BackupTool {
                 &dst,
                 &destination_path,
                 &self.security,
+                WriteTarget::Archive,
                 cancellation,
             )?;
         }
@@ -164,7 +166,7 @@ impl BackupTool {
         let checksums = compute_checksums(&backup, &backup_path, &self.security)?;
         let file_count = checksums.len();
         let manifest = serde_json::to_string_pretty(&checksums)?;
-        self.authorize_write(&backup_path.join("manifest.json"))?;
+        self.authorize_write(&backup_path.join("manifest.json"), WriteTarget::Archive)?;
         cancellation.checkpoint()?;
         write_file_atomic(&backup, Path::new("manifest.json"), manifest.as_bytes())?;
 
@@ -225,10 +227,8 @@ impl BackupTool {
         Ok((canonical, dir))
     }
 
-    fn authorize_write(&self, path: &Path) -> anyhow::Result<()> {
-        if self.security.is_runtime_config_path(path)
-            || !self.security.is_resolved_path_allowed(path)
-        {
+    fn authorize_write(&self, path: &Path, target: WriteTarget) -> anyhow::Result<()> {
+        if !target.allows(&self.security, path) {
             return Err(boundary_violation(tool_text_arg(
                 "tool-backup-error-write-blocked",
                 "path",
@@ -242,11 +242,16 @@ impl BackupTool {
         ensure_readable(&self.security, path)
     }
 
-    fn authorize_write_prefixes(&self, root: &Path, relative: &Path) -> anyhow::Result<()> {
+    fn authorize_write_prefixes(
+        &self,
+        root: &Path,
+        relative: &Path,
+        target: WriteTarget,
+    ) -> anyhow::Result<()> {
         let mut path = root.to_path_buf();
         for component in relative.components() {
             path.push(component);
-            self.authorize_write(&path)?;
+            self.authorize_write(&path, target)?;
         }
         Ok(())
     }
@@ -493,7 +498,7 @@ impl BackupTool {
         // restore before rejection.
         for sub in &restore_items {
             let destination_path = workspace_path.join(sub);
-            self.authorize_write(&destination_path)?;
+            self.authorize_write(&destination_path, WriteTarget::Live)?;
             let src = open_dir_no_symlinks_checked(
                 &backup,
                 Path::new(sub),
@@ -509,6 +514,7 @@ impl BackupTool {
                 &backup_path.join(sub),
                 &destination_path,
                 &self.security,
+                WriteTarget::Live,
             )?;
         }
 
@@ -523,7 +529,7 @@ impl BackupTool {
             .ok_or_else(|| anyhow::Error::msg(format!("Backup entry disappeared: {sub}")))?;
             let source_path = backup_path.join(sub);
             let destination_path = workspace_path.join(sub);
-            self.authorize_write(&destination_path)?;
+            self.authorize_write(&destination_path, WriteTarget::Live)?;
             cancellation.checkpoint()?;
             let dst = create_dir_path_nofollow(&workspace, Path::new(sub))?;
             copy_dir_recursive(
@@ -532,6 +538,7 @@ impl BackupTool {
                 &dst,
                 &destination_path,
                 &self.security,
+                WriteTarget::Live,
                 cancellation,
             )?;
         }
@@ -788,6 +795,27 @@ impl std::fmt::Display for BoundaryViolation {
 
 impl std::error::Error for BoundaryViolation {}
 
+/// Which write check a backup write goes through. `Archive` writes land in the
+/// tool's own `backups/` store (create, rotation): they skip the built-in
+/// write guardrails, since an archived `config.toml` is a copy, not the live
+/// install config (see [`SecurityPolicy::is_resolved_managed_store_writable`]).
+/// `Live` writes restore into the workspace and get the full check.
+#[derive(Clone, Copy)]
+enum WriteTarget {
+    Archive,
+    Live,
+}
+
+impl WriteTarget {
+    fn allows(self, security: &SecurityPolicy, path: &Path) -> bool {
+        !security.is_runtime_config_path(path)
+            && match self {
+                Self::Archive => security.is_resolved_managed_store_writable(path),
+                Self::Live => security.is_resolved_path_allowed(path),
+            }
+    }
+}
+
 fn boundary_violation(message: impl Into<String>) -> anyhow::Error {
     BoundaryViolation(message.into()).into()
 }
@@ -1014,9 +1042,7 @@ fn authorize_deletion_tree(
     security: &SecurityPolicy,
 ) -> anyhow::Result<()> {
     ensure_readable(security, absolute_path)?;
-    if !security.is_resolved_path_allowed(absolute_path)
-        || security.is_runtime_config_path(absolute_path)
-    {
+    if !WriteTarget::Archive.allows(security, absolute_path) {
         return Err(boundary_violation(tool_text_arg(
             "tool-backup-error-write-blocked",
             "path",
@@ -1029,9 +1055,7 @@ fn authorize_deletion_tree(
         let name = entry.file_name();
         let child_path = absolute_path.join(&name);
         ensure_readable(security, &child_path)?;
-        if !security.is_resolved_path_allowed(&child_path)
-            || security.is_runtime_config_path(&child_path)
-        {
+        if !WriteTarget::Archive.allows(security, &child_path) {
             return Err(boundary_violation(tool_text_arg(
                 "tool-backup-error-write-blocked",
                 "path",
@@ -1059,6 +1083,7 @@ fn copy_dir_recursive(
     dst: &Dir,
     dst_path: &Path,
     security: &SecurityPolicy,
+    target: WriteTarget,
     cancellation: &BlockingOperationCancellation,
 ) -> anyhow::Result<()> {
     ensure_readable(security, src_path)?;
@@ -1069,9 +1094,7 @@ fn copy_dir_recursive(
         let source_child_path = src_path.join(&name);
         let destination_child_path = dst_path.join(&name);
         ensure_readable(security, &source_child_path)?;
-        if !security.is_resolved_path_allowed(&destination_child_path)
-            || security.is_runtime_config_path(&destination_child_path)
-        {
+        if !target.allows(security, &destination_child_path) {
             return Err(boundary_violation(tool_text_arg(
                 "tool-backup-error-write-blocked",
                 "path",
@@ -1117,6 +1140,7 @@ fn copy_dir_recursive(
                 &dst_child,
                 &destination_child_path,
                 security,
+                target,
                 cancellation,
             )?;
         } else if file_type.is_file() {
@@ -1185,6 +1209,7 @@ fn validate_copy_destination(
     src_path: &Path,
     dst_path: &Path,
     security: &SecurityPolicy,
+    target: WriteTarget,
 ) -> anyhow::Result<()> {
     ensure_readable(security, src_path)?;
     for entry in src.entries()? {
@@ -1194,9 +1219,7 @@ fn validate_copy_destination(
         let source_child_path = src_path.join(&name);
         let destination_child_path = dst_path.join(&name);
         ensure_readable(security, &source_child_path)?;
-        if !security.is_resolved_path_allowed(&destination_child_path)
-            || security.is_runtime_config_path(&destination_child_path)
-        {
+        if !target.allows(security, &destination_child_path) {
             return Err(boundary_violation(tool_text_arg(
                 "tool-backup-error-write-blocked",
                 "path",
@@ -1243,6 +1266,7 @@ fn validate_copy_destination(
                 &source_child_path,
                 &destination_child_path,
                 security,
+                target,
             )?;
         } else if file_type.is_file()
             && destination_metadata
@@ -2166,6 +2190,50 @@ mod tests {
             assert_eq!(std::fs::read_to_string(&earlier).unwrap(), "live value");
             assert_eq!(std::fs::read_to_string(&denied).unwrap(), "live value");
         }
+    }
+
+    #[tokio::test]
+    async fn archive_writes_skip_guardrails_but_live_restore_keeps_them() {
+        // `config.toml` is a built-in write guardrail. Archiving a copy into
+        // the tool's own backups store must work; restoring it over the live
+        // workspace copy must still be refused.
+        let root = TempDir::new().unwrap();
+        std::fs::create_dir_all(root.path().join("config")).unwrap();
+        let live = root.path().join("config/config.toml");
+        std::fs::write(&live, "archived").unwrap();
+        let profile = zeroclaw_config::schema::RiskProfileConfig::default();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::from_risk_profile(&profile, root.path())
+        });
+        let tool = BackupTool::new_with_security(vec!["config".into()], 10, security);
+
+        let created = tool.execute(json!({"command": "create"})).await.unwrap();
+        assert!(
+            created.success,
+            "archiving a guardrailed file name must succeed: {:?}",
+            created.error
+        );
+        let created: serde_json::Value = serde_json::from_str(&created.output).unwrap();
+        let name = created["backup"].as_str().unwrap();
+        assert!(
+            root.path()
+                .join("backups")
+                .join(name)
+                .join("config/config.toml")
+                .exists()
+        );
+
+        std::fs::write(&live, "live").unwrap();
+        let restored = tool
+            .execute(json!({"command": "restore", "backup_name": name, "confirm": true}))
+            .await
+            .unwrap();
+        assert!(
+            !restored.success,
+            "restoring over a guardrailed live file must stay refused"
+        );
+        assert_eq!(std::fs::read_to_string(&live).unwrap(), "live");
     }
 
     #[tokio::test]
