@@ -1734,6 +1734,92 @@ impl GitOperationsTool {
     /// dwim-falls-through to a detached checkout the attachment check
     /// rejects. Comparing against the pinned id (rather than re-resolving
     /// the reference at verification time) is what detects the move.
+    /// Attach HEAD to `refname` only while the branch still designates
+    /// `pinned`. The mutating command already materialized the PINNED tree
+    /// detached — the only tree Git wrote is the one the preflight listed —
+    /// so attaching is a purely symbolic update that rewrites no files: a
+    /// branch that moved or vanished between resolution and execution costs
+    /// the refusal and nothing else, and the working tree keeps exactly the
+    /// authorized tree instead of a mutation followed by an error.
+    async fn attach_head_if_still_pinned(
+        &self,
+        refname: &str,
+        pinned: &str,
+        working_dir: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        let current = match self
+            .run_git_read_command(&["--no-optional-locks", "rev-parse", refname], working_dir)
+            .await
+        {
+            Ok(stdout) => stdout.trim().to_string(),
+            // The ref no longer resolves at all — vanished (or the query
+            // itself failed): either way attaching is refused and the tree
+            // stays exactly where the pinned checkout left it.
+            Err(_) => String::new(),
+        };
+        if current != pinned {
+            anyhow::bail!(
+                "branch '{refname}' moved or vanished between resolution and execution; \
+                 HEAD can no longer be attached to the pinned commit '{pinned}' — \
+                 the working tree stays detached at the authorized commit"
+            );
+        }
+        self.run_git_command(&["symbolic-ref", "HEAD", refname], working_dir)
+            .await?;
+        Ok(())
+    }
+
+    /// Dwim execution shared by checkout and `worktree add`: verify the
+    /// remote-tracking ref still designates the pinned commit, then create
+    /// `new_branch` directly AT the pinned id — a ref write naming the tree
+    /// the preflight authorized — and wire its upstream from the
+    /// remote-tracking spelling. No live reference is dereferenced when the
+    /// checkout materializes the tree, so a concurrent fetch cannot
+    /// substitute a tree the preflight never listed. `Err` carries the
+    /// operator-facing message; the caller shapes its tool result.
+    async fn materialize_dwim_branch_at_pinned(
+        &self,
+        refname: &str,
+        new_branch: &str,
+        pinned: &str,
+        working_dir: &std::path::Path,
+        op_label: &str,
+    ) -> Result<(), String> {
+        let remote_tip = self
+            .run_git_read_command(&["--no-optional-locks", "rev-parse", refname], working_dir)
+            .await
+            .map_err(|e| format!("{op_label} failed: {e}"))?;
+        let remote_tip = remote_tip.trim();
+        if remote_tip != pinned {
+            return Err(format!(
+                "{op_label} failed: remote-tracking ref '{refname}' moved between resolution \
+                 and execution ('{remote_tip}' is not the pinned commit '{pinned}'); refusing \
+                 to create '{new_branch}' anywhere but at the pinned commit"
+            ));
+        }
+        if let Err(e) = self
+            .run_git_command(&["branch", new_branch, pinned], working_dir)
+            .await
+        {
+            return Err(format!("{op_label} failed: {e}"));
+        }
+        let start_point = refname.strip_prefix("refs/remotes/").unwrap_or(refname);
+        let upstream = format!("--set-upstream-to={start_point}");
+        if let Err(e) = self
+            .run_git_command(&["branch", &upstream, new_branch], working_dir)
+            .await
+        {
+            // The upstream wiring failed (for example the remote ref
+            // vanished mid-sequence): remove the branch this sequence just
+            // created so the refusal leaves no half-dwim state behind.
+            let _ = self
+                .run_git_command(&["branch", "-D", new_branch], working_dir)
+                .await;
+            return Err(format!("{op_label} failed: {e}"));
+        }
+        Ok(())
+    }
+
     async fn verify_checkout_result(
         &self,
         resolved: &Option<ResolvedReference>,
@@ -2617,43 +2703,66 @@ impl GitOperationsTool {
             return Ok(refused);
         }
 
-        // Execution uses the attachment-correct spelling of the SAME
-        // resolution the preflight listed: a branch checkout stays attached
-        // only when Git receives the bare branch name (`checkout
-        // refs/heads/x` detaches), so the resolved branch runs short with
-        // remote guessing disabled, while tag/commit references keep the
-        // exact fully-spelled detached form. The residual race — the branch
-        // vanishing between resolution and execution so the bare name
-        // falls through to a same-named tag — cannot be closed by
-        // spelling; the post-exec verification below asserts the
-        // attachment and tree and fails loudly instead.
+        // Pinned-tree execution: the mutating command never names a live
+        // reference. An existing branch is checked out DETACHED at the
+        // pinned commit — the only tree Git can materialize is the one the
+        // preflight listed — and attached afterward by a symbolic update
+        // that rewrites no files (`attach_head_if_still_pinned`), so a
+        // reference that moved or vanished between resolution and execution
+        // cannot turn a denied write into a mutation followed by an error.
+        // The dwim path re-checks its remote-tracking ref and creates the
+        // new branch directly AT the pinned commit before checking the
+        // fresh branch out. Tag and custom-ref spellings run by the pinned
+        // id too, since those references can move as well.
         let mut checkout_args: Vec<String> = vec!["checkout".to_string()];
         let mut expected_branch: Option<String> = None;
         let mut detached_at: Option<String> = None;
-        match resolved.as_ref().map(|resolved| &resolved.reference) {
+        let mut attach_refname: Option<String> = None;
+        match resolved.as_ref() {
             None => checkout_args.push("HEAD".to_string()),
-            Some(ResolvedGitReference::Branch(refname)) => {
+            Some(ResolvedReference {
+                reference: ResolvedGitReference::Branch(refname),
+                commit,
+            }) => {
                 checkout_args.push("--no-guess".to_string());
-                checkout_args.push(short_branch_name(refname).to_string());
+                checkout_args.push("--detach".to_string());
+                checkout_args.push(commit.clone());
+                attach_refname = Some(refname.clone());
                 expected_branch = Some(short_branch_name(refname).to_string());
             }
-            Some(ResolvedGitReference::Commit(refname)) => {
-                checkout_args.push(refname.clone());
+            Some(ResolvedReference {
+                reference: ResolvedGitReference::Commit(refname),
+                commit,
+            }) => {
+                checkout_args.push(commit.clone());
                 detached_at = Some(refname.clone());
             }
-            Some(ResolvedGitReference::RemoteTrack {
-                refname,
-                new_branch,
+            Some(ResolvedReference {
+                reference:
+                    ResolvedGitReference::RemoteTrack {
+                        refname,
+                        new_branch,
+                    },
+                commit,
             }) => {
-                checkout_args.push("--track".to_string());
-                checkout_args.push("-b".to_string());
+                if let Err(message) = self
+                    .materialize_dwim_branch_at_pinned(
+                        refname,
+                        new_branch,
+                        commit,
+                        working_dir,
+                        "Checkout",
+                    )
+                    .await
+                {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(message),
+                    });
+                }
+                checkout_args.push("--no-guess".to_string());
                 checkout_args.push(new_branch.clone());
-                // Tracking setup needs the `<remote>/<branch>` spelling;
-                // resolution verified it maps back to `refname` alone.
-                let start_point = refname
-                    .strip_prefix("refs/remotes/")
-                    .unwrap_or(refname.as_str());
-                checkout_args.push(start_point.to_string());
                 expected_branch = Some(new_branch.clone());
             }
         }
@@ -2662,6 +2771,33 @@ impl GitOperationsTool {
 
         match output {
             Ok(_) => {
+                if let Some(refname) = &attach_refname
+                    && let Err(e) = self
+                        .attach_head_if_still_pinned(
+                            refname,
+                            resolved
+                                .as_ref()
+                                .map(|r| r.commit.as_str())
+                                .unwrap_or_default(),
+                            working_dir,
+                        )
+                        .await
+                {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(serde_json::json!({
+                                "branch": branch_name,
+                            })),
+                        "git_operations: checkout result did not match the resolved reference"
+                    );
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!("Checkout verification failed: {e}")),
+                    });
+                }
                 let expected = expected_branch.as_deref();
                 if let Err(e) = self
                     .verify_checkout_result(&resolved, expected, working_dir)
@@ -2973,56 +3109,101 @@ impl GitOperationsTool {
                 )? {
                     return Ok(refused);
                 }
-                // Options precede `--`; what follows is tool-built. Like
-                // checkout, execution uses the attachment-correct spelling
-                // of the SAME resolution the preflight pinned: an existing
-                // branch is handed to Git by its bare name so the new
-                // worktree attaches to it (`worktree add refs/heads/x`
-                // detaches), with remote guessing disabled; tag and commit
-                // references keep the exact fully-spelled form, which
-                // creates a DETACHED worktree (the basename-branch
-                // convenience applies only to bare short names, which the
-                // resolver never passes for these). The post-exec
-                // verification below asserts attachment and pinned commit
-                // in the new worktree, closing the residual race where a
-                // vanishing branch would let the bare name fall through to
-                // a different commit-ish.
+                // Options precede `--`; what follows is tool-built. Like the
+                // checkout counterpart, execution materializes the PINNED
+                // commit and never names a live reference: an existing
+                // branch is added DETACHED at the pinned id and attached
+                // afterward by a symbolic update that rewrites no files;
+                // the dwim path creates its branch directly at the pinned
+                // commit; the omitted-reference create-from-HEAD case pins
+                // HEAD itself and hands `-b` the pinned id. A reference
+                // that moved or vanished between resolution and execution
+                // can never substitute a tree the preflight did not list —
+                // the post-exec verification below asserts attachment and
+                // the pinned commit in the new worktree.
                 let mut git_args: Vec<String> = vec!["worktree".to_string(), "add".to_string()];
-                let mut positional: Option<String> = None;
+                let positional: Option<String>;
                 let mut expected_branch: Option<String> = None;
-                match resolved.as_ref().map(|resolved| &resolved.reference) {
-                    Some(ResolvedGitReference::Branch(refname)) => {
+                let mut attach_refname: Option<String> = None;
+                match resolved.as_ref() {
+                    Some(ResolvedReference {
+                        reference: ResolvedGitReference::Branch(refname),
+                        commit,
+                    }) => {
                         // Pinning --no-guess-remote keeps execution on this
                         // resolution even if the branch vanishes and a
                         // remote-tracking branch of the same name exists.
                         git_args.push("--no-guess-remote".to_string());
-                        positional = Some(short_branch_name(refname).to_string());
+                        git_args.push("--detach".to_string());
+                        positional = Some(commit.clone());
+                        attach_refname = Some(refname.clone());
                         expected_branch = Some(short_branch_name(refname).to_string());
                     }
-                    Some(ResolvedGitReference::Commit(refname)) => {
-                        positional = Some(refname.clone());
-                    }
-                    Some(ResolvedGitReference::RemoteTrack {
-                        refname,
-                        new_branch,
+                    Some(ResolvedReference {
+                        reference: ResolvedGitReference::Commit(_),
+                        commit,
                     }) => {
-                        git_args.push("--track".to_string());
-                        git_args.push("-b".to_string());
-                        git_args.push(new_branch.clone());
-                        // Tracking setup needs the `<remote>/<branch>` spelling;
-                        // resolution verified it maps back to `refname` alone.
-                        let start_point = refname
-                            .strip_prefix("refs/remotes/")
-                            .unwrap_or(refname.as_str());
-                        positional = Some(start_point.to_string());
+                        positional = Some(commit.clone());
+                    }
+                    Some(ResolvedReference {
+                        reference:
+                            ResolvedGitReference::RemoteTrack {
+                                refname,
+                                new_branch,
+                            },
+                        commit,
+                    }) => {
+                        if let Err(message) = self
+                            .materialize_dwim_branch_at_pinned(
+                                refname,
+                                new_branch,
+                                commit,
+                                working_dir,
+                                "Worktree add",
+                            )
+                            .await
+                        {
+                            return Ok(ToolResult {
+                                success: false,
+                                output: ToolOutput::default(),
+                                error: Some(message),
+                            });
+                        }
+                        git_args.push("--no-guess-remote".to_string());
+                        positional = Some(new_branch.clone());
                         expected_branch = Some(new_branch.clone());
                     }
                     None => {
-                        // Create the basename branch from HEAD. Pinning
+                        // Create the basename branch from HEAD — the pinned
+                        // HEAD id, so a concurrent commit on the current
+                        // worktree cannot substitute a newer tree. Pinning
                         // --no-guess-remote keeps execution on this
                         // resolution even if a remote-tracking branch of
                         // the same name exists.
+                        let head = self
+                            .run_git_read_command(
+                                &["--no-optional-locks", "rev-parse", "HEAD"],
+                                working_dir,
+                            )
+                            .await?
+                            .trim()
+                            .to_string();
+                        let Some(basename) = Path::new(git_worktree_path)
+                            .file_name()
+                            .and_then(std::ffi::OsStr::to_str)
+                            .map(str::to_string)
+                        else {
+                            anyhow::bail!(
+                                "Worktree add blocked: cannot determine the basename branch \
+                                 for the omitted branch argument (path basename is not valid \
+                                 UTF-8); refusing to authorize a tree that cannot be named"
+                            );
+                        };
                         git_args.push("--no-guess-remote".to_string());
+                        git_args.push("-b".to_string());
+                        git_args.push(basename.clone());
+                        positional = Some(head);
+                        expected_branch = Some(basename);
                     }
                 }
                 git_args.push("--".to_string());
@@ -3032,6 +3213,33 @@ impl GitOperationsTool {
                 }
                 let git_args: Vec<&str> = git_args.iter().map(String::as_str).collect();
                 self.run_git_command(&git_args, working_dir).await?;
+                if let Some(refname) = &attach_refname
+                    && let Err(e) = self
+                        .attach_head_if_still_pinned(
+                            refname,
+                            resolved
+                                .as_ref()
+                                .map(|r| r.commit.as_str())
+                                .unwrap_or_default(),
+                            Path::new(git_worktree_path),
+                        )
+                        .await
+                {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(serde_json::json!({
+                                "worktree_path": git_worktree_path,
+                            })),
+                        "git_operations: worktree add result did not match the resolved reference"
+                    );
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!("Worktree add verification failed: {e}")),
+                    });
+                }
                 if let Err(e) = self
                     .verify_checkout_result(
                         &resolved,
@@ -7314,8 +7522,8 @@ mod tests {
         run_git(&root, &["checkout", "master"]);
 
         // The actor repoints refs/heads/topic at master after the tool
-        // resolved and preflighted the original tip, so the checkout
-        // materializes a tree the preflight never listed.
+        // resolved and preflighted the original tip, so a live-name
+        // execution would materialize a tree the preflight never listed.
         let tool = racing_tool(&root, &["branch", "-f", "topic", "master"]);
         let result = tool
             .execute(json!({"operation": "checkout", "branch": "topic"}))
@@ -7333,6 +7541,117 @@ mod tests {
                 .contains("pinned"),
             "the failure must come from the pin verification: {:?}",
             result.error
+        );
+        // The refusal must not have materialized the moved tree: execution
+        // checked out the PINNED commit detached, so the working tree holds
+        // the pinned tip's content and never the branch's new tip (master).
+        assert_eq!(
+            std::fs::read_to_string(root.join("notes.txt")).unwrap(),
+            "moved tip",
+            "the working tree must hold the pinned tree, not the moved branch's"
+        );
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        let master = std::process::Command::new("git")
+            .args(["rev-parse", "master"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert_ne!(
+            String::from_utf8_lossy(&head.stdout).trim(),
+            String::from_utf8_lossy(&master.stdout).trim(),
+            "HEAD must remain at the pinned commit, not the moved branch tip"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkout_dwim_materializes_only_the_pinned_remote_tree_when_the_ref_moves() {
+        // The dwim execution path never dereferences the live remote-tracking
+        // ref when materializing the tree: the new branch is created directly
+        // AT the pinned commit. A concurrent fetch advancing the ref between
+        // resolution and execution therefore cannot substitute a tree the
+        // preflight never listed — the checkout lands on the authorized
+        // commit, attached to the new branch, with the remote marked
+        // upstream (a moved remote is ordinary Git life, not a refusal; the
+        // refusal case is the ref moving BEFORE the materialize check).
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        run_git(&root, &["checkout", "-b", "carrier-topic"]);
+        std::fs::write(root.join("remote-note.txt"), "from remote tip").unwrap();
+        run_git(&root, &["add", "remote-note.txt"]);
+        run_git(
+            &root,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "remote note",
+            ],
+        );
+        run_git(
+            &root,
+            &[
+                "update-ref",
+                "refs/remotes/origin/topic",
+                "refs/heads/carrier-topic",
+            ],
+        );
+        let pinned = run_git(&root, &["rev-parse", "refs/remotes/origin/topic"]);
+        let pinned = pinned.trim().to_string();
+        run_git(&root, &["checkout", "master"]);
+        run_git(&root, &["branch", "-D", "carrier-topic"]);
+        run_git(
+            &root,
+            &["remote", "add", "origin", "https://.invalid/nowhere.git"],
+        );
+
+        // The fetch-equivalent actor advances the remote-tracking ref at the
+        // first mutating command — after the materialize pre-check, exactly
+        // the residual race the pinned branch creation closes.
+        let tool = racing_tool(
+            &root,
+            &["update-ref", "refs/remotes/origin/topic", "master"],
+        );
+        let result = tool
+            .execute(json!({"operation": "checkout", "branch": "topic"}))
+            .await
+            .unwrap();
+        assert!(
+            result.success,
+            "the dwim checkout must succeed on the authorized tree: {:?}",
+            result.error
+        );
+        assert!(
+            root.join("remote-note.txt").exists(),
+            "the pinned remote tree must be materialized, not the moved ref's"
+        );
+        let head = run_git(&root, &["rev-parse", "HEAD"]);
+        assert_eq!(
+            head.trim(),
+            pinned,
+            "HEAD must sit at the commit the resolution pinned, not the advanced ref"
+        );
+        let symbolic = run_git(&root, &["symbolic-ref", "HEAD"]);
+        assert_eq!(
+            symbolic.trim(),
+            "refs/heads/topic",
+            "the dwim branch must stay attached"
+        );
+        let upstream = run_git(
+            &root,
+            &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+        );
+        assert_eq!(
+            upstream.trim(),
+            "origin/topic",
+            "the remote-tracking ref must be marked upstream"
         );
     }
 
@@ -7427,6 +7746,18 @@ mod tests {
                 .contains("pinned"),
             "the failure must come from the pin verification: {:?}",
             result.error
+        );
+        // The refusal must not have materialized the moved tree: the add ran
+        // DETACHED at the pinned commit, so the worktree holds the pinned
+        // tip's content and never the branch's new tip (master).
+        assert!(
+            worktree.join("notes.txt").exists(),
+            "the worktree must exist with the pinned tree"
+        );
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("notes.txt")).unwrap(),
+            "moved tip",
+            "the worktree must hold the pinned tree, not the moved branch's"
         );
     }
 
