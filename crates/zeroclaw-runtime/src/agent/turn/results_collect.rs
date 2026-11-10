@@ -48,7 +48,7 @@ pub(crate) struct CollectedResults {
 /// forms.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_tool_results(
-    ordered_results: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>>,
+    ordered_results: &[Option<(String, Option<String>, ToolExecutionOutcome)>],
     executed_calls: &[Option<ParsedToolCall>],
     history: &mut Vec<ChatMessage>,
     loop_detector: &mut LoopDetector,
@@ -66,9 +66,9 @@ pub(crate) fn collect_tool_results(
     // Use enumerate *before* filter_map so result_index stays aligned with
     // tool_calls even when some ordered_results entries are None.
     for (result_index, (tool_name, tool_call_id, outcome)) in ordered_results
-        .into_iter()
+        .iter()
         .enumerate()
-        .filter_map(|(i, opt)| opt.map(|v| (i, v)))
+        .filter_map(|(i, opt)| opt.as_ref().map(|v| (i, v)))
     {
         if let Some(call) = executed_calls.get(result_index).and_then(Option::as_ref)
             && !loop_ignore_tools.contains(call.name.as_str())
@@ -179,7 +179,7 @@ pub(crate) fn collect_tool_results(
             }
         }
         individual_results.push(ToolRoundResult {
-            tool_call_id,
+            tool_call_id: tool_call_id.clone(),
             output: result_output.clone(),
             attachments,
         });
@@ -311,7 +311,7 @@ mod tests {
             )));
         }
         let collected = collect_tool_results(
-            ordered,
+            &ordered,
             &tool_calls.iter().cloned().map(Some).collect::<Vec<_>>(),
             &mut history,
             &mut detector,
@@ -434,7 +434,7 @@ mod tests {
                 outcome(output, success),
             ))];
             let collected = collect_tool_results(
-                ordered,
+                &ordered,
                 &tool_calls.iter().cloned().map(Some).collect::<Vec<_>>(),
                 &mut history,
                 &mut detector,
@@ -485,7 +485,7 @@ mod tests {
         }];
         let ordered = vec![Some(("shell".to_string(), None, outcome(&output, true)))];
         let collected = collect_tool_results(
-            ordered,
+            &ordered,
             &tool_calls.iter().cloned().map(Some).collect::<Vec<_>>(),
             &mut history,
             &mut detector,
@@ -531,7 +531,7 @@ mod tests {
             ordered.push(Some(("shell".to_string(), None, outcome("same", true))));
         }
         let err = collect_tool_results(
-            ordered,
+            &ordered,
             &tool_calls.iter().cloned().map(Some).collect::<Vec<_>>(),
             &mut history,
             &mut detector,
@@ -580,7 +580,7 @@ mod tests {
             .map(|_| Some(("shell".into(), None, outcome("connection refused", false))))
             .collect();
         let collected = collect_tool_results(
-            outcomes,
+            &outcomes,
             &calls.iter().cloned().map(Some).collect::<Vec<_>>(),
             &mut Vec::new(),
             &mut LoopDetector::new(Default::default()),
@@ -609,7 +609,7 @@ mod tests {
             .map(|_| Some(("shell".into(), None, outcome("(no output)", true))))
             .collect();
         let collected = collect_tool_results(
-            outcomes,
+            &outcomes,
             &calls.iter().cloned().map(Some).collect::<Vec<_>>(),
             &mut Vec::new(),
             &mut LoopDetector::new(Default::default()),
@@ -640,7 +640,7 @@ mod tests {
             .collect();
         let mut detector = LoopDetector::new(LoopDetectorConfig::default());
         let collected = collect_tool_results(
-            ordered,
+            &ordered,
             &[Some(call.clone()), None, None, None],
             &mut Vec::new(),
             &mut detector,

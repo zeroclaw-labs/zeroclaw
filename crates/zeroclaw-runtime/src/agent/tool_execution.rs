@@ -2496,7 +2496,7 @@ mod tests {
         let mut detector = LoopDetector::new(LoopDetectorConfig::default());
         let ignore: HashSet<&str> = HashSet::new();
         let collected = collect_tool_results(
-            ordered,
+            &ordered,
             &tool_calls.iter().cloned().map(Some).collect::<Vec<_>>(),
             &mut history,
             &mut detector,

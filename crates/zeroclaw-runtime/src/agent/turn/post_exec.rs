@@ -8,32 +8,23 @@ use super::redact::scrub_credentials;
 use crate::agent::tool_execution::{CompletedToolExecution, ToolExecutionOutcome};
 use zeroclaw_tool_call_parser::ParsedToolCall;
 
-/// Record each executed tool call's outcome (upstream loop body,
-/// post-execution section): one `tool_call_result` log line, the
-/// `after_tool_call` hook, a completion Status to the draft, and the
-/// call's slot in `ordered_results`.
-pub(crate) async fn record_executed_outcomes(
+/// Move completed results into the round's canonical slots without awaiting
+/// hooks or transport. The turn owner must append these slots before notifying.
+pub(crate) fn retain_executed_outcomes(
     ctx: &TurnCtx<'_>,
     executable_indices: &[usize],
     executable_calls: &[ParsedToolCall],
-    stream_calls: &[Option<StreamToolCall>],
     executed_outcomes: Vec<CompletedToolExecution>,
     ordered_results: &mut [Option<(String, Option<String>, ToolExecutionOutcome)>],
     iteration: usize,
 ) {
-    for (((idx, call), stream_call), outcome) in executable_indices
+    for ((idx, call), completed) in executable_indices
         .iter()
-        .zip(executable_calls.iter())
-        .zip(stream_calls.iter())
+        .zip(executable_calls)
         .zip(executed_outcomes)
     {
-        let was_executed = outcome.executed_tool_name.is_some();
-        let outcome = outcome.outcome;
-        // The pending ToolCall and terminal ToolResult are emitted by the
-        // executor (execute_one_tool) at dispatch and completion time so serial
-        // batches interleave call->result per tool. Post-exec only records the
-        // outcome to history, logs, hooks, and ordered_results.
-
+        let was_executed = completed.executed_tool_name.is_some();
+        let outcome = completed.outcome;
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(
@@ -61,6 +52,49 @@ pub(crate) async fn record_executed_outcomes(
             })),
             "tool_call_result"
         );
+
+        // The SOP ledger retains attempted calls too, including denied or
+        // unknown calls with their failed outcomes. This is separate from
+        // completion hooks, which require actual dispatch provenance.
+        if crate::sop::executor::step_capture_active() {
+            crate::sop::executor::record_step_tool_call(
+                &call.name,
+                &call.arguments,
+                outcome.success,
+                outcome.output.clone(),
+                outcome.output_data.clone(),
+                outcome.error_reason.as_deref(),
+                u64::try_from(outcome.duration.as_millis()).unwrap_or(u64::MAX),
+            );
+        }
+
+        ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
+    }
+}
+
+/// Notify hooks and the draft only after the turn owner retains the whole round.
+pub(crate) async fn notify_executed_outcomes(
+    ctx: &TurnCtx<'_>,
+    executable_indices: &[usize],
+    executable_calls: &[ParsedToolCall],
+    stream_calls: &[Option<StreamToolCall>],
+    ordered_results: &[Option<(String, Option<String>, ToolExecutionOutcome)>],
+    executed_calls: &[Option<ParsedToolCall>],
+    iteration: usize,
+) {
+    for ((idx, call), stream_call) in executable_indices
+        .iter()
+        .zip(executable_calls.iter())
+        .zip(stream_calls.iter())
+    {
+        let Some((_, _, outcome)) = &ordered_results[*idx] else {
+            continue;
+        };
+        let was_executed = executed_calls[*idx].is_some();
+        // The pending ToolCall and terminal ToolResult are emitted by the
+        // executor (execute_one_tool) at dispatch and completion time so serial
+        // batches interleave call->result per tool. Post-exec only records the
+        // outcome to history, logs, hooks, and ordered_results.
 
         // ── Hook: after_tool_call (void) ─────────────────
         if let Some(hooks) = ctx.hooks {
@@ -112,22 +146,46 @@ pub(crate) async fn record_executed_outcomes(
                 })
                 .await;
         }
-
-        // The SOP ledger retains attempted calls too, including denied or
-        // unknown calls with their failed outcomes. This is separate from
-        // completion hooks, which require actual dispatch provenance.
-        if crate::sop::executor::step_capture_active() {
-            crate::sop::executor::record_step_tool_call(
-                &call.name,
-                &call.arguments,
-                outcome.success,
-                outcome.output.clone(),
-                outcome.output_data.clone(),
-                outcome.error_reason.as_deref(),
-                u64::try_from(outcome.duration.as_millis()).unwrap_or(u64::MAX),
-            );
-        }
-
-        ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
     }
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn record_executed_outcomes(
+    ctx: &TurnCtx<'_>,
+    executable_indices: &[usize],
+    executable_calls: &[ParsedToolCall],
+    stream_calls: &[Option<StreamToolCall>],
+    outcomes: Vec<CompletedToolExecution>,
+    ordered_results: &mut [Option<(String, Option<String>, ToolExecutionOutcome)>],
+    iteration: usize,
+) {
+    let mut dispatched = vec![None; ordered_results.len()];
+    for ((index, call), outcome) in executable_indices
+        .iter()
+        .zip(executable_calls)
+        .zip(&outcomes)
+    {
+        if outcome.executed_tool_name.is_some() {
+            dispatched[*index] = Some(call.clone());
+        }
+    }
+    retain_executed_outcomes(
+        ctx,
+        executable_indices,
+        executable_calls,
+        outcomes,
+        ordered_results,
+        iteration,
+    );
+    notify_executed_outcomes(
+        ctx,
+        executable_indices,
+        executable_calls,
+        stream_calls,
+        ordered_results,
+        &dispatched,
+        iteration,
+    )
+    .await;
 }

@@ -65,7 +65,9 @@ pub(crate) use parse_response::{
     interpret_chat_response, record_accepted_chat_response, resolve_display_text,
     unforwarded_narration,
 };
+#[cfg(test)]
 pub(crate) use post_exec::record_executed_outcomes;
+use post_exec::{notify_executed_outcomes, retain_executed_outcomes};
 pub(crate) use provider_call::{
     ProviderCallOutcome, announce_budget_warning, announce_llm_request, call_provider,
     enforce_tool_loop_budget,
@@ -3597,28 +3599,15 @@ async fn run_tool_call_loop_impl<'a>(
             }
         }
 
-        record_executed_outcomes(
+        retain_executed_outcomes(
             &ctx,
             &executed_completed_indices,
             &executed_completed_calls,
-            &executed_completed_stream_calls,
             executed_completed_outcomes,
             &mut ordered_results,
             iteration,
-        )
-        .await;
+        );
         if cancelled_mid_batch {
-            // Completed calls already received their after hook; every other
-            // executable context of the batch was interrupted before
-            // post-execution handling and gets exactly one abandonment.
-            call_prep::abandon_unexecuted_prepared_contexts(
-                &ctx,
-                iteration,
-                &executable_indices,
-                &executable_calls,
-                &executed_completed_indices,
-            )
-            .await;
             for (idx, call) in tool_calls.iter().enumerate() {
                 if ordered_results[idx].is_none() {
                     ordered_results[idx] = Some((
@@ -3638,6 +3627,60 @@ async fn run_tool_call_loop_impl<'a>(
                     ));
                 }
             }
+        }
+
+        let CollectedResults {
+            individual_results,
+            tool_results,
+            detection_relevant_output,
+            loop_stopped,
+        } = collect_tool_results(
+            &ordered_results,
+            &detection_calls,
+            turn_state.history,
+            &mut loop_detector,
+            &loop_ignore_tools,
+            max_tool_result_chars,
+            collected_receipts,
+            active_model,
+            iteration,
+            turn_id,
+        )?;
+
+        let loop_stopped = preflight_loop_stopped || loop_stopped;
+
+        turn_state.append_tool_round(
+            assistant_history_content,
+            &native_tool_calls,
+            &individual_results,
+            &tool_results,
+            use_native_tools,
+        );
+
+        // Canonical history is complete before hooks, draft backpressure or
+        // cooperative closeout can suspend/drop the enclosing future.
+        notify_executed_outcomes(
+            &ctx,
+            &executed_completed_indices,
+            &executed_completed_calls,
+            &executed_completed_stream_calls,
+            &ordered_results,
+            &detection_calls,
+            iteration,
+        )
+        .await;
+        if cancelled_mid_batch {
+            // Completed calls already received their after hook; every other
+            // executable context of the batch was interrupted before
+            // post-execution handling and gets exactly one abandonment.
+            call_prep::abandon_unexecuted_prepared_contexts(
+                &ctx,
+                iteration,
+                &executable_indices,
+                &executable_calls,
+                &executed_completed_indices,
+            )
+            .await;
             // Close pending cards only for executable calls whose terminal
             // ToolResult was never emitted by the executor. A parallel call that
             // completed before the cancellation already emitted its real result;
@@ -3666,26 +3709,6 @@ async fn run_tool_call_loop_impl<'a>(
             }
         }
 
-        let CollectedResults {
-            individual_results,
-            tool_results,
-            detection_relevant_output,
-            loop_stopped,
-        } = collect_tool_results(
-            ordered_results,
-            &detection_calls,
-            turn_state.history,
-            &mut loop_detector,
-            &loop_ignore_tools,
-            max_tool_result_chars,
-            collected_receipts,
-            active_model,
-            iteration,
-            turn_id,
-        )?;
-
-        let loop_stopped = preflight_loop_stopped || loop_stopped;
-
         if !cancelled_mid_batch && !loop_stopped && repetition_guard.is_none() {
             check_identical_output_abort(
                 &detection_relevant_output,
@@ -3698,14 +3721,6 @@ async fn run_tool_call_loop_impl<'a>(
                 turn_id,
             )?;
         }
-
-        turn_state.append_tool_round(
-            assistant_history_content,
-            &native_tool_calls,
-            &individual_results,
-            &tool_results,
-            use_native_tools,
-        );
 
         if cancelled_mid_batch {
             return Err(ToolLoopCancelled.into());
@@ -11391,6 +11406,159 @@ mod tool_lifecycle_abandonment_tests {
             served_route_sink: None,
         })
         .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completed_round_survives_cancelled_closeout_with_full_draft_queue() {
+        struct CompletionBarrier {
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+        #[async_trait::async_trait]
+        impl crate::hooks::HookHandler for CompletionBarrier {
+            fn name(&self) -> &str {
+                "completion-barrier"
+            }
+            async fn on_after_tool_call_with_context(
+                &self,
+                _context: &ToolCallHookContext,
+                _tool: &str,
+                result: &zeroclaw_api::tool::ToolResult,
+                _duration: Duration,
+            ) {
+                assert!(result.success);
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+        }
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut runner = crate::hooks::HookRunner::new();
+        runner.register(Box::new(CompletionBarrier {
+            entered: entered.clone(),
+            release: release.clone(),
+        }));
+        let provider = &ScriptedProvider {
+            responses: Mutex::new(vec![ChatResponse {
+                text: None,
+                tool_calls: vec![tool_call(
+                    "completed-once",
+                    "performed",
+                    serde_json::json!({"result":"already-completed"}),
+                )],
+                usage: None,
+                reasoning_content: None,
+            }]),
+        };
+        let tools_registry = &registry_with(vec![Box::new(EchoTool {
+            name: "performed".into(),
+        })]);
+        let observer = &NoopObserver;
+        let hooks = Some(&runner);
+        let pacing = &zeroclaw_config::schema::PacingConfig::default();
+        let turn_id = "draft-backpressure";
+        let parallel_tools = false;
+        let cancel = CancellationToken::new();
+        let cancellation_token = Some(cancel.clone());
+        let context_token_budget = 0;
+        let image_cache = None;
+        let mut history = vec![
+            ChatMessage::system("test"),
+            ChatMessage::user("perform one operation"),
+        ];
+        let mut crumb_present = false;
+        let mut injected_preamble = None;
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel(1);
+        let mut turn = Box::pin(run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            capability_binding: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: provider,
+                    provider_name: "scripted",
+                    model: "scripted-model",
+                    dispatch_model: "scripted-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry,
+                observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 3,
+                hooks,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing,
+                strict_tool_parsing: false,
+                parallel_tools,
+                max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
+                context_limits: zeroclaw_config::schema::ResolvedContextLimits {
+                    context_token_budget,
+                    ..zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0)
+                },
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+                security: None,
+            },
+            history: &mut history,
+            history_has_trim_breadcrumb: &mut crumb_present,
+            injected_memory_preamble: &mut injected_preamble,
+            channel_name: "cli",
+            channel_reply_target: None,
+            cancellation_token,
+            on_delta: Some(&delta_tx),
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id,
+            served_route_sink: None,
+        }));
+        // Drain normal streaming until a real completed tool reaches its hook.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    biased;
+                    () = entered.notified() => break,
+                    result = &mut turn => panic!("turn ended before its completed result: {result:?}"),
+                    delta = delta_rx.recv() => assert!(delta.is_some()),
+                }
+            }
+        }).await.expect("tool must complete");
+        while delta_rx.try_recv().is_ok() {}
+        delta_tx
+            .try_send(StreamDelta::Status("blocked draft transport".into()))
+            .unwrap();
+        cancel.cancel();
+        release.notify_one();
+        // The receiver stays open but full for the complete cooperative-closeout
+        // window. Dropping the future must not erase the completed operation.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), &mut turn)
+                .await
+                .is_err()
+        );
+        drop(turn);
+        assert!(
+            history
+                .iter()
+                .any(|m| (m.role == "tool" || m.content.contains("<tool_result"))
+                    && m.content.contains("already-completed")),
+            "the next turn must see the completed result even when progress never drains"
+        );
     }
 
     async fn run_loop_review_scenario(
