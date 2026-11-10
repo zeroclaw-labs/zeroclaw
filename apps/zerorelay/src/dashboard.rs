@@ -366,9 +366,10 @@ where
 /// own send buffer (up to 64 KiB with rustls) when the socket was full. Only
 /// a flush, or the next write, sends the rest. A keep-alive connection has no
 /// next write once a response is done, so without this the browser is left
-/// waiting on the end of that response until the idle timeout closes the
-/// connection, and the close flushes it.
-async fn write_flushed<W>(writer: &mut W, bytes: &[u8]) -> std::io::Result<()>
+/// waiting on the end of that response until the connection closes, and the
+/// close flushes it. The frontdoor's keep-alive loop uses it for the same
+/// reason.
+pub(crate) async fn write_flushed<W>(writer: &mut W, bytes: &[u8]) -> std::io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
@@ -428,6 +429,61 @@ where
         let _ = browser.shutdown().await;
     })
     .await;
+}
+
+/// A TLS client and server over an in-memory socket that holds `capacity`
+/// bytes each way, for tests that need a real TLS writer: one that keeps what
+/// the socket can't take in its own buffer until it is flushed.
+#[cfg(test)]
+pub(crate) async fn tls_over_duplex(
+    capacity: usize,
+) -> (
+    tokio_rustls::client::TlsStream<tokio::io::DuplexStream>,
+    tokio_rustls::server::TlsStream<tokio::io::DuplexStream>,
+) {
+    let (ca_cert, ca_key) = zeroclaw_tls::testing::gen_ca();
+    let (cert, key) =
+        zeroclaw_tls::testing::gen_server_cert(&ca_cert, &ca_key, &["abc.relay.test".to_string()]);
+    let pem_certs = |pem: &str| {
+        rustls_pemfile::certs(&mut pem.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let server = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            pem_certs(&cert),
+            rustls_pemfile::private_key(&mut key.as_bytes())
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    for ca in pem_certs(&ca_cert) {
+        roots.add(ca).unwrap();
+    }
+    let client = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+    let (client_io, server_io) = tokio::io::duplex(capacity);
+    let accepting = tokio::spawn(async move {
+        tokio_rustls::TlsAcceptor::from(Arc::new(server))
+            .accept(server_io)
+            .await
+            .unwrap()
+    });
+    let name = rustls::pki_types::ServerName::try_from("abc.relay.test").unwrap();
+    let client = tokio_rustls::TlsConnector::from(Arc::new(client))
+        .connect(name, client_io)
+        .await
+        .unwrap();
+    (client, accepting.await.unwrap())
 }
 
 #[cfg(test)]
@@ -624,52 +680,7 @@ mod tests {
     /// idle timeout, and the browser waits on the end of the response.
     #[tokio::test]
     async fn a_tls_browser_gets_the_whole_response_while_the_connection_stays_open() {
-        let (ca_cert, ca_key) = zeroclaw_tls::testing::gen_ca();
-        let (cert, key) = zeroclaw_tls::testing::gen_server_cert(
-            &ca_cert,
-            &ca_key,
-            &["abc.relay.test".to_string()],
-        );
-        let pem_certs = |pem: &str| {
-            rustls_pemfile::certs(&mut pem.as_bytes())
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap()
-        };
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let server = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(
-                pem_certs(&cert),
-                rustls_pemfile::private_key(&mut key.as_bytes())
-                    .unwrap()
-                    .unwrap(),
-            )
-            .unwrap();
-        let mut roots = rustls::RootCertStore::empty();
-        for ca in pem_certs(&ca_cert) {
-            roots.add(ca).unwrap();
-        }
-        let client = rustls::ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-
-        let (browser_io, relay_io) = tokio::io::duplex(4 * 1024);
-        let accepting = tokio::spawn(async move {
-            tokio_rustls::TlsAcceptor::from(Arc::new(server))
-                .accept(relay_io)
-                .await
-                .unwrap()
-        });
-        let name = rustls::pki_types::ServerName::try_from("abc.relay.test").unwrap();
-        let mut browser = tokio_rustls::TlsConnector::from(Arc::new(client))
-            .connect(name, browser_io)
-            .await
-            .unwrap();
-        let relay_browser_side = accepting.await.unwrap();
+        let (mut browser, relay_browser_side) = tls_over_duplex(4 * 1024).await;
         let (relay_daemon_side, mut daemon) = tokio::io::duplex(64 * 1024);
         let splicing = tokio::spawn(splice(
             relay_browser_side,
