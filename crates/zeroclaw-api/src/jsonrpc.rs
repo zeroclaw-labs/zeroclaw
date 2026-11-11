@@ -370,6 +370,18 @@ impl RpcOutbound {
         method: &str,
         params: Value,
     ) -> std::result::Result<Value, JsonRpcError> {
+        self.request_bounded(method, params, u64::MAX).await
+    }
+
+    /// Send a request only if its encoded NDJSON frame, including the
+    /// terminating newline, fits the transport's limit. An oversized
+    /// request is refused before enqueueing and leaves the writer usable.
+    pub async fn request_bounded(
+        &self,
+        method: &str,
+        params: Value,
+        max_frame_bytes: u64,
+    ) -> std::result::Result<Value, JsonRpcError> {
         let n = self.next_id.fetch_add(1, Ordering::Relaxed);
         let id = format!("{OUTBOUND_ID_PREFIX}{n}");
         let (tx, rx) = oneshot::channel();
@@ -392,6 +404,16 @@ impl RpcOutbound {
                 });
             }
         };
+        if (body.len() as u64).saturating_add(1) > max_frame_bytes {
+            return Err(JsonRpcError {
+                code: error_codes::INVALID_PARAMS,
+                message: "JSON-RPC request exceeds the frame size limit".to_string(),
+                data: Some(serde_json::json!({
+                    "reason": "frame_too_large",
+                    "limit_bytes": max_frame_bytes,
+                })),
+            });
+        }
         if self.writer_tx.send(body).await.is_err() {
             return Err(JsonRpcError {
                 code: error_codes::INTERNAL_ERROR,
@@ -631,6 +653,54 @@ pub struct FsStatError {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn bounded_request_counts_escapes_envelope_and_newline_before_enqueueing() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let outbound = RpcOutbound::new(tx);
+        let params = json!({ "prompt": "\n\"\0" });
+        let encoded = serde_json::to_string(&JsonRpcRequest::new(
+            "echo",
+            params.clone(),
+            Value::String(format!("{OUTBOUND_ID_PREFIX}0")),
+        ))
+        .unwrap();
+        let limit = encoded.len() as u64;
+        // Bounded wait: if the frame check ever let this through, the
+        // request would sit queued with no reply and the test would hang.
+        let refused = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            outbound.request_bounded("echo", params.clone(), limit),
+        )
+        .await
+        .expect("an oversized request is refused at once, not queued")
+        .unwrap_err();
+        assert_eq!(refused.code, error_codes::INVALID_PARAMS);
+        assert_eq!(refused.data.unwrap()["reason"], "frame_too_large");
+        assert_eq!(outbound.pending_count(), 0);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        // The same escaped payload fits with the newline included. Its
+        // response still reaches the caller after the preceding refusal.
+        let (answer, ()) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            tokio::join!(outbound.request_bounded("echo", params, limit + 1), async {
+                let body = rx.recv().await.unwrap();
+                assert_eq!(body.len() as u64 + 1, limit + 1);
+                let request: JsonRpcRequest = serde_json::from_str(&body).unwrap();
+                let id = request.id.unwrap();
+                assert!(
+                    outbound.dispatch_validated_response(id.as_str().unwrap(), Ok(json!("ok")))
+                );
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(answer.unwrap(), json!("ok"));
+        assert_eq!(outbound.pending_count(), 0);
+    }
 
     #[test]
     fn frame_parses_success_response() {

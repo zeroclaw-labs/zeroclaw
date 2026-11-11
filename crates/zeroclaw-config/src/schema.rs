@@ -14299,10 +14299,13 @@ pub struct OidcConfig {
     pub allowed_authorized_parties: Vec<String>,
     /// Client identities whose tokens are ALWAYS service principals
     /// (`client_credentials` callers), matched against the token's
-    /// verified `client_id` claim. Service principals are keyed by
-    /// issuer + client identity and never inherit human-user assumptions,
-    /// whatever provider-specific shape their `sub` takes (`<client>@clients`,
-    /// a service-account user id, or the client id itself).
+    /// verified `client_id` claim. Service tokens always need `client_id`:
+    /// in JWKS mode a token with no `client_id` whose signed `azp` names one
+    /// of these clients is refused, never treated as a service. Service
+    /// principals are keyed by issuer + client identity and never inherit
+    /// human-user assumptions, whatever provider-specific shape their
+    /// `sub` takes (`<client>@clients`, a service-account user id, or the
+    /// client id itself).
     ///
     /// Actor classification is declarative, never inferred from the
     /// `sub`/`client_id` relationship: a token is a service because its
@@ -14313,7 +14316,8 @@ pub struct OidcConfig {
     pub service_clients: Vec<String>,
     /// Client identities whose tokens are ALWAYS human principals
     /// (authorization-code / device-code clients), matched against the
-    /// verified `client_id` claim. Their tokens must carry a nonblank `sub`
+    /// verified `client_id` claim, or in JWKS mode the signed `azp` when
+    /// `client_id` is absent. Their tokens must carry a nonblank `sub`
     /// and resolve through `profile_map`. A client may appear in only one of
     /// `service_clients` and `interactive_clients`.
     pub interactive_clients: Vec<String>,
