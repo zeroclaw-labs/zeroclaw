@@ -8698,27 +8698,44 @@ impl RpcDispatcher {
         };
         self.ensure_session_incarnation(&req.session_id, expected_generation)
             .await?;
-        let admitted = self
-            .revalidate_admitted_session(&req.session_id, authorized.as_ref())
-            .await?;
         // The lookups above awaited, and the gate decided on the grants
         // stamped at admission. Re-resolve the caller against the policy in
         // force now: a revoked `sessions:update` refuses the reload, and an
-        // administrator demoted meanwhile is held to ownership again. Nothing
-        // below awaits, so this decision covers the mutation.
+        // administrator demoted meanwhile is held to ownership again.
         let grants = self.recheck_authority_after_admission(Method::SessionReloadContext)?;
+        let admitted = self
+            .revalidate_admitted_session(
+                &req.session_id,
+                authorized.as_ref(),
+                self.scoped_principal_id_from(grants.as_ref()).as_deref(),
+            )
+            .await?;
         self.require_ownership_under(grants.as_ref(), admitted.as_ref())?;
-        let changed = {
-            let mut agent = agent.try_lock().map_err(|_| {
-                rpc_err(
-                    SESSION_BUSY,
-                    "a turn is running; reload the context after it finishes",
-                )
-            })?;
-            agent
-                .reload_personality()
-                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Failed to reload context: {e}")))?
-        };
+        let mut guard = agent.try_lock().map_err(|_| {
+            rpc_err(
+                SESSION_BUSY,
+                "a turn is running; reload the context after it finishes",
+            )
+        })?;
+        // Reload exactly the agent that was admitted, under the authority in
+        // force at the effect.
+        let changed = self
+            .ctx
+            .sessions
+            .with_session_effect(&req.session_id, |session| {
+                let session = session
+                    .filter(|s| Arc::ptr_eq(&s.agent, &agent))
+                    .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session was replaced"))?;
+                let _authority = self.session_effect_lease(
+                    Method::SessionReloadContext,
+                    session.owner_principal_id.as_deref(),
+                )?;
+                guard
+                    .reload_personality()
+                    .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Failed to reload context: {e}")))
+            })
+            .await?;
+        drop(guard);
         to_result(SessionReloadContextResult {
             session_id: req.session_id,
             live: true,
