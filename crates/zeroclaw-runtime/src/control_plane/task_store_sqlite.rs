@@ -66,7 +66,7 @@ impl SqliteTaskStore {
     fn init(conn: Connection) -> Result<Self> {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;
+             PRAGMA synchronous = FULL;
              PRAGMA busy_timeout = 5000;
              PRAGMA temp_store = MEMORY;
              PRAGMA foreign_keys = ON;",
@@ -1553,6 +1553,26 @@ CREATE TABLE IF NOT EXISTS terminal_settlement_intents (
 
         assert_eq!(version, CONTROL_PLANE_SCHEMA_VERSION);
         assert_eq!(outbox_exists, 1);
+    }
+
+    #[test]
+    fn each_file_backed_control_plane_connection_uses_full_wal_synchronous_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = SqliteTaskStore::new(directory.path()).unwrap();
+        let second = SqliteTaskStore::new(directory.path()).unwrap();
+
+        for store in [&first, &second] {
+            let conn = store.conn.lock();
+            let journal_mode: String = conn
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap();
+            let synchronous: i64 = conn
+                .query_row("PRAGMA synchronous", [], |row| row.get(0))
+                .unwrap();
+
+            assert_eq!(journal_mode, "wal");
+            assert_eq!(synchronous, 2, "SQLite FULL synchronous mode");
+        }
     }
 
     #[test]
