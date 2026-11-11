@@ -9,6 +9,10 @@
       "owner": "crates/zeroclaw-runtime/src/live_config_authority.rs",
       "reason": "Authoritative schema3 config generation, policy resolution and admitted agent identity; the runtime keeps enforcement and resolves live state at use time."
     },
+    "zeroclaw-goal": {
+      "owner": "crates/zeroclaw-runtime/src/control_plane/task_store_sqlite/goal.rs",
+      "reason": "The runtime control plane implements GoalTaskRegistry on its existing SQLite task store; the transport-neutral Goal contracts remain in zeroclaw-goal without creating a second persistence owner."
+    },
     "zeroclaw-spawn": {
       "owner": "crates/zeroclaw-runtime/src/tools/shell.rs",
       "reason": "Existing process/sandbox execution ownership for the compatibility shell tool and managed background children."

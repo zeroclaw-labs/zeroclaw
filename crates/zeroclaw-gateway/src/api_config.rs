@@ -5670,7 +5670,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let router = crate::config_admin_router(&auth).with_state(state.clone());
+        let route_auth = crate::principal_gate::ConfigRouteAuth::new(&auth, &state.config);
+        let router = crate::config_admin_router(route_auth).with_state(state.clone());
         let request = axum::http::Request::builder()
             .method("PATCH")
             .uri("/api/config")
