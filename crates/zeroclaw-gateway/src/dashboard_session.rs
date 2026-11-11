@@ -169,6 +169,8 @@ struct Session {
     /// them. Never a credential: they only let that browser's next sign-in,
     /// or its sign-out, end this session.
     browser: Vec<[u8; 32]>,
+    /// The chats the session has open on the core.
+    core: Arc<crate::dashboard_core::CoreBinding>,
 }
 
 impl std::fmt::Debug for Session {
@@ -359,6 +361,7 @@ impl DashboardSessions {
             hard_expiry: now.saturating_add(lifetime_secs),
             ended: CancellationToken::new(),
             browser,
+            core: Arc::default(),
         };
         let view = Arc::new(SessionAuth::from_session(key, &session, None));
         sessions.insert(key, session);
@@ -617,6 +620,9 @@ pub struct DashboardAuth {
     /// cannot say whether this generation was stopped.
     stopping: Option<tokio::sync::watch::Receiver<bool>>,
     _sweeper: SweeperGuard,
+    /// A fixture owns its socket clock; production always uses SOCKET_RECHECK.
+    #[cfg(test)]
+    socket_recheck: std::time::Duration,
 }
 
 /// How often the store is swept when no request arrives: an expired
@@ -702,7 +708,15 @@ impl DashboardAuth {
             inbound,
             stopping: None,
             _sweeper: SweeperGuard(None),
+            #[cfg(test)]
+            socket_recheck: SOCKET_RECHECK,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_socket_recheck(mut self, interval: std::time::Duration) -> Self {
+        self.socket_recheck = interval;
+        self
     }
 
     /// Bind this state to the gateway generation `state` belongs to, before
@@ -724,6 +738,15 @@ impl DashboardAuth {
         self._sweeper = SweeperGuard::start(&self.sessions, state.config.clone(), stopping.clone());
         self.stopping = Some(stopping);
         self
+    }
+
+    /// The stop signal of the generation this state is bound to, for a task
+    /// that must end with it. `None` for a state bound to no generation
+    /// ([`DashboardAuth::new`] alone, in unit tests): treat it as none. The
+    /// clone keeps the unseen version, so a stop sent before the call is
+    /// still seen.
+    pub(crate) fn generation_stopping(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+        self.stopping.clone()
     }
 
     /// Whether this state's generation was told to stop. A closed channel
@@ -1010,6 +1033,38 @@ impl DashboardAuth {
     /// (sign-out).
     pub(crate) fn end_browser(&self, browser: &[[u8; 32]]) -> usize {
         DashboardSessions::end_marked(&mut self.sessions.sessions.lock(), browser)
+    }
+
+    /// The token `session` signed in with and the provider it was issued
+    /// by, for its chats' core connections to present, bound to that
+    /// provider, and nothing else. The copy is wiped when dropped like the
+    /// stored one. `None` once the session has ended.
+    pub(crate) fn core_credential(
+        &self,
+        session: &SessionAuth,
+    ) -> Option<crate::dashboard_core::CoreCredential> {
+        self.sessions.sessions.lock().get(&session.key).map(|held| {
+            crate::dashboard_core::CoreCredential {
+                bearer: held.bearer.clone(),
+                binding: zeroclaw_runtime::rpc::inproc::OidcSessionBinding {
+                    provider: held.provider.binding(),
+                    principal_id: held.auth.principal.id.clone(),
+                },
+            }
+        })
+    }
+
+    /// The chats `session` has open on the core. `None` once the session
+    /// has ended.
+    pub(crate) fn core_binding(
+        &self,
+        session: &SessionAuth,
+    ) -> Option<Arc<crate::dashboard_core::CoreBinding>> {
+        self.sessions
+            .sessions
+            .lock()
+            .get(&session.key)
+            .map(|held| Arc::clone(&held.core))
     }
 }
 
@@ -1344,6 +1399,10 @@ pub(crate) struct SessionWatch {
     auth: Arc<DashboardAuth>,
     session: Arc<SessionAuth>,
     require_admin: bool,
+    /// For a scoped chat, the agent it talks to: the session must keep the
+    /// grants a chat needs and that agent, as the upgrade checked them, or
+    /// the socket closes as an administrator's does on demotion.
+    chat_agent: Option<String>,
     recheck: tokio::time::Interval,
     /// A recheck in progress. Kept here, not in a `lost` future, because
     /// a socket's loop drops that future whenever another branch fires: a
@@ -1363,8 +1422,12 @@ impl SessionWatch {
         require_admin: bool,
         state: &AppState,
     ) -> Self {
-        let start = tokio::time::Instant::now() + SOCKET_RECHECK;
-        let mut recheck = tokio::time::interval_at(start, SOCKET_RECHECK);
+        #[cfg(not(test))]
+        let interval = SOCKET_RECHECK;
+        #[cfg(test)]
+        let interval = auth.socket_recheck;
+        let start = tokio::time::Instant::now() + interval;
+        let mut recheck = tokio::time::interval_at(start, interval);
         recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // The generation's own signal when the state is bound to one (every
         // served gateway); otherwise this state's, from now.
@@ -1376,11 +1439,25 @@ impl SessionWatch {
             auth,
             session,
             require_admin,
+            chat_agent: None,
             recheck,
             pending: None,
             stopping,
             stopped: false,
         }
+    }
+
+    /// The watch for a scoped chat with `agent`: on top of the session
+    /// staying valid, every check requires what the chat was opened with.
+    pub(crate) fn for_chat(
+        auth: Arc<DashboardAuth>,
+        session: Arc<SessionAuth>,
+        agent: &str,
+        state: &AppState,
+    ) -> Self {
+        let mut watch = Self::new(auth, session, false, state);
+        watch.chat_agent = Some(agent.to_string());
+        watch
     }
 
     pub(crate) fn principal_id(&self) -> &str {
@@ -1419,12 +1496,29 @@ impl SessionWatch {
 
     fn judge(&mut self, outcome: DashboardCaller) -> Result<(), u16> {
         match outcome {
-            DashboardCaller::Session(session) if !self.require_admin || session.is_admin() => {
+            DashboardCaller::Session(session) if self.still_admits(&session) => {
                 self.session = session;
                 Ok(())
             }
             DashboardCaller::Session(_) => Err(WS_CLOSE_ACCESS_LOST),
             DashboardCaller::Rejected(_) => Err(WS_CLOSE_SESSION_ENDED),
+        }
+    }
+
+    /// Whether a session that still verifies keeps what the socket was
+    /// opened with, under the current policy: administrator rights for an
+    /// operator stream; for a scoped chat, the session grants a chat needs
+    /// and its agent.
+    fn still_admits(&self, session: &SessionAuth) -> bool {
+        if self.require_admin && !session.is_admin() {
+            return false;
+        }
+        match &self.chat_agent {
+            Some(agent) => {
+                crate::dashboard_core::may_chat(&session.grants)
+                    && session.grants.may_use_agent(agent)
+            }
+            None => true,
         }
     }
 
@@ -1550,6 +1644,13 @@ pub(crate) async fn session_lost(watch: &mut Option<SessionWatch>, state: &AppSt
     }
 }
 
+/// [`SessionWatch::known_lost`] for a socket that may have no session: the
+/// close code if what is already known ends it (the session ended or
+/// expired, or its generation stopped), with no recheck and nothing awaited.
+pub(crate) fn session_known_lost(watch: &mut Option<SessionWatch>) -> Option<u16> {
+    watch.as_mut().and_then(SessionWatch::known_lost)
+}
+
 /// [`SessionWatch::admits_now`] for a socket that may have no session; a
 /// socket without one is always admitted here (its own credential check
 /// already ran when it opened).
@@ -1629,7 +1730,12 @@ pub async fn layer(
     if request.headers().contains_key(header::AUTHORIZATION) {
         return next.run(request).await;
     }
-    let https = crate::api_oidc::request_is_https(&layer.state, request.headers());
+    let via_relay = request
+        .extensions()
+        .get::<crate::relay_ingress::ViaRelay>()
+        .cloned();
+    let https =
+        crate::api_oidc::request_is_https(&layer.state, request.headers(), via_relay.as_ref());
     let scope = CookieScope {
         https,
         path_prefix: &layer.state.path_prefix,
@@ -1643,10 +1749,18 @@ pub async fn layer(
     if layer.auth.is_retired() {
         return crate::gateway_restarting(request.version());
     }
-    // A Host that isn't a plain authority leaves no own origin to check
-    // against, so the request is refused as coming from another origin.
-    let checked = match crate::api_oidc::request_authority(request.headers()) {
-        Some(host) => check_origin(request.method(), request.headers(), &origin_of(https, host)),
+    // Through a relay-served dashboard the own origin is that dashboard's,
+    // fixed. Otherwise it is built from the Host, and a Host that isn't a
+    // plain authority leaves no own origin to check against, so the
+    // request is refused as coming from another origin.
+    let own_origin = match &via_relay {
+        Some(via_relay) => Some(via_relay.origin().to_string()),
+        None => {
+            crate::api_oidc::request_authority(request.headers()).map(|host| origin_of(https, host))
+        }
+    };
+    let checked = match own_origin {
+        Some(own_origin) => check_origin(request.method(), request.headers(), &own_origin),
         None => Err(SessionRejection::Origin),
     };
     let caller = match checked {
@@ -2918,6 +3032,169 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
+    // ── Through a relay-served dashboard ─────────────────────────────
+
+    const RELAY_HOST: &str = "abc.relay.example";
+    const RELAY_ORIGIN: &str = "https://abc.relay.example";
+
+    /// A request on a connection a relay forwarded for the dashboard at
+    /// [`RELAY_HOST`]: the browser's address, admitted as the accept loop
+    /// admits it.
+    fn relay_request(method: &str, path: &str, headers: &[(&str, &str)]) -> HttpRequest<Body> {
+        let mut builder = HttpRequest::builder()
+            .method(method)
+            .uri(path)
+            .header("host", RELAY_HOST);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let mut request = builder.body(Body::empty()).unwrap();
+        request.extensions_mut().insert(ConnectInfo(remote()));
+        crate::relay_ingress::RelayConnection::new(
+            zeroclaw_runtime::relay_dashboard::DashboardOrigin::new(RELAY_HOST, 443).unwrap(),
+        )
+        .admit(&mut request)
+        .expect("a request for the relay dashboard is admitted");
+        request
+    }
+
+    #[tokio::test]
+    async fn a_relay_served_dashboard_signs_in_at_its_own_https_origin() {
+        let server = idp(&["admins"], "gw").await;
+        // The gateway's own listener is plain HTTP; the browser's TLS ended
+        // at the relay.
+        let fixture = fixture(sign_in_config(&server.uri()));
+
+        let response = send(
+            &fixture.router,
+            relay_request("GET", "/auth/sign-in/corp?return=/chat", &[]),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        let location = response.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            query_param(&location, "redirect_uri"),
+            "https%3A%2F%2Fabc.relay.example%2Foidc%2Fcallback",
+            "the callback is the dashboard's origin"
+        );
+        let binding_cookie = set_cookies(&response)
+            .into_iter()
+            .find(|c| c.starts_with(&format!("__Host-{BINDING_COOKIE_STEM}")))
+            .expect("a __Host- binding cookie at the HTTPS root");
+        assert!(binding_cookie.contains("; Secure"), "{binding_cookie}");
+        assert!(binding_cookie.contains("Path=/;"), "{binding_cookie}");
+        let (binding_name, rest) = binding_cookie.split_once('=').unwrap();
+        let binding = rest.split(';').next().unwrap().to_string();
+
+        mount_token(&server, &query_param(&location, "nonce"), true).await;
+        let cookie = format!("{binding_name}={binding}");
+        let response = send(
+            &fixture.router,
+            relay_request(
+                "GET",
+                &format!(
+                    "/oidc/callback?state={}&code=c1",
+                    query_param(&location, "state")
+                ),
+                &[("cookie", &cookie)],
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let session_cookie = set_cookies(&response)
+            .into_iter()
+            .find(|c| c.starts_with(HOST_SESSION_COOKIE))
+            .expect("a __Host- session cookie");
+        assert!(session_cookie.contains("; Secure"), "{session_cookie}");
+        let session = cookie_from(&response, HOST_SESSION_COOKIE).unwrap();
+        let cookie = format!("{HOST_SESSION_COOKIE}={session}");
+
+        let response = send(
+            &fixture.router,
+            relay_request(
+                "GET",
+                "/api/auth/session",
+                &[("cookie", &cookie), ("sec-fetch-site", "same-origin")],
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let csrf = json(response).await["csrf_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Another relay-served dashboard is same-site, so only the exact
+        // origin tells them apart.
+        for foreign in [
+            "https://xyz.relay.example",
+            "http://abc.relay.example",
+            "https://abc.relay.example:8443",
+        ] {
+            let response = send(
+                &fixture.router,
+                relay_request(
+                    "POST",
+                    "/auth/sign-out",
+                    &[
+                        ("cookie", &cookie),
+                        ("origin", foreign),
+                        (CSRF_HEADER, &csrf),
+                    ],
+                ),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{foreign}");
+            assert_eq!(json(response).await["reason"], "origin", "{foreign}");
+        }
+        let response = send(
+            &fixture.router,
+            relay_request(
+                "POST",
+                "/auth/sign-out",
+                &[
+                    ("cookie", &cookie),
+                    ("origin", RELAY_ORIGIN),
+                    (CSRF_HEADER, &csrf),
+                ],
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn a_relay_forwarded_request_does_not_count_as_this_machine() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        // Even naming a loopback host and a forwarded loopback address, a
+        // request a relay forwarded is the browser's, and the relay
+        // admission refuses it before routing.
+        let mut request = HttpRequest::builder()
+            .uri("/auth/sign-in/corp")
+            .header("host", "localhost")
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(remote()));
+        let refusal = crate::relay_ingress::RelayConnection::new(
+            zeroclaw_runtime::relay_dashboard::DashboardOrigin::new(RELAY_HOST, 443).unwrap(),
+        )
+        .admit(&mut request)
+        .unwrap_err();
+        assert_eq!(refusal.status(), StatusCode::MISDIRECTED_REQUEST);
+        // Admitted for its own host, it still has the browser's address,
+        // so the sign-in it starts is billed to that browser.
+        let response = send(
+            &fixture.router,
+            relay_request("GET", "/auth/sign-in/corp", &[]),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    }
+
     // ── The store ────────────────────────────────────────────────────
 
     async fn verified_auth(fixture: &Fixture) -> ConnectionAuth {
@@ -3255,6 +3532,140 @@ mod tests {
     }
 
     // ── Long-lived sockets ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_chat_watch_closes_on_narrowed_grants_without_input() {
+        use zeroclaw_api::grants::{Resource, Verb};
+
+        for narrowing in ["sessions:read", "sessions:update", "agent"] {
+            let server = idp(&["admins"], "gw").await;
+            let mut config = sign_in_config(&server.uri());
+            for alias in ["support", "other"] {
+                config.agents.insert(alias.into(), Default::default());
+            }
+            let profile = config.permission_profiles.get_mut("admin").unwrap();
+            profile.admin = false;
+            profile.allowed_agents = vec!["support".into()];
+            profile.grants.insert(
+                Resource::Sessions,
+                vec![Verb::Create, Verb::Read, Verb::Execute, Verb::Update],
+            );
+            config.validate_auth().unwrap();
+            let fixture = fixture(config.clone());
+            let signed_in = sign_in(&fixture, &server).await;
+            let DashboardCaller::Session(session) = fixture
+                .auth
+                .admit(|alias| Some(pin_for(&fixture, alias)), &signed_in.cookie)
+                .await
+            else {
+                panic!("signed in");
+            };
+            let mut watch = SessionWatch::for_chat(
+                Arc::clone(&fixture.auth),
+                session,
+                "support",
+                &fixture.state,
+            );
+            assert_eq!(watch.admits_now(&fixture.state).await, Ok(()));
+            let profile = config.permission_profiles.get_mut("admin").unwrap();
+            match narrowing {
+                "agent" => profile.allowed_agents = vec!["other".into()],
+                verb => {
+                    let verb = if verb == "sessions:read" {
+                        Verb::Read
+                    } else {
+                        Verb::Update
+                    };
+                    profile
+                        .grants
+                        .get_mut(&Resource::Sessions)
+                        .unwrap()
+                        .retain(|granted| *granted != verb);
+                }
+            }
+            let authority = fixture.auth.inbound.authority_ref().upgrade().unwrap();
+            authority
+                .publish_accepted(&config, authority.accepted_revision() + 1)
+                .unwrap();
+            watch.recheck = tokio::time::interval(std::time::Duration::from_millis(1));
+            let code = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                watch.lost(&fixture.state),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("without {narrowing}, an idle chat closes"));
+            assert_eq!(code, WS_CLOSE_ACCESS_LOST, "without {narrowing}");
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_chat_drain_checks_access_before_ready_updates() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_rpc_client::Notification;
+
+        let server = idp(&["admins"], "gw").await;
+        let mut config = sign_in_config(&server.uri());
+        config.agents.insert("support".into(), Default::default());
+        let profile = config.permission_profiles.get_mut("admin").unwrap();
+        profile.admin = false;
+        profile.allowed_agents = vec!["support".into()];
+        profile.grants.insert(
+            Resource::Sessions,
+            vec![Verb::Create, Verb::Read, Verb::Execute, Verb::Update],
+        );
+        let fixture = fixture(config.clone());
+        let signed_in = sign_in(&fixture, &server).await;
+        let DashboardCaller::Session(session) = fixture
+            .auth
+            .admit(|alias| Some(pin_for(&fixture, alias)), &signed_in.cookie)
+            .await
+        else {
+            panic!("signed in")
+        };
+        let mut watch = SessionWatch::for_chat(
+            Arc::clone(&fixture.auth),
+            session,
+            "support",
+            &fixture.state,
+        );
+        assert_eq!(watch.admits_now(&fixture.state).await, Ok(()));
+        config
+            .permission_profiles
+            .get_mut("admin")
+            .unwrap()
+            .grants
+            .get_mut(&Resource::Sessions)
+            .unwrap()
+            .retain(|verb| *verb != Verb::Read);
+        let authority = fixture.auth.inbound.authority_ref().upgrade().unwrap();
+        authority
+            .publish_accepted(&config, authority.accepted_revision() + 1)
+            .unwrap();
+        watch.recheck = tokio::time::interval(std::time::Duration::from_millis(1));
+        let mut watch = Some(watch);
+        let mut stopping = fixture.state.shutdown_tx.subscribe();
+        let (tx, mut updates) = tokio::sync::broadcast::channel(4);
+        let code = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                tx.send(Notification {
+                    method: "session/update".into(),
+                    params: serde_json::json!({"type": "agent_message_chunk", "session_id": "queued", "text": "chunk"}),
+                }).unwrap();
+                match crate::chat_core::next_queued_update(
+                    &mut watch, &fixture.state, &mut stopping, &mut updates,
+                ).await {
+                    Err(crate::chat_core::Stop::Close(code)) => break code,
+                    Ok(Ok(_)) => {
+                        // A reading browser can yield on every write while
+                        // leaving the next notification ready for the drain.
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                    other => panic!("unexpected queued drain result: {other:?}"),
+                }
+            }
+        }).await.expect("queued output cannot starve the actual permission watch");
+        assert_eq!(code, WS_CLOSE_ACCESS_LOST);
+    }
 
     #[tokio::test]
     async fn a_socket_watch_fires_when_its_session_is_signed_out() {
