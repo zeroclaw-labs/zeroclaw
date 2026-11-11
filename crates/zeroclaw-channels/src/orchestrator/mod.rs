@@ -2950,7 +2950,7 @@ fn resolved_runtime_model_provider_ref(
     let configured = agent.model_provider.trim();
     if configured.is_empty() {
         anyhow::bail!(
-            "agents.{agent_alias}.model_provider is empty; runtime reload requires a dotted `<type>.<alias>` provider reference"
+            "agents.{agent_alias}.model_provider is empty; runtime reload requires an exact configured model reference"
         );
     }
     if config.is_configured_model_ref(configured) {
@@ -2971,9 +2971,7 @@ fn model_provider_entry_for_ref(config: &Config, model_provider: &str) -> anyhow
     Ok(trimmed.to_owned())
 }
 
-/// Resolve runtime defaults from `config` against a specific dotted
-/// `model_provider` reference (`"<type>.<alias>"`) — the per-agent
-/// resolution path.
+/// Resolve per-agent defaults through the exact configured model reference.
 fn runtime_defaults_from_config(
     config: &Config,
     model_provider: &str,
@@ -17061,7 +17059,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
             "Channels supervisor: no model configured. Waiting for reload \
              (complete onboarding at /onboard or set \
-             [providers.models.<type>.<alias>] model = \"...\" and reload)."
+             [providers.models.<key>] model = \"...\" and reload)."
         );
         cancel.cancelled().await;
         return Ok(());

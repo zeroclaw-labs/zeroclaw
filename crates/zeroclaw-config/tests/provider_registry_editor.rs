@@ -765,3 +765,78 @@ fn registry_rename_refuses_environment_owned_consumer_bindings_atomically() {
     assert!(error.to_string().contains("environment-owned reference"));
     assert_eq!(serde_json::to_value(&config).unwrap(), before);
 }
+
+#[test]
+fn legacy_gemini_oauth_clients_survive_projection_and_editor_save() {
+    for explicit_oauth in [false, true] {
+        let mut profile = json!({
+            "model": "gemini-test",
+            "oauth_client_id": "test-client",
+            "oauth_client_secret": "test-client-secret"
+        });
+        if explicit_oauth {
+            profile["auth_mode"] = json!("o_auth");
+        }
+        let mut config = Config {
+            providers: serde_json::from_value(json!({
+                "models": {"gemini": {"work": profile}}
+            }))
+            .unwrap(),
+            ..Config::default()
+        };
+        let credentials = Some(("test-client".to_owned(), "test-client-secret".to_owned()));
+        assert_eq!(
+            config
+                .gemini_oauth_client_credentials("gemini.work")
+                .unwrap(),
+            credentials
+        );
+        let expected = snapshot(&config).unwrap();
+        assert!(!expected.to_string().contains("test-client-secret"));
+        stage(
+            &mut config,
+            RegistryEdit {
+                registry: expected.clone(),
+                expected,
+            },
+        )
+        .unwrap();
+        assert!(config.providers.models.gemini.is_empty());
+        let reloaded: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(
+            reloaded
+                .gemini_oauth_client_credentials("gemini.work")
+                .unwrap(),
+            credentials
+        );
+        assert_eq!(
+            reloaded
+                .gemini_oauth_client_credentials("legacy.gemini.work")
+                .unwrap(),
+            credentials
+        );
+    }
+}
+
+#[test]
+fn legacy_gemini_explicit_api_key_keeps_priority_over_oauth_clients() {
+    let config = Config {
+        providers: serde_json::from_value(json!({
+            "models": {"gemini": {"work": {
+                "model": "gemini-test", "api_key": "test-key",
+                "oauth_client_id": "test-client", "oauth_client_secret": "test-client-secret"
+            }}}
+        }))
+        .unwrap(),
+        ..Config::default()
+    };
+    let registry = config.provider_registry().unwrap();
+    let selection = registry.resolve_chat(&"gemini.work".into()).unwrap();
+    assert_eq!(selection.selection.connection.api_key(), Some("test-key"));
+    assert_eq!(
+        config
+            .gemini_oauth_client_credentials("gemini.work")
+            .unwrap(),
+        None
+    );
+}

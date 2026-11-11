@@ -16230,11 +16230,7 @@ impl ModelRouteConfig {
     /// Resolve the upstream model id owned by the referenced canonical model.
     /// Empty means the route is incomplete or the model has no upstream id.
     pub fn effective_model(&self, config: &Config) -> String {
-        let canonical_ref = crate::provider_registry::ModelRef::from(self.model_ref.trim());
-        if let Some(model) = config.providers.models.canonical_model(&canonical_ref) {
-            return model.upstream_model().unwrap_or_default().to_owned();
-        }
-        String::new()
+        config.resolve_model_id(&self.model_ref).unwrap_or_default()
     }
 }
 
@@ -25947,7 +25943,11 @@ impl Config {
             );
         }
 
-        // Model routes
+        // Use the same projected definitions as provider construction, including
+        // historical input normalized at the configuration boundary.
+        let route_registry = (!self.model_routes.is_empty())
+            .then(|| self.provider_registry())
+            .transpose()?;
         for (i, route) in self.model_routes.iter().enumerate() {
             let required = crate::setup::route_required_fields(&route.hint, &route.model_ref);
             let model_ref = route.model_ref.trim();
@@ -25966,7 +25966,10 @@ impl Config {
                 );
             }
             let model_key = crate::provider_registry::ModelRef::from(model_ref);
-            let Some(model) = self.providers.models.canonical_model(&model_key) else {
+            let Some(model) = route_registry
+                .as_ref()
+                .and_then(|registry| registry.models.get(&model_key))
+            else {
                 validation_bail!(
                     DanglingReference,
                     format!("model_routes[{i}].model_ref"),
@@ -39727,12 +39730,6 @@ model = "primary-model"
                 },
             },
         );
-        crate::migration::bind_test_route_model(
-            &mut config,
-            "openai.gateway.fast",
-            "gpt-nested",
-            None,
-        );
         config.model_routes.push(ModelRouteConfig {
             hint: "fast".to_string(),
             model_ref: "openai.gateway.fast".to_string(),
@@ -39743,6 +39740,14 @@ model = "primary-model"
             "a nested model id makes an omitted route model unambiguous: {:?}",
             config.validate().err()
         );
+        assert_eq!(
+            config.model_routes[0].effective_model(&config),
+            "gpt-nested"
+        );
+        crate::migration::bind_test_route_model(&mut config, "chat.other", "other-id", None);
+        config
+            .validate()
+            .expect("projected routes also work beside explicit models");
     }
 
     #[::core::prelude::v1::test]

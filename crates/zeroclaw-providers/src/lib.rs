@@ -691,8 +691,8 @@ fn resolve_qwen_oauth_context(credential_override: Option<&str>) -> QwenOauthPro
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ModelProviderRuntimeOptions {
     pub auth_profile_override: Option<String>,
-    /// Explicit provider implementation from `[providers.models.<family>.<alias>].kind`.
-    /// When unset, provider resolution falls back to the configured family.
+    /// Provider implementation materialized from the selected connection's kind.
+    /// Direct provider construction may supply a built-in kind instead.
     pub provider_kind: Option<String>,
     pub provider_api_url: Option<String>,
     pub zeroclaw_dir: Option<PathBuf>,
@@ -1697,7 +1697,7 @@ fn create_model_provider_inner(
         {
             anyhow::bail!(
                 "Custom model_provider `{prefix}:<url>` requires a URL beginning with http:// or https://. \
-                 Set `[providers.models.custom.<alias>] uri = \"https://your-api.com\"` or pass a valid URL."
+                 Set `[providers.connections.<key>] uri = \"https://your-api.com\"` or pass a valid URL."
             );
         }
     }

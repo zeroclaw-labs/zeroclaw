@@ -6281,6 +6281,34 @@ model_ref = "chat.stable"
     }
 
     #[test]
+    fn v3_gemini_oauth_route_preserves_implicit_clients_in_memory_and_on_disk() {
+        let raw = r#"schema_version = 3
+[providers.models.gemini.work]
+model = "gemini-test"
+oauth_client_id = "test-client"
+oauth_client_secret = "test-client-secret"
+[[model_routes]]
+hint = "oauth"
+model_provider = "gemini.work"
+"#;
+        let memory = migrate_to_current(raw).unwrap();
+        let (disk, notices) = migrate_file_with_notices(raw).unwrap().unwrap();
+        assert!(notices.is_empty());
+        let disk = migrate_to_current(&disk).unwrap();
+        for config in [memory, disk] {
+            let reference = &config.model_routes[0].model_ref;
+            assert_eq!(
+                config.resolve_model_id(reference).as_deref(),
+                Some("gemini-test")
+            );
+            assert_eq!(
+                config.gemini_oauth_client_credentials(reference).unwrap(),
+                Some(("test-client".into(), "test-client-secret".into()))
+            );
+        }
+    }
+
+    #[test]
     fn an_inferred_v3_file_is_migrated_to_v4_and_keeps_every_channel_alias() {
         let config =
             migrate_to_current(HAND_WRITTEN_V3_WITHOUT_VERSION).expect("a V3-shaped file loads");

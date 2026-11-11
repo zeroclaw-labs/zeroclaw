@@ -2434,14 +2434,16 @@ pub fn model_provider_is_local(model_provider: &str) -> bool {
 /// not encode provider kinds; bare kinds remain valid for public discovery.
 #[must_use]
 pub fn model_reference_is_local(config: &Config, reference: &str) -> bool {
-    match config.providers.models.canonical_model(&reference.into()) {
-        Some(model) => config
-            .providers
+    let reference = reference.trim();
+    if let Ok(registry) = config.provider_registry()
+        && let Some(model) = registry.models.get(reference)
+    {
+        return registry
             .connections
             .get(model.provider())
-            .is_some_and(|connection| model_provider_is_local(connection.kind())),
-        None => model_provider_is_local(reference),
+            .is_some_and(|connection| model_provider_is_local(connection.kind()));
     }
+    model_provider_is_local(reference)
 }
 
 #[cfg(test)]
@@ -4025,6 +4027,24 @@ mod tests {
         assert!(model_provider_is_local("hailo_ollama"));
         assert!(model_reference_is_local(&cfg, "openai.not-a-family"));
         assert!(!model_reference_is_local(&cfg, "ollama.not-a-family"));
+    }
+
+    #[test]
+    fn model_locality_includes_projected_legacy_models_in_mixed_configs() {
+        let cfg = Config {
+            providers: serde_json::from_value(serde_json::json!({
+                "connections": {"remote": {"kind": "openai"}},
+                "models": {
+                    "ollama": {"home": {"model": "local-model"}},
+                    "chat.remote": {"capability": "chat", "provider": "remote", "model": "remote-model"}
+                }
+            })).unwrap(),
+            ..Config::default()
+        };
+        assert!(model_reference_is_local(&cfg, "ollama.home"));
+        assert!(!model_reference_is_local(&cfg, "chat.remote"));
+        assert!(model_reference_is_local(&cfg, "ollama"));
+        assert!(!model_reference_is_local(&cfg, "unknown.home"));
     }
 
     #[tokio::test]

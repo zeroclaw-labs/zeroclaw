@@ -1564,7 +1564,7 @@ pub async fn run_gateway_with_plugin_webhooks(
                         })),
                     "Gateway: seed model_provider failed to construct; booting in \
                      needs_quickstart mode so /quickstart and /admin/reload stay \
-                     reachable. Fix the [providers.models.<type>.<alias>] entry \
+                     reachable. Fix the [providers.models.<key>] entry and its provider connection \
                      and POST /admin/reload."
                 );
                 (
@@ -1582,7 +1582,7 @@ pub async fn run_gateway_with_plugin_webhooks(
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                 .with_attrs(::serde_json::json!({"display_addr": display_addr})),
             &format!(
-                "Gateway booting without a configured model. Visit http://{display_addr}/quickstart to complete browser quickstart. Chat endpoints will return 503 needs_quickstart until at least one [providers.models.<type>.<alias>] model = \"...\" is set."
+                "Gateway booting without a configured model. Visit http://{display_addr}/quickstart to complete browser quickstart. Chat endpoints will return 503 needs_quickstart until at least one [providers.models.<key>] chat model = \"...\" is set."
             )
         );
         String::new()
@@ -3559,7 +3559,7 @@ impl ModelProvider for UnconfiguredModelProvider {
         anyhow::bail!(
             "needs_quickstart: gateway booted without a working model_provider. \
              Complete browser quickstart at /quickstart, or fix \
-             [providers.models.<type>.<alias>] and POST /admin/reload."
+             [providers.models.<key>] and its provider connection, then POST /admin/reload."
         )
     }
 }
@@ -3587,7 +3587,7 @@ fn needs_quickstart_for(model: &str) -> Option<anyhow::Error> {
         );
         Some(anyhow::Error::msg(
             "needs_quickstart: gateway has no model configured. Complete \
-             browser quickstart at /quickstart, or set [providers.models.<type>.<alias>] \
+             browser quickstart at /quickstart, or set [providers.models.<key>] \
              model = \"...\" before sending messages.",
         ))
     } else {
