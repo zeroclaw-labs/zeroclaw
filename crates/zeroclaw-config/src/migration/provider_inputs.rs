@@ -273,7 +273,10 @@ fn asr_definition(
     raw: &serde_json::Value,
     family: &str,
     provider: &ProviderId,
-) -> Result<(registry::ProviderConnection, ModelDefinition)> {
+) -> Result<(
+    registry::ProviderConnection,
+    ModelDefinition<serde_json::Value>,
+)> {
     let mut connection = json!({"kind": family});
     if let Some(uri) = raw
         .get("uri")
@@ -800,16 +803,23 @@ pub(crate) fn normalize_definitions(config: &mut Config) -> Result<()> {
     let mut registry = current.clone();
     promote_embedding_bindings(config, &current, &mut registry)?;
     for agent in config.agents.values_mut() {
-        for (binding, capability) in [
-            (&mut agent.tts_provider, Capability::Tts),
-            (&mut agent.transcription_provider, Capability::Asr),
-        ] {
-            if !binding.trim().is_empty() {
-                *binding =
-                    speech_reference(&config.providers, &current, binding.as_str(), capability)
-                        .to_string()
-                        .into();
-            }
+        if !agent.tts_provider.trim().is_empty() {
+            let reference = speech_reference(
+                &config.providers,
+                &current,
+                agent.tts_provider.as_str(),
+                Capability::Tts,
+            );
+            agent.tts_provider = reference.to_string().into();
+        }
+        if !agent.transcription_provider.trim().is_empty() {
+            let reference = speech_reference(
+                &config.providers,
+                &current,
+                agent.transcription_provider.as_str(),
+                Capability::Asr,
+            );
+            agent.transcription_provider = reference.to_string().into();
         }
     }
     registry.validate()?;

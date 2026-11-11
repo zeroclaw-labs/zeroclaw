@@ -1051,10 +1051,10 @@ export function AgentProvider({
 
     async function loadModelInfo() {
       try {
-        // Agent-scoped status: `/api/status?agent=<alias>` runs the same
-        // `resolved_model_provider_for_agent` logic the gateway uses to build
-        // the Agent, so the fallback `status.model` is correct for THIS agent
-        // rather than the install-wide default. (Ported from
+        // Agent-scoped status: `/api/status?agent=<alias>` resolves the
+        // agent's canonical model reference before building the Agent, so the
+        // fallback `status.model` is correct for THIS agent rather than the
+        // install-wide default. (Ported from
         // zeroclaw-labs/zeroclaw#7191.)
         const status = await getStatus(agentAlias);
         if (cancelled) return;

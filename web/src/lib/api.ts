@@ -477,9 +477,9 @@ export async function getPublicHealth(): Promise<{
 /**
  * System status overview. Pass an `agent` alias to get the model, provider,
  * temperature, and memory backend resolved for that specific agent — the
- * gateway runs the same `resolved_model_provider_for_agent` logic it uses to
- * build the Agent, so the returned `model` reflects that agent's configured
- * provider entry. Omitting the alias returns the install-wide first-of-each
+ * gateway resolves the agent's canonical model reference before it builds the
+ * Agent, so the returned `model` reflects that agent's configured model.
+ * Omitting the alias returns the install-wide first-of-each
  * summary (the gateway default model), which is NOT correct for any
  * non-default agent.
  */

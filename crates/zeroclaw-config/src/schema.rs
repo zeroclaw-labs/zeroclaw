@@ -25712,7 +25712,10 @@ impl Config {
                     "embedding_routes[{i}].model_provider must not be empty"
                 );
             }
-            let Some(model) = model_registry.models.get(&mp.into()) else {
+            let Some(model) = model_registry
+                .models
+                .get(&crate::provider_registry::ModelRef::from(mp))
+            else {
                 validation_bail!(
                     DanglingReference,
                     format!("embedding_routes[{i}].model_provider"),
@@ -26200,7 +26203,10 @@ impl Config {
                 continue;
             }
             let path = format!("runtime_profiles.{palias}.context_compression.summary_provider");
-            let Some(model) = model_registry.models.get(&value.into()) else {
+            let Some(model) = model_registry
+                .models
+                .get(&crate::provider_registry::ModelRef::from(value))
+            else {
                 validation_bail!(
                     DanglingReference,
                     path,
@@ -26234,7 +26240,10 @@ impl Config {
                     "agents.{alias}.model_provider must reference a configured chat model"
                 );
             }
-            let Some(model) = model_registry.models.get(&mp.into()) else {
+            let Some(model) = model_registry
+                .models
+                .get(&crate::provider_registry::ModelRef::from(mp))
+            else {
                 validation_bail!(
                     DanglingReference,
                     format!("agents.{alias}.model_provider"),
@@ -26304,7 +26313,10 @@ impl Config {
                     continue;
                 }
                 let path = format!("agents.{alias}.{field}");
-                let Some(model) = model_registry.models.get(&value.into()) else {
+                let Some(model) = model_registry
+                    .models
+                    .get(&crate::provider_registry::ModelRef::from(value))
+                else {
                     validation_bail!(
                         DanglingReference,
                         path,
