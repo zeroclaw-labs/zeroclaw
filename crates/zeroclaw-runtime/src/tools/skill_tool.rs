@@ -171,7 +171,7 @@ impl Tool for SkillShellTool {
 
         // The runtime resolves the shell on the daemon's own `PATH`. The
         // policy reads the command in that program's grammar, and nothing is
-        // built until the policy accepts the command (#9182).
+        // built until the policy accepts the command.
         let shell = self
             .security
             .command_shell(ShellTarget::of(self.runtime.as_ref(), None));

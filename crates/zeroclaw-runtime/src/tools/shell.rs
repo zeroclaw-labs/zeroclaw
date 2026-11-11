@@ -240,7 +240,7 @@ impl Tool for ShellTool {
             .map(OsStr::new);
         // The policy reads the command in the grammar of the program this
         // runtime will resolve on that `PATH`. Nothing is built until the
-        // policy accepts the command (#9182).
+        // policy accepts the command.
         let shell = self
             .security
             .command_shell(ShellTarget::of(self.runtime.as_ref(), effective_path));
@@ -2665,7 +2665,7 @@ mod shell_grammar_tests {
     }
 
     /// A command the policy refuses never reaches the runtime's builder
-    /// (#9182): choosing the grammar resolves the program and builds nothing.
+    /// (choosing the grammar resolves the program and builds nothing).
     #[tokio::test]
     async fn a_refused_command_never_reaches_the_builder() {
         let Some(other) = host_shell_other_than_bash() else {
