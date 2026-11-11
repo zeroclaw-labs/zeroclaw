@@ -10,13 +10,6 @@ pub use zeroclaw_api::runtime_traits::{RuntimeAdapter, ShellDialect, ShellProfil
 use crate::schema::{RuntimeConfig, RuntimeKind};
 use std::ffi::OsStr;
 
-/// The shell the native runtime runs: the configured `[runtime].shell`, or
-/// the detected platform default. The runtime factory and the command policy
-/// both take it from here, so they cannot derive it differently.
-pub fn native_runtime_shell(config: &RuntimeConfig) -> String {
-    config.shell.clone().unwrap_or_else(native::default_shell)
-}
-
 pub fn create_runtime(config: &RuntimeConfig) -> anyhow::Result<Box<dyn RuntimeAdapter>> {
     create_runtime_with_path(config, None)
 }
@@ -32,7 +25,7 @@ pub fn create_runtime_with_path(
 
     match config.kind {
         RuntimeKind::Native => {
-            let shell = native_runtime_shell(config);
+            let shell = config.shell.clone().unwrap_or_else(native::default_shell);
             #[cfg(unix)]
             validate_shell(&shell)?;
             #[cfg(windows)]

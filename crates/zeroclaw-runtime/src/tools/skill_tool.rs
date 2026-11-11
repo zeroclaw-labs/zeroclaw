@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
+use zeroclaw_config::policy::ShellTarget;
 
 /// Default execution time for a skill shell command when the manifest does not
 /// set `timeout_secs` (seconds). A skill may raise this via `timeout_secs` in
@@ -168,13 +169,19 @@ impl Tool for SkillShellTool {
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let command = self.substitute_args(&args);
 
+        // The runtime resolves the shell on the daemon's own `PATH`. The
+        // policy reads the command in that program's grammar, and nothing is
+        // built until the policy accepts the command (#9182).
+        let shell = self
+            .security
+            .command_shell(ShellTarget::of(self.runtime.as_ref(), None));
+
         // Security validation — always requires explicit approval (approved=true)
         // since skill tools are user-defined and should be treated as medium-risk.
-        match self.security.validate_command_execution_for_shell(
-            &command,
-            true,
-            self.runtime.shell_dialect(),
-        ) {
+        match self
+            .security
+            .validate_command_execution_in(&command, true, shell)
+        {
             Ok(_) => {}
             Err(reason) => {
                 return Ok(ToolResult {
@@ -187,7 +194,7 @@ impl Tool for SkillShellTool {
 
         if let Some(path) = self
             .security
-            .forbidden_workspace_path_argument_for_shell(&command, self.runtime.shell_dialect())
+            .forbidden_workspace_path_argument_in(&command, shell)
         {
             return Ok(ToolResult {
                 success: false,
@@ -211,6 +218,16 @@ impl Tool for SkillShellTool {
                 });
             }
         };
+        if let Err(reason) = self
+            .security
+            .confirm_built_shell(shell, cmd.as_std().get_program())
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(reason),
+            });
+        }
         cmd.env_clear();
 
         // Only pass safe environment variables
@@ -1481,5 +1498,69 @@ mod tests {
             registry.iter().any(|t| t.name() == "ops__use_shell"),
             "the scoped elevation wrapper must be the only callable path"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod shell_grammar_tests {
+    use super::*;
+    use crate::tools::shell::shell_grammar_test_support::{
+        BASH_ONLY_HEREDOC, MispredictingRuntime, RAN_OUTSIDE_BASH, host_bash,
+        host_shell_other_than_bash, wildcard_policy,
+    };
+
+    fn skill(command: &str) -> crate::skills::SkillTool {
+        crate::skills::SkillTool {
+            name: "heredoc".to_string(),
+            description: "Print a heredoc".to_string(),
+            kind: "shell".to_string(),
+            command: command.to_string(),
+            args: HashMap::new(),
+            target: None,
+            locked_args: HashMap::new(),
+            timeout_secs: None,
+        }
+    }
+
+    /// A skill command read as bash is refused when the runtime built
+    /// another shell to run it; one the policy refuses is never built.
+    #[tokio::test]
+    async fn a_skill_command_runs_only_in_the_shell_it_was_read_for() {
+        let (Some(bash), Some(other)) = (host_bash(), host_shell_other_than_bash()) else {
+            eprintln!("skipping: needs bash and another POSIX shell");
+            return;
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let security = Arc::new(wildcard_policy(workspace.path()));
+
+        let mispredicted = Arc::new(MispredictingRuntime::new(bash, other.clone()));
+        let tool = SkillShellTool::new_with_runtime(
+            "test",
+            &skill(BASH_ONLY_HEREDOC),
+            security.clone(),
+            mispredicted.clone(),
+        );
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+        assert!(!result.success, "{result:?}");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("checked as a bash command")),
+            "{result:?}"
+        );
+        assert!(!result.output.contains(RAN_OUTSIDE_BASH), "{result:?}");
+        assert_eq!(mispredicted.builds(), 1);
+
+        let portable = Arc::new(MispredictingRuntime::new(other.clone(), other));
+        let tool = SkillShellTool::new_with_runtime(
+            "test",
+            &skill(BASH_ONLY_HEREDOC),
+            security,
+            portable.clone(),
+        );
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+        assert!(!result.success, "{result:?}");
+        assert_eq!(portable.builds(), 0);
     }
 }
