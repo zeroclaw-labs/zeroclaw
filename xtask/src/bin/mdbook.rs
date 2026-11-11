@@ -82,6 +82,10 @@ enum Cmd {
     /// Emit the gh-pages root index.html redirecting to the stable alias
     /// (stable/), or master when no stable-version.txt pointer resolves
     GenRootIndex,
+    /// Emit the gh-pages root 404.html, which sends links to pruned release
+    /// dirs to the same page under the stable alias
+    #[command(name = "gen-root-404")]
+    GenRoot404,
     /// Inject the version-selector script into deployed pages that lack it
     RetrofitSelector,
     /// Write canonical, hreflang, description and share tags into every
@@ -163,6 +167,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::PruneRoot => cmd::mdbook::versions::prune_root(),
         Cmd::PruneVersions => cmd::mdbook::versions::prune_versions(),
         Cmd::GenRootIndex => cmd::mdbook::versions::gen_root_index(),
+        Cmd::GenRoot404 => cmd::mdbook::versions::gen_root_404(),
         Cmd::RetrofitSelector => cmd::mdbook::versions::retrofit_selector(),
         Cmd::GenSeo => cmd::mdbook::seo::run(),
         Cmd::GenStableAlias => cmd::mdbook::versions::gen_stable_alias(),

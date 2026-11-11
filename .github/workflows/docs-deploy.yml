@@ -364,6 +364,12 @@ jobs:
             $MDBOOK_XTASK gen-versions > versions.json
             $MDBOOK_XTASK retrofit-selector
             $MDBOOK_XTASK gen-root-index > index.html
+            # GitHub Pages serves the root 404.html for every missing path.
+            # Links to release dirs that prune-versions dropped (and the legacy
+            # docs host forwards them here unchanged) go to the same page under
+            # stable/. A promote-stable run refreshes its target and locales
+            # (scripts/docs/promote_stable.py).
+            $MDBOOK_XTASK gen-root-404 > 404.html
 
             # Root llms.txt / llms-full.txt mirror the English pair of the
             # version / redirects to (the stable pointer target, else master)
