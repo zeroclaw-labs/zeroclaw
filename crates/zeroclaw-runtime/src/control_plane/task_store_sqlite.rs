@@ -64,8 +64,11 @@ impl SqliteTaskStore {
     }
 
     fn init(conn: Connection) -> Result<Self> {
+        // In WAL mode, FULL adds a WAL sync after each commit; fullfsync
+        // requests F_FULLFSYNC where the SQLite VFS supports it.
         conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
+            "PRAGMA fullfsync = ON;
+             PRAGMA journal_mode = WAL;
              PRAGMA synchronous = FULL;
              PRAGMA busy_timeout = 5000;
              PRAGMA temp_store = MEMORY;
@@ -1556,7 +1559,7 @@ CREATE TABLE IF NOT EXISTS terminal_settlement_intents (
     }
 
     #[test]
-    fn each_file_backed_control_plane_connection_uses_full_wal_synchronous_mode() {
+    fn each_file_backed_control_plane_connection_uses_wal_full_and_fullfsync() {
         let directory = tempfile::tempdir().unwrap();
         let first = SqliteTaskStore::new(directory.path()).unwrap();
         let second = SqliteTaskStore::new(directory.path()).unwrap();
@@ -1569,9 +1572,13 @@ CREATE TABLE IF NOT EXISTS terminal_settlement_intents (
             let synchronous: i64 = conn
                 .query_row("PRAGMA synchronous", [], |row| row.get(0))
                 .unwrap();
+            let fullfsync: i64 = conn
+                .query_row("PRAGMA fullfsync", [], |row| row.get(0))
+                .unwrap();
 
             assert_eq!(journal_mode, "wal");
             assert_eq!(synchronous, 2, "SQLite FULL synchronous mode");
+            assert_eq!(fullfsync, 1, "SQLite fullfsync mode");
         }
     }
 
