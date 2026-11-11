@@ -271,7 +271,7 @@ fn effort_turn_route(
         })?;
     crate::agent::eval::log_effort_route_selection(&selection, message.len(), "direct");
     Ok(Some(EffortTurnRoute {
-        model_provider: selection.route.model_provider.clone(),
+        model_provider: selection.route.model_ref.clone(),
         model: selection.route.effective_model(config),
         allowed_provider_refs: Arc::new(selection.allowed_profile_refs(config)),
     }))
@@ -312,7 +312,7 @@ fn effort_scoped_provider_config(
     });
     scoped
         .model_routes
-        .retain(|route| is_allowed(&route.model_provider));
+        .retain(|route| is_allowed(&route.model_ref));
     scoped
 }
 
@@ -4561,18 +4561,26 @@ mod tests {
             )],
         );
         config.providers.models.ensure("custom", "cloud").unwrap();
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut config,
+            "custom.local",
+            "small",
+            None,
+        );
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut config,
+            "custom.cloud",
+            "large",
+            None,
+        );
         config.model_routes = vec![
             ModelRouteConfig {
                 hint: "local".into(),
-                model_provider: "custom.local".into(),
-                model: "small".into(),
-                api_key: None,
+                model_ref: "custom.local".into(),
             },
             ModelRouteConfig {
                 hint: "cloud".into(),
-                model_provider: "custom.cloud".into(),
-                model: "large".into(),
-                api_key: None,
+                model_ref: "custom.cloud".into(),
             },
         ];
         let policy = EffortRoutingConfig {
@@ -4629,8 +4637,13 @@ mod tests {
 
         let mut duplicate_route = config;
         let mut final_local_route = duplicate_route.model_routes[0].clone();
-        final_local_route.model_provider = "custom.final".into();
-        final_local_route.model = "final-small".into();
+        final_local_route.model_ref = "custom.final".into();
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut duplicate_route,
+            "custom.final",
+            "final-small",
+            None,
+        );
         duplicate_route.model_routes.push(final_local_route);
         let selected = effort_turn_route(&duplicate_route, Some(&policy), "say hello")
             .unwrap()
@@ -24750,18 +24763,26 @@ Let me check the result."#;
                 ..Default::default()
             },
         );
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut config,
+            "ollama.local",
+            "local-model",
+            None,
+        );
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut config,
+            "ollama.cloud",
+            "cloud-model",
+            None,
+        );
         config.model_routes = vec![
             ModelRouteConfig {
                 hint: "local".into(),
-                model_provider: "ollama.local".into(),
-                model: "local-model".into(),
-                api_key: None,
+                model_ref: "ollama.local".into(),
             },
             ModelRouteConfig {
                 hint: "cloud".into(),
-                model_provider: "ollama.cloud".into(),
-                model: "cloud-model".into(),
-                api_key: None,
+                model_ref: "ollama.cloud".into(),
             },
         ];
         config.runtime_profiles.insert(
@@ -24932,18 +24953,26 @@ Let me check the result."#;
                 ..Default::default()
             },
         );
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut config,
+            "ollama.local",
+            "local-model",
+            None,
+        );
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut config,
+            "ollama.cloud",
+            "cloud-model",
+            None,
+        );
         config.model_routes = vec![
             ModelRouteConfig {
                 hint: "local".into(),
-                model_provider: "ollama.local".into(),
-                model: "local-model".into(),
-                api_key: None,
+                model_ref: "ollama.local".into(),
             },
             ModelRouteConfig {
                 hint: "cloud".into(),
-                model_provider: "ollama.cloud".into(),
-                model: "cloud-model".into(),
-                api_key: None,
+                model_ref: "ollama.cloud".into(),
             },
         ];
         config.runtime_profiles.insert(

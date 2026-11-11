@@ -3140,6 +3140,7 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
     let model_provider_instance = create_resilient_model_provider_nonblocking(
         Arc::clone(&next_config),
         &next_defaults.default_model_provider,
+        &next_defaults.model,
         None,
     )
     .await?;
@@ -3177,8 +3178,12 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
             defaults: next_defaults.clone(),
             generation: next_generation,
         });
-        let cache_key =
-            provider_cache_key(&next_defaults.default_model_provider, None, next_generation);
+        let cache_key = provider_cache_key(
+            &next_defaults.default_model_provider,
+            &next_defaults.model,
+            None,
+            next_generation,
+        );
 
         let mut cache = ctx.provider_cache.lock().unwrap_or_else(|e| e.into_inner());
         cache.clear();
@@ -3289,14 +3294,17 @@ fn apply_model_ref(
     sel.automatic = false;
     if let Some(route) = model_routes
         .iter()
-        .find(|r| r.model.eq_ignore_ascii_case(model) || r.hint.eq_ignore_ascii_case(model))
+        .find(|r| r.model_ref == model || r.hint.eq_ignore_ascii_case(model))
     {
-        sel.model_provider = route.model_provider.clone();
-        // An unset route model resolves through the selection contract so a
-        // three-segment route ref keeps the named model entry's id instead of
-        // dispatching with an empty model string.
+        sel.model_provider = route.model_ref.clone();
         sel.model = route.effective_model(config);
-        sel.api_key = route.api_key.clone();
+        sel.api_key = None;
+    } else if let Some(model_id) = config.resolve_model_id(model)
+        && config.is_configured_model_ref(model)
+    {
+        sel.model_provider = model.to_owned();
+        sel.model = model_id;
+        sel.api_key = None;
     } else {
         sel.model = model.to_string();
     }
@@ -4783,19 +4791,29 @@ fn load_cached_model_preview(
     Vec::new()
 }
 
-/// Build a cache key that includes the runtime-defaults generation, the
-/// model_provider name, and, when a route-specific API key is supplied, a hash
-/// of that key. Generation `0` is the immutable startup config, so its key shape
-/// stays unchanged; hot-reload generations get isolated cache entries.
-fn provider_cache_key(provider_name: &str, route_api_key: Option<&str>, generation: u64) -> String {
+/// Build a cache key from the exact provider/model selection, the optional
+/// route credential, and the admitted runtime-defaults generation. Length
+/// prefixes keep provider refs and model names unambiguous, while hot
+/// generations remain isolated after a config refresh.
+fn provider_cache_key(
+    provider_name: &str,
+    model: &str,
+    route_api_key: Option<&str>,
+    generation: u64,
+) -> String {
+    let identity = format!(
+        "{}:{provider_name}{}:{model}",
+        provider_name.len(),
+        model.len()
+    );
     let base = match route_api_key {
         Some(key) => {
             use std::hash::{Hash, Hasher};
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             key.hash(&mut hasher);
-            format!("{provider_name}@{:x}", hasher.finish())
+            format!("{identity}@{:x}", hasher.finish())
         }
-        None => provider_name.to_string(),
+        None => identity,
     };
     if generation == 0 {
         base
@@ -4807,10 +4825,16 @@ fn provider_cache_key(provider_name: &str, route_api_key: Option<&str>, generati
 async fn get_or_create_provider(
     ctx: &ChannelRuntimeContext,
     provider_name: &str,
+    model: &str,
     route_api_key: Option<&str>,
     defaults_snapshot: &ChannelRuntimeDefaultsSnapshot,
 ) -> anyhow::Result<Arc<dyn ModelProvider>> {
-    let cache_key = provider_cache_key(provider_name, route_api_key, defaults_snapshot.generation);
+    let cache_key = provider_cache_key(
+        provider_name,
+        model,
+        route_api_key,
+        defaults_snapshot.generation,
+    );
 
     if let Some(existing) = ctx
         .provider_cache
@@ -4832,6 +4856,8 @@ async fn get_or_create_provider(
     if route_api_key.is_none()
         && provider_name == defaults.default_model_provider.as_str()
         && provider_name == ctx.model_provider_ref.as_str()
+        && model == defaults.model
+        && model == ctx.model.as_str()
         && !defaults_snapshot.hot
     {
         return Ok(Arc::clone(&ctx.model_provider));
@@ -4839,6 +4865,7 @@ async fn get_or_create_provider(
     let model_provider = create_resilient_model_provider_nonblocking(
         config,
         provider_name,
+        model,
         route_api_key.map(ToString::to_string),
     )
     .await?;
@@ -4866,15 +4893,17 @@ async fn get_or_create_provider(
 async fn create_resilient_model_provider_nonblocking(
     config: Arc<zeroclaw_config::schema::Config>,
     provider_name: &str,
+    model: &str,
     route_api_key: Option<String>,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
     let provider_name = provider_name.to_string();
+    let model = model.to_string();
     zeroclaw_providers::model::build_nonblocking(move || {
         zeroclaw_providers::model::build_reliable_provider(
             &config,
             &provider_name,
             zeroclaw_providers::model::ProviderOverrides {
-                model: None,
+                model: Some(&model),
                 api_key: route_api_key.as_deref(),
             },
         )
@@ -4910,11 +4939,7 @@ fn build_models_help_response(
         ));
         response.push('\n');
         for route in model_routes {
-            let _ = writeln!(
-                response,
-                "  `{}` → {} ({})",
-                route.hint, route.model, route.model_provider
-            );
+            let _ = writeln!(response, "  `{}` → {}", route.hint, route.model_ref);
         }
     }
 
@@ -5000,11 +5025,7 @@ fn build_config_text_response(
         ));
         resp.push('\n');
         for route in model_routes {
-            let _ = writeln!(
-                resp,
-                "  `{}` -> {} ({})",
-                route.hint, route.model, route.model_provider
-            );
+            let _ = writeln!(resp, "  `{}` -> {}", route.hint, route.model_ref);
         }
     }
     resp.push('\n');
@@ -5036,13 +5057,13 @@ fn build_config_block_kit(
         .iter()
         .map(|r| {
             let label = if r.hint.is_empty() {
-                r.model.clone()
+                r.model_ref.clone()
             } else {
-                format!("{} ({})", r.model, r.hint)
+                format!("{} ({})", r.model_ref, r.hint)
             };
             serde_json::json!({
                 "text": { "type": "plain_text", "text": label },
-                "value": r.model
+                "value": r.hint
             })
         })
         .collect();
@@ -5283,8 +5304,8 @@ async fn handle_runtime_command_for_delivery(
                 .iter()
                 .map(|route| zeroclaw_api::channel::ChannelModelPickerRoute {
                     hint: route.hint.clone(),
-                    model_provider: route.model_provider.clone(),
-                    model: route.model.clone(),
+                    model_provider: route.model_ref.clone(),
+                    model: route.effective_model(defaults_snapshot.config.as_ref()),
                 })
                 .collect(),
         };
@@ -5312,10 +5333,23 @@ async fn handle_runtime_command_for_delivery(
         ChannelRuntimeCommand::SetProvider(raw_model_provider) => {
             match resolve_models_command(defaults_snapshot.config.as_ref(), &raw_model_provider) {
                 ModelsCommandResolution::Resolved(provider_ref) => {
-                    match get_or_create_provider(ctx, &provider_ref, None, &defaults_snapshot).await
+                    let model = defaults_snapshot
+                        .config
+                        .resolve_model_id(&provider_ref)
+                        .unwrap_or_else(|| current.model.clone());
+                    match get_or_create_provider(
+                        ctx,
+                        &provider_ref,
+                        &model,
+                        None,
+                        &defaults_snapshot,
+                    )
+                    .await
                     {
                         Ok(_) => {
                             current.model_provider = provider_ref.clone();
+                            current.model = model;
+                            current.api_key = None;
                             current.automatic = false;
                             set_route_selection(
                                 ctx,
@@ -5928,8 +5962,14 @@ async fn resolve_classifier_route(
         .is_configured_model_ref(provider_str)
     {
         let model = defaults_snapshot.config.resolve_model_id(provider_str)?;
-        let provider = match get_or_create_provider(ctx, provider_str, None, defaults_snapshot)
-            .await
+        let provider = match get_or_create_provider(
+            ctx,
+            provider_str,
+            &model,
+            None,
+            defaults_snapshot,
+        )
+        .await
         {
             Ok(provider) => provider,
             Err(error) => {
@@ -6019,6 +6059,7 @@ async fn resolve_classifier_route(
         // cache keys on the named model entry and its per-model tuning is
         // resolved, matching the id/temperature pair derived above.
         provider_str,
+        &model,
         model_cfg.api_key.as_deref(),
         defaults_snapshot,
     )
@@ -9636,12 +9677,12 @@ async fn process_channel_message_body(
                 selection.allowed_profile_refs(runtime_defaults.config.as_ref()),
             ));
             route = ChannelRouteSelection {
-                model_provider: selection.route.model_provider.clone(),
+                model_provider: selection.route.model_ref.clone(),
                 model: selection
                     .route
                     .effective_model(runtime_defaults.config.as_ref()),
                 automatic: true,
-                api_key: selection.route.api_key.clone(),
+                api_key: None,
             };
             zeroclaw_runtime::agent::eval::log_effort_route_selection(
                 &selection,
@@ -9656,16 +9697,15 @@ async fn process_channel_message_body(
             .iter()
             .find(|r| r.hint.eq_ignore_ascii_case(&hint))
     {
-        // An unset route model resolves through the selection contract so a
-        // three-segment route ref dispatches to the named model entry instead
-        // of carrying an empty model string into the turn.
+        // The canonical model definition owns the upstream model id; the
+        // route contributes only the hint-to-model reference.
         let route_model = matched_route.effective_model(runtime_defaults.config.as_ref());
-        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hint": hint.as_str(), "model_provider": matched_route.model_provider.as_str(), "model": route_model.as_str()})), "Channel message classified — overriding route");
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hint": hint.as_str(), "model_ref": matched_route.model_ref.as_str(), "model": route_model.as_str()})), "Channel message classified — overriding route");
         route = ChannelRouteSelection {
-            model_provider: matched_route.model_provider.clone(),
+            model_provider: matched_route.model_ref.clone(),
             model: route_model,
             automatic: true,
-            api_key: matched_route.api_key.clone(),
+            api_key: None,
         };
     }
 
@@ -9679,6 +9719,7 @@ async fn process_channel_message_body(
     let mut active_model_provider = match get_or_create_provider(
         ctx.as_ref(),
         &route.model_provider,
+        &route.model,
         route.api_key.as_deref(),
         &runtime_defaults,
     )
@@ -10002,7 +10043,7 @@ async fn process_channel_message_body(
                     (
                         Arc::clone(&active_model_provider),
                         route.model.clone(),
-                        if runtime_defaults.config.resolve_model_selection(&route.model_provider).is_some() {
+                        if runtime_defaults.config.is_configured_model_ref(&route.model_provider) {
                             zeroclaw_providers::temperature::Temperature::default().for_call(
                                 Some(Arc::clone(&runtime_defaults.config)),
                                 &route.model_provider,
@@ -10694,19 +10735,12 @@ async fn process_channel_message_body(
                     }
                 };
 
-                let resolved_api_key = ctx
-                    .model_routes
-                    .iter()
-                    .find(|r| {
-                        r.model_provider.eq_ignore_ascii_case(&new_model_provider)
-                            && (r.model.eq_ignore_ascii_case(&new_model)
-                                || r.hint.eq_ignore_ascii_case(&new_model))
-                    })
-                    .and_then(|r| r.api_key.clone());
+                let resolved_api_key = None;
 
                 match get_or_create_provider(
                     ctx.as_ref(),
                     &resolved_model_provider,
+                    &new_model,
                     resolved_api_key.as_deref(),
                     &runtime_defaults,
                 )
@@ -11480,6 +11514,7 @@ async fn process_channel_message_body(
                 {
                     let cache_key = provider_cache_key(
                         &route.model_provider,
+                        &route.model,
                         route.api_key.as_deref(),
                         runtime_defaults.generation,
                     );
@@ -17224,6 +17259,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
             create_resilient_model_provider_nonblocking(
                 Arc::new(config.clone()),
                 &provider_name,
+                &model,
                 None,
             )
             .await?,
@@ -17677,7 +17713,10 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
         }
 
         let mut provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
-        provider_cache_seed.insert(provider_name.clone(), Arc::clone(&model_provider));
+        provider_cache_seed.insert(
+            provider_cache_key(&provider_name, &model, None, 0),
+            Arc::clone(&model_provider),
+        );
         let message_timeout_secs =
             effective_channel_message_timeout_secs(config.channels.message_timeout_secs);
         let interrupt_on_new_message = interrupt_on_new_message_config(&config.channels);
@@ -20366,6 +20405,14 @@ fn channel_trim_resync_preserves_a_concurrent_workers_later_turn_across_eviction
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    fn route_test_config(models: &[(&str, &str)]) -> Config {
+        let mut config = Config::default();
+        for (reference, model) in models {
+            zeroclaw_config::migration::bind_test_route_model(&mut config, reference, model, None);
+        }
+        config
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn ingress_task_tracker_reaps_completed_tasks_before_spawning() {
@@ -24226,6 +24273,7 @@ temperature = 0.1
         let provider = create_resilient_model_provider_nonblocking(
             Arc::new(config.clone()),
             "openai.channel.fast",
+            "nested-channel-model",
             None,
         )
         .await
@@ -24340,13 +24388,21 @@ api_key = "second-key"
 
     #[test]
     fn provider_cache_key_isolates_hot_generations() {
-        let startup = provider_cache_key("openrouter.default", None, 0);
-        let hot_1 = provider_cache_key("openrouter.default", None, 1);
-        let hot_2 = provider_cache_key("openrouter.default", None, 2);
+        let startup = provider_cache_key("openrouter.default", "model", None, 0);
+        let hot_1 = provider_cache_key("openrouter.default", "model", None, 1);
+        let hot_2 = provider_cache_key("openrouter.default", "model", None, 2);
 
-        assert_eq!(startup, "openrouter.default");
+        assert_eq!(startup, "18:openrouter.default5:model");
+        assert_ne!(
+            startup,
+            provider_cache_key("openrouter.default", "other", None, 0)
+        );
         assert_ne!(hot_1, startup);
         assert_ne!(hot_1, hot_2);
+        assert_ne!(
+            provider_cache_key("a#8:xxxx", "y", None, 0),
+            provider_cache_key("a", "xxxx#1:y", None, 0),
+        );
     }
 
     #[test]
@@ -30719,7 +30775,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 generation: 1,
             }));
         context.provider_cache.lock().unwrap().insert(
-            provider_cache_key("custom.local", None, 1),
+            provider_cache_key("custom.local", "old-model", None, 1),
             Arc::new(NativeModelToolsProvider),
         );
         process_channel_message(
@@ -33347,10 +33403,13 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let mut provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
         provider_cache_seed.insert(
-            "test-provider".to_string(),
+            provider_cache_key("test-provider", "default-model", None, 0),
             Arc::clone(&agent_model_provider),
         );
-        provider_cache_seed.insert("openrouter.default".to_string(), alt_model_provider);
+        provider_cache_seed.insert(
+            provider_cache_key("openrouter.default", "default-model", None, 0),
+            alt_model_provider,
+        );
 
         let mut prompt_config = zeroclaw_config::schema::Config::default();
         prompt_config
@@ -33506,10 +33565,13 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let mut provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
         provider_cache_seed.insert(
-            "test-provider".to_string(),
+            provider_cache_key("test-provider", "default-model", None, 0),
             Arc::clone(&agent_model_provider),
         );
-        provider_cache_seed.insert("openrouter".to_string(), routed_model_provider);
+        provider_cache_seed.insert(
+            provider_cache_key("openrouter", "route-model", None, 0),
+            routed_model_provider,
+        );
 
         let route_key = "telegram_chat-1_alice".to_string();
         let mut route_overrides = HashMap::new();
@@ -33648,7 +33710,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
-    async fn process_channel_message_preserves_trim_provenance_and_route_credential_across_model_switch()
+    async fn process_channel_message_preserves_trim_provenance_and_connection_credential_across_model_switch()
      {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -33665,7 +33727,7 @@ BTC is currently around $65,000 based on latest tool output."#
         // the switch handler must preserve it through provider construction,
         // caching, and route persistence.
         let switched_provider_ref = "openrouter.default";
-        let switched_key = Some("route-specific-key");
+        let switched_key = None;
 
         // Seed the provider cache so `get_or_create_provider` returns our
         // mock for the switched provider instead of constructing a real one.
@@ -33673,19 +33735,17 @@ BTC is currently around $65,000 based on latest tool output."#
         // resolved (dotted) provider ref at the current (startup) generation.
         let mut provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
         provider_cache_seed.insert(
-            "test-provider".to_string(),
+            provider_cache_key("test-provider", "default-model", None, 0),
             Arc::clone(&default_model_provider),
         );
         provider_cache_seed.insert(
-            provider_cache_key(switched_provider_ref, switched_key, 0),
+            provider_cache_key(switched_provider_ref, "switched-model", switched_key, 0),
             Arc::clone(&switched_model_provider),
         );
 
         let model_routes = vec![zeroclaw_config::schema::ModelRouteConfig {
             hint: "fast".to_string(),
-            model_provider: switched_provider_ref.to_string(),
-            model: "switched-model".to_string(),
-            api_key: Some("route-specific-key".to_string()),
+            model_ref: switched_provider_ref.to_string(),
         }];
 
         // The prompt config owns the profile accepted by ModelSwitchTool and
@@ -33717,6 +33777,12 @@ BTC is currently around $65,000 based on latest tool output."#
                 entry.api_key = Some("config-openrouter-key".to_string());
                 entry.model = Some("switched-model".to_string());
             }
+            zeroclaw_config::migration::bind_test_route_model(
+                &mut cfg,
+                switched_provider_ref,
+                "switched-model",
+                Some("connection-key"),
+            );
             Arc::new(cfg)
         };
 
@@ -34243,7 +34309,10 @@ BTC is currently around $65,000 based on latest tool output."#
         let reloaded_model_provider: Arc<dyn ModelProvider> = reloaded_model_provider_impl.clone();
 
         let mut provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
-        provider_cache_seed.insert("test-provider".to_string(), reloaded_model_provider);
+        provider_cache_seed.insert(
+            provider_cache_key("test-provider", "default-model", None, 0),
+            reloaded_model_provider,
+        );
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
@@ -43330,11 +43399,15 @@ BTC is currently around $65,000 based on latest tool output."#
             "openrouter.default",
             "default-model",
         );
+        zeroclaw_config::migration::bind_test_route_model(
+            Arc::make_mut(&mut ctx.prompt_config),
+            "anthropic.work",
+            "claude-sonnet",
+            None,
+        );
         ctx.model_routes = Arc::new(vec![zeroclaw_config::schema::ModelRouteConfig {
             hint: "auto".into(),
-            model_provider: "anthropic.work".into(),
-            model: "claude-sonnet".into(),
-            api_key: None,
+            model_ref: "anthropic.work".into(),
         }]);
         let mut msg = scope_test_msg("alice", "chan", None);
         msg.content = "/model auto".into();
@@ -43378,19 +43451,27 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let mut routes = vec![zeroclaw_config::schema::ModelRouteConfig {
             hint: "local".into(),
-            model_provider: "custom.local".into(),
-            model: "local-model".into(),
-            api_key: None,
+            model_ref: "custom.local".into(),
         }];
         if include_cloud_route {
             routes.push(zeroclaw_config::schema::ModelRouteConfig {
                 hint: "cloud".into(),
-                model_provider: "custom.cloud".into(),
-                model: "cloud-model".into(),
-                api_key: None,
+                model_ref: "custom.cloud".into(),
             });
         }
         let mut config = ctx.prompt_config.as_ref().clone();
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut config,
+            "custom.local",
+            "local-model",
+            None,
+        );
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut config,
+            "custom.cloud",
+            "cloud-model",
+            None,
+        );
         config.model_routes = routes.clone();
         config.runtime_profiles.insert(
             "effort".into(),
@@ -43428,8 +43509,14 @@ BTC is currently around $65,000 based on latest tool output."#
         let provider: Arc<dyn ModelProvider> = provider_impl.clone();
         ctx.model_provider = Arc::clone(&provider);
         ctx.provider_cache = Arc::new(Mutex::new(HashMap::from([
-            ("custom.local".into(), Arc::clone(&provider)),
-            ("custom.cloud".into(), provider),
+            (
+                provider_cache_key("custom.local", "local-model", None, 0),
+                Arc::clone(&provider),
+            ),
+            (
+                provider_cache_key("custom.cloud", "cloud-model", None, 0),
+                provider,
+            ),
         ])));
 
         (Arc::new(ctx), provider_impl, channel_impl)
@@ -45179,11 +45266,15 @@ BTC is currently around $65,000 based on latest tool output."#
             "openrouter.default",
             "config-model",
         );
+        zeroclaw_config::migration::bind_test_route_model(
+            Arc::make_mut(&mut ctx.prompt_config),
+            "anthropic.work",
+            "claude-sonnet-4-5",
+            None,
+        );
         ctx.model_routes = Arc::new(vec![zeroclaw_config::schema::ModelRouteConfig {
             hint: "fast".into(),
-            model_provider: "anthropic.work".into(),
-            model: "claude-sonnet-4-5".into(),
-            api_key: None,
+            model_ref: "anthropic.work".into(),
         }]);
         let msg = zeroclaw_api::channel::ChannelMessage {
             id: "message-7".into(),
@@ -45238,11 +45329,15 @@ BTC is currently around $65,000 based on latest tool output."#
             "openrouter.default",
             "config-model",
         );
+        zeroclaw_config::migration::bind_test_route_model(
+            Arc::make_mut(&mut ctx.prompt_config),
+            "anthropic.work",
+            "claude-sonnet-4-5",
+            None,
+        );
         ctx.model_routes = Arc::new(vec![zeroclaw_config::schema::ModelRouteConfig {
             hint: "fast".into(),
-            model_provider: "anthropic.work".into(),
-            model: "claude-sonnet-4-5".into(),
-            api_key: None,
+            model_ref: "anthropic.work".into(),
         }]);
         let msg = zeroclaw_api::channel::ChannelMessage {
             id: "message-8".into(),
@@ -45291,11 +45386,15 @@ BTC is currently around $65,000 based on latest tool output."#
         let mut prompt_config = zeroclaw_config::schema::Config::default();
         prompt_config.channels.debounce_ms = 300;
         ctx.prompt_config = Arc::new(prompt_config);
+        zeroclaw_config::migration::bind_test_route_model(
+            Arc::make_mut(&mut ctx.prompt_config),
+            "openrouter.default",
+            "fast-model",
+            None,
+        );
         ctx.model_routes = Arc::new(vec![zeroclaw_config::schema::ModelRouteConfig {
             hint: "fast".into(),
-            model_provider: "openrouter.default".into(),
-            model: "fast-model".into(),
-            api_key: None,
+            model_ref: "openrouter.default".into(),
         }]);
         let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
         ctx.model_provider = provider_impl.clone();
@@ -45391,11 +45490,15 @@ BTC is currently around $65,000 based on latest tool output."#
             "openrouter.default",
             "config-model",
         );
+        zeroclaw_config::migration::bind_test_route_model(
+            Arc::make_mut(&mut ctx.prompt_config),
+            "anthropic.work",
+            "claude-sonnet-4-5",
+            None,
+        );
         ctx.model_routes = Arc::new(vec![zeroclaw_config::schema::ModelRouteConfig {
             hint: "fast".into(),
-            model_provider: "anthropic.work".into(),
-            model: "claude-sonnet-4-5".into(),
-            api_key: None,
+            model_ref: "anthropic.work".into(),
         }]);
         let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
         ctx.model_provider = provider_impl.clone();
@@ -45513,11 +45616,15 @@ BTC is currently around $65,000 based on latest tool output."#
             "openrouter.default",
             "config-model",
         );
+        zeroclaw_config::migration::bind_test_route_model(
+            Arc::make_mut(&mut ctx.prompt_config),
+            "anthropic.work",
+            "claude-sonnet-4-5",
+            None,
+        );
         ctx.model_routes = Arc::new(vec![zeroclaw_config::schema::ModelRouteConfig {
             hint: "fast".into(),
-            model_provider: "anthropic.work".into(),
-            model: "claude-sonnet-4-5".into(),
-            api_key: None,
+            model_ref: "anthropic.work".into(),
         }]);
         let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
         ctx.model_provider = provider_impl.clone();
@@ -45851,11 +45958,15 @@ BTC is currently around $65,000 based on latest tool output."#
             "openrouter.default",
             "config-model",
         );
+        zeroclaw_config::migration::bind_test_route_model(
+            Arc::make_mut(&mut ctx.prompt_config),
+            "anthropic.work",
+            "claude-sonnet-4-5",
+            None,
+        );
         ctx.model_routes = Arc::new(vec![zeroclaw_config::schema::ModelRouteConfig {
             hint: "fast".into(),
-            model_provider: "anthropic.work".into(),
-            model: "claude-sonnet-4-5".into(),
-            api_key: None,
+            model_ref: "anthropic.work".into(),
         }]);
         let msg = zeroclaw_api::channel::ChannelMessage {
             id: "telegram_model_picker_selection_revoked_past_gate".into(),
@@ -46143,19 +46254,23 @@ BTC is currently around $65,000 based on latest tool output."#
                 ..Default::default()
             },
         );
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut picker_config,
+            "anthropic.work",
+            "claude-sonnet-4-5",
+            None,
+        );
         picker_config.model_routes = vec![zeroclaw_config::schema::ModelRouteConfig {
             hint: "fast".into(),
-            model_provider: "anthropic.work".into(),
-            model: "claude-sonnet-4-5".into(),
-            api_key: None,
+            model_ref: "anthropic.work".into(),
         }];
         let picker_routes = picker_config
             .model_routes
             .iter()
             .map(|route| zeroclaw_api::channel::ChannelModelPickerRoute {
                 hint: route.hint.clone(),
-                model_provider: route.model_provider.clone(),
-                model: route.model.clone(),
+                model_provider: route.model_ref.clone(),
+                model: route.effective_model(&picker_config),
             })
             .collect();
         let telegram = Arc::new(
@@ -46252,11 +46367,15 @@ BTC is currently around $65,000 based on latest tool output."#
             "openrouter.default",
             "config-model",
         );
+        zeroclaw_config::migration::bind_test_route_model(
+            Arc::make_mut(&mut ctx.prompt_config),
+            "anthropic.work",
+            "claude-sonnet-4-5",
+            None,
+        );
         ctx.model_routes = Arc::new(vec![zeroclaw_config::schema::ModelRouteConfig {
             hint: "fast".into(),
-            model_provider: "anthropic.work".into(),
-            model: "claude-sonnet-4-5".into(),
-            api_key: None,
+            model_ref: "anthropic.work".into(),
         }]);
         let mut original_sender_message = queued.clone();
         original_sender_message.sender = "original_user".into();
@@ -53239,10 +53358,13 @@ This is an example JSON object for profile settings."#;
 
         let mut provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
         provider_cache_seed.insert(
-            "test-provider".to_string(),
+            provider_cache_key("test-provider", "default-model", None, 0),
             Arc::clone(&agent_model_provider),
         );
-        provider_cache_seed.insert("vision-provider".to_string(), vision_model_provider);
+        provider_cache_seed.insert(
+            provider_cache_key("vision-provider", "gpt-4-vision", None, 0),
+            vision_model_provider,
+        );
 
         let classification_config = zeroclaw_config::schema::QueryClassificationConfig {
             enabled: true,
@@ -53255,9 +53377,7 @@ This is an example JSON object for profile settings."#;
 
         let model_routes = vec![zeroclaw_config::schema::ModelRouteConfig {
             hint: "vision".into(),
-            model_provider: "vision-provider".into(),
-            model: "gpt-4-vision".into(),
-            api_key: None,
+            model_ref: "vision-provider".into(),
         }];
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
@@ -53297,7 +53417,7 @@ This is an example JSON object for profile settings."#;
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            prompt_config: Arc::new(route_test_config(&[("vision-provider", "gpt-4-vision")])),
             live_config: zeroclaw_config::live::LiveConfig::new(
                 zeroclaw_config::schema::Config::default(),
             )
@@ -53400,10 +53520,13 @@ This is an example JSON object for profile settings."#;
 
         let mut provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
         provider_cache_seed.insert(
-            "test-provider".to_string(),
+            provider_cache_key("test-provider", "default-model", None, 0),
             Arc::clone(&agent_model_provider),
         );
-        provider_cache_seed.insert("vision-provider".to_string(), vision_model_provider);
+        provider_cache_seed.insert(
+            provider_cache_key("vision-provider", "gpt-4-vision", None, 0),
+            vision_model_provider,
+        );
 
         // Classification is disabled — matching keyword should NOT trigger reroute.
         let classification_config = zeroclaw_config::schema::QueryClassificationConfig {
@@ -53417,9 +53540,7 @@ This is an example JSON object for profile settings."#;
 
         let model_routes = vec![zeroclaw_config::schema::ModelRouteConfig {
             hint: "vision".into(),
-            model_provider: "vision-provider".into(),
-            model: "gpt-4-vision".into(),
-            api_key: None,
+            model_ref: "vision-provider".into(),
         }];
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
@@ -53459,7 +53580,7 @@ This is an example JSON object for profile settings."#;
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            prompt_config: Arc::new(route_test_config(&[("vision-provider", "gpt-4-vision")])),
             live_config: zeroclaw_config::live::LiveConfig::new(
                 zeroclaw_config::schema::Config::default(),
             )
@@ -53554,10 +53675,13 @@ This is an example JSON object for profile settings."#;
 
         let mut provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
         provider_cache_seed.insert(
-            "test-provider".to_string(),
+            provider_cache_key("test-provider", "default-model", None, 0),
             Arc::clone(&agent_model_provider),
         );
-        provider_cache_seed.insert("vision-provider".to_string(), vision_model_provider);
+        provider_cache_seed.insert(
+            provider_cache_key("vision-provider", "gpt-4-vision", None, 0),
+            vision_model_provider,
+        );
 
         // Classification enabled with a rule that won't match the message.
         let classification_config = zeroclaw_config::schema::QueryClassificationConfig {
@@ -53571,9 +53695,7 @@ This is an example JSON object for profile settings."#;
 
         let model_routes = vec![zeroclaw_config::schema::ModelRouteConfig {
             hint: "vision".into(),
-            model_provider: "vision-provider".into(),
-            model: "gpt-4-vision".into(),
-            api_key: None,
+            model_ref: "vision-provider".into(),
         }];
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
@@ -53613,7 +53735,7 @@ This is an example JSON object for profile settings."#;
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            prompt_config: Arc::new(route_test_config(&[("vision-provider", "gpt-4-vision")])),
             live_config: zeroclaw_config::live::LiveConfig::new(
                 zeroclaw_config::schema::Config::default(),
             )
@@ -53710,11 +53832,17 @@ This is an example JSON object for profile settings."#;
 
         let mut provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
         provider_cache_seed.insert(
-            "test-provider".to_string(),
+            provider_cache_key("test-provider", "default-model", None, 0),
             Arc::clone(&agent_model_provider),
         );
-        provider_cache_seed.insert("fast-provider".to_string(), fast_model_provider);
-        provider_cache_seed.insert("code-provider".to_string(), code_model_provider);
+        provider_cache_seed.insert(
+            provider_cache_key("fast-provider", "fast-model", None, 0),
+            fast_model_provider,
+        );
+        provider_cache_seed.insert(
+            provider_cache_key("code-provider", "code-model", None, 0),
+            code_model_provider,
+        );
 
         // Both rules match "code" keyword, but "code" rule has higher priority.
         let classification_config = zeroclaw_config::schema::QueryClassificationConfig {
@@ -53738,15 +53866,11 @@ This is an example JSON object for profile settings."#;
         let model_routes = vec![
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "fast".into(),
-                model_provider: "fast-provider".into(),
-                model: "fast-model".into(),
-                api_key: None,
+                model_ref: "fast-provider".into(),
             },
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "code".into(),
-                model_provider: "code-provider".into(),
-                model: "code-model".into(),
-                api_key: None,
+                model_ref: "code-provider".into(),
             },
         ];
 
@@ -53787,7 +53911,10 @@ This is an example JSON object for profile settings."#;
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            prompt_config: Arc::new(route_test_config(&[
+                ("fast-provider", "fast-model"),
+                ("code-provider", "code-model"),
+            ])),
             live_config: zeroclaw_config::live::LiveConfig::new(
                 zeroclaw_config::schema::Config::default(),
             )

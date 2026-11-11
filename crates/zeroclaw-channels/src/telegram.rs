@@ -1459,17 +1459,20 @@ impl TelegramChannel {
     }
 
     fn configured_model_provider(config: &Config, provider_ref: &str) -> bool {
-        provider_ref
-            .split_once('.')
-            .filter(|(family, alias)| !family.is_empty() && !alias.is_empty())
-            .is_some_and(|(family, alias)| config.providers.models.find(family, alias).is_some())
+        config
+            .providers
+            .models
+            .canonical_model(&zeroclaw_config::provider_registry::ModelRef::from(
+                provider_ref,
+            ))
+            .is_some_and(|model| model.capability() == zeroclaw_api::capability::Capability::Chat)
     }
 
     /// Mirror of the text resolver's match rule (`apply_model_ref`): a
-    /// `/model <hint>` argument matches a route by model identifier or by
-    /// hint, ASCII case-insensitively, first match wins.
+    /// `/model <hint>` matches an exact model reference or an ASCII
+    /// case-insensitive hint; first match wins.
     fn model_picker_route_matches_argument(hint: &str, model: &str, argument: &str) -> bool {
-        model.eq_ignore_ascii_case(argument) || hint.eq_ignore_ascii_case(argument)
+        model == argument || hint.eq_ignore_ascii_case(argument)
     }
 
     /// Classify why `selected` cannot be offered, or `None` when selecting
@@ -1487,8 +1490,8 @@ impl TelegramChannel {
         }
         let is_selected_route = |route: &zeroclaw_config::schema::ModelRouteConfig| {
             route.hint == selected.hint
-                && route.model_provider == selected.model_provider
-                && route.model == selected.model
+                && route.model_ref == selected.model_provider
+                && route.effective_model(config) == selected.model
         };
         if !Self::configured_model_provider(config, &selected.model_provider)
             || !config.model_routes.iter().any(&is_selected_route)
@@ -1504,14 +1507,22 @@ impl TelegramChannel {
             .model_routes
             .iter()
             .find(|route| {
-                Self::model_picker_route_matches_argument(&route.hint, &route.model, &selected.hint)
+                Self::model_picker_route_matches_argument(
+                    &route.hint,
+                    &route.model_ref,
+                    &selected.hint,
+                )
             })
             .filter(|route| !is_selected_route(route))
             .map(|route| route.hint.clone());
         let shadowing_runtime = runtime_routes
             .iter()
             .find(|route| {
-                Self::model_picker_route_matches_argument(&route.hint, &route.model, &selected.hint)
+                Self::model_picker_route_matches_argument(
+                    &route.hint,
+                    &route.model_provider,
+                    &selected.hint,
+                )
             })
             .filter(|route| *route != selected)
             .map(|route| route.hint.clone());
@@ -1608,14 +1619,7 @@ impl TelegramChannel {
         }
 
         let current_provider = owner.model_provider.as_str();
-        let (current_family, current_alias) = current_provider.split_once('.')?;
-        let current_model = config
-            .providers
-            .models
-            .find(current_family, current_alias)?
-            .model
-            .clone()
-            .unwrap_or_default();
+        let current_model = config.resolve_model_id(current_provider)?;
 
         let mut categories: Vec<ModelPickerCategory> = Vec::new();
         // Presented (provider, model) targets and the hint each is shown
@@ -13545,30 +13549,30 @@ mod tests {
                 ..Default::default()
             },
         );
+        for (reference, model) in [
+            ("openai.primary", "gpt-current"),
+            ("openai.reasoning", "gpt-reasoning"),
+            ("openai.fast", "gpt-fast"),
+            ("anthropic.team", "claude-sonnet"),
+        ] {
+            zeroclaw_config::migration::bind_test_route_model(&mut config, reference, model, None);
+        }
         config.model_routes = vec![
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "current".to_string(),
-                model_provider: "openai.primary".to_string(),
-                model: "gpt-current".to_string(),
-                api_key: None,
+                model_ref: "openai.primary".to_string(),
             },
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "reasoning".to_string(),
-                model_provider: "openai.primary".to_string(),
-                model: "gpt-reasoning".to_string(),
-                api_key: None,
+                model_ref: "openai.reasoning".to_string(),
             },
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "fast".to_string(),
-                model_provider: "openai.fast".to_string(),
-                model: "gpt-fast".to_string(),
-                api_key: None,
+                model_ref: "openai.fast".to_string(),
             },
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "sonnet".to_string(),
-                model_provider: "anthropic.team".to_string(),
-                model: "claude-sonnet".to_string(),
-                api_key: None,
+                model_ref: "anthropic.team".to_string(),
             },
         ];
         config
@@ -13581,8 +13585,8 @@ mod tests {
                 .iter()
                 .map(|route| ModelPickerOption {
                     hint: route.hint.clone(),
-                    model_provider: route.model_provider.clone(),
-                    model: route.model.clone(),
+                    model_provider: route.model_ref.clone(),
+                    model: route.effective_model(config),
                 })
                 .collect(),
         )
@@ -13596,8 +13600,8 @@ mod tests {
             .iter()
             .map(|route| zeroclaw_api::channel::ChannelModelPickerRoute {
                 hint: route.hint.clone(),
-                model_provider: route.model_provider.clone(),
-                model: route.model.clone(),
+                model_provider: route.model_ref.clone(),
+                model: route.effective_model(config),
             })
             .collect()
     }
@@ -13613,13 +13617,15 @@ mod tests {
         assert_eq!(context.owner_agent_alias, "assistant");
         assert_eq!(context.current.model_provider, "openai.primary");
         assert_eq!(context.current.model, "gpt-current");
-        assert_eq!(context.categories.len(), 3);
+        assert_eq!(context.categories.len(), 4);
         assert_eq!(context.categories[0].provider_ref, "openai.primary");
-        assert_eq!(context.categories[0].options.len(), 2);
-        assert_eq!(context.categories[1].provider_ref, "openai.fast");
+        assert_eq!(context.categories[0].options.len(), 1);
+        assert_eq!(context.categories[1].provider_ref, "openai.reasoning");
         assert_eq!(context.categories[1].options.len(), 1);
-        assert_eq!(context.categories[2].provider_ref, "anthropic.team");
+        assert_eq!(context.categories[2].provider_ref, "openai.fast");
         assert_eq!(context.categories[2].options.len(), 1);
+        assert_eq!(context.categories[3].provider_ref, "anthropic.team");
+        assert_eq!(context.categories[3].options.len(), 1);
     }
 
     #[test]
@@ -13628,47 +13634,33 @@ mod tests {
         config.model_routes.extend([
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "duplicate".to_string(),
-                model_provider: "openai.primary".to_string(),
-                model: "gpt-current".to_string(),
-                api_key: None,
+                model_ref: "openai.primary".to_string(),
             },
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "missing".to_string(),
-                model_provider: "openai.not-configured".to_string(),
-                model: "ghost".to_string(),
-                api_key: None,
+                model_ref: "openai.not-configured".to_string(),
             },
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "unsafe\nroute".to_string(),
-                model_provider: "openai.fast".to_string(),
-                model: "unsafe".to_string(),
-                api_key: None,
+                model_ref: "openai.fast".to_string(),
             },
             // Regression: flag-shaped hints must not cross the `/model
             // --user|--agent` scope boundary via the picker.
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "--user fast".to_string(),
-                model_provider: "openai.fast".to_string(),
-                model: "gpt-flag-user".to_string(),
-                api_key: None,
+                model_ref: "openai.fast".to_string(),
             },
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "--agent fast".to_string(),
-                model_provider: "openai.fast".to_string(),
-                model: "gpt-flag-agent".to_string(),
-                api_key: None,
+                model_ref: "openai.fast".to_string(),
             },
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "--flag".to_string(),
-                model_provider: "openai.fast".to_string(),
-                model: "gpt-flag-generic".to_string(),
-                api_key: None,
+                model_ref: "openai.fast".to_string(),
             },
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "current".to_string(),
-                model_provider: "anthropic.team".to_string(),
-                model: "claude-conflicting".to_string(),
-                api_key: None,
+                model_ref: "anthropic.team".to_string(),
             },
         ]);
 
@@ -13682,7 +13674,7 @@ mod tests {
             .flat_map(|category| category.options.iter())
             .collect::<Vec<_>>();
 
-        assert_eq!(context.categories.len(), 3);
+        assert_eq!(context.categories.len(), 4);
         assert_eq!(options.len(), 4);
         assert!(options.iter().all(|option| option.model != "ghost"));
         assert!(options.iter().all(|option| option.hint != "duplicate"));
@@ -13722,37 +13714,27 @@ mod tests {
             // different target: unreachable through its own hint.
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "FAST".to_string(),
-                model_provider: "anthropic.team".to_string(),
-                model: "claude-fast".to_string(),
-                api_key: None,
+                model_ref: "anthropic.team".to_string(),
             },
-            // Hint equal to an earlier route's model identifier: the text
+            // Hint equal to an earlier route's exact model ref: the text
             // resolver would pick the `sonnet` route first.
             zeroclaw_config::schema::ModelRouteConfig {
-                hint: "claude-sonnet".to_string(),
-                model_provider: "openai.fast".to_string(),
-                model: "gpt-alias-collision".to_string(),
-                api_key: None,
+                hint: "anthropic.team".to_string(),
+                model_ref: "openai.fast".to_string(),
             },
             // Same target as `reasoning` under a second hint: still
             // reachable, presented once.
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "think".to_string(),
-                model_provider: "openai.primary".to_string(),
-                model: "gpt-reasoning".to_string(),
-                api_key: None,
+                model_ref: "openai.reasoning".to_string(),
             },
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "ghost".to_string(),
-                model_provider: "openai.not-configured".to_string(),
-                model: "gpt-ghost".to_string(),
-                api_key: None,
+                model_ref: "openai.not-configured".to_string(),
             },
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "bad\thint".to_string(),
-                model_provider: "openai.fast".to_string(),
-                model: "gpt-bad".to_string(),
-                api_key: None,
+                model_ref: "openai.fast".to_string(),
             },
         ]);
         let runtime_routes = model_picker_runtime_routes(&config);
@@ -13770,15 +13752,14 @@ mod tests {
                 .model_routes
                 .iter()
                 .find(|route| {
-                    route.model.eq_ignore_ascii_case(&option.hint)
-                        || route.hint.eq_ignore_ascii_case(&option.hint)
+                    route.model_ref == option.hint || route.hint.eq_ignore_ascii_case(&option.hint)
                 })
                 .expect("displayed route must resolve through the text command");
             assert_eq!(
                 (
                     first_match.hint.as_str(),
-                    first_match.model_provider.as_str(),
-                    first_match.model.as_str(),
+                    first_match.model_ref.as_str(),
+                    first_match.effective_model(&config).as_str(),
                 ),
                 (
                     option.hint.as_str(),
@@ -13821,7 +13802,7 @@ mod tests {
             })
         );
         assert_eq!(
-            exclusion("claude-sonnet"),
+            exclusion("anthropic.team"),
             Some(ModelPickerExclusion::ShadowedByRoute {
                 shadowing_hint: "sonnet".to_string(),
             })
@@ -13928,23 +13909,34 @@ mod tests {
             .model_routes
             .push(zeroclaw_config::schema::ModelRouteConfig {
                 hint: "also-fast".into(),
-                model_provider: "openai.fast".into(),
-                model: "gpt-fast".into(),
-                api_key: None,
+                model_ref: "openai.fast".into(),
             });
         assert!(TelegramChannel::model_picker_route_available(
             &config,
             runtime_routes.as_ref(),
             &option,
         ));
-        config.model_routes[2].model = "gpt-fast-v2".to_string();
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut config,
+            "openai.fast",
+            "gpt-fast-v2",
+            None,
+        );
         assert!(!TelegramChannel::model_picker_route_available(
             &config,
             runtime_routes.as_ref(),
             &option,
         ));
-        config.model_routes[2].model = "gpt-fast".to_string();
-        config.providers.models.openai.remove("fast");
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut config,
+            "openai.fast",
+            "gpt-fast",
+            None,
+        );
+        config
+            .providers
+            .models
+            .retain_canonical_models(|reference, _| reference.as_str() != "openai.fast");
         assert!(!TelegramChannel::model_picker_route_available(
             &config,
             runtime_routes.as_ref(),
@@ -13995,14 +13987,12 @@ mod tests {
             "--agent fast",
             "fast --user",
         ];
-        for (index, hint) in non_canonical.iter().enumerate() {
+        for hint in &non_canonical {
             config
                 .model_routes
                 .push(zeroclaw_config::schema::ModelRouteConfig {
                     hint: (*hint).to_string(),
-                    model_provider: "openai.fast".to_string(),
-                    model: format!("gpt-non-canonical-{index}"),
-                    api_key: None,
+                    model_ref: "openai.fast".to_string(),
                 });
         }
 

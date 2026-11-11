@@ -178,7 +178,9 @@ impl RouterModelProvider {
             .map(|(name, provider)| (name, Arc::from(provider)))
             .collect();
 
-        // Build model_provider name → index lookup.
+        // Build the hint-target lookup. A default slot may have the same
+        // reference but different invocation overrides, so the later canonical
+        // target wins here; direct calls always use default_index.
         let provider_indices: HashMap<String, usize> = model_providers
             .iter()
             .enumerate()
@@ -295,11 +297,14 @@ impl RouterModelProvider {
                 "Unknown route hint, falling back to default model_provider"
             );
         }
-        let index = self
-            .provider_indices
-            .get(&resolved.provider_name)
-            .copied()
-            .unwrap_or(self.default_index);
+        let index = if resolved.kind == RouteResolutionKind::MatchedHint {
+            self.provider_indices
+                .get(&resolved.provider_name)
+                .copied()
+                .unwrap_or(self.default_index)
+        } else {
+            self.default_index
+        };
         (index, resolved.model)
     }
 }
@@ -1292,6 +1297,27 @@ mod tests {
 
         // Route should not exist
         assert!(!router.route_resolver().has_hint("broken"));
+    }
+
+    #[test]
+    fn direct_and_hint_calls_keep_distinct_slots_for_the_same_model_reference() {
+        let (router, _) = make_router(
+            vec![
+                ("chat.primary", "invocation"),
+                ("chat.primary", "canonical"),
+            ],
+            vec![("configured", "chat.primary", "configured-model")],
+        );
+
+        assert_eq!(
+            router.resolve("override-model"),
+            (0, "override-model".into())
+        );
+        assert_eq!(
+            router.resolve("hint:configured"),
+            (1, "configured-model".into())
+        );
+        assert_eq!(router.resolve("hint:missing"), (0, "hint:missing".into()));
     }
 
     #[test]

@@ -812,16 +812,21 @@ mod argument_preservation_tests {
         let expected = json!({
             "action": "upsert_scenario",
             "hint": "coding",
-            "model_provider": "openai",
-            "model": "test-model"
+            "model_ref": "chat.test-model"
         });
         for native in [true, false] {
             let workspace = tempfile::tempdir().unwrap();
-            let config = zeroclaw_config::schema::Config {
+            let mut config = zeroclaw_config::schema::Config {
                 config_path: workspace.path().join("config.toml"),
                 data_dir: workspace.path().join("data"),
                 ..zeroclaw_config::schema::Config::default()
             };
+            zeroclaw_config::migration::bind_test_route_model(
+                &mut config,
+                "chat.test-model",
+                "test-model",
+                None,
+            );
             config.save().await.unwrap();
             let tool = ModelRoutingConfigTool::new(
                 Arc::new(config.clone()),
@@ -852,8 +857,7 @@ mod argument_preservation_tests {
             assert_eq!(saved.model_routes.len(), 1);
             let route = &saved.model_routes[0];
             assert_eq!(route.hint, "coding");
-            assert_eq!(route.model_provider, "openai");
-            assert_eq!(route.model, "test-model");
+            assert_eq!(route.model_ref, "chat.test-model");
         }
     }
 

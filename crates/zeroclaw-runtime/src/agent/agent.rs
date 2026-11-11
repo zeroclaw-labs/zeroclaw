@@ -4230,7 +4230,7 @@ impl Agent {
             })?;
             let selector = format!("hint:{}", selection.route.hint);
             let installed_route = self.model_route_resolver.resolve(&selector);
-            if installed_route.provider_name != selection.route.model_provider
+            if installed_route.provider_name != selection.route.model_ref
                 || installed_route.model != selection.route.effective_model(config)
             {
                 return Err(anyhow::Error::msg(
@@ -6035,11 +6035,15 @@ mod tests {
                 ..Default::default()
             },
         );
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut cfg,
+            &(provider_ref),
+            &(model.to_string()),
+            None,
+        );
         cfg.model_routes = vec![zeroclaw_config::schema::ModelRouteConfig {
             hint: "fast".to_string(),
-            model_provider: provider_ref,
-            model: model.to_string(),
-            api_key: None,
+            model_ref: provider_ref,
         }];
         cfg
     }
@@ -6381,10 +6385,16 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
                 ..Default::default()
             },
         );
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut config,
+            "custom.target.selected",
+            "shared-id",
+            None,
+        );
         config.model_routes = vec![ModelRouteConfig {
             hint: "target".into(),
-            model_provider: "custom.target.selected".into(),
-            model: "shared-id".into(),
+            model_ref: "custom.target.selected".into(),
+
             ..Default::default()
         }];
         // The explicit value deliberately equals the primary's default. Its
@@ -6821,11 +6831,17 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
         // Exercise the no-router reliable primary and the routed path, including
         // a hint back to the default entry with the identical provider-local ID.
         for routed in [false, true] {
+            zeroclaw_config::migration::bind_test_route_model(
+                &mut config,
+                "custom.gw",
+                "shared-id",
+                None,
+            );
             config.model_routes = if routed {
                 vec![ModelRouteConfig {
                     hint: "large".into(),
-                    model_provider: "custom.gw".into(),
-                    model: "shared-id".into(),
+                    model_ref: "custom.gw".into(),
+
                     ..Default::default()
                 }]
             } else {
@@ -10884,6 +10900,12 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
                 ..Default::default()
             },
         );
+        for (reference, model) in [
+            ("custom.local", "local-model"),
+            ("custom.cloud", "cloud-model"),
+        ] {
+            zeroclaw_config::migration::bind_test_route_model(&mut config, reference, model, None);
+        }
         let agent_config = config
             .resolved_agent_config("effort-agent")
             .expect("effort agent must resolve");
@@ -10893,8 +10915,8 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
                 (
                     route.hint.clone(),
                     zeroclaw_providers::router::Route {
-                        provider_name: route.model_provider.clone(),
-                        model: route.model.clone(),
+                        provider_name: route.model_ref.clone(),
+                        model: route.effective_model(&config),
                     },
                 )
             })
@@ -10940,15 +10962,11 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
         vec![
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "local".into(),
-                model_provider: "custom.local".into(),
-                model: "local-model".into(),
-                api_key: None,
+                model_ref: "custom.local".into(),
             },
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "cloud".into(),
-                model_provider: "custom.cloud".into(),
-                model: "cloud-model".into(),
-                api_key: None,
+                model_ref: "custom.cloud".into(),
             },
         ]
     }
@@ -14511,9 +14529,7 @@ options = { extract_text_tool_calls = true }
 
         let routes = vec![zeroclaw_config::schema::ModelRouteConfig {
             hint: "local".into(),
-            model_provider: "custom.local".into(),
-            model: "local-model".into(),
-            api_key: None,
+            model_ref: "custom.local".into(),
         }];
         let (mut agent, observations) =
             effort_routing_test_agent(CloudEscalationPolicy::Auto, routes);
@@ -23480,12 +23496,11 @@ model_provider = "custom.primary"
     }
 
     #[tokio::test]
-    async fn try_apply_model_switch_prefers_route_api_key() {
+    async fn try_apply_model_switch_uses_referenced_connection_credentials() {
         let route = zeroclaw_config::schema::ModelRouteConfig {
-            model_provider: "ollama.local".to_string(),
-            model: "tinyllama".to_string(),
+            model_ref: "ollama.local".to_string(),
+
             hint: "fast".to_string(),
-            api_key: Some("route-specific-key".to_string()),
         };
 
         let mut route_config = zeroclaw_config::schema::Config {
@@ -23497,6 +23512,12 @@ model_provider = "custom.primary"
             .models
             .ensure("ollama", "local")
             .unwrap();
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut route_config,
+            "ollama.local",
+            "tinyllama",
+            Some("connection-key"),
+        );
         let switch_cfg = ProviderSwitchConfig {
             config: Some(std::sync::Arc::new(route_config)),
             live_config: None,
@@ -25646,13 +25667,18 @@ mod capability_construction_tests {
     async fn config_backed_capabilities_construct_and_switch_like_the_adapter() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = two_provider_config(&tmp);
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut config,
+            "chat.ollama",
+            "tinyllama",
+            Some("route-specific-key"),
+        );
         config
             .model_routes
             .push(zeroclaw_config::schema::ModelRouteConfig {
-                model_provider: "ollama".to_string(),
-                model: "tinyllama".to_string(),
+                model_ref: "chat.ollama".to_string(),
+
                 hint: "fast".to_string(),
-                api_key: Some("route-specific-key".to_string()),
             });
 
         let mut supplied = Agent::from_config_with_capabilities(
@@ -25690,18 +25716,18 @@ mod capability_construction_tests {
             let switched = agent
                 .try_apply_model_switch(
                     "gpt-4o-mini",
-                    "ollama".to_string(),
+                    "chat.ollama".to_string(),
                     "tinyllama".to_string(),
                 )
                 .await
                 .unwrap();
             assert_eq!(switched, ModelSwitchOutcome::Rebuilt("tinyllama".into()));
-            assert_eq!(agent.model_provider_name, "ollama");
+            assert_eq!(agent.model_provider_name, "chat.ollama");
             assert_eq!(
                 agent.model_route_resolver.resolve("hint:fast"),
                 zeroclaw_providers::model_route_resolver(
                     &config,
-                    "ollama",
+                    "chat.ollama",
                     &config.model_routes,
                     "tinyllama",
                 )

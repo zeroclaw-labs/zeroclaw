@@ -17,15 +17,13 @@ For ad-hoc multi-step routing inside a single conversation, the `spawn_subagent`
 
 ## Hint-based model routes
 
-A narrower mechanism: `[[model_routes]]` lets an agent override the configured `model_provider` for prompts marked with a hint string. Useful when one agent should occasionally reach for a different model without spinning up a second agent. Each route entry carries a `hint` (the string a prompt must declare to fire it) and a dotted `model_provider` reference. A route can also carry a provider-local `model` id, such as `deepseek-reasoner`; that field is optional when `model_provider` itself resolves an effective model, including a three-segment `<type>.<alias>.<model_alias>` reference. Configure routes through the gateway, zerocode, or `zeroclaw config set`; see the [Config reference](../reference/config.md#model_routes) for the field schema.
+A narrower mechanism: `[[model_routes]]` maps a task hint to one canonical model reference. Each entry carries only `hint` and exact `model_ref`; the referenced model owns its connection, credentials, upstream model ID, and options. Configure routes through the gateway, zerocode, or `zeroclaw config set`; see the [Config reference](../reference/config.md#model_routes) for the field schema.
 
 Routes normally fire when a prompt explicitly carries the matching hint. An opted-in effort-routing runtime profile can also select two named routes automatically before provider execution.
 
-An unknown `hint:<name>` logs a warning and stays in the default reliability domain while preserving the literal hint as the requested model. A pinned default entry still serves its active/default pin. An unpinned default entry forwards the literal value, which the provider may reject before normal fallback or error handling continues.
+An unknown `hint:<name>` logs a warning and stays in the default reliability domain while preserving the literal hint as the requested model. Each route target is materialized from its complete canonical model definition, so a switch or fallback receives the target model's own connection, credentials, options, and fallback policy.
 
-`model_provider` is a provider profile reference in dotted form. The common shape is two-segment `<type>.<alias>`, such as `anthropic.sonnet` or `openai.default`: the profile carries the endpoint, credential reference, compatibility flavor, fallback chain, and configured default model, and the `model` field is provider-local state under that profile. When a profile hosts several models under a `[providers.models.<type>.<alias>.models.<model_alias>]` subtable (see [Configuration → multiple models per profile](./configuration.md#hosting-multiple-models-on-one-provider-entry)), a three-segment `<type>.<alias>.<model_alias>` ref selects one of those models directly.
-
-> **Current limitation:** Route pinning depends on the target profile. The primary target is pinned to the active/default model used to construct the router, including when a recognized hint points back to the active primary profile; that hint's `model_routes[].model` value does not override the primary pin. A non-primary target with a configured profile model is pinned to that model, so its route model does not override the profile model either. A non-primary target without a configured model remains unpinned and receives the route model; its own model definition is always materialized independently, although referenced fallback targets are still walked. Keep the route model aligned with the target pin when one exists.
+`model_ref` is an opaque exact key under `[providers.models]`. Dots are part of the TOML key and are never split into family, alias, or nested model segments.
 
 ## Effort-based local/cloud routing
 
@@ -34,13 +32,11 @@ An `effort_routing` block on a runtime profile can select a local route for simp
 ```toml
 [[model_routes]]
 hint = "local"
-model_provider = "ollama.local"
-model = "qwen3:8b"
+model_ref = "chat.local"
 
 [[model_routes]]
 hint = "cloud"
-model_provider = "anthropic.sonnet"
-model = "claude-sonnet-4-5"
+model_ref = "chat.cloud"
 
 [runtime_profiles.local_first.effort_routing]
 local_hint = "local"
@@ -79,8 +75,8 @@ Configure the chain through the ZeroCode Config editor, the dashboard, or `zeroc
 Runtime switches use the same provider-profile contract as config-backed routing:
 
 - `/models <type>.<alias>` selects the active provider profile for the sender session. Channel runtimes can also accept a bare `<type>` shorthand when exactly one configured alias exists for that provider family.
-- `/model <model-id>` selects a model within the active provider profile. If the value resolves through a `[[model_routes]]` entry, that route can select a different provider profile. A pinned target serves its effective pin rather than necessarily `model_routes[].model`; an unpinned target without a configured profile model receives the route model.
-- The `model_switch` tool takes `model_provider = "<type>.<alias>"` plus `model = "<provider-local-model-id>"`. It also accepts a three-segment `model_provider = "<type>.<alias>.<model_alias>"`, in which case the `model` argument is optional: the model id is taken from the named model entry.
+- `/model <model-or-hint>` selects an active model or a declared route hint. A route resolves through its exact `model_ref`, so the selected connection, credentials, upstream model ID, and options are taken from that canonical model definition.
+- The `model_switch` tool keeps the legacy provider/model arguments for runtime session overrides. Persisted `[[model_routes]]` entries use only `hint` plus exact `model_ref`; they do not duplicate provider credentials or an upstream model ID.
 
 Runtime switches are session/runtime state. They do not edit `config.toml`; persisted defaults require an explicit config write. For tool-driven switches, bare provider family names such as `openai` are not switch targets because they do not identify which configured profile, credential, endpoint, or compatibility mode should be used.
 

@@ -29,8 +29,8 @@ The runtime starts with an active provider reference and model from the selected
 
 There are two current construction constraints:
 
-- Route pinning is exact-key based. A recognized hint selects its configured model reference; `model_routes[].model` cannot replace that model definition. A fallback or model switch resolves a new exact key and rematerializes its complete policy, so route construction never inherits the primary model's options by accident.
-- Route targets are deduplicated by `model_provider`. If a route supplies `api_key`, the first matching route credential takes precedence when the shared target is constructed. Prefer credentials on the provider profile when several hints share one target.
+- Route selection is exact-key based. A recognized hint selects its configured `model_ref`; the route does not duplicate or override connection credentials, upstream model IDs, or model options. A fallback or model switch resolves a new exact key and rematerializes its complete policy, so construction never inherits the primary model's options by accident.
+- Each route target is built from its own canonical model definition. The immutable connection registry may be reused during one build transaction, but the model-aware adapter and all model-specific options are resolved afresh for every target.
 
 This ordering matters: routing chooses a reliability domain; it does not bypass reliability. An external routing service such as OpenRouter can still perform server-side selection behind one ZeroClaw profile, but it is optional and does not replace ZeroClaw's first-party route and fallback contracts.
 

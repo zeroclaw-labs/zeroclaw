@@ -1489,7 +1489,7 @@ group_id = "dm"
 }
 
 #[test]
-fn v2_model_routes_provider_field_renamed_to_model_provider() {
+fn v2_model_routes_materialize_canonical_model_refs() {
     let raw = r#"
 schema_version = 2
 
@@ -1517,18 +1517,79 @@ model_provider = "openai.default"
         .find(|r| r.hint == "vision")
         .expect("vision route");
     assert_eq!(
-        vision.model_provider, "openai.default",
-        "bare V2 `provider = openai` must be promoted to dotted V3 `openai.default`"
+        vision.model_ref, "route.vision",
+        "V2 route model becomes a canonical V4 model"
     );
-    assert_eq!(vision.model, "gpt-4-vision");
+    assert_eq!(vision.effective_model(&cfg), "gpt-4-vision");
 
     let fast = cfg
         .model_routes
         .iter()
         .find(|r| r.hint == "fast")
         .expect("fast route");
-    assert_eq!(fast.model_provider, "groq.default");
-    assert_eq!(fast.model, "llama-3.1-8b-instant");
+    assert_eq!(fast.model_ref, "route.fast");
+    assert_eq!(fast.effective_model(&cfg), "llama-3.1-8b-instant");
+}
+
+#[test]
+fn v3_route_migration_preserves_bare_provider_with_explicit_model() {
+    let cfg = migrate_to_current(
+        r#"
+schema_version = 3
+[[model_routes]]
+hint = "fast"
+model_provider = "openai"
+model = "gpt-4o-mini"
+api_key = "fixture-key"
+"#,
+    )
+    .unwrap();
+    let route = &cfg.model_routes[0];
+    assert_eq!(route.model_ref, "route.fast");
+    assert_eq!(route.effective_model(&cfg), "gpt-4o-mini");
+    let registry = cfg.provider_registry().unwrap();
+    let model = registry
+        .resolve_chat(&route.model_ref.as_str().into())
+        .unwrap();
+    assert_eq!(model.selection.connection.kind(), "openai");
+    assert_eq!(model.selection.connection.api_key(), Some("fixture-key"));
+}
+
+#[test]
+fn v3_route_migration_preserves_dotted_profile_and_model_aliases() {
+    let cfg = migrate_to_current(
+        r#"
+schema_version = 3
+[providers.models.custom."prod.us"]
+uri = "http://127.0.0.1:1/v1"
+api_key = "fixture-key"
+temperature = 0.8
+[providers.models.custom."prod.us".models."fast.v2"]
+id = "wire-model"
+temperature = 0.2
+context_window = 8192
+[[model_routes]]
+hint = "coding.v2"
+model_provider = "custom.prod.us.fast.v2"
+"#,
+    )
+    .unwrap();
+    let route = &cfg.model_routes[0];
+    assert_eq!(route.model_ref, "route.coding.v2");
+    let registry = cfg.provider_registry().unwrap();
+    let resolved = registry
+        .resolve_chat(&route.model_ref.as_str().into())
+        .unwrap();
+    assert_eq!(resolved.upstream_model(), Some("wire-model"));
+    let model = serde_json::to_value(
+        cfg.providers
+            .models
+            .canonical_model(&route.model_ref.as_str().into())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(model["options"]["temperature"], 0.2);
+    assert_eq!(model["metadata"]["context_window"], 8192);
 }
 
 #[test]
@@ -1590,8 +1651,8 @@ model_provider = "openai.default"
         .find(|r| r.hint == "vision")
         .expect("vision route");
     assert_eq!(
-        vision.model_provider, "openai.default",
-        "bare model_provider value is promoted to dotted form regardless of source field name"
+        vision.model_ref, "route.vision",
+        "V2 route model becomes a canonical V4 model regardless of source field name"
     );
 }
 

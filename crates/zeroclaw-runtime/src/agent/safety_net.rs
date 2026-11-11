@@ -3299,12 +3299,16 @@ async fn usage_event_coherent_tuple_in_turn_model_switch() {
 
         // The model route forces credential resolution to look up provider B's
         // config entry (api_key/uri) instead of falling back to the primary's.
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut cfg,
+            "anthropic.provider-b",
+            "claude-3-opus",
+            None,
+        );
         cfg.model_routes
             .push(zeroclaw_config::schema::ModelRouteConfig {
                 hint: "matrix-switch".into(),
-                model_provider: "anthropic.provider-b".into(),
-                model: "claude-3-opus".into(),
-                api_key: None,
+                model_ref: "anthropic.provider-b".into(),
             });
 
         let cfg_arc = Arc::new(cfg.clone());
@@ -3482,12 +3486,16 @@ async fn usage_by_provider_breakdown_after_in_turn_model_switch() {
         .pricing
         .insert("claude-3-opus.cached_input".into(), 0.0);
 
+    zeroclaw_config::migration::bind_test_route_model(
+        &mut cfg,
+        "anthropic.provider-b",
+        "claude-3-opus",
+        None,
+    );
     cfg.model_routes
         .push(zeroclaw_config::schema::ModelRouteConfig {
             hint: "req-b2-switch".into(),
-            model_provider: "anthropic.provider-b".into(),
-            model: "claude-3-opus".into(),
-            api_key: None,
+            model_ref: "anthropic.provider-b".into(),
         });
 
     let cfg_arc = Arc::new(cfg.clone());

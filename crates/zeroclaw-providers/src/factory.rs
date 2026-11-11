@@ -1686,10 +1686,10 @@ impl FamilyProviderFactory for BedrockModelProviderConfig {
         &self,
         alias: &str,
         key: Option<&str>,
-        _api_url: Option<&str>,
+        api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        let builder = crate::bedrock::BedrockModelProvider::builder(alias);
+        let builder = crate::bedrock::BedrockModelProvider::builder(alias).api_url(api_url);
         // Explicit-key path stays no-probe — do not run BEDROCK_API_KEY /
         // AwsCredentials::from_env / from_credential_process (which can
         // spawn a shell command) when the operator has already resolved
@@ -2413,6 +2413,7 @@ pub(crate) fn dispatch_model_ref_with_registry(
         }
         ProviderConnection::Bedrock(connection) => {
             let mut builder = crate::bedrock::BedrockModelProvider::builder(alias)
+                .api_url(connection.uri.as_deref())
                 .region(connection.extra.region.as_deref());
             if let Some(key) = api_key {
                 builder = builder.bearer_token(key);

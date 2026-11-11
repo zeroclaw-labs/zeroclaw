@@ -478,8 +478,7 @@ fn scrub_model_alias_refs(cfg: &mut Config, target: &str) {
             !targets.is_empty()
         }
     });
-    cfg.model_routes
-        .retain(|r| r.model_provider.trim() != target);
+    cfg.model_routes.retain(|r| r.model_ref.trim() != target);
     cfg.embedding_routes
         .retain(|r| r.model_provider.trim() != target);
 }
@@ -539,7 +538,7 @@ fn scrub_model_provider_refs(cfg: &mut Config, family: &str, alias: &str) {
             !targets.is_empty()
         }
     });
-    cfg.model_routes.retain(|r| !matches(&r.model_provider));
+    cfg.model_routes.retain(|r| !matches(&r.model_ref));
     cfg.embedding_routes.retain(|r| !matches(&r.model_provider));
 }
 
@@ -1089,8 +1088,8 @@ fn rewrite_model_alias_refs(
     }
     let mut routes_touched = false;
     for r in cfg.model_routes.iter_mut() {
-        if r.model_provider.trim() == old_target {
-            r.model_provider = new_target.clone();
+        if r.model_ref.trim() == old_target {
+            r.model_ref = new_target.clone();
             routes_touched = true;
         }
     }
@@ -1182,12 +1181,23 @@ fn rewrite_model_provider_refs(
     }) {
         dirty.push("providers.fallback".to_string());
     }
+    let canonical_route_refs: std::collections::HashSet<String> = cfg
+        .providers
+        .models
+        .canonical_models
+        .keys()
+        .map(|reference| reference.as_str().to_string())
+        .collect();
     let mut routes_touched = false;
     for r in cfg.model_routes.iter_mut() {
-        if let Some(v) =
-            retarget_profile_ref(&r.model_provider, &old_target, &new_target, references)
-        {
-            r.model_provider = v; // String field
+        // Current model routes use exact canonical keys. A key such as
+        // `chat.fast.us` may contain the legacy separator but is still one
+        // TOML key and must not move when a legacy provider alias changes.
+        if canonical_route_refs.contains(r.model_ref.trim()) {
+            continue;
+        }
+        if let Some(v) = retarget_profile_ref(&r.model_ref, &old_target, &new_target, references) {
+            r.model_ref = v;
             routes_touched = true;
         }
     }
@@ -1420,11 +1430,11 @@ fn collect_model_alias_refs(
         }
     }
     for (i, route) in cfg.model_routes.iter().enumerate() {
-        if route.model_provider.trim() == target {
+        if route.model_ref.trim() == target {
             sites.push(RefSite::soft(
-                format!("model_routes[{i}].model_provider"),
+                format!("model_routes[{i}].model_ref"),
                 ScrubAction::DropFromVec { index: i },
-                &route.model_provider,
+                &route.model_ref,
             ));
         }
     }
@@ -1518,11 +1528,11 @@ fn collect_provider_refs(
                 }
             }
             for (i, route) in cfg.model_routes.iter().enumerate() {
-                if ref_targets_profile(cfg, route.model_provider.as_str(), &target) {
+                if ref_targets_profile(cfg, route.model_ref.as_str(), &target) {
                     sites.push(RefSite::soft(
-                        format!("model_routes[{i}].model_provider"),
+                        format!("model_routes[{i}].model_ref"),
                         ScrubAction::DropFromVec { index: i },
-                        route.model_provider.as_str(),
+                        route.model_ref.as_str(),
                     ));
                 }
             }
@@ -1832,9 +1842,7 @@ mod tests {
         );
         cfg.model_routes.push(ModelRouteConfig {
             hint: "deep".to_string(),
-            model_provider: "anthropic.default".to_string(),
-            model: "claude".to_string(),
-            api_key: None,
+            model_ref: "anthropic.default".to_string(),
         });
 
         let kind = provider_kind("anthropic");
@@ -2056,9 +2064,7 @@ mod tests {
         );
         cfg.model_routes.push(ModelRouteConfig {
             hint: "deep".to_string(),
-            model_provider: " anthropic.default ".to_string(),
-            model: "claude".to_string(),
-            api_key: None,
+            model_ref: " anthropic.default ".to_string(),
         });
         let kind = provider_kind("anthropic");
         let sites = find_all_references(&cfg, &kind, "default");
@@ -2354,9 +2360,7 @@ mod tests {
         );
         cfg.model_routes.push(ModelRouteConfig {
             hint: "deep".to_string(),
-            model_provider: "anthropic.default".to_string(),
-            model: "claude".to_string(),
-            api_key: None,
+            model_ref: "anthropic.default".to_string(),
         });
         cfg.embedding_routes.push(EmbeddingRouteConfig {
             hint: "sem".to_string(),
@@ -2404,9 +2408,7 @@ mod tests {
         );
         cfg.model_routes.push(ModelRouteConfig {
             hint: "deep".to_string(),
-            model_provider: " anthropic.default ".to_string(),
-            model: "claude".to_string(),
-            api_key: None,
+            model_ref: " anthropic.default ".to_string(),
         });
         let kind = provider_kind("anthropic");
         let report = delete_with_cascade(&mut cfg, &kind, "default", CascadePolicy::RefuseOnHard)
@@ -3343,9 +3345,7 @@ mod tests {
         );
         cfg.model_routes.push(ModelRouteConfig {
             hint: "deep".to_string(),
-            model_provider: "anthropic.default".to_string(),
-            model: "claude".to_string(),
-            api_key: None,
+            model_ref: "anthropic.default".to_string(),
         });
 
         let kind = provider_kind("anthropic");
@@ -3362,7 +3362,7 @@ mod tests {
             cfg.agents["researcher"].classifier_provider.as_str(),
             "anthropic.prod"
         );
-        assert_eq!(cfg.model_routes[0].model_provider, "anthropic.prod");
+        assert_eq!(cfg.model_routes[0].model_ref, "anthropic.prod");
         let fast_fallback: Vec<String> = cfg
             .providers
             .fallback
@@ -3490,10 +3490,7 @@ mod tests {
             dirty_entry_for("escalation.alert_channels[3]"),
             "escalation.alert_channels"
         );
-        assert_eq!(
-            dirty_entry_for("model_routes[0].model_provider"),
-            "model_routes"
-        );
+        assert_eq!(dirty_entry_for("model_routes[0].model_ref"), "model_routes");
         // provider entry → the 4-segment entry path.
         assert_eq!(
             dirty_entry_for("providers.fallback.anthropic.default[0]"),

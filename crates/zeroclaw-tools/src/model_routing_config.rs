@@ -12,7 +12,7 @@ use zeroclaw_providers::ProviderDispatch;
 
 const DEFAULT_AGENT_MAX_DEPTH: u32 = 3;
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 10;
-const SCENARIO_REQUIRED_STRING_FIELDS: [&str; 3] = ["hint", "model_provider", "model"];
+const SCENARIO_REQUIRED_STRING_FIELDS: [&str; 2] = ["hint", "model_ref"];
 
 /// Why a model probe failed.
 ///
@@ -530,12 +530,7 @@ impl ModelRoutingConfigTool {
 
         json!({
             "hint": route.hint,
-            "model_provider": route.model_provider,
-            "model": route.model,
-            "api_key_configured": route
-                .api_key
-                .as_ref()
-                .is_some_and(|value| !value.trim().is_empty()),
+            "model_ref": route.model_ref,
             "classification": classification,
         })
     }
@@ -665,15 +660,13 @@ impl ModelRoutingConfigTool {
                     "conversation": {
                         "action": "upsert_scenario",
                         "hint": "conversation",
-                        "model_provider": "kimi",
-                        "model": "moonshot-v1-8k",
+                        "model_ref": "chat.conversation",
                         "classification_enabled": false
                     },
                     "coding": {
                         "action": "upsert_scenario",
                         "hint": "coding",
-                        "model_provider": "openai",
-                        "model": "gpt-5.3-codex",
+                        "model_ref": "chat.coding",
                         "classification_enabled": true,
                         "keywords": ["code", "bug", "refactor", "test"],
                         "patterns": ["```"],
@@ -978,68 +971,112 @@ impl ModelRoutingConfigTool {
         // authority, including current environment overrides. A missing key
         // must stay missing: the startup snapshot may retain a credential the
         // operator has since removed from disk or the environment.
-        let selection = match effective.resolve_model_selection(provider_name) {
-            Some(selection) => selection,
-            None if effective
-                .providers
-                .models
-                .find_by_name(provider_name)
-                .is_none()
-                && effective
-                    .providers
-                    .models
-                    .profile_ref(provider_name)
-                    .and_then(|(family, alias)| effective.providers.models.find(family, alias))
-                    .is_none() =>
+        let canonical_ref = zeroclaw_config::provider_registry::ModelRef::from(provider_name);
+        let (probe_model_name, probe_temperature) = if effective
+            .providers
+            .models
+            .canonical_model(&canonical_ref)
+            .is_some()
+        {
+            let registry =
+                effective
+                    .provider_registry()
+                    .map_err(|error| ProbeFailure::Construction {
+                        model: None,
+                        error: error.into(),
+                    })?;
+            let resolved = registry.resolve_chat(&canonical_ref).map_err(|error| {
+                ProbeFailure::Construction {
+                    model: None,
+                    error: error.into(),
+                }
+            })?;
+            if !zeroclaw_providers::model::selection_auth_ready(&effective, provider_name)
+                .map_err(|error| ProbeFailure::Construction { model: None, error })?
             {
                 return Ok(ModelProbeOutcome::SkippedNoCredentials);
             }
-            None => {
-                return Err(ProbeFailure::Construction {
-                    model: None,
-                    error: anyhow::Error::msg("model probe selection does not exist"),
-                });
+            let Some(model) = resolved
+                .upstream_model()
+                .filter(|model| !model.trim().is_empty())
+            else {
+                return Ok(ModelProbeOutcome::SkippedNoModel);
+            };
+            (
+                model.to_owned(),
+                effective.resolve_model_temperature(provider_name),
+            )
+        } else {
+            let selection = match effective.resolve_model_selection(provider_name) {
+                Some(selection) => selection,
+                None if effective
+                    .providers
+                    .models
+                    .find_by_name(provider_name)
+                    .is_none()
+                    && effective
+                        .providers
+                        .models
+                        .profile_ref(provider_name)
+                        .and_then(|(family, alias)| effective.providers.models.find(family, alias))
+                        .is_none() =>
+                {
+                    return Ok(ModelProbeOutcome::SkippedNoCredentials);
+                }
+                None => {
+                    return Err(ProbeFailure::Construction {
+                        model: None,
+                        error: anyhow::Error::msg("model probe selection does not exist"),
+                    });
+                }
+            };
+            // The factory knows which endpoint families allow keyless/local or
+            // OAuth authentication. A URI alone does not replace a required key;
+            // configured headers can supply authentication for a compatible API.
+            if selection.entry.extra_headers.is_empty()
+                && !zeroclaw_providers::model::selection_auth_ready(&effective, provider_name)
+                    .map_err(|error| ProbeFailure::Construction { model: None, error })?
+            {
+                return Ok(ModelProbeOutcome::SkippedNoCredentials);
             }
-        };
-        // The factory knows which endpoint families allow keyless/local or
-        // OAuth authentication. A URI alone does not replace a required key;
-        // configured headers can supply authentication for a compatible API.
-        if selection.entry.extra_headers.is_empty()
-            && !zeroclaw_providers::model::selection_auth_ready(&effective, provider_name)
-                .map_err(|error| ProbeFailure::Construction { model: None, error })?
-        {
-            return Ok(ModelProbeOutcome::SkippedNoCredentials);
-        }
 
-        // Probe the model the post-reload runtime will actually serve, and
-        // take it from the effective entry alone. A `ZEROCLAW_*` override on
-        // the alias's `model` field is authoritative in memory after load, so
-        // falling back to the saved value would validate a model the runtime
-        // never uses — and could roll the disk change back over a model that
-        // was never going to be served. The override layer also treats an
-        // empty value as an explicit clear of an optional field, and a saved
-        // fallback would silently undo that clear.
-        //
-        // No effective model means the reloaded runtime resolves none for this
-        // alias (such an entry is only usable through routes that carry their
-        // own model), so there is nothing to validate and the probe stops
-        // before dispatch instead of failing the update.
-        let Some(probe_model_name) = selection
-            .model_id
-            .clone()
-            .filter(|value| !value.trim().is_empty())
-        else {
-            return Ok(ModelProbeOutcome::SkippedNoModel);
+            // Probe the model the post-reload runtime will actually serve, and
+            // take it from the effective entry alone. A `ZEROCLAW_*` override on
+            // the alias's `model` field is authoritative in memory after load, so
+            // falling back to the saved value would validate a model the runtime
+            // never uses — and could roll the disk change back over a model that
+            // was never going to be served. The override layer also treats an
+            // empty value as an explicit clear of an optional field, and a saved
+            // fallback would silently undo that clear.
+            //
+            // No effective model means the reloaded runtime resolves none for this
+            // alias (such an entry is only usable through routes that carry their
+            // own model), so there is nothing to validate and the probe stops
+            // before dispatch instead of failing the update.
+            let Some(probe_model_name) = selection
+                .model_id
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+            else {
+                return Ok(ModelProbeOutcome::SkippedNoModel);
+            };
+            // The temperature the served turns send for this alias: the configured
+            // one, or none, so the provider's own default applies. A fixed value
+            // here would fail the probe, and revert the change, for a model that
+            // rejects any temperature but serves the alias's turns fine.
+            let probe_temperature = selection.temperature();
+
+            (probe_model_name, probe_temperature)
         };
-        // The temperature the served turns send for this alias: the configured
-        // one, or none, so the provider's own default applies. A fixed value
-        // here would fail the probe, and revert the change, for a model that
-        // rejects any temperature but serves the alias's turns fine.
-        let probe_temperature = selection.temperature();
 
         let selection_ref = provider_name.to_string();
         let model_provider = zeroclaw_providers::model::build_nonblocking(move || {
-            zeroclaw_providers::create_model_provider_from_ref(&effective, &selection_ref)
+            zeroclaw_providers::model::build_raw_provider(
+                &effective,
+                &selection_ref,
+                Default::default(),
+            )
+            .map(|resolved| resolved.provider)
         })
         .await
         .map_err(|error| ProbeFailure::Construction {
@@ -1066,9 +1103,7 @@ impl ModelRoutingConfigTool {
     async fn handle_upsert_scenario(&self, args: &Value) -> anyhow::Result<ToolResult> {
         Self::validate_scenario_required_strings(args)?;
         let hint = Self::parse_non_empty_string(args, "hint")?;
-        let model_provider = Self::parse_non_empty_string(args, "model_provider")?;
-        let model = Self::parse_non_empty_string(args, "model")?;
-        let api_key_update = Self::parse_optional_string_update(args, "api_key")?;
+        let model_ref = Self::parse_non_empty_string(args, "model_ref")?;
 
         let keywords_update = if let Some(raw) = args.get("keywords") {
             Some(Self::parse_string_list(raw, "keywords")?)
@@ -1094,6 +1129,11 @@ impl ModelRoutingConfigTool {
 
         let mut cfg = self.load_config_without_env()?;
 
+        let registry = cfg.provider_registry()?;
+        registry.resolve_chat(&zeroclaw_config::provider_registry::ModelRef::from(
+            model_ref.as_str(),
+        ))?;
+
         let existing_route = cfg
             .model_routes
             .iter()
@@ -1102,20 +1142,11 @@ impl ModelRoutingConfigTool {
 
         let mut next_route = existing_route.unwrap_or(ModelRouteConfig {
             hint: hint.clone(),
-            model_provider: model_provider.clone(),
-            model: model.clone(),
-            api_key: None,
+            model_ref: model_ref.clone(),
         });
 
         next_route.hint = hint.clone();
-        next_route.model_provider = model_provider;
-        next_route.model = model;
-
-        match api_key_update {
-            MaybeSet::Set(api_key) => next_route.api_key = Some(api_key),
-            MaybeSet::Null => next_route.api_key = None,
-            MaybeSet::Unset => {}
-        }
+        next_route.model_ref = model_ref;
 
         cfg.model_routes.retain(|route| route.hint != hint);
         cfg.model_routes.push(next_route);
@@ -1684,7 +1715,7 @@ impl Tool for ModelRoutingConfigTool {
     }
 
     fn description(&self) -> &str {
-        "Manage default model settings, scenario-based model_provider/model routes, classification rules, and aliased agent profiles"
+        "Manage default model settings, scenario hint-to-model_ref routes, classification rules, and aliased agent profiles"
     }
 
     fn parameters_schema(&self) -> Value {
@@ -1745,21 +1776,25 @@ impl Tool for ModelRoutingConfigTool {
                     "type": "string",
                     "description": "Scenario hint name (for example: conversation, coding, reasoning). Required and nonblank for upsert_scenario."
                 },
-                "model_provider": {
+                "model_ref": {
                     "type": "string",
-                    "description": "ModelProvider for set_default/upsert_scenario/upsert_agent. For set_default, `<type>.<alias>` targets the profile (legacy `model` field) while `<type>.<alias>.<model>` targets that nested model entry's id/temperature. Required and nonblank for upsert_scenario."
-                },
-                "model": {
-                    "type": "string",
-                    "description": "Model for set_default/upsert_scenario or bare-family upsert_agent; omitted when upsert_agent reuses an existing dotted provider ref. Required and nonblank for upsert_scenario."
+                    "description": "Exact canonical model reference from [providers.models]. Required and nonblank for upsert_scenario."
                 },
                 "temperature": {
                     "type": ["number", "null"],
                     "description": "Optional temperature override (0.0-2.0)"
                 },
+                "model_provider": {
+                    "type": "string",
+                    "description": "ModelProvider for set_default/upsert_agent. For set_default, `<type>.<alias>` targets the profile while `<type>.<alias>.<model>` targets that nested model entry."
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Model for set_default or bare-family upsert_agent; omitted when upsert_agent reuses an existing dotted provider ref."
+                },
                 "api_key": {
                     "type": ["string", "null"],
-                    "description": "Optional API key override for scenario route or aliased agent"
+                    "description": "Optional API key for a bare-family aliased agent"
                 },
                 "keywords": {
                     "description": "Classification keywords for upsert_scenario (string or string array)",
@@ -1980,11 +2015,8 @@ mod tests {
                 schema["if"]["properties"]["action"]["enum"],
                 json!(["upsert_scenario"])
             );
-            assert_eq!(
-                schema["then"]["required"],
-                json!(["hint", "model_provider", "model"])
-            );
-            for field in ["hint", "model_provider", "model"] {
+            assert_eq!(schema["then"]["required"], json!(["hint", "model_ref"]));
+            for field in ["hint", "model_ref"] {
                 assert_eq!(
                     schema["then"]["properties"][field],
                     json!({"type": "string", "minLength": 1, "pattern": "\\S"})
@@ -2005,27 +2037,24 @@ mod tests {
         let tool = ModelRoutingConfigTool::new(config.clone(), test_security());
 
         for (args, invalid) in [
+            (json!({"action": "upsert_scenario"}), "hint, model_ref"),
             (
-                json!({"action": "upsert_scenario"}),
-                "hint, model_provider, model",
-            ),
-            (
-                json!({"action": "upsert_scenario", "hint": null, "model_provider": 42, "model": " \t\n"}),
-                "hint, model_provider, model",
+                json!({"action": "upsert_scenario", "hint": null, "model_ref": 42}),
+                "hint, model_ref",
             ),
             (
                 json!({"action": "upsert_scenario", "hint": "coding"}),
-                "model_provider, model",
+                "model_ref",
             ),
             (
-                json!({"action": "upsert_scenario", "hint": "coding", "model_provider": "openai", "model": "\u{2003}"}),
-                "model",
+                json!({"action": "upsert_scenario", "hint": "coding", "model_ref": "\u{2003}"}),
+                "model_ref",
             ),
         ] {
             let result = tool.execute(args).await.unwrap();
             assert!(!result.success);
             let error = result.error.unwrap();
-            assert!(error.contains("Supply nonempty strings for: hint, model_provider, model."));
+            assert!(error.contains("Supply nonempty strings for: hint, model_ref."));
             assert!(error.contains(&format!(
                 "Fix missing, non-string, or blank fields: {invalid}."
             )));
@@ -2201,6 +2230,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn candidate_probe_resolves_canonical_dotted_model_and_preset() {
+        let _test_serial = CONFIG_EDIT_TESTS.lock().await;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{body_partial_json, header, method, path},
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("x-probe-key", "configured"))
+            .and(body_partial_json(
+                json!({"model":"private-wire-id", "temperature":0.25}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices":[{"message":{"role":"assistant","content":"OK"}}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let config: Config = toml::from_str(&format!(
+            r#"
+schema_version = 4
+[providers.connections."gateway.prod"]
+kind = "custom"
+uri = "{}/v1"
+extra_headers = {{ "x-probe-key" = "configured" }}
+[providers.model_presets."chat.shared"]
+capability = "chat"
+options = {{ temperature = 0.25 }}
+[providers.models."chat.fast.us"]
+capability = "chat"
+provider = "gateway.prod"
+model = "private-wire-id"
+preset = "chat.shared"
+"#,
+            server.uri()
+        ))
+        .unwrap();
+        let tool = ModelRoutingConfigTool::new(Arc::new(config.clone()), test_security());
+        assert_eq!(
+            tool.probe_model(&config, "chat.fast.us").await.unwrap(),
+            ModelProbeOutcome::Verified,
+        );
+    }
+
+    #[tokio::test]
     async fn candidate_probe_uses_nested_model_and_profile_headers() {
         let _test_serial = CONFIG_EDIT_TESTS.lock().await;
         use wiremock::{
@@ -2212,7 +2287,7 @@ mod tests {
             .and(path("/v1/chat/completions"))
             .and(header("x-probe-key", "configured"))
             .and(body_partial_json(
-                json!({"model": "nested-wire-id", "temperature": 0.0}),
+                json!({"model": "nested-wire-id", "temperature": 0.25}),
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "choices": [{"message": {"role": "assistant", "content": "OK"}}]
@@ -2224,6 +2299,7 @@ mod tests {
         let profile = config.providers.models.ensure("custom", "probe").unwrap();
         profile.uri = Some(format!("{}/v1", server.uri()));
         profile.api_key = Some("test-key".into());
+        profile.temperature = Some(0.8);
         profile
             .extra_headers
             .insert("x-probe-key".into(), "configured".into());
@@ -2231,6 +2307,7 @@ mod tests {
             "nested".into(),
             zeroclaw_config::schema::ModelEntryConfig {
                 id: Some("nested-wire-id".into()),
+                temperature: Some(0.25),
                 ..Default::default()
             },
         );
@@ -2410,14 +2487,21 @@ mod tests {
     async fn upsert_scenario_creates_route_and_rule() {
         let _test_serial = CONFIG_EDIT_TESTS.lock().await;
         let tmp = TempDir::new().unwrap();
-        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
+        let mut config = Box::pin(test_config(&tmp)).await;
+        zeroclaw_config::migration::bind_test_route_model(
+            Arc::make_mut(&mut config),
+            "openai.default",
+            "test-model",
+            None,
+        );
+        config.save().await.unwrap();
+        let tool = ModelRoutingConfigTool::new(config, test_security());
 
         let result = tool
             .execute(json!({
                 "action": "upsert_scenario",
                 "hint": "coding",
-                "model_provider": "openai",
-                "model": "gpt-5.3-codex",
+                "model_ref": "openai.default",
                 "classification_enabled": true,
                 "keywords": ["code", "bug", "refactor"],
                 "patterns": ["```"],
@@ -2436,9 +2520,7 @@ mod tests {
 
         let scenarios = output["scenarios"].as_array().unwrap();
         assert!(scenarios.iter().any(|item| {
-            item["hint"] == json!("coding")
-                && item["model_provider"] == json!("openai")
-                && item["model"] == json!("gpt-5.3-codex")
+            item["hint"] == json!("coding") && item["model_ref"] == json!("openai.default")
         }));
     }
 
@@ -2446,14 +2528,21 @@ mod tests {
     async fn remove_scenario_also_removes_rule() {
         let _test_serial = CONFIG_EDIT_TESTS.lock().await;
         let tmp = TempDir::new().unwrap();
-        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
+        let mut config = Box::pin(test_config(&tmp)).await;
+        zeroclaw_config::migration::bind_test_route_model(
+            Arc::make_mut(&mut config),
+            "openai.default",
+            "test-model",
+            None,
+        );
+        config.save().await.unwrap();
+        let tool = ModelRoutingConfigTool::new(config, test_security());
 
         let _ = tool
             .execute(json!({
                 "action": "upsert_scenario",
                 "hint": "coding",
-                "model_provider": "openai",
-                "model": "gpt-5.3-codex",
+                "model_ref": "openai.default",
                 "classification_enabled": true,
                 "keywords": ["code"]
             }))

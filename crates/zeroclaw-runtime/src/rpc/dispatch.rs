@@ -412,7 +412,7 @@ fn model_provider_ref_from_provider_profile_prop(config: &Config, prop: &str) ->
 }
 
 /// Whether a config prop path touches `model_routes` (a field edit like
-/// `model_routes.<hint>.model_provider`, or the section path itself from a
+/// `model_routes.<hint>.model_ref`, or the section path itself from a
 /// map-key create/delete/rename on `model_routes`). A route table edit can
 /// change which provider/model a hint-routed call dispatches to and which
 /// capacity `ResolvedContextLimits` reports for it, so it needs the same live
@@ -43732,14 +43732,24 @@ model = "before"
         small.uri = Some("http://127.0.0.1:1".into());
         small.model = Some("small-model".into());
         small.context_window = Some(8_000);
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut cfg,
+            "openai.small-provider",
+            "small-model",
+            None,
+        );
 
         // A hint route initially points at the large provider.
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut cfg,
+            "openai.test-provider",
+            "old-model",
+            None,
+        );
         cfg.model_routes
             .push(zeroclaw_config::schema::ModelRouteConfig {
                 hint: "reasoning".into(),
-                model_provider: "openai.test-provider".into(),
-                model: "old-model".into(),
-                api_key: None,
+                model_ref: "openai.test-provider".into(),
             });
 
         let dispatcher = make_config_set_test_dispatcher(cfg);
@@ -43768,23 +43778,13 @@ model = "before"
         // Repoint the route at the small provider via the live config/set path.
         let res = dispatcher
             .handle_config_set(&json!({
-                "prop": "model_routes.reasoning.model_provider",
+                "prop": "model_routes.reasoning.model_ref",
                 "value": "openai.small-provider"
             }))
             .await;
         assert!(
             res.is_ok(),
-            "config/set model_routes.<hint>.model_provider must succeed: {res:?}"
-        );
-        let res = dispatcher
-            .handle_config_set(&json!({
-                "prop": "model_routes.reasoning.model",
-                "value": "small-model"
-            }))
-            .await;
-        assert!(
-            res.is_ok(),
-            "config/set model_routes.<hint>.model must succeed: {res:?}"
+            "config/set model_routes.<hint>.model_ref must succeed: {res:?}"
         );
 
         // A successful response acknowledges an already-published generation;
@@ -43810,7 +43810,7 @@ model = "before"
     }
 
     #[tokio::test]
-    async fn config_set_provider_refreshes_implicit_nested_route_model() {
+    async fn registry_edit_refreshes_the_referenced_route_model() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut cfg = make_model_refresh_test_config(&tmp);
         let provider = cfg
@@ -43834,12 +43834,16 @@ model = "before"
                 ..Default::default()
             },
         );
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut cfg,
+            "openai.test-provider.fast",
+            "fast-v1",
+            None,
+        );
         cfg.model_routes
             .push(zeroclaw_config::schema::ModelRouteConfig {
                 hint: "reasoning".into(),
-                model_provider: "openai.test-provider.fast".into(),
-                model: String::new(),
-                api_key: None,
+                model_ref: "openai.test-provider.fast".into(),
             });
 
         let dispatcher = make_config_set_test_dispatcher(cfg);
@@ -43862,20 +43866,17 @@ model = "before"
             );
         }
 
+        let expected =
+            zeroclaw_config::provider_registry::editor::snapshot(&dispatcher.ctx.config.read())
+                .unwrap();
+        let mut registry = expected.clone();
+        registry["models"]["openai.test-provider.fast"]["model"] = json!("fast-v2");
+        registry["models"]["openai.test-provider.fast"]["metadata"]["context_window"] =
+            json!(16000);
         dispatcher
-            .handle_config_set(&json!({
-                "prop": "providers.models.openai.test-provider.models.fast.id",
-                "value": "fast-v2"
-            }))
+            .handle_config_registry_set(&json!({"expected": expected, "registry": registry}))
             .await
-            .expect("editing the nested provider entry must succeed");
-        dispatcher
-            .handle_config_set(&json!({
-                "prop": "providers.models.openai.test-provider.models.fast.context_window",
-                "value": 16000
-            }))
-            .await
-            .expect("editing the nested context window must succeed");
+            .expect("editing the exact route model must succeed");
 
         let agent = dispatcher
             .ctx
@@ -43887,14 +43888,14 @@ model = "before"
         let route = agent.resolved_route_for_test("hint:reasoning");
         assert_eq!(
             route.model, "fast-v2",
-            "an implicit route model must refresh when its nested provider entry changes"
+            "the route must refresh when its exact model definition changes"
         );
         assert_eq!(
             agent
                 .context_limits_for_route(&route.provider_name, &route.model)
                 .model_context_window,
             16_000,
-            "context limits must come from the same refreshed nested model generation"
+            "context limits must come from the same refreshed model generation"
         );
     }
 
@@ -43909,7 +43910,13 @@ model = "before"
             .expect("openai staged-provider slot exists");
         staged.api_key = Some("test-key-staged".into());
         staged.uri = Some("http://127.0.0.1:1".into());
-        staged.model = None;
+        staged.model = Some("old-model".into());
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut cfg,
+            "openai.staged-provider",
+            "old-model",
+            None,
+        );
         let dispatcher = make_config_set_test_dispatcher(cfg);
         let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
 
@@ -43920,14 +43927,6 @@ model = "before"
             }))
             .await
             .expect("creating a staged model route must succeed");
-        dispatcher
-            .handle_config_set(&json!({
-                "prop": "model_routes.reasoning.model_provider",
-                "value": "openai.staged-provider"
-            }))
-            .await
-            .expect("setting the staged route provider must succeed");
-
         {
             let agent = dispatcher
                 .ctx
@@ -43944,8 +43943,8 @@ model = "before"
 
         dispatcher
             .handle_config_set(&json!({
-                "prop": "model_routes.reasoning.model",
-                "value": "old-model"
+                "prop": "model_routes.reasoning.model_ref",
+                "value": "openai.staged-provider"
             }))
             .await
             .expect("completing the staged route must atomically publish it");
@@ -44772,11 +44771,17 @@ model = "before"
         route_provider.api_key = Some("test-key".into());
         route_provider.uri = Some("http://127.0.0.1:1".into());
         route_provider.model = Some("route-model".into());
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut config,
+            "openai.route-only",
+            "route-model",
+            None,
+        );
         config
             .model_routes
             .push(zeroclaw_config::schema::ModelRouteConfig {
                 hint: "reasoning".into(),
-                model_provider: "openai.route-only".into(),
+                model_ref: "openai.route-only".into(),
                 ..Default::default()
             });
         let dispatcher = make_config_set_test_dispatcher(config);
@@ -44798,11 +44803,11 @@ model = "before"
 
         dispatcher
             .handle_config_set(&json!({
-                "prop": "providers.models.openai.route-only.model",
+                "prop": "model_routes.reasoning.model_ref",
                 "value": ""
             }))
             .await
-            .expect("removing an implicit route model must rebuild its old consumers");
+            .expect("clearing a staged route reference must rebuild its old consumers");
 
         let route = agent.lock().await.resolved_route_for_test("hint:reasoning");
         assert_eq!(route.provider_name, "openai.test-provider");
@@ -45485,13 +45490,17 @@ model = "before"
         routed.api_key = Some("routed-key".into());
         routed.model = Some("routed-model".into());
         routed.context_window = Some(8_000);
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut config,
+            "openai.routed-provider",
+            "routed-model",
+            None,
+        );
         config
             .model_routes
             .push(zeroclaw_config::schema::ModelRouteConfig {
                 hint: "reasoning".into(),
-                model_provider: "openai.routed-provider".into(),
-                model: "routed-model".into(),
-                api_key: None,
+                model_ref: "openai.routed-provider".into(),
             });
         let dispatcher = make_config_set_test_dispatcher(config);
         let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
@@ -46339,21 +46348,37 @@ model = "before"
     async fn config_set_many_refreshes_routes_and_capacity_in_one_generation() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = make_model_refresh_test_config(&tmp);
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut config,
+            "openai.test-provider",
+            "old-model",
+            None,
+        );
+        let test_provider = config
+            .providers
+            .models
+            .ensure("openai", "capacity-provider")
+            .expect("openai capacity-provider slot exists");
+        test_provider.model = Some("batched-model".into());
+        test_provider.context_window = Some(32_000);
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut config,
+            "openai.capacity-provider",
+            "batched-model",
+            None,
+        );
         config
             .model_routes
             .push(zeroclaw_config::schema::ModelRouteConfig {
                 hint: "reasoning".into(),
-                model_provider: "openai.test-provider".into(),
-                model: "old-model".into(),
-                api_key: None,
+                model_ref: "openai.test-provider".into(),
             });
         let dispatcher = make_config_set_test_dispatcher(config);
         let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
         let before = dispatcher.ctx.auth.accepted_revision();
         dispatcher
             .handle_config_set_many(&json!({"sets": [
-                {"prop": "providers.models.openai.test-provider.context_window", "value": 32000},
-                {"prop": "model_routes.reasoning.model", "value": "batched-model"}
+                {"prop": "model_routes.reasoning.model_ref", "value": "openai.capacity-provider"}
             ]}))
             .await
             .expect("the whole batch must commit");

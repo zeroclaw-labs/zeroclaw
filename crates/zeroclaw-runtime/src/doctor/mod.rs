@@ -1538,12 +1538,12 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         if route.hint.is_empty() {
             items.push(DiagItem::warn(cat, "model route with empty hint"));
         }
-        if let Some(reason) = provider_validation_error(config, &route.model_provider) {
+        if let Some(reason) = provider_validation_error(config, &route.model_ref) {
             items.push(DiagItem::warn(
                 cat,
                 format!(
                     "model route \"{}\" uses invalid model_provider \"{}\": {}",
-                    route.hint, route.model_provider, reason
+                    route.hint, route.model_ref, reason
                 ),
             ));
         }
@@ -3401,9 +3401,7 @@ mod tests {
         let config = Config {
             model_routes: vec![zeroclaw_config::schema::ModelRouteConfig {
                 hint: "fast".into(),
-                model_provider: "groq".into(),
-                model: String::new(),
-                api_key: None,
+                model_ref: "groq".into(),
             }],
             ..Config::default()
         };
@@ -3429,13 +3427,17 @@ mod tests {
                 ..Default::default()
             },
         );
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut config,
+            "openai.default.fast",
+            "gpt-4o-mini",
+            None,
+        );
         config
             .model_routes
             .push(zeroclaw_config::schema::ModelRouteConfig {
                 hint: "fast".into(),
-                model_provider: "openai.default.fast".into(),
-                model: String::new(),
-                api_key: None,
+                model_ref: "openai.default.fast".into(),
             });
 
         let mut items = Vec::new();

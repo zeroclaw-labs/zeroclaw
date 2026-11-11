@@ -244,7 +244,7 @@ Each provider entry resolves credentials in this order:
 2. **Secrets store** at `~/.zeroclaw/secrets`.
 3. **Generic env override**: `ZEROCLAW_providers__models__<type>__<alias>__api_key=...` at startup. If your shell already exports `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, or a similar vendor-default name, bridge it into this schema-mirror variable before startup unless the provider family explicitly documents a native runtime env bridge. See [Environment variables](../reference/env-vars.md) for the full grammar and bridge examples.
 
-Credentials are not shared between provider profiles; set them per profile. A route-level `model_routes[].api_key` is a higher-precedence override when its routed target is constructed. Route targets are deduplicated by `model_provider`, so the first matching route credential can construct the provider shared by several hints. Prefer profile-owned credentials when routes share a target.
+Credentials are owned by the canonical model's connection. A `[[model_routes]]` entry contains only `hint` and exact `model_ref`, so it cannot introduce a second credential or silently override the target model. When several hints use the same reference, they naturally share that model definition; different references are materialized independently.
 
 ## Related Documentation
 

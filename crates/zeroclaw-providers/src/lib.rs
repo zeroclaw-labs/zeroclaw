@@ -2108,73 +2108,6 @@ fn create_resilient_model_provider_from_ref_with_model_override(
     }
 }
 
-/// Build a routed entry without pinning its primary model. Route hints carry
-/// the model argument at dispatch time, so one provider profile can serve
-/// several model IDs without reconstructing a provider for every hint.
-fn create_resilient_model_provider_from_ref_for_route(
-    config: &zeroclaw_config::schema::Config,
-    name: &str,
-    api_key: Option<&str>,
-    api_url: Option<&str>,
-    reliability: &zeroclaw_config::schema::ReliabilityConfig,
-    options: &ModelProviderRuntimeOptions,
-    route_model: Option<&str>,
-) -> anyhow::Result<Box<dyn ModelProvider>> {
-    let name = name.trim();
-    ensure_known_model_entry_ref(config, name)?;
-    let canonical_ref = zeroclaw_config::provider_registry::ModelRef::from(name);
-    if config
-        .providers
-        .models
-        .canonical_model(&canonical_ref)
-        .is_some()
-    {
-        return Ok(crate::model::build_canonical_provider_with_options(
-            config,
-            &canonical_ref,
-            crate::model::ProviderOverrides {
-                model: route_model,
-                api_key,
-            },
-            options,
-            false,
-        )?
-        .provider);
-    }
-
-    let selection = config.resolve_model_selection(name);
-    let mut options = options.clone();
-    apply_model_entry_options(
-        &mut options,
-        selection.as_ref().and_then(|selected| selected.model_entry),
-    );
-    match config.providers.models.profile_ref(name) {
-        Some((family, alias))
-            if !family.contains(':') && config.providers.models.find(family, alias).is_some() =>
-        {
-            create_resilient_model_provider_for_alias_with_model_override_and_pin(
-                config,
-                family,
-                alias,
-                api_key,
-                api_url,
-                reliability,
-                &options,
-                None,
-                name,
-                false,
-            )
-        }
-        _ => create_resilient_model_provider_with_options(
-            name,
-            api_key,
-            api_url,
-            reliability,
-            &options,
-        ),
-    }
-}
-
 /// A configured profile may have a dotted alias, but any suffix beyond that
 /// alias selects a model entry. Never turn a missing entry into a profile call.
 pub fn ensure_known_model_entry_ref(
@@ -2247,7 +2180,7 @@ pub fn model_route_resolver(
             (
                 route.hint.clone(),
                 router::Route {
-                    provider_name: route.model_provider.clone(),
+                    provider_name: route.model_ref.clone(),
                     model: route.effective_model(config),
                 },
             )
@@ -2260,7 +2193,7 @@ pub fn model_route_resolver(
     ))
 }
 
-/// Routes whose three identity fields are all present. Config map editing
+/// Routes whose hint and referenced model are both materialized. Config map editing
 /// creates a default route entry and fills its fields through separate
 /// writes; a staged entry is not yet a routing fact.
 fn materialized_model_routes<'a>(
@@ -2269,7 +2202,7 @@ fn materialized_model_routes<'a>(
 ) -> impl Iterator<Item = &'a zeroclaw_config::schema::ModelRouteConfig> {
     model_routes.iter().filter(move |route| {
         !route.hint.trim().is_empty()
-            && !route.model_provider.trim().is_empty()
+            && !route.model_ref.trim().is_empty()
             && !route.effective_model(config).trim().is_empty()
     })
 }
@@ -2291,8 +2224,7 @@ pub fn create_routed_model_provider_with_options_and_resolver(
     // Config map editing creates a default route entry and then fills its
     // required fields through separate writes. Such a staged entry is not yet
     // a routing fact: omit it from the materialized provider/resolver until the
-    // hint, provider ref, and effective model are present. The effective model
-    // may come from a three-segment provider ref when `model` is omitted.
+    // hint, model reference, and effective model are present.
     // `Config::validate` remains the canonical persisted-config gate and still
     // rejects incomplete routes.
     let materialized_routes: Vec<_> = materialized_model_routes(config, model_routes).collect();
@@ -2311,101 +2243,36 @@ pub fn create_routed_model_provider_with_options_and_resolver(
         return Ok((provider, resolver));
     }
 
-    // Collect unique model_provider names needed
+    // The default slot carries invocation overrides. Hint targets always use
+    // their canonical definitions, even when the exact reference equals the
+    // default's: a CLI/session model override must not change a declared route.
     let mut needed: Vec<String> = vec![primary_name.to_string()];
     for route in &materialized_routes {
-        if !needed.iter().any(|n| n == &route.model_provider) {
-            needed.push(route.model_provider.clone());
+        if !needed[1..].iter().any(|name| name == &route.model_ref) {
+            needed.push(route.model_ref.clone());
         }
     }
 
-    // Create each model_provider (with its own resilience wrapper). Each
-    // entry's options come from its own typed alias block when dotted;
-    // the primary inherits the caller's options (already alias-resolved
-    // upstream for the owning agent).
+    // Every route references a complete canonical model. Build it independently
+    // so its options, credentials and fallback models cannot inherit from the
+    // caller's primary model.
     let mut model_providers: Vec<(String, Box<dyn ModelProvider>)> = Vec::new();
-    for name in &needed {
-        let is_primary = name == primary_name;
-        let routed_model = materialized_routes
-            .iter()
-            .find(|route| &route.model_provider == name)
-            .map(|route| route.effective_model(config));
-        let is_routed = routed_model.is_some();
-        let routed_credential = materialized_routes
-            .iter()
-            .find(|r| &r.model_provider == name)
-            .and_then(|r| {
-                r.api_key.as_ref().and_then(|raw_key| {
-                    let trimmed_key = raw_key.trim();
-                    (!trimmed_key.is_empty()).then_some(trimmed_key)
-                })
-            });
-        let key = routed_credential
-            .or_else(|| {
-                config
-                    .providers
-                    .models
-                    .profile_ref(name)
-                    .and_then(|(family, alias)| {
-                        config
-                            .providers
-                            .models
-                            .find(family, alias)
-                            .and_then(|cfg| cfg.api_key.as_deref())
-                    })
-                    .and_then(|raw_key| {
-                        let trimmed = raw_key.trim();
-                        (!trimmed.is_empty()).then_some(trimmed)
-                    })
-            })
-            .or_else(|| is_primary.then_some(api_key).flatten());
-        let url = if is_primary { api_url } else { None };
-        let entry_options = if is_primary {
-            options.clone()
-        } else {
-            options_for_provider_ref(config, name, options)
-        };
-        // A route may point back to the primary provider with a different
-        // model. Pinning the primary to the agent's default would make the
-        // route hint resolve correctly but still send the default upstream
-        // model. Leave that entry unpinned so the router's route model wins.
-        let primary_is_routed = materialized_routes
-            .iter()
-            .any(|route| route.model_provider == *primary_name);
-        let model_override = if is_primary && !primary_is_routed {
-            Some(default_model)
-        } else {
-            None
-        };
-
-        let built = if is_routed {
-            create_resilient_model_provider_from_ref_for_route(
-                config,
-                name,
-                key,
-                url,
-                reliability,
-                &entry_options,
-                routed_model.as_deref(),
-            )
-        } else {
+    for (index, name) in needed.iter().enumerate() {
+        let provider = if index == 0 {
             create_resilient_model_provider_from_ref_with_model_override(
                 config,
                 name,
-                key,
-                url,
+                api_key,
+                api_url,
                 reliability,
-                &entry_options,
-                model_override,
-            )
+                options,
+                Some(default_model),
+            )?
+        } else {
+            model::build_reliable_provider(config, name, model::ProviderOverrides::default())?
+                .provider
         };
-
-        match built {
-            Ok(model_provider) => model_providers.push((name.clone(), model_provider)),
-            Err(e) => {
-                anyhow::bail!("Routed model_provider `{name}` failed to initialize: {e}");
-            }
-        }
+        model_providers.push((name.clone(), provider));
     }
 
     // Build route table
@@ -2415,10 +2282,7 @@ pub fn create_routed_model_provider_with_options_and_resolver(
             (
                 r.hint.clone(),
                 router::Route {
-                    provider_name: r.model_provider.clone(),
-                    // An unset route model resolves through the selection
-                    // contract so a three-segment route ref names its nested
-                    // model entry instead of dispatching with an empty model.
+                    provider_name: r.model_ref.clone(),
                     model: r.effective_model(config),
                 },
             )
@@ -3964,11 +3828,15 @@ mod tests {
                 },
             },
         );
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut config,
+            "custom.primary.fast",
+            "nested-fast-model",
+            None,
+        );
         let routes = [ModelRouteConfig {
             hint: "fast".to_string(),
-            model_provider: "custom.primary.fast".to_string(),
-            model: String::new(),
-            api_key: None,
+            model_ref: "custom.primary.fast".to_string(),
         }];
         let provider = create_routed_model_provider_with_options(
             &config,
@@ -4201,6 +4069,12 @@ mod tests {
                 base: ModelProviderConfig::default(),
             },
         );
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut config,
+            "openrouter.route",
+            "route-model",
+            Some("route-key"),
+        );
         let options = provider_runtime_options_for_alias(&config, "openai", "primary");
         assert_eq!(options.provider_kind.as_deref(), Some("openai-compatible"));
 
@@ -4212,9 +4086,7 @@ mod tests {
             &config.reliability,
             &[ModelRouteConfig {
                 hint: "fast".to_string(),
-                model_provider: "openrouter.route".to_string(),
-                model: "openrouter/auto".to_string(),
-                api_key: None,
+                model_ref: "openrouter.route".to_string(),
             }],
             "gpt-test",
             &options,
@@ -5650,20 +5522,22 @@ mod tests {
 
     #[test]
     fn routed_model_provider_omits_incomplete_staged_routes() {
-        let config = config_with_openai_alias();
+        let mut config = config_with_openai_alias();
         let reliability = zeroclaw_config::schema::ReliabilityConfig::default();
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut config,
+            "openai.alias",
+            "gpt-4o",
+            None,
+        );
         let routes = [
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "staged".into(),
-                model_provider: String::new(),
-                model: String::new(),
-                api_key: None,
+                model_ref: String::new(),
             },
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "ready".into(),
-                model_provider: "openai.alias".into(),
-                model: "gpt-4o".into(),
-                api_key: None,
+                model_ref: "openai.alias".into(),
             },
         ];
 
@@ -5685,20 +5559,22 @@ mod tests {
 
     #[test]
     fn config_derived_route_resolver_matches_the_routed_provider_resolver() {
-        let config = config_with_openai_alias();
+        let mut config = config_with_openai_alias();
         let reliability = zeroclaw_config::schema::ReliabilityConfig::default();
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut config,
+            "openai.alias",
+            "gpt-4o-mini",
+            None,
+        );
         let routes = [
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "staged".into(),
-                model_provider: String::new(),
-                model: String::new(),
-                api_key: None,
+                model_ref: String::new(),
             },
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "fast".into(),
-                model_provider: "openai.alias".into(),
-                model: "gpt-4o-mini".into(),
-                api_key: None,
+                model_ref: "openai.alias".into(),
             },
         ];
         for routes in [&routes[..], &[]] {
@@ -5732,13 +5608,17 @@ mod tests {
 
     #[test]
     fn routed_model_provider_credential_precedence_uses_route_key_first() {
-        let config = config_with_openai_alias();
+        let mut config = config_with_openai_alias();
         let reliability = zeroclaw_config::schema::ReliabilityConfig::default();
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut config,
+            "openai.alias",
+            "gpt-4o",
+            Some("route-key"),
+        );
         let routes = [zeroclaw_config::schema::ModelRouteConfig {
             hint: "test".into(),
-            model_provider: "openai.alias".into(),
-            model: "gpt-4o".into(),
-            api_key: Some("route-key".into()),
+            model_ref: "openai.alias".into(),
         }];
 
         let result = create_routed_model_provider_with_options(
@@ -5761,14 +5641,18 @@ mod tests {
 
     #[test]
     fn routed_model_provider_credential_precedence_uses_config_entry_key() {
-        let config = config_with_openai_alias();
+        let mut config = config_with_openai_alias();
         let reliability = zeroclaw_config::schema::ReliabilityConfig::default();
         // Route has no api_key — should fall back to config entry key "openai-alias-key"
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut config,
+            "openai.alias",
+            "gpt-4o",
+            None,
+        );
         let routes = [zeroclaw_config::schema::ModelRouteConfig {
             hint: "test".into(),
-            model_provider: "openai.alias".into(),
-            model: "gpt-4o".into(),
-            api_key: None,
+            model_ref: "openai.alias".into(),
         }];
 
         let result = create_routed_model_provider_with_options(
@@ -5791,14 +5675,13 @@ mod tests {
 
     #[test]
     fn routed_model_provider_credential_precedence_falls_back_to_api_key_param() {
-        let config = zeroclaw_config::schema::Config::default(); // no entry in config.models
+        let mut config = zeroclaw_config::schema::Config::default(); // no entry in config.models
         let reliability = zeroclaw_config::schema::ReliabilityConfig::default();
         // Neither route nor config entry has api_key — should use the param "fallback-key"
+        zeroclaw_config::migration::bind_test_route_model(&mut config, "openai", "gpt-4o", None);
         let routes = [zeroclaw_config::schema::ModelRouteConfig {
             hint: "test".into(),
-            model_provider: "openai".into(),
-            model: "gpt-4o".into(),
-            api_key: None,
+            model_ref: "openai".into(),
         }];
 
         let result = create_routed_model_provider_with_options(
@@ -5821,15 +5704,14 @@ mod tests {
 
     #[test]
     fn routed_model_provider_credential_skips_config_entry_for_non_dotted_name() {
-        let config = zeroclaw_config::schema::Config::default();
+        let mut config = zeroclaw_config::schema::Config::default();
         let reliability = zeroclaw_config::schema::ReliabilityConfig::default();
         // Non-dotted name "openai" — split_once('.') returns None, so config entry
         // lookup is skipped entirely. Falls back to api_key param.
+        zeroclaw_config::migration::bind_test_route_model(&mut config, "openai", "gpt-4o", None);
         let routes = [zeroclaw_config::schema::ModelRouteConfig {
             hint: "test".into(),
-            model_provider: "openai".into(),
-            model: "gpt-4o".into(),
-            api_key: None,
+            model_ref: "openai".into(),
         }];
 
         let result = create_routed_model_provider_with_options(

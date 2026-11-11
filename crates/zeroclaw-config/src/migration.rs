@@ -5,6 +5,61 @@ use crate::schema::Config;
 use crate::schema::v1::V1Config;
 use crate::schema::v2::V2Config;
 
+mod model_routes;
+
+/// Adapt existing provider test fixtures to canonical route model definitions.
+/// This is test-only fixture construction; current configuration never accepts
+/// route-owned model ids or credentials.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn bind_test_route_model(
+    config: &mut Config,
+    reference: &str,
+    model_id: &str,
+    api_key: Option<&str>,
+) {
+    use crate::provider_registry::{ModelRef, ProviderId};
+    let (mut connection, mut model) = if let Some(model) = config
+        .providers
+        .models
+        .canonical_model(&ModelRef::from(reference))
+    {
+        let connection = &config.providers.connections[model.provider()];
+        (
+            serde_json::to_value(connection).unwrap(),
+            serde_json::to_value(model).unwrap(),
+        )
+    } else if let Some(selection) = config.resolve_model_selection(reference) {
+        let profiles = serde_json::to_value(&config.providers.models).unwrap();
+        model_routes::legacy_model(
+            &profiles[selection.family][selection.alias],
+            selection.family,
+            selection.model_entry,
+        )
+        .unwrap()
+    } else {
+        (
+            serde_json::json!({"kind":"custom", "uri":"https://example.invalid/v1"}),
+            serde_json::json!({"capability":"chat", "provider":""}),
+        )
+    };
+    if let Some(api_key) = api_key {
+        connection["auth"] = serde_json::json!({"mode":"api_key", "api_key":api_key});
+    }
+    let connection_ref = format!("test.{reference}");
+    model["provider"] = connection_ref.clone().into();
+    if !model_id.trim().is_empty() {
+        model["model"] = model_id.into();
+    }
+    config.providers.connections.insert(
+        ProviderId::from(connection_ref),
+        serde_json::from_value(connection).unwrap(),
+    );
+    config.providers.models.insert_canonical_model(
+        ModelRef::from(reference),
+        serde_json::from_value(model).unwrap(),
+    );
+}
+
 /// The schema version this binary writes and expects on disk.
 ///
 /// V4 retires keys listed in [`RETIRED_KEYS`] (first: `[security.nevis]`).
@@ -2573,11 +2628,10 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
             .context("failed to deserialize as V2 schema")?;
         v2.migrate().context("failed to migrate V2 → V3")
     },
-    // V3 → V4: canonical provider definitions are already TOML-keyed and
-    // therefore need no lossy family/alias reshaping. The step stamps the
-    // version and lets the V4 retirement pass remove only keys that are no
-    // longer part of the current schema.
-    |value| stamp_schema_version(value, 4),
+    // V3 → V4: retire route-owned provider/model/credential fields by
+    // materializing each route as an ordinary canonical model and connection;
+    // the current route then keeps only its hint and exact model reference.
+    |value| model_routes::migrate(value).and_then(|value| stamp_schema_version(value, 4)),
 ];
 
 const _: () = assert!(

@@ -16296,18 +16296,16 @@ impl Default for SchedulerConfig {
 
 // ── Model routing ────────────────────────────────────────────────
 
-/// Route a task hint to a specific model_provider + model.
+/// Route a task hint to one canonical model reference.
 ///
 /// ```toml
 /// [[model_routes]]
 /// hint = "reasoning"
-/// model_provider = "openrouter.default"
-/// model = "anthropic/claude-opus-4-20250514"
+/// model_ref = "chat.reasoning"
 ///
 /// [[model_routes]]
 /// hint = "fast"
-/// model_provider = "groq.low-latency"
-/// model = "llama-3.3-70b-versatile"
+/// model_ref = "chat.fast"
 /// ```
 ///
 /// Usage: pass `hint:reasoning` as the model parameter to route the request.
@@ -16315,6 +16313,7 @@ impl Default for SchedulerConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "model_routes"]
 #[application = "model_provider_refresh"]
+#[serde(deny_unknown_fields)]
 pub struct ModelRouteConfig {
     /// Task hint name (e.g. "reasoning", "fast", "code", "summarize")
     /// `#[serde(default)]` lets the `create_map_key` macro default-construct
@@ -16322,46 +16321,24 @@ pub struct ModelRouteConfig {
     /// are rejected by `Config::validate()`.
     #[serde(default)]
     pub hint: String,
-    /// Dotted provider profile ref to route to (must resolve to `providers.models.<type>.<alias>`)
+    /// Exact canonical model reference (must resolve to a key in
+    /// `[providers.models]`). Dots are part of the TOML key and are never
+    /// interpreted as path separators.
     /// `#[serde(default)]` is required for `Default` + `create_map_key` construction.
     /// Empty strings are rejected by `Config::validate()`.
     #[serde(default)]
-    pub model_provider: String,
-    /// Provider-local model identifier to use with that provider profile.
-    /// When omitted, the model selected by `model_provider` is used.
-    /// `#[serde(default)]` is required for `Default` + `create_map_key` construction.
-    #[serde(default)]
-    pub model: String,
-    /// Optional API key override for this route's model provider
-    #[serde(default)]
-    #[secret]
-    #[credential_class = "encrypted_secret"]
-    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub api_key: Option<String>,
+    pub model_ref: String,
 }
 
 impl ModelRouteConfig {
-    /// The provider-local model this route requests: the explicit `model`
-    /// when set, otherwise the model id selected by the `model_provider`
-    /// reference — a three-segment `<type>.<alias>.<model_alias>` ref names a
-    /// nested model entry, and a two-segment ref resolves the profile's
-    /// default. Empty when neither resolves.
+    /// Resolve the upstream model id owned by the referenced canonical model.
+    /// Empty means the route is incomplete or the model has no upstream id.
     pub fn effective_model(&self, config: &Config) -> String {
-        let explicit = self.model.trim();
-        if !explicit.is_empty() {
-            return explicit.to_string();
-        }
-        // Canonical model references are exact TOML keys. Resolve them before
-        // the legacy family/alias parser, which intentionally treats dots as
-        // profile separators and therefore cannot identify a dotted key.
-        let canonical_ref = crate::provider_registry::ModelRef::from(self.model_provider.trim());
+        let canonical_ref = crate::provider_registry::ModelRef::from(self.model_ref.trim());
         if let Some(model) = config.providers.models.canonical_model(&canonical_ref) {
             return model.upstream_model().unwrap_or_default().to_owned();
         }
-        config
-            .resolve_model_selection(&self.model_provider)
-            .and_then(|selection| selection.model_id)
-            .unwrap_or_default()
+        String::new()
     }
 }
 
@@ -26059,11 +26036,8 @@ impl Config {
 
         // Model routes
         for (i, route) in self.model_routes.iter().enumerate() {
-            let required = crate::setup::route_required_fields(
-                &route.hint,
-                &route.model_provider,
-                &route.model,
-            );
+            let required = crate::setup::route_required_fields(&route.hint, &route.model_ref);
+            let model_ref = route.model_ref.trim();
             if required.hint.missing {
                 validation_bail!(
                     RequiredFieldEmpty,
@@ -26071,77 +26045,43 @@ impl Config {
                     "model_routes[{i}].hint must not be empty"
                 );
             }
-            let mp = route.model_provider.trim();
-            if required.model_provider.missing {
+            if required.model_ref.missing {
                 validation_bail!(
                     RequiredFieldEmpty,
-                    format!("model_routes[{i}].model_provider"),
-                    "model_routes[{i}].model_provider must not be empty"
+                    format!("model_routes[{i}].model_ref"),
+                    "model_routes[{i}].model_ref must not be empty"
                 );
             }
-            // Route refs are dotted `<type>.<alias>` (optionally three-segment
-            // `<type>.<alias>.<model>`) and must resolve to a configured
-            // `[providers.models.<type>.<alias>]` entry. Unresolved routes are
-            // dropped at runtime construction; rejecting them here keeps that
-            // drift visible at config-load time.
-            match self.providers.models.profile_ref(mp) {
-                Some((ty, inner)) => {
-                    if self.providers.models.find(ty, inner).is_none() {
-                        validation_bail!(
-                            DanglingReference,
-                            format!("model_routes[{i}].model_provider"),
-                            "model_routes[{i}].model_provider = {mp:?} but providers.models.{ty}.{inner} is not configured",
-                        );
-                    }
-                    if let Some(model_alias) = mp
-                        .strip_prefix(ty)
-                        .and_then(|tail| tail.strip_prefix('.'))
-                        .and_then(|tail| tail.strip_prefix(inner))
-                        .and_then(|tail| tail.strip_prefix('.'))
-                        && !model_alias.is_empty()
-                        && self
-                            .providers
-                            .models
-                            .find_model(ty, inner, model_alias)
-                            .is_none()
-                    {
-                        validation_bail!(
-                            DanglingReference,
-                            format!("model_routes[{i}].model_provider"),
-                            "model_routes[{i}].model_provider = {mp:?} but [providers.models.{ty}.{inner}.models.{model_alias}] is not configured",
-                        );
-                    }
-                }
-                None => validation_bail!(
+            let model_key = crate::provider_registry::ModelRef::from(model_ref);
+            let Some(model) = self.providers.models.canonical_model(&model_key) else {
+                validation_bail!(
+                    DanglingReference,
+                    format!("model_routes[{i}].model_ref"),
+                    "model_routes[{i}].model_ref = {model_ref:?} does not resolve to a canonical providers.models entry"
+                );
+            };
+            if model.capability() != zeroclaw_api::capability::Capability::Chat {
+                validation_bail!(
                     InvalidFormat,
-                    format!("model_routes[{i}].model_provider"),
-                    "model_routes[{i}].model_provider must be dotted form `<type>.<alias>` (got {mp:?})",
-                ),
+                    format!("model_routes[{i}].model_ref"),
+                    "model_routes[{i}].model_ref = {model_ref:?} must reference a chat model"
+                );
             }
-            if route.model.trim().is_empty()
-                && self
-                    .resolve_model_selection(mp)
-                    .and_then(|selection| selection.model_id)
-                    .as_deref()
-                    .map(str::trim)
-                    .is_none_or(str::is_empty)
+            if model
+                .upstream_model()
+                .is_none_or(|model| model.trim().is_empty())
             {
                 validation_bail!(
                     RequiredFieldEmpty,
-                    format!("model_routes[{i}].model"),
-                    "model_routes[{i}].model may be omitted only when model_provider resolves to a configured model id"
+                    format!("model_routes[{i}].model_ref"),
+                    "model_routes[{i}].model_ref = {model_ref:?} must reference a chat model with a model id"
                 );
             }
         }
 
         // Embedding routes
         for (i, route) in self.embedding_routes.iter().enumerate() {
-            let required = crate::setup::route_required_fields(
-                &route.hint,
-                &route.model_provider,
-                &route.model,
-            );
-            if required.hint.missing {
+            if route.hint.trim().is_empty() {
                 validation_bail!(
                     RequiredFieldEmpty,
                     format!("embedding_routes[{i}].hint"),
@@ -26149,7 +26089,7 @@ impl Config {
                 );
             }
             let mp = route.model_provider.trim();
-            if required.model_provider.missing {
+            if mp.is_empty() {
                 validation_bail!(
                     RequiredFieldEmpty,
                     format!("embedding_routes[{i}].model_provider"),
@@ -26183,7 +26123,7 @@ impl Config {
                     "embedding_routes[{i}].model_provider must use two-segment `<type>.<alias>` form; set embedding_routes[{i}].model separately (got {mp:?})",
                 ),
             }
-            if required.model.missing {
+            if route.model.trim().is_empty() {
                 validation_bail!(
                     RequiredFieldEmpty,
                     format!("embedding_routes[{i}].model"),
@@ -30085,11 +30025,11 @@ mod tests {
         let mut previous = Config::default();
         previous.model_routes.push(ModelRouteConfig {
             hint: "fast".into(),
-            model: "old-model".into(),
+
             ..ModelRouteConfig::default()
         });
         let mut candidate = previous.clone();
-        candidate.model_routes[0].model = "new-model".into();
+        candidate.model_routes[0].model_ref = "chat.new-model".into();
         candidate.gateway.paired_tokens.push("test-token".into());
         assert_eq!(
             Config::semantic_changed_paths(&previous, &candidate).unwrap(),
@@ -39813,69 +39753,36 @@ model = "primary-model"
     }
 
     #[test]
-    async fn model_route_effective_model_resolves_nested_refs() {
-        let _env_guard = env_override_lock().await;
+    async fn model_route_effective_model_resolves_exact_model_keys() {
         let mut config = Config::default();
-        config.providers.models.openrouter.insert(
-            "default".to_string(),
-            OpenRouterModelProviderConfig {
-                base: ModelProviderConfig {
-                    model: Some("profile-model".to_string()),
-                    models: HashMap::from([
-                        (
-                            "default".to_string(),
-                            ModelEntryConfig {
-                                id: Some("nested-default".to_string()),
-                                ..Default::default()
-                            },
-                        ),
-                        (
-                            "reasoning".to_string(),
-                            ModelEntryConfig {
-                                id: Some("nested-reasoning".to_string()),
-                                ..Default::default()
-                            },
-                        ),
-                    ]),
-                    ..Default::default()
-                },
-            },
+        for (reference, model) in [
+            ("chat.gateway.prod", "reasoning-id"),
+            ("chat.gateway", "fast-id"),
+        ] {
+            crate::migration::bind_test_route_model(&mut config, reference, model, None);
+        }
+        for (reference, expected) in [
+            ("chat.gateway.prod", "reasoning-id"),
+            ("chat.gateway", "fast-id"),
+            ("chat.gateway.missing", ""),
+            ("", ""),
+        ] {
+            let route = ModelRouteConfig {
+                hint: "reasoning".into(),
+                model_ref: reference.into(),
+            };
+            assert_eq!(route.effective_model(&config), expected);
+        }
+        assert!(
+            toml::from_str::<ModelRouteConfig>(
+                "hint='x'\nmodel_ref='chat.gateway'\nmodel='override'"
+            )
+            .is_err()
         );
-
-        // A three-segment route ref with no explicit `model` names its nested
-        // model entry instead of dispatching with an empty model string.
-        let route = ModelRouteConfig {
-            hint: "reasoning".to_string(),
-            model_provider: "openrouter.default.reasoning".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(route.effective_model(&config), "nested-reasoning");
-
-        // A two-segment ref resolves the profile default (models.default
-        // before the legacy profile-level `model`).
-        let route = ModelRouteConfig {
-            hint: "fast".to_string(),
-            model_provider: "openrouter.default".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(route.effective_model(&config), "nested-default");
-
-        // An explicit `model` always wins over the ref resolution.
-        let route = ModelRouteConfig {
-            hint: "pinned".to_string(),
-            model_provider: "openrouter.default.reasoning".to_string(),
-            model: "explicit-model".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(route.effective_model(&config), "explicit-model");
-
-        // Nothing set — not even whitespace-only model text — resolves.
-        let route = ModelRouteConfig {
-            hint: "empty".to_string(),
-            model: "  ".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(route.effective_model(&config), "");
+        assert!(
+            toml::from_str::<ModelRouteConfig>("hint='x'\nmodel_ref='chat.gateway'\napi_key='key'")
+                .is_err()
+        );
     }
 
     #[::core::prelude::v1::test]
@@ -39899,11 +39806,15 @@ model = "primary-model"
                 },
             },
         );
+        crate::migration::bind_test_route_model(
+            &mut config,
+            "openai.gateway.fast",
+            "gpt-nested",
+            None,
+        );
         config.model_routes.push(ModelRouteConfig {
             hint: "fast".to_string(),
-            model_provider: "openai.gateway.fast".to_string(),
-            model: String::new(),
-            api_key: None,
+            model_ref: "openai.gateway.fast".to_string(),
         });
 
         assert!(
@@ -52278,9 +52189,7 @@ allowed_users = []
         // prop_fields with EncryptedSecret classification (from #[secret]).
         config.model_routes.push(ModelRouteConfig {
             hint: "reasoning".into(),
-            model_provider: "openai.default".into(),
-            model: "gpt-4".into(),
-            api_key: None,
+            model_ref: "openai.default".into(),
         });
         config.embedding_routes.push(EmbeddingRouteConfig {
             hint: "semantic".into(),
@@ -52296,10 +52205,7 @@ allowed_users = []
                 .find(|field| field.name == name)
                 .and_then(|field| field.credential_class)
         };
-        assert_eq!(
-            nested_class_for("model_routes.reasoning.api_key"),
-            Some(crate::config::CredentialSurfaceClass::EncryptedSecret)
-        );
+        assert_eq!(nested_class_for("model_routes.reasoning.api_key"), None);
         assert_eq!(
             nested_class_for("embedding_routes.semantic.api_key"),
             Some(crate::config::CredentialSurfaceClass::EncryptedSecret)
@@ -56440,10 +56346,16 @@ level = "supervised"
 
 [runtime_profiles.default]
 
+[providers.connections."gateway.prod"]
+kind = "openai"
+[providers.models."openai.gw.fast"]
+capability = "chat"
+provider = "gateway.prod"
+model = "gpt-4o-mini"
+
 [[model_routes]]
 hint = "deep"
-model_provider = "openai.gw.fast"
-model = "gpt-4o-mini"
+model_ref = "openai.gw.fast"
 
 [agents.a]
 model_provider = "openai.gw.fast"
@@ -56459,8 +56371,8 @@ runtime_profile = "default"
 
         // Dangling model alias in a route → error naming the missing entry.
         let bad = base.replace(
-            "\"openai.gw.fast\"\nmodel = \"gpt-4o-mini\"",
-            "\"openai.gw.nope\"\nmodel = \"gpt-4o-mini\"",
+            "model_ref = \"openai.gw.fast\"",
+            "model_ref = \"openai.gw.nope\"",
         );
         let cfg: Config = toml::from_str(&bad).unwrap();
         let err = cfg
@@ -56468,7 +56380,7 @@ runtime_profile = "default"
             .expect_err("dangling route model alias must fail")
             .to_string();
         assert!(
-            err.contains("models.nope"),
+            err.contains("model_routes[0].model_ref"),
             "error should name the missing model entry, got: {err}"
         );
 
@@ -56597,19 +56509,21 @@ model = "gpt-4o"
                 .ensure("custom", alias)
                 .expect("custom provider entry");
             entry.model = Some(format!("{alias}-model"));
+            crate::migration::bind_test_route_model(
+                &mut config,
+                &format!("custom.{alias}"),
+                &format!("{alias}-model"),
+                None,
+            );
         }
         config.model_routes = vec![
             super::ModelRouteConfig {
                 hint: "local".into(),
-                model_provider: "custom.local".into(),
-                model: "local-model".into(),
-                api_key: None,
+                model_ref: "custom.local".into(),
             },
             super::ModelRouteConfig {
                 hint: "cloud".into(),
-                model_provider: "custom.cloud".into(),
-                model: "cloud-model".into(),
-                api_key: None,
+                model_ref: "custom.cloud".into(),
             },
         ];
         config.runtime_profiles.insert(
@@ -56686,8 +56600,7 @@ model = "gpt-4o"
 
         let mut duplicate_route = effort_routing_config();
         let mut final_local_route = duplicate_route.model_routes[0].clone();
-        final_local_route.model_provider = "custom.cloud".into();
-        final_local_route.model = "final-local-model".into();
+        final_local_route.model_ref = "custom.cloud".into();
         duplicate_route.model_routes.push(final_local_route);
         duplicate_route
             .validate()

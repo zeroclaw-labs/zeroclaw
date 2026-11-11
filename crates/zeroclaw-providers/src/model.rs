@@ -634,7 +634,7 @@ pub fn routed_selection_depends_on_model_ref(
         || config.model_routes.iter().any(|route| {
             !route.hint.trim().is_empty()
                 && !route.effective_model(config).trim().is_empty()
-                && selection_depends_on_model_ref(config, &route.model_provider, changed_model_ref)
+                && selection_depends_on_model_ref(config, &route.model_ref, changed_model_ref)
         })
 }
 
@@ -1113,8 +1113,8 @@ model = "backup-model"
         assert!(build_model(&config, "worker", " llamacpp.typo ", Some("model-id")).is_err());
         config.model_routes = vec![ModelRouteConfig {
             hint: "fast".into(),
-            model_provider: "llamacpp.typo".into(),
-            model: "route-id".into(),
+            model_ref: "llamacpp.typo".into(),
+
             ..Default::default()
         }];
         assert!(build_model(&config, "worker", "custom.target.v2.fast", None).is_err());

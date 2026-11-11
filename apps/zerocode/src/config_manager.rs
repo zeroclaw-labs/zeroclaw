@@ -7592,7 +7592,7 @@ mod tests {
 
     #[test]
     fn older_daemon_setup_metadata_stays_unknown() {
-        let value = serde_json::to_value(field("model_routes.fast.model")).unwrap();
+        let value = serde_json::to_value(field("model_routes.fast.model_ref")).unwrap();
         let mut value = value.as_object().unwrap().clone();
         value.remove("setup");
         let decoded: ConfigFieldEntry = serde_json::from_value(value.into()).unwrap();
@@ -7789,7 +7789,7 @@ mod tests {
         for (width, height) in [(120, 40), (60, 24)] {
             for path in [
                 "providers.tts.openai.sample.api_key",
-                "model_routes.fast.model_provider",
+                "model_routes.fast.model_ref",
             ] {
                 let mut manager = test_manager();
                 manager.sections = vec![typed_section("providers.tts")];
