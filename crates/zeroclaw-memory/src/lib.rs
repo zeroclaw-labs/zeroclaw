@@ -80,6 +80,11 @@ pub use traits::{
 use anyhow::Context;
 use std::path::Path;
 use std::sync::Arc;
+#[cfg(test)]
+use zeroclaw_config::provider_registry::embedding_input::{
+    ResolvedEmbeddingConfig, resolve_embedding_config,
+};
+#[cfg(test)]
 use zeroclaw_config::providers::ModelProviders;
 use zeroclaw_config::schema::{
     ActiveStorage, Config, EmbeddingRouteConfig, MemoryConfig, MemoryPolicyConfig,
@@ -277,156 +282,13 @@ fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
         .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
 }
 
-#[derive(Clone, PartialEq, Eq)]
-struct ResolvedEmbeddingConfig {
-    model_provider: String,
-    model: String,
-    dimensions: usize,
-    api_key: Option<String>,
-}
-
-impl std::fmt::Debug for ResolvedEmbeddingConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ResolvedEmbeddingConfig")
-            .field("model_provider", &self.model_provider)
-            .field("model", &self.model)
-            .field("dimensions", &self.dimensions)
-            .finish_non_exhaustive()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EmbeddingSettings {
-    pub model_provider: String,
-    pub model: String,
-    pub dimensions: usize,
-    pub api_key: Option<String>,
-}
-
-pub fn resolve_embedding_settings(
-    config: &MemoryConfig,
-    embedding_routes: &[EmbeddingRouteConfig],
-    api_key: Option<&str>,
-    providers: Option<&ModelProviders>,
-) -> EmbeddingSettings {
-    let resolved = resolve_embedding_config(config, embedding_routes, api_key, providers);
-    EmbeddingSettings {
-        model_provider: resolved.model_provider,
-        model: resolved.model,
-        dimensions: resolved.dimensions,
-        api_key: resolved.api_key,
-    }
-}
-
-/// Resolve embedding settings from the full loaded config. Canonical logical
-/// model bindings take precedence; the legacy helper remains available for
-/// callers that only have the old `[memory]` and route sections.
+/// Construct the selected capability model from the full admitted config.
 pub fn build_embedder_from_config(
     config: &Config,
     api_key: Option<&str>,
 ) -> anyhow::Result<Arc<dyn zeroclaw_api::embedding::EmbeddingProvider>> {
-    if let Some(embedder) = resolve_canonical_embedding_config(config, api_key)? {
-        return Ok(embedder);
-    }
-    Ok(build_legacy_embedder(&resolve_embedding_config(
-        &config.memory,
-        &config.embedding_routes,
-        api_key,
-        Some(&config.providers.models),
-    )))
-}
-
-fn build_legacy_embedder(
-    resolved: &ResolvedEmbeddingConfig,
-) -> Arc<dyn zeroclaw_api::embedding::EmbeddingProvider> {
-    Arc::from(zeroclaw_providers::embedding::create_embedding_provider(
-        &resolved.model_provider,
-        resolved.api_key.as_deref(),
-        &resolved.model,
-        resolved.dimensions,
-    ))
-}
-
-fn resolve_embedding_config(
-    config: &MemoryConfig,
-    embedding_routes: &[EmbeddingRouteConfig],
-    api_key: Option<&str>,
-    providers: Option<&ModelProviders>,
-) -> ResolvedEmbeddingConfig {
-    let inherited_api_key = api_key
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    let configured_api_key = config
-        .embedding_api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-
-    let fallback = || {
-        resolve_provider_ref(
-            config.embedding_provider.trim().to_string(),
-            config.embedding_model.trim().to_string(),
-            config.embedding_dimensions,
-            configured_api_key.clone(),
-            inherited_api_key.clone(),
-            providers,
-        )
-    };
-
-    let Some(hint) = config
-        .embedding_model
-        .strip_prefix("hint:")
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return fallback();
-    };
-
-    let Some(route) = embedding_routes
-        .iter()
-        .find(|route| route.hint.trim() == hint)
-    else {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"hint": hint})),
-            "Unknown embedding route hint; falling back to [memory] embedding settings"
-        );
-        return fallback();
-    };
-
-    let model_provider = route.model_provider.trim();
-    let model = route.model.trim();
-    let dimensions = route.dimensions.unwrap_or(config.embedding_dimensions);
-    if model_provider.is_empty() || model.is_empty() || dimensions == 0 {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"hint": hint})),
-            "Invalid embedding route configuration; falling back to [memory] embedding settings"
-        );
-        return fallback();
-    }
-
-    let routed_api_key = route
-        .api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|value: &&str| !value.is_empty())
-        .map(|value| value.to_string());
-
-    resolve_provider_ref(
-        model_provider.to_string(),
-        model.to_string(),
-        dimensions,
-        routed_api_key.or(configured_api_key),
-        inherited_api_key,
-        providers,
-    )
+    Ok(resolve_canonical_embedding_config(config, api_key)?
+        .unwrap_or_else(|| Arc::new(zeroclaw_providers::embedding::NoopEmbedding)))
 }
 
 /// Resolve the new logical embedding model binding without flattening its
@@ -437,51 +299,13 @@ fn resolve_canonical_embedding_config(
     config: &Config,
     inherited_api_key: Option<&str>,
 ) -> anyhow::Result<Option<Arc<dyn zeroclaw_api::embedding::EmbeddingProvider>>> {
-    let registry = config.provider_registry()?;
-    let routed = config
-        .memory
-        .embedding_model
-        .strip_prefix("hint:")
-        .and_then(|hint| {
-            config
-                .embedding_routes
-                .iter()
-                .find(|route| route.hint.trim() == hint.trim())
-        });
-    let Some(model_ref) = config
-        .memory
-        .embedding_model_ref
-        .as_deref()
-        .map(str::trim)
-        .filter(|reference| !reference.is_empty())
-        .or_else(|| {
-            routed
-                .map(|route| route.model_provider.trim())
-                .filter(|reference| registry.resolve_embedding(&(*reference).into()).is_ok())
-        })
-    else {
+    let (registry, reference) = config.embedding_registry_for_input(inherited_api_key)?;
+    let Some(model_ref) = reference else {
         return Ok(None);
     };
-    let model_ref = zeroclaw_config::provider_registry::ModelRef::from(model_ref);
     let resolved = registry.resolve_embedding(&model_ref)?;
-    let api_key = routed
-        .filter(|_| {
-            config
-                .memory
-                .embedding_model_ref
-                .as_deref()
-                .is_none_or(|reference| reference.trim().is_empty())
-        })
-        .and_then(|route| route.api_key.as_deref())
-        .filter(|key| !key.trim().is_empty())
-        .or(config
-            .memory
-            .embedding_api_key
-            .as_deref()
-            .filter(|key| !key.trim().is_empty()))
-        .or_else(|| resolved.selection.connection.api_key())
-        .or(inherited_api_key)
-        .map(ToOwned::to_owned);
+    let api_key = config
+        .embedding_api_key_for_input(resolved.selection.connection.api_key(), inherited_api_key);
     let settings = zeroclaw_providers::embedding::EmbeddingProviderConfig::from_resolved(
         &resolved,
         config.memory.embedding_dimensions,
@@ -490,95 +314,6 @@ fn resolve_canonical_embedding_config(
     Ok(Some(Arc::from(
         zeroclaw_providers::embedding::build_embedding_provider(settings),
     )))
-}
-
-fn resolve_provider_ref(
-    model_provider: String,
-    model: String,
-    dimensions: usize,
-    explicit_api_key: Option<String>,
-    inherited_api_key: Option<String>,
-    providers: Option<&ModelProviders>,
-) -> ResolvedEmbeddingConfig {
-    let trimmed = model_provider.trim();
-    let is_dotted_ref =
-        !trimmed.is_empty() && !trimmed.starts_with("custom:") && trimmed.contains('.');
-    if !is_dotted_ref {
-        return ResolvedEmbeddingConfig {
-            model_provider,
-            model,
-            dimensions,
-            api_key: explicit_api_key.or(inherited_api_key),
-        };
-    }
-
-    let reference = trimmed.to_string();
-    let Some((kind, _alias, provider_cfg)) =
-        providers.and_then(|catalog| catalog.find_by_name(&reference))
-    else {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({
-                    "error_key": "memory.embedding_route_unresolved",
-                    "provider_ref": reference,
-                })),
-            "Embedding provider reference did not resolve against providers.models; \
-             embeddings disabled (keyword-only) for this profile"
-        );
-        return ResolvedEmbeddingConfig {
-            model_provider,
-            model,
-            dimensions,
-            api_key: explicit_api_key.or(inherited_api_key),
-        };
-    };
-
-    let provider_key = provider_cfg
-        .api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    let concrete_provider = match provider_cfg
-        .uri
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        Some(uri) => Some(format!("custom:{uri}")),
-        None if matches!(kind, "openai" | "openrouter") => Some(kind.to_string()),
-        None => None,
-    };
-    let Some(concrete_provider) = concrete_provider else {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({
-                    "error_key": "memory.embedding_route_no_endpoint",
-                    "provider_ref": reference,
-                    "provider_kind": kind,
-                })),
-            "Embedding provider reference resolved but has no usable embeddings \
-             endpoint (set its `uri`, or point the route at an openai/openrouter \
-             compatible profile); embeddings disabled (keyword-only) for this profile"
-        );
-        return ResolvedEmbeddingConfig {
-            model_provider,
-            model,
-            dimensions,
-            api_key: explicit_api_key.or(inherited_api_key),
-        };
-    };
-
-    ResolvedEmbeddingConfig {
-        model_provider: concrete_provider,
-        model,
-        dimensions,
-        api_key: explicit_api_key.or(provider_key).or(inherited_api_key),
-    }
 }
 
 pub fn create_memory(
@@ -593,14 +328,7 @@ pub fn create_memory(
         );
     }
 
-    create_memory_with_storage_and_routes(
-        config,
-        &[],
-        ActiveStorage::None,
-        workspace_dir,
-        api_key,
-        None,
-    )
+    create_memory_with_storage_and_routes(config, &[], ActiveStorage::None, workspace_dir, api_key)
 }
 
 /// Construct memory from the canonical loaded configuration.
@@ -614,12 +342,10 @@ pub fn create_memory_from_config(
     let canonical_embedding = resolve_canonical_embedding_config(config, api_key)?;
     create_memory_with_storage_and_routes_inner(
         &config.memory,
-        &config.embedding_routes,
         config.resolve_active_storage(),
         &config.data_dir,
-        api_key,
-        Some(&config.providers.models),
-        canonical_embedding.as_ref(),
+        canonical_embedding
+            .unwrap_or_else(|| Arc::new(zeroclaw_providers::embedding::NoopEmbedding)),
     )
 }
 
@@ -656,38 +382,24 @@ pub fn create_memory_with_storage_and_routes(
     active_storage: ActiveStorage<'_>,
     workspace_dir: &Path,
     api_key: Option<&str>,
-    providers: Option<&ModelProviders>,
 ) -> anyhow::Result<Box<dyn Memory>> {
-    create_memory_with_storage_and_routes_inner(
-        config,
-        embedding_routes,
-        active_storage,
-        workspace_dir,
-        api_key,
-        providers,
-        None,
-    )
+    let full = Config {
+        memory: config.clone(),
+        embedding_routes: embedding_routes.to_vec(),
+        ..Config::default()
+    };
+    let embedder = build_embedder_from_config(&full, api_key)?;
+    create_memory_with_storage_and_routes_inner(config, active_storage, workspace_dir, embedder)
 }
 
 fn create_memory_with_storage_and_routes_inner(
     config: &MemoryConfig,
-    embedding_routes: &[EmbeddingRouteConfig],
     active_storage: ActiveStorage<'_>,
     workspace_dir: &Path,
-    api_key: Option<&str>,
-    providers: Option<&ModelProviders>,
-    canonical_embedding: Option<&Arc<dyn zeroclaw_api::embedding::EmbeddingProvider>>,
+    resolved_embedding: Arc<dyn zeroclaw_api::embedding::EmbeddingProvider>,
 ) -> anyhow::Result<Box<dyn Memory>> {
     let backend_name = backend_kind_from_dotted(&config.backend);
     let backend_kind = classify_memory_backend(&backend_name);
-    let resolved_embedding = canonical_embedding.cloned().unwrap_or_else(|| {
-        build_legacy_embedder(&resolve_embedding_config(
-            config,
-            embedding_routes,
-            api_key,
-            providers,
-        ))
-    });
 
     // Best-effort memory hygiene/retention pass (throttled by state file).
     if let Err(e) = hygiene::run_if_due(config, workspace_dir) {
@@ -2404,7 +2116,6 @@ store_timeout_ms = 40000
             ActiveStorage::Postgres(&storage),
             tmp.path(),
             None,
-            None,
         )
         .err()
         .expect("backend=postgres without memory-postgres feature should fail");
@@ -2560,7 +2271,6 @@ url = "http://localhost:6333"
             ActiveStorage::Qdrant(&storage),
             tmp.path(),
             None,
-            None,
         )
         .expect("qdrant with resolved storage config must still construct");
         assert_eq!(mem.name(), "qdrant");
@@ -2668,10 +2378,10 @@ url = "http://localhost:6333"
             ..MemoryConfig::default()
         };
 
-        let settings = resolve_embedding_settings(&cfg, &[], Some("base-key"), None);
+        let settings = resolve_embedding_config(&cfg, &[], Some("base-key"), None);
         assert_eq!(
             settings,
-            EmbeddingSettings {
+            ResolvedEmbeddingConfig {
                 model_provider: "openai".into(),
                 model: "text-embedding-3-small".into(),
                 dimensions: 1536,

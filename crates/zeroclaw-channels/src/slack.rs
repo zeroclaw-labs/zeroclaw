@@ -622,11 +622,9 @@ impl SlackChannel {
     /// the legacy section, so it binds a lone registered provider and
     /// otherwise leaves the choice unbound (see
     /// `transcription::build_transcription_manager_from_legacy_config`).
-    pub fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
-        let manager =
-            zeroclaw_providers::transcription::build_transcription_manager_from_legacy_config(
-                &config,
-            );
+    #[cfg(test)]
+    fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
+        let manager = crate::transcription_fixture(&config);
         self.with_transcription_manager(config, manager)
     }
 

@@ -304,14 +304,10 @@ pub(crate) fn agent_model(config: &Config, alias: &str) -> Option<AgentModel> {
     } else {
         Some(agent.model_provider.as_str().to_string())
     };
-    let resolved = config.resolved_model_provider_for_agent(alias);
     let model = config
         .resolve_model_id(agent.model_provider.as_str())
-        .or_else(|| resolved.as_ref().and_then(|(_, _, cfg)| cfg.model.clone()))
         .unwrap_or_default();
-    let temperature = config
-        .resolve_model_temperature(agent.model_provider.as_str())
-        .or_else(|| resolved.as_ref().and_then(|(_, _, cfg)| cfg.temperature));
+    let temperature = config.resolve_model_temperature(agent.model_provider.as_str());
     Some(AgentModel {
         provider_ref,
         model,
@@ -374,12 +370,15 @@ pub async fn handle_api_status(
                 (provider_ref, model, temperature, backend)
             }
             None => (
-                config
-                    .providers
-                    .models
-                    .iter_entries()
-                    .next()
-                    .map(|(ty, alias, _)| format!("{ty}.{alias}")),
+                config.provider_registry().ok().and_then(|registry| {
+                    registry
+                        .models
+                        .iter()
+                        .find(|(_, model)| {
+                            model.capability() == zeroclaw_api::capability::Capability::Chat
+                        })
+                        .map(|(reference, _)| reference.to_string())
+                }),
                 state.model.clone(),
                 state.temperature,
                 state.mem.name().to_string(),
@@ -1117,9 +1116,7 @@ async fn resolve_memory_handle(
             )})),
         ));
     }
-    let api_key = config
-        .resolved_model_provider_for_agent(alias)
-        .and_then(|(_, _, cfg)| cfg.api_key.clone());
+    let api_key = config.agent_model_api_key(alias);
     zeroclaw_memory::create_memory_for_agent(&config, alias, api_key.as_deref())
         .await
         .map_err(|e| {

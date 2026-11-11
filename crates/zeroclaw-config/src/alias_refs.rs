@@ -21,6 +21,28 @@ pub enum AliasKind {
     Agent,
 }
 
+impl AliasKind {
+    /// Translate a legacy map-key event at the config boundary. Consumers only
+    /// receive complete model references, never profile path components.
+    pub fn model_rename_refs(&self, from: &str, to: &str) -> Option<(String, String, bool)> {
+        match self {
+            Self::Provider {
+                category: ProviderCategory::Models,
+                family,
+            } => Some((format!("{family}.{from}"), format!("{family}.{to}"), false)),
+            Self::ModelAlias {
+                family,
+                profile_alias,
+            } => Some((
+                format!("{family}.{profile_alias}.{from}"),
+                format!("{family}.{profile_alias}.{to}"),
+                true,
+            )),
+            _ => None,
+        }
+    }
+}
+
 /// Which typed provider section the alias lives in. Selects which referrer
 /// fields can point at it (model refs vs TTS vs transcription).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -860,7 +882,7 @@ pub fn rename_with_cascade(
 
 /// The map-key section path for a kind — the `section_path` argument to
 /// `Config::rename_map_key` / `Config::delete_map_key`.
-fn section_path(kind: &AliasKind) -> String {
+pub fn section_path(kind: &AliasKind) -> String {
     match kind {
         AliasKind::Agent => "agents".to_string(),
         AliasKind::Provider { category, family } => {

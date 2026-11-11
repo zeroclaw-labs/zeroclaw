@@ -5,7 +5,10 @@
 
 mod api;
 mod connection;
+pub mod embedding_input;
+pub(crate) mod env_input;
 mod ids;
+pub(crate) mod input;
 mod model;
 mod options;
 mod override_value;

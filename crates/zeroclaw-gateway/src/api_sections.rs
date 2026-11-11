@@ -111,7 +111,9 @@ pub fn derive_section_status(cfg: &zeroclaw_config::schema::Config) -> ConfigSta
     let missing = quickstart_missing_requirements(cfg);
     let ready = missing.is_empty();
     let has_partial_state = !cfg.onboard_state.completed_sections.is_empty()
-        || cfg.providers.models.iter_entries().next().is_some()
+        || cfg
+            .provider_registry()
+            .is_ok_and(|registry| !registry.models.is_empty())
         || cfg.providers.models.has_canonical_models()
         || !cfg.providers.connections.is_empty()
         || !cfg.providers.model_presets.is_empty()
@@ -136,12 +138,12 @@ pub fn derive_section_status(cfg: &zeroclaw_config::schema::Config) -> ConfigSta
 
 fn quickstart_missing_requirements(cfg: &zeroclaw_config::schema::Config) -> Vec<String> {
     let mut missing = Vec::new();
-    if cfg.providers.models.iter_entries().next().is_none()
-        && !cfg
-            .providers
+    if !cfg.provider_registry().is_ok_and(|registry| {
+        registry
             .models
-            .has_canonical_capability(zeroclaw_api::capability::Capability::Chat)
-    {
+            .values()
+            .any(|model| model.capability() == zeroclaw_api::capability::Capability::Chat)
+    }) {
         missing.push("Add a model provider.".to_string());
     }
     if cfg.agents.is_empty() {
@@ -184,23 +186,6 @@ fn quickstart_agent_missing_requirements(
             missing.push(format!("Choose a model for model provider `{model_ref}`."));
         } else if !zeroclaw_providers::model::selection_auth_ready(cfg, model_ref).unwrap_or(false)
         {
-            missing.push(format!(
-                "Set credential/auth for model provider `{model_ref}`."
-            ));
-        }
-    } else if let Some((family, _, provider)) = cfg.resolved_model_provider_for_agent(alias) {
-        // Resolve through the selection so a nested-only profile (model ids
-        // under `[providers.models.<family>.<alias>.models.*]`) still counts.
-        let effective_model = cfg
-            .resolve_model_selection(model_ref)
-            .and_then(|selection| selection.model_id);
-        if effective_model.is_none() {
-            missing.push(format!("Choose a model for model provider `{model_ref}`."));
-        } else if !model_provider_alias_usable(
-            provider,
-            effective_model.as_deref(),
-            zeroclaw_runtime::quickstart::model_provider_is_local(family),
-        ) {
             missing.push(format!(
                 "Set credential/auth for model provider `{model_ref}`."
             ));
@@ -509,12 +494,32 @@ fn picker_items_for(
     use zeroclaw_config::sections::Section;
     match section {
         Section::ModelProviders => PickerDispatch::Items(providers_picker(cfg)),
-        // TTS / transcription share the typed-family two-tier shape. Each
-        // family enumerates its picker via `schema_walk_picker(<family>)`
-        // — the same machinery channels uses, so no per-section catalog
-        // table to drift.
         Section::TtsProviders | Section::TranscriptionProviders => {
-            PickerDispatch::Items(schema_walk_picker(cfg, section.as_str()))
+            let capability = if matches!(section, Section::TtsProviders) {
+                zeroclaw_api::capability::Capability::Tts
+            } else {
+                zeroclaw_api::capability::Capability::Asr
+            };
+            let items = cfg
+                .provider_registry()
+                .map(|registry| {
+                    registry
+                        .models
+                        .iter()
+                        .filter(|(_, model)| model.capability() == capability)
+                        .map(|(reference, model)| PickerItem {
+                            key: reference.to_string(),
+                            label: reference.to_string(),
+                            description: registry
+                                .connections
+                                .get(model.provider())
+                                .map(|connection| connection.kind().to_owned()),
+                            badge: Some("configured".to_owned()),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            PickerDispatch::Items(items)
         }
         Section::Memory => PickerDispatch::Items(memory_picker(cfg)),
         Section::Channels => PickerDispatch::Items(schema_walk_picker(cfg, "channels")),
@@ -562,21 +567,6 @@ fn providers_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
 }
 
 fn any_usable_model_provider(cfg: &zeroclaw_config::schema::Config) -> bool {
-    let legacy = cfg
-        .providers
-        .models
-        .iter_entries()
-        .any(|(family, alias, base)| {
-            model_provider_alias_usable(
-                base,
-                alias_effective_model(cfg, family, alias).as_deref(),
-                zeroclaw_runtime::quickstart::model_provider_is_local(family),
-            )
-        });
-    if legacy {
-        return true;
-    }
-
     cfg.provider_registry().is_ok_and(|registry| {
         registry
             .models
@@ -610,58 +600,29 @@ fn provider_type_badge(
     family: &str,
     local: bool,
 ) -> Option<String> {
-    let mut has_alias = false;
-    let mut has_usable_alias = false;
-    for (ty, alias, base) in cfg.providers.models.iter_entries() {
-        if ty != family {
-            continue;
-        }
-        has_alias = true;
-        if model_provider_alias_usable(
-            base,
-            alias_effective_model(cfg, ty, alias).as_deref(),
-            local,
-        ) {
-            has_usable_alias = true;
-        }
-    }
-    if has_usable_alias {
-        Some("configured".to_string())
-    } else if has_alias {
-        Some("needs setup".to_string())
-    } else {
+    let _ = local;
+    let registry = cfg.provider_registry().ok()?;
+    let models: Vec<_> = registry
+        .models
+        .values()
+        .filter(|model| {
+            model.capability() == zeroclaw_api::capability::Capability::Chat
+                && registry
+                    .connections
+                    .get(model.provider())
+                    .is_some_and(|connection| connection.kind() == family)
+        })
+        .collect();
+    if models
+        .iter()
+        .any(|model| canonical_chat_model_usable(model, &registry))
+    {
+        Some("configured".to_owned())
+    } else if models.is_empty() {
         None
+    } else {
+        Some("needs setup".to_owned())
     }
-}
-
-fn model_provider_alias_usable(
-    base: &zeroclaw_config::schema::ModelProviderConfig,
-    effective_model: Option<&str>,
-    local: bool,
-) -> bool {
-    let has_model = effective_model
-        .map(str::trim)
-        .is_some_and(|model| !model.is_empty());
-    if !has_model {
-        return false;
-    }
-    base.api_key
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|key| !key.is_empty())
-        || base.requires_openai_auth
-        || local
-}
-
-/// The model id an alias effectively serves: the nested-model selection for a
-/// `<family>.<alias>` ref (falling back to the legacy profile-level `model`),
-/// so a nested-only profile still counts as having a model.
-fn alias_effective_model(
-    cfg: &zeroclaw_config::schema::Config,
-    family: &str,
-    alias: &str,
-) -> Option<String> {
-    cfg.resolve_model_id(&format!("{family}.{alias}"))
 }
 
 fn storage_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
@@ -822,12 +783,13 @@ fn agents_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
 }
 
 fn apply_first_run_agent_defaults(cfg: &mut zeroclaw_config::schema::Config, alias: &str) {
-    let model_provider = cfg
-        .providers
-        .models
-        .iter_entries()
-        .next()
-        .map(|(ty, alias, _)| format!("{ty}.{alias}"));
+    let model_provider = cfg.provider_registry().ok().and_then(|registry| {
+        registry
+            .models
+            .iter()
+            .find(|(_, model)| model.capability() == zeroclaw_api::capability::Capability::Chat)
+            .map(|(reference, _)| reference.to_string())
+    });
     let risk_profile = first_alias(cfg.risk_profiles.keys());
     let runtime_profile = first_alias(cfg.runtime_profiles.keys());
 

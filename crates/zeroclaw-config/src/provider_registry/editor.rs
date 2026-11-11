@@ -5,6 +5,10 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[path = "editor_mutations.rs"]
+mod mutations;
+pub use mutations::{create_entry, delete_entry, rename_entry};
+
 use crate::{schema::Config, traits::MASKED_SECRET};
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -32,6 +36,25 @@ pub fn snapshot(config: &Config) -> Result<Value> {
             .unwrap_or_else(|| serde_json::json!({}));
     }
     Ok(document)
+}
+
+/// Edit exact registry keys on a caller-owned candidate using the same
+/// validation, credential preservation and legacy promotion as the UI.
+/// Persistence and live publication remain the caller's transaction.
+pub fn update(
+    config: &mut Config,
+    edit: impl FnOnce(&mut super::ProviderRegistry) -> Result<()>,
+) -> Result<()> {
+    let expected = snapshot(config)?;
+    let mut registry = config.provider_registry()?;
+    edit(&mut registry)?;
+    stage(
+        config,
+        RegistryEdit {
+            expected,
+            registry: serde_json::to_value(registry)?,
+        },
+    )
 }
 
 /// Stage a complete, validated replacement on a caller-owned config candidate.
@@ -95,6 +118,14 @@ pub fn stage(config: &mut Config, edit: RegistryEdit) -> Result<()> {
     candidate.providers.models.canonical_models = raw_models;
     candidate.providers.model_presets = registry.model_presets;
     candidate.providers.fallback = registry.fallback;
+    // Those section-only definitions were included in the projection above.
+    // Retire their source after promotion so a deletion cannot regenerate them.
+    candidate.transcription.api_key = None;
+    candidate.transcription.openai = None;
+    candidate.transcription.deepgram = None;
+    candidate.transcription.assemblyai = None;
+    candidate.transcription.google = None;
+    candidate.transcription.local_whisper = None;
     serde_json::to_value(&candidate.providers)?;
     candidate.validate()?;
     // Memory's canonical model reference is outside the provider graph. Do
@@ -112,7 +143,9 @@ pub fn stage(config: &mut Config, edit: RegistryEdit) -> Result<()> {
             .resolve_embedding(&super::ModelRef::from(reference))
             .context("invalid memory.embedding_model_ref")?;
     }
+    super::env_input::remap_after_promotion(config, &mut candidate)?;
     candidate.mark_dirty("providers");
+    candidate.mark_dirty("transcription");
     if agents_changed {
         candidate.mark_dirty("agents");
     }

@@ -440,9 +440,7 @@ async fn resolve_ws_memory_handle(
         return Ok(None);
     }
 
-    let api_key = config
-        .resolved_model_provider_for_agent(agent_alias)
-        .and_then(|(_, _, cfg)| cfg.api_key.clone());
+    let api_key = config.agent_model_api_key(agent_alias);
     zeroclaw_memory::create_memory_for_agent(config, agent_alias, api_key.as_deref())
         .await
         .map(Some)
@@ -5959,7 +5957,7 @@ data: {\"type\":\"message_stop\"}\n\n",
         let (provider, identity, _) = built.into_parts();
         let agent = Agent::builder()
             .model_provider(provider)
-            .model_provider_name(identity.profile_ref())
+            .model_provider_name(identity.provider_ref())
             .model_name(identity.model_id.clone())
             .model_identity(identity)
             .agent_alias("worker".into())

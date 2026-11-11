@@ -2501,105 +2501,74 @@ async fn rename_agent_cascade(
 pub async fn handle_refresh_context_window(
     State(state): State<AppState>,
     principal: RequestPrincipal,
-    axum::extract::Path((provider_type, alias)): axum::extract::Path<(String, String)>,
+    axum::extract::Path(reference): axum::extract::Path<String>,
 ) -> Response {
-    let path = format!("providers.models.{provider_type}.{alias}");
-
-    // Build the minimal provider config the fetch below needs from a brief,
-    // un-witnessed read that clones what it needs out immediately (the
-    // `parking_lot` guard never survives past this block, well before the
-    // network `.await`). Deliberately NOT inside an admitted config commit:
-    // the outbound provider fetch can be slow or hang, and holding the
-    // daemon-wide writer serialization across it would block every other
-    // gateway config write process-wide for the duration -- a
-    // self-inflicted availability bottleneck.
-    let provider_config = {
-        let snapshot = state.config.read();
-        if snapshot.get_prop(&format!("{path}.model")).is_err() {
-            return error_response(
-                ConfigApiError::new(
-                    ConfigApiCode::PathNotFound,
-                    format!("model provider '{provider_type}.{alias}' not found"),
-                )
-                .with_path(&path),
-            );
-        }
-        let model = snapshot
-            .get_prop(&format!("{path}.model"))
-            .ok()
-            .unwrap_or_default();
-        let uri = snapshot.get_prop(&format!("{path}.uri")).ok();
-        // Read api_key via JSON serialization to bypass #[secret] masking in get_prop.
-        let api_key = serde_json::to_value(&snapshot.providers)
-            .ok()
-            .and_then(|v| {
-                v.pointer(&format!("/models/{provider_type}/{alias}/api_key"))
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty() && *s != "<unset>")
-                    .map(String::from)
-            });
-        zeroclaw_config::schema::ModelProviderConfig {
-            model: Some(model),
-            uri,
-            api_key,
-            ..Default::default()
-        }
-    };
-
-    // Fetch context window from provider. No config commit — nor any
-    // reader guard — is held across this await.
-    let context_window = match zeroclaw_providers::fetch_context_window(
-        &provider_type,
-        &provider_config,
-    )
-    .await
-    {
-        Some(ctx) => ctx,
-        None => {
-            return error_response(
-                ConfigApiError::new(
-                    ConfigApiCode::InvalidFormat,
-                    format!("provider '{provider_type}' does not support context window auto-detection or fetch failed"),
-                )
-                .with_path(&path),
-            );
-        }
-    };
-
-    // The commit is admitted only now, spanning just the config mutation:
-    // read-for-modify, apply the fetched value, save, publish.
-    let _cfg_guard = match state.begin_config_commit().await {
-        Ok(commit) => commit,
-        Err(e) => return error_response(config_commit_admission_error(e)),
-    };
-    let mut working = _cfg_guard.current_config();
-
-    // Re-verify: a concurrent writer could have removed this entry while
-    // the un-witnessed fetch above was in flight.
-    if working.get_prop(&format!("{path}.model")).is_err() {
-        return error_response(
-            ConfigApiError::new(
+    fn target(
+        config: &zeroclaw_config::schema::Config,
+        reference: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        let registry = config.provider_registry()?;
+        let selected = registry.resolve_chat(&reference.into())?;
+        Ok(serde_json::to_value((
+            selected.selection.model,
+            selected.selection.connection,
+            selected.options,
+        ))?)
+    }
+    // Never hold the config writer across provider I/O.
+    let snapshot = Box::new(state.config.read().clone());
+    let expected = match target(&snapshot, &reference) {
+        Ok(target) => target,
+        Err(_) => {
+            return error_response(ConfigApiError::new(
                 ConfigApiCode::PathNotFound,
-                format!("model provider '{provider_type}.{alias}' not found"),
-            )
-            .with_path(&path),
-        );
+                "chat model reference does not exist",
+            ));
+        }
+    };
+    let context_window =
+        match zeroclaw_providers::fetch_model_context_window(&snapshot, &reference).await {
+            Ok(Some(window)) => window,
+            Ok(None) => {
+                return error_response(ConfigApiError::new(
+                    ConfigApiCode::InvalidFormat,
+                    "provider does not expose a context window for this model",
+                ));
+            }
+            Err(_) => {
+                return error_response(ConfigApiError::new(
+                    ConfigApiCode::InvalidFormat,
+                    "context-window discovery failed",
+                ));
+            }
+        };
+    let commit = match state.begin_config_commit().await {
+        Ok(commit) => commit,
+        Err(error) => return error_response(config_commit_admission_error(error)),
+    };
+    let mut working = commit.current_config();
+    if target(&working, &reference).ok().as_ref() != Some(&expected) {
+        return error_response(ConfigApiError::new(
+            ConfigApiCode::InvalidFormat,
+            "model or connection changed during discovery; retry",
+        ));
     }
-
-    if let Err(e) = working.set_prop_persistent(
-        &format!("{path}.context_window"),
-        &context_window.to_string(),
-    ) {
-        return error_response(
-            ConfigApiError::new(
-                ConfigApiCode::InternalError,
-                format!("failed to persist context_window: {e}"),
-            )
-            .with_path(&path),
-        );
+    if let Err(error) =
+        zeroclaw_config::provider_registry::editor::update(&mut working, |registry| {
+            let Some(zeroclaw_config::provider_registry::ModelDefinition::Chat(model)) =
+                registry.models.get_mut(&reference.as_str().into())
+            else {
+                anyhow::bail!("chat model reference no longer exists");
+            };
+            model.metadata.context_window = Some(context_window);
+            Ok(())
+        })
+    {
+        return error_response(ConfigApiError::new(
+            ConfigApiCode::InvalidFormat,
+            format!("invalid model metadata: {error}"),
+        ));
     }
-
-    working.mark_dirty(&format!("{path}.context_window"));
     let before = state.config.read().clone();
     let authorization = match authorize_config_write(
         &principal,
@@ -2608,20 +2577,16 @@ pub async fn handle_refresh_context_window(
             &working,
             working.dirty_paths.iter().map(String::as_str),
         ),
-        &_cfg_guard,
+        &commit,
     ) {
         Ok(authorization) => authorization,
         Err(denied) => return denied.into_response(),
     };
-    if let Err(e) = persist_and_swap(&state, authorization, working, _cfg_guard).await {
-        return e;
+    if let Err(error) = persist_and_swap(&state, authorization, working, commit).await {
+        return error;
     }
-
-    axum::Json(serde_json::json!({
-        "path": path,
-        "context_window": context_window,
-    }))
-    .into_response()
+    axum::Json(serde_json::json!({"model_ref": reference, "context_window": context_window}))
+        .into_response()
 }
 
 pub async fn handle_patch(
@@ -7028,7 +6993,7 @@ model = "before"
         let mock = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/models"))
+            .and(path("/v1/models"))
             .and(header("authorization", "Bearer test-api-key-123"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -7049,24 +7014,17 @@ model = "before"
             config_path: path.clone(),
             ..Default::default()
         };
-        cfg.providers.models.groq.insert(
-            "test".to_string(),
-            zeroclaw_config::schema::GroqModelProviderConfig {
-                base: zeroclaw_config::schema::ModelProviderConfig {
-                    model: Some("llama-3.1-70b".into()),
-                    api_key: Some("test-api-key-123".into()),
-                    uri: Some(mock.uri()),
-                    ..Default::default()
-                },
-            },
-        );
+        cfg.providers = serde_json::from_value(serde_json::json!({
+            "connections": {"gateway.prod.v2": {"kind":"groq", "uri": format!("{}/v1", mock.uri()), "auth":{"mode":"api_key", "api_key":"test-api-key-123"}}},
+            "models": {"chat.fast.v2":{"capability":"chat", "provider":"gateway.prod.v2", "model":"llama-3.1-70b"}}
+        })).unwrap();
         cfg.save().await.expect("initial save");
 
         let state = crate::api::test_state(cfg);
 
         let app = axum::Router::new()
             .route(
-                "/api/config/model-providers/{type}/{alias}/refresh-context-window",
+                "/api/config/models/{model_ref}/refresh-context-window",
                 axum::routing::post(handle_refresh_context_window),
             )
             .with_state(state);
@@ -7075,7 +7033,7 @@ model = "before"
             .oneshot(
                 axum::http::Request::builder()
                     .method("POST")
-                    .uri("/api/config/model-providers/groq/test/refresh-context-window")
+                    .uri("/api/config/models/chat.fast.v2/refresh-context-window")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -7097,7 +7055,7 @@ model = "before"
         let body_str = String::from_utf8(body.to_vec()).unwrap();
         let json: serde_json::Value = serde_json::from_str(&body_str).unwrap();
 
-        assert_eq!(json["path"], "providers.models.groq.test");
+        assert_eq!(json["model_ref"], "chat.fast.v2");
         assert_eq!(json["context_window"], 4096);
         assert!(
             !body_str.contains("test-api-key-123"),

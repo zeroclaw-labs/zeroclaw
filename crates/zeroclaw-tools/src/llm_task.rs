@@ -781,14 +781,13 @@ options.temperature = "null"
 
         // Both factories should produce equivalent providers for a
         // normal (non-alias-specific) provider like "openrouter".
-        let alias_aware = zeroclaw_providers::create_model_provider_for_alias(
+        let alias_aware = zeroclaw_providers::model::build_raw_provider(
             &config,
             "openrouter",
-            "default",
-            None,
-            &default_opts,
+            zeroclaw_providers::model::ProviderOverrides::default(),
         )
-        .expect("alias-aware construction must succeed");
+        .expect("canonical construction must succeed")
+        .provider;
 
         let legacy = zeroclaw_providers::create_model_provider_with_options(
             "openrouter",

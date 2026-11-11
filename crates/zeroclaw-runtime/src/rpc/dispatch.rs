@@ -403,12 +403,17 @@ fn personality_template_context(
     }
 }
 
-fn model_provider_ref_from_provider_profile_prop(config: &Config, prop: &str) -> Option<String> {
-    let rest = prop.strip_prefix("providers.models.")?;
-    let (family, alias) = config.providers.models.profile_ref(rest)?;
-    let prefix = format!("{family}.{alias}");
-    rest.strip_prefix(&prefix)?.strip_prefix('.')?;
-    Some(prefix)
+fn touches_provider_registry(prop: &str) -> bool {
+    prop == "providers" || prop.starts_with("providers.")
+}
+
+fn touches_embedding_config(prop: &str) -> bool {
+    touches_provider_registry(prop)
+        || prop == "memory"
+        || prop.starts_with("memory.embedding_")
+        || prop == "embedding_routes"
+        || prop.starts_with("embedding_routes.")
+        || prop.starts_with("embedding_routes[")
 }
 
 /// Whether a config prop path touches `model_routes` (a field edit like
@@ -453,19 +458,6 @@ fn agent_scoped_refresh_selects(
         && overrides.model_provider.as_deref().is_none_or(|reference| {
             zeroclaw_providers::model::inherits_agent_selection(config, reference)
         })
-}
-
-/// Reduce a possibly three-segment `<type>.<alias>.<model>` model_provider
-/// reference to its two-segment `<type>.<alias>` provider-profile form, so it
-/// can be matched against a profile-scoped edit target. Falls back to the
-/// trimmed input when the ref has no dot separator.
-fn profile_ref_of(config: &Config, model_provider_ref: &str) -> String {
-    config
-        .providers
-        .models
-        .profile_ref(model_provider_ref)
-        .map(|(family, alias)| format!("{family}.{alias}"))
-        .unwrap_or_else(|| model_provider_ref.trim().to_string())
 }
 
 /// The live-session materialization affected by one config mutation.
@@ -516,8 +508,9 @@ impl LiveSessionRefreshScope {
     }
 
     fn for_prop(config: &Config, prop: &str) -> Option<Self> {
-        model_provider_ref_from_provider_profile_prop(config, prop)
-            .map(Self::ModelProvider)
+        let _ = config;
+        touches_provider_registry(prop)
+            .then_some(Self::SharedConstruction)
             .or_else(|| agent_alias_from_model_provider_prop(prop).map(Self::Agent))
             .or_else(|| touches_model_routes(prop).then_some(Self::ModelRoutes))
             .or_else(|| {
@@ -553,7 +546,7 @@ impl LiveSessionRefreshScope {
         // provider graph. Select with either generation, then build from next.
         let previous_scope = match self {
             Self::ProviderAliasRename { old_ref, .. } | Self::ModelAliasRename { old_ref, .. } => {
-                Self::ModelProvider(profile_ref_of(previous, old_ref))
+                Self::ModelProvider(old_ref.clone())
             }
             _ => self.clone(),
         };
@@ -651,28 +644,9 @@ impl LiveSessionRefreshScope {
                 // from config; a session carrying an explicit override still
                 // reads `old_ref`. Both name the same profile across the
                 // rename, so both rebuild against the new reference.
-                let matches_old = effective_ref == old_ref
-                    || effective_ref
-                        .strip_prefix(old_ref)
-                        .is_some_and(|suffix| suffix.starts_with('.'))
-                        && !config
-                            .providers
-                            .models
-                            .iter_entries()
-                            .any(|(family, alias, _)| {
-                                let profile = format!("{family}.{alias}");
-                                profile.len() >= old_ref.len()
-                                    && (effective_ref == profile
-                                        || effective_ref
-                                            .strip_prefix(&profile)
-                                            .is_some_and(|suffix| suffix.starts_with('.')))
-                            });
-                if matches_old {
-                    let suffix = effective_ref
-                        .trim()
-                        .strip_prefix(old_ref)
-                        .unwrap_or_default();
-                    return Ok(Some(format!("{new_ref}{suffix}")));
+                if let Some(reference) = config.renamed_model_input(effective_ref, old_ref, new_ref)
+                {
+                    return Ok(Some(reference));
                 }
                 Ok(
                     zeroclaw_providers::model::routed_selection_depends_on_model_ref(
@@ -697,10 +671,7 @@ impl LiveSessionRefreshScope {
                 if effective_ref == old_ref || effective_ref == new_ref {
                     return Ok(Some(new_ref.clone()));
                 }
-                let profile_ref = new_ref
-                    .rsplit_once('.')
-                    .map_or(new_ref.as_str(), |(profile, _)| profile);
-                Self::ModelProvider(profile_ref.to_string()).resolve_provider_ref(
+                Self::ModelProvider(new_ref.clone()).resolve_provider_ref(
                     config,
                     session_agent,
                     overrides,
@@ -734,35 +705,15 @@ struct PreparedLiveSessionRefresh {
 /// profile — either the base `[memory].embedding_provider` reference or any
 /// `[[embedding_routes]]` entry. Gates the memory-embedder refresh on a
 /// `config/set` provider-profile change
-fn memory_embeddings_use_provider(
-    config: &zeroclaw_config::schema::Config,
-    model_provider_ref: &str,
-) -> bool {
-    if let Some(reference) = config
-        .memory
-        .embedding_model_ref
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return reference == model_provider_ref
-            || config.provider_registry().ok().is_some_and(|registry| {
-                registry
-                    .resolve_embedding(&zeroclaw_config::provider_registry::ModelRef::from(
-                        reference,
-                    ))
-                    .is_ok_and(|resolved| {
-                        resolved.selection.provider_id.as_str() == model_provider_ref
-                    })
-            });
-    }
-    // Compare on the provider-profile portion so a three-segment
-    // `<type>.<alias>.<model>` embedding ref still matches the edited profile.
-    profile_ref_of(config, &config.memory.embedding_provider) == model_provider_ref
-        || config
-            .embedding_routes
-            .iter()
-            .any(|route| profile_ref_of(config, &route.model_provider) == model_provider_ref)
+fn prepare_memory_embedder(
+    config: &Config,
+) -> Result<std::sync::Arc<dyn zeroclaw_api::embedding::EmbeddingProvider>, JsonRpcError> {
+    zeroclaw_memory::build_embedder_from_config(config, None).map_err(|error| {
+        rpc_err(
+            INVALID_PARAMS,
+            format!("Invalid embedding configuration: {error:#}"),
+        )
+    })
 }
 
 fn rename_error_to_rpc(
@@ -839,7 +790,7 @@ pub(crate) struct RpcConfigCommitEffects {
     /// Prepared alias reservations and session views stay owned through apply.
     config_reservations: Vec<crate::live_config_authority::AgentAdmissionReservation>,
     prepared_sessions: Vec<PreparedLiveSessionRefresh>,
-    memory_provider_refs: Vec<String>,
+    memory_embedder: Option<Arc<dyn zeroclaw_api::embedding::EmbeddingProvider>>,
     /// `(config_path, [(prop, comment)])` — write `config/set` comments
     /// into config.toml after the save. Best-effort, warned on failure.
     comments: Option<(std::path::PathBuf, Vec<(String, String)>)>,
@@ -3287,8 +3238,8 @@ impl RpcDispatcher {
                         .await;
                     }
                 }
-                for provider in effects.memory_provider_refs {
-                    Self::refresh_memory_embedder_for_model_provider(&ctx, &accepted, &provider);
+                if let Some(embedder) = effects.memory_embedder {
+                    Self::refresh_memory_embedder(&ctx, embedder);
                 }
             }
             result.map(|()| revision)
@@ -9623,9 +9574,7 @@ impl RpcDispatcher {
         if private_plane {
             return Ok((memory, Some(alias.to_string())));
         }
-        let api_key = config
-            .resolved_model_provider_for_agent(alias)
-            .and_then(|(_, _, provider)| provider.api_key.clone());
+        let api_key = config.agent_model_api_key(alias);
         let shared = zeroclaw_memory::create_memory_for_agent(&config, alias, api_key.as_deref())
             .await
             .map_err(|error| {
@@ -10099,28 +10048,13 @@ impl RpcDispatcher {
         // A model can change without its connection changing. Match the real
         // embedding consumer (including routes), then rebuild its entire view
         // once rather than refreshing once per model on a shared connection.
-        let memory_provider_refs = candidate
-            .providers
-            .models
-            .canonical_model_refs()
-            .map(|reference| reference.as_str())
-            .chain(
-                candidate
-                    .providers
-                    .connections
-                    .keys()
-                    .map(|provider| provider.as_str()),
-            )
-            .find(|reference| memory_embeddings_use_provider(&candidate, reference))
-            .map(str::to_owned)
-            .into_iter()
-            .collect();
+        let memory_embedder = Some(prepare_memory_embedder(&candidate)?);
         let revision = Box::pin(self.commit_config_with_live_session_refresh(
             *candidate,
             commit,
             &LiveSessionRefreshScope::SharedConstruction,
             RpcConfigCommitEffects {
-                memory_provider_refs,
+                memory_embedder,
                 ..RpcConfigCommitEffects::default()
             },
         ))
@@ -10155,8 +10089,6 @@ impl RpcDispatcher {
                 .map(|alias| self.ctx.agent_lifecycle.reserve_config_mutation(alias))
                 .transpose()
                 .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?;
-        let refresh_model_provider_ref =
-            model_provider_ref_from_provider_profile_prop(&self.ctx.config.read(), &req.prop);
         let refresh_channel_agent = agent_alias_from_channel_auth_prop(&req.prop);
         let refresh_scope = LiveSessionRefreshScope::for_prop(&self.ctx.config.read(), &req.prop);
         let config_commit = self
@@ -10195,7 +10127,9 @@ impl RpcDispatcher {
         Self::stage_config_set(&mut config, &req.prop, &req.value)?;
         let effects = RpcConfigCommitEffects {
             config_reservations: _agent_config_reservation.into_iter().collect(),
-            memory_provider_refs: refresh_model_provider_ref.into_iter().collect(),
+            memory_embedder: touches_embedding_config(&req.prop)
+                .then(|| prepare_memory_embedder(&config))
+                .transpose()?,
             channel_handle_refresh: refresh_channel_agent
                 .map(|alias| (Box::new(old_config), vec![alias])),
             channel_generation: channel_generation_revocation,
@@ -10373,15 +10307,12 @@ impl RpcDispatcher {
             .collect();
         let effects = RpcConfigCommitEffects {
             config_reservations: _agent_config_reservations,
-            memory_provider_refs: req
+            memory_embedder: req
                 .sets
                 .iter()
-                .filter_map(|entry| {
-                    model_provider_ref_from_provider_profile_prop(&config, &entry.prop)
-                })
-                .collect::<std::collections::BTreeSet<_>>()
-                .into_iter()
-                .collect(),
+                .any(|entry| touches_embedding_config(&entry.prop))
+                .then(|| prepare_memory_embedder(&config))
+                .transpose()?,
             channel_handle_refresh: Some((old_config, channel_agents.into_iter().collect())),
             channel_generation: channel_generation_revocation,
             ..RpcConfigCommitEffects::default()
@@ -10455,26 +10386,10 @@ impl RpcDispatcher {
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")))
     }
 
-    fn refresh_memory_embedder_for_model_provider(
+    fn refresh_memory_embedder(
         ctx: &Arc<RpcContext>,
-        config: &Config,
-        model_provider_ref: &str,
+        embedder: Arc<dyn zeroclaw_api::embedding::EmbeddingProvider>,
     ) {
-        if !memory_embeddings_use_provider(config, model_provider_ref) {
-            return;
-        }
-        // Match daemon-boot resolution (`create_memory_with_storage_and_routes`
-        // is called with `api_key = None`): keys come from the per-route /
-        // `[memory]` override or the referenced profile, never an inherited seed.
-        let embedder = match zeroclaw_memory::build_embedder_from_config(config, None) {
-            Ok(embedder) => embedder,
-            Err(error) => {
-                ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"error_key": "memory.embedder_refresh_failed", "error": error.to_string()})), "failed to prepare memory embedder refresh");
-                return;
-            }
-        };
         // 1. Install-wide RPC memory handle.
         if let Some(memory) = ctx.memory.as_ref() {
             memory.refresh_embedder(Arc::clone(&embedder));
@@ -10628,14 +10543,11 @@ impl RpcDispatcher {
                 binding_overrides.model = active_model_override;
             }
             let override_migration = match scope {
-                LiveSessionRefreshScope::ProviderAliasRename { old_ref, new_ref } => overrides
-                    .model_provider
-                    .as_deref()
-                    .filter(|current| profile_ref_of(&previous_config, current) == *old_ref)
-                    .map(|current| {
-                        let suffix = current.trim().strip_prefix(old_ref).unwrap_or_default();
-                        format!("{new_ref}{suffix}")
-                    }),
+                LiveSessionRefreshScope::ProviderAliasRename { old_ref, new_ref } => {
+                    overrides.model_provider.as_deref().and_then(|current| {
+                        previous_config.renamed_model_input(current, old_ref, new_ref)
+                    })
+                }
                 LiveSessionRefreshScope::ModelAliasRename { old_ref, new_ref } => overrides
                     .model_provider
                     .as_deref()
@@ -10698,24 +10610,9 @@ impl RpcDispatcher {
                 application_paths: application_paths
                     .iter()
                     .filter(|path| {
-                        if let LiveSessionRefreshScope::ProviderAliasRename { old_ref, new_ref } =
-                            scope
-                            && let [root, category, family, alias, ..] = path.as_slice()
-                            && root == "providers"
-                            && category == "models"
-                        {
-                            let reference = format!("{family}.{alias}");
-                            if &reference == old_ref || &reference == new_ref {
-                                return true;
-                            }
-                        }
                         let path_scope = match path.as_slice() {
-                            [root, category, family, alias, ..]
-                                if root == "providers" && category == "models" =>
-                            {
-                                Some(LiveSessionRefreshScope::ModelProvider(format!(
-                                    "{family}.{alias}"
-                                )))
+                            [root, ..] if root == "providers" => {
+                                Some(LiveSessionRefreshScope::SharedConstruction)
                             }
                             [root, alias, field]
                                 if root == "agents" && field == "model_provider" =>
@@ -10872,8 +10769,6 @@ impl RpcDispatcher {
                 .map(|alias| self.ctx.agent_lifecycle.reserve_config_mutation(alias))
                 .transpose()
                 .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?;
-        let refresh_model_provider_ref =
-            model_provider_ref_from_provider_profile_prop(&self.ctx.config.read(), &req.prop);
         let refresh_scope = LiveSessionRefreshScope::for_prop(&self.ctx.config.read(), &req.prop);
         let refresh_channel_agent = agent_alias_from_channel_auth_prop(&req.prop);
         let config_commit = self
@@ -10893,7 +10788,9 @@ impl RpcDispatcher {
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config delete failed: {e}")))?;
         let effects = RpcConfigCommitEffects {
             config_reservations: _agent_config_reservation.into_iter().collect(),
-            memory_provider_refs: refresh_model_provider_ref.into_iter().collect(),
+            memory_embedder: touches_embedding_config(&req.prop)
+                .then(|| prepare_memory_embedder(&working))
+                .transpose()?,
             channel_handle_refresh: refresh_channel_agent
                 .map(|alias| (Box::new(old_config), vec![alias])),
             channel_generation: channel_generation_revocation,
@@ -11304,23 +11201,15 @@ impl RpcDispatcher {
             // `from` must be rebuilt against `to` on the same generation as
             // the config commit, the same as a `providers.models.*` field
             // edit already does.
-            let model_refresh_scope = match &kind {
-                zeroclaw_config::alias_refs::AliasKind::Provider {
-                    category: zeroclaw_config::alias_refs::ProviderCategory::Models,
-                    family,
-                } => Some(LiveSessionRefreshScope::ProviderAliasRename {
-                    old_ref: format!("{family}.{}", req.from),
-                    new_ref: format!("{family}.{}", req.to),
-                }),
-                zeroclaw_config::alias_refs::AliasKind::ModelAlias {
-                    family,
-                    profile_alias,
-                } => Some(LiveSessionRefreshScope::ModelAliasRename {
-                    old_ref: format!("{family}.{profile_alias}.{}", req.from),
-                    new_ref: format!("{family}.{profile_alias}.{}", req.to),
-                }),
-                _ => None,
-            };
+            let model_refresh_scope = kind.model_rename_refs(&req.from, &req.to).map(
+                |(old_ref, new_ref, model_entry)| {
+                    if model_entry {
+                        LiveSessionRefreshScope::ModelAliasRename { old_ref, new_ref }
+                    } else {
+                        LiveSessionRefreshScope::ProviderAliasRename { old_ref, new_ref }
+                    }
+                },
+            );
             if is_agent {
                 // Live RPC sessions hold the selected agent alias in memory; refuse
                 // rather than letting them recreate old-alias state after the rename.
@@ -27700,28 +27589,20 @@ mod tests {
     }
 
     #[test]
-    fn memory_embeddings_use_provider_matches_base_ref_and_routes() {
-        use zeroclaw_config::schema::{Config, EmbeddingRouteConfig};
-
-        let mut config = Config::default();
-        config.memory.embedding_provider = "openai.default".into();
-        config.embedding_routes = vec![EmbeddingRouteConfig {
-            hint: "semantic".into(),
-            model_provider: "openrouter.alt".into(),
-            model: "embed".into(),
-            dimensions: Some(1024),
-            api_key: None,
-        }];
-
-        // Base `[memory].embedding_provider` reference.
-        assert!(memory_embeddings_use_provider(&config, "openai.default"));
-        // Any `[[embedding_routes]]` reference.
-        assert!(memory_embeddings_use_provider(&config, "openrouter.alt"));
-        // An unrelated provider must not trigger a memory-embedder refresh.
-        assert!(!memory_embeddings_use_provider(
-            &config,
-            "anthropic.default"
-        ));
+    fn embedding_refresh_covers_registry_and_embedding_policy_edits() {
+        for path in [
+            "providers",
+            "providers.models.chat.fast.options.temperature",
+            "providers.connections.gateway.prod.auth.api_key",
+            "providers.model_presets.concise",
+            "memory.embedding_model_ref",
+            "memory.embedding_dimensions",
+            "embedding_routes[0].model_provider",
+        ] {
+            assert!(touches_embedding_config(path), "{path}");
+        }
+        assert!(!touches_embedding_config("gateway.port"));
+        assert!(!touches_embedding_config("memory.auto_save"));
     }
 
     #[test]
@@ -42326,15 +42207,7 @@ mod tests {
 
         // Long-lived handle built via the real factory → embedder points at A.
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory_with_storage_and_routes(
-                &cfg.memory,
-                &cfg.embedding_routes,
-                cfg.resolve_active_storage(),
-                &cfg.data_dir,
-                None,
-                Some(&cfg.providers.models),
-            )
-            .expect("build memory"),
+            zeroclaw_memory::create_memory_from_config(&cfg, None).expect("build memory"),
         );
 
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));

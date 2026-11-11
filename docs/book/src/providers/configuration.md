@@ -3,7 +3,9 @@
 The canonical layout separates reusable connections from logical models. A
 model reference is an exact TOML key, so a name such as `chat.gateway.prod`
 keeps both dots as part of the reference. The older family/alias layout below
-remains the migration reference for existing V4 files.
+remains the migration reference for existing V4 files. Historical field and
+reference decoding lives in `zeroclaw-config`; provider, runtime, CLI, tools,
+Doctor, and UI consumers receive exact model references from its registry view.
 
 The dashboard and Zerocode expose a **Provider registry** configuration section
 for connections, capability models, presets, and fallback routes. The dashboard
@@ -15,7 +17,11 @@ For inherited options, omit a field to inherit its value; use the JSON string
 Unchanged masked credentials retain their existing values and follow the normal
 secret encryption lifecycle. A stale editor must reload before saving.
 
-The editor retains existing typed provider maps. Because a registry replacement
+Saving promotes historical provider input into the canonical registries and
+retires the old provider tables, so deleted models cannot reappear on reload.
+Environment overrides retain their original values for persistence across this
+promotion; environment credentials are never written to the configuration file.
+Because a registry replacement
 can add, update, and remove entries, a scoped principal needs Config create,
 update, and delete grants with write access to `providers`. Dashboard saves use
 the normal configuration application/reload flow; RPC saves also prepare and
@@ -913,3 +919,31 @@ refusal/fallback metadata; route Anthropic models through
 - [Streaming](./streaming.md)
 - [Routing](./routing.md)
 - [Custom providers](./custom.md)
+
+## Registry CLI editing
+
+Provider commands address an exact key in one canonical registry:
+
+```bash
+zeroclaw providers list --registry models
+zeroclaw providers create connections 'gateway.prod' '{"kind":"custom","uri":"https://gateway.example.com/v1"}'
+zeroclaw providers create models 'chat.fast.v2' '{"capability":"chat","provider":"gateway.prod","model":"wire-model"}'
+zeroclaw providers rename models 'chat.fast.v2' 'chat.primary'
+zeroclaw providers delete models 'chat.unused' --dry-run
+zeroclaw providers delete models 'chat.unused' --yes
+```
+
+The registry argument is `connections`, `models`, `model-presets`, or `fallback`.
+Create accepts a complete JSON definition and refuses an existing key. Rename
+rewrites exact registry and configuration references, preserving credentials;
+it never rewrites other keys sharing a dotted prefix. External SOP files or
+other operator-managed references must be updated separately. Delete refuses
+referenced entries; remove their bindings explicitly before deleting. Entries
+with environment overrides cannot be renamed or deleted until their environment
+configuration is updated. `--dry-run` validates the deletion without saving.
+The old category/family/alias CLI syntax has been removed.
+
+Provider CLI mutations (including `models set`) acquire exclusive offline
+configuration ownership and reload before editing. While a daemon owns the
+configuration, use its configuration editor, or stop it before using these
+commands. This prevents a connection/model rename from racing live sessions.

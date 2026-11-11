@@ -758,9 +758,7 @@ async fn headless_step_memory(
     let Some(owner) = owner else {
         return Ok(None);
     };
-    let api_key = config
-        .resolved_model_provider_for_agent(agent_alias)
-        .and_then(|(_, _, cfg)| cfg.api_key.clone());
+    let api_key = config.agent_model_api_key(agent_alias);
     crate::agent::turn::step_agent_memory(config, agent_alias, api_key.as_deref(), Some(owner))
         .await
         .map(Some)

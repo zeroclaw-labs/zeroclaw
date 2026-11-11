@@ -72,17 +72,40 @@ The override state is surfaced wherever the config is rendered, with a 💉 indi
 2. **Web Config editor**: every `ListEntry` carries an `is_env_overridden` bool. Env-overridden field rows render the 💉 badge and a persistent warning *"Edits here won't take effect, overridden by ZEROCLAW_..."* so operators see the override without having to attempt an edit.
 3. **CLI/TUI onboarding**: `prompt_field` skips env-overridden fields and prints a 💉 three-line note (the env var name, the TOML path, and a skip notice) that clears on next/back navigation. Operators don't get prompted to type a value they've already injected.
 4. **Reload drift**: `GET /api/config/drift`, `GET /api/config/list`, and the reload banner exclude env-overridden paths from drift computation. Because these values live only in memory and are never written to disk, they would otherwise report as permanent drift that no config-file edit could reconcile. Excluding them keeps drift output limited to differences an operator can actually resolve by editing the stored config.
-5. **Programmatic**: `Config::prop_is_env_overridden(path) -> bool` is an O(1) HashSet lookup. Hooks here for any custom render layer.
+5. **Programmatic**: `Config::prop_is_env_overridden(path) -> bool` resolves the stored override identity, including canonical registry JSON pointers. Hooks here for any custom render layer.
 
 ## Deriving env-var names from your config
 
-Three mechanical steps to derive an env-var name from any TOML key:
+Use `ZEROCLAW_` followed by the TOML path segments separated by `__`.
+Field names stay in snake_case. Each quoted registry key is **one segment**;
+preserve its dots and letter case instead of replacing dots inside the key.
+For example:
 
-1. **Prefix the path with `ZEROCLAW_`.** The dotted config path is the source of truth, find the field via `zeroclaw config schema`.
-2. **Replace `.` with `__`** (double underscore, the path separator).
-3. **Field name stays as-is** (snake_case). Aliases stay as-is. Nothing else transforms.
+```toml
+[providers.connections."gateway.Prod"]
+kind = "custom"
+uri = "https://gateway.example.com/v1"
+auth = { mode = "api_key", api_key = "<API_KEY>" }
 
-For example, `[providers.models.anthropic.home] api_key = "sk-..."` lives at the dotted path `providers.models.anthropic.home.api_key`. Apply the three rules and the env var is `ZEROCLAW_providers__models__anthropic__home__api_key=sk-...`. Same mechanical mapping for any field in any section.
+[providers.models."chat.Fast.v2"]
+capability = "chat"
+provider = "gateway.Prod"
+model = "wire-model"
+```
+
+Set overrides through a launcher that accepts arbitrary environment names:
+
+```sh
+env 'ZEROCLAW_providers__connections__gateway.Prod__auth__api_key=<API_KEY>' \
+    'ZEROCLAW_providers__models__chat.Fast.v2__options__temperature=null' \
+    zeroclaw daemon
+```
+
+Omitting an option inherits it; the literal `null` clears a nullable model
+option. An empty environment value removes the field. The `__` separator
+cannot occur inside a key addressed through this environment grammar. The
+legacy lowercase alias grammar above applies to historical schema paths;
+canonical registry keys preserve their complete TOML spelling.
 
 ## Bridging ecosystem-default env vars
 
@@ -98,9 +121,8 @@ These lines are shell bridges into typed config, not a general rule that constru
 
 A handful of fields live as schema fields, reachable via the standard mapping:
 
-1. **MiniMax OAuth refresh flow**: `[providers.models.minimax.<alias>] oauth_refresh_token = "..."` (with optional `oauth_client_id`); region selection is the typed `endpoint` enum (`cn` / `intl`). The runtime exchanges the refresh token for a short-lived access token at provider construction time.
-2. **Qwen OAuth refresh flow**: `[providers.models.qwen.<alias>] oauth_refresh_token = "..."` (with optional `oauth_client_id` and `oauth_resource_url`).
-3. **Gemini OAuth**: `[providers.models.gemini.<alias>] oauth_client_id` and `oauth_client_secret`; optional `oauth_project` pins a Code Assist GCP project ID.
-4. **KiloCLI / Gemini CLI / Grok Build CLI process settings**: `[providers.models.kilocli.<alias>] binary_path`, `[providers.models.gemini_cli.<alias>] binary_path`, and `[providers.models.grok_cli.<alias>]` fields `binary_path`, required absolute `working_directory`, optional `extra_args`, and `max_acp_stdout_bytes`. Grok Build aliases may also list environment variable names in `env_passthrough` (tool credentials and the optional `XAI_API_KEY` auth bridge); values are resolved only when the child is spawned and are not stored in config. Authentication uses the CLI login cache by default. The exact name `XAI_API_KEY` is the documented native bridge for API-key auth when explicitly listed; other `XAI_*` and all `GROK_*` names are rejected.
-5. **Transcription / TTS keys**: `[transcription].api_key`, `[providers.tts.openai.<alias>].api_key`, `[providers.tts.elevenlabs.<alias>].api_key`, `[providers.tts.google.<alias>].api_key`.
-6. **Notion / WhatsApp**: `[notion].api_key`, `[channels.whatsapp.<alias>].ws_url` (test/proxy WebSocket override).
+1. **MiniMax / Qwen OAuth**: connection `auth = { mode = "oauth", refresh_token = "...", client_id = "..." }`; vendor endpoint selection lives in `extra.endpoint`. Qwen's URI override lives on the connection.
+2. **Gemini OAuth**: connection `auth = { mode = "oauth", client_id = "...", client_secret = "..." }`; optional `extra.project` pins a Code Assist GCP project ID.
+3. **KiloCLI / Gemini CLI / Grok Build CLI process settings**: use the connection's `api.chat` object for `binary_path`, `working_directory`, `extra_args`, `env_passthrough`, and `max_acp_stdout_bytes` where supported by that driver. Authentication uses the CLI login cache by default. Grok's explicit `XAI_API_KEY` environment passthrough remains the documented native bridge; other `XAI_*` and all `GROK_*` names are rejected.
+4. **ASR / TTS keys**: connection `auth.api_key`; select a capability model referencing the connection. Speech consumers do not read historical provider tables.
+5. **Notion / WhatsApp**: `[notion].api_key`, `[channels.whatsapp.<alias>].ws_url` (test/proxy WebSocket override).

@@ -16236,19 +16236,18 @@ fn collect_configured_channels_with_authority(
         channels.push(ConfiguredChannel {
             display_name: "VoiceWake",
             alias: Some(alias.clone()),
-            channel: Arc::new(
-                VoiceWakeChannel::new(alias.clone(), vw.clone(), config.transcription.clone())
-                    .with_transcription_manager_factory(move || {
-                        let config = transcription_config_arc.read();
-                        let provider = resolve_agent_transcription_provider(
-                            &config,
-                            &transcription_channel_key,
-                        );
-                        zeroclaw_providers::transcription::build_transcription_manager(
-                            &config, &provider,
-                        )
-                    }),
-            ),
+            channel: Arc::new(VoiceWakeChannel::new(
+                alias.clone(),
+                vw.clone(),
+                move || {
+                    let config = transcription_config_arc.read();
+                    let provider =
+                        resolve_agent_transcription_provider(&config, &transcription_channel_key);
+                    zeroclaw_providers::transcription::build_transcription_manager(
+                        &config, &provider,
+                    )
+                },
+            )),
         });
     }
 

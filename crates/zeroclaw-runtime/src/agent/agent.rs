@@ -1090,7 +1090,7 @@ impl AgentBuilder {
             tool_dispatcher,
         } = runtime;
         let (provider, identity, model_route_resolver) = model.into_parts();
-        let provider_name = identity.profile_ref();
+        let provider_name = identity.provider_ref();
         let model_name = identity.model_id.clone();
         self.model_provider = Some(provider);
         self.model_provider_name = Some(provider_name);
@@ -2055,13 +2055,12 @@ impl Agent {
         let selected = self.model_route_resolver.resolve(effective_model);
         let config_fingerprint = if let Some(config) = self.full_config() {
             use sha2::{Digest, Sha256};
-            let agent_options =
-                zeroclaw_providers::provider_runtime_options_for_agent(config, &self.agent_alias);
-            let options = zeroclaw_providers::options_for_provider_ref(
+            let options = zeroclaw_providers::model::runtime_options(
                 config,
+                &self.agent_alias,
                 &selected.provider_name,
-                &agent_options,
-            );
+            )
+            .ok()?;
             // Include shared construction defaults (reasoning, multimodal,
             // secrets directory) through the existing options materializer.
             let mut provider_config = serde_json::to_value((&config.providers, options)).ok()?;
@@ -2139,7 +2138,7 @@ impl Agent {
             tool_dispatcher,
         } = runtime;
         let (provider, identity, model_route_resolver) = model.into_parts();
-        let provider_name = identity.profile_ref();
+        let provider_name = identity.provider_ref();
         let model_name = identity.model_id.clone();
         self.model_provider = provider;
         self.model_provider_name = provider_name;
@@ -23414,11 +23413,7 @@ model_provider = "custom.primary"
         config.multimodal.max_images = 8;
         config.multimodal.max_image_size_mb = 10;
 
-        let options = zeroclaw_providers::options_for_provider_ref(
-            &config,
-            "ollama",
-            &zeroclaw_providers::provider_runtime_options_for_bare_family(&config),
-        );
+        let options = zeroclaw_providers::model::runtime_options(&config, "", "ollama").unwrap();
 
         assert_eq!(
             options.multimodal.max_images, 8,

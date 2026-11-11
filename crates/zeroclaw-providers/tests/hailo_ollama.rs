@@ -11,13 +11,14 @@ use axum::{
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
-use zeroclaw_config::schema::{Config, HailoOllamaModelProviderConfig, ModelProviderConfig};
+use zeroclaw_config::schema::{HailoOllamaModelProviderConfig, ModelProviderConfig};
+use zeroclaw_providers::ModelProviderRuntimeOptions;
+use zeroclaw_providers::factory::FamilyProviderFactory;
 use zeroclaw_providers::hailo_ollama::HailoOllamaModelProvider;
 use zeroclaw_providers::ollama::{OllamaModelProvider, OllamaTuning};
 use zeroclaw_providers::traits::{
     ChatMessage, ChatRequest, ModelProvider, NonRetryableProviderError,
 };
-use zeroclaw_providers::{ModelProviderRuntimeOptions, create_model_provider_for_alias_with_url};
 
 type Capture = Arc<Mutex<Option<Value>>>;
 type RawCapture = Arc<Mutex<Option<Vec<u8>>>>;
@@ -69,20 +70,7 @@ fn hailo_provider_from_public_factory(
     api_url: Option<&str>,
     options: &ModelProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
-    let mut full_config = Config::default();
-    full_config
-        .providers
-        .models
-        .hailo_ollama
-        .insert(alias.to_string(), config.clone());
-    create_model_provider_for_alias_with_url(
-        &full_config,
-        "hailo_ollama",
-        alias,
-        api_key,
-        api_url,
-        options,
-    )
+    config.create_provider(alias, api_key, api_url, options)
 }
 
 async fn capture_chat(State(capture): State<Capture>, Json(body): Json<Value>) -> Json<Value> {

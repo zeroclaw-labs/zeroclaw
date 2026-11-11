@@ -59,7 +59,7 @@ impl ProviderEndpoint {
     }
 }
 
-pub(crate) trait FamilyProviderFactory {
+pub trait FamilyProviderFactory {
     const ENDPOINT: ProviderEndpoint;
 
     /// How a context-window discovery probe must authenticate to this
@@ -70,7 +70,7 @@ pub(crate) trait FamilyProviderFactory {
     /// two. A family cannot be declared probeable without also declaring how
     /// its stored credential becomes an outbound header, so the generic
     /// reader can never be handed a raw credential it does not know how to
-    /// transform. [`crate::fetch_context_window`] resolves this and applies it
+    /// transform. [`crate::fetch_model_context_window`] resolves this and applies it
     /// through the compatible module's `apply_auth_to_request` — the same
     /// function the family's chat requests use. (Plain text rather than an
     /// intra-doc link: that helper is crate-private, and a public item may not
@@ -465,22 +465,22 @@ pub fn dispatch_family_factory(
     api_url: Option<&str>,
     opts: &ModelProviderRuntimeOptions,
 ) -> Result<Box<dyn ModelProvider>> {
+    if let Some(config) = config {
+        let (registry, reference) = config.chat_registry_for_legacy_alias(family, alias)?;
+        return dispatch_model_ref_with_registry(&registry, &reference, opts, key);
+    }
     // openai missing-entry fallback: see `openai_missing_entry_fallback_config`.
     // A persisted entry keeps its stored `wire_api`; an implicit dispatch with no
     // entry (bare `openai` ref or a dangling alias) stays on the chat-completions
     // wire so existing installs don't flip wire + tool-calling mode on upgrade.
     if family == "openai" {
         let default_cfg = openai_missing_entry_fallback_config();
-        let cfg = config
-            .and_then(|c| c.providers.models.openai.get(alias))
-            .unwrap_or(&default_cfg);
+        let cfg = &default_cfg;
         return cfg.create_provider(alias, key, api_url, opts);
     }
     if family == "qwen" {
         let default_cfg = qwen_missing_entry_fallback_config();
-        let cfg = config
-            .and_then(|c| c.providers.models.qwen.get(alias))
-            .unwrap_or(&default_cfg);
+        let cfg = &default_cfg;
         return cfg.create_provider(alias, key, api_url, opts);
     }
     macro_rules! emit_dispatch {
@@ -488,21 +488,13 @@ pub fn dispatch_family_factory(
             match family {
                 "openai-compatible" | "openai_compatible" => {
                     let default_cfg = zeroclaw_config::schema::ModelProviderConfig::default();
-                    let cfg = config
-                        .and_then(|c| c.providers.models.find("openai", alias))
-                        .unwrap_or(&default_cfg);
+                    let cfg = &default_cfg;
                     cfg.create_provider(alias, key, api_url, opts)
                 }
                 $(
                     $type_str => {
-                        let default_cfg: $cfg_ty;
-                        let cfg: &$cfg_ty = match config.and_then(|c| c.providers.models.$field.get(alias)) {
-                            Some(c) => c,
-                            None => {
-                                default_cfg = <$cfg_ty>::default();
-                                &default_cfg
-                            }
-                        };
+                        let default_cfg = <$cfg_ty>::default();
+                        let cfg = &default_cfg;
                         cfg.create_provider(alias, key, api_url, opts)
                     }
                 )+
@@ -525,67 +517,6 @@ pub fn dispatch_family_factory(
         }
     }
     zeroclaw_config::for_each_model_provider_slot!(emit_dispatch)
-}
-
-pub(crate) fn fallback_auth_ready_for_alias(
-    config: &zeroclaw_config::schema::Config,
-    family: &str,
-    alias: &str,
-    key: Option<&str>,
-    opts: &ModelProviderRuntimeOptions,
-) -> bool {
-    let provider_kind = opts
-        .provider_kind
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(family);
-
-    // openai missing-entry fallback: keep construction symmetric with
-    // `dispatch_family_factory`. `wire_api` does not influence auth-readiness,
-    // but constructing the same chat-anchored fallback avoids any future
-    // divergence if that changes.
-    if provider_kind == "openai" {
-        let default_cfg = openai_missing_entry_fallback_config();
-        let cfg = config
-            .providers
-            .models
-            .openai
-            .get(alias)
-            .unwrap_or(&default_cfg);
-        return cfg.fallback_auth_ready(key, opts);
-    }
-
-    macro_rules! emit_auth_ready {
-        ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
-            match provider_kind {
-                "openai-compatible" | "openai_compatible" => {
-                    let default_cfg = zeroclaw_config::schema::ModelProviderConfig::default();
-                    let cfg = config
-                        .providers
-                        .models
-                        .find("openai", alias)
-                        .unwrap_or(&default_cfg);
-                    cfg.fallback_auth_ready(key, opts)
-                }
-                $(
-                    $type_str => {
-                        let default_cfg: $cfg_ty;
-                        let cfg: &$cfg_ty = match config.providers.models.$field.get(alias) {
-                            Some(c) => c,
-                            None => {
-                                default_cfg = <$cfg_ty>::default();
-                                &default_cfg
-                            }
-                        };
-                        cfg.fallback_auth_ready(key, opts)
-                    }
-                )+
-                _ => has_api_key(key),
-            }
-        }
-    }
-    zeroclaw_config::for_each_model_provider_slot!(emit_auth_ready)
 }
 
 /// Authentication admission for an exact canonical selection. Reuse each
@@ -690,7 +621,7 @@ pub fn get_default_url(provider_type: &str) -> Option<&'static str> {
 /// defines the typed slots — so the answer is derived from the family list
 /// instead of tracking it by hand. A family declares this beside its own spec
 /// and is classified the moment its slot exists, which is the property the
-/// previous hand-written list in [`crate::fetch_context_window`] did not have.
+/// previous hand-written list in [`crate::fetch_model_context_window`] did not have.
 ///
 /// [`for_each_model_provider_slot!`]: zeroclaw_config::for_each_model_provider_slot
 #[must_use]

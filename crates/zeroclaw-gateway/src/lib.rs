@@ -918,105 +918,54 @@ impl DashboardFeed {
     }
 }
 
-enum GatewayBootSelection<'a> {
-    Legacy(Option<zeroclaw_config::schema::ModelSelection<'a>>),
-    Canonical {
-        model_ref: String,
-        model_id: Option<String>,
-        temperature: Option<f64>,
-        api_key: Option<String>,
-    },
+struct GatewayBootSelection {
+    model_ref: String,
+    model_id: Option<String>,
+    temperature: Option<f64>,
+    api_key: Option<String>,
 }
-
-impl GatewayBootSelection<'_> {
+impl GatewayBootSelection {
     fn provider_ref(&self) -> String {
-        match self {
-            Self::Legacy(selection) => selection.as_ref().map_or_else(
-                || "openrouter.default".into(),
-                |selection| selection.identity(None).provider_ref(),
-            ),
-            Self::Canonical { model_ref, .. } => model_ref.clone(),
-        }
+        self.model_ref.clone()
     }
-
-    fn entry(&self) -> Option<&zeroclaw_config::schema::ModelProviderConfig> {
-        match self {
-            Self::Legacy(selection) => selection.as_ref().map(|selection| selection.entry),
-            Self::Canonical { .. } => None,
-        }
-    }
-
     fn alias(&self) -> &str {
-        match self {
-            Self::Legacy(selection) => selection
-                .as_ref()
-                .map_or("default", |selection| selection.alias),
-            Self::Canonical { model_ref, .. } => model_ref,
-        }
+        &self.model_ref
     }
-
     fn model(&self) -> &str {
-        match self {
-            Self::Legacy(selection) => selection
-                .as_ref()
-                .and_then(|selection| selection.model_id.as_deref())
-                .unwrap_or_default(),
-            Self::Canonical { model_id, .. } => model_id.as_deref().unwrap_or_default(),
-        }
+        self.model_id.as_deref().unwrap_or_default()
     }
-
     fn temperature(&self) -> Option<f64> {
-        match self {
-            Self::Legacy(selection) => selection
-                .as_ref()
-                .and_then(|selection| selection.temperature()),
-            Self::Canonical { temperature, .. } => *temperature,
-        }
+        self.temperature
     }
-
     fn api_key(&self) -> Option<&str> {
-        match self {
-            Self::Legacy(selection) => selection
-                .as_ref()
-                .and_then(|selection| selection.entry.api_key.as_deref()),
-            Self::Canonical { api_key, .. } => api_key.as_deref(),
-        }
+        self.api_key.as_deref()
     }
 }
-
-fn resolve_gateway_boot_selection(config: &Config) -> GatewayBootSelection<'_> {
-    if config.providers.models.has_canonical_models()
-        && let Ok(registry) = config.provider_registry()
-        && let Some(model_ref) = registry.models.iter().find_map(|(model_ref, model)| {
-            (model.capability() == zeroclaw_api::capability::Capability::Chat)
-                .then_some((model_ref, model))
+fn resolve_gateway_boot_selection(config: &Config) -> GatewayBootSelection {
+    let model_ref = config
+        .resolved_runtime_agent_alias()
+        .and_then(|alias| config.agent(alias))
+        .map(|agent| agent.model_provider.as_str().to_owned())
+        .or_else(|| {
+            config
+                .provider_registry()
+                .ok()?
+                .models
+                .iter()
+                .find(|(_, model)| model.capability() == zeroclaw_api::capability::Capability::Chat)
+                .map(|(reference, _)| reference.to_string())
         })
-    {
-        let (model_ref, model) = model_ref;
-        let model_id = model.upstream_model().map(str::to_owned);
-        let temperature = registry.resolve_chat(model_ref).ok().and_then(|resolved| {
-            resolved
-                .options
-                .temperature
-                .as_ref()
-                .and_then(|value| match value {
-                    zeroclaw_config::provider_registry::Override::Set(value) => Some(*value),
-                    zeroclaw_config::provider_registry::Override::Clear => None,
-                })
-        });
-        let api_key = registry
-            .connections
-            .get(model.provider())
-            .and_then(|connection| connection.api_key())
-            .map(str::to_owned);
-        return GatewayBootSelection::Canonical {
-            model_ref: model_ref.to_string(),
-            model_id,
-            temperature,
-            api_key,
-        };
+        .unwrap_or_default();
+    let api_key = config.provider_registry().ok().and_then(|registry| {
+        let selected = registry.resolve_chat(&model_ref.as_str().into()).ok()?;
+        selected.selection.connection.api_key().map(str::to_owned)
+    });
+    GatewayBootSelection {
+        model_id: config.resolve_model_id(&model_ref),
+        temperature: config.resolve_model_temperature(&model_ref),
+        model_ref,
+        api_key,
     }
-    GatewayBootSelection::Legacy(config.resolve_default_model_selection())
 }
 
 async fn create_gateway_boot_provider(
@@ -1080,7 +1029,7 @@ fn config_admin_router(route_auth: principal_gate::ConfigRouteAuth) -> Router<Ap
             post(api_config::handle_rename_map_key),
         )
         .route(
-            "/api/config/model-providers/{type}/{alias}/refresh-context-window",
+            "/api/config/models/{model_ref}/refresh-context-window",
             post(api_config::handle_refresh_context_window),
         )
         .route(
@@ -1599,7 +1548,6 @@ pub async fn run_gateway_with_plugin_webhooks(
     // nested-only profile from being paired with another profile's provider.
     let boot = resolve_gateway_boot_selection(&config);
     let boot_provider_ref = boot.provider_ref();
-    let fallback = boot.entry();
     let model_provider_name = boot_provider_ref.as_str();
     let (model_provider, boot_provider_failed): (Arc<dyn ModelProvider>, bool) =
         match create_gateway_boot_provider(Arc::new(config.clone()), &boot_provider_ref).await {
@@ -1648,11 +1596,7 @@ pub async fn run_gateway_with_plugin_webhooks(
     let mem: Arc<dyn Memory> = if config.agents.is_empty() {
         Arc::new(zeroclaw_memory::NoneMemory::new("none"))
     } else {
-        match zeroclaw_memory::create_memory_from_config(
-            &config,
-            boot.api_key()
-                .or_else(|| fallback.and_then(|e| e.api_key.as_deref())),
-        ) {
+        match zeroclaw_memory::create_memory_from_config(&config, boot.api_key()) {
             Ok(m) => Arc::from(m),
             Err(e) => {
                 ::zeroclaw_log::record!(
@@ -7563,8 +7507,12 @@ path = "{trigger_path}"
         // The compatible adapter supports arbitrary request body overlays.
         let compatible_profile = profile.clone();
         *config.providers.models.ensure("custom", "gateway").unwrap() = compatible_profile;
-        let boot =
-            GatewayBootSelection::Legacy(config.resolve_model_selection("custom.gateway.only"));
+        let boot = GatewayBootSelection {
+            model_ref: "custom.gateway.only".into(),
+            model_id: config.resolve_model_id("custom.gateway.only"),
+            temperature: config.resolve_model_temperature("custom.gateway.only"),
+            api_key: None,
+        };
         assert_eq!(boot.provider_ref(), "custom.gateway.only");
         let provider = create_gateway_boot_provider(Arc::new(config.clone()), &boot.provider_ref())
             .await

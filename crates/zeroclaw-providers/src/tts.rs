@@ -1021,6 +1021,16 @@ fn build_canonical_tts_provider(
     model_ref: &str,
     resolved: &ResolvedTts<'_>,
 ) -> Result<(Box<dyn TtsProvider>, Option<String>)> {
+    if matches!(resolved.selection.connection, ProviderConnection::OpenAi(_)) {
+        anyhow::ensure!(
+            resolved
+                .selection
+                .connection
+                .api_key()
+                .is_some_and(|key| !key.trim().is_empty()),
+            "Missing OpenAI TTS API key: set the model connection auth.api_key"
+        );
+    }
     if matches!(
         resolved.selection.connection,
         ProviderConnection::OpenAi(_)
@@ -1183,141 +1193,41 @@ impl TtsManager {
         let mut tts_providers: HashMap<String, Box<dyn TtsProvider>> = HashMap::new();
         let mut voice_by_alias: HashMap<String, String> = HashMap::new();
 
-        // Canonical model references are exact TOML keys.  Register them
-        // before the legacy family maps so a new model such as
-        // `voice.gateway.prod` is never split or shadowed by a dotted legacy
-        // profile parser.
-        if config.provider_registry().is_ok_and(|registry| {
-            registry
-                .models
-                .values()
-                .any(|model| model.capability() == zeroclaw_api::capability::Capability::Tts)
-        }) {
-            let registry = config.provider_registry().map_err(|error| {
-                anyhow::Error::msg(format!("invalid canonical provider registry: {error}"))
-            })?;
-            for (model_ref, model) in &registry.models {
-                if !matches!(model, ModelDefinition::Tts(_)) {
-                    continue;
-                }
-                let result = registry.resolve_tts(model_ref).and_then(|resolved| {
-                    build_canonical_tts_provider(model_ref.as_str(), &resolved)
-                        .map(|(provider, voice)| (resolved, provider, voice))
-                        .map_err(|error| {
-                            zeroclaw_config::provider_registry::RegistryError::new(
-                                ["providers", "models", model_ref.as_str()],
-                                error.to_string(),
-                            )
-                        })
-                });
-                match result {
-                    Ok((resolved, provider, voice)) => {
-                        let key = model_ref.to_string();
-                        if let Some(voice) = voice {
-                            voice_by_alias.insert(key.clone(), voice);
-                        }
-                        tts_providers.insert(key.clone(), provider);
-                        // Legacy agents store typed speech selections as
-                        // `<family>.<alias>`.  The compatibility projection
-                        // names their canonical model `tts.<family>.<alias>`;
-                        // expose the old exact key while that source remains
-                        // present so loading a v3/v4 config does not break
-                        // its next synthesis request.
-                        if let Some(legacy_key) =
-                            model_ref.as_str().strip_prefix("tts.").filter(|_| {
-                                resolved
-                                    .selection
-                                    .provider_id
-                                    .as_str()
-                                    .starts_with("legacy.tts.")
-                            })
-                            && registry
-                                .resolve_tts(&zeroclaw_config::provider_registry::ModelRef::from(
-                                    legacy_key,
-                                ))
-                                .is_err()
-                            && let Ok((legacy_provider, _)) =
-                                build_canonical_tts_provider(model_ref.as_str(), &resolved)
-                        {
-                            // An explicitly canonical model may already own
-                            // the legacy-shaped key (`openai.voice`).  Keep
-                            // its provider and default voice intact; only
-                            // create the alias when no canonical model owns it.
-                            tts_providers.insert(legacy_key.to_owned(), legacy_provider);
-                            if let Some(voice) = voice_by_alias.get(&key).cloned() {
-                                voice_by_alias.insert(legacy_key.to_owned(), voice);
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note,
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({
-                                "error": error.to_string(),
-                                "model_ref": model_ref.as_str(),
-                            })),
-                            "canonical TTS model skipped (config error)"
-                        );
-                    }
-                }
+        let binding = agent_alias
+            .or_else(|| config.resolved_runtime_agent_alias())
+            .and_then(|alias| config.agents.get(alias))
+            .map(|agent| agent.tts_provider.as_str())
+            .unwrap_or_default();
+        let agent_tts_provider = if binding.is_empty() {
+            String::new()
+        } else {
+            config
+                .capability_model_ref(binding, zeroclaw_api::capability::Capability::Tts)?
+                .to_string()
+        };
+        let registry = config.provider_registry()?;
+        for (reference, model) in &registry.models {
+            if !matches!(model, ModelDefinition::Tts(_)) {
+                continue;
             }
-        }
-
-        // Legacy typed entries are projected into the registry at the config
-        // boundary. Keep this fallback only for an invalid/incomplete
-        // registry so normal consumers have one exact-key path.
-        let registry_has_tts = config.provider_registry().is_ok_and(|registry| {
-            registry
-                .models
-                .values()
-                .any(|model| model.capability() == zeroclaw_api::capability::Capability::Tts)
-        });
-        if !registry_has_tts {
-            for (family, alias, instance) in config.providers.tts.iter_entries() {
-                let dotted = format!("{family}.{alias}");
-                let result: Result<Box<dyn TtsProvider>> = match family {
-                    "openai" => OpenAiTtsProvider::new(alias, instance).map(|p| Box::new(p) as _),
-                    "elevenlabs" => {
-                        ElevenLabsTtsProvider::new(alias, instance).map(|p| Box::new(p) as _)
+            let built = registry
+                .resolve_tts(reference)
+                .map_err(anyhow::Error::from)
+                .and_then(|resolved| build_canonical_tts_provider(reference.as_str(), &resolved));
+            match built {
+                Ok((provider, voice)) => {
+                    if let Some(voice) = voice {
+                        voice_by_alias.insert(reference.to_string(), voice);
                     }
-                    "google" => GoogleTtsProvider::new(alias, instance).map(|p| Box::new(p) as _),
-                    "edge" => EdgeTtsProvider::new(alias, instance).map(|p| Box::new(p) as _),
-                    "piper" => Ok(Box::new(PiperTtsProvider::new(alias, instance)) as _),
-                    _ => Err(anyhow::Error::msg(format!(
-                        "unsupported typed TTS family: {family}"
-                    ))),
-                };
-                match result {
-                    Ok(p) => {
-                        tts_providers.entry(dotted.clone()).or_insert(p);
-                        if let Some(voice) = instance
-                            .voice
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|v| !v.is_empty())
-                        {
-                            voice_by_alias
-                                .entry(dotted)
-                                .or_insert_with(|| voice.to_string());
-                        }
-                    }
-                    Err(e) => {
-                        let config_path = format!("[providers.tts.{dotted}]");
-                        ::zeroclaw_log::record!(
-                        WARN,
+                    tts_providers.insert(reference.to_string(), provider);
+                }
+                Err(error) if reference.as_str() == agent_tts_provider => return Err(error),
+                Err(error) => {
+                    ::zeroclaw_log::record!(WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(
-                                ::serde_json::json!({"error": e.to_string(), "config_path": config_path})
-                            ),
-                        "typed TTS provider skipped (config error)"
-                    );
-                    }
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"model_ref":reference.as_str(),"error":error.to_string()})),
+                        "unselected TTS model is unavailable");
                 }
             }
         }
@@ -1327,16 +1237,6 @@ impl TtsManager {
         } else {
             config.tts.max_text_length
         };
-
-        // Per-agent join: bind to the channel-owning agent's `tts_provider`
-        // when known, else the runtime-active agent. Empty (or no resolved
-        // agent) = no TTS; `synthesize` fails loud rather than silently
-        // pick a provider.
-        let agent_tts_provider = agent_alias
-            .or_else(|| config.resolved_runtime_agent_alias())
-            .and_then(|alias| config.agents.get(alias))
-            .map(|a| a.tts_provider.as_str().to_string())
-            .unwrap_or_default();
 
         Ok(Self {
             tts_providers,
@@ -1366,8 +1266,8 @@ impl TtsManager {
         if provider_alias.is_empty() {
             bail!(
                 "Agent has no tts_provider configured. Set \
-                 `agent.<alias>.tts_provider = \"<type>.<alias>\"` referencing a \
-                 [providers.tts.<type>.<alias>] entry."
+                 `agent.<alias>.tts_provider = \"<model-key>\"` referencing a \
+                 [providers.models.<model-key>] TTS definition."
             );
         }
         let voice = self
@@ -1385,8 +1285,8 @@ impl TtsManager {
         if provider_alias.is_empty() {
             bail!(
                 "Agent has no tts_provider configured. Set \
-                 `agent.<alias>.tts_provider = \"<type>.<alias>\"` referencing a \
-                 [providers.tts.<type>.<alias>] entry."
+                 `agent.<alias>.tts_provider = \"<model-key>\"` referencing a \
+                 [providers.models.<model-key>] TTS definition."
             );
         }
         self.synthesize_with_provider(text, provider_alias, voice)
@@ -2331,10 +2231,10 @@ voice = "legacy-voice"
         let events: Vec<serde_json::Value> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         let event = events
             .iter()
-            .find(|value| value["attributes"]["config_path"] == "[providers.tts.openai.stoa]")
+            .find(|value| value["attributes"]["model_ref"] == "openai.stoa")
             .unwrap_or_else(|| panic!("expected a skip record for openai.stoa: {events:?}"));
         assert_eq!(
-            event["message"], "typed TTS provider skipped (config error)",
+            event["message"], "unselected TTS model is unavailable",
             "event: {event:?}"
         );
         assert!(

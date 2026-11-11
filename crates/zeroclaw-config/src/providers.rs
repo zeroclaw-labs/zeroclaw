@@ -1222,6 +1222,11 @@ impl Providers {
             if let Some(api_key) = base.api_key.as_deref() {
                 connection["auth"] = serde_json::json!({"mode":"api_key","api_key":api_key});
             }
+            if let Some(command) = base.binary_path.as_deref() {
+                if matches!(family, "edge" | "piper") {
+                    connection["api"] = serde_json::json!({"tts":{"command":command}});
+                }
+            }
             let mut options = serde_json::Map::new();
             for (field, value) in [
                 ("voice", base.voice.clone().map(serde_json::Value::String)),
@@ -1296,36 +1301,25 @@ impl Providers {
                 )
             })?;
             let provider_id = ProviderId::from(format!("legacy.asr.{family}.{alias}"));
-            let kind = if family == "openai" { "openai" } else { family };
-            let mut connection = serde_json::json!({"kind": kind});
-            if let Some(uri) = raw.get("uri").and_then(serde_json::Value::as_str) {
-                connection["uri"] = serde_json::Value::String(uri.to_owned());
-            }
-            if let Some(api_key) = raw.get("api_key").and_then(serde_json::Value::as_str) {
-                connection["auth"] = serde_json::json!({"mode":"api_key","api_key":api_key});
-            }
-            let model_id = raw
-                .get("model")
-                .cloned()
-                .unwrap_or_else(|| serde_json::Value::String("whisper-1".into()));
-            let model = serde_json::json!({"capability":"asr","provider":provider_id.as_str(),"model":model_id});
-            connections.insert(
-                provider_id.clone(),
-                serde_json::from_value(connection).map_err(|error| {
-                    super::provider_registry::RegistryError::new(
-                        ["providers", "transcription", family, alias],
-                        error.to_string(),
-                    )
-                })?,
-            );
+            let (connection, model) =
+                super::provider_registry::input::asr_definition(&raw, family, &provider_id)
+                    .map_err(|error| {
+                        super::provider_registry::RegistryError::new(
+                            ["providers", "transcription", family, alias],
+                            error.to_string(),
+                        )
+                    })?;
+            connections.entry(provider_id).or_insert(connection);
             models.insert(
                 reference,
-                serde_json::from_value(model).map_err(|error| {
-                    super::provider_registry::RegistryError::new(
-                        ["providers", "transcription", family, alias],
-                        error.to_string(),
-                    )
-                })?,
+                serde_json::to_value(model)
+                    .and_then(serde_json::from_value)
+                    .map_err(|error| {
+                        super::provider_registry::RegistryError::new(
+                            ["providers", "transcription", family, alias],
+                            error.to_string(),
+                        )
+                    })?,
             );
         }
         ProviderRegistry::from_raw_parts(

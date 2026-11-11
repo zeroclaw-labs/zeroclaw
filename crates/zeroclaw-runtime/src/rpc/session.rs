@@ -4025,12 +4025,7 @@ mod tests {
         crate::agent::agent::ModelRuntime::for_test(
             zeroclaw_providers::model::BuiltModel::from_provider(
                 Box::new(StubProvider),
-                zeroclaw_config::schema::ModelIdentity {
-                    family: provider_name.to_string(),
-                    alias: String::new(),
-                    entry_alias: None,
-                    model_id: model_name.to_string(),
-                },
+                zeroclaw_config::schema::ModelIdentity::new(provider_name, model_name),
             ),
             Box::new(NativeToolDispatcher),
         )

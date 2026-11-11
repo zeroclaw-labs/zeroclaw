@@ -3370,11 +3370,9 @@ impl TelegramChannel {
     /// the legacy section, so it binds a lone registered provider and
     /// otherwise leaves the choice unbound (see
     /// `transcription::build_transcription_manager_from_legacy_config`).
-    pub fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
-        let manager =
-            zeroclaw_providers::transcription::build_transcription_manager_from_legacy_config(
-                &config,
-            );
+    #[cfg(test)]
+    fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
+        let manager = crate::transcription_fixture(&config);
         self.with_transcription_manager(config, manager)
     }
 
@@ -21322,8 +21320,10 @@ mod tests {
             api_key: Some(api_key),
             ..Default::default()
         };
-        let manager = zeroclaw_providers::transcription::TranscriptionManager::new(&config)
-            .expect("TranscriptionManager::new should succeed with valid GROQ_API_KEY");
+        let manager = zeroclaw_providers::transcription::TranscriptionManager::new(
+            &Config::from_transcription_input(&config),
+        )
+        .expect("TranscriptionManager::new should succeed with valid GROQ_API_KEY");
         let transcript: String = manager
             .transcribe(&audio_data, "hello.mp3")
             .await

@@ -325,15 +325,7 @@ mod tests {
     use zeroclaw_config::schema::{ModelEntryConfig, ModelIdentity};
 
     fn test_built_model(provider: Box<dyn ModelProvider>) -> BuiltModel {
-        BuiltModel::from_provider(
-            provider,
-            ModelIdentity {
-                family: "custom".into(),
-                alias: "gw".into(),
-                entry_alias: Some("chosen".into()),
-                model_id: "test".into(),
-            },
-        )
+        BuiltModel::from_provider(provider, ModelIdentity::new("custom.gw.chosen", "test"))
     }
 
     struct RecordingLlm {

@@ -1196,8 +1196,7 @@ enum Commands {
         #[arg(long, hide = true)]
         api_key: Option<String>,
 
-        /// ModelProvider name. Used as the type key for the synthesized
-        /// `[providers.models.<type>.default]` entry.
+        /// Provider kind for the synthesized connection and chat model.
         #[arg(long, hide = true)]
         model_provider: Option<String>,
 
@@ -3205,16 +3204,16 @@ fn report_agent_not_created(
 }
 
 #[cfg(feature = "agent-runtime")]
-fn model_path_provider_type(path: &str) -> Option<&'static str> {
-    let parts: Vec<&str> = path.split('.').collect();
-    if parts.len() != 5 || parts[0] != "providers" || parts[1] != "models" || parts[4] != "model" {
-        return None;
-    }
-    let family = parts[2];
-    zeroclaw_providers::list_model_providers()
-        .iter()
-        .find(|p| p.name == family)
-        .map(|p| p.name)
+fn model_path_selection(config: &Config, path: &str) -> Option<(String, String)> {
+    let reference = path
+        .strip_prefix("providers.models.")?
+        .strip_suffix(".model")?;
+    let registry = config.provider_registry().ok()?;
+    let selected = registry.resolve_chat(&reference.into()).ok()?;
+    Some((
+        reference.to_owned(),
+        selected.selection.connection.kind().to_owned(),
+    ))
 }
 
 #[cfg(any(feature = "agent-runtime", test))]
@@ -9172,13 +9171,14 @@ async fn kernel_agent_chat(
     // Bare-family overrides inherit the configured agent selection. Keep that
     // derived scalar separate from invocation input so fallbacks resolve their
     // own sampling policy from Config.
-    let selection_ref = if model.identity().alias.is_empty() {
-        config
-            .agent(agent_alias)
-            .map_or(provider_ref.as_str(), |agent| agent.model_provider.as_str())
-    } else {
-        provider_ref.as_str()
-    };
+    let selection_ref =
+        if zeroclaw_providers::model::inherits_agent_selection(config, &provider_ref) {
+            config
+                .agent(agent_alias)
+                .map_or(provider_ref.as_str(), |agent| agent.model_provider.as_str())
+        } else {
+            provider_ref.as_str()
+        };
     let input = zeroclaw_providers::temperature::Temperature::from(temperature_override);
     zeroclaw_providers::ProviderDispatch::from_ref(model.provider())
         .chat_with_system_with_sampling(
@@ -11706,7 +11706,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 let Some(model) = configured.model_id.as_deref() else {
                     continue;
                 };
-                if configured.profile_ref != shown_profile {
+                if configured.connection_id != shown_profile {
                     // First profile uses the emoji-anchored line; later ones
                     // the indented variant — the original layout.
                     let (key, fallback) = if shown_provider {
@@ -11723,22 +11723,22 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                                     "family",
                                     registry
                                         .connections
-                                        .get(configured.profile_ref.as_str())
+                                        .get(configured.connection_id.as_str())
                                         .map_or("", |connection| connection.kind())
                                 ),
-                                ("alias", configured.profile_ref.as_str()),
+                                ("alias", configured.connection_id.as_str()),
                             ],
                             fallback
                         )
                     );
                     shown_provider = true;
-                    shown_profile = configured.profile_ref;
+                    shown_profile = configured.connection_id;
                 }
                 println!(
                     "{}",
                     ta(
                         "cli-status-model-entry",
-                        &[("alias", &configured.provider_ref), ("model", model)],
+                        &[("alias", &configured.model_ref), ("model", model)],
                         "Model [{$alias}]: {$model}"
                     )
                 );
@@ -12320,11 +12320,13 @@ Add pricing to the active provider profile or supply a catalog entry."
             providers_command: None,
         } => {
             let model_providers = zeroclaw_providers::list_model_providers();
-            let configured_types: std::collections::HashSet<&str> = config
-                .providers
+            let registry = config.provider_registry()?;
+            let configured_types: std::collections::HashSet<&str> = registry
                 .models
-                .iter_entries()
-                .map(|(ty, _, _)| ty)
+                .values()
+                .filter(|model| model.capability() == zeroclaw_api::capability::Capability::Chat)
+                .filter_map(|model| registry.connections.get(model.provider()))
+                .map(|connection| connection.kind())
                 .collect();
             println!(
                 "Supported model model_providers ({} total):\n",
@@ -12349,9 +12351,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                 }
             }
             println!(
-                "\n  Set [providers.models.custom.<alias>] uri = \"<URL>\" for any \
-                 OpenAI-compatible endpoint, or [providers.models.anthropic.<alias>] \
-                 uri = \"<URL>\" for an Anthropic-compatible endpoint."
+                "\n  Set kind and uri under [providers.connections.<key>], then bind a capability model under [providers.models.<key>]." // i18n-exempt: literal config syntax example
             );
             Ok(())
         }
@@ -13035,13 +13035,11 @@ Add pricing to the active provider profile or supply a catalog entry."
                     dialoguer::Input::<String>::new()
                         .with_prompt(format!("Enter value for {path}"))
                         .interact_text()?
-                } else if let Some(provider_type) = model_path_provider_type(&path) {
+                } else if let Some((provider_ref, provider_type)) =
+                    model_path_selection(&config, &path)
+                {
                     use dialoguer::{FuzzySelect, Input};
-                    let provider_ref = path
-                        .split('.')
-                        .nth(3)
-                        .map(|alias| format!("{provider_type}.{alias}"));
-                    let catalog_selector = provider_ref.as_deref().unwrap_or(provider_type);
+                    let catalog_selector = provider_ref.as_str();
                     let catalog = zeroclaw_runtime::quickstart::model_catalog_with_config_result(
                         Some(&config),
                         catalog_selector,
@@ -16884,44 +16882,43 @@ fn available_gateway_restart_hint_port(host: &str, port: u16) -> Option<u16> {
     None
 }
 
-/// Persist `model` as the default for the first configured provider.
+/// Set the active agent model's upstream ID, or the first configured chat model.
 #[cfg(feature = "agent-runtime")]
 async fn handle_models_set(config: &mut Config, model: &str) -> Result<()> {
+    let _ownership = crate::alias_cli::begin_provider_edit(config).await?;
     crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
-    let (type_key, alias) = {
-        let entry = config
-            .providers
+    // Change the upstream ID of the active agent's exact model definition.
+    let reference = config
+        .resolved_runtime_agent_alias()
+        .and_then(|alias| config.agent(alias))
+        .map(|agent| agent.model_provider.as_str().to_owned())
+        .or_else(|| {
+            config
+                .provider_registry()
+                .ok()?
+                .models
+                .into_iter()
+                .find(|(_, model)| model.capability() == zeroclaw_api::capability::Capability::Chat)
+                .map(|(reference, _)| reference.to_string())
+        })
+        .ok_or_else(|| anyhow::Error::msg("No model provider configured"))?;
+    zeroclaw_config::provider_registry::editor::update(config, |registry| {
+        let selected = registry
             .models
-            .iter_entries()
-            .find(|(_, _, entry)| {
-                entry.model.as_ref().is_some_and(|m| !m.trim().is_empty())
-                    || !entry.models.is_empty()
-            })
-            .ok_or_else(|| {
-                anyhow::Error::msg(
-                    "No model provider configured. Run `zeroclaw config init` first.",
-                )
-            })?;
-        (entry.0, entry.1.to_string())
-    };
-    // When the profile resolves through a nested model entry (`models.default`
-    // or its sole entry), the profile-level `model` is shadowed — the write
-    // must land on that entry's `id` or the command silently does nothing.
-    let prop_path = config
-        .resolve_model_selection(&format!("{type_key}.{alias}"))
-        .and_then(|selection| selection.model_alias)
-        .map(|model_alias| format!("providers.models.{type_key}.{alias}.models.{model_alias}.id"))
-        .unwrap_or_else(|| format!("providers.models.{type_key}.{alias}.model"));
-    config.set_prop_persistent(&prop_path, model)?;
+            .get_mut(&reference.as_str().into())
+            .ok_or_else(|| anyhow::Error::msg("Selected model does not exist"))?;
+        let zeroclaw_config::provider_registry::ModelDefinition::Chat(selected) = selected else {
+            anyhow::bail!("Selected model is not a chat model");
+        };
+        selected.model = Some(model.to_owned());
+        Ok(())
+    })?;
     Box::pin(config.save_dirty()).await?;
     println!(
         "{}",
         crate::i18n::get_required_cli_string_with_args(
             "cli-models-set-ok",
-            &[
-                ("model", model),
-                ("provider", &format!("{type_key}.{alias}")),
-            ]
+            &[("model", model), ("provider", &reference),]
         )
     );
     Ok(())
@@ -16960,16 +16957,8 @@ async fn dispatch_models_command(model_command: ModelCommands, config: &mut Conf
                 );
                 return Ok(());
             };
-            let (provider, model) = config
-                .resolve_model_id(&winner.profile_ref)
-                .filter(|m| !m.trim().is_empty())
-                .map(|m| (winner.profile_ref.clone(), m))
-                .unwrap_or_else(|| {
-                    (
-                        winner.provider_ref.clone(),
-                        winner.model_id.unwrap_or_else(|| "unknown".to_string()),
-                    )
-                });
+            let provider = winner.model_ref;
+            let model = winner.model_id.unwrap_or_default();
             println!(
                 "{}",
                 crate::i18n::get_required_cli_string_with_args(

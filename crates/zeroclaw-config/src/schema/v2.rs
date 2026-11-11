@@ -616,7 +616,7 @@ fn dot_delivery_channel(job: &mut toml::Table) {
 /// emit this exact value or migration output fails config deserialization.
 const AUTH_MODE_OAUTH: &str = "o_auth";
 
-fn normalize_provider_type(
+pub(crate) fn normalize_provider_type(
     raw: &str,
     incoming_alias: &str,
 ) -> (String, String, Vec<(&'static str, toml::Value)>) {

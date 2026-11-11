@@ -132,7 +132,7 @@ pub use traits::{
     ProviderCapabilityError, ToolCall, ToolResultMessage, durable_chat_messages,
 };
 
-use reliable::{ReliableModelProvider, ReliableModelProviderEntry};
+use reliable::ReliableModelProvider;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -826,6 +826,7 @@ impl Default for ModelProviderRuntimeOptions {
     }
 }
 
+#[cfg(test)]
 pub fn model_provider_runtime_options_from_model_provider_entry(
     config: &zeroclaw_config::schema::Config,
     entry: Option<&zeroclaw_config::schema::ModelProviderConfig>,
@@ -883,6 +884,7 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
 /// built from its enclosing provider profile. Only fields the entry sets
 /// override the profile-derived value; connection-side options (URL, headers,
 /// TLS, kind, wire) are left untouched. No-op when `model_entry` is `None`.
+#[cfg(test)]
 pub fn apply_model_entry_options(
     options: &mut ModelProviderRuntimeOptions,
     model_entry: Option<&zeroclaw_config::schema::ModelEntryConfig>,
@@ -934,6 +936,7 @@ pub fn apply_model_entry_options(
 /// Resolve `ModelProviderRuntimeOptions` from an agent's `model_provider` alias
 /// (`"<type>.<alias>"`). Returns safe defaults when the agent alias doesn't
 /// exist, doesn't have a `model_provider` set, or names a non-existent entry.
+#[cfg(test)]
 pub fn provider_runtime_options_for_agent(
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
@@ -950,6 +953,7 @@ pub fn provider_runtime_options_for_agent(
     };
     crate::factory::runtime_options_for_chat(&resolved, &base)
 }
+#[cfg(test)]
 pub fn provider_runtime_options_for_alias(
     config: &zeroclaw_config::schema::Config,
     family: &str,
@@ -974,44 +978,24 @@ pub fn provider_runtime_options_for_alias(
 /// a bare family or a dotted alias. Dotted names yield alias-resolved
 /// options; bare names inherit only provider-agnostic settings from
 /// `fallback`.
+#[cfg(test)]
 pub fn options_for_provider_ref(
     config: &zeroclaw_config::schema::Config,
     name: &str,
     fallback: &ModelProviderRuntimeOptions,
 ) -> ModelProviderRuntimeOptions {
-    match config.providers.models.profile_ref(name) {
-        Some((family, alias)) if !family.contains(':') => {
-            provider_runtime_options_for_alias(config, family, alias)
-        }
-        _ => {
-            let mut options = fallback.clone();
-            options.provider_kind = None;
-            options.provider_api_url = None;
-            // `vision` is provider-specific: a bare family ref must not inherit
-            // the fallback provider's capability flag. Clearing it falls back to
-            // the family default (or the choke point's own resolution).
-            options.vision = None;
-            // `reasoning_effort_passthrough` is a per-entry opt-in on a
-            // verified backend; a bare family has no entry and gets the
-            // default filter. The provider-agnostic `reasoning_effort` stays.
-            options.reasoning_effort_passthrough = false;
-            // Tool-result image handling is provider-specific: a bare
-            // fallback family must use its own default rather than inherit
-            // the previous provider alias's policy.
-            options.tool_result_image_policy = Default::default();
-            // Cache settings are provider-entry opt-ins: `cache_ttl` is a
-            // paid lifetime choice and `cache_passthrough` gates marker
-            // injection, so a bare family ref must not inherit another
-            // alias's cache opt-ins (there is no entry to turn them off on).
-            options.cache_ttl = None;
-            options.cache_passthrough = false;
-            // `multimodal` is deliberately NOT reset: it is the root
-            // `[multimodal]` section, identical for every alias, so a bare
-            // family ref inherits the same operator policy rather than
-            // silently reverting to library defaults.
-            options
-        }
+    if let Ok(registry) = config.chat_registry_for_input(None, name)
+        && let Ok(selected) = registry.resolve_chat(&name.trim().into())
+    {
+        return factory::runtime_options_for_chat(
+            &selected,
+            &provider_runtime_options_for_bare_family(config),
+        );
     }
+    // An unresolved target must not inherit another model's connection policy.
+    let mut options = provider_runtime_options_for_bare_family(config);
+    options.multimodal = fallback.multimodal.clone();
+    options
 }
 
 fn is_secret_char(c: char) -> bool {
@@ -1566,6 +1550,7 @@ pub fn create_model_provider_with_url(
     )
 }
 
+#[cfg(test)]
 pub fn create_model_provider_for_alias(
     config: &zeroclaw_config::schema::Config,
     family: &str,
@@ -1574,18 +1559,6 @@ pub fn create_model_provider_for_alias(
     options: &ModelProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
     create_model_provider_inner(Some(config), family, alias, api_key, None, options)
-}
-
-/// Factory: create model_provider with alias context AND custom base URL.
-pub fn create_model_provider_for_alias_with_url(
-    config: &zeroclaw_config::schema::Config,
-    family: &str,
-    alias: &str,
-    api_key: Option<&str>,
-    api_url: Option<&str>,
-    options: &ModelProviderRuntimeOptions,
-) -> anyhow::Result<Box<dyn ModelProvider>> {
-    create_model_provider_inner(Some(config), family, alias, api_key, api_url, options)
 }
 
 #[must_use]
@@ -1818,6 +1791,7 @@ pub fn create_resilient_model_provider_with_options(
 /// Low-level compatibility API with explicit connection and retry overrides.
 /// Configured consumers should use [`model::build_reliable_provider`], which
 /// derives these inputs from one selection and prevents conflicting policy.
+#[cfg(test)]
 pub fn create_resilient_model_provider_for_alias(
     config: &zeroclaw_config::schema::Config,
     family: &str,
@@ -1838,123 +1812,8 @@ pub fn create_resilient_model_provider_for_alias(
     )
 }
 
-fn create_resilient_model_provider_for_alias_with_model_override(
-    config: &zeroclaw_config::schema::Config,
-    family: &str,
-    alias: &str,
-    api_key: Option<&str>,
-    api_url: Option<&str>,
-    reliability: &zeroclaw_config::schema::ReliabilityConfig,
-    options: &ModelProviderRuntimeOptions,
-    primary_model_override: Option<&str>,
-    selection_ref: &str,
-) -> anyhow::Result<Box<dyn ModelProvider>> {
-    create_resilient_model_provider_for_alias_with_model_override_and_pin(
-        config,
-        family,
-        alias,
-        api_key,
-        api_url,
-        reliability,
-        options,
-        primary_model_override,
-        selection_ref,
-        true,
-    )
-}
-
-fn create_resilient_model_provider_for_alias_with_model_override_and_pin(
-    config: &zeroclaw_config::schema::Config,
-    family: &str,
-    alias: &str,
-    api_key: Option<&str>,
-    api_url: Option<&str>,
-    reliability: &zeroclaw_config::schema::ReliabilityConfig,
-    options: &ModelProviderRuntimeOptions,
-    primary_model_override: Option<&str>,
-    selection_ref: &str,
-    pin_primary_model: bool,
-) -> anyhow::Result<Box<dyn ModelProvider>> {
-    let primary_model_provider =
-        create_model_provider_inner(Some(config), family, alias, api_key, api_url, options)?;
-
-    let mut model_providers: Vec<ReliableModelProviderEntry> = Vec::new();
-    push_pinned_entries(
-        &mut model_providers,
-        config,
-        family,
-        alias,
-        primary_model_provider,
-        primary_model_override,
-        selection_ref,
-        pin_primary_model,
-    );
-
-    let reliable = ReliableModelProvider::new_with_entries(
-        alias,
-        model_providers,
-        reliability.provider_retries,
-        reliability.provider_backoff_ms,
-    )
-    .with_api_keys(reliability.api_keys.clone());
-
-    Ok(Box::new(reliable))
-}
-
-fn push_pinned_entries(
-    out: &mut Vec<ReliableModelProviderEntry>,
-    config: &zeroclaw_config::schema::Config,
-    family: &str,
-    alias: &str,
-    built: Box<dyn ModelProvider>,
-    primary_model_override: Option<&str>,
-    selection_ref: &str,
-    pin_primary_model: bool,
-) {
-    let entry = config.providers.models.find(family, alias);
-    let primary_model = primary_model_override
-        .and_then(|model| {
-            let trimmed = model.trim();
-            (!trimmed.is_empty()).then_some(trimmed)
-        })
-        .or_else(|| entry.and_then(|e| e.model.as_deref()));
-    let cooldown_key = format!("{family}.{alias}");
-
-    let Some(primary_model) = primary_model else {
-        out.push(
-            ReliableModelProviderEntry::new_with_candidate(
-                family,
-                cooldown_key.clone(),
-                cooldown_key,
-                built,
-            )
-            .with_selection_ref(selection_ref),
-        );
-        return;
-    };
-
-    let built: std::sync::Arc<dyn ModelProvider> = std::sync::Arc::from(built);
-    let primary = if pin_primary_model {
-        ReliableModelProviderEntry::new_pinned(
-            family,
-            cooldown_key.clone(),
-            alias,
-            primary_model,
-            Box::new(std::sync::Arc::clone(&built)),
-        )
-    } else {
-        ReliableModelProviderEntry::new_with_candidate(
-            family,
-            cooldown_key.clone(),
-            cooldown_key.clone(),
-            Box::new(std::sync::Arc::clone(&built)),
-        )
-    };
-    out.push(primary.with_selection_ref(selection_ref));
-}
-
-/// Low-level compatibility API. Prefer [`model::build_reliable_provider`] for
-/// configured consumers; supplied options here intentionally override Config.
+/// Construct a configured exact-key model with retry policy.
+#[cfg(test)]
 pub fn create_resilient_model_provider_from_ref(
     config: &zeroclaw_config::schema::Config,
     name: &str,
@@ -1982,18 +1841,8 @@ pub struct ResolvedModelProviderRef {
     pub model: Option<String>,
 }
 
-/// Build a **bare** (non-resilient) provider named by `name` - a bare family
-/// (`"llamacpp"`), a dotted alias (`"llamacpp.text_model"`), or a `custom:<url>`
-/// ref - resolving its alias-specific runtime options from `config`: the
-/// `vision` capability override, the endpoint URI, and per-alias credentials
-/// from `[providers.models.<family>.<alias>]`.
-///
-/// Unlike the legacy `create_model_provider(name, None)` (which passes
-/// `config = None` and `ModelProviderRuntimeOptions::default()`, so it cannot see
-/// any per-alias config), this honors the alias's `vision` override and typed
-/// config while returning an un-wrapped provider - the shape the dedicated
-/// vision route needs so its configured `[multimodal] vision_model_provider`
-/// respects a per-alias `vision = true/false`.
+/// Construct a raw provider from an exact configured model reference.
+/// Historical bare/URL CLI input is normalized by zeroclaw-config.
 pub fn create_model_provider_from_ref(
     config: &zeroclaw_config::schema::Config,
     name: &str,
@@ -2001,9 +1850,7 @@ pub fn create_model_provider_from_ref(
     create_model_provider_from_ref_with_model(config, name).map(|resolved| resolved.provider)
 }
 
-/// Resolve a provider reference and its alias-owned model as one materialized
-/// view. Callers may apply their own explicit model override after resolution;
-/// when the reference is bare or URL-based, `model` is `None`.
+/// Resolve the provider and its upstream model from one canonical selection.
 pub fn create_model_provider_from_ref_with_model(
     config: &zeroclaw_config::schema::Config,
     name: &str,
@@ -2011,37 +1858,22 @@ pub fn create_model_provider_from_ref_with_model(
     model::build_raw_provider(config, name, model::ProviderOverrides::default())
 }
 
-/// Runtime options for a **bare family** reference (e.g. `ollama`), which has no
-/// alias entry to resolve.
-///
-/// Provider construction for these names stays on the family-default path
-/// (`config = None` at `create_model_provider_inner`) — that is what keeps a
-/// dotted-but-dangling ref fail-closed, per the exclusions documented in
-/// [`create_model_provider_from_ref_with_model`]. The config-owned
-/// `[multimodal]` policy must still reach the provider, though.
-///
-/// `ModelProviderRuntimeOptions::default()` embeds `MultimodalConfig::default()`
-/// (`max_images = 4`, `max_image_size_mb = 5`). A configured
-/// `vision_model_provider = "ollama"` with `max_images = 8` would otherwise
-/// re-normalize already-prepared messages under the default cap at the provider
-/// boundary, evicting the request's oldest images down to 4 even though the
-/// operator's configuration legitimately accepted 8.
-///
-/// Only config-owned policy is carried across; every entry-specific option
-/// (kind, URI, credentials, `vision`, ...) stays at its default, since a bare
-/// family name names no entry to take them from.
-///
-/// Public because the runtime's live model-switch path builds a replacement
-/// provider from the same config and must resolve the same options — a bare
-/// family switch that fell back to `ModelProviderRuntimeOptions::default()`
-/// would rebuild the provider boundary under default caps, exactly the
-/// mismatch above.
+/// Shared construction policy only. Model and connection settings are
+/// materialized independently for every exact selection by the factory.
 pub fn provider_runtime_options_for_bare_family(
     config: &zeroclaw_config::schema::Config,
 ) -> ModelProviderRuntimeOptions {
-    model_provider_runtime_options_from_model_provider_entry(config, None)
+    ModelProviderRuntimeOptions {
+        zeroclaw_dir: config.config_path.parent().map(PathBuf::from),
+        secrets_encrypt: config.secrets.encrypt,
+        reasoning_enabled: config.runtime.reasoning_enabled,
+        reasoning_effort: config.runtime.reasoning_effort.clone(),
+        multimodal: config.multimodal.clone(),
+        ..Default::default()
+    }
 }
 
+#[cfg(test)]
 fn create_resilient_model_provider_from_ref_with_model_override(
     config: &zeroclaw_config::schema::Config,
     name: &str,
@@ -2051,82 +1883,34 @@ fn create_resilient_model_provider_from_ref_with_model_override(
     options: &ModelProviderRuntimeOptions,
     primary_model_override: Option<&str>,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
-    let name = name.trim();
-    let canonical_ref = zeroclaw_config::provider_registry::ModelRef::from(name);
-    if config.is_configured_model_ref(name) {
-        return Ok(crate::model::build_canonical_provider_with_options(
-            config,
-            &canonical_ref,
-            crate::model::ProviderOverrides {
-                model: primary_model_override,
-                api_key,
-            },
-            options,
-            true,
-        )?
-        .provider);
-    }
-    ensure_known_model_entry_ref(config, name)?;
-    let selection = config.resolve_model_selection(name);
-    let selected_model = selection
-        .as_ref()
-        .filter(|selection| selection.model_entry.is_some())
-        .and_then(|selection| selection.model_id.as_deref());
-    let mut options = options.clone();
-    apply_model_entry_options(
-        &mut options,
-        selection
-            .as_ref()
-            .and_then(|selection| selection.model_entry),
-    );
-    match config.providers.models.profile_ref(name) {
-        Some((family, alias))
-            if !family.contains(':') && config.providers.models.find(family, alias).is_some() =>
-        {
-            create_resilient_model_provider_for_alias_with_model_override(
-                config,
-                family,
-                alias,
-                api_key,
-                api_url,
-                reliability,
-                &options,
-                primary_model_override.or(selected_model),
-                name,
-            )
-        }
-        _ => create_resilient_model_provider_with_options(
-            name,
+    // Explicit transport overrides are normalized by the input/config boundary;
+    // a configured model always owns its endpoint and complete options.
+    let _ = (api_url, reliability);
+    Ok(model::build_canonical_provider_with_options(
+        config,
+        &name.trim().into(),
+        model::ProviderOverrides {
+            model: primary_model_override,
             api_key,
-            api_url,
-            reliability,
-            &options,
-        ),
-    }
+        },
+        options,
+        true,
+    )?
+    .provider)
 }
 
-/// A configured profile may have a dotted alias, but any suffix beyond that
-/// alias selects a model entry. Never turn a missing entry into a profile call.
+/// Validate an input through the config boundary without parsing its key.
 pub fn ensure_known_model_entry_ref(
     config: &zeroclaw_config::schema::Config,
     name: &str,
 ) -> anyhow::Result<()> {
-    if config.is_configured_model_ref(name) {
-        return Ok(());
-    }
-    if let Some((family, alias)) = config.providers.models.profile_ref(name)
-        && !family.contains(':')
-        && config.providers.models.find(family, alias).is_some()
-        && name.trim() != format!("{family}.{alias}")
-        && config.resolve_model_selection(name.trim()).is_none()
-    {
-        anyhow::bail!("model_provider `{name}` names an unknown model entry");
-    }
+    config.chat_registry_for_input(None, name)?;
     Ok(())
 }
 
 /// Low-level compatibility API with explicit route and retry overrides.
 /// Prefer [`model::build_model`] to bind provider, identity and resolver.
+#[cfg(test)]
 pub fn create_routed_model_provider_with_options(
     config: &zeroclaw_config::schema::Config,
     primary_name: &str,
@@ -2154,7 +1938,7 @@ pub fn create_routed_model_provider_with_options(
 /// derived from config alone.
 ///
 /// For a caller that obtains its provider from somewhere other than
-/// [`create_routed_model_provider_with_options_and_resolver`] but still needs
+/// [`model::build_model`] but still needs
 /// route-aware turn metadata and limits. It applies the same staged-entry
 /// filter, and a successfully built routed provider keeps every materialized
 /// route, so the two resolvers agree.
@@ -2201,6 +1985,7 @@ fn materialized_model_routes<'a>(
 /// it uses. Agent turn metadata can therefore resolve the serving profile and
 /// model without maintaining a second hint table.
 /// Configured consumers should use [`model::build_model`].
+#[cfg(test)]
 pub fn create_routed_model_provider_with_options_and_resolver(
     config: &zeroclaw_config::schema::Config,
     primary_name: &str,
@@ -6175,6 +5960,55 @@ mod tests {
 /// `None` means *unknown*: the caller must leave the setting unset rather
 /// than substitute a value. An unset context window and a fabricated default
 /// are different states and must stay distinguishable downstream.
+pub async fn fetch_model_context_window(
+    config: &zeroclaw_config::schema::Config,
+    reference: &str,
+) -> anyhow::Result<Option<usize>> {
+    let registry = config.provider_registry()?;
+    let selected = registry.resolve_chat(&reference.into())?;
+    let connection = selected.selection.connection;
+    let Some(auth) = (if connection.kind() == "openrouter" {
+        Some(crate::compatible::AuthStyle::Bearer)
+    } else {
+        factory::family_model_context_catalog_auth(connection.kind())
+    }) else {
+        return Ok(None);
+    };
+    let transport = crate::transport::HttpTransportConfig::from_connection(
+        connection,
+        selected.request_timeout_secs.clone(),
+    )?;
+    let client = transport.client(std::time::Duration::from_secs(60), "provider.catalog")?;
+    let url = transport.endpoint("models")?;
+    let request = crate::compatible::apply_auth_to_request(
+        client.get(url),
+        &auth,
+        transport.api_key.as_deref(),
+        connection.kind(),
+    )?;
+    // Discovery is best effort: unavailable catalogs leave metadata unset.
+    let Ok(response) = request.send().await else {
+        return Ok(None);
+    };
+    let Ok(response) = response.error_for_status() else {
+        return Ok(None);
+    };
+    let Ok(document) = response.json::<serde_json::Value>().await else {
+        return Ok(None);
+    };
+    let model = selected.upstream_model().unwrap_or_default();
+    Ok(document["data"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["id"].as_str() == Some(model)))
+        .and_then(|row| {
+            row.get("context_length")
+                .or_else(|| row.get("context_window"))
+        })
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|window| usize::try_from(window).ok()))
+}
+
+#[cfg(test)]
 pub async fn fetch_context_window(
     provider_type: &str,
     config: &zeroclaw_config::schema::ModelProviderConfig,
@@ -6187,6 +6021,7 @@ pub async fn fetch_context_window(
     fetch_openai_compatible_context_window(provider_type, config).await
 }
 
+#[cfg(test)]
 async fn fetch_openrouter_context_window(
     config: &zeroclaw_config::schema::ModelProviderConfig,
 ) -> Option<usize> {
@@ -6209,6 +6044,7 @@ async fn fetch_openrouter_context_window(
         .map(|v| v as usize)
 }
 
+#[cfg(test)]
 fn openrouter_context_window_url(
     config: &zeroclaw_config::schema::ModelProviderConfig,
 ) -> std::borrow::Cow<'_, str> {
@@ -6236,6 +6072,7 @@ fn openrouter_context_window_url(
 /// case no probe is built. `provider_type` names the family in that refusal
 /// record: discovery runs outside any per-provider span, so it has to carry
 /// its own attribution.
+#[cfg(test)]
 fn context_catalog_request(
     client: &reqwest::Client,
     base_url: &str,
@@ -6261,6 +6098,7 @@ fn context_catalog_request(
 /// endpoint exists in this shape and that the stored credential can be
 /// presented to it, so an undeclared family is never probed and its
 /// credential is never read.
+#[cfg(test)]
 async fn fetch_openai_compatible_context_window(
     provider_type: &str,
     config: &zeroclaw_config::schema::ModelProviderConfig,

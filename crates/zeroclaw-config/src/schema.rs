@@ -158,10 +158,11 @@ pub struct Config {
     /// Path to config.toml - computed from home, not serialized
     #[serde(skip)]
     pub config_path: PathBuf,
-    /// Dotted prop-paths overridden by `ZEROCLAW_*` env vars at load time.
+    /// Property identities overridden by `ZEROCLAW_*` env vars at load time.
+    /// Canonical registry identities are escaped JSON pointers.
     /// Populated by `apply_env_overrides`; consulted by `save()` to mask the
     /// env-injected values back to disk-or-default before encryption, and by
-    /// `prop_is_env_overridden` for O(1) display-layer lookup (config list,
+    /// `prop_is_env_overridden` for display-layer lookup (config list,
     /// dashboard, quickstart).
     #[serde(skip)]
     pub env_overridden_paths: std::collections::HashSet<String>,
@@ -1053,48 +1054,32 @@ pub struct ModelSelection<'a> {
     pub model_id: Option<String>,
 }
 
-/// Owned identity of a resolved model selection — the comparison key for
-/// "is this a different model than the current one".
+/// Exact configured model reference and effective upstream model id.
 ///
-/// Two refs that resolve to the same profile, the same model entry, and the
-/// same effective model id compare equal — so a two-segment ref and the
-/// three-segment ref naming that profile's selected entry are the same model
-/// (no spurious rebuild), while two entries under one profile that happen to
-/// share a model id stay distinct (a real switch).
+/// References are opaque registry keys: dots have no structural meaning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelIdentity {
-    /// Provider family key, e.g. `"openai"`.
-    pub family: String,
-    /// Provider profile alias, e.g. `"default"`.
-    pub alias: String,
-    /// Name of the selected model entry under the profile's `models` map.
-    /// `None` when no entry was selected (legacy single-model path).
-    pub entry_alias: Option<String>,
-    /// Effective model id, after any caller-supplied override.
+    pub model_ref: crate::provider_registry::ModelRef,
+    /// Effective upstream model id, after any caller-supplied override.
     pub model_id: String,
 }
 
 impl ModelIdentity {
-    /// Profile identity used for credentials, billing, and cooldowns.
     #[must_use]
-    pub fn profile_ref(&self) -> String {
-        if self.alias.is_empty() {
-            self.family.clone()
-        } else {
-            format!("{}.{}", self.family, self.alias)
+    pub fn new(
+        model_ref: impl Into<crate::provider_registry::ModelRef>,
+        model_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            model_ref: model_ref.into(),
+            model_id: model_id.into(),
         }
     }
 
-    /// Reference retaining the selected entry, including dotted profile aliases.
+    /// Full model reference used for attribution and model selection.
     #[must_use]
     pub fn provider_ref(&self) -> String {
-        if self.alias.is_empty() {
-            return self.family.clone();
-        }
-        let profile = self.profile_ref();
-        self.entry_alias
-            .as_ref()
-            .map_or(profile.clone(), |alias| format!("{profile}.{alias}"))
+        self.model_ref.to_string()
     }
 }
 
@@ -1128,30 +1113,22 @@ impl ModelSelection<'_> {
             .map(str::to_string)
             .or_else(|| self.model_id.clone())
             .unwrap_or_default();
-        ModelIdentity {
-            family: self.family.to_string(),
-            alias: self.alias.to_string(),
-            entry_alias: self.model_alias.clone(),
-            model_id,
-        }
+        let profile = format!("{}.{}", self.family, self.alias);
+        let reference = self
+            .model_alias
+            .as_ref()
+            .map_or_else(|| profile.clone(), |alias| format!("{profile}.{alias}"));
+        ModelIdentity::new(reference, model_id)
     }
 }
 
-/// One configured model as the CLI surfaces report it — the shared
-/// enumeration behind `models list` / `models status` / `zeroclaw status`
-/// and the doctor commands, so they can never disagree about what a
-/// profile hosts. Produced by [`Config::configured_model_entries`].
+/// Canonical chat-model inventory shared by CLI status and Doctor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfiguredModelEntry {
-    /// `family.alias` on the legacy single-model path,
-    /// `family.alias.model_alias` when the profile hosts multiple models.
-    pub provider_ref: String,
-    /// The two-segment profile ref.
-    pub profile_ref: String,
-    /// The nested model entry's alias; `None` on the legacy path.
-    pub model_alias: Option<String>,
-    /// Resolved model id (the entry's `id`, else the profile `model`);
-    /// `None` when neither is set.
+    /// Exact key in `providers.models`.
+    pub model_ref: String,
+    /// Exact key in `providers.connections`.
+    pub connection_id: String,
     pub model_id: Option<String>,
 }
 
@@ -5616,16 +5593,9 @@ impl Config {
         )
     }
 
-    /// Enumerate every configured model across all provider profiles, as the
-    /// CLI surfaces (`models list/status`, `zeroclaw status`) and `doctor`
-    /// report them. A legacy single-model profile yields one entry with
-    /// `model_alias: None`; a profile hosting a `models` map yields one entry
-    /// per nested model alias (deterministically sorted), each resolving its
-    /// model id the same way [`Self::resolve_model_selection`] does.
-    ///
-    /// `provider_override` narrows the enumeration, matched by full
-    /// `type.alias` or `type.alias.model_alias` ref, or by bare family name —
-    /// the same filters the doctor commands accept.
+    /// Enumerate canonical chat models in deterministic exact-key order.
+    /// CLI status and Doctor share this view. A filter matches the complete
+    /// model reference, complete connection ID, or connection kind.
     #[must_use]
     pub fn configured_model_entries(
         &self,
@@ -5653,9 +5623,8 @@ impl Config {
                     return None;
                 }
                 Some(ConfiguredModelEntry {
-                    provider_ref: reference.to_string(),
-                    profile_ref: model.provider().to_string(),
-                    model_alias: None,
+                    model_ref: reference.to_string(),
+                    connection_id: model.provider().to_string(),
                     model_id: model.upstream_model().map(str::to_owned),
                 })
             })
@@ -24137,10 +24106,22 @@ impl Config {
     }
 
     /// Returns `true` if `path` was populated by a `ZEROCLAW_*` env-var
-    /// override at load time. O(1) HashSet lookup; safe to call per row in
-    /// list-rendering paths (`config list`, dashboard, quickstart).
+    /// override at load time. Canonical registry overrides use JSON pointers
+    /// internally; dotted display paths are derived from those same identities.
     pub fn prop_is_env_overridden(&self, path: &str) -> bool {
         self.env_overridden_paths.contains(path)
+            || self
+                .env_overridden_paths
+                .iter()
+                .filter(|key| key.starts_with("/providers/"))
+                .any(|key| {
+                    key.trim_start_matches('/')
+                        .split('/')
+                        .map(|segment| segment.replace("~1", "/").replace("~0", "~"))
+                        .collect::<Vec<_>>()
+                        .join(".")
+                        == path
+                })
     }
 
     pub async fn load_or_init() -> Result<Self> {
@@ -56124,7 +56105,7 @@ model = "llama-3.3-70b"
         // The compatibility boundary projects exact model keys, sorted by
         // reference, including the profile's selected/default model.
         let all = config.configured_model_entries(None);
-        let refs: Vec<&str> = all.iter().map(|e| e.provider_ref.as_str()).collect();
+        let refs: Vec<&str> = all.iter().map(|e| e.model_ref.as_str()).collect();
         assert_eq!(
             refs,
             vec![
@@ -56135,11 +56116,9 @@ model = "llama-3.3-70b"
             ]
         );
         let cheap = &all[3];
-        assert_eq!(cheap.profile_ref, "legacy.openai.gw");
-        assert_eq!(cheap.model_alias, None);
+        assert_eq!(cheap.connection_id, "legacy.openai.gw");
         assert_eq!(cheap.model_id.as_deref(), Some("gpt-4o-mini"));
         let legacy = &all[0];
-        assert_eq!(legacy.model_alias, None);
         assert_eq!(legacy.model_id.as_deref(), Some("llama-3.3-70b"));
 
         // An entry without an id falls back to the profile-level model.
@@ -56172,7 +56151,7 @@ temperature = 0.3
         );
         let selected = config.configured_model_entries(Some("openai.gw.cheap"));
         assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].provider_ref, "openai.gw.cheap");
+        assert_eq!(selected[0].model_ref, "openai.gw.cheap");
         assert_eq!(config.configured_model_entries(Some("groq")).len(), 1);
         assert!(
             config
@@ -56568,6 +56547,10 @@ impl Config {
         &self,
     ) -> Result<crate::provider_registry::ProviderRegistry, crate::provider_registry::RegistryError>
     {
-        self.providers.canonical_registry()
+        crate::provider_registry::input::providers_for_input(self)
+            .map_err(|error| {
+                crate::provider_registry::RegistryError::new(["transcription"], error.to_string())
+            })?
+            .canonical_registry()
     }
 }

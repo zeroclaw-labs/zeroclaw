@@ -191,3 +191,16 @@ identifiers present on the event payload rather than assuming each
 `GET /api/events/history` replays the retained recent events from the same
 buffer, oldest first. It is a reconnect window for subscribers, not a separate
 canonical lifecycle store.
+
+## Model context-window discovery
+
+`POST /api/config/models/{model_ref}/refresh-context-window` discovers and saves
+`metadata.context_window` for one exact chat model key. URL-encode the complete
+key as one path parameter. The request uses that model's connection endpoint,
+authentication, headers, and configured request timeout. Unsupported catalogs
+leave metadata unset. A concurrent edit of the target model or connection
+rejects the stale result; unrelated edits survive the commit. Config write
+authorization and the normal persistence/reload transaction apply.
+
+A successful response contains `model_ref` and `context_window`. The historical
+family/alias context-window endpoint has been removed.

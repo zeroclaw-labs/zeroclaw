@@ -53,12 +53,23 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
             (!tail.is_empty()
                 && tail
                     .chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                || [
+                    "providers__models__",
+                    "providers__connections__",
+                    "providers__model_presets__",
+                    "providers__fallback__",
+                ]
+                .iter()
+                .any(|prefix| tail.starts_with(prefix)))
             .then(|| (k.clone(), v, tail.to_string()))
         })
         .collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
+    // One admission-time source for snapshots, including several env names
+    // that address the same field or create the same optional auth table.
+    let registry_before = serde_json::to_value(&config.providers)?;
     let mut paths: HashSet<String> = HashSet::with_capacity(entries.len());
     let mut snapshots: HashMap<String, String> = HashMap::with_capacity(entries.len());
     for (env_name, value, tail) in entries {
@@ -115,12 +126,19 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
         // `Config::get_prop`'s unconditional secret mask: secret fields on
         // `config` carry plaintext (post-`decrypt_secrets`), so the snapshot
         // captures the real value that should be restored at save time.
-        let snapshot = raw_value_for_path(config, &path).unwrap_or_default();
-        snapshots.insert(path.clone(), snapshot);
+        let snapshot = if path.starts_with("/providers/") {
+            crate::provider_registry::env_input::snapshot_document(&registry_before, &path)?
+        } else {
+            raw_value_for_path(config, &path).unwrap_or_default()
+        };
+        snapshots.entry(path.clone()).or_insert(snapshot);
 
-        config
-            .set_prop(&path, &value)
-            .with_context(|| format!("{env_name} → {path}"))?;
+        if path.starts_with("/providers/") {
+            crate::provider_registry::env_input::set(config, &path, &value, false)
+        } else {
+            config.set_prop(&path, &value)
+        }
+        .with_context(|| format!("{env_name} → {path}"))?;
         if Config::prop_is_secret(&path) {
             ::zeroclaw_log::record!(
                 WARN,
@@ -154,6 +172,9 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
 /// `__`-delimited alias token (which may contain single `_` per the alias
 /// validator); everything else resolves via `prop_fields()` lookup.
 fn resolve_path(tail: &str, config: &mut Config) -> Result<String> {
+    if let Some(path) = crate::provider_registry::env_input::path(config, tail) {
+        return Ok(path);
+    }
     let mut sections = Config::map_key_sections();
     sections.sort_by_key(|s| std::cmp::Reverse(s.path.len()));
     for section in sections {
@@ -226,6 +247,9 @@ fn resolve_path(tail: &str, config: &mut Config) -> Result<String> {
 }
 
 pub(crate) fn raw_value_for_path(source: &Config, path: &str) -> Option<String> {
+    if path.starts_with("/providers/") {
+        return crate::provider_registry::env_input::snapshot(source, path).ok();
+    }
     let table = toml::Value::try_from(source).ok()?;
     let mut current: &toml::Value = &table;
     for segment in path.split('.') {
@@ -248,7 +272,11 @@ pub fn mask_env_overrides_for_save(
     config_to_save: &mut Config,
     snapshots: &HashMap<String, String>,
 ) -> Result<()> {
+    crate::provider_registry::env_input::restore(config_to_save, snapshots)?;
     for (path, value) in snapshots {
+        if path.starts_with("/providers/") {
+            continue;
+        }
         config_to_save
             .set_prop(path, value)
             .with_context(|| format!("failed to restore env-overridden path {path} before save"))?;
@@ -281,6 +309,106 @@ mod tests {
             // SAFETY: tests serialize on `env_test_lock()`.
             unsafe { std::env::remove_var(self.0) };
         }
+    }
+
+    #[tokio::test]
+    async fn provider_editor_promotes_override_snapshots_without_persisting_env_secrets() {
+        let _guard = super::env_test_lock().await;
+        let _key = EnvVarGuard::set(
+            "ZEROCLAW_providers__models__openai__default__api_key",
+            "env-only-secret",
+        );
+        let mut config = Config::default();
+        let entry = config.providers.models.ensure("openai", "default").unwrap();
+        entry.model = Some("wire-model".into());
+        entry.api_key = Some("original-file-key".into());
+        let applied = apply_env_overrides(&mut config).unwrap();
+        config.env_overridden_paths = applied.paths;
+        config.pre_override_snapshots = applied.snapshots;
+        crate::provider_registry::editor::update(&mut config, |_| Ok(())).unwrap();
+        assert!(config.providers.models.openai.is_empty());
+        assert!(
+            config
+                .prop_is_env_overridden("providers.connections.legacy.openai.default.auth.api_key")
+        );
+        let snapshots = config.pre_override_snapshots.clone();
+        mask_env_overrides_for_save(&mut config, &snapshots).unwrap();
+        assert!(
+            config.providers.models.openai.is_empty(),
+            "save must not recreate the retired input"
+        );
+        let registry = config.provider_registry().unwrap();
+        let model = registry.resolve_chat(&"openai.default".into()).unwrap();
+        assert_eq!(
+            model.selection.connection.api_key(),
+            Some("original-file-key")
+        );
+        assert!(
+            !serde_json::to_string(&config.providers)
+                .unwrap()
+                .contains("env-only-secret")
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_and_legacy_env_names_restore_one_original_snapshot() {
+        let _guard = super::env_test_lock().await;
+        let _legacy = EnvVarGuard::set(
+            "ZEROCLAW_providers__models__openai__default__api_key",
+            "legacy-env-key",
+        );
+        let _canonical = EnvVarGuard::set(
+            "ZEROCLAW_providers__connections__gateway.Prod__auth__api_key",
+            "canonical-env-key",
+        );
+        let _mode = EnvVarGuard::set(
+            "ZEROCLAW_providers__connections__gateway.Prod__auth__mode",
+            "api_key",
+        );
+        let _temperature = EnvVarGuard::set(
+            "ZEROCLAW_providers__models__openai.default__options__temperature",
+            "null",
+        );
+        let mut config = Config {
+            providers: serde_json::from_value(serde_json::json!({
+                "connections": {"gateway.Prod": {"kind": "custom", "uri": "https://example.invalid/v1"}},
+                "models": {"openai.default": {"capability": "chat", "provider": "gateway.Prod", "model": "wire-model"}},
+            })).unwrap(),
+            ..Config::default()
+        };
+        let original = serde_json::to_value(&config.providers).unwrap();
+        let applied = apply_env_overrides(&mut config).unwrap();
+        let registry = config.provider_registry().unwrap();
+        assert_eq!(
+            registry.connections["gateway.Prod"].api_key(),
+            Some("legacy-env-key")
+        );
+        assert_eq!(
+            applied.snapshots.len(),
+            3,
+            "two env names address one credential"
+        );
+        assert!(matches!(
+            registry
+                .resolve_chat(&"openai.default".into())
+                .unwrap()
+                .options
+                .temperature,
+            Some(crate::provider_registry::Override::Clear)
+        ));
+        // A concurrent, unrelated edit survives masking. Neither env secret
+        // nor an auth container created by env is persisted.
+        crate::provider_registry::env_input::set(
+            &mut config,
+            "/providers/connections/gateway.Prod/uri",
+            "https://updated.invalid/v1",
+            false,
+        )
+        .unwrap();
+        mask_env_overrides_for_save(&mut config, &applied.snapshots).unwrap();
+        let mut expected = original;
+        expected["connections"]["gateway.Prod"]["uri"] = "https://updated.invalid/v1".into();
+        assert_eq!(serde_json::to_value(&config.providers).unwrap(), expected);
     }
 
     #[tokio::test]

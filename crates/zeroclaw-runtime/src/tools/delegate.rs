@@ -30,8 +30,8 @@ use tokio_util::sync::CancellationToken;
 use zeroclaw_api::memory_traits::PrincipalScope;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::{
-    AliasedAgentConfig, Config, DelegateExecutionMode, DelegateToolConfig, ModelProviderConfig,
-    ResolvedRuntime, RiskProfileConfig, RuntimeProfileConfig, SkillBundleConfig,
+    AliasedAgentConfig, Config, DelegateExecutionMode, DelegateToolConfig, ResolvedRuntime,
+    RiskProfileConfig, RuntimeProfileConfig, SkillBundleConfig,
 };
 use zeroclaw_log::Instrument as _;
 use zeroclaw_memory::Memory;
@@ -466,10 +466,9 @@ impl Default for OwnedParentTools {
 pub struct DelegateTool {
     agents: Arc<HashMap<String, AliasedAgentConfig>>,
     security: Arc<SecurityPolicy>,
-    /// Global credential (from config.api_key) used when an agent has none set.
+    /// Historical fixture-only injection; production resolves the target config.
+    #[cfg(test)]
     global_credential: Option<String>,
-    /// ModelProvider runtime options inherited from root config.
-    provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions,
     /// Depth at which this tool instance lives in the delegation chain.
     depth: u32,
     /// Binding delegation-depth ceiling for this tool's owner and its whole
@@ -525,8 +524,6 @@ pub struct DelegateTool {
     /// Session owner, shared with spawned and nested delegates. `None` is the
     /// legacy shared operator. Set once when the owning Agent is routed.
     principal_scope: Arc<RwLock<Option<PrincipalScope>>>,
-    /// nested model provider map for brain resolution.
-    providers_models: Arc<HashMap<String, HashMap<String, ModelProviderConfig>>>,
     /// named risk profiles for delegation depth and timeout resolution.
     risk_profiles: Arc<HashMap<String, RiskProfileConfig>>,
     /// named runtime profiles for agentic/tools/iteration resolution.
@@ -673,7 +670,7 @@ impl DelegateTool {
         security: Arc<SecurityPolicy>,
         context: DelegateBuildContext,
     ) -> Self {
-        let mut tool = Self::new(HashMap::new(), None, security);
+        let mut tool = Self::empty(security);
         tool.root_config = Some(config);
         tool.caller_alias = caller_alias.to_owned();
         tool.parent_tools = OwnedParentTools {
@@ -701,30 +698,12 @@ impl DelegateTool {
     const AGENTIC_ALWAYS_ASK_DOC_REF: &'static str =
         "ZeroClaw docs, \"Delegation & SubAgents\" > \"What's not supported\"";
 
-    pub fn new(
-        agents: HashMap<String, AliasedAgentConfig>,
-        global_credential: Option<String>,
-        security: Arc<SecurityPolicy>,
-    ) -> Self {
-        Self::new_with_options(
-            agents,
-            global_credential,
-            security,
-            zeroclaw_providers::ModelProviderRuntimeOptions::default(),
-        )
-    }
-
-    pub fn new_with_options(
-        agents: HashMap<String, AliasedAgentConfig>,
-        global_credential: Option<String>,
-        security: Arc<SecurityPolicy>,
-        provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions,
-    ) -> Self {
+    fn empty(security: Arc<SecurityPolicy>) -> Self {
         Self {
-            agents: Arc::new(agents),
+            agents: Arc::new(HashMap::new()),
             security,
-            global_credential,
-            provider_runtime_options,
+            #[cfg(test)]
+            global_credential: None,
             depth: 0,
             max_delegation_depth: None,
             background_task_management: true,
@@ -739,7 +718,6 @@ impl DelegateTool {
             turn_token: None,
             memory: None,
             principal_scope: Arc::new(RwLock::new(None)),
-            providers_models: Arc::new(HashMap::new()),
             risk_profiles: Arc::new(HashMap::new()),
             runtime_profiles: Arc::new(HashMap::new()),
             skill_bundles: Arc::new(HashMap::new()),
@@ -756,65 +734,28 @@ impl DelegateTool {
         }
     }
 
-    /// Create a DelegateTool for a sub-agent (with incremented depth).
-    /// When sub-agents eventually get their own tool registry, construct
-    /// their DelegateTool via this method with `depth: parent.depth + 1`.
+    #[cfg(test)]
+    pub fn new(
+        agents: HashMap<String, AliasedAgentConfig>,
+        global_credential: Option<String>,
+        security: Arc<SecurityPolicy>,
+    ) -> Self {
+        let mut tool = Self::empty(security);
+        tool.agents = Arc::new(agents);
+        tool.global_credential = global_credential;
+        tool
+    }
+
+    #[cfg(test)]
     pub fn with_depth(
         agents: HashMap<String, AliasedAgentConfig>,
         global_credential: Option<String>,
         security: Arc<SecurityPolicy>,
         depth: u32,
     ) -> Self {
-        Self::with_depth_and_options(
-            agents,
-            global_credential,
-            security,
-            depth,
-            zeroclaw_providers::ModelProviderRuntimeOptions::default(),
-        )
-    }
-
-    pub fn with_depth_and_options(
-        agents: HashMap<String, AliasedAgentConfig>,
-        global_credential: Option<String>,
-        security: Arc<SecurityPolicy>,
-        depth: u32,
-        provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions,
-    ) -> Self {
-        Self {
-            agents: Arc::new(agents),
-            security,
-            global_credential,
-            provider_runtime_options,
-            depth,
-            max_delegation_depth: None,
-            background_task_management: true,
-            operator_approval_available: true,
-            parent_tools: OwnedParentTools::default(),
-            unrestricted_tools: UnrestrictedToolWithholding::default(),
-            runtime: None,
-            multimodal_config: zeroclaw_config::schema::MultimodalConfig::default(),
-            delegate_config: DelegateToolConfig::default(),
-            workspace_dir: PathBuf::new(),
-            cancellation_token: CancellationToken::new(),
-            turn_token: None,
-            memory: None,
-            principal_scope: Arc::new(RwLock::new(None)),
-            providers_models: Arc::new(HashMap::new()),
-            risk_profiles: Arc::new(HashMap::new()),
-            runtime_profiles: Arc::new(HashMap::new()),
-            skill_bundles: Arc::new(HashMap::new()),
-            root_config: None,
-            live_config: None,
-            capabilities: Arc::new(std::sync::OnceLock::new()),
-            execution_capability: None,
-            caller_alias: String::new(),
-            originator_chain: Vec::new(),
-            task_control_plane: Arc::new(tokio::sync::OnceCell::new()),
-            prebuilt_cost_ctx: None,
-            inherited_cost_tracker: None,
-            progress: None,
-        }
+        let mut tool = Self::new(agents, global_credential, security);
+        tool.depth = depth;
+        tool
     }
 
     /// Attach parent tools used to build sub-agent allowlist registries.
@@ -974,12 +915,16 @@ impl DelegateTool {
         }
     }
 
-    /// Attach nested model provider map for brain resolution.
+    /// Adapt historical test fixtures at the configuration boundary.
+    #[cfg(test)]
     pub fn with_providers_models(
         mut self,
-        m: HashMap<String, HashMap<String, ModelProviderConfig>>,
+        m: HashMap<String, HashMap<String, zeroclaw_config::schema::ModelProviderConfig>>,
     ) -> Self {
-        self.providers_models = Arc::new(m);
+        let mut config = self.root_config.as_deref().cloned().unwrap_or_default();
+        config.providers = serde_json::from_value(serde_json::json!({"models":m})).unwrap();
+        config.agents = (*self.agents).clone();
+        self.root_config = Some(Arc::new(config));
         self
     }
 
@@ -1635,25 +1580,7 @@ impl DelegateTool {
                 temperature: None,
             });
         }
-        if self.capabilities.get().is_some() {
-            anyhow::bail!("a bound delegate has no root config to resolve its target");
-        }
-        let (provider_type, credential, model, temperature) = self.resolve_brain(model_provider);
-        let options = self.provider_runtime_options.clone();
-        zeroclaw_providers::model::build_nonblocking(move || {
-            let provider = zeroclaw_providers::create_model_provider_with_options(
-                &provider_type,
-                credential.as_deref(),
-                &options,
-            )?;
-            Ok(BuiltDelegateProvider {
-                provider,
-                provider_ref: provider_type,
-                model,
-                temperature,
-            })
-        })
-        .await
+        anyhow::bail!("delegate requires admitted root config to resolve its model")
     }
 
     async fn memory_for_target_agent(
@@ -1978,56 +1905,25 @@ impl DelegateTool {
         })
     }
 
-    /// Resolve `model_provider` (`type.alias` or `type.alias.model`) →
-    /// (provider_type, credential, model, temperature).
-    fn resolve_brain(&self, model_provider: &str) -> (String, Option<String>, String, Option<f64>) {
-        let (type_key, tail) = model_provider
-            .split_once('.')
-            .unwrap_or((model_provider, ""));
-        if let Some(alias_map) = self.providers_models.get(type_key)
-            && let Some((alias, cfg)) = alias_map
-                .iter()
-                .filter(|(alias, _)| {
-                    tail == alias.as_str() || tail.starts_with(&format!("{alias}."))
-                })
-                .max_by_key(|(alias, _)| alias.len())
-        {
-            // A three-segment ref selects a model entry; its `id` (with its own
-            // temperature) overrides the profile's `model`/`temperature`.
-            let model_alias = tail
-                .strip_prefix(alias.as_str())
-                .and_then(|suffix| suffix.strip_prefix('.'));
-            let model_entry = match model_alias {
-                Some(alias) => cfg.models.get(alias),
-                None => cfg.models.get("default").or_else(|| {
-                    (cfg.models.len() == 1)
-                        .then(|| cfg.models.values().next())
+    #[cfg(test)]
+    fn resolve_brain(&self, reference: &str) -> (String, Option<String>, String, Option<f64>) {
+        let config = self.root_config.as_deref().unwrap();
+        let registry = config.provider_registry().unwrap();
+        let selected = registry.resolve_chat(&reference.into()).unwrap();
+        (
+            selected.selection.connection.kind().to_owned(),
+            selected
+                .selection
+                .connection
+                .api_key()
+                .map(str::to_owned)
+                .or_else(|| {
+                    (!selected.selection.connection.uses_openai_codex_auth())
+                        .then(|| self.global_credential.clone())
                         .flatten()
                 }),
-            };
-            let model = model_entry
-                .and_then(|e| e.id.clone())
-                .or_else(|| cfg.model.clone())
-                .unwrap_or_default();
-            let temperature = model_entry.and_then(|e| e.temperature).or(cfg.temperature);
-            return (
-                type_key.to_string(),
-                if cfg.requires_openai_auth {
-                    cfg.api_key.clone()
-                } else {
-                    cfg.api_key
-                        .clone()
-                        .or_else(|| self.global_credential.clone())
-                },
-                model,
-                temperature,
-            );
-        }
-        (
-            type_key.to_string(),
-            self.global_credential.clone(),
-            String::new(),
-            None,
+            selected.upstream_model().unwrap_or_default().to_owned(),
+            config.resolve_model_temperature(reference),
         )
     }
 
@@ -3886,8 +3782,8 @@ impl DelegateTool {
         // policy moves into the child tool's `security` field.
         let target_policy_ceiling_cents = target_policy.max_cost_per_day_cents;
         let security = target_policy;
+        #[cfg(test)]
         let global_credential = self.global_credential.clone();
-        let provider_runtime_options = self.provider_runtime_options.clone();
         // Depth ownership: a logical hop increments depth exactly once, at the
         // target-bound sub-delegate tool built in the bounded assembly. This
         // wrapper re-executes the SAME hop, so it inherits `depth` and the
@@ -3928,7 +3824,6 @@ impl DelegateTool {
             .lock()
             .insert(task_id.clone(), child_token.clone());
         let task_id_clone = task_id.clone();
-        let providers_models = Arc::clone(&self.providers_models);
         let risk_profiles = Arc::clone(&self.risk_profiles);
         let runtime_profiles = Arc::clone(&self.runtime_profiles);
         let skill_bundles = Arc::clone(&self.skill_bundles);
@@ -4028,8 +3923,8 @@ impl DelegateTool {
                 let inner = DelegateTool {
                     agents,
                     security,
+                    #[cfg(test)]
                     global_credential,
-                    provider_runtime_options,
                     depth,
                     max_delegation_depth,
                     background_task_management,
@@ -4044,7 +3939,6 @@ impl DelegateTool {
                     memory,
                     principal_scope,
                     unrestricted_tools,
-                    providers_models,
                     risk_profiles,
                     runtime_profiles,
                     skill_bundles,
@@ -4341,8 +4235,8 @@ impl DelegateTool {
         for (index, agent_name) in agent_names.iter().enumerate() {
             let agents = Arc::clone(&self.agents);
             let security = Arc::clone(&self.security);
+            #[cfg(test)]
             let global_credential = self.global_credential.clone();
-            let provider_runtime_options = self.provider_runtime_options.clone();
             // Depth ownership on the parallel path mirrors the background
             // wrapper: the fan-out task re-executes the SAME hop, so it
             // inherits `depth` and the carried ceiling verbatim; the single
@@ -4365,7 +4259,6 @@ impl DelegateTool {
             let agent_name = agent_name.clone();
             let prompt = prompt.to_string();
             let args_clone = args.clone();
-            let providers_models = Arc::clone(&self.providers_models);
             let risk_profiles = Arc::clone(&self.risk_profiles);
             let runtime_profiles = Arc::clone(&self.runtime_profiles);
             let skill_bundles = Arc::clone(&self.skill_bundles);
@@ -4416,8 +4309,8 @@ impl DelegateTool {
                     let inner = DelegateTool {
                         agents,
                         security,
+                        #[cfg(test)]
                         global_credential,
-                        provider_runtime_options,
                         depth,
                         max_delegation_depth,
                         background_task_management,
@@ -4432,7 +4325,6 @@ impl DelegateTool {
                         memory,
                         principal_scope,
                         unrestricted_tools,
-                        providers_models,
                         risk_profiles,
                         runtime_profiles,
                         skill_bundles,
@@ -5634,8 +5526,8 @@ impl DelegateTool {
                     Arc::new(DelegateTool {
                         agents: Arc::clone(&self.agents),
                         security: Arc::clone(&target_policy),
+                        #[cfg(test)]
                         global_credential: self.global_credential.clone(),
-                        provider_runtime_options: self.provider_runtime_options.clone(),
                         depth: self.depth + 1,
                         max_delegation_depth: Some(self.tightened_max_depth_from_config(
                             target_config,
@@ -5670,7 +5562,6 @@ impl DelegateTool {
                         turn_token: Some(self.turn_bound_child_token()),
                         memory: target_memory.clone().or_else(|| self.memory.clone()),
                         principal_scope: Arc::clone(&self.principal_scope),
-                        providers_models: Arc::clone(&self.providers_models),
                         risk_profiles: Arc::clone(&self.risk_profiles),
                         runtime_profiles: Arc::clone(&self.runtime_profiles),
                         skill_bundles: Arc::clone(&self.skill_bundles),
@@ -16550,13 +16441,20 @@ options = { extract_text_tool_calls = false }
             })))
             .mount(&server)
             .await;
-        let options = zeroclaw_providers::ModelProviderRuntimeOptions {
-            provider_api_url: Some(server.uri()),
-            ..Default::default()
-        };
+        let mut config = Config::default();
+        config.data_dir = workspace.to_path_buf();
+        config.agents = sample_agents();
+        config.providers = serde_json::from_value(json!({
+            "connections": {"fixture": {"kind":"custom", "uri":server.uri()}},
+            "models": {
+                "ollama.researcher": {"capability":"chat", "provider":"fixture", "model":"fixture-model"},
+                "openrouter.coder": {"capability":"chat", "provider":"fixture", "model":"fixture-model"}
+            }
+        })).unwrap();
         let tool = with_in_memory_task_store(
-            DelegateTool::new_with_options(sample_agents(), None, test_security(), options)
-                .with_workspace_dir(workspace.to_path_buf()),
+            DelegateTool::new(sample_agents(), None, test_security())
+                .with_workspace_dir(workspace.to_path_buf())
+                .with_root_config(Arc::new(config)),
         );
         (tool, server)
     }
@@ -16575,7 +16473,7 @@ options = { extract_text_tool_calls = false }
         assert_eq!(requests[0].url.path(), "/v1/chat/completions");
         let body: serde_json::Value =
             serde_json::from_slice(&requests[0].body).expect("typed provider JSON request");
-        assert_eq!(body["model"], "");
+        assert_eq!(body["model"], "fixture-model");
         assert_eq!(result.task_id, task_id);
         assert_eq!(result.agent, "researcher");
         assert_eq!(result.status, BackgroundTaskStatus::Failed);

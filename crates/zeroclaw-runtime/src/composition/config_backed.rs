@@ -104,11 +104,13 @@ pub struct ConfigMemory;
 #[async_trait]
 impl MemorySource for ConfigMemory {
     async fn memory(&self, request: &MemoryRequest<'_>) -> anyhow::Result<Arc<dyn Memory>> {
-        let api_key = request
-            .config
-            .resolved_model_provider_for_agent(request.agent_alias)
-            .and_then(|(_, _, entry)| entry.api_key.as_deref());
-        zeroclaw_memory::create_memory_for_agent(request.config, request.agent_alias, api_key).await
+        let api_key = request.config.agent_model_api_key(request.agent_alias);
+        zeroclaw_memory::create_memory_for_agent(
+            request.config,
+            request.agent_alias,
+            api_key.as_deref(),
+        )
+        .await
     }
 }
 
@@ -160,9 +162,7 @@ pub fn native_compat_registry(
         .composio
         .enabled
         .then_some(config.composio.entity_id.as_str());
-    let fallback_key = config
-        .resolved_model_provider_for_agent(request.agent_alias)
-        .and_then(|(_, _, provider)| provider.api_key.as_deref());
+    let fallback_key = config.agent_model_api_key(request.agent_alias);
     crate::tools::all_tools_with_runtime_context(
         Arc::clone(request.config),
         request.security,
@@ -177,7 +177,7 @@ pub fn native_compat_registry(
         &config.web_fetch,
         workspace_dir,
         &config.agents,
-        fallback_key,
+        fallback_key.as_deref(),
         config,
         canvas_store,
         is_subagent_caller,

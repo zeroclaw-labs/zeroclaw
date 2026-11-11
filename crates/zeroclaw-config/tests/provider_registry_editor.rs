@@ -575,3 +575,122 @@ fn registry_connection_header_secrets_follow_encryption_and_decryption() {
         .unwrap();
     assert_eq!(serde_json::to_value(connection).unwrap(), original);
 }
+
+#[test]
+fn exact_model_rename_rewrites_consumers_and_fallback_without_prefix_matching() {
+    use zeroclaw_config::provider_registry::editor::{create_entry, delete_entry, rename_entry};
+    use zeroclaw_config::schema::{AliasedAgentConfig, ModelRouteConfig};
+    let mut config = config();
+    create_entry(
+        &mut config,
+        "models",
+        "chat.fast.us.extra",
+        json!({"capability":"chat", "provider":"gateway.prod", "model":"model-one"}),
+    )
+    .unwrap();
+    config.agents.insert(
+        "consumer".into(),
+        AliasedAgentConfig {
+            model_provider: "chat.fast.us".into(),
+            classifier_provider: "chat.fast.us".into(),
+            summary_provider: "chat.fast.us".into(),
+            ..Default::default()
+        },
+    );
+    config.model_routes.push(ModelRouteConfig {
+        hint: "fast".into(),
+        model_ref: "chat.fast.us".into(),
+    });
+    config.multimodal.vision_model_provider = Some("chat.fast.us".into());
+    rename_entry(&mut config, "models", "chat.fast.us", "chat.Next.v2").unwrap();
+    let registry = config.provider_registry().unwrap();
+    assert!(!registry.models.contains_key("chat.fast.us"));
+    assert!(registry.models.contains_key("chat.fast.us.extra"));
+    assert_eq!(
+        registry.fallback["chat.Next.v2"],
+        vec!["chat.backup".into()]
+    );
+    assert_eq!(
+        config.agents["consumer"].model_provider.as_str(),
+        "chat.Next.v2"
+    );
+    assert_eq!(
+        config.agents["consumer"].classifier_provider.as_str(),
+        "chat.Next.v2"
+    );
+    assert_eq!(
+        config.agents["consumer"].summary_provider.as_str(),
+        "chat.Next.v2"
+    );
+    assert_eq!(config.model_routes[0].model_ref, "chat.Next.v2");
+    assert_eq!(
+        config.multimodal.vision_model_provider.as_deref(),
+        Some("chat.Next.v2")
+    );
+    let before = snapshot(&config).unwrap();
+    assert!(delete_entry(&mut config, "models", "chat.Next.v2").is_err());
+    assert_eq!(snapshot(&config).unwrap(), before);
+}
+
+#[test]
+fn exact_connection_rename_preserves_credentials_and_rebuilds_bindings() {
+    use zeroclaw_config::provider_registry::editor::rename_entry;
+    let mut config = config();
+    rename_entry(
+        &mut config,
+        "connections",
+        "gateway.prod",
+        "gateway.Next.v2",
+    )
+    .unwrap();
+    let registry = config.provider_registry().unwrap();
+    let model = registry.resolve_chat(&"chat.fast.us".into()).unwrap();
+    assert_eq!(model.selection.model.provider().as_str(), "gateway.Next.v2");
+    assert_eq!(model.selection.connection.api_key(), Some("test-secret"));
+    assert_eq!(
+        model.selection.connection.extra_headers().unwrap()["X-Custom-Auth"],
+        "custom-header-secret"
+    );
+    assert!(!registry.connections.contains_key("gateway.prod"));
+}
+
+#[test]
+fn preset_rename_updates_api_and_model_bindings() {
+    use zeroclaw_config::provider_registry::editor::rename_entry;
+    let mut config = Config {
+        providers: serde_json::from_value(json!({
+            "connections":{"gateway.prod":{"kind":"custom", "uri":"https://example.test/v1", "api":{"chat":{"preset":"common.v1"}}}},
+            "model_presets":{"common.v1":{"capability":"chat", "options":{"temperature":0.4}}},
+            "models":{"chat.Fast":{"capability":"chat", "provider":"gateway.prod", "model":"wire-model", "preset":"common.v1"}}
+        })).unwrap(), ..Config::default()
+    };
+    rename_entry(&mut config, "model_presets", "common.v1", "common.v2").unwrap();
+    let registry = snapshot(&config).unwrap();
+    assert_eq!(
+        registry["connections"]["gateway.prod"]["api"]["chat"]["preset"],
+        "common.v2"
+    );
+    assert_eq!(registry["models"]["chat.Fast"]["preset"], "common.v2");
+}
+
+#[test]
+fn registry_rename_refuses_environment_owned_consumer_bindings_atomically() {
+    let mut config = config();
+    config
+        .agents
+        .insert("test-agent".into(), Default::default());
+    config.agents.get_mut("test-agent").unwrap().model_provider = "chat.fast.us".into();
+    config
+        .env_overridden_paths
+        .insert("agents.test-agent.model_provider".into());
+    let before = serde_json::to_value(&config).unwrap();
+    let error = zeroclaw_config::provider_registry::editor::rename_entry(
+        &mut config,
+        "models",
+        "chat.fast.us",
+        "chat.next",
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("environment-owned reference"));
+    assert_eq!(serde_json::to_value(&config).unwrap(), before);
+}

@@ -280,40 +280,10 @@ fn effort_turn_route(
 fn effort_scoped_provider_config(
     config: &Config,
     allowed_provider_refs: &HashSet<String>,
-) -> Box<Config> {
+) -> anyhow::Result<Box<Config>> {
     let mut scoped = Box::new(config.clone());
-    let is_allowed = |reference: &str| {
-        let reference = reference.trim();
-        allowed_provider_refs.contains(reference)
-            || config
-                .providers
-                .models
-                .profile_ref(reference)
-                .is_some_and(|(family, alias)| {
-                    allowed_provider_refs.contains(&format!("{family}.{alias}"))
-                })
-    };
-    let excluded_profiles: Vec<(String, String)> = scoped
-        .providers
-        .models
-        .iter_entries()
-        .filter(|(family, alias, _)| !is_allowed(&format!("{family}.{alias}")))
-        .map(|(family, alias, _)| (family.to_string(), alias.to_string()))
-        .collect();
-    for (family, alias) in excluded_profiles {
-        scoped.providers.models.remove_alias(&family, &alias);
-    }
-    scoped
-        .providers
-        .models
-        .retain_canonical_models(|model_ref, _| is_allowed(model_ref.as_str()));
-    scoped.providers.fallback.retain(|source, targets| {
-        is_allowed(source.as_str()) && targets.iter().all(|target| is_allowed(target.as_str()))
-    });
-    scoped
-        .model_routes
-        .retain(|route| is_allowed(&route.model_ref));
-    scoped
+    scoped.restrict_chat_inputs(allowed_provider_refs)?;
+    Ok(scoped)
 }
 
 // Cost tracking moved to `super::cost`.
@@ -1477,20 +1447,14 @@ pub struct AgentRunOverrides {
     pub sop_step_scope: Option<crate::sop::active_scope::HeadlessStepScope>,
 }
 
-fn agent_provider_composite(
-    config: &zeroclaw_config::schema::Config,
-    agent_alias: &str,
-) -> Option<String> {
-    if let Some(model_provider) = config
-        .agent(agent_alias)
-        .map(|agent| agent.model_provider.trim())
-        .filter(|reference| config.is_canonical_model_ref(reference))
-    {
-        return Some(model_provider.to_owned());
-    }
+fn agent_provider_composite(config: &Config, agent_alias: &str) -> Option<String> {
+    let reference = config.agent(agent_alias)?.model_provider.as_str();
     config
-        .resolved_model_provider_for_agent(agent_alias)
-        .map(|(ty, alias, _)| format!("{ty}.{alias}"))
+        .provider_registry()
+        .ok()?
+        .resolve_chat(&reference.into())
+        .ok()?;
+    Some(reference.to_owned())
 }
 
 /// Return the owned agent config direct-turn setup needs, with runtime-profile
@@ -1807,10 +1771,6 @@ async fn run_inner(
             None => Arc::new(SecurityPolicy::for_agent(&config, agent_alias)?),
         };
 
-        let agent_provider_resolved = config
-            .resolved_model_provider_for_agent(agent_alias)
-            .map(|(ty, alias, cfg)| (ty, alias.to_string(), cfg.clone()));
-
         let mem: Arc<dyn Memory> = if memory_free {
             Arc::new(zeroclaw_memory::NoneMemory::new("none"))
         } else {
@@ -2026,11 +1986,10 @@ async fn run_inner(
         let build_config = selection
             .as_ref()
             .map(|selection| {
-                Arc::from(effort_scoped_provider_config(
-                    &config,
-                    &selection.allowed_provider_refs,
-                ))
+                effort_scoped_provider_config(&config, &selection.allowed_provider_refs)
+                    .map(Arc::from)
             })
+            .transpose()?
             .unwrap_or_else(|| Arc::clone(&config));
         let build_ref = selection.as_ref().map_or(effective_model_ref, |selection| {
             selection.model_provider.as_str()
@@ -2061,10 +2020,8 @@ async fn run_inner(
 
         {
             let span = zeroclaw_log::Span::current();
-            let mp_composite = match agent_provider_resolved.as_ref() {
-                Some((ty, alias, _)) => format!("{ty}.{alias}"),
-                None => provider_name.clone(),
-            };
+            let mp_composite = agent_provider_composite(&config, agent_alias)
+                .unwrap_or_else(|| provider_name.clone());
             span.record("model_provider", mp_composite.as_str());
             span.record("model", model_name.as_str());
         }
@@ -2642,8 +2599,8 @@ async fn run_inner(
                             // values (temperature, billing name) move with the
                             // new model.
                             let switch_config = active_effort_provider_refs.as_deref().map(|allowed|
-                                Arc::from(effort_scoped_provider_config(&config, allowed))
-                            ).unwrap_or_else(|| Arc::clone(&config));
+                                effort_scoped_provider_config(&config, allowed).map(Arc::from)
+                            ).transpose()?.unwrap_or_else(|| Arc::clone(&config));
                             let model = bound_capabilities.build_model(
                                 switch_config,
                                 agent_alias,
@@ -2984,7 +2941,7 @@ async fn run_inner(
                         let scoped_config = Arc::from(effort_scoped_provider_config(
                             &config,
                             &selection.allowed_provider_refs,
-                        ));
+                        )?);
                         let built = bound_capabilities
                             .build_model(
                                 scoped_config,
@@ -3339,8 +3296,8 @@ async fn run_inner(
                                 // Same rebuild as the one-shot path above —
                                 // one construction site for both loops.
                                 let switch_config = active_effort_provider_refs.as_deref().map(|allowed|
-                                    Arc::from(effort_scoped_provider_config(&config, allowed))
-                                ).unwrap_or_else(|| Arc::clone(&config));
+                                    effort_scoped_provider_config(&config, allowed).map(Arc::from)
+                                ).transpose()?.unwrap_or_else(|| Arc::clone(&config));
                                 let model = bound_capabilities.build_model(
                                     switch_config,
                                     agent_alias,
@@ -4106,11 +4063,10 @@ async fn process_message_inner(
         let build_config = effort_selection
             .as_ref()
             .map(|selection| {
-                Arc::from(effort_scoped_provider_config(
-                    &config,
-                    &selection.allowed_provider_refs,
-                ))
+                effort_scoped_provider_config(&config, &selection.allowed_provider_refs)
+                    .map(Arc::from)
             })
+            .transpose()?
             .unwrap_or_else(|| Arc::clone(&config));
         let build_ref = effort_selection
             .as_ref()
@@ -4599,7 +4555,7 @@ mod tests {
             &std::collections::HashSet::from(["custom.local".to_string()])
         );
         let local_config =
-            effort_scoped_provider_config(&config, local.allowed_provider_refs.as_ref());
+            effort_scoped_provider_config(&config, local.allowed_provider_refs.as_ref()).unwrap();
         assert!(
             !local_config.providers.fallback.contains_key(
                 &zeroclaw_config::provider_registry::ModelRef::new("custom.local")

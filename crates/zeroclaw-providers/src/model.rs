@@ -54,7 +54,7 @@ impl BuiltModel {
     }
 
     pub fn provider_name(&self) -> String {
-        self.identity.profile_ref()
+        self.identity.provider_ref()
     }
 
     pub fn route_resolver(&self) -> Arc<crate::router::ModelRouteResolver> {
@@ -148,26 +148,10 @@ pub async fn build_model_nonblocking(
 /// Resolve auth readiness using the same typed-family policy as fallback admission.
 /// Explicit endpoints may still be probed anonymously by their caller.
 pub fn selection_auth_ready(config: &Config, selection_ref: &str) -> anyhow::Result<bool> {
-    let canonical_ref = zeroclaw_config::provider_registry::ModelRef::from(selection_ref.trim());
-    if config.is_canonical_model_ref(canonical_ref.as_str()) {
-        let registry = config.provider_registry()?;
-        let selection = registry.resolve_chat(&canonical_ref)?;
-        return Ok(crate::factory::canonical_auth_ready(
-            selection.selection.connection,
-        ));
-    }
-    let selection = config
-        .resolve_model_selection(selection_ref)
-        .ok_or_else(|| anyhow::Error::msg("model selection does not exist"))?;
-    let mut options =
-        crate::provider_runtime_options_for_alias(config, selection.family, selection.alias);
-    crate::apply_model_entry_options(&mut options, selection.model_entry);
-    Ok(crate::factory::fallback_auth_ready_for_alias(
-        config,
-        selection.family,
-        selection.alias,
-        selection.entry.api_key.as_deref(),
-        &options,
+    let registry = config.chat_registry_for_input(None, selection_ref)?;
+    let selection = registry.resolve_chat(&selection_ref.trim().into())?;
+    Ok(crate::factory::canonical_auth_ready(
+        selection.selection.connection,
     ))
 }
 
@@ -193,74 +177,42 @@ pub fn build_reliable_provider(
 /// Whether routed construction borrows model and connection defaults from its
 /// agent rather than resolving a named provider profile.
 pub fn inherits_agent_selection(config: &Config, selection_ref: &str) -> bool {
-    if config.is_canonical_model_ref(selection_ref) {
-        return false;
-    }
-    !config
-        .providers
-        .models
-        .profile_ref(selection_ref.trim())
-        .is_some_and(|(family, _)| !family.contains(':'))
+    !config.is_configured_model_ref(selection_ref)
+        && config.chat_registry_for_input(None, selection_ref).is_ok()
 }
 
-fn configured_selection_for_construction<'a>(
-    config: &'a Config,
+/// Resolve options for the same selection used by model construction, without
+/// constructing a transport or borrowing tuning from another model handle.
+pub fn runtime_options(
+    config: &Config,
     agent_alias: &str,
     selection_ref: &str,
-) -> Option<zeroclaw_config::schema::ModelSelection<'a>> {
-    let selection_ref = selection_ref.trim();
-    if !inherits_agent_selection(config, selection_ref) {
-        config.resolve_model_selection(selection_ref)
-    } else {
-        config
-            .agent(agent_alias)
-            .and_then(|agent| config.resolve_model_selection(&agent.model_provider))
-    }
+) -> anyhow::Result<crate::ModelProviderRuntimeOptions> {
+    let registry = config.chat_registry_for_input(Some(agent_alias), selection_ref)?;
+    let selected = registry.resolve_chat(&selection_ref.trim().into())?;
+    Ok(crate::factory::runtime_options_for_chat(
+        &selected,
+        &crate::provider_runtime_options_for_bare_family(config),
+    ))
 }
 
-/// Resolve construction identity without creating a transport. Bare families
-/// and URL references inherit their model from the configured agent selection.
+/// Resolve the exact identity without constructing a transport.
 pub fn resolve_model_identity(
     config: &Config,
     agent_alias: &str,
     selection_ref: &str,
     model_override: Option<&str>,
 ) -> Option<ModelIdentity> {
-    let selection_ref = selection_ref.trim();
-    if config.is_canonical_model_ref(selection_ref) {
-        let model_id = model_override
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-            .or_else(|| config.resolve_model_id(selection_ref))?;
-        return Some(ModelIdentity {
-            family: selection_ref.to_owned(),
-            alias: String::new(),
-            entry_alias: None,
-            model_id,
-        });
-    }
-    let selection = configured_selection_for_construction(config, agent_alias, selection_ref);
+    let registry = config
+        .chat_registry_for_input(Some(agent_alias), selection_ref)
+        .ok()?;
+    let selected = registry.resolve_chat(&selection_ref.trim().into()).ok()?;
     let model_id = model_override
         .map(str::trim)
         .filter(|model| !model.is_empty())
-        .map(str::to_owned)
-        .or_else(|| {
-            selection
-                .as_ref()
-                .and_then(|selection| selection.model_id.clone())
-        })?;
-    match config.providers.models.profile_ref(selection_ref) {
-        Some((family, _)) if !family.contains(':') => {
-            selection.map(|selection| selection.identity(Some(&model_id)))
-        }
-        _ => Some(ModelIdentity {
-            family: selection_ref.to_string(),
-            alias: String::new(),
-            entry_alias: None,
-            model_id,
-        }),
-    }
+        .or_else(|| selected.upstream_model())?
+        .to_owned();
+    Some(ModelIdentity::new(selection_ref.trim(), model_id))
 }
 
 fn build_provider(
@@ -269,163 +221,33 @@ fn build_provider(
     overrides: ProviderOverrides<'_>,
     reliable: bool,
 ) -> anyhow::Result<crate::ResolvedModelProviderRef> {
-    let selection_ref = selection_ref.trim();
-
-    // Canonical model references are exact registry keys. They must be
-    // admitted before the V4 family/alias parser, which intentionally treats
-    // dots as legacy profile boundaries. The initial migration boundary uses
-    // the new resolver for both transport construction and the exact-key
-    // fallback graph. The legacy family/alias parser is only considered when
-    // this lookup does not find a canonical model.
-    let canonical_ref = zeroclaw_config::provider_registry::ModelRef::from(selection_ref);
-    if config.is_canonical_model_ref(canonical_ref.as_str()) {
-        let options = crate::provider_runtime_options_for_bare_family(config);
-        let registry = config.provider_registry()?;
-        let mut reliable_candidates = Vec::new();
-        let mut raw_candidates = Vec::new();
-        let mut refs = vec![canonical_ref.clone()];
-        refs.extend(registry.fallback_chain(&canonical_ref)?);
-        for candidate_ref in refs {
-            // Reuse the immutable registry/connection descriptors for this
-            // construction transaction, but resolve and materialize every
-            // candidate's model policy independently.
-            let provider = crate::factory::dispatch_model_ref_with_registry(
-                &registry,
-                &candidate_ref,
-                &options,
-                if candidate_ref == canonical_ref {
-                    overrides.api_key
-                } else {
-                    None
-                },
-            )?;
-            let configured_model = registry
-                .resolve_chat(&candidate_ref)?
-                .upstream_model()
-                .unwrap_or(candidate_ref.as_str())
-                .to_owned();
-            let pinned_model = if candidate_ref == canonical_ref {
-                overrides
-                    .model
-                    .map(str::trim)
-                    .filter(|model| !model.is_empty())
-                    .map(str::to_owned)
-                    .unwrap_or(configured_model)
-            } else {
-                configured_model
-            };
-            if reliable {
-                let provider: std::sync::Arc<dyn ModelProvider> = provider.into();
-                reliable_candidates.push(
-                    crate::reliable::ReliableModelProviderEntry::new_pinned(
-                        candidate_ref.as_str(),
-                        candidate_ref.as_str(),
-                        candidate_ref.as_str(),
-                        &pinned_model,
-                        Box::new(provider),
-                    )
-                    .with_selection_ref(candidate_ref.as_str()),
-                );
-            } else {
-                raw_candidates.push((pinned_model, provider));
-            }
-        }
-        let provider: Box<dyn ModelProvider> = if reliable {
-            Box::new(
-                crate::reliable::ReliableModelProvider::new_with_entries(
-                    selection_ref,
-                    reliable_candidates,
-                    config.reliability.provider_retries,
-                    config.reliability.provider_backoff_ms,
-                )
-                .with_api_keys(config.reliability.api_keys.clone()),
-            )
-        } else {
-            raw_candidates
-                .into_iter()
-                .next()
-                .map(|(_, provider)| provider)
-                .ok_or_else(|| anyhow::Error::msg("canonical model has no provider candidate"))?
-        };
+    let registry = config.chat_registry_for_input(None, selection_ref)?;
+    let reference = selection_ref.trim().into();
+    let options = crate::provider_runtime_options_for_bare_family(config);
+    if reliable {
+        build_provider_in_registry(config, &registry, &reference, overrides, &options, true)
+    } else {
+        let provider = crate::factory::dispatch_model_ref_with_registry(
+            &registry,
+            &reference,
+            &options,
+            overrides.api_key,
+        )?;
         let model = overrides.model.map(str::to_owned).or_else(|| {
             registry
-                .resolve_chat(&canonical_ref)
-                .ok()
-                .and_then(|resolved| resolved.upstream_model().map(str::to_owned))
+                .resolve_chat(&reference)
+                .ok()?
+                .upstream_model()
+                .map(str::to_owned)
         });
-        return Ok(crate::ResolvedModelProviderRef { provider, model });
+        Ok(crate::ResolvedModelProviderRef { provider, model })
     }
-    crate::ensure_known_model_entry_ref(config, selection_ref)?;
-    let selection = config.resolve_model_selection(selection_ref);
-    let model = overrides
-        .model
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .map(str::to_owned)
-        .or_else(|| {
-            selection
-                .as_ref()
-                .and_then(|selection| selection.model_id.clone())
-        })
-        .map(|model| model.trim().to_string())
-        .filter(|model| !model.is_empty());
-    let provider = if let Some(selection) = selection {
-        let mut options =
-            crate::provider_runtime_options_for_alias(config, selection.family, selection.alias);
-        crate::apply_model_entry_options(&mut options, selection.model_entry);
-        let key = overrides.api_key.or(selection.entry.api_key.as_deref());
-        let url = selection.entry.uri.as_deref();
-        if reliable {
-            crate::create_resilient_model_provider_for_alias_with_model_override(
-                config,
-                selection.family,
-                selection.alias,
-                key,
-                url,
-                &config.reliability,
-                &options,
-                model.as_deref(),
-                selection_ref,
-            )?
-        } else {
-            crate::create_model_provider_inner(
-                Some(config),
-                selection.family,
-                selection.alias,
-                key,
-                url,
-                &options,
-            )?
-        }
-    } else {
-        // Preserve complete bare/URL references. Splitting an unknown dotted
-        // alias here could silently construct the family's default transport.
-        let options = crate::provider_runtime_options_for_bare_family(config);
-        if reliable {
-            crate::create_resilient_model_provider_with_options(
-                selection_ref,
-                overrides.api_key,
-                None,
-                &config.reliability,
-                &options,
-            )?
-        } else {
-            crate::create_model_provider_inner(
-                None,
-                selection_ref,
-                "default",
-                overrides.api_key,
-                None,
-                &options,
-            )?
-        }
-    };
-    Ok(crate::ResolvedModelProviderRef { provider, model })
 }
 
 /// Construct a canonical model with the caller's admitted runtime options.
 /// This is kept separate from the legacy family parser so the exact ModelRef
 /// remains intact through provider construction and fallback pinning.
+#[cfg(test)]
 pub(crate) fn build_canonical_provider_with_options(
     config: &Config,
     model_ref: &zeroclaw_config::provider_registry::ModelRef,
@@ -433,13 +255,31 @@ pub(crate) fn build_canonical_provider_with_options(
     options: &crate::ModelProviderRuntimeOptions,
     pin_primary_model: bool,
 ) -> anyhow::Result<crate::ResolvedModelProviderRef> {
-    let registry = config.provider_registry()?;
+    let registry = config.chat_registry_for_input(None, model_ref.as_str())?;
+    build_provider_in_registry(
+        config,
+        &registry,
+        model_ref,
+        overrides,
+        options,
+        pin_primary_model,
+    )
+}
+
+fn build_provider_in_registry(
+    config: &Config,
+    registry: &zeroclaw_config::provider_registry::ProviderRegistry,
+    model_ref: &zeroclaw_config::provider_registry::ModelRef,
+    overrides: ProviderOverrides<'_>,
+    options: &crate::ModelProviderRuntimeOptions,
+    pin_primary_model: bool,
+) -> anyhow::Result<crate::ResolvedModelProviderRef> {
     let mut candidates = Vec::new();
     let mut refs = vec![model_ref.clone()];
     refs.extend(registry.fallback_chain(model_ref)?);
     for candidate_ref in refs {
         let provider = crate::factory::dispatch_model_ref_with_registry(
-            &registry,
+            registry,
             &candidate_ref,
             options,
             if candidate_ref == *model_ref {
@@ -521,16 +361,10 @@ pub fn selection_depends_on_model_ref(
     };
     let root = zeroclaw_config::provider_registry::ModelRef::from(selection_ref);
     let changed = zeroclaw_config::provider_registry::ModelRef::from(changed_model_ref);
-    // Legacy profiles refresh as a unit, including their default/sole-entry
-    // projections. Exact model edits have no such effect on sibling models,
-    // even when they share a connection. Explicit model keys take precedence.
-    let shared_profile_edit = config.providers.models.canonical_model(&changed).is_none()
-        && config.resolve_model_selection(changed_model_ref).is_some();
     fn visit(
         registry: &zeroclaw_config::provider_registry::ProviderRegistry,
         current: &zeroclaw_config::provider_registry::ModelRef,
         changed: &zeroclaw_config::provider_registry::ModelRef,
-        shared_profile_edit: bool,
         visited: &mut HashSet<zeroclaw_config::provider_registry::ModelRef>,
     ) -> bool {
         if current == changed {
@@ -539,28 +373,13 @@ pub fn selection_depends_on_model_ref(
         if !visited.insert(current.clone()) {
             return false;
         }
-        if shared_profile_edit
-            && registry
-                .models
-                .get(current)
-                .zip(registry.models.get(changed))
-                .is_some_and(|(model, edited)| model.provider() == edited.provider())
-        {
-            return true;
-        }
         registry.fallback.get(current).is_some_and(|targets| {
             targets
                 .iter()
-                .any(|target| visit(registry, target, changed, shared_profile_edit, visited))
+                .any(|target| visit(registry, target, changed, visited))
         })
     }
-    visit(
-        &registry,
-        &root,
-        &changed,
-        shared_profile_edit,
-        &mut HashSet::new(),
-    )
+    visit(&registry, &root, &changed, &mut HashSet::new())
 }
 
 /// Dependencies of the routed graph built by [`build_model`], including each
@@ -588,14 +407,9 @@ pub fn routed_selection_depends_on_model_ref(
 /// The single model constructor: initial construction, runtime switches, live
 /// refresh, and session overrides all rebuild through here.
 ///
-/// Callers supply only the ref (two- or three-segment, or a bare family name
-/// for the legacy CLI `--provider <family>` form), an optional explicit
-/// model; everything else (agent config, entry
-/// overlay, temperature, context window, identity) is derived
-/// from the full config. The raw ref is passed through to the providers
-/// construction chain: that chain re-resolves the model entry from the ref it
-/// is given, and feeding it a normalised two-segment ref would select
-/// `models.default` and clobber the selected entry's tuning overlay.
+/// Callers supply an exact model key and optional invocation override. Config
+/// normalizes historical CLI input before construction. Primary, hint and
+/// fallback targets each resolve their complete policy from that registry.
 pub fn build_model(
     config: &Config,
     agent_alias: &str,
@@ -603,142 +417,94 @@ pub fn build_model(
     model_override: Option<&str>,
 ) -> anyhow::Result<BuiltModel> {
     let model_provider_ref = model_provider_ref.trim();
-    let canonical_ref = zeroclaw_config::provider_registry::ModelRef::from(model_provider_ref);
-    if config.is_canonical_model_ref(canonical_ref.as_str()) {
-        let registry = config.provider_registry()?;
-        registry.resolve_chat(&canonical_ref)?;
-        // Each candidate materializes its own model policy. Supplying the
-        // primary model's options here would leak them into a backup whose
-        // corresponding field is unset.
-        let options = crate::provider_runtime_options_for_bare_family(config);
-        let model_id = model_override
-            .map(str::trim)
-            .filter(|model| !model.is_empty())
-            .map(str::to_owned)
-            .or_else(|| {
-                registry
-                    .resolve_chat(&canonical_ref)
-                    .ok()?
-                    .upstream_model()
-                    .map(str::to_owned)
-            })
-            .ok_or_else(|| {
+    let registry = config.chat_registry_for_input(Some(agent_alias), model_provider_ref)?;
+    let reference = zeroclaw_config::provider_registry::ModelRef::from(model_provider_ref);
+    let selected = registry.resolve_chat(&reference)?;
+    let model_id = model_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| selected.upstream_model())
+        .map(str::to_owned)
+        .ok_or_else(|| {
             anyhow::Error::msg(format!(
-                "model_provider `{model_provider_ref}` has no `model` configured and no model override was supplied"
+                "model `{model_provider_ref}` has no upstream model"
             ))
-            })?;
-        let identity = ModelIdentity {
-            family: model_provider_ref.to_owned(),
-            alias: String::new(),
-            entry_alias: None,
-            model_id: model_id.clone(),
-        };
-        let (provider, resolver) = crate::create_routed_model_provider_with_options_and_resolver(
-            config,
-            model_provider_ref,
-            None,
-            None,
-            &config.reliability,
-            &config.model_routes,
-            &model_id,
-            &options,
-        )?;
+        })?;
+    let options = crate::provider_runtime_options_for_bare_family(config);
+    let primary = build_provider_in_registry(
+        config,
+        &registry,
+        &reference,
+        ProviderOverrides {
+            model: model_override,
+            api_key: None,
+        },
+        &options,
+        true,
+    )?
+    .provider;
+    let mut routes = Vec::new();
+    let mut providers = vec![(model_provider_ref.to_owned(), primary)];
+    // Hint targets share only the immutable registry. Every target is built
+    // again from its complete model definition, even when it equals primary.
+    for route in config
+        .model_routes
+        .iter()
+        .filter(|route| !route.hint.trim().is_empty() && !route.model_ref.trim().is_empty())
+    {
+        let target = zeroclaw_config::provider_registry::ModelRef::from(route.model_ref.trim());
+        let upstream = registry
+            .resolve_chat(&target)?
+            .upstream_model()
+            .filter(|model| !model.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow::Error::msg(format!("route `{}` has no upstream model", route.hint))
+            })?
+            .to_owned();
+        if !providers
+            .iter()
+            .skip(1)
+            .any(|(key, _)| key == target.as_str())
+        {
+            let provider = build_provider_in_registry(
+                config,
+                &registry,
+                &target,
+                ProviderOverrides::default(),
+                &options,
+                true,
+            )?
+            .provider;
+            providers.push((target.to_string(), provider));
+        }
+        routes.push((
+            route.hint.clone(),
+            crate::router::Route {
+                provider_name: target.to_string(),
+                model: upstream,
+            },
+        ));
+    }
+    let identity = ModelIdentity::new(model_provider_ref, model_id.clone());
+    if routes.is_empty() {
+        let (_, provider) = providers.remove(0);
+        let resolver = Arc::new(crate::router::ModelRouteResolver::new(
+            Vec::new(),
+            model_provider_ref.to_owned(),
+            model_id,
+        ));
         return Ok(BuiltModel::from_routed_provider(
             provider, identity, resolver,
         ));
     }
-    let (_, explicit_url) = crate::split_v2_colon_url(model_provider_ref);
-    crate::ensure_known_model_entry_ref(config, model_provider_ref)?;
-    // A two- or three-segment ref names a profile; a third segment selects a
-    // model entry under the profile's `models` map. A bare family inherits
-    // the agent selection's model and connection, with runtime options
-    // inherited from the agent's own profile with the provider-specific bits
-    // cleared (exactly what `options_for_provider_ref` gives a bare name).
-    // Bare families and URL references need no configured profile. A dotted
-    // profile reference must resolve rather than using a family's defaults.
-    let (model_provider_name, model_provider_alias, bare_family) =
-        match config.providers.models.profile_ref(model_provider_ref) {
-            Some((family, alias)) if !family.contains(':') => {
-                (family.to_string(), alias.to_string(), false)
-            }
-            _ => (model_provider_ref.to_string(), String::new(), true),
-        };
-
-    // Named refs select their own profile. Bare selectors inherit model
-    // defaults, but only the same bare family may reuse the agent connection;
-    // a different family or an explicit URL keeps its requested transport.
-    let selection = configured_selection_for_construction(config, agent_alias, model_provider_ref);
-    let inherit_connection = bare_family
-        && explicit_url.is_none()
-        && selection
-            .as_ref()
-            .is_some_and(|selected| selected.family == model_provider_name);
-    let entry = selection
-        .as_ref()
-        .filter(|_| !bare_family || inherit_connection)
-        .map(|selection| selection.entry);
-    let model_entry = selection.as_ref().and_then(|s| s.model_entry);
-
-    let identity = resolve_model_identity(config, agent_alias, model_provider_ref, model_override)
-        .ok_or_else(|| {
-            anyhow::Error::msg(format!(
-                "model_provider `{model_provider_ref}` has no `model` configured and no model \
-                 override was supplied"
-            ))
-        })?;
-    let model_name = &identity.model_id;
-
-    let mut runtime_options = if bare_family {
-        // Reuse full connection options only for a same-family shorthand.
-        // Other selectors inherit applicable model defaults after removing
-        // the configured profile's transport-specific options.
-        if inherit_connection {
-            crate::provider_runtime_options_for_agent(config, agent_alias)
-        } else {
-            let agent_options = crate::provider_runtime_options_for_agent(config, agent_alias);
-            crate::options_for_provider_ref(config, model_provider_ref, &agent_options)
-        }
-    } else {
-        crate::provider_runtime_options_for_alias(
-            config,
-            &model_provider_name,
-            &model_provider_alias,
-        )
-    };
-    crate::apply_model_entry_options(&mut runtime_options, model_entry);
-
-    let construction_ref = if inherit_connection {
-        selection.as_ref().map_or_else(
-            || model_provider_ref.to_owned(),
-            |selected| {
-                let profile = format!("{}.{}", selected.family, selected.alias);
-                selected
-                    .model_alias
-                    .as_ref()
-                    .map_or(profile.clone(), |model| format!("{profile}.{model}"))
-            },
-        )
-    } else {
-        model_provider_ref.to_owned()
-    };
-
-    let (provider, model_route_resolver) =
-        crate::create_routed_model_provider_with_options_and_resolver(
-            config,
-            &construction_ref,
-            entry.and_then(|e| e.api_key.as_deref()),
-            explicit_url.or_else(|| entry.and_then(|e| e.uri.as_deref())),
-            &config.reliability,
-            &config.model_routes,
-            model_name,
-            &runtime_options,
-        )?;
-
-    Ok(BuiltModel {
-        provider,
+    let router =
+        crate::router::RouterModelProvider::new(model_provider_ref, providers, routes, model_id);
+    let resolver = router.route_resolver();
+    Ok(BuiltModel::from_routed_provider(
+        Box::new(router),
         identity,
-        model_route_resolver,
-    })
+        resolver,
+    ))
 }
 
 #[cfg(test)]
@@ -935,7 +701,7 @@ model = "backup"
     }
 
     #[test]
-    fn projected_model_dependencies_preserve_profile_refresh_and_exact_key_precedence() {
+    fn normalized_model_keys_have_no_implicit_prefix_dependencies() {
         let mut config = Config::default();
         let profile = config
             .providers
@@ -953,22 +719,22 @@ model = "backup"
                 },
             );
         }
-        assert!(selection_depends_on_model_ref(
+        assert!(!selection_depends_on_model_ref(
             &config,
             "custom.gateway.prod.fast",
             "custom.gateway.prod"
         ));
-        assert!(selection_depends_on_model_ref(
+        assert!(!selection_depends_on_model_ref(
             &config,
             "custom.gateway.prod.slow",
             "custom.gateway.prod"
         ));
-        assert!(selection_depends_on_model_ref(
+        assert!(!selection_depends_on_model_ref(
             &config,
             "custom.gateway.prod.fast",
             "custom.gateway.prod.slow"
         ));
-        assert!(selection_depends_on_model_ref(
+        assert!(!selection_depends_on_model_ref(
             &config,
             "custom.gateway.prod",
             "custom.gateway.prod.fast"
@@ -1191,9 +957,12 @@ model = "backup-model"
             "custom:https://api.example.test/v1".into(),
         ] {
             let options = crate::options_for_provider_ref(&config, &reference, &inherited_options);
-            assert!(options.merge_system_into_user);
-            assert_eq!(options.provider_max_tokens, Some(123));
-            assert_eq!(options.provider_api_url, None);
+            assert!(!options.merge_system_into_user);
+            assert_eq!(options.provider_max_tokens, None);
+            assert_eq!(
+                options.provider_api_url.as_deref(),
+                reference.strip_prefix("custom:")
+            );
         }
 
         for (reference, override_model, expected_model) in [

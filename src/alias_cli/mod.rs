@@ -2,10 +2,8 @@
 //! {create,list,rename,delete}`.
 
 use anyhow::{Context, Result, bail};
-use zeroclaw::{AgentsCommands, ChannelsCommands, ProvidersCommands};
-use zeroclaw_config::alias_refs::{
-    self, AliasKind, CascadeError, CascadePolicy, ProviderCategory, RenameError,
-};
+use zeroclaw::{AgentsCommands, ChannelsCommands, ProviderRegistrySection, ProvidersCommands};
+use zeroclaw_config::alias_refs::{self, AliasKind, CascadeError, CascadePolicy, RenameError};
 use zeroclaw_config::schema::Config;
 
 mod export;
@@ -38,41 +36,8 @@ fn mta(key: &str, args: &[(&str, &str)], fallback: &str) -> String {
     }
 }
 
-fn parse_provider_category(category: &str) -> Result<ProviderCategory> {
-    match category {
-        "models" => Ok(ProviderCategory::Models),
-        "tts" => Ok(ProviderCategory::Tts),
-        "transcription" => Ok(ProviderCategory::Transcription),
-        other => bail!(
-            "{}",
-            mta(
-                "cli-alias-unknown-provider-category",
-                &[("category", other)],
-                "unknown provider category `{$category}` (expected models | tts | transcription)"
-            )
-        ),
-    }
-}
-
-/// The map-key section path for a kind (e.g. `agents`, `providers.models.anthropic`,
-/// `channels.discord`).
 fn section_path(kind: &AliasKind) -> String {
-    match kind {
-        AliasKind::Agent => "agents".to_string(),
-        AliasKind::Provider { category, family } => {
-            let cat = match category {
-                ProviderCategory::Models => "models",
-                ProviderCategory::Tts => "tts",
-                ProviderCategory::Transcription => "transcription",
-            };
-            format!("providers.{cat}.{family}")
-        }
-        AliasKind::ModelAlias {
-            family,
-            profile_alias,
-        } => format!("providers.models.{family}.{profile_alias}.models"),
-        AliasKind::Channel { channel_type } => format!("channels.{channel_type}"),
-    }
+    alias_refs::section_path(kind)
 }
 
 fn list_section(config: &Config, section: &str) -> Result<()> {
@@ -913,82 +878,143 @@ fn warn_agent_owned_state() {
 
 // ── providers ─────────────────────────────────────────────────────────────────
 
+/// Hold the same exclusive ownership as offline agent edits until persistence.
+/// Registry renames can rewrite consumer bindings, so they must never race a
+/// running daemon or publish only a partial generation.
+#[cfg(feature = "agent-runtime")]
+pub(crate) async fn begin_provider_edit(
+    config: &mut Config,
+) -> Result<zeroclaw_runtime::live_config_authority::ConfigOwnershipGuard> {
+    let ownership = zeroclaw_runtime::live_config_authority::ConfigOwnershipGuard::acquire(
+        &config.data_dir,
+    )
+    .context("provider CLI edits require offline config ownership; use the running daemon's configuration editor or stop it first")?;
+    let expected_path = config.config_path.clone();
+    let fresh = Box::pin(Config::load_or_init())
+        .await
+        .context("reload config after acquiring offline provider ownership")?;
+    anyhow::ensure!(
+        fresh.config_path == expected_path,
+        "config path changed while acquiring provider edit ownership"
+    );
+    *config = fresh;
+    Ok(ownership)
+}
+
 pub async fn handle_providers(cmd: ProvidersCommands, config: &mut Config) -> Result<()> {
+    #[cfg(feature = "agent-runtime")]
+    let _ownership = if matches!(&cmd, ProvidersCommands::List { .. }) {
+        None
+    } else {
+        Some(begin_provider_edit(config).await?)
+    };
+    use zeroclaw_config::provider_registry::editor;
     match cmd {
-        ProvidersCommands::List { category } => {
-            let cats = match category {
-                Some(c) => vec![parse_provider_category(&c)?],
-                None => vec![
-                    ProviderCategory::Models,
-                    ProviderCategory::Tts,
-                    ProviderCategory::Transcription,
-                ],
-            };
-            for cat in cats {
-                let cat_name = match cat {
-                    ProviderCategory::Models => "models",
-                    ProviderCategory::Tts => "tts",
-                    ProviderCategory::Transcription => "transcription",
-                };
-                // Enumerate families under this category, then their aliases.
-                if let Some(families) = config.get_map_keys(&format!("providers.{cat_name}")) {
-                    let mut families = families;
-                    families.sort();
-                    for family in families {
-                        if let Some(mut aliases) =
-                            config.get_map_keys(&format!("providers.{cat_name}.{family}"))
-                        {
-                            aliases.sort();
-                            for a in aliases {
-                                println!("{cat_name}.{family}.{a}");
-                            }
-                        }
+        ProvidersCommands::List { registry } => {
+            let document = editor::snapshot(config)?;
+            let sections = registry.map_or_else(
+                || {
+                    vec![
+                        ProviderRegistrySection::Connections,
+                        ProviderRegistrySection::Models,
+                        ProviderRegistrySection::ModelPresets,
+                        ProviderRegistrySection::Fallback,
+                    ]
+                },
+                |section| vec![section],
+            );
+            for section in sections {
+                if let Some(entries) = document[section.as_str()].as_object() {
+                    for key in entries.keys() {
+                        println!("{}\t{}", section.as_str(), key);
                     }
                 }
             }
             Ok(())
         }
         ProvidersCommands::Create {
-            category,
-            family,
-            alias,
+            registry,
+            key,
+            value,
         } => {
-            let cat = parse_provider_category(&category)?;
-            let section = section_path(&AliasKind::Provider {
-                category: cat,
-                family,
-            });
-            create_entry(config, &section, &alias)?;
-            save(config).await
+            let value = serde_json::from_str(&value).context("invalid registry entry JSON")?;
+            editor::create_entry(config, registry.as_str(), &key, value)?;
+            save(config).await?;
+            println!(
+                "{}",
+                mta(
+                    "cli-alias-created",
+                    &[("section", registry.as_str()), ("alias", &key)],
+                    "created {$section}.{$alias}"
+                )
+            );
+            Ok(())
         }
-        ProvidersCommands::Rename {
-            category,
-            family,
-            from,
-            to,
-        } => {
-            let category = parse_provider_category(&category)?;
-            rename_config(
-                config,
-                &AliasKind::Provider { category, family },
-                &from,
-                &to,
-            )?;
-            save(config).await
+        ProvidersCommands::Rename { registry, from, to } => {
+            editor::rename_entry(config, registry.as_str(), &from, &to)?;
+            let count = config.dirty_paths.len().to_string();
+            save(config).await?;
+            println!(
+                "{}",
+                mta(
+                    "cli-alias-renamed",
+                    &[
+                        ("section", registry.as_str()),
+                        ("from", &from),
+                        ("to", &to),
+                        ("count", &count)
+                    ],
+                    "renamed {$section}.{$from} → {$section}.{$to}"
+                )
+            );
+            Ok(())
         }
         ProvidersCommands::Delete {
-            category,
-            family,
-            alias,
+            registry,
+            key,
             dry_run,
             yes,
         } => {
-            let category = parse_provider_category(&category)?;
-            let kind = AliasKind::Provider { category, family };
-            delete_config(config, &kind, &alias, dry_run, yes)?;
-            if yes && !dry_run {
-                save(config).await?;
+            let mut candidate = config.clone();
+            editor::delete_entry(&mut candidate, registry.as_str(), &key)?;
+            if dry_run || !yes {
+                println!(
+                    "{}",
+                    mta(
+                        "cli-alias-impact-scrub-header",
+                        &[
+                            ("section", registry.as_str()),
+                            ("alias", &key),
+                            ("count", "0")
+                        ],
+                        "deleting {$section}.{$alias} would scrub {$count} reference(s):"
+                    )
+                );
+                if !dry_run {
+                    println!(
+                        "{}",
+                        mt(
+                            "cli-alias-no-changes",
+                            "No changes made. Re-run with --yes to apply (or --dry-run to preview)."
+                        )
+                    );
+                }
+                return Ok(());
             }
+            save(&mut candidate).await?;
+            *config = candidate;
+            println!(
+                "{}",
+                mta(
+                    "cli-alias-deleted",
+                    &[
+                        ("section", registry.as_str()),
+                        ("alias", &key),
+                        ("count", "0")
+                    ],
+                    "deleted {$section}.{$alias}"
+                )
+            );
             Ok(())
         }
     }
@@ -1054,48 +1080,6 @@ pub async fn handle_channels(cmd: ChannelsCommands, config: &mut Config) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_provider_category_maps_known_and_rejects_unknown() {
-        assert_eq!(
-            parse_provider_category("models").unwrap(),
-            ProviderCategory::Models
-        );
-        assert_eq!(
-            parse_provider_category("tts").unwrap(),
-            ProviderCategory::Tts
-        );
-        assert_eq!(
-            parse_provider_category("transcription").unwrap(),
-            ProviderCategory::Transcription
-        );
-        assert!(parse_provider_category("bogus").is_err());
-    }
-
-    #[test]
-    fn section_path_for_each_kind() {
-        assert_eq!(section_path(&AliasKind::Agent), "agents");
-        assert_eq!(
-            section_path(&AliasKind::Provider {
-                category: ProviderCategory::Models,
-                family: "anthropic".to_string(),
-            }),
-            "providers.models.anthropic"
-        );
-        assert_eq!(
-            section_path(&AliasKind::Provider {
-                category: ProviderCategory::Tts,
-                family: "elevenlabs".to_string(),
-            }),
-            "providers.tts.elevenlabs"
-        );
-        assert_eq!(
-            section_path(&AliasKind::Channel {
-                channel_type: "discord".to_string(),
-            }),
-            "channels.discord"
-        );
-    }
 
     #[cfg(feature = "agent-runtime")]
     #[tokio::test]
