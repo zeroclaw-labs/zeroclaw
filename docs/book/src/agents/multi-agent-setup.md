@@ -101,7 +101,7 @@ zeroclaw agents delete researcher --dry-run
 zeroclaw agents delete researcher --yes
 ```
 
-1. Review the impact preview and clear every blocker it reports. Common config blockers are an enabled heartbeat owned by the agent and an enabled channel binding that no other enabled agent owns. The preview also lists soft references that the cascade will remove automatically.
+1. Review the impact preview and clear every blocker it reports. Common config blockers are an enabled heartbeat owned by the agent, an enabled channel binding that no other enabled agent owns, and a permission profile that names the agent in `allowed_agents` (a `"*"` entry does not block). The preview also lists soft references that the cascade will remove automatically.
 2. End any live ACP sessions. The dashboard includes them in its preview; the CLI verifies them when `--yes` executes, after the config-only `--dry-run` preview.
 3. Confirm the dashboard deletion or run the CLI command with `--yes`. The operation removes the agent and soft references from config first, then runs the owned-state cascade.
 4. Inspect `<data_dir>/agents/_deleted/<alias>-<timestamp>/` and the gateway logs before relying on the archive or cleanup result.

@@ -12,6 +12,9 @@ use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 pub struct SopApproveTool {
     engine: Arc<Mutex<SopEngine>>,
     audit: Option<Arc<SopAuditLogger>>,
+    /// The session memory of the registry this tool was assembled into; once
+    /// that session is pinned, audit rows go to its owner's plane.
+    session_memory: Option<Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>>,
     agent_alias: String,
 }
 
@@ -20,6 +23,7 @@ impl SopApproveTool {
         Self {
             engine,
             audit: None,
+            session_memory: None,
             agent_alias: "agent".to_string(),
         }
     }
@@ -27,6 +31,22 @@ impl SopApproveTool {
     pub fn with_audit(mut self, audit: Arc<SopAuditLogger>) -> Self {
         self.audit = Some(audit);
         self
+    }
+
+    /// Share the session memory route of the registry this tool is
+    /// assembled into.
+    #[must_use]
+    pub fn with_session_memory(
+        mut self,
+        route: Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>,
+    ) -> Self {
+        self.session_memory = Some(route);
+        self
+    }
+
+    /// The audit logger this call writes through (see `session_audit`).
+    fn audit(&self) -> Option<Arc<SopAuditLogger>> {
+        crate::sop::audit::session_audit(self.audit.as_ref(), self.session_memory.as_ref())
     }
 
     /// Set the agent alias recorded as the approval principal (default `"agent"`).
@@ -38,6 +58,11 @@ impl SopApproveTool {
 
 #[async_trait]
 impl Tool for SopApproveTool {
+    fn requires_unrestricted_principal(&self) -> bool {
+        // Resuming a run can assemble agents outside the caller's ceilings.
+        true
+    }
+
     fn name(&self) -> &str {
         "sop_approve"
     }
@@ -83,7 +108,13 @@ impl Tool for SopApproveTool {
         // chokepoint: `resolve_via_broker` owns the checkpoint bridge (audited
         // resume via `approve_step` + headless drive of the following capability
         // steps), so approval gates and checkpoints behave identically here.
-        let result = {
+        let owner = self
+            .session_memory
+            .as_ref()
+            .and_then(|route| route.routed())
+            .and_then(|routed| routed.memory.principal_scope());
+
+        let (result, memory_owner) = {
             let mut engine = self.engine.lock().map_err(|e| {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -96,22 +127,37 @@ impl Tool for SopApproveTool {
                 anyhow::Error::msg(format!("Engine lock poisoned: {e}"))
             })?;
 
+            let Some(run) = engine
+                .get_run(run_id)
+                .filter(|run| run.is_accessible_from(owner.as_ref()))
+            else {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(crate::i18n::get_required_cli_string(
+                        "cli-sop-run-unavailable",
+                    )),
+                });
+            };
+            let memory_owner = run.memory_owner.clone();
+
             // EPIC G: route through the broker (membership + quorum). With no
             // `[sop.approval]` policy it is exactly `resolve_gate`, so behavior is
             // unchanged; with a policy the agent must be an authorized member and a
             // quorum must be met before the chokepoint clears the gate.
-            engine.resolve_via_broker_deferred(
+            let result = engine.resolve_via_broker_deferred(
                 run_id,
                 ApprovalDecision::Approve,
                 ApprovalPrincipal::agent(&self.agent_alias),
-            )
+            );
+            (result, memory_owner)
         };
 
         match result {
             Ok(BrokerOutcome::Resolved(ResolveOutcome::Resumed(action))) => {
                 crate::sop::executor::enqueue_live_action(
                     Arc::clone(&self.engine),
-                    self.audit.clone(),
+                    crate::sop::audit::audit_for_run(self.audit(), memory_owner.as_ref()),
                     &action,
                 );
                 let output = match *action {
@@ -291,7 +337,12 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.unwrap().contains("Approval failed"));
+        assert_eq!(
+            result.error,
+            Some(crate::i18n::get_required_cli_string(
+                "cli-sop-run-unavailable"
+            ))
+        );
     }
 
     #[tokio::test]

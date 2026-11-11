@@ -181,6 +181,7 @@ cli-oidc-token-expiry = The token expires in { $seconds } seconds.
 cli-oidc-browser-open = Opening your browser to sign in. If nothing opens, visit:
     { $uri }
 cli-oidc-browser-waiting = Waiting for the browser sign-in to complete...
+cli-oidc-browser-start-failed = could not start sign-in
 cli-auth-list-about = List auth profiles
 cli-auth-status-about = Show auth status with active profile and token expiry info
 
@@ -358,12 +359,14 @@ cli-update-long-about =
     Use --check to only check for updates without installing.
     Use --force to skip the confirmation prompt.
     Use --version to target a specific release instead of latest.
+    Use --standard in a CLI-only build to switch it to the standard build, which adds the dashboard and web gateway.
 
     Examples:
       zeroclaw update                      # download and install latest
       zeroclaw update --check              # check only, don't install
       zeroclaw update --force              # install without confirmation
       zeroclaw update --version 0.6.0      # install specific version
+      zeroclaw update --standard           # CLI-only build: switch to the standard build
 
 cli-self-test-long-about =
     Run diagnostic self-tests to verify the ZeroClaw installation.
@@ -541,6 +544,7 @@ cli-self-test-web-dist-dir-name = web_dist_dir
 cli-self-test-web-dist-dir-pass-unset = not set (using auto-detect)
 cli-self-test-web-dist-dir-pass-literal = {$path} (literal path)
 cli-self-test-web-dist-dir-fail-expansion = WARNING: {$path} — {$reason}; gateway.web_dist_dir is read verbatim, so expand the value yourself (e.g. an absolute path)
+cli-self-test-gateway-not-in-build = not included in this build (CLI-only)
 
 # Service lifecycle warnings.
 cli-service-systemd-linger-disabled-warning = systemd user lingering is disabled. ZeroClaw's user service may stop after logout. Enable it with: loginctl enable-linger {$user}
@@ -706,7 +710,7 @@ cli-quickstart-terminal-too-narrow = Quickstart needs a terminal at least {$min_
 cli-quickstart-terminal-too-short = Quickstart needs a terminal at least {$min_height} rows tall; the current terminal is {$height} rows. Make the terminal taller and try again.
 cli-quickstart-terminal-resized = The terminal changed from {$initial_width}x{$initial_height} to {$current_width}x{$current_height} while the Quickstart checklist was open. Reopen the checklist to continue.
 cli-quickstart-empty-checklist = Quickstart cannot open an empty checklist.
-cli-quickstart-cancelled = Quickstart cancelled. No config written.
+cli-quickstart-cancelled = Quickstart cancelled. Nothing was configured.
 cli-quickstart-incomplete = {"  "}Not all selectors are filled yet.
 cli-quickstart-create-agent = ── Create agent
 cli-quickstart-create-agent-locked = ── Create agent (locked — fill every selector first)
@@ -1009,6 +1013,9 @@ cli-status-agent-no-risk-profile-summary = {$alias}=<no risk_profile>
 cli-status-runtime = ⚙️  Runtime:       {$v}
 cli-status-web-ui-found = 🌐 Web UI:        FOUND ({$path})
 cli-status-web-ui-missing = 🌐 Web UI:        MISSING
+cli-status-web-ui-not-in-build = 🌐 Web UI:        not included in this build (CLI-only)
+# A build without the gateway answers this for `zeroclaw gateway …` and `zeroclaw desktop`.
+cli-no-dashboard-in-build = This ZeroClaw build has no dashboard or web gateway (CLI-only build). To use them, install the standard build: curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | sh
 cli-status-heartbeat = 💓 Heartbeat:      {$v}
 cli-status-heartbeat-every-minutes = every {$minutes}min
 cli-status-memory = 🧠 Memory:         {$backend} (auto-save: {$auto_save})
@@ -1105,8 +1112,28 @@ cli-config-section-degraded-executable = warning: config section `{$section}` in
 cli-plugin-list-entry-loads = {$name} v{$version} — {$description} [loads]
 cli-plugin-list-entry-failed = {$name} v{$version} — {$description} [does not load: {$error}]
 cli-plugin-list-entry-no-component = {$name} v{$version} — {$description} [no component to load]
-cli-config-section-retired-wati = warning: retired WATI channel config section `{$section}` is ignored because WATI support was removed. Migrate to `[channels.whatsapp.<alias>]` using the Cloud API or WhatsApp Web, then revoke the unused WATI API token.
-cli-config-section-retired-node-transport = warning: retired `[node_transport]` config is ignored because the legacy HMAC node transport was removed. Delete the section from config.toml.
+cli-config-migration-assumed-v1 = warning: {$path} has no `schema_version`, so it was read as schema V1 and migrated from there. The V1 migration reshapes sections written for a newer version: provider entries can end up nested one level too deep, and channel sections are merged into a `default` alias. If this file was written for a newer ZeroClaw, add `schema_version` at the top with the version it was written for (restore the `.backup` copy first if `zeroclaw config migrate` already rewrote it).
+cli-config-retired-key-removed = warning: dropped retired config key `{$key}` from {$path}: {$reason}
+cli-config-capped-key-lowered = warning: lowered config key `{$key}` in {$path} to its maximum: {$reason}
+cli-config-capped-reason-pairing-code-ttl = a pairing code stays redeemable for at most 600 seconds (10 minutes)
+cli-config-retired-reason-nevis = the Nevis IAM integration was removed; configure `[oidc.<alias>]` with `[users]` and `[permission_profiles]` instead
+cli-config-retired-reason-agent-tunable = agent-inline runtime tunables are no longer read; runtime profiles are authoritative, so set this key on the agent's `[runtime_profiles.<profile>]` instead
+cli-config-retired-reason-summary-model = the deprecated bare model id had no provider identity and was never read; `summary_provider` replaced it (context compression itself is not currently implemented in the runtime)
+cli-config-retired-reason-node-transport = the legacy HMAC node transport was removed
+cli-config-retired-reason-wati = WATI support was removed; migrate to `[channels.whatsapp.<alias>]` using the Cloud API or WhatsApp Web, then revoke the unused WATI API token
+cli-config-retired-reason-twitter = a top-level `[twitter]` section is not read; configure the Twitter channel as `[channels.twitter.<alias>]`
+cli-config-retired-reason-reddit = a top-level `[reddit]` section is not read; configure the Reddit channel as `[channels.reddit.<alias>]`
+cli-config-retired-reason-notion = a `[channels.notion]` table is not read; Notion is configured in the top-level `[notion]` section, whose database poller is the `notion` channel
+cli-config-retired-reason-pairing-code-length = the dashboard no longer has its own pairing-code length; `[gateway.pairing_code]` `length` sets it for every pairing surface
+cli-config-retired-reason-swarms = swarms were removed in V3
+cli-config-retired-reason-global-fallback = the global fallback lists were removed in V3; set `fallback` on each `[providers.models.<type>.<alias>]` instead
+cli-config-retired-reason-tts-default = there is no global default TTS provider; set `tts_provider` on each `[agents.<alias>]` instead
+cli-config-retired-reason-global-transcription = there is no global default transcription provider; set `transcription_provider` on each `[agents.<alias>]` instead
+cli-config-retired-reason-identity = identity is set per agent; move it to `[agents.<alias>.identity]`
+cli-config-retired-reason-pairing-max-pending = the gateway keeps one pending pairing code at a time, and issuing a new code cancels the previous one
+cli-config-migration-inferred-v3 = warning: {$path} has no `schema_version`, but its sections are in the V3 format, so it was read as schema V3 and migrated from there. Run `zeroclaw config migrate` to write the current `schema_version` into the file.
+cli-config-env-override-retired = warning: ignored `{$variable}`, which sets a retired config key: {$reason}
+cli-config-migration-pending = warning: these changes apply to this run only. Run `zeroclaw config migrate` to write them to {$path}.
 cli-plugin-removed = Plugin '{$name}' removed.
 cli-plugin-removed-grant-kept = Its config entry '{$key}' is kept, with its egress grant ({$grants}): a package installed later as '{$name}' inherits it. Delete the [[plugins.entries]] row named '{$key}' to drop the grant.
 cli-plugin-removed-binding-kept = The channel binding plugin.{$alias} still names '{$name}'. It stays inert until a package of that name is installed again; remove the {$table} table to drop it.
@@ -1205,6 +1232,7 @@ model-switch-catalog-failed = Could not load catalog for configured provider pro
 model-switch-provider-not-allowed = Model switch to {$provider} is not allowed by the active effort-routing policy.
 model-switch-route-selector-not-allowed = Model ID cannot be a route selector; provide a provider-local model ID.
 cli-config-backed-up = Backed up to {$path}
+cli-config-kept-original = Kept the schema V{$version} original as {$path}, readable only by you. It is never replaced, and it still holds any secrets the migration removed; delete it once you no longer need to go back to an older ZeroClaw.
 cli-plugin-name-version = Plugin: {$name} v{$version}
 cli-plugin-description = Description: {$desc}
 cli-plugin-capabilities = Capabilities: {$v}
@@ -1264,6 +1292,12 @@ cli-update-prebuilt-channel-note = Pre-built updates use the lean standard distr
 cli-update-available = Update available: v{$current} -> v{$latest}
 cli-update-forcing-reinstall = Forcing reinstall: v{$current} -> v{$latest}
 cli-update-not-writable = install directory {$dir} is not writable ({$error}); re-run `zeroclaw update` with elevated privileges (sudo on macOS/Linux, an Administrator console on Windows)
+# A CLI-only build (no gateway) answers `zeroclaw update` with this unless --standard is given.
+cli-update-cli-only-needs-standard =
+    This is a CLI-only build, and releases publish only the standard build. The standard build adds the dashboard and web gateway, which start with the daemon, by default on {$address} with pairing required.
+    To switch to the standard build, run: zeroclaw update --standard
+    To stay CLI-only, re-run the installer: install.sh --cli-only
+cli-update-switching-to-standard = Switching this CLI-only build to the standard build, which adds the dashboard and web gateway.
 
 # ── self-test (zeroclaw self-test) ──
 cli-selftest-all-passed = All {$total} checks passed.
@@ -1537,6 +1571,8 @@ cli-daemon-started-stop = Ctrl+C or SIGTERM to stop
 cli-relay-rotation-requested = Requested a relay node-id rotation. A running daemon will rotate within ~{$secs}s; the new id reaches clients in-band on their next certificate renewal.
 cli-relay-claim-ok = Daemon claimed as node-id {$node_id} on relay {$relay}. Wrote [relay] to your config; start (or restart) the daemon to register against the relay.
 cli-relay-claim-wss-disabled = Note: [wss] is disabled, and the relay refuses registration until it is enabled. The claim above is saved and stays valid - enable the WSS listener (see the secure-transport guide) and the binding takes effect on the next start.
+cli-relay-dashboard-no-gateway = [relay.dashboard] is enabled, but this build has no gateway to serve the dashboard. Use a build with the `gateway` feature, or disable [relay.dashboard].
+cli-relay-dashboard-bad-origin = [relay.dashboard] domain and port must form the dashboard's HTTPS origin
 cli-mtls-issued-client-cert = Issued client certificate for '{$name}':
 cli-mtls-issued-cert-path = {"  "}cert: {$path}
 cli-mtls-issued-key-path = {"  "}key:  {$path}
@@ -1560,6 +1596,10 @@ cli-enroll-confirm-sas-line-2 = matches on both ends before trusting the daemon:
 cli-enroll-pairing-code = {"    "}pairing code : {$code}
 cli-enroll-sas = {"    "}SAS          : {$sas}
 cli-tunnel-tcp-service-published = {"  "}🔒 Tunnel {$service} (TLS passthrough): {$endpoint}
+
+# ── Supplied capabilities (CLI session channel, delegate tool preparation) ──
+cli-agent-error-channel-unavailable = This agent has no channel for the CLI session.
+tool-delegate-error-target-tools-initialization = Tools could not be prepared safely for agent '{$agent_name}'.
 
 # ── Context window (doctor update-context-windows, agent interactive) ──
 cli-delegate-error-invalid-semantic-completion = Agent '{$agent_name}' failed: model provider returned an invalid semantic completion.
@@ -1613,6 +1653,7 @@ sop-approval-deferred-at-capacity = Approval could not resume run {$run_id}: exe
 sop-approval-policy-unavailable = Approval failed because the parked SOP step is unavailable: {$reason}. The run remains waiting.
 sop-rpc-decision-invalid-state = Run {$run_id} cannot be resolved in its current state.
 sop-rpc-decision-unauthorized = The RPC principal is not authorized to resolve this SOP step.
+sop-rpc-principal-ceiling-required = Procedure execution requires an administrator until headless steps preserve the caller's principal restrictions.
 sop-rpc-policy-missing = SOP approval policy '{$name}' is not configured.
 sop-rpc-policy-unavailable = The parked SOP policy is unavailable: {$reason}.
 
@@ -1693,18 +1734,30 @@ rpc-auth-alias-not-entitled = Principal is not entitled to the requested agent
 rpc-auth-misconfigured = Authentication is misconfigured on this daemon (fail closed)
 rpc-auth-local-roster-required = A local user roster is configured: connect from a mapped uid or present auth_token in initialize
 rpc-auth-remote-token-required = Remote connections must present auth_token in initialize
+rpc-auth-inproc-token-required = In-process connections must present auth_token in initialize
 rpc-auth-first-call-initialize = First call must be 'initialize'
 rpc-auth-revalidation-due = Credential revalidation due: re-initialize to revalidate
 rpc-auth-pairing-revoked = Pairing token revoked: re-pair and re-initialize
 
 cron-agent-job-failed = The scheduled task could not be completed. Please try again or ask an administrator to check the logs.
 
+# Principal-owned delegation
+delegate-owned-background-unavailable = Background delegation and task management are unavailable in principal-owned sessions until task results enforce principal ownership. Use synchronous delegation instead.
+
 # Atomic RPC configuration batches
 rpc-config-set-many-empty = config/set-many requires at least one entry in `sets`
 rpc-config-set-many-limit = config/set-many accepts at most { $limit } entries in `sets`; got { $count }
 rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop }`) rejected; nothing was saved: { $reason }
+rpc-cron-agent-principal-required = Agent cron jobs do not carry principal restrictions; only administrators may modify or trigger them.
+cron-rpc-requested-agent-forbidden = The principal is not entitled to the requested agent.
 
 skill-http-request-timeout = HTTP request timed out
+sop-store-busy = SOP storage is busy or unavailable; retry the request.
+sop-store-nonblocking-unavailable = SOP storage cannot provide immediate access; this request was refused.
+sop-rpc-definition-unavailable = The procedure definition is no longer available.
+cli-sop-run-unavailable = SOP run unavailable in this session.
+cli-sop-step-owner-principal-mismatch = SOP step refused: this run belongs to a different principal than the one this turn's capabilities act for.
+cli-sop-step-owner-memory-unavailable = SOP step failed: the memory of this run's owner is unavailable ({ $error }).
 
 # Result-aware Agent loop recovery
 turn-repeated-success-advisory = The same tool call returned the same successful result repeatedly. Reconsider whether another call will help. Polling may continue when needed.
