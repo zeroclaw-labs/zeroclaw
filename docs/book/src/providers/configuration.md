@@ -306,12 +306,13 @@ thinking_passthrough = true
   when wire-first streaming support lands.
 - **Thinking shape follows the model.** The injected object matches the
   native provider's style resolution: fixed-budget models get
-  `{"type": "enabled", "budget_tokens": N}`, adaptive-only models
-  (Opus 4.7, the whole Fable 5 family) get `{"type": "adaptive"}` with no
-  budget key. Gateway model IDs may carry routing prefixes
-  (`claude-group/...`); resolution matches on substrings, so prefixed IDs
-  resolve to the same shape as bare names. When the runtime requests a
-  display mode, the snake_case `display` key rides on both shapes
+  `{"type": "enabled", "budget_tokens": N}`, and every Claude model numbered
+  4.7 or later gets `{"type": "adaptive"}` with no budget key. The version
+  is read immediately after the family token, so gateway prefixes
+  (`claude-group/...`, `anthropic.`) and suffixes (`-fast`, `-v1:0`,
+  snapshot dates, `-latest`) resolve to the same shape as the bare name.
+  When the runtime requests a display mode, the snake_case `display` key
+  rides on both shapes
   (`omitted`, `updates`, `summarized`); with no display requested the key
   is omitted entirely.
 - **Escape hatch**: for shapes this feature does not cover, `provider_extra`

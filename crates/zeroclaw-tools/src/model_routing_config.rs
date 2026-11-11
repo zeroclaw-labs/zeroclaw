@@ -1024,10 +1024,18 @@ impl ModelRoutingConfigTool {
         // alias (such an entry is only usable through routes that carry their
         // own model), so there is nothing to validate and the probe stops
         // before dispatch instead of failing the update.
-        let Some(probe_model_name) = selection.model_id.filter(|value| !value.trim().is_empty())
+        let Some(probe_model_name) = selection
+            .model_id
+            .clone()
+            .filter(|value| !value.trim().is_empty())
         else {
             return Ok(ModelProbeOutcome::SkippedNoModel);
         };
+        // The temperature the served turns send for this alias: the configured
+        // one, or none, so the provider's own default applies. A fixed value
+        // here would fail the probe, and revert the change, for a model that
+        // rejects any temperature but serves the alias's turns fine.
+        let probe_temperature = selection.temperature();
 
         let selection_ref = provider_name.to_string();
         let model_provider = zeroclaw_providers::model::build_nonblocking(move || {
@@ -1039,14 +1047,12 @@ impl ModelRoutingConfigTool {
             error,
         })?;
 
-        // Greedy sampling: the ping is a liveness check, not a generation task.
-        const PING_TEMPERATURE: f64 = 0.0;
         ProviderDispatch::from_ref(&*model_provider)
             .chat_with_system(
                 Some("Respond with OK."),
                 "ping",
                 &probe_model_name,
-                Some(PING_TEMPERATURE),
+                probe_temperature,
             )
             .await
             .map_err(|error| ProbeFailure::Request {
@@ -3823,6 +3829,65 @@ mod tests {
     /// alias `model` override decides what the post-reload runtime serves.
     /// Probing the saved disk value instead would validate — or roll back
     /// over — a model that is never dispatched.
+    /// The probe sends the alias's configured temperature, or none when it is
+    /// unset, never a fixed value: a model that rejects any temperature must
+    /// pass the same liveness check its own turns would.
+    #[tokio::test]
+    async fn probe_model_sends_only_the_configured_temperature() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _env_guard = env_override_test_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let base = test_config(&tmp).await;
+        const ALIAS: &str = "probe_temperature_case";
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_probe", "type": "message", "role": "assistant",
+                "content": [{ "type": "text", "text": "OK" }],
+                "model": "claude-opus-5-5", "stop_reason": "end_turn",
+                "usage": { "input_tokens": 1, "output_tokens": 1 }
+            })))
+            .mount(&server)
+            .await;
+
+        let tool = ModelRoutingConfigTool::new(Arc::clone(&base), test_security());
+        for configured in [None, Some(0.4)] {
+            let mut saved = (*base).clone();
+            {
+                let entry = saved.providers.models.ensure("anthropic", ALIAS).unwrap();
+                entry.api_key = Some("sk-ant-fixture".to_string());
+                entry.model = Some("claude-opus-5-5".to_string());
+                entry.uri = Some(server.uri());
+                entry.temperature = configured;
+            }
+            let probe = tool
+                .probe_model(&saved, &format!("anthropic.{ALIAS}"))
+                .await;
+            assert!(probe.is_ok(), "the mock accepts the probe: {probe:?}");
+
+            let requests = server
+                .received_requests()
+                .await
+                .expect("the mock server records requests");
+            let body: serde_json::Value = requests
+                .last()
+                .expect("the probe dispatched a request")
+                .body_json()
+                .expect("the probe sends a JSON request");
+            assert_eq!(body["model"], "claude-opus-5-5");
+            assert_eq!(
+                body.get("temperature").cloned(),
+                configured.map(|t| serde_json::json!(t)),
+                "the probe must send the configured temperature ({configured:?}), and none \
+                 when unset: {body}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn probe_model_dispatches_the_env_effective_alias_model_not_the_saved_one() {
         use wiremock::matchers::method;
