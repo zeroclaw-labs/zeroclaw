@@ -111,6 +111,7 @@ mod tests {
             interrupt_on_new_message: false,
             mention_only: false,
             unauthorized_message: None,
+            owner_chat_id: None,
             per_user_session: true,
             passive_group_context: false,
             ack_reactions: None,

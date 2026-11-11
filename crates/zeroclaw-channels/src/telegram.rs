@@ -5129,9 +5129,55 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 &bind_command,
                 &self.alias,
             );
-            let _ = self
-                .send_unauthorized_notice(&owner_notice, &owner_chat)
-                .await;
+            let delivery = Self::deliver_owner_notice(
+                self.http_client(),
+                self.api_url("sendMessage"),
+                self.alias.clone(),
+                owner_notice,
+                owner_chat,
+            );
+            #[cfg(test)]
+            {
+                // Tests drive the handler directly and assert against the
+                // mock server; completing inline keeps that deterministic.
+                delivery.await;
+            }
+            #[cfg(not(test))]
+            tokio::spawn(delivery);
+        }
+    }
+
+    /// Deliver the owner heads-up off the serial inbound loop.
+    ///
+    /// Telegram answers a flood-limit `sendMessage` with a `retry_after` of
+    /// up to [`TELEGRAM_MAX_INLINE_RETRY_AFTER`] per retry, and honoring that
+    /// inline would freeze every later update — including authorized messages
+    /// from unrelated chats. The future owns its state (client, URL, copies)
+    /// so the caller can hand it to a bounded background task; the flood-limit
+    /// waits then happen off the inbound loop. Delivery failure is logged as
+    /// a failure event — never silently dropped — and never re-fires the
+    /// public stub, which already reached the sender.
+    async fn deliver_owner_notice(
+        http: reqwest::Client,
+        send_url: String,
+        alias: String,
+        notice: String,
+        owner_chat: String,
+    ) {
+        if let Err(err) =
+            Self::post_text_chunks(&http, &send_url, &notice, &owner_chat, None, 0).await
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "alias": alias,
+                        "owner_chat": owner_chat,
+                        "error": err.to_string(),
+                    })),
+                "Telegram owner notice delivery failed; owner was not notified"
+            );
         }
     }
 
@@ -6439,6 +6485,32 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         thread_id: Option<&str>,
         skip_chunks: usize,
     ) -> Result<usize, SendChunksError> {
+        Self::post_text_chunks(
+            &self.http_client(),
+            &self.api_url("sendMessage"),
+            message,
+            chat_id,
+            thread_id,
+            skip_chunks,
+        )
+        .await
+    }
+
+    /// Chunked `sendMessage` posting against an explicit client and URL.
+    ///
+    /// Extracted from [`Self::send_text_chunks`] so a caller that cannot
+    /// borrow the channel across an `await` — the background owner-notice
+    /// delivery — can own its state and still reuse the exact chunking,
+    /// formatting, and flood-limit honoring of every other text send.
+    #[allow(clippy::too_many_arguments)]
+    async fn post_text_chunks(
+        http: &reqwest::Client,
+        send_url: &str,
+        message: &str,
+        chat_id: &str,
+        thread_id: Option<&str>,
+        skip_chunks: usize,
+    ) -> Result<usize, SendChunksError> {
         let chunks = split_message_for_telegram(message);
 
         for (index, chunk) in chunks.iter().enumerate() {
@@ -6459,31 +6531,31 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 markdown_body["message_thread_id"] = serde_json::Value::String(tid.to_string());
             }
 
-            let (markdown_status, markdown_err) = match self
-                .send_message_honoring_rate_limit(&markdown_body)
-                .await
-                .map_err(|e| SendChunksError {
-                    delivered: index,
-                    rate_limited: false,
-                    source: e.into(),
-                })? {
-                SendMessageAttempt::Sent => {
-                    if index < chunks.len() - 1 {
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
-                    continue;
-                }
-                SendMessageAttempt::RateLimited { status, body } => {
-                    return Err(SendChunksError {
+            let (markdown_status, markdown_err) =
+                match Self::post_message_honoring_rate_limit(http, send_url, &markdown_body)
+                    .await
+                    .map_err(|e| SendChunksError {
                         delivered: index,
-                        rate_limited: true,
-                        source: anyhow::Error::msg(format!(
-                            "Telegram sendMessage rate limited ({status}): {body}"
-                        )),
-                    });
-                }
-                SendMessageAttempt::Failed { status, body } => (status, body),
-            };
+                        rate_limited: false,
+                        source: e.into(),
+                    })? {
+                    SendMessageAttempt::Sent => {
+                        if index < chunks.len() - 1 {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        continue;
+                    }
+                    SendMessageAttempt::RateLimited { status, body } => {
+                        return Err(SendChunksError {
+                            delivered: index,
+                            rate_limited: true,
+                            source: anyhow::Error::msg(format!(
+                                "Telegram sendMessage rate limited ({status}): {body}"
+                            )),
+                        });
+                    }
+                    SendMessageAttempt::Failed { status, body } => (status, body),
+                };
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -6501,8 +6573,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             if let Some(tid) = thread_id {
                 plain_body["message_thread_id"] = serde_json::Value::String(tid.to_string());
             }
-            match self
-                .send_message_honoring_rate_limit(&plain_body)
+            match Self::post_message_honoring_rate_limit(http, send_url, &plain_body)
                 .await
                 .map_err(|e| SendChunksError {
                     delivered: index,
@@ -6548,18 +6619,14 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// `retry_after` (up to [`TELEGRAM_MAX_INLINE_RETRY_AFTER`]) and resends the
     /// same body, at most [`TELEGRAM_RATE_LIMIT_RETRIES`] times, so a flood
     /// limit is never answered with immediate extra requests.
-    async fn send_message_honoring_rate_limit(
-        &self,
+    async fn post_message_honoring_rate_limit(
+        http: &reqwest::Client,
+        send_url: &str,
         body: &serde_json::Value,
     ) -> Result<SendMessageAttempt, reqwest::Error> {
         let mut retries = 0;
         loop {
-            let resp = self
-                .http_client()
-                .post(self.api_url("sendMessage"))
-                .json(body)
-                .send()
-                .await?;
+            let resp = http.post(send_url).json(body).send().await?;
             let status = resp.status();
             if status.is_success() {
                 return Ok(SendMessageAttempt::Sent);
