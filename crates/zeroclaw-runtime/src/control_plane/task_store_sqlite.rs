@@ -63,6 +63,17 @@ impl SqliteTaskStore {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn insert_legacy_terminal_settlement_intent_for_test(
+        &self,
+        intent: &TerminalSettlementIntent,
+    ) -> Result<bool> {
+        // Bypass the current Goal writer guard only to model a valid row left by
+        // an older writer. Keep the ordinary intent validation in place.
+        let mut conn = self.conn.lock();
+        persist_settlement_intent_record(&mut conn, intent)
+    }
+
     fn init(conn: Connection) -> Result<Self> {
         // In WAL mode, FULL adds a WAL sync after each commit; fullfsync
         // requests F_FULLFSYNC where the SQLite VFS supports it.
