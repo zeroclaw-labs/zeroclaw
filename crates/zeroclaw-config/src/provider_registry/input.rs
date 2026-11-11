@@ -236,7 +236,8 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use registry::*;
+    use super::*;
+    use serde_json::json;
 
     fn fixture() -> Config {
         let mut config = Config {

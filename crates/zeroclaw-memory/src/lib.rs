@@ -1466,14 +1466,31 @@ mod tests {
     #[test]
     fn factory_with_embedder_stamps_and_migrates_identity() {
         let tmp = TempDir::new().unwrap();
-        let mut cfg = MemoryConfig {
-            backend: "sqlite".into(),
-            embedding_provider: "openai".into(),
-            embedding_model: "model-a".into(),
-            embedding_dimensions: 4,
-            ..MemoryConfig::default()
+        let config_for = |model: &str| {
+            let mut config = Config::default();
+            config.memory.backend = "sqlite".into();
+            config.memory.embedding_model_ref = Some("embedding.openai".into());
+            config.memory.embedding_dimensions = 4;
+            config.providers.connections.insert(
+                "openai".into(),
+                serde_json::from_value(serde_json::json!({
+                    "kind": "openai",
+                    "auth": {"mode": "api_key", "api_key": "test-key"}
+                }))
+                .unwrap(),
+            );
+            config.providers.models.insert_canonical_model(
+                "embedding.openai".into(),
+                serde_json::from_value(serde_json::json!({
+                    "capability": "embedding",
+                    "provider": "openai",
+                    "model": model
+                }))
+                .unwrap(),
+            );
+            config
         };
-        drop(create_memory(&cfg, tmp.path(), Some("test-key")).unwrap());
+        drop(create_memory_from_config(&config_for("model-a"), None).unwrap());
         {
             let mem = SqliteMemory::new("test", tmp.path()).unwrap();
             let identity = mem.stored_embedding_identity().unwrap().unwrap();
@@ -1483,11 +1500,10 @@ mod tests {
         }
 
         // Same config again → identity unchanged (Match path, no churn).
-        drop(create_memory(&cfg, tmp.path(), Some("test-key")).unwrap());
+        drop(create_memory_from_config(&config_for("model-a"), None).unwrap());
 
         // Model change → factory reconciles to the new identity.
-        cfg.embedding_model = "model-b".into();
-        drop(create_memory(&cfg, tmp.path(), Some("test-key")).unwrap());
+        drop(create_memory_from_config(&config_for("model-b"), None).unwrap());
         let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         let identity = mem.stored_embedding_identity().unwrap().unwrap();
         assert!(identity.provider.starts_with("openai:"));

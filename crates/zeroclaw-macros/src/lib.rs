@@ -3261,6 +3261,58 @@ fn extract_hashmap_value_type(ty: &syn::Type) -> Option<&syn::Type> {
     extract_type_arg("HashMap", 1, ty)
 }
 
+/// Deserialize a configuration through a transient input DTO, then normalize
+/// it before exposing the authoritative value. Both DTO and value use the
+/// original field definitions, so schema fields cannot drift between them.
+#[proc_macro_attribute]
+pub fn normalize_config_input(args: TokenStream, item: TokenStream) -> TokenStream {
+    let normalize = parse_macro_input!(args as syn::Path);
+    let schema = parse_macro_input!(item as syn::ItemStruct);
+    let Fields::Named(fields) = &schema.fields else {
+        return syn::Error::new_spanned(&schema, "configuration requires named fields")
+            .to_compile_error()
+            .into();
+    };
+    let name = &schema.ident;
+    let input_name = quote::format_ident!("{}Input", name);
+    let input_fields = fields.named.iter().map(|field| {
+        let mut field = field.clone();
+        field
+            .attrs
+            .retain(|attr| attr.path().is_ident("serde") || attr.path().is_ident("cfg"));
+        field
+    });
+    let input_attrs = schema
+        .attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("serde"));
+    let assignments = fields.named.iter().map(|field| {
+        let name = &field.ident;
+        let conditions = field
+            .attrs
+            .iter()
+            .filter(|attr| attr.path().is_ident("cfg"));
+        quote! { #(#conditions)* #name: input.#name }
+    });
+    quote! {
+        #schema
+        #[derive(::serde::Deserialize)]
+        #(#input_attrs)*
+        struct #input_name { #(#input_fields,)* }
+        impl<'de> ::serde::Deserialize<'de> for #name {
+            fn deserialize<D: ::serde::Deserializer<'de>>(
+                deserializer: D,
+            ) -> ::core::result::Result<Self, D::Error> {
+                let input = <#input_name as ::serde::Deserialize>::deserialize(deserializer)?;
+                let mut config = Self { #(#assignments,)* };
+                #normalize(&mut config).map_err(::serde::de::Error::custom)?;
+                Ok(config)
+            }
+        }
+    }
+    .into()
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -3469,56 +3521,4 @@ mod tests {
             "expected a plain field read for the active field, got: {tokens}"
         );
     }
-}
-
-/// Deserialize a configuration through a transient input DTO, then normalize
-/// it before exposing the authoritative value. Both DTO and value use the
-/// original field definitions, so schema fields cannot drift between them.
-#[proc_macro_attribute]
-pub fn normalize_config_input(args: TokenStream, item: TokenStream) -> TokenStream {
-    let normalize = parse_macro_input!(args as syn::Path);
-    let schema = parse_macro_input!(item as syn::ItemStruct);
-    let Fields::Named(fields) = &schema.fields else {
-        return syn::Error::new_spanned(&schema, "configuration requires named fields")
-            .to_compile_error()
-            .into();
-    };
-    let name = &schema.ident;
-    let input_name = quote::format_ident!("{}Input", name);
-    let input_fields = fields.named.iter().map(|field| {
-        let mut field = field.clone();
-        field
-            .attrs
-            .retain(|attr| attr.path().is_ident("serde") || attr.path().is_ident("cfg"));
-        field
-    });
-    let input_attrs = schema
-        .attrs
-        .iter()
-        .filter(|attr| attr.path().is_ident("serde"));
-    let assignments = fields.named.iter().map(|field| {
-        let name = &field.ident;
-        let conditions = field
-            .attrs
-            .iter()
-            .filter(|attr| attr.path().is_ident("cfg"));
-        quote! { #(#conditions)* #name: input.#name }
-    });
-    quote! {
-        #schema
-        #[derive(::serde::Deserialize)]
-        #(#input_attrs)*
-        struct #input_name { #(#input_fields,)* }
-        impl<'de> ::serde::Deserialize<'de> for #name {
-            fn deserialize<D: ::serde::Deserializer<'de>>(
-                deserializer: D,
-            ) -> ::core::result::Result<Self, D::Error> {
-                let input = <#input_name as ::serde::Deserialize>::deserialize(deserializer)?;
-                let mut config = Self { #(#assignments,)* };
-                #normalize(&mut config).map_err(::serde::de::Error::custom)?;
-                Ok(config)
-            }
-        }
-    }
-    .into()
 }
