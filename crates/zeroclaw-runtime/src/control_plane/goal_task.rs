@@ -342,6 +342,12 @@ pub trait GoalTaskRegistry: Send + Sync {
 
     /// Atomically create a session-bound Goal or replace its fully settled
     /// terminal predecessor. New Goals always begin at execution epoch one.
+    ///
+    /// The caller must supply a globally unique task ID that has never been
+    /// used before, including when replacing a terminal predecessor. This
+    /// registry rejects IDs still present in storage, but cannot detect reuse
+    /// after a task row has been disposed. Goal producers should use a fresh
+    /// UUID for each new Goal.
     async fn create_or_replace_session_goal(
         &self,
         task: TaskRecord,
