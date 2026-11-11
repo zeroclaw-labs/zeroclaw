@@ -1531,6 +1531,13 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         if route.hint.trim().is_empty() {
             items.push(DiagItem::warn(cat, "embedding route with empty hint"));
         }
+        if config.provider_registry().is_ok_and(|registry| {
+            registry
+                .resolve_embedding(&route.model_provider.trim().into())
+                .is_ok()
+        }) {
+            continue;
+        }
         if let Some(reason) = embedding_provider_validation_error(&route.model_provider) {
             items.push(DiagItem::warn(
                 cat,

@@ -23002,9 +23002,7 @@ model_provider = "custom.primary"
 
     #[tokio::test]
     async fn try_apply_model_switch_noop_when_identical_to_current() {
-        // A switch to the model that is already running — however the ref
-        // spells it: the two-segment ref and the three-segment ref naming the
-        // selected entry are the same model — must not rebuild.
+        // Switching to the same exact model reference must not rebuild.
         use zeroclaw_config::schema::{
             ModelEntryConfig, ModelProviderConfig, OpenAIModelProviderConfig,
         };
@@ -23026,10 +23024,13 @@ model_provider = "custom.primary"
                 },
             },
         );
-        let identity = config
-            .resolve_model_selection("openai.default")
-            .unwrap()
-            .identity(None);
+        let identity = zeroclaw_providers::model::resolve_model_identity(
+            &config,
+            "test",
+            "openai.default",
+            None,
+        )
+        .unwrap();
 
         let mut agent = build_test_agent(
             "openai.default",
@@ -23044,14 +23045,14 @@ model_provider = "custom.primary"
         let result = agent
             .try_apply_model_switch(
                 "gpt-4o-mini",
-                "openai.default.default".to_string(),
+                "openai.default".to_string(),
                 "gpt-4o-mini".to_string(),
             )
             .await;
         assert_eq!(
             result.unwrap(),
             ModelSwitchOutcome::Unchanged,
-            "a switch to the already-running model (2-seg vs 3-seg spelling) is a no-op"
+            "a switch to the already-running exact model reference is a no-op"
         );
     }
 
@@ -23121,8 +23122,8 @@ model_provider = "custom.primary"
             "switching between entries of one profile is a real switch"
         );
         assert_eq!(
-            agent.model_provider_name, "openai.gw",
-            "the committed name is the normalised two-segment billing key"
+            agent.model_provider_name, "openai.gw.cheap",
+            "the committed name is the selected exact model reference"
         );
         assert_eq!(
             agent.effective_temperature(),
@@ -23714,10 +23715,13 @@ model_provider = "custom.primary"
                 .ensure("openai", "reasoning")
                 .unwrap()
                 .model = Some("reasoning-model".into());
-            let identity = config
-                .resolve_model_selection("openai.primary")
-                .unwrap()
-                .identity(None);
+            let identity = zeroclaw_providers::model::resolve_model_identity(
+                &config,
+                "test",
+                "openai.primary",
+                None,
+            )
+            .unwrap();
             let calls = Arc::new(Mutex::new(0));
             let models = Arc::new(Mutex::new(Vec::new()));
             let resolver = Arc::new(zeroclaw_providers::router::ModelRouteResolver::new(
@@ -23744,7 +23748,7 @@ model_provider = "custom.primary"
                 .tool_dispatcher(Box::new(NativeToolDispatcher))
                 .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
                     vec![Box::new(ModelSwitchTriggerTool {
-                        target_provider: "openai.primary.default".into(),
+                        target_provider: "openai.primary".into(),
                         target_model: "primary-model".into(),
                     })],
                 ))

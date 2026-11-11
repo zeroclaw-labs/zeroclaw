@@ -1519,7 +1519,7 @@ fn validate_provider_credential(
             api_key.and_then(|key| check_api_key_prefix(provider_kind, key))
     {
         anyhow::bail!(
-            "API key prefix mismatch: credential looks like a {likely_provider} key, but model_provider {provider_kind:?} is selected"
+            "API key prefix mismatch: [REDACTED] credential looks like a {likely_provider} key, but model_provider {provider_kind:?} is selected"
         );
     }
     Ok(())
@@ -2039,10 +2039,7 @@ pub fn create_model_provider_from_ref_with_model(
 pub fn provider_runtime_options_for_bare_family(
     config: &zeroclaw_config::schema::Config,
 ) -> ModelProviderRuntimeOptions {
-    ModelProviderRuntimeOptions {
-        multimodal: config.multimodal.clone(),
-        ..ModelProviderRuntimeOptions::default()
-    }
+    model_provider_runtime_options_from_model_provider_entry(config, None)
 }
 
 fn create_resilient_model_provider_from_ref_with_model_override(
@@ -5392,6 +5389,32 @@ mod tests {
             "unknown agent must not silently inherit any configured provider; got `{:?}`",
             opts.provider_api_url
         );
+    }
+
+    #[test]
+    fn provider_agnostic_options_keep_shared_defaults_without_model_policy() {
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: std::path::PathBuf::from("/configured/config.toml"),
+            ..Default::default()
+        };
+        config.runtime.reasoning_enabled = Some(true);
+        config.runtime.reasoning_effort = Some("high".into());
+        config.secrets.encrypt = true;
+        let entry = config.providers.models.ensure("custom", "primary").unwrap();
+        entry.uri = Some("https://primary.example.test/v1".into());
+        entry.max_tokens = Some(42);
+        entry.vision = Some(false);
+        let options = provider_runtime_options_for_bare_family(&config);
+        assert_eq!(options.reasoning_enabled, Some(true));
+        assert_eq!(options.reasoning_effort.as_deref(), Some("high"));
+        assert!(options.secrets_encrypt);
+        assert_eq!(
+            options.zeroclaw_dir,
+            Some(std::path::PathBuf::from("/configured"))
+        );
+        assert!(options.provider_api_url.is_none());
+        assert!(options.provider_max_tokens.is_none());
+        assert!(options.vision.is_none());
     }
 
     #[test]

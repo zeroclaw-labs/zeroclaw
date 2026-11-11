@@ -16289,14 +16289,12 @@ pub struct ModelCacheEntry {
 
 // ── Embedding routing ───────────────────────────────────────────
 
-/// Route an embedding hint to a specific model_provider + model.
+/// Route an embedding hint to an exact embedding model reference.
 ///
 /// ```toml
 /// [[embedding_routes]]
 /// hint = "semantic"
-/// model_provider = "openai.embeddings"
-/// model = "text-embedding-3-small"
-/// dimensions = 1536
+/// model_provider = "embedding.semantic"
 ///
 /// [memory]
 /// embedding_model = "hint:semantic"
@@ -16311,18 +16309,18 @@ pub struct EmbeddingRouteConfig {
     /// are rejected by `Config::validate()`.
     #[serde(default)]
     pub hint: String,
-    /// Two-segment embedding-capable provider profile ref (`<type>.<alias>`).
-    /// Select the provider-local embedding model with the separate `model` field.
+    /// Exact embedding model reference. The compatibility reader also accepts
+    /// a legacy provider profile with separate `model` and `dimensions` fields.
     /// `#[serde(default)]` is required for `Default` + `create_map_key` construction.
     /// Empty strings are rejected by `Config::validate()`.
     #[serde(default)]
     pub model_provider: String,
-    /// Provider-local embedding model identifier to use with that provider profile
+    /// Legacy provider-local model identifier. Ignored for exact model references.
     /// `#[serde(default)]` is required for `Default` + `create_map_key` construction.
-    /// Empty strings are rejected by `Config::validate()`.
+    /// Required only for legacy provider profile references.
     #[serde(default)]
     pub model: String,
-    /// Optional embedding dimension override for this route
+    /// Legacy dimension override. Exact model references use their metadata.
     #[serde(default)]
     pub dimensions: Option<usize>,
     /// Optional API key override for this route's model_provider
@@ -24916,7 +24914,14 @@ impl Config {
             return fallback();
         };
 
-        if Self::embedding_route_has_effective_embedder(route, self.memory.embedding_dimensions) {
+        if self.provider_registry().is_ok_and(|registry| {
+            registry
+                .resolve_embedding(&route.model_provider.trim().into())
+                .is_ok()
+        }) || Self::embedding_route_has_effective_embedder(
+            route,
+            self.memory.embedding_dimensions,
+        ) {
             return true;
         }
         fallback()
@@ -26024,6 +26029,14 @@ impl Config {
                     format!("embedding_routes[{i}].model_provider"),
                     "embedding_routes[{i}].model_provider must not be empty"
                 );
+            }
+            // New routes select an exact embedding model. Legacy profile +
+            // model fields below are read only at the compatibility boundary.
+            if self
+                .provider_registry()
+                .is_ok_and(|registry| registry.resolve_embedding(&mp.into()).is_ok())
+            {
+                continue;
             }
             // Embedding routes resolve a provider profile here and carry their
             // provider-local model id in `route.model`. The embedding runtime
@@ -56108,20 +56121,24 @@ model = "llama-3.3-70b"
 "#;
         let config: Config = toml::from_str(raw).unwrap();
 
-        // Nested profile: one entry per alias (sorted), each with its
-        // resolved id; the profile's legacy `model` is only a fallback.
-        // Legacy profile: one entry with the profile-level model.
+        // The compatibility boundary projects exact model keys, sorted by
+        // reference, including the profile's selected/default model.
         let all = config.configured_model_entries(None);
         let refs: Vec<&str> = all.iter().map(|e| e.provider_ref.as_str()).collect();
         assert_eq!(
             refs,
-            vec!["openai.gw.big", "openai.gw.cheap", "groq.legacy"]
+            vec![
+                "groq.legacy",
+                "openai.gw",
+                "openai.gw.big",
+                "openai.gw.cheap"
+            ]
         );
-        let cheap = &all[1];
-        assert_eq!(cheap.profile_ref, "openai.gw");
-        assert_eq!(cheap.model_alias.as_deref(), Some("cheap"));
+        let cheap = &all[3];
+        assert_eq!(cheap.profile_ref, "legacy.openai.gw");
+        assert_eq!(cheap.model_alias, None);
         assert_eq!(cheap.model_id.as_deref(), Some("gpt-4o-mini"));
-        let legacy = &all[2];
+        let legacy = &all[0];
         assert_eq!(legacy.model_alias, None);
         assert_eq!(legacy.model_id.as_deref(), Some("llama-3.3-70b"));
 
@@ -56146,7 +56163,13 @@ temperature = 0.3
         // The filter narrows by full ref or bare family, matching the doctor
         // commands.
         let config: Config = toml::from_str(raw).unwrap();
-        assert_eq!(config.configured_model_entries(Some("openai.gw")).len(), 2);
+        assert_eq!(config.configured_model_entries(Some("openai.gw")).len(), 1);
+        assert_eq!(
+            config
+                .configured_model_entries(Some("legacy.openai.gw"))
+                .len(),
+            3
+        );
         let selected = config.configured_model_entries(Some("openai.gw.cheap"));
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].provider_ref, "openai.gw.cheap");

@@ -2884,8 +2884,14 @@ fn resolve_models_command(
     raw: &str,
 ) -> ModelsCommandResolution {
     let candidate = raw.trim();
-    if config.is_configured_model_ref(candidate) && config.resolve_model_id(candidate).is_some() {
+    if config
+        .provider_registry()
+        .is_ok_and(|registry| registry.resolve_chat(&candidate.into()).is_ok())
+    {
         return ModelsCommandResolution::Resolved(candidate.to_owned());
+    }
+    if candidate.contains('.') {
+        return ModelsCommandResolution::NoAlias(candidate.to_owned());
     }
     let Some(family) = canonical_model_provider_name(candidate) else {
         return ModelsCommandResolution::Unknown;
@@ -2917,11 +2923,7 @@ fn resolve_provider_ref_for_runtime_switch(config: &Config, raw: &str) -> anyhow
     match resolve_models_command(config, raw) {
         ModelsCommandResolution::Resolved(provider_ref) => Ok(provider_ref),
         ModelsCommandResolution::Ambiguous { family, aliases } => {
-            let list = aliases
-                .iter()
-                .map(|alias| format!("{family}.{alias}"))
-                .collect::<Vec<_>>()
-                .join(", ");
+            let list = aliases.join(", ");
             anyhow::bail!(
                 "model_provider `{family}` has multiple configured aliases; use one of: {list}"
             )
@@ -43495,7 +43497,8 @@ BTC is currently around $65,000 based on latest tool output."#
                     .providers
                     .models
                     .ensure("openrouter", "default")
-                    .unwrap();
+                    .unwrap()
+                    .model = Some("switched-model".into());
                 let config = Arc::new(config);
                 ctx.prompt_config = Arc::clone(&config);
                 ctx.tools_registry = Arc::new(
@@ -46770,7 +46773,10 @@ BTC is currently around $65,000 based on latest tool output."#
                 assert_eq!(family, "openrouter");
                 assert_eq!(
                     aliases,
-                    vec!["default".to_string(), "secondary".to_string()]
+                    vec![
+                        "openrouter.default".to_string(),
+                        "openrouter.secondary".to_string()
+                    ]
                 );
             }
             other => panic!("expected Ambiguous, got {other:?}"),

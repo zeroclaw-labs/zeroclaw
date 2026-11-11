@@ -2292,12 +2292,22 @@ pub(crate) fn dispatch_model_ref_with_registry(
     options: &ModelProviderRuntimeOptions,
     api_key_override: Option<&str>,
 ) -> Result<Box<dyn ModelProvider>> {
-    use zeroclaw_config::provider_registry::{ModelDefinition, ProviderConnection};
-
     let resolved = registry
         .resolve_chat(model_ref)
         .map_err(|error| anyhow::Error::msg(error.to_string()))?;
     let runtime = runtime_options_for_chat(&resolved, options);
+    let vision = runtime.vision;
+    let provider = dispatch_resolved_chat(resolved, model_ref, runtime, api_key_override)?;
+    Ok(crate::apply_factory_leaf_metadata(provider, vision))
+}
+
+fn dispatch_resolved_chat(
+    resolved: zeroclaw_config::provider_registry::ResolvedChat<'_>,
+    model_ref: &zeroclaw_config::provider_registry::ModelRef,
+    runtime: ModelProviderRuntimeOptions,
+    api_key_override: Option<&str>,
+) -> Result<Box<dyn ModelProvider>> {
+    use zeroclaw_config::provider_registry::{ModelDefinition, ProviderConnection};
 
     let api_key = api_key_override.or_else(|| resolved.selection.connection.api_key());
     let provider_kind = resolved.selection.connection.kind();

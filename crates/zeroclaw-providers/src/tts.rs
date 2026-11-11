@@ -1979,9 +1979,9 @@ mod tests {
 
     #[test]
     fn projected_legacy_voice_does_not_override_a_canonical_selection() {
-        let mut config = Config::default();
-        config.providers = toml::from_str(
-            r#"
+        let mut config = Config {
+            providers: toml::from_str(
+                r#"
 [connections.gateway]
 kind = "openai"
 auth = { mode = "api_key", api_key = "test-key" }
@@ -1993,8 +1993,10 @@ model = "tts-1"
 api_key = "legacy-test-key"
 voice = "legacy-voice"
 "#,
-        )
-        .unwrap();
+            )
+            .unwrap(),
+            ..Config::default()
+        };
         let manager = TtsManager::from_config(&config).unwrap();
         assert!(manager.tts_providers.contains_key("openai.voice"));
         assert!(!manager.voice_by_alias.contains_key("openai.voice"));

@@ -3038,7 +3038,7 @@
             "description": "Masked document originally read by the editor. Compared under the\nexisting config commit lock so a stale editor cannot overwrite changes."
           },
           "registry": {
-            "description": "Complete canonical registry candidate. Legacy provider maps are retained."
+            "description": "Complete canonical registry candidate, including projected legacy entries."
           }
         },
         "required": [

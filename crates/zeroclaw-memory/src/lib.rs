@@ -437,23 +437,48 @@ fn resolve_canonical_embedding_config(
     config: &Config,
     inherited_api_key: Option<&str>,
 ) -> anyhow::Result<Option<Arc<dyn zeroclaw_api::embedding::EmbeddingProvider>>> {
+    let registry = config.provider_registry()?;
+    let routed = config
+        .memory
+        .embedding_model
+        .strip_prefix("hint:")
+        .and_then(|hint| {
+            config
+                .embedding_routes
+                .iter()
+                .find(|route| route.hint.trim() == hint.trim())
+        });
     let Some(model_ref) = config
         .memory
         .embedding_model_ref
         .as_deref()
         .map(str::trim)
         .filter(|reference| !reference.is_empty())
+        .or_else(|| {
+            routed
+                .map(|route| route.model_provider.trim())
+                .filter(|reference| registry.resolve_embedding(&(*reference).into()).is_ok())
+        })
     else {
         return Ok(None);
     };
-    let registry = config.provider_registry()?;
     let model_ref = zeroclaw_config::provider_registry::ModelRef::from(model_ref);
     let resolved = registry.resolve_embedding(&model_ref)?;
-    let api_key = config
-        .memory
-        .embedding_api_key
-        .as_deref()
+    let api_key = routed
+        .filter(|_| {
+            config
+                .memory
+                .embedding_model_ref
+                .as_deref()
+                .is_none_or(|reference| reference.trim().is_empty())
+        })
+        .and_then(|route| route.api_key.as_deref())
         .filter(|key| !key.trim().is_empty())
+        .or(config
+            .memory
+            .embedding_api_key
+            .as_deref()
+            .filter(|key| !key.trim().is_empty()))
         .or_else(|| resolved.selection.connection.api_key())
         .or(inherited_api_key)
         .map(ToOwned::to_owned);
@@ -1305,6 +1330,49 @@ mod tests {
     use tempfile::TempDir;
     use zeroclaw_config::schema::Config;
     use zeroclaw_config::schema::EmbeddingRouteConfig;
+
+    #[test]
+    fn registry_save_keeps_the_selected_embedding_route_dispatchable() {
+        use zeroclaw_config::provider_registry::editor::{RegistryEdit, snapshot, stage};
+        let mut config = Config::default();
+        config
+            .providers
+            .models
+            .ensure("openai", "gateway.prod")
+            .unwrap()
+            .uri = Some("https://embeddings.example.test/v1".into());
+        config.memory.embedding_provider = "none".into();
+        config.memory.embedding_model = "hint:semantic.v1".into();
+        config.embedding_routes.push(EmbeddingRouteConfig {
+            hint: "semantic.v1".into(),
+            model_provider: "openai.gateway.prod".into(),
+            model: "embedding-large".into(),
+            dimensions: Some(3072),
+            api_key: None,
+        });
+        let expected = snapshot(&config).unwrap();
+        stage(
+            &mut config,
+            RegistryEdit {
+                registry: expected.clone(),
+                expected,
+            },
+        )
+        .unwrap();
+        let embedder = build_embedder_from_config(&config, None).unwrap();
+        assert_eq!(embedder.name(), "openai");
+        assert_eq!(embedder.dimensions(), 3072);
+        assert_eq!(embedder.identity().model, "embedding-large");
+        assert!(embedder.identity().provider.contains("openai"));
+        // Canonical model metadata, rather than the retired route fields,
+        // owns the upstream model and dimensions after the save.
+        config.embedding_routes[0].model.clear();
+        config.embedding_routes[0].dimensions = Some(1);
+        config.validate().unwrap();
+        let embedder = build_embedder_from_config(&config, None).unwrap();
+        assert_eq!(embedder.identity().model, "embedding-large");
+        assert_eq!(embedder.dimensions(), 3072);
+    }
 
     #[test]
     fn factory_sqlite() {

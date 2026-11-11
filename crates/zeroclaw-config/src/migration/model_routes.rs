@@ -154,6 +154,14 @@ pub(super) fn legacy_model(
             connection[field] = value.clone();
         }
     }
+    if kind == "qwen"
+        && connection.get("uri").is_none_or(Value::is_null)
+        && let Some(resource) = raw
+            .get("oauth_resource_url")
+            .filter(|value| !value.is_null())
+    {
+        connection["uri"] = resource.clone();
+    }
     let mut extra = Map::new();
     for (old, new) in [
         ("resource", "resource"),
@@ -239,8 +247,8 @@ pub(super) fn legacy_model(
     for &field in ChatOptionsPatch::FIELDS {
         if let Some(value) = entry
             .get(field)
-            .or_else(|| raw.get(field))
             .filter(|value| !value.is_null())
+            .or_else(|| raw.get(field).filter(|value| !value.is_null()))
         {
             options.insert(field.into(), value.clone());
         }
@@ -249,8 +257,8 @@ pub(super) fn legacy_model(
     for field in ["context_window", "vision"] {
         if let Some(value) = entry
             .get(field)
-            .or_else(|| raw.get(field))
             .filter(|value| !value.is_null())
+            .or_else(|| raw.get(field).filter(|value| !value.is_null()))
         {
             metadata.insert(field.into(), value.clone());
         }

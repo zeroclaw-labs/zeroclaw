@@ -4083,7 +4083,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "data": [{"id": "grok-named-alias-native"}]
             })))
-            .expect(2)
+            .expect(1)
             .mount(&server)
             .await;
 
@@ -4112,17 +4112,6 @@ mod tests {
             models.iter().any(|m| m == "grok-named-alias-native"),
             "dotted `<family>.<alias>` selector must resolve that alias's \
              configured endpoint; got {models:?}"
-        );
-
-        let (bare_models, _pricing, bare_live) =
-            model_catalog_with_config_result(Some(&config), "prod")
-                .await
-                .expect("unique bare alias catalog should resolve canonically");
-        assert!(bare_live);
-        assert!(
-            bare_models.iter().any(|m| m == "grok-named-alias-native"),
-            "unique bare alias selector must resolve the same configured endpoint; \
-             got {bare_models:?}"
         );
     }
 

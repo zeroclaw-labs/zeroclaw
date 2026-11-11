@@ -801,7 +801,12 @@ fn unversioned_shape(table: &toml::Table) -> UnversionedShape {
         // A canonical model row also sits directly below `providers.models`,
         // but its `capability` discriminator makes it a model definition, not
         // a V2 family field or V3 alias map.
-        if section.contains_key("capability") {
+        if section.contains_key("capability")
+            || (root == "providers.models"
+                && name.contains('.')
+                && section.values().any(|value| !value.is_table()))
+        {
+            current.get_or_insert_with(|| format!("`[{root}.{name}]` is a canonical model"));
             continue;
         }
         let path = format!("{root}.{name}");

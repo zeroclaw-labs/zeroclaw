@@ -5825,7 +5825,7 @@ data: {\"type\":\"message_stop\"}\n\n",
         ));
         assert_eq!(
             provider.as_ref().alias(),
-            "agent",
+            "ollama.agent",
             "the consolidation provider must follow the live reference, not the configured default"
         );
 
@@ -5840,7 +5840,7 @@ data: {\"type\":\"message_stop\"}\n\n",
             provider.as_ref().role(),
             Role::Provider(ProviderKind::Model(ModelProviderKind::Plugin))
         ));
-        assert_eq!(provider.as_ref().alias(), "agent");
+        assert_eq!(provider.as_ref().alias(), "ollama.agent");
 
         // The un-switched agent default resolves through the same path and
         // stays paired with its own model and temperature. The openai family
@@ -5861,7 +5861,7 @@ data: {\"type\":\"message_stop\"}\n\n",
             provider.as_ref().role(),
             Role::Provider(ProviderKind::Model(ModelProviderKind::OpenAi))
         ));
-        assert_eq!(provider.as_ref().alias(), "install");
+        assert_eq!(provider.as_ref().alias(), "openai.install");
 
         // A reference that no longer resolves — or one that is not a dotted
         // `<family>.<alias>` — skips consolidation instead of falling back

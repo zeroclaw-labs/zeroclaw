@@ -568,7 +568,13 @@ pub fn plan_export(config: &Config, alias: &str) -> Result<ExportPlan, ExportErr
     let canonical_speech_refs: Vec<&str> = provider_refs
         .iter()
         .map(|(_, reference)| *reference)
-        .filter(|reference| config.is_canonical_model_ref(reference))
+        .filter(|reference| {
+            config
+                .providers
+                .models
+                .canonical_model(&(*reference).into())
+                .is_some()
+        })
         .collect();
     carry_model_provider_closure(
         &mut out,
@@ -579,7 +585,12 @@ pub fn plan_export(config: &Config, alias: &str) -> Result<ExportPlan, ExportErr
     );
     let mut carried_providers: BTreeSet<String> = BTreeSet::new();
     for (section, reference) in provider_refs {
-        if config.is_canonical_model_ref(reference) {
+        if config
+            .providers
+            .models
+            .canonical_model(&reference.into())
+            .is_some()
+        {
             continue;
         }
         let Some((family, entry)) = split_provider_ref(reference) else {

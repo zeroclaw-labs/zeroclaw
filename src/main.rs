@@ -11701,7 +11701,11 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
             // a profile hosting a `models` map no longer reports "(none)".
             let mut shown_provider = false;
             let mut shown_profile = String::new();
+            let registry = config.provider_registry()?;
             for configured in config.configured_model_entries(None) {
+                let Some(model) = configured.model_id.as_deref() else {
+                    continue;
+                };
                 if configured.profile_ref != shown_profile {
                     // First profile uses the emoji-anchored line; later ones
                     // the indented variant — the original layout.
@@ -11717,15 +11721,12 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                             &[
                                 (
                                     "family",
-                                    configured.profile_ref.split('.').next().unwrap_or("")
+                                    registry
+                                        .connections
+                                        .get(configured.profile_ref.as_str())
+                                        .map_or("", |connection| connection.kind())
                                 ),
-                                (
-                                    "alias",
-                                    configured
-                                        .profile_ref
-                                        .split_once('.')
-                                        .map_or("", |(_, a)| a)
-                                ),
+                                ("alias", configured.profile_ref.as_str()),
                             ],
                             fallback
                         )
@@ -11733,18 +11734,14 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     shown_provider = true;
                     shown_profile = configured.profile_ref;
                 }
-                let model = configured.model_id.as_deref().unwrap_or("(none)");
-                match &configured.model_alias {
-                    Some(model_alias) => println!(
-                        "{}",
-                        ta(
-                            "cli-status-model-entry",
-                            &[("alias", model_alias), ("model", model)],
-                            "Model [{$alias}]: {$model}"
-                        )
-                    ),
-                    None => println!("{}", ta("cli-status-model", &[("model", model)], "Model")),
-                }
+                println!(
+                    "{}",
+                    ta(
+                        "cli-status-model-entry",
+                        &[("alias", &configured.provider_ref), ("model", model)],
+                        "Model [{$alias}]: {$model}"
+                    )
+                );
             }
             if !shown_provider {
                 println!(

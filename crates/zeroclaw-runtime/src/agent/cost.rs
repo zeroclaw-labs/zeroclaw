@@ -1591,6 +1591,7 @@ output_per_mtok = 4.0
             "work".to_string(),
             DeepseekModelProviderConfig {
                 base: ModelProviderConfig {
+                    model: Some("deepseek-v4-flash".into()),
                     pricing: HashMap::from([("deepseek-v4-flash.output".into(), 0.77)]),
                     ..Default::default()
                 },
@@ -1600,6 +1601,7 @@ output_per_mtok = 4.0
             "personal".to_string(),
             DeepseekModelProviderConfig {
                 base: ModelProviderConfig {
+                    model: Some("deepseek-v4-flash".into()),
                     pricing: HashMap::from([("deepseek-v4-flash.output".into(), 0.91)]),
                     ..Default::default()
                 },
@@ -1626,6 +1628,18 @@ output_per_mtok = 4.0
             "work".to_string(),
             DeepseekModelProviderConfig {
                 base: ModelProviderConfig {
+                    models: ["flash", "pro"]
+                        .into_iter()
+                        .map(|name| {
+                            (
+                                name.into(),
+                                zeroclaw_config::schema::ModelEntryConfig {
+                                    id: Some(format!("deepseek-v4-{name}")),
+                                    ..Default::default()
+                                },
+                            )
+                        })
+                        .collect(),
                     pricing: HashMap::from([
                         ("deepseek-v4-flash.output".into(), 0.77),
                         ("deepseek-v4-pro.output".into(), 1.55),
@@ -1635,17 +1649,24 @@ output_per_mtok = 4.0
             },
         );
         let alias_map = build_model_provider_pricing(&config);
-        let work = alias_map.get("deepseek.work").expect("work alias pricing");
-        assert_eq!(work.get("deepseek-v4-flash.output").copied(), Some(0.77));
-        assert_eq!(work.get("deepseek-v4-pro.output").copied(), Some(1.55));
+        let flash = alias_map
+            .get("deepseek.work.flash")
+            .expect("flash model pricing");
+        let pro = alias_map
+            .get("deepseek.work.pro")
+            .expect("pro model pricing");
+        assert_eq!(flash.get("deepseek-v4-flash.output").copied(), Some(0.77));
+        assert_eq!(pro.get("deepseek-v4-pro.output").copied(), Some(1.55));
+        assert!(!flash.contains_key("deepseek-v4-pro.output"));
+        assert!(!pro.contains_key("deepseek-v4-flash.output"));
 
-        // The alias-keyed slot is what the lookup chain resolves per model id.
+        // Each exact model reference has its own prices, even on one connection.
         assert_eq!(
-            resolve_rates_opt(work, "deepseek-v4-flash").output_per_mtok,
+            resolve_rates_opt(flash, "deepseek-v4-flash").output_per_mtok,
             Some(0.77)
         );
         assert_eq!(
-            resolve_rates_opt(work, "deepseek-v4-pro").output_per_mtok,
+            resolve_rates_opt(pro, "deepseek-v4-pro").output_per_mtok,
             Some(1.55)
         );
     }
@@ -1663,6 +1684,7 @@ output_per_mtok = 4.0
             "cheap".to_string(),
             CustomModelProviderConfig {
                 base: ModelProviderConfig {
+                    model: Some("gpt-4o-mini".into()),
                     pricing: HashMap::from([
                         ("gpt-4o-mini.input".into(), 0.10),
                         ("gpt-4o-mini.output".into(), 0.40),
@@ -1675,6 +1697,7 @@ output_per_mtok = 4.0
             "premium".to_string(),
             CustomModelProviderConfig {
                 base: ModelProviderConfig {
+                    model: Some("gpt-4o".into()),
                     pricing: HashMap::from([
                         ("gpt-4o.input".into(), 5.0),
                         ("gpt-4o.output".into(), 15.0),

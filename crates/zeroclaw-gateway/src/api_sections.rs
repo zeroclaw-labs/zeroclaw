@@ -182,6 +182,11 @@ fn quickstart_agent_missing_requirements(
     } else if cfg.is_canonical_model_ref(model_ref) {
         if cfg.resolve_model_id(model_ref).is_none() {
             missing.push(format!("Choose a model for model provider `{model_ref}`."));
+        } else if !zeroclaw_providers::model::selection_auth_ready(cfg, model_ref).unwrap_or(false)
+        {
+            missing.push(format!(
+                "Set credential/auth for model provider `{model_ref}`."
+            ));
         }
     } else if let Some((family, _, provider)) = cfg.resolved_model_provider_for_agent(alias) {
         // Resolve through the selection so a nested-only profile (model ids

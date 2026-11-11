@@ -93,6 +93,15 @@ model = "decision-model"
 embedding_model_ref = "embedding.semantic"
 ```
 
+Embedding hints can select the same exact model key with
+`[[embedding_routes]]`, `hint = "semantic"`, and
+`model_provider = "embedding.semantic"`; set
+`memory.embedding_model = "hint:semantic"` and leave
+`memory.embedding_model_ref` unset to use that route. The model definition owns
+the upstream ID and dimensions. Saving the registry promotes existing legacy
+embedding bindings before retiring their provider profiles, preserving the
+shared connection and any explicit consumer credentials.
+
 `connections.<name>.uri` is the shared endpoint; capability tables derive
 their paths and do not define a second URI. API defaults are applied first,
 then the API preset/options, model preset/options, and finally invocation

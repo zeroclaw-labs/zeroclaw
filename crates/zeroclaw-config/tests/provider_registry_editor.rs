@@ -39,6 +39,95 @@ model = "model-two"
 }
 
 #[test]
+fn registry_save_promotes_legacy_embedding_consumers_and_reuses_the_connection() {
+    let mut config = config();
+    config.memory.embedding_provider = "openai.legacy.prod".into();
+    config.memory.embedding_model = "text-embedding-3-small".into();
+    config.memory.embedding_dimensions = 1536;
+    config
+        .embedding_routes
+        .push(zeroclaw_config::schema::EmbeddingRouteConfig {
+            hint: "semantic.v1".into(),
+            model_provider: "openai.legacy.prod".into(),
+            model: "text-embedding-3-large".into(),
+            dimensions: Some(3072),
+            api_key: Some("route-secret".into()),
+        });
+    let expected = snapshot(&config).unwrap();
+    stage(
+        &mut config,
+        RegistryEdit {
+            registry: expected.clone(),
+            expected,
+        },
+    )
+    .unwrap();
+    assert!(config.providers.models.openai.is_empty());
+    let registry = config.provider_registry().unwrap();
+    let memory_ref = config.memory.embedding_model_ref.as_deref().unwrap();
+    let memory = registry.resolve_embedding(&memory_ref.into()).unwrap();
+    assert_eq!(memory.model, "text-embedding-3-small");
+    assert_eq!(memory.dimensions, Some(1536));
+    let route = registry
+        .resolve_embedding(&config.embedding_routes[0].model_provider.as_str().into())
+        .unwrap();
+    assert_eq!(route.model, "text-embedding-3-large");
+    assert_eq!(route.dimensions, Some(3072));
+    assert_eq!(
+        route.selection.model.provider(),
+        memory.selection.model.provider()
+    );
+    assert_eq!(
+        config.embedding_routes[0].api_key.as_deref(),
+        Some("route-secret")
+    );
+    let before = snapshot(&config).unwrap();
+    stage(
+        &mut config,
+        RegistryEdit {
+            registry: before.clone(),
+            expected: before.clone(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        snapshot(&config).unwrap(),
+        before,
+        "subsequent saves must not regenerate models"
+    );
+    let reloaded: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+    reloaded.validate().unwrap();
+}
+
+#[test]
+fn registry_save_rejects_deleting_a_legacy_embedding_connection_atomically() {
+    let mut config = config();
+    config.memory.embedding_provider = "openai.legacy.prod".into();
+    config.memory.embedding_model = "text-embedding-3-small".into();
+    let expected = snapshot(&config).unwrap();
+    let mut registry = expected.clone();
+    registry["connections"]
+        .as_object_mut()
+        .unwrap()
+        .remove("legacy.openai.legacy.prod");
+    registry["models"]
+        .as_object_mut()
+        .unwrap()
+        .remove("openai.legacy.prod");
+    assert!(
+        stage(
+            &mut config,
+            RegistryEdit {
+                expected: expected.clone(),
+                registry
+            }
+        )
+        .is_err()
+    );
+    assert_eq!(snapshot(&config).unwrap(), expected);
+}
+
+#[test]
 fn connection_presets_require_matching_capabilities_even_without_models() {
     use zeroclaw_config::provider_registry::ProviderRegistry;
 

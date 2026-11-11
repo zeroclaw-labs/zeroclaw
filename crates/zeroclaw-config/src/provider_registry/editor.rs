@@ -60,8 +60,9 @@ pub fn stage(config: &mut Config, edit: RegistryEdit) -> Result<()> {
         }
         connection.validate_editor_secrets()?;
     }
-    let raw_models = serde_json::from_value(serde_json::to_value(&registry.models)?)?;
     let mut candidate = config.clone();
+    promote_embedding_bindings(&mut candidate, &projected_current, &mut registry)?;
+    let raw_models = serde_json::from_value(serde_json::to_value(&registry.models)?)?;
     // An editor save promotes the complete projection to canonical storage.
     // Keeping the legacy tables would create a second source for edited
     // connections and regenerate deleted models on the next read. Retain the
@@ -116,6 +117,110 @@ pub fn stage(config: &mut Config, edit: RegistryEdit) -> Result<()> {
         candidate.mark_dirty("agents");
     }
     *config = candidate;
+    Ok(())
+}
+
+/// Materialize legacy embedding consumers before retiring their profiles.
+/// The generated model owns its upstream ID/dimensions and reuses the edited
+/// connection; no second transport snapshot or legacy table is retained.
+fn promote_embedding_bindings(
+    config: &mut Config,
+    current: &super::ProviderRegistry,
+    candidate: &mut super::ProviderRegistry,
+) -> Result<()> {
+    fn promote(
+        profiles: &crate::providers::ModelProviders,
+        current: &super::ProviderRegistry,
+        candidate: &mut super::ProviderRegistry,
+        reference: &str,
+        model: &str,
+        dimensions: usize,
+        suggested: &str,
+    ) -> Result<Option<super::ModelRef>> {
+        if !profiles
+            .profile_ref(reference.trim())
+            .is_some_and(|(family, alias)| profiles.find(family, alias).is_some())
+        {
+            return Ok(None);
+        }
+        let Some(source) = current.models.get(reference.trim()) else {
+            return Ok(None);
+        };
+        if source.capability() != zeroclaw_api::capability::Capability::Chat {
+            return Ok(None);
+        }
+        let connection = candidate
+            .connections
+            .get(source.provider())
+            .context("cannot delete a connection used by legacy embeddings")?;
+        ensure!(
+            connection.supports(zeroclaw_api::capability::Capability::Embedding),
+            "legacy embedding connection does not support embeddings"
+        );
+        ensure!(
+            !model.trim().is_empty() && dimensions > 0,
+            "legacy embedding model and dimensions must be configured"
+        );
+        let mut name = super::ModelRef::from(suggested);
+        let mut suffix = 2;
+        while candidate.models.contains_key(&name) {
+            name = format!("{suggested}.{suffix}").into();
+            suffix += 1;
+        }
+        candidate.models.insert(
+            name.clone(),
+            super::ModelDefinition::Embedding(super::EmbeddingModelConfig {
+                provider: source.provider().clone(),
+                model: model.trim().to_owned(),
+                metadata: super::EmbeddingMetadata {
+                    dimensions: Some(dimensions),
+                },
+            }),
+        );
+        Ok(Some(name))
+    }
+
+    if config
+        .memory
+        .embedding_model_ref
+        .as_deref()
+        .is_none_or(|r| r.trim().is_empty())
+        && !config.memory.embedding_model.starts_with("hint:")
+        && let Some(reference) = promote(
+            &config.providers.models,
+            current,
+            candidate,
+            &config.memory.embedding_provider,
+            &config.memory.embedding_model,
+            config.memory.embedding_dimensions,
+            "embedding.memory",
+        )?
+    {
+        config.memory.embedding_model_ref = Some(reference.to_string());
+        config.mark_dirty("memory");
+    }
+    let mut routes_changed = false;
+    for route in &mut config.embedding_routes {
+        if let Some(reference) = promote(
+            &config.providers.models,
+            current,
+            candidate,
+            &route.model_provider,
+            &route.model,
+            route
+                .dimensions
+                .unwrap_or(config.memory.embedding_dimensions),
+            &format!("embedding.route.{}", route.hint),
+        )? {
+            route.model_provider = reference.to_string();
+            route.model.clear();
+            route.dimensions = None;
+            routes_changed = true;
+        }
+    }
+    if routes_changed {
+        config.mark_dirty("embedding_routes");
+    }
     Ok(())
 }
 
