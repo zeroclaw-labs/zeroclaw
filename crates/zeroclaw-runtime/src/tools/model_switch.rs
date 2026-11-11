@@ -499,7 +499,7 @@ mod tests {
         let state = Arc::new(std::sync::Mutex::new(None));
         crate::agent::turn::scope_model_switch_provider_allowlist(
             Some(Arc::new(std::collections::HashSet::from([
-                "custom.edge.local".to_string(),
+                "custom.edge.local.selected".to_string(),
             ]))),
             scope_model_switch_state(Arc::clone(&state), async {
                 let accepted = tool
@@ -595,7 +595,7 @@ mod tests {
                     .error
                     .as_deref()
                     .unwrap_or_default()
-                    .contains("exact model reference"),
+                    .contains("model does not exist"),
                 "unexpected error: {:?}",
                 result.error
             );
@@ -686,7 +686,7 @@ mod tests {
                     .error
                     .as_deref()
                     .unwrap_or_default()
-                    .contains("configured model reference"),
+                    .contains("model does not exist"),
                 "unexpected error: {:?}",
                 result.error
             );

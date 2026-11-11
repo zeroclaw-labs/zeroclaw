@@ -7042,7 +7042,7 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
 
         let rt = build_model(&config, "tester", "openai.gw.cheap", None).unwrap();
 
-        assert_eq!(rt.model.provider_name(), "openai.gw");
+        assert_eq!(rt.model.provider_name(), "openai.gw.cheap");
         assert_eq!(rt.model.model_name(), "gpt-4o-mini");
         assert!(
             rt.model

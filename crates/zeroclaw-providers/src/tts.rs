@@ -1231,20 +1231,21 @@ impl TtsManager {
                                     .as_str()
                                     .starts_with("legacy.tts.")
                             })
+                            && registry
+                                .resolve_tts(&zeroclaw_config::provider_registry::ModelRef::from(
+                                    legacy_key,
+                                ))
+                                .is_err()
+                            && let Ok((legacy_provider, _)) =
+                                build_canonical_tts_provider(model_ref.as_str(), &resolved)
                         {
                             // An explicitly canonical model may already own
                             // the legacy-shaped key (`openai.voice`).  Keep
                             // its provider and default voice intact; only
                             // create the alias when no canonical model owns it.
-                            if !tts_providers.contains_key(legacy_key) {
-                                if let Ok((legacy_provider, _)) =
-                                    build_canonical_tts_provider(model_ref.as_str(), &resolved)
-                                {
-                                    tts_providers.insert(legacy_key.to_owned(), legacy_provider);
-                                    if let Some(voice) = voice_by_alias.get(&key).cloned() {
-                                        voice_by_alias.insert(legacy_key.to_owned(), voice);
-                                    }
-                                }
+                            tts_providers.insert(legacy_key.to_owned(), legacy_provider);
+                            if let Some(voice) = voice_by_alias.get(&key).cloned() {
+                                voice_by_alias.insert(legacy_key.to_owned(), voice);
                             }
                         }
                     }
@@ -1974,6 +1975,35 @@ mod tests {
         let config = Config::default();
         let manager = TtsManager::from_config(&config).unwrap();
         assert!(manager.available_providers().is_empty());
+    }
+
+    #[test]
+    fn projected_legacy_voice_does_not_override_a_canonical_selection() {
+        let mut config = Config::default();
+        config.providers = toml::from_str(
+            r#"
+[connections.gateway]
+kind = "openai"
+auth = { mode = "api_key", api_key = "test-key" }
+[models."openai.voice"]
+capability = "tts"
+provider = "gateway"
+model = "tts-1"
+[tts.openai.voice]
+api_key = "legacy-test-key"
+voice = "legacy-voice"
+"#,
+        )
+        .unwrap();
+        let manager = TtsManager::from_config(&config).unwrap();
+        assert!(manager.tts_providers.contains_key("openai.voice"));
+        assert!(!manager.voice_by_alias.contains_key("openai.voice"));
+        assert_eq!(manager.voice_by_alias["tts.openai.voice"], "legacy-voice");
+
+        config.providers.models = Default::default();
+        let manager = TtsManager::from_config(&config).unwrap();
+        assert!(manager.tts_providers.contains_key("openai.voice"));
+        assert_eq!(manager.voice_by_alias["openai.voice"], "legacy-voice");
     }
 
     #[test]

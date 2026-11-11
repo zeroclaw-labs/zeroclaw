@@ -541,23 +541,31 @@ pub fn selection_depends_on_model_ref(
         current: &zeroclaw_config::provider_registry::ModelRef,
         changed: &zeroclaw_config::provider_registry::ModelRef,
         visited: &mut HashSet<zeroclaw_config::provider_registry::ModelRef>,
-        depth: usize,
     ) -> bool {
         if current == changed {
             return true;
         }
-        if depth >= zeroclaw_config::providers::MAX_FALLBACK_DEPTH
-            || !visited.insert(current.clone())
-        {
+        if !visited.insert(current.clone()) {
             return false;
+        }
+        // A compatibility profile edit may change the shared connection for
+        // every model projected from it. Compare the registry's connection
+        // identity rather than parsing either exact model key.
+        if registry
+            .models
+            .get(current)
+            .zip(registry.models.get(changed))
+            .is_some_and(|(model, edited)| model.provider() == edited.provider())
+        {
+            return true;
         }
         registry.fallback.get(current).is_some_and(|targets| {
             targets
                 .iter()
-                .any(|target| visit(registry, target, changed, visited, depth + 1))
+                .any(|target| visit(registry, target, changed, visited))
         })
     }
-    visit(&registry, &root, &changed, &mut HashSet::new(), 0)
+    visit(&registry, &root, &changed, &mut HashSet::new())
 }
 
 /// Dependencies of the routed graph built by [`build_model`], including each
@@ -617,7 +625,10 @@ pub fn build_model(
     if config.is_canonical_model_ref(canonical_ref.as_str()) {
         let registry = config.provider_registry()?;
         registry.resolve_chat(&canonical_ref)?;
-        let options = crate::provider_runtime_options_for_agent(config, agent_alias);
+        // Each candidate materializes its own model policy. Supplying the
+        // primary model's options here would leak them into a backup whose
+        // corresponding field is unset.
+        let options = crate::provider_runtime_options_for_bare_family(config);
         let model_id = model_override
             .map(str::trim)
             .filter(|model| !model.is_empty())
@@ -1066,8 +1077,6 @@ model = "backup-model"
         config.model_routes = vec![ModelRouteConfig {
             hint: "fast".into(),
             model_ref: "llamacpp.typo".into(),
-
-            ..Default::default()
         }];
         assert!(build_model(&config, "worker", "custom.target.v2.fast", None).is_err());
         config.model_routes.clear();

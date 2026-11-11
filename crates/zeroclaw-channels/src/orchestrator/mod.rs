@@ -2897,13 +2897,10 @@ fn resolve_models_command(
             registry
                 .models
                 .keys()
-                .filter(|reference| reference.starts_with(&format!("{family}.")))
                 .filter(|reference| {
                     registry
-                        .resolve_chat(&zeroclaw_config::provider_registry::ModelRef::from(
-                            reference.as_str(),
-                        ))
-                        .is_ok()
+                        .resolve_chat(reference)
+                        .is_ok_and(|resolved| resolved.selection.connection.kind() == family)
                 })
                 .map(ToString::to_string)
                 .collect()

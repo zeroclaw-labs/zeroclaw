@@ -1205,7 +1205,12 @@ impl Providers {
         // exact-key registry. This keeps TTS/ASR consumers independent from
         // their retired family maps while preserving their legacy defaults.
         for (family, alias, base) in self.tts.iter_entries() {
-            let reference = ModelRef::from(format!("tts.{family}.{alias}"));
+            let legacy_ref = ModelRef::from(format!("{family}.{alias}"));
+            let reference = if models.contains_key(&legacy_ref) {
+                ModelRef::from(format!("tts.{family}.{alias}"))
+            } else {
+                legacy_ref
+            };
             if models.contains_key(&reference) {
                 continue;
             }
@@ -1267,7 +1272,12 @@ impl Providers {
             );
         }
         for (family, alias, entry) in self.transcription.iter_entries() {
-            let reference = ModelRef::from(format!("asr.{family}.{alias}"));
+            let legacy_ref = ModelRef::from(format!("{family}.{alias}"));
+            let reference = if models.contains_key(&legacy_ref) {
+                ModelRef::from(format!("asr.{family}.{alias}"))
+            } else {
+                legacy_ref
+            };
             if models.contains_key(&reference) {
                 continue;
             }

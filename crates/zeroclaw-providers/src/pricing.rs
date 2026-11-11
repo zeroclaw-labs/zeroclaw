@@ -280,8 +280,6 @@ struct WantedModel {
     /// Legacy family aliases can safely project a bare-family snapshot entry;
     /// canonical exact model refs intentionally have no such projection.
     alias_family: Option<String>,
-    /// Same as `provider_key`; kept for clarity at use sites that build handles.
-    composite: String,
     model_id: String,
     models_dev_key: Option<String>,
 }
@@ -303,12 +301,12 @@ fn enabled_pricing_groups(
     let mut total_aliases_per_family: HashMap<String, usize> = HashMap::new();
     if let Ok(registry) = config.provider_registry() {
         for model in registry.models.values() {
-            if model.capability() == zeroclaw_api::capability::Capability::Chat {
-                if let Some(connection) = registry.connections.get(model.provider()) {
-                    *total_aliases_per_family
-                        .entry(connection.kind().to_owned())
-                        .or_default() += 1;
-                }
+            if model.capability() == zeroclaw_api::capability::Capability::Chat
+                && let Some(connection) = registry.connections.get(model.provider())
+            {
+                *total_aliases_per_family
+                    .entry(connection.kind().to_owned())
+                    .or_default() += 1;
             }
         }
     }
@@ -349,7 +347,6 @@ fn enabled_pricing_groups(
             let wanted = WantedModel {
                 provider_key: composite.clone(),
                 alias_family: None,
-                composite,
                 model_id: model_id.to_owned(),
                 models_dev_key: crate::catalog::catalog_source_for(
                     resolved.selection.connection.kind(),
@@ -819,7 +816,6 @@ model = "fast-id"
             alias_family: composite
                 .split_once('.')
                 .map(|(family, _)| family.to_owned()),
-            composite: composite.to_string(),
             model_id: model.to_string(),
             models_dev_key: md_key.map(str::to_string),
         }

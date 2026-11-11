@@ -938,12 +938,17 @@ pub fn provider_runtime_options_for_agent(
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
 ) -> ModelProviderRuntimeOptions {
-    // The registry is the only runtime source of model and connection
-    // policy. Model-specific overlays are applied by the factory after this
-    // provider-agnostic base is created; no consumer should re-read the
-    // legacy family maps here.
-    let _ = config.agent(agent_alias);
-    provider_runtime_options_for_bare_family(config)
+    let base = provider_runtime_options_for_bare_family(config);
+    let Some(agent) = config.agent(agent_alias) else {
+        return base;
+    };
+    let Ok(registry) = config.provider_registry() else {
+        return base;
+    };
+    let Ok(resolved) = registry.resolve_chat(&agent.model_provider.as_str().into()) else {
+        return base;
+    };
+    crate::factory::runtime_options_for_chat(&resolved, &base)
 }
 pub fn provider_runtime_options_for_alias(
     config: &zeroclaw_config::schema::Config,
@@ -959,27 +964,10 @@ pub fn provider_runtime_options_for_alias(
     )) else {
         return provider_runtime_options_for_bare_family(config);
     };
-    let mut options = provider_runtime_options_for_bare_family(config);
-    options.provider_kind = Some(resolved.selection.connection.kind().to_owned());
-    options.provider_api_url = resolved.selection.connection.uri().map(str::to_owned);
-    options.extra_headers = resolved
-        .selection
-        .connection
-        .extra_headers()
-        .map(|headers| {
-            headers
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
-    options.tls_ca_cert_path = resolved
-        .selection
-        .connection
-        .tls_ca_cert_path()
-        .map(str::to_owned);
-    options.wire_api = resolved.wire_api.map(|wire| wire.as_str().to_owned());
-    options
+    crate::factory::runtime_options_for_chat(
+        &resolved,
+        &provider_runtime_options_for_bare_family(config),
+    )
 }
 
 /// Options to use when building a provider from a name that may be either
@@ -1516,6 +1504,27 @@ fn check_api_key_prefix(model_provider_name: &str, key: &str) -> Option<&'static
     }
 }
 
+fn validate_provider_credential(
+    provider_kind: &str,
+    api_key: Option<&str>,
+    api_url: Option<&str>,
+) -> anyhow::Result<()> {
+    let is_custom = provider_kind.starts_with("custom")
+        || provider_kind.starts_with("anthropic-custom:")
+        || provider_kind == "openai-compatible";
+    let has_custom_url = api_url.is_some_and(|uri| !uri.trim().is_empty());
+    if !is_custom
+        && !has_custom_url
+        && let Some(likely_provider) =
+            api_key.and_then(|key| check_api_key_prefix(provider_kind, key))
+    {
+        anyhow::bail!(
+            "API key prefix mismatch: credential looks like a {likely_provider} key, but model_provider {provider_kind:?} is selected"
+        );
+    }
+    Ok(())
+}
+
 pub fn create_model_provider(
     name: &str,
     api_key: Option<&str>,
@@ -1749,22 +1758,7 @@ fn create_model_provider_inner(
     let key = resolved_credential.as_ref().map(String::as_str);
 
     // Pre-flight: catch obvious API-key / model_provider mismatches early.
-    if let Some(key_value) = key {
-        let is_custom =
-            provider_kind.starts_with("custom:") || provider_kind.starts_with("anthropic-custom:");
-        let has_custom_url = api_url.map(str::trim).filter(|u| !u.is_empty()).is_some();
-        if !is_custom
-            && !has_custom_url
-            && let Some(likely_model_provider) = check_api_key_prefix(provider_kind, key_value)
-        {
-            let visible = &key_value[..key_value.len().min(8)];
-            anyhow::bail!(
-                "API key prefix mismatch: key \"{visible}...\" looks like a \
-                     {likely_model_provider} key, but model_provider \"{provider_kind}\" is selected. \
-                     Set the correct provider-specific env var or use `-p {likely_model_provider}`."
-            );
-        }
-    }
+    validate_provider_credential(provider_kind, key, api_url)?;
 
     // Resolve the effective endpoint URL for the dispatch arms below.
     // Precedence: `api_url` parameter (operator-set base.uri), then
@@ -2061,6 +2055,20 @@ fn create_resilient_model_provider_from_ref_with_model_override(
     primary_model_override: Option<&str>,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
     let name = name.trim();
+    let canonical_ref = zeroclaw_config::provider_registry::ModelRef::from(name);
+    if config.is_configured_model_ref(name) {
+        return Ok(crate::model::build_canonical_provider_with_options(
+            config,
+            &canonical_ref,
+            crate::model::ProviderOverrides {
+                model: primary_model_override,
+                api_key,
+            },
+            options,
+            true,
+        )?
+        .provider);
+    }
     ensure_known_model_entry_ref(config, name)?;
     let selection = config.resolve_model_selection(name);
     let selected_model = selection
@@ -2074,25 +2082,6 @@ fn create_resilient_model_provider_from_ref_with_model_override(
             .as_ref()
             .and_then(|selection| selection.model_entry),
     );
-    let canonical_ref = zeroclaw_config::provider_registry::ModelRef::from(name);
-    if config
-        .providers
-        .models
-        .canonical_model(&canonical_ref)
-        .is_some()
-    {
-        return Ok(crate::model::build_canonical_provider_with_options(
-            config,
-            &canonical_ref,
-            crate::model::ProviderOverrides {
-                model: primary_model_override,
-                api_key,
-            },
-            &options,
-            true,
-        )?
-        .provider);
-    }
     match config.providers.models.profile_ref(name) {
         Some((family, alias))
             if !family.contains(':') && config.providers.models.find(family, alias).is_some() =>
@@ -2125,14 +2114,7 @@ pub fn ensure_known_model_entry_ref(
     config: &zeroclaw_config::schema::Config,
     name: &str,
 ) -> anyhow::Result<()> {
-    if config
-        .providers
-        .models
-        .canonical_model(&zeroclaw_config::provider_registry::ModelRef::from(
-            name.trim(),
-        ))
-        .is_some()
-    {
+    if config.is_configured_model_ref(name) {
         return Ok(());
     }
     if let Some((family, alias)) = config.providers.models.profile_ref(name)

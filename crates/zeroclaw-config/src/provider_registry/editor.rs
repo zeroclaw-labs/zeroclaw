@@ -14,7 +14,7 @@ pub struct RegistryEdit {
     /// Masked document originally read by the editor. Compared under the
     /// existing config commit lock so a stale editor cannot overwrite changes.
     pub expected: Value,
-    /// Complete canonical registry candidate. Legacy provider maps are retained.
+    /// Complete canonical registry candidate, including projected legacy entries.
     pub registry: Value,
 }
 
@@ -62,21 +62,38 @@ pub fn stage(config: &mut Config, edit: RegistryEdit) -> Result<()> {
     }
     let raw_models = serde_json::from_value(serde_json::to_value(&registry.models)?)?;
     let mut candidate = config.clone();
-    // Generated compatibility connections are reconstructed from the legacy
-    // sections by `canonical_registry`; persisting them would make the next
-    // projection report a false explicit-name collision.  Keep only the
-    // connections that belong to the canonical source document.
-    candidate.providers.connections = registry
-        .connections
-        .into_iter()
-        .filter(|(id, _)| {
-            config.providers.connections.contains_key(id) || !id.as_str().starts_with("legacy.")
-        })
-        .collect();
+    // An editor save promotes the complete projection to canonical storage.
+    // Keeping the legacy tables would create a second source for edited
+    // connections and regenerate deleted models on the next read. Retain the
+    // projected definitions themselves, including restored credentials.
+    let mut agents_changed = false;
+    for agent in candidate.agents.values_mut() {
+        if let Some(reference) = projected_speech_reference(
+            &projected_current,
+            agent.tts_provider.as_str(),
+            zeroclaw_api::capability::Capability::Tts,
+            "tts",
+        ) {
+            agent.tts_provider = reference.into();
+            agents_changed = true;
+        }
+        if let Some(reference) = projected_speech_reference(
+            &projected_current,
+            agent.transcription_provider.as_str(),
+            zeroclaw_api::capability::Capability::Asr,
+            "asr",
+        ) {
+            agent.transcription_provider = reference.into();
+            agents_changed = true;
+        }
+    }
+    candidate.providers.connections = registry.connections;
+    candidate.providers.models = Default::default();
+    candidate.providers.tts = Default::default();
+    candidate.providers.transcription = Default::default();
     candidate.providers.models.canonical_models = raw_models;
     candidate.providers.model_presets = registry.model_presets;
     candidate.providers.fallback = registry.fallback;
-    // Detect a canonical key colliding with a retained legacy family too.
     serde_json::to_value(&candidate.providers)?;
     candidate.validate()?;
     // Memory's canonical model reference is outside the provider graph. Do
@@ -95,8 +112,33 @@ pub fn stage(config: &mut Config, edit: RegistryEdit) -> Result<()> {
             .context("invalid memory.embedding_model_ref")?;
     }
     candidate.mark_dirty("providers");
+    if agents_changed {
+        candidate.mark_dirty("agents");
+    }
     *config = candidate;
     Ok(())
+}
+
+fn projected_speech_reference(
+    registry: &super::ProviderRegistry,
+    reference: &str,
+    capability: zeroclaw_api::capability::Capability,
+    prefix: &str,
+) -> Option<String> {
+    if reference.is_empty()
+        || registry
+            .models
+            .get(&super::ModelRef::from(reference))
+            .is_some_and(|model| model.capability() == capability)
+    {
+        return None;
+    }
+    let projected = super::ModelRef::from(format!("{prefix}.{reference}"));
+    registry
+        .models
+        .get(&projected)
+        .is_some_and(|model| model.capability() == capability)
+        .then(|| projected.to_string())
 }
 
 impl super::ProviderConnection {

@@ -134,7 +134,7 @@ fn chat_defaults_apply_to_driver_specific_api_objects() {
 }
 
 #[test]
-fn registry_editor_preserves_exact_keys_secrets_and_legacy_maps() {
+fn registry_editor_preserves_exact_keys_and_secrets_while_promoting_legacy_maps() {
     let mut config = config();
     let expected = snapshot(&config).unwrap();
     assert!(!expected.to_string().contains("test-secret"));
@@ -165,6 +165,59 @@ fn registry_editor_preserves_exact_keys_secrets_and_legacy_maps() {
         snapshot(&config).unwrap()["models"]["chat.fast.us"]["options"]["temperature"],
         "null"
     );
+    assert!(config.providers.models.iter_entries().next().is_none());
+    let encoded = toml::to_string(&config.providers).unwrap();
+    let reloaded = Config {
+        providers: toml::from_str(&encoded).unwrap(),
+        ..Config::default()
+    };
+    assert_eq!(snapshot(&reloaded).unwrap(), snapshot(&config).unwrap());
+}
+
+#[test]
+fn registry_editor_promotes_masked_legacy_credentials_and_keeps_later_edits() {
+    let mut config = config();
+    config
+        .providers
+        .models
+        .ensure("openai", "legacy.prod")
+        .unwrap()
+        .api_key = Some("legacy-test-secret".into());
+    let expected = snapshot(&config).unwrap();
+    assert!(!expected.to_string().contains("legacy-test-secret"));
+    stage(
+        &mut config,
+        RegistryEdit {
+            expected: expected.clone(),
+            registry: expected,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        config.providers.connections["legacy.openai.legacy.prod"].api_key(),
+        Some("legacy-test-secret")
+    );
+    let expected = snapshot(&config).unwrap();
+    let mut registry = expected.clone();
+    registry["connections"]["legacy.openai.legacy.prod"]["uri"] = json!("https://updated.test/v1");
+    stage(&mut config, RegistryEdit { expected, registry }).unwrap();
+    assert_eq!(
+        config
+            .provider_registry()
+            .unwrap()
+            .resolve_chat(&"openai.legacy.prod".into())
+            .unwrap()
+            .selection
+            .connection
+            .uri(),
+        Some("https://updated.test/v1")
+    );
+    let encoded = toml::to_string(&config.providers).unwrap();
+    let reloaded = Config {
+        providers: toml::from_str(&encoded).unwrap(),
+        ..Config::default()
+    };
+    assert_eq!(snapshot(&reloaded).unwrap(), snapshot(&config).unwrap());
 }
 
 #[test]

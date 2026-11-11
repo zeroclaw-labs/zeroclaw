@@ -177,10 +177,15 @@ pub(super) fn legacy_model(
     }
     if raw.get("requires_openai_auth").and_then(Value::as_bool) == Some(true) {
         connection["auth"] = json!({"mode":"codex"});
-    } else if raw
-        .get("auth_mode")
-        .and_then(Value::as_str)
-        .is_some_and(|mode| matches!(mode, "o_auth" | "oauth"))
+    } else if (kind == "qwen"
+        && raw
+            .get("oauth_refresh_token")
+            .and_then(Value::as_str)
+            .is_some_and(|token| !token.trim().is_empty()))
+        || raw
+            .get("auth_mode")
+            .and_then(Value::as_str)
+            .is_some_and(|mode| matches!(mode, "o_auth" | "oauth"))
     {
         let mut auth = json!({"mode":"oauth"});
         for (old, new) in [

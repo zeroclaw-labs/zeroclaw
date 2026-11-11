@@ -209,8 +209,6 @@ mod tests {
             config.model_routes.push(ModelRouteConfig {
                 hint: hint.into(),
                 model_ref: model_ref.into(),
-
-                ..Default::default()
             });
         }
         config.embedding_routes.push(EmbeddingRouteConfig {
@@ -329,8 +327,6 @@ mod tests {
                     config.model_routes.push(ModelRouteConfig {
                         hint: hint.into(),
                         model_ref: provider.into(),
-
-                        ..Default::default()
                     });
                 } else {
                     config.embedding_routes.push(EmbeddingRouteConfig {

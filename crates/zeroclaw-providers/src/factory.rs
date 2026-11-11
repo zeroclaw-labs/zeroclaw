@@ -2183,22 +2183,13 @@ pub fn dispatch_model_ref(
     dispatch_model_ref_with_registry(&registry, model_ref, options, None)
 }
 
-/// Construct one fresh provider adapter from an already validated immutable
-/// registry. The registry/connection descriptors are reused for all candidates
-/// in one build transaction, while model options are resolved and applied anew
-/// for every exact model reference. This prevents model-switch/fallback state
-/// from leaking between candidates.
-pub(crate) fn dispatch_model_ref_with_registry(
-    registry: &zeroclaw_config::provider_registry::ProviderRegistry,
-    model_ref: &zeroclaw_config::provider_registry::ModelRef,
+/// Materialize transport options from one admitted model selection. Shared by
+/// construction and option consumers so connection and preset fields cannot drift.
+pub(crate) fn runtime_options_for_chat(
+    resolved: &zeroclaw_config::provider_registry::ResolvedChat<'_>,
     options: &ModelProviderRuntimeOptions,
-    api_key_override: Option<&str>,
-) -> Result<Box<dyn ModelProvider>> {
+) -> ModelProviderRuntimeOptions {
     use zeroclaw_config::provider_registry::{ModelDefinition, Override, ProviderConnection};
-
-    let resolved = registry
-        .resolve_chat(model_ref)
-        .map_err(|error| anyhow::Error::msg(error.to_string()))?;
     let mut runtime = options.clone();
     let model_options = &resolved.options;
     if let Some(Override::Set(value)) = &model_options.max_tokens {
@@ -2288,8 +2279,33 @@ pub(crate) fn dispatch_model_ref_with_registry(
         .tls_ca_cert_path()
         .map(str::to_owned);
 
+    runtime.provider_kind = Some(resolved.selection.connection.kind().to_owned());
+    runtime.provider_api_url = resolved.selection.connection.uri().map(str::to_owned);
+    runtime
+}
+
+/// Construct a fresh adapter while sharing immutable registry descriptors.
+/// Model policy is materialized independently for every candidate.
+pub(crate) fn dispatch_model_ref_with_registry(
+    registry: &zeroclaw_config::provider_registry::ProviderRegistry,
+    model_ref: &zeroclaw_config::provider_registry::ModelRef,
+    options: &ModelProviderRuntimeOptions,
+    api_key_override: Option<&str>,
+) -> Result<Box<dyn ModelProvider>> {
+    use zeroclaw_config::provider_registry::{ModelDefinition, ProviderConnection};
+
+    let resolved = registry
+        .resolve_chat(model_ref)
+        .map_err(|error| anyhow::Error::msg(error.to_string()))?;
+    let runtime = runtime_options_for_chat(&resolved, options);
+
     let api_key = api_key_override.or_else(|| resolved.selection.connection.api_key());
     let provider_kind = resolved.selection.connection.kind();
+    crate::validate_provider_credential(
+        provider_kind,
+        api_key,
+        resolved.selection.connection.uri(),
+    )?;
     // Canonical connections carry typed authentication and model extras. The
     // legacy family dispatcher cannot recover either fact from `api_key` or a
     // missing config slot, so materialize those provider-specific settings at
