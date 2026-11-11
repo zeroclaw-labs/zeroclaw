@@ -542,7 +542,7 @@ mod tests {
         config.agents.get_mut(TEST_AGENT).unwrap().model_provider =
             format!("openai.{TEST_AGENT}").into();
         let job = cron::add_agent_job(
-            &config,
+            &zeroclaw_config::migration::admit_test_input(&config),
             TEST_AGENT,
             Some("child".into()),
             cron::Schedule::Cron {
@@ -558,7 +558,10 @@ mod tests {
             true,
         )
         .unwrap();
-        (Arc::new(config), job)
+        (
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
+            job,
+        )
     }
 
     /// Match the scheduler's same-binary isolation for process-global state.

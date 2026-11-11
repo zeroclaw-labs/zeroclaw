@@ -1514,7 +1514,6 @@ pub fn create_model_provider(
     api_key: Option<&str>,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
     create_model_provider_inner(
-        None,
         name,
         "default",
         api_key,
@@ -1530,7 +1529,7 @@ pub fn create_model_provider_with_options(
     api_key: Option<&str>,
     options: &ModelProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
-    create_model_provider_inner(None, name, "default", api_key, None, options)
+    create_model_provider_inner(name, "default", api_key, None, options)
 }
 
 /// Factory: create model_provider with optional custom base URL.
@@ -1541,7 +1540,6 @@ pub fn create_model_provider_with_url(
     api_url: Option<&str>,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
     create_model_provider_inner(
-        None,
         name,
         "default",
         api_key,
@@ -1558,7 +1556,8 @@ pub fn create_model_provider_for_alias(
     api_key: Option<&str>,
     options: &ModelProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
-    create_model_provider_inner(Some(config), family, alias, api_key, None, options)
+    factory::dispatch_test_alias(config, family, alias, api_key, options)
+        .map(|provider| apply_factory_leaf_metadata(provider, options.vision))
 }
 
 #[must_use]
@@ -1682,7 +1681,6 @@ fn apply_factory_leaf_metadata(
 /// Factory: create model_provider with optional base URL and runtime options.
 #[allow(clippy::too_many_lines)]
 fn create_model_provider_inner(
-    config: Option<&zeroclaw_config::schema::Config>,
     raw_name: &str,
     alias: &str,
     api_key: Option<&str>,
@@ -1763,7 +1761,7 @@ fn create_model_provider_inner(
         ));
     }
 
-    factory::dispatch_family_factory(config, provider_kind, alias, key, resolved_url, options)
+    factory::dispatch_family_factory(provider_kind, alias, key, resolved_url, options)
         .map(|provider| apply_factory_leaf_metadata(provider, options.vision))
 }
 
@@ -1775,7 +1773,7 @@ pub fn create_resilient_model_provider_with_options(
     options: &ModelProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
     let primary_model_provider =
-        create_model_provider_inner(None, primary_name, "default", api_key, api_url, options)?;
+        create_model_provider_inner(primary_name, "default", api_key, api_url, options)?;
 
     let reliable = ReliableModelProvider::new(
         primary_name,
@@ -2844,8 +2842,7 @@ mod tests {
                 vision: Some(false),
                 ..Default::default()
             };
-            let provider =
-                create_model_provider_inner(None, name, "default", None, None, &off).unwrap();
+            let provider = create_model_provider_inner(name, "default", None, None, &off).unwrap();
             assert!(
                 !provider.supports_vision(),
                 "{name}: vision=false should mark the provider non-vision"
@@ -2856,7 +2853,6 @@ mod tests {
             );
             // `None` preserves the family default (vision-capable here).
             let provider = create_model_provider_inner(
-                None,
                 name,
                 "default",
                 None,
@@ -2880,8 +2876,7 @@ mod tests {
                     ..Default::default()
                 };
                 let provider =
-                    create_model_provider_inner(None, name, "default", None, None, &options)
-                        .unwrap();
+                    create_model_provider_inner(name, "default", None, None, &options).unwrap();
                 assert!(
                     provider.has_stable_request_identity("model"),
                     "{name}: factory-created leaves must attest to a stable request identity"
@@ -2906,17 +2901,26 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            model_provider_runtime_options_from_model_provider_entry(&config, Some(&entry))
-                .merge_system_into_user
+            model_provider_runtime_options_from_model_provider_entry(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                Some(&entry)
+            )
+            .merge_system_into_user
         );
         let without_uri = ModelProviderConfig { uri: None, ..entry };
         assert!(
-            model_provider_runtime_options_from_model_provider_entry(&config, Some(&without_uri))
-                .merge_system_into_user
+            model_provider_runtime_options_from_model_provider_entry(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                Some(&without_uri)
+            )
+            .merge_system_into_user
         );
         assert!(
-            !model_provider_runtime_options_from_model_provider_entry(&config, None)
-                .merge_system_into_user
+            !model_provider_runtime_options_from_model_provider_entry(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                None
+            )
+            .merge_system_into_user
         );
     }
 
@@ -3027,7 +3031,7 @@ mod tests {
         // no entry that could hold (or turn off) those settings, so it must
         // not inherit them.
         let fallback = model_provider_runtime_options_from_model_provider_entry(
-            &config,
+            &zeroclaw_config::migration::admit_test_input(&config),
             Some(&ModelProviderConfig {
                 cache_ttl: Some(CacheTtl::OneHour),
                 cache_passthrough: true,
@@ -3035,7 +3039,11 @@ mod tests {
             }),
         );
 
-        let options = options_for_provider_ref(&config, "anthropic", &fallback);
+        let options = options_for_provider_ref(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "anthropic",
+            &fallback,
+        );
         assert_eq!(options.cache_ttl, None);
         assert!(!options.cache_passthrough);
         // Root-scoped `[multimodal]` keeps its bare-ref inheritance.
@@ -3054,7 +3062,11 @@ mod tests {
                 ..Default::default()
             },
         );
-        let dotted = options_for_provider_ref(&config, "anthropic.direct", &fallback);
+        let dotted = options_for_provider_ref(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "anthropic.direct",
+            &fallback,
+        );
         assert_eq!(dotted.cache_ttl, Some(CacheTtl::FiveMinutes));
         assert!(!dotted.cache_passthrough);
     }
@@ -3077,9 +3089,13 @@ mod tests {
                 },
             },
         );
-        let options = provider_runtime_options_for_alias(&config, "openai", "responses_vision");
+        let options = provider_runtime_options_for_alias(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "openai",
+            "responses_vision",
+        );
         let provider = create_model_provider_for_alias(
-            &config,
+            &zeroclaw_config::migration::admit_test_input(&config),
             "openai",
             "responses_vision",
             Some("sk-test"),
@@ -3153,7 +3169,11 @@ mod tests {
             reasoning_effort_passthrough: false,
             ..Default::default()
         };
-        let dotted = options_for_provider_ref(&config, "openai.gw", &fallback_off);
+        let dotted = options_for_provider_ref(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "openai.gw",
+            &fallback_off,
+        );
         assert!(
             dotted.reasoning_effort_passthrough,
             "dotted ref resolves its own entry's opt-in, not the fallback's"
@@ -3348,7 +3368,10 @@ mod tests {
         );
 
         let entry = config.providers.models.find("openai", "corp");
-        let options = model_provider_runtime_options_from_model_provider_entry(&config, entry);
+        let options = model_provider_runtime_options_from_model_provider_entry(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            entry,
+        );
         assert_eq!(
             options.tls_ca_cert_path.as_deref(),
             Some("/tmp/example-ca.pem"),
@@ -3371,7 +3394,11 @@ mod tests {
             },
         );
 
-        let options = provider_runtime_options_for_alias(&config, "openai", "primary");
+        let options = provider_runtime_options_for_alias(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "openai",
+            "primary",
+        );
         assert_eq!(options.provider_kind.as_deref(), Some("openai-compatible"));
         assert_eq!(
             options.provider_api_url.as_deref(),
@@ -3431,7 +3458,7 @@ mod tests {
             },
         );
         let provider = create_routed_model_provider_with_options(
-            &config,
+            &zeroclaw_config::migration::admit_test_input(&config),
             "openai.primary",
             Some("sk-test"),
             Some(&format!("http://{addr}/v1")),
@@ -3516,11 +3543,20 @@ mod tests {
             for (selection, accepted) in [("large", true), ("inherited", false)] {
                 let reference = format!("hailo_ollama.edge.{selection}");
                 let provider = if reliable {
-                    model::build_model(&config, "worker", &reference, None)
-                        .unwrap()
-                        .into_provider()
+                    model::build_model(
+                        &zeroclaw_config::migration::admit_test_input(&config),
+                        "worker",
+                        &reference,
+                        None,
+                    )
+                    .unwrap()
+                    .into_provider()
                 } else {
-                    create_model_provider_from_ref(&config, &reference).unwrap()
+                    create_model_provider_from_ref(
+                        &zeroclaw_config::migration::admit_test_input(&config),
+                        &reference,
+                    )
+                    .unwrap()
                 };
                 let result = ProviderDispatch::from_ref(provider.as_ref())
                     .chat_with_history(&messages, "hailo-id", None)
@@ -3632,7 +3668,7 @@ mod tests {
             model_ref: "custom.primary.fast".to_string(),
         }];
         let provider = create_routed_model_provider_with_options(
-            &config,
+            &zeroclaw_config::migration::admit_test_input(&config),
             "openai.source",
             Some("sk-source"),
             None,
@@ -3720,9 +3756,13 @@ mod tests {
         // Config-to-wire proof for the opted-in alias: the runtime effort
         // setting, the entry's opt-in, and the factory dispatch all have to
         // line up for `reasoning_effort` to reach a non-OpenAI model name.
-        let options = provider_runtime_options_for_alias(&config, "openai", "gw");
+        let options = provider_runtime_options_for_alias(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "openai",
+            "gw",
+        );
         let provider = create_routed_model_provider_with_options(
-            &config,
+            &zeroclaw_config::migration::admit_test_input(&config),
             "openai.gw",
             Some("sk-test"),
             Some(&format!("http://{addr}/v1")),
@@ -3757,10 +3797,14 @@ mod tests {
         // compatible family here: a bare `openai` ref dispatches to the
         // native OpenAI chat provider, which never applies runtime
         // reasoning_effort, so the isolation would be unobservable there.
-        let bare_options = options_for_provider_ref(&config, "llamacpp", &options);
+        let bare_options = options_for_provider_ref(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "llamacpp",
+            &options,
+        );
         assert!(!bare_options.reasoning_effort_passthrough);
         let bare_provider = create_routed_model_provider_with_options(
-            &config,
+            &zeroclaw_config::migration::admit_test_input(&config),
             "llamacpp",
             None,
             Some(&format!("http://{addr}/v1")),
@@ -3826,13 +3870,21 @@ mod tests {
                 },
             },
         );
-        let options = provider_runtime_options_for_alias(&config, "openai", "primary");
+        let options = provider_runtime_options_for_alias(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "openai",
+            "primary",
+        );
         assert_eq!(
             options.provider_api_url.as_deref(),
             Some("http://primary.example/v1")
         );
 
-        let route_options = options_for_provider_ref(&config, "openrouter", &options);
+        let route_options = options_for_provider_ref(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "openrouter",
+            &options,
+        );
 
         assert_eq!(route_options.provider_kind, None);
         assert_eq!(route_options.provider_api_url, None);
@@ -3868,11 +3920,15 @@ mod tests {
             "route-model",
             Some("route-key"),
         );
-        let options = provider_runtime_options_for_alias(&config, "openai", "primary");
+        let options = provider_runtime_options_for_alias(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "openai",
+            "primary",
+        );
         assert_eq!(options.provider_kind.as_deref(), Some("openai-compatible"));
 
         let provider = create_routed_model_provider_with_options(
-            &config,
+            &zeroclaw_config::migration::admit_test_input(&config),
             "openai.primary",
             Some("sk-test"),
             None,
@@ -4328,15 +4384,34 @@ mod tests {
                 },
             );
             let reference = format!("custom.{alias}.typo");
-            assert!(crate::model::build_model(&config, "worker", &reference, None).is_err());
             assert!(
-                crate::model::build_model(&config, "worker", &reference, Some("explicit-id"))
-                    .is_err()
+                crate::model::build_model(
+                    &zeroclaw_config::migration::admit_test_input(&config),
+                    "worker",
+                    &reference,
+                    None
+                )
+                .is_err()
             );
-            assert!(create_model_provider_from_ref_with_model(&config, &reference).is_err());
+            assert!(
+                crate::model::build_model(
+                    &zeroclaw_config::migration::admit_test_input(&config),
+                    "worker",
+                    &reference,
+                    Some("explicit-id")
+                )
+                .is_err()
+            );
+            assert!(
+                create_model_provider_from_ref_with_model(
+                    &zeroclaw_config::migration::admit_test_input(&config),
+                    &reference
+                )
+                .is_err()
+            );
             assert!(
                 create_resilient_model_provider_from_ref(
-                    &config,
+                    &zeroclaw_config::migration::admit_test_input(&config),
                     &reference,
                     None,
                     None,
@@ -4346,12 +4421,17 @@ mod tests {
                 .is_err()
             );
             assert!(
-                crate::model::build_model(&config, "worker", &format!("custom.{alias}"), None)
-                    .is_ok()
+                crate::model::build_model(
+                    &zeroclaw_config::migration::admit_test_input(&config),
+                    "worker",
+                    &format!("custom.{alias}"),
+                    None
+                )
+                .is_ok()
             );
             assert!(
                 crate::model::build_model(
-                    &config,
+                    &zeroclaw_config::migration::admit_test_input(&config),
                     "worker",
                     &format!("custom.{alias}.selected"),
                     None
@@ -5207,7 +5287,9 @@ mod tests {
         entry.uri = Some("https://primary.example.test/v1".into());
         entry.max_tokens = Some(42);
         entry.vision = Some(false);
-        let options = provider_runtime_options_for_bare_family(&config);
+        let options = provider_runtime_options_for_bare_family(
+            &zeroclaw_config::migration::admit_test_input(&config),
+        );
         assert_eq!(options.reasoning_enabled, Some(true));
         assert_eq!(options.reasoning_effort.as_deref(), Some("high"));
         assert!(options.secrets_encrypt);
@@ -5247,8 +5329,15 @@ mod tests {
                 },
             );
             for options in [
-                provider_runtime_options_for_alias(&config, "qwen", "oauth"),
-                provider_runtime_options_for_agent(&config, "worker"),
+                provider_runtime_options_for_alias(
+                    &zeroclaw_config::migration::admit_test_input(&config),
+                    "qwen",
+                    "oauth",
+                ),
+                provider_runtime_options_for_agent(
+                    &zeroclaw_config::migration::admit_test_input(&config),
+                    "worker",
+                ),
             ] {
                 assert!(
                     options.provider_api_url.is_none(),
@@ -5265,8 +5354,15 @@ mod tests {
                 .base
                 .uri = Some("http://127.0.0.1:1/explicit/v1".into());
             for options in [
-                provider_runtime_options_for_alias(&config, "qwen", "oauth"),
-                provider_runtime_options_for_agent(&config, "worker"),
+                provider_runtime_options_for_alias(
+                    &zeroclaw_config::migration::admit_test_input(&config),
+                    "qwen",
+                    "oauth",
+                ),
+                provider_runtime_options_for_agent(
+                    &zeroclaw_config::migration::admit_test_input(&config),
+                    "worker",
+                ),
             ] {
                 assert_eq!(
                     options.provider_api_url.as_deref(),
@@ -5573,11 +5669,10 @@ mod tests {
         // and routes to OpenAiCodexModelProvider. `dispatch_family_factory` is
         // called directly (no ReliableModelProvider wrapper) so `capabilities()`
         // reflects the inner provider's values.
-        let result = factory::dispatch_family_factory(
-            Some(&config),
+        let result = factory::dispatch_test_alias(
+            &config,
             "openai",
             arbitrary_alias,
-            None,
             None,
             &ModelProviderRuntimeOptions::default(),
         );
@@ -5648,8 +5743,14 @@ mod tests {
             },
         );
 
-        let openai_opts = provider_runtime_options_for_agent(&config, "openai_agent");
-        let anthropic_opts = provider_runtime_options_for_agent(&config, "anthropic_agent");
+        let openai_opts = provider_runtime_options_for_agent(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "openai_agent",
+        );
+        let anthropic_opts = provider_runtime_options_for_agent(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "anthropic_agent",
+        );
 
         assert_eq!(
             openai_opts.provider_max_tokens,
@@ -5692,7 +5793,7 @@ mod tests {
         }
 
         let result = create_resilient_model_provider_for_alias(
-            &config,
+            &zeroclaw_config::migration::admit_test_input(&config),
             "openai",
             "a0",
             None,

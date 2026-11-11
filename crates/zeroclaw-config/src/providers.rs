@@ -247,10 +247,10 @@ macro_rules! emit_model_providers_struct {
                 #[nested]
                 pub $field: HashMap<String, $cfg_ty>,
             )+
-            /// Canonical model definitions. This is an in-memory bridge
-            /// while the old typed family consumers are migrated. Canonical
-            /// and legacy entries may coexist during that migration; each
-            /// top-level row keeps its own exact TOML key.
+            /// Authoritative model definitions after Config input admission.
+            /// Historical family maps are transient input only and are empty
+            /// before any consumer receives the configuration. Each model row
+            /// keeps its complete, opaque TOML key.
             #[serde(skip)]
             pub(crate) canonical_models: BTreeMap<ModelRef, ModelDefinition<serde_json::Value>>,
         }
@@ -369,7 +369,7 @@ impl ModelProviders {
 
     /// Whether the canonical exact-key map contains at least one model for a
     /// capability. Consumers use this to decide whether an enabled subsystem
-    /// can rely on canonical registration before falling back to legacy maps.
+    /// resolve only admitted canonical registrations.
     pub fn has_canonical_capability(&self, capability: Capability) -> bool {
         self.canonical_models
             .values()
@@ -1069,7 +1069,9 @@ pub(crate) mod canonical_connection_secrets {
 #[serde(default, deny_unknown_fields)]
 struct ProvidersWire {
     models: ModelProviders,
+    #[serde(skip_serializing_if = "TtsProviders::is_empty")]
     tts: TtsProviders,
+    #[serde(skip_serializing_if = "TranscriptionProviders::is_empty")]
     transcription: TranscriptionProviders,
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     connections: std::collections::BTreeMap<ProviderId, ProviderConnection>,
@@ -1096,7 +1098,7 @@ impl Serialize for Providers {
 impl<'de> Deserialize<'de> for Providers {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let wire = ProvidersWire::deserialize(deserializer)?;
-        let mut providers = Self {
+        let providers = Self {
             models: wire.models,
             tts: wire.tts,
             transcription: wire.transcription,
@@ -1104,227 +1106,19 @@ impl<'de> Deserialize<'de> for Providers {
             model_presets: wire.model_presets,
             fallback: wire.fallback,
         };
-        if !providers.models.canonical_models.is_empty()
-            || !providers.connections.is_empty()
-            || !providers.model_presets.is_empty()
-            || !providers.fallback.is_empty()
-        {
-            let raw_models = std::mem::take(&mut providers.models.canonical_models);
-            let registry = ProviderRegistry::from_raw_parts(
-                providers.connections.clone(),
-                raw_models.clone(),
-                providers.model_presets.clone(),
-                providers.fallback.clone(),
-            )
-            .map_err(serde::de::Error::custom)?;
-            providers.connections = registry.connections;
-            providers.model_presets = registry.model_presets;
-            providers.fallback = registry.fallback;
-            providers.models.canonical_models = raw_models;
-        }
         Ok(providers)
     }
 }
 
 impl Providers {
-    /// Build the validated canonical registry for a consumer admission. This
-    /// view is materialized on demand and is never stored as a second config
-    /// snapshot.
+    /// Resolve only admitted canonical definitions. Historical input is
+    /// normalized before a Config is returned to any consumer.
     pub fn canonical_registry(
         &self,
     ) -> Result<ProviderRegistry, super::provider_registry::RegistryError> {
-        // Compatibility is confined to this config read boundary. Consumers
-        // receive one exact-key registry and never parse family/profile refs.
-        let mut connections = self.connections.clone();
-        let mut models = self.models.canonical_models.clone();
-        let legacy = serde_json::to_value(&self.models).map_err(|error| {
-            super::provider_registry::RegistryError::new(["providers", "models"], error.to_string())
-        })?;
-        for (family, alias, profile) in self.models.iter_entries() {
-            let profile_ref = format!("{family}.{alias}");
-            let mut raw = legacy[family][alias].clone();
-            if profile.uri.is_none()
-                && family != "qwen"
-                && let Some(uri) = self.models.resolved_endpoint_uri(family, alias)
-            {
-                raw["uri"] = serde_json::Value::String(uri.to_string());
-            }
-            let selected = profile.models.get("default").or_else(|| {
-                (profile.models.len() == 1)
-                    .then(|| profile.models.values().next())
-                    .flatten()
-            });
-            let entries = std::iter::once((profile_ref.clone(), selected)).chain(
-                profile
-                    .models
-                    .iter()
-                    .map(|(name, entry)| (format!("{profile_ref}.{name}"), Some(entry))),
-            );
-            for (reference, entry) in entries {
-                let model_ref = ModelRef::from(reference.as_str());
-                if models.contains_key(&model_ref) {
-                    continue;
-                }
-                let (connection, mut model) = crate::migration::legacy_chat_definition(
-                    &raw, family, entry, None,
-                )
-                .map_err(|error| {
-                    super::provider_registry::RegistryError::new(
-                        ["providers", "models", reference.as_str()],
-                        error.to_string(),
-                    )
-                })?;
-                let provider_id = ProviderId::from(format!("legacy.{profile_ref}"));
-                if self.connections.contains_key(&provider_id) {
-                    return Err(super::provider_registry::RegistryError::new(
-                        ["providers", "connections", provider_id.as_str()],
-                        "legacy connection name conflicts with an explicit connection",
-                    ));
-                }
-                let connection = serde_json::from_value(connection).map_err(|error| {
-                    super::provider_registry::RegistryError::new(
-                        ["providers", "models", reference.as_str()],
-                        error.to_string(),
-                    )
-                })?;
-                connections.entry(provider_id.clone()).or_insert(connection);
-                model["provider"] = serde_json::Value::String(provider_id.to_string());
-                models.insert(
-                    model_ref,
-                    serde_json::from_value(model).map_err(|error| {
-                        super::provider_registry::RegistryError::new(
-                            ["providers", "models", reference.as_str()],
-                            error.to_string(),
-                        )
-                    })?,
-                );
-            }
-        }
-
-        // Project the remaining typed compatibility tables into the same
-        // exact-key registry. This keeps TTS/ASR consumers independent from
-        // their retired family maps while preserving their legacy defaults.
-        for (family, alias, base) in self.tts.iter_entries() {
-            let legacy_ref = ModelRef::from(format!("{family}.{alias}"));
-            let reference = if models.contains_key(&legacy_ref) {
-                ModelRef::from(format!("tts.{family}.{alias}"))
-            } else {
-                legacy_ref
-            };
-            if models.contains_key(&reference) {
-                continue;
-            }
-            let provider_id = ProviderId::from(format!("legacy.tts.{family}.{alias}"));
-            let mut connection = serde_json::json!({"kind": family});
-            if let Some(uri) = base.uri.as_deref() {
-                connection["uri"] = serde_json::Value::String(uri.to_owned());
-            }
-            if let Some(api_key) = base.api_key.as_deref() {
-                connection["auth"] = serde_json::json!({"mode":"api_key","api_key":api_key});
-            }
-            if let Some(command) = base.binary_path.as_deref() {
-                if matches!(family, "edge" | "piper") {
-                    connection["api"] = serde_json::json!({"tts":{"command":command}});
-                }
-            }
-            let mut options = serde_json::Map::new();
-            for (field, value) in [
-                ("voice", base.voice.clone().map(serde_json::Value::String)),
-                ("speed", base.speed.map(serde_json::Value::from)),
-                ("stability", base.stability.map(serde_json::Value::from)),
-                (
-                    "similarity_boost",
-                    base.similarity_boost.map(serde_json::Value::from),
-                ),
-                (
-                    "language",
-                    base.language_code.clone().map(serde_json::Value::String),
-                ),
-                (
-                    "format",
-                    base.response_format.clone().map(serde_json::Value::String),
-                ),
-            ] {
-                if let Some(value) = value {
-                    options.insert(field.to_owned(), value);
-                }
-            }
-            let mut model = serde_json::json!({
-                "capability": "tts",
-                "provider": provider_id.as_str(),
-                "options": options,
-            });
-            if let Some(model_id) = base.model.as_deref() {
-                model["model"] = serde_json::Value::String(model_id.to_owned());
-            }
-            connections.insert(
-                provider_id.clone(),
-                serde_json::from_value(connection).map_err(|error| {
-                    super::provider_registry::RegistryError::new(
-                        ["providers", "tts", family, alias],
-                        error.to_string(),
-                    )
-                })?,
-            );
-            models.insert(
-                reference,
-                serde_json::from_value(model).map_err(|error| {
-                    super::provider_registry::RegistryError::new(
-                        ["providers", "tts", family, alias],
-                        error.to_string(),
-                    )
-                })?,
-            );
-        }
-        for (family, alias, entry) in self.transcription.iter_entries() {
-            let legacy_ref = ModelRef::from(format!("{family}.{alias}"));
-            let reference = if models.contains_key(&legacy_ref) {
-                ModelRef::from(format!("asr.{family}.{alias}"))
-            } else {
-                legacy_ref
-            };
-            if models.contains_key(&reference) {
-                continue;
-            }
-            let raw = match entry {
-                TranscriptionProviderEntry::Groq(value) => serde_json::to_value(value),
-                TranscriptionProviderEntry::OpenAi(value) => serde_json::to_value(value),
-                TranscriptionProviderEntry::Deepgram(value) => serde_json::to_value(value),
-                TranscriptionProviderEntry::AssemblyAi(value) => serde_json::to_value(value),
-                TranscriptionProviderEntry::Google(value) => serde_json::to_value(value),
-                TranscriptionProviderEntry::LocalWhisper(value) => serde_json::to_value(value),
-            }
-            .map_err(|error| {
-                super::provider_registry::RegistryError::new(
-                    ["providers", "transcription", family, alias],
-                    error.to_string(),
-                )
-            })?;
-            let provider_id = ProviderId::from(format!("legacy.asr.{family}.{alias}"));
-            let (connection, model) =
-                super::provider_registry::input::asr_definition(&raw, family, &provider_id)
-                    .map_err(|error| {
-                        super::provider_registry::RegistryError::new(
-                            ["providers", "transcription", family, alias],
-                            error.to_string(),
-                        )
-                    })?;
-            connections.entry(provider_id).or_insert(connection);
-            models.insert(
-                reference,
-                serde_json::to_value(model)
-                    .and_then(serde_json::from_value)
-                    .map_err(|error| {
-                        super::provider_registry::RegistryError::new(
-                            ["providers", "transcription", family, alias],
-                            error.to_string(),
-                        )
-                    })?,
-            );
-        }
         ProviderRegistry::from_raw_parts(
-            connections,
-            models,
+            self.connections.clone(),
+            self.models.canonical_models.clone(),
             self.model_presets.clone(),
             self.fallback.clone(),
         )
@@ -1574,7 +1368,10 @@ model = "gpt-4o-mini"
                 .canonical_model(&ModelRef::from("chat"))
                 .is_none()
         );
-        let registry = providers
+        let config: crate::schema::Config =
+            serde_json::from_value(serde_json::json!({"providers":providers})).unwrap();
+        let registry = config
+            .providers
             .canonical_registry()
             .expect("canonical registry should validate");
         assert!(

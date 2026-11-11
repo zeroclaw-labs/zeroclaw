@@ -591,7 +591,8 @@ model = "fast-id"
                     ..Default::default()
                 },
             );
-            let groups = enabled_pricing_groups(&config);
+            let groups =
+                enabled_pricing_groups(&zeroclaw_config::migration::admit_test_input(&config));
             assert_eq!(groups.len(), 1);
             assert_eq!(groups[0].wanted.len(), 2);
             assert!(

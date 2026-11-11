@@ -3601,7 +3601,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             ));
             let rpc_auth = Arc::new(
                 zeroclaw_runtime::rpc::auth::RpcInboundAuth::from_config(
-                    &config,
+                    &zeroclaw_config::migration::admit_test_input(&config),
                     Arc::clone(&pairing),
                 )
                 .expect("inbound auth builds"),
@@ -5807,10 +5807,14 @@ data: {\"type\":\"message_stop\"}\n\n",
         // The ollama family builds through the OpenAI-compatible provider,
         // so its attribution kind is Plugin; the entry alias is what pins
         // the provider to the live reference.
-        let (provider, model, temperature) =
-            ws_consolidation_model(Arc::new(config.clone()), "worker", "ollama.agent", "llama3")
-                .await
-                .expect("the switched reference must resolve");
+        let (provider, model, temperature) = ws_consolidation_model(
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
+            "worker",
+            "ollama.agent",
+            "llama3",
+        )
+        .await
+        .expect("the switched reference must resolve");
         assert_eq!(model, "llama3");
         assert_eq!(
             temperature.resolve_for(None),
@@ -5828,10 +5832,14 @@ data: {\"type\":\"message_stop\"}\n\n",
         );
 
         // Without a live model (empty), the switched entry's own model is used.
-        let (provider, model, temperature) =
-            ws_consolidation_model(Arc::new(config.clone()), "worker", "ollama.agent", "")
-                .await
-                .expect("the switched reference must resolve");
+        let (provider, model, temperature) = ws_consolidation_model(
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
+            "worker",
+            "ollama.agent",
+            "",
+        )
+        .await
+        .expect("the switched reference must resolve");
         assert_eq!(model, "agent-entry-model");
         assert_eq!(temperature.resolve_for(None), Some(0.3));
         assert!(matches!(
@@ -5846,7 +5854,7 @@ data: {\"type\":\"message_stop\"}\n\n",
         // from the switched ollama entry — both must follow their own
         // reference.
         let (provider, model, temperature) = ws_consolidation_model(
-            Arc::new(config.clone()),
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
             "worker",
             "openai.install",
             "install-wide-model",
@@ -5865,14 +5873,24 @@ data: {\"type\":\"message_stop\"}\n\n",
         // `<family>.<alias>` — skips consolidation instead of falling back
         // to an unrelated entry.
         assert!(
-            ws_consolidation_model(Arc::new(config.clone()), "worker", "ollama.gone", "m")
-                .await
-                .is_none()
+            ws_consolidation_model(
+                Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
+                "worker",
+                "ollama.gone",
+                "m"
+            )
+            .await
+            .is_none()
         );
         assert!(
-            ws_consolidation_model(Arc::new(config), "worker", "not-dotted", "m")
-                .await
-                .is_none()
+            ws_consolidation_model(
+                Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
+                "worker",
+                "not-dotted",
+                "m"
+            )
+            .await
+            .is_none()
         );
     }
 
@@ -5981,7 +5999,10 @@ data: {\"type\":\"message_stop\"}\n\n",
         assert!(live.snapshot().memory.consolidation_extract_facts);
 
         let config = agent.admitted_model_config().unwrap();
-        assert!(Arc::ptr_eq(&config, &admitted));
+        assert!(Arc::ptr_eq(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            &admitted
+        ));
         let (_, _, model) = agent.attribution_fields();
         let (provider, model, sampling) = ws_consolidation_model(
             Arc::clone(&config),
@@ -6053,7 +6074,8 @@ data: {\"type\":\"message_stop\"}\n\n",
         );
 
         assert!(
-            needs_onboarding_ws_error(&config).is_none(),
+            needs_onboarding_ws_error(&zeroclaw_config::migration::admit_test_input(&config))
+                .is_none(),
             "current configured model must allow WebSocket agent construction to continue"
         );
     }

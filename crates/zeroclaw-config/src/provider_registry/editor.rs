@@ -18,7 +18,7 @@ pub struct RegistryEdit {
     /// Masked document originally read by the editor. Compared under the
     /// existing config commit lock so a stale editor cannot overwrite changes.
     pub expected: Value,
-    /// Complete canonical registry candidate, including projected legacy entries.
+    /// Complete canonical registry candidate.
     pub registry: Value,
 }
 
@@ -39,7 +39,7 @@ pub fn snapshot(config: &Config) -> Result<Value> {
 }
 
 /// Edit exact registry keys on a caller-owned candidate using the same
-/// validation, credential preservation and legacy promotion as the UI.
+/// validation and credential preservation as the UI.
 /// Persistence and live publication remain the caller's transaction.
 pub fn update(
     config: &mut Config,
@@ -67,68 +67,28 @@ pub fn stage(config: &mut Config, edit: RegistryEdit) -> Result<()> {
     );
     let mut registry: super::ProviderRegistry =
         serde_json::from_value(edit.registry).context("invalid provider registry")?;
-    // `snapshot` is built from the projected registry, so legacy typed
-    // providers appear as generated `legacy.*` connections even though they
-    // are not stored in `providers.connections`.  Use that same projection to
-    // restore masked credentials during an unchanged edit.
-    let projected_current = config.provider_registry()?;
     for (id, connection) in &mut registry.connections {
-        if let Some(current) = config
-            .providers
-            .connections
-            .get(id)
-            .or_else(|| projected_current.connections.get(id))
-        {
+        if let Some(current) = config.providers.connections.get(id) {
             connection.restore_secrets_from(current);
         }
         connection.validate_editor_secrets()?;
     }
     let mut candidate = config.clone();
-    promote_embedding_bindings(&mut candidate, &projected_current, &mut registry)?;
-    let raw_models = serde_json::from_value(serde_json::to_value(&registry.models)?)?;
-    // An editor save promotes the complete projection to canonical storage.
-    // Keeping the legacy tables would create a second source for edited
-    // connections and regenerate deleted models on the next read. Retain the
-    // projected definitions themselves, including restored credentials.
-    let mut agents_changed = false;
-    for agent in candidate.agents.values_mut() {
-        if let Some(reference) = projected_speech_reference(
-            config,
-            &projected_current,
-            &registry,
-            agent.tts_provider.as_str(),
-            zeroclaw_api::capability::Capability::Tts,
-        )? {
-            agent.tts_provider = reference.into();
-            agents_changed = true;
-        }
-        if let Some(reference) = projected_speech_reference(
-            config,
-            &projected_current,
-            &registry,
-            agent.transcription_provider.as_str(),
-            zeroclaw_api::capability::Capability::Asr,
-        )? {
-            agent.transcription_provider = reference.into();
-            agents_changed = true;
-        }
-    }
     candidate.providers.connections = registry.connections;
-    candidate.providers.models = Default::default();
-    candidate.providers.tts = Default::default();
-    candidate.providers.transcription = Default::default();
-    candidate.providers.models.canonical_models = raw_models;
+    candidate.providers.models.canonical_models =
+        serde_json::from_value(serde_json::to_value(registry.models)?)?;
     candidate.providers.model_presets = registry.model_presets;
     candidate.providers.fallback = registry.fallback;
-    // Those section-only definitions were included in the projection above.
-    // Retire their source after promotion so a deletion cannot regenerate them.
-    candidate.transcription.api_key = None;
-    candidate.transcription.openai = None;
-    candidate.transcription.deepgram = None;
-    candidate.transcription.assemblyai = None;
-    candidate.transcription.google = None;
-    candidate.transcription.local_whisper = None;
-    serde_json::to_value(&candidate.providers)?;
+    let previous = serde_json::to_value(&config.providers)?;
+    let admitted = serde_json::to_value(&candidate.providers)?;
+    // Keep external references only for credentials that were left untouched.
+    // Removed/changed credentials must never be recreated during save.
+    candidate.onepassword_reference_snapshots.retain(|path, _| {
+        path.strip_prefix("/providers").is_none_or(|pointer| {
+            previous.pointer(pointer).is_some()
+                && previous.pointer(pointer) == admitted.pointer(pointer)
+        })
+    });
     candidate.validate()?;
     // Memory's canonical model reference is outside the provider graph. Do
     // not admit deletion or a capability change while that consumer still
@@ -145,187 +105,9 @@ pub fn stage(config: &mut Config, edit: RegistryEdit) -> Result<()> {
             .resolve_embedding(&super::ModelRef::from(reference))
             .context("invalid memory.embedding_model_ref")?;
     }
-    super::env_input::remap_after_promotion(config, &mut candidate)?;
     candidate.mark_dirty("providers");
-    candidate.mark_dirty("transcription");
-    if agents_changed {
-        candidate.mark_dirty("agents");
-    }
     *config = candidate;
     Ok(())
-}
-
-/// Materialize legacy embedding consumers before retiring their profiles.
-/// The generated model owns its upstream ID/dimensions. Native embedding
-/// connections are reused; chat-only kinds with an explicit compatible endpoint
-/// need a separate custom connection to retain their legacy embedding protocol.
-fn promote_embedding_bindings(
-    config: &mut Config,
-    current: &super::ProviderRegistry,
-    candidate: &mut super::ProviderRegistry,
-) -> Result<()> {
-    fn embedding_connection(
-        candidate: &mut super::ProviderRegistry,
-        provider: &super::ProviderId,
-    ) -> Result<super::ProviderId> {
-        use zeroclaw_api::capability::Capability;
-
-        let connection = candidate
-            .connections
-            .get(provider)
-            .context("cannot delete a connection used by legacy embeddings")?;
-        if connection
-            .implemented_capabilities()
-            .contains(&Capability::Embedding)
-        {
-            ensure!(
-                connection.supports(Capability::Embedding),
-                "legacy embedding connection does not support embeddings"
-            );
-            return Ok(provider.clone());
-        }
-        // The legacy embedder used any explicit profile URI as an OpenAI
-        // compatible embedding endpoint, independently of the chat driver.
-        // Preserve that protocol without broadening the native driver's
-        // capabilities. The edited connection is the sole migration input.
-        let uri = connection
-            .uri()
-            .map(str::trim)
-            .filter(|uri| !uri.is_empty())
-            .context("legacy embeddings on a chat-only connection require an explicit URI")?;
-        let promoted = super::ProviderConnection::Custom(super::CompatibleConnection {
-            capabilities: [Capability::Embedding].into_iter().collect(),
-            uri: Some(uri.to_owned()),
-            auth: Some(super::ApiKeyAuth::ApiKey {
-                api_key: connection.api_key().map(str::to_owned),
-            }),
-            extra_headers: connection.extra_headers().cloned().unwrap_or_default(),
-            tls_ca_cert_path: connection.tls_ca_cert_path().map(str::to_owned),
-            api: Default::default(),
-        });
-        let definition = serde_json::to_value(&promoted)?;
-        let base = format!("embedding.{provider}");
-        let mut id = super::ProviderId::from(base.as_str());
-        let mut suffix = 2;
-        while let Some(existing) = candidate.connections.get(&id) {
-            if serde_json::to_value(existing)? == definition {
-                return Ok(id);
-            }
-            id = format!("{base}.{suffix}").into();
-            suffix += 1;
-        }
-        candidate.connections.insert(id.clone(), promoted);
-        Ok(id)
-    }
-
-    fn promote(
-        profiles: &crate::providers::ModelProviders,
-        current: &super::ProviderRegistry,
-        candidate: &mut super::ProviderRegistry,
-        reference: &str,
-        model: &str,
-        dimensions: usize,
-        suggested: &str,
-    ) -> Result<Option<super::ModelRef>> {
-        if !profiles
-            .profile_ref(reference.trim())
-            .is_some_and(|(family, alias)| profiles.find(family, alias).is_some())
-        {
-            return Ok(None);
-        }
-        let Some(source) = current.models.get(reference.trim()) else {
-            return Ok(None);
-        };
-        if source.capability() != zeroclaw_api::capability::Capability::Chat {
-            return Ok(None);
-        }
-        let provider = embedding_connection(candidate, source.provider())?;
-        ensure!(
-            !model.trim().is_empty() && dimensions > 0,
-            "legacy embedding model and dimensions must be configured"
-        );
-        let mut name = super::ModelRef::from(suggested);
-        let mut suffix = 2;
-        while candidate.models.contains_key(&name) {
-            name = format!("{suggested}.{suffix}").into();
-            suffix += 1;
-        }
-        candidate.models.insert(
-            name.clone(),
-            super::ModelDefinition::Embedding(super::EmbeddingModelConfig {
-                provider,
-                model: model.trim().to_owned(),
-                metadata: super::EmbeddingMetadata {
-                    dimensions: Some(dimensions),
-                },
-            }),
-        );
-        Ok(Some(name))
-    }
-
-    if config
-        .memory
-        .embedding_model_ref
-        .as_deref()
-        .is_none_or(|r| r.trim().is_empty())
-        && !config.memory.embedding_model.starts_with("hint:")
-        && let Some(reference) = promote(
-            &config.providers.models,
-            current,
-            candidate,
-            &config.memory.embedding_provider,
-            &config.memory.embedding_model,
-            config.memory.embedding_dimensions,
-            "embedding.memory",
-        )?
-    {
-        config.memory.embedding_model_ref = Some(reference.to_string());
-        config.mark_dirty("memory");
-    }
-    let mut routes_changed = false;
-    for route in &mut config.embedding_routes {
-        if let Some(reference) = promote(
-            &config.providers.models,
-            current,
-            candidate,
-            &route.model_provider,
-            &route.model,
-            route
-                .dimensions
-                .unwrap_or(config.memory.embedding_dimensions),
-            &format!("embedding.route.{}", route.hint),
-        )? {
-            route.model_provider = reference.to_string();
-            route.model.clear();
-            route.dimensions = None;
-            routes_changed = true;
-        }
-    }
-    if routes_changed {
-        config.mark_dirty("embedding_routes");
-    }
-    Ok(())
-}
-
-fn projected_speech_reference(
-    config: &Config,
-    current: &super::ProviderRegistry,
-    candidate: &super::ProviderRegistry,
-    reference: &str,
-    capability: zeroclaw_api::capability::Capability,
-) -> Result<Option<String>> {
-    if reference.trim().is_empty()
-        || candidate
-            .models
-            .get(&super::ModelRef::from(reference.trim()))
-            .is_some_and(|model| model.capability() == capability)
-    {
-        // A rename may already have rewritten this binding to a new exact
-        // key which exists only in the candidate, not the current registry.
-        return Ok(None);
-    }
-    let projected = config.capability_model_ref_in_registry(current, reference, capability)?;
-    Ok((projected.as_str() != reference).then(|| projected.to_string()))
 }
 
 impl super::ProviderConnection {

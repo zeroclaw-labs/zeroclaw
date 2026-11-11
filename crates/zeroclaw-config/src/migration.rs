@@ -5,7 +5,10 @@ use crate::schema::Config;
 use crate::schema::v1::V1Config;
 use crate::schema::v2::V2Config;
 
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod embedding_fixtures;
 mod model_routes;
+pub(crate) mod provider_inputs;
 
 /// Legacy input adapter for the canonical registry. Keep this conversion in
 /// config; downstream consumers only resolve exact model references.
@@ -1508,7 +1511,11 @@ fn migrate_toml(value: toml::Value) -> Result<Option<Migrated>> {
         // Master already stamped V4 before routes became exact model refs.
         // Accept that input shape at the same boundary as the V3 migration.
         let routes_changed = model_routes::needs_migration(&value);
-        if notices.is_empty() && !selector_omitted && !routes_changed {
+        if notices.is_empty()
+            && !selector_omitted
+            && !routes_changed
+            && !provider_inputs::document_needs_migration(&value)
+        {
             return Ok(None);
         }
         value = model_routes::migrate(value)?;
@@ -1572,6 +1579,7 @@ pub fn migrate_file_with_notices(input: &str) -> Result<Option<(String, Vec<Migr
     let from = detect_version(&value)?;
     if (FIRST_RETIREMENT_ONLY_VERSION..=CURRENT_SCHEMA_VERSION).contains(&from)
         && !model_routes::needs_migration(&value)
+        && !provider_inputs::document_needs_migration(&value)
         && let Ok(mut doc) = input.parse::<toml_edit::DocumentMut>()
     {
         let selector_omitted = !value
@@ -1599,6 +1607,7 @@ pub fn migrate_file_with_notices(input: &str) -> Result<Option<(String, Vec<Migr
     let Some(Migrated { value, notices }) = migrate_toml(value)? else {
         return Ok(None);
     };
+    let value = provider_inputs::migrate_document(value)?;
     let migrated_table = match value {
         toml::Value::Table(t) => t,
         _ => {
@@ -3813,23 +3822,15 @@ temperature = "hot"
         let load = migrate_to_current_salvaged(raw);
         assert_eq!(load.dropped, vec!["providers.models.custom.broken"]);
         assert!(
-            load.config.providers.models.find("ollama", "ai").is_some(),
+            load.config.resolve_model_id("ollama.ai").is_some(),
             "valid alias in another family must survive"
         );
         assert!(
-            load.config
-                .providers
-                .models
-                .find("custom", "rag_bot")
-                .is_some(),
+            load.config.resolve_model_id("custom.rag_bot").is_some(),
             "valid sibling alias must survive"
         );
         assert!(
-            load.config
-                .providers
-                .models
-                .find("custom", "broken")
-                .is_none(),
+            load.config.resolve_model_id("custom.broken").is_none(),
             "only the malformed alias is pruned"
         );
     }
@@ -3855,7 +3856,7 @@ vision_model = "a-vision-capable-openrouter-model"
 enabled = true
 describe_images = true
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("openrouter.default"),
@@ -3931,7 +3932,7 @@ model = "m"
 [multimodal]
 vision_model_provider = "grok"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("xai.default"),
@@ -3965,7 +3966,7 @@ default_model = "vision-model"
 [multimodal]
 vision_model_provider = "grok"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("xai.default"),
@@ -4004,7 +4005,7 @@ model = "grok-model"
 [multimodal]
 vision_model_provider = "grok"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("xai.default"),
@@ -4076,7 +4077,7 @@ model = "vision-model"
 [multimodal]
 vision_model_provider = "custom"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("custom"),
@@ -4121,7 +4122,7 @@ model = "vision-model"
 [multimodal]
 vision_model_provider = "custom"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("custom"),
@@ -4168,7 +4169,7 @@ model = "vision-model"
 [multimodal]
 vision_model_provider = "custom:https://b.example.invalid/v1"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("custom.default"),
@@ -4210,7 +4211,7 @@ default_model = "vision-model"
 [multimodal]
 vision_model_provider = "custom:https://b.example.invalid/v1"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("custom.default"),
@@ -4250,7 +4251,7 @@ default_model = "vision-model"
 [multimodal]
 vision_model_provider = "openai"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("openai.default"),
@@ -4285,7 +4286,7 @@ model = "m"
 [multimodal]
 vision_model_provider = "openai"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("openai.default"),
@@ -4317,7 +4318,7 @@ model = "m"
 [multimodal]
 vision_model_provider = "openai-codex"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("openai.codex"),
@@ -4353,7 +4354,7 @@ default_model = "vision-model"
 [multimodal]
 vision_model_provider = "openai"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("openai"),
@@ -4393,7 +4394,7 @@ api_key = "sk-opencode-test"
 [multimodal]
 vision_model_provider = "openai"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("openai"),
@@ -4433,7 +4434,7 @@ api_key = "opencode-key"
 [multimodal]
 vision_model_provider = "openai"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("openai.default"),
@@ -4466,7 +4467,7 @@ model = "m"
 [multimodal]
 vision_model_provider = "llama.cpp"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("llamacpp.default"),
@@ -4494,7 +4495,7 @@ model = "m"
 [multimodal]
 vision_model_provider = "openai"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("openai"),
@@ -4523,7 +4524,7 @@ model = "m"
 [multimodal]
 vision_model_provider = "qwen"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("qwen"),
@@ -4551,7 +4552,7 @@ model = "m"
 [multimodal]
 vision_model_provider = "qwen-intl"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("qwen-intl"),
@@ -4605,7 +4606,7 @@ model = "m2"
 [multimodal]
 vision_model_provider = "openai"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("openai.default"),
@@ -4641,7 +4642,7 @@ model = "m2"
 [multimodal]
 vision_model_provider = "qwen"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("qwen"),
@@ -4699,7 +4700,7 @@ model = "vision-model"
 [multimodal]
 vision_model_provider = "xai"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("xai"),
@@ -4772,7 +4773,7 @@ default_model = "vision-model"
 [multimodal]
 vision_model_provider = "xai"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("xai.default"),
@@ -4803,7 +4804,7 @@ model = "grok-model"
 [multimodal]
 vision_model_provider = "xai"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("xai.default"),
@@ -4878,7 +4879,7 @@ model = "vision-model"
 [multimodal]
 vision_model_provider = "custom"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("custom.default"),
@@ -4910,7 +4911,7 @@ default_model = "vision-model"
 [multimodal]
 vision_model_provider = "openrouter"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("openrouter.default"),
@@ -4936,7 +4937,7 @@ model = "m"
 [multimodal]
 vision_model_provider = "grok"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("xai.default"),
@@ -4964,7 +4965,7 @@ model = "vision-model"
 [multimodal]
 vision_model_provider = "custom:https://vision.example.invalid/v1"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("custom.default"),
@@ -5025,7 +5026,7 @@ endpoint = "intl"
 [multimodal]
 vision_model_provider = "qwen-intl"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("qwen.default"),
@@ -5071,7 +5072,7 @@ model = "vision-model"
 [multimodal]
 vision_model_provider = "custom"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("custom.default"),
@@ -5106,7 +5107,7 @@ model = "vision-model"
 [multimodal]
 vision_model_provider = "stepfun"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("stepfun"),
@@ -5142,7 +5143,7 @@ model = "vision-model"
 [multimodal]
 vision_model_provider = "stepfun-intl"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("stepfun.default"),
@@ -5182,7 +5183,7 @@ uri = "https://api.stepfun.com/intl/v1/"
 [multimodal]
 vision_model_provider = "stepfun-intl"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("stepfun.default"),
@@ -5247,7 +5248,7 @@ requires_openai_auth = true
 [multimodal]
 vision_model_provider = "openai"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("openai.default"),
@@ -5292,7 +5293,7 @@ oauth_refresh_token = "test-token"
 [multimodal]
 vision_model_provider = "qwen"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("qwen.default"),
@@ -5337,7 +5338,7 @@ wire_api = "responses"
 [multimodal]
 vision_model_provider = "openai"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("openai.default"),
@@ -5391,7 +5392,7 @@ model = "vision-model"
 vision_model_provider = "{raw_source}"
 "#
             );
-            let cfg = migrate_to_current(&raw)
+            let cfg = migrated_provider_input_fixture(&raw)
                 .unwrap_or_else(|e| panic!("legacy variant {raw_source} must migrate: {e}"));
             assert_eq!(
                 cfg.multimodal.vision_model_provider.as_deref(),
@@ -5479,7 +5480,7 @@ model = "vision-model"
 [multimodal]
 vision_model_provider = "qwen"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("qwen"),
@@ -5522,7 +5523,7 @@ model = "other-model"
 [multimodal]
 vision_model_provider = "openai"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("openai.default"),
@@ -5556,7 +5557,7 @@ default_model = "vision-model"
 [multimodal]
 vision_model_provider = "custom:https://vision.example.invalid/v1"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("custom.default"),
@@ -5591,7 +5592,7 @@ model = "vision-model"
 [multimodal]
 vision_model_provider = "custom:https://vision.example.invalid"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("custom:https://vision.example.invalid"),
@@ -5642,11 +5643,7 @@ model = "m"
         let load = migrate_to_current_salvaged(raw);
         assert_eq!(load.dropped, vec!["providers.models.ollama"]);
         assert!(
-            load.config
-                .providers
-                .models
-                .find("custom", "rag_bot")
-                .is_some(),
+            load.config.resolve_model_id("custom.rag_bot").is_some(),
             "valid alias must survive a scalar sibling family"
         );
     }
@@ -9470,4 +9467,36 @@ model = "backup"
             "a moved identity is not reported as removed: {notices:?}"
         );
     }
+}
+
+/// Admit an explicitly constructed historical fixture through the same input
+/// normalization as deserialization. Production consumers never call this.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn normalize_test_input(config: &mut Config) {
+    provider_inputs::normalize(config).expect("valid historical provider fixture");
+}
+
+/// An explicit input boundary for fixtures that keep their historical source
+/// mutable while exercising canonical consumers. Preserve non-serialized state.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn admit_test_input(input: &Config) -> Config {
+    let mut config = input.clone();
+    normalize_test_input(&mut config);
+    config
+}
+
+#[cfg(test)]
+/// Inspect the versioned adapter's provider output before final Config
+/// admission. This intentionally raw fixture never reaches a consumer.
+pub(crate) fn migrated_provider_input_fixture(input: &str) -> Result<Config> {
+    let (document, _) = migrate_value(input)?;
+    let providers = document
+        .get("providers")
+        .cloned()
+        .map(toml::Value::try_into)
+        .transpose()?
+        .unwrap_or_default();
+    let mut config: Config = document.try_into()?;
+    config.providers = providers;
+    Ok(config)
 }

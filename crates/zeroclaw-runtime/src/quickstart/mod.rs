@@ -3997,9 +3997,11 @@ mod tests {
             .models
             .ensure("bedrock", "static")
             .expect("bedrock fixture profile");
-        let provider =
-            zeroclaw_providers::create_model_provider_from_ref(&config, "bedrock.static")
-                .expect("configured Bedrock provider should construct");
+        let provider = zeroclaw_providers::create_model_provider_from_ref(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "bedrock.static",
+        )
+        .expect("configured Bedrock provider should construct");
         let error = zeroclaw_providers::ProviderDispatch::from_ref(&*provider)
             .list_models_with_pricing()
             .await
@@ -4030,8 +4032,8 @@ mod tests {
     }
 
     #[test]
-    fn model_locality_includes_projected_legacy_models_in_mixed_configs() {
-        let cfg = Config {
+    fn model_locality_uses_admitted_models_in_mixed_input() {
+        let mut cfg = Config {
             providers: serde_json::from_value(serde_json::json!({
                 "connections": {"remote": {"kind": "openai"}},
                 "models": {
@@ -4041,6 +4043,7 @@ mod tests {
             })).unwrap(),
             ..Config::default()
         };
+        zeroclaw_config::migration::normalize_test_input(&mut cfg);
         assert!(model_reference_is_local(&cfg, "ollama.home"));
         assert!(!model_reference_is_local(&cfg, "chat.remote"));
         assert!(model_reference_is_local(&cfg, "ollama"));
@@ -4246,10 +4249,13 @@ mod tests {
             },
         );
 
-        let error = model_catalog_with_config_result(Some(&config), "openai.mismatch")
-            .await
-            .expect_err("mismatched credential prefix must reject provider construction")
-            .to_string();
+        let error = model_catalog_with_config_result(
+            Some(&zeroclaw_config::migration::admit_test_input(&config)),
+            "openai.mismatch",
+        )
+        .await
+        .expect_err("mismatched credential prefix must reject provider construction")
+        .to_string();
         assert!(error.contains("could not be constructed"), "{error}");
         assert!(!error.contains("xai-"), "credential prefix leaked: {error}");
         assert!(

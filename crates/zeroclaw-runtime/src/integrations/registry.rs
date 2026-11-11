@@ -555,7 +555,7 @@ mod tests {
                  (drift: name not in `for_each_model_provider_slot!`)",
                 info.name,
             );
-            let entries = all_integrations(&config);
+            let entries = all_integrations(&zeroclaw_config::migration::admit_test_input(&config));
             let integration = entries
                 .iter()
                 .find(|e| e.name == info.display_name)

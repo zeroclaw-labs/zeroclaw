@@ -4450,7 +4450,7 @@ mod tests {
         let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::new());
         let memory: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("lean"));
         let built = all_tools_with_runtime(
-            Arc::new(config.clone()),
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
             "lean",
@@ -4464,7 +4464,7 @@ mod tests {
             tmp.path(),
             &config.agents,
             None,
-            &config,
+            &zeroclaw_config::migration::admit_test_input(&config),
             None,
             false,
             None,
@@ -4478,7 +4478,7 @@ mod tests {
         assert!(built.poll_handle.is_none());
         assert!(built.ask_user_handle.is_none());
         let assembled = ScopedToolRegistry::assemble(ScopedAssembly {
-            config: &config,
+            config: &zeroclaw_config::migration::admit_test_input(&config),
             agent_alias: "lean",
             security: &security,
             built,
@@ -5553,7 +5553,7 @@ permissions = ["http_client"]
         let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::new());
         let memory: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("late"));
         let built = all_tools_with_runtime(
-            Arc::new(config.clone()),
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
             "late",
@@ -5567,7 +5567,7 @@ permissions = ["http_client"]
             tmp.path(),
             &config.agents,
             None,
-            &config,
+            &zeroclaw_config::migration::admit_test_input(&config),
             None,
             false,
             None,
@@ -5625,7 +5625,7 @@ permissions = ["http_client"]
             location: None,
         };
         let assembled = ScopedToolRegistry::assemble(ScopedAssembly {
-            config: &config,
+            config: &zeroclaw_config::migration::admit_test_input(&config),
             agent_alias: "late",
             security: &security,
             built,
@@ -8236,7 +8236,7 @@ permissions = ["http_client"]
             Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
 
         let tools = all_tools_with_runtime(
-            Arc::new(config.clone()),
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
             &security,
             &RiskProfileConfig::default(),
             "test-agent",
@@ -8250,7 +8250,7 @@ permissions = ["http_client"]
             tmp.path(),
             &HashMap::new(),
             None,
-            &config,
+            &zeroclaw_config::migration::admit_test_input(&config),
             None,
             false,
             None,
@@ -8530,7 +8530,7 @@ permissions = ["http_client"]
         let sop_audit = Arc::new(crate::sop::SopAuditLogger::new(Arc::clone(&mem)));
 
         let built = all_tools_with_runtime(
-            Arc::new(cfg.clone()),
+            Arc::new(zeroclaw_config::migration::admit_test_input(&cfg)),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
             "test-agent",
@@ -8544,7 +8544,7 @@ permissions = ["http_client"]
             &workspace,
             &delegate_targets,
             None,
-            &cfg,
+            &zeroclaw_config::migration::admit_test_input(&cfg),
             None,
             false,
             None,
@@ -8557,7 +8557,7 @@ permissions = ["http_client"]
         // The scoped assembly mints `execute_pipeline` and the MCP capability
         // tools. `acp_delivery` keeps `deliver_file`, which only ACP turns admit.
         let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
-            config: &cfg,
+            config: &zeroclaw_config::migration::admit_test_input(&cfg),
             agent_alias: "test-agent",
             security: &security,
             built,

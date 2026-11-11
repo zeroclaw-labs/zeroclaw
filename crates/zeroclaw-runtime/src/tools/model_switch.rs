@@ -495,7 +495,10 @@ mod tests {
                     ..Default::default()
                 },
             );
-        let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()), Arc::new(config));
+        let tool = ModelSwitchTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
+        );
         let state = Arc::new(std::sync::Mutex::new(None));
         crate::agent::turn::scope_model_switch_provider_allowlist(
             Some(Arc::new(std::collections::HashSet::from([
@@ -541,7 +544,7 @@ mod tests {
                     ..Default::default()
                 },
             );
-        *generation.write() = Arc::new(next);
+        *generation.write() = Arc::new(zeroclaw_config::migration::admit_test_input(&next));
         let state = Arc::new(std::sync::Mutex::new(None));
         scope_model_switch_state(Arc::clone(&state), async {
             let result = tool
@@ -730,7 +733,10 @@ mod tests {
                     ..Default::default()
                 },
             );
-        let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()), Arc::new(config));
+        let tool = ModelSwitchTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
+        );
 
         with_switch_state(|state| {
             let result = tool
@@ -795,7 +801,10 @@ mod tests {
                     ..Default::default()
                 },
             );
-        let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()), Arc::new(config));
+        let tool = ModelSwitchTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
+        );
 
         with_switch_state(|state| {
             let result = tool
@@ -864,11 +873,14 @@ mod tests {
             .models
             .ensure("hailo_ollama", "edge")
             .unwrap();
-        let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()), Arc::new(config))
-            .with_catalog_resolver(|provider_ref| async move {
-                assert_eq!(provider_ref, "hailo_ollama.edge");
-                Ok(vec!["edge-model".to_string()])
-            });
+        let tool = ModelSwitchTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
+        )
+        .with_catalog_resolver(|provider_ref| async move {
+            assert_eq!(provider_ref, "hailo_ollama.edge");
+            Ok(vec!["edge-model".to_string()])
+        });
 
         let result = tool
             .handle_list_models(&json!({ "model_provider": "hailo_ollama.edge" }))
@@ -977,7 +989,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()), Arc::new(config));
+        let tool = ModelSwitchTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
+        );
 
         let result = tool
             .handle_list_models(&json!({ "model_provider": "ollama.local" }))
@@ -1030,7 +1045,10 @@ mod tests {
         // No `with_catalog_resolver`: this must go through the production
         // `resolve_catalog` -> `ProviderDispatch::from_ref(...).list_models()`
         // call, not the `#[cfg(test)]` resolver shortcut.
-        let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()), Arc::new(config));
+        let tool = ModelSwitchTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
+        );
 
         let _writer_guard = zeroclaw_log::__private_test_writer_lock();
         let _hook_guard = zeroclaw_log::__private_test_hook_lock();
@@ -1087,10 +1105,13 @@ mod tests {
             .models
             .ensure("hailo_ollama", "edge")
             .unwrap();
-        let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()), Arc::new(config))
-            .with_catalog_resolver(|_provider_ref| async {
-                anyhow::bail!("configured catalog denied request")
-            });
+        let tool = ModelSwitchTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
+        )
+        .with_catalog_resolver(|_provider_ref| async {
+            anyhow::bail!("configured catalog denied request")
+        });
 
         let result = tool
             .handle_list_models(&json!({ "model_provider": "hailo_ollama.edge" }))
@@ -1206,7 +1227,7 @@ mod tests {
             .models
             .ensure("hailo_ollama", "log_error")
             .unwrap();
-        let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()), Arc::new(config))
+        let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()), Arc::new(zeroclaw_config::migration::admit_test_input(&config)))
             .with_catalog_resolver(|_provider_ref| async {
                 anyhow::bail!(
                     "GET https://{USER}:{PASSWORD}@api.example.com/v1/models?signature={SIGNATURE} failed"

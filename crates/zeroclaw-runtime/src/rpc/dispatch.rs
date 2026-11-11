@@ -27711,7 +27711,11 @@ mod tests {
         let scope = LiveSessionRefreshScope::ModelProvider("anthropic.default".into());
         let selects = |overrides: &SessionOverrides| {
             scope
-                .resolve_provider_ref(&config, "worker", overrides)
+                .resolve_provider_ref(
+                    &zeroclaw_config::migration::admit_test_input(&config),
+                    "worker",
+                    overrides,
+                )
                 .unwrap()
                 .is_some()
         };
@@ -45374,7 +45378,10 @@ model = "before"
                 hint: "reasoning".into(),
                 model_ref: "openai.routed-provider".into(),
             });
-        let expected = zeroclaw_config::provider_registry::editor::snapshot(&config).unwrap();
+        let expected = zeroclaw_config::provider_registry::editor::snapshot(
+            &zeroclaw_config::migration::admit_test_input(&config),
+        )
+        .unwrap();
         let mut registry = expected.clone();
         registry["models"]["openai.routed-provider"]["metadata"]["context_window"] = json!(16_000);
         let dispatcher = make_config_set_test_dispatcher(config);
@@ -52305,7 +52312,11 @@ model = "before"
             0,
             "the recipient never ran"
         );
-        assert!(crate::cron::list_jobs(&config).unwrap().is_empty());
+        assert!(
+            crate::cron::list_jobs(&zeroclaw_config::migration::admit_test_input(&config))
+                .unwrap()
+                .is_empty()
+        );
 
         // Control: the shared operator's production session keeps the tool,
         // and its peer message does get the recipient's job scheduled.
@@ -52326,7 +52337,9 @@ model = "before"
         }
         let scheduled = tokio::time::timeout(std::time::Duration::from_secs(30), async {
             loop {
-                let jobs = crate::cron::list_jobs(&config).unwrap();
+                let jobs =
+                    crate::cron::list_jobs(&zeroclaw_config::migration::admit_test_input(&config))
+                        .unwrap();
                 if !jobs.is_empty() {
                     break jobs;
                 }

@@ -1,5 +1,5 @@
-//! Normalize historical input at the config boundary. Consumers receive exact
-//! keys and complete definitions, including for an explicit temporary CLI input.
+//! Canonical model inputs and explicit temporary CLI selections. Historical
+//! configuration is normalized in migration before these consumers run.
 
 use anyhow::{Context, Result, ensure};
 use serde_json::json;
@@ -9,39 +9,13 @@ use super::{ModelDefinition, ModelRef, ProviderId, ProviderRegistry};
 use crate::schema::Config;
 
 impl Config {
-    /// Historical section-only injection is translated here, before any
-    /// capability consumer is constructed.
-    pub fn from_transcription_input(input: &crate::schema::TranscriptionConfig) -> Self {
-        Self {
-            transcription: input.clone(),
-            ..Self::default()
-        }
-    }
-    /// Normalize a legacy rename event while its input is still in the config
-    /// boundary. Canonical exact model keys are never treated as prefixes.
+    /// Rename only the complete configured model key.
     pub fn renamed_model_input(&self, current: &str, old: &str, new: &str) -> Option<String> {
-        if current == old {
-            return Some(new.to_owned());
-        }
-        if self
-            .providers
-            .models
-            .canonical_model(&ModelRef::from(current))
-            .is_some()
-        {
-            return None;
-        }
-        let (family, alias) = self.providers.models.profile_ref(current)?;
-        let profile = format!("{family}.{alias}");
-        if profile != old {
-            return None;
-        }
-        let suffix = current.strip_prefix(old)?;
-        Some(format!("{new}{suffix}"))
+        (current == old).then(|| new.to_owned())
     }
 
-    /// Materialize an effort scope from exact model keys. Historical profile
-    /// expansion belongs to this config input boundary, never to runtime.
+    /// Materialize an effort scope from exact model keys. The admitted
+    /// registry is already canonical; no profile expansion happens here.
     pub fn restrict_chat_inputs(
         &mut self,
         allowed: &std::collections::HashSet<String>,
@@ -49,8 +23,6 @@ impl Config {
         let registry = self.provider_registry()?;
         let allowed = |key: &ModelRef| allowed.contains(key.as_str());
         self.providers.models = Default::default();
-        self.providers.tts = Default::default();
-        self.providers.transcription = Default::default();
         self.providers.connections = registry.connections;
         for (key, model) in registry.models {
             if model.capability() != Capability::Chat || allowed(&key) {
@@ -79,9 +51,8 @@ impl Config {
     }
 
     /// Resolve Gemini OAuth client input at the config boundary. New auth
-    /// profiles select an exact connection or model key. A historical Gemini
-    /// alias is decoded here, including credentials configured before login
-    /// without an explicit legacy `auth_mode`.
+    /// profiles select an exact connection or model key. Historical input
+    /// has already been normalized before configuration admission.
     pub fn gemini_oauth_client_credentials(
         &self,
         profile: &str,
@@ -95,11 +66,6 @@ impl Config {
                     .connections
                     .get(model.provider())
                     .context("OAuth model has no connection")?
-            } else if let Some(legacy) = self.providers.models.gemini.get(profile) {
-                return Ok(Some((
-                    legacy.oauth_client_id.clone().unwrap_or_default(),
-                    legacy.oauth_client_secret.clone().unwrap_or_default(),
-                )));
             } else {
                 return Ok(None);
             };
@@ -116,18 +82,6 @@ impl Config {
             )),
             _ => None,
         })
-    }
-
-    /// Historical family/alias input used by fixture-level factory adapters.
-    /// Joining this shape is config compatibility, never protocol dispatch.
-    pub fn chat_registry_for_legacy_alias(
-        &self,
-        family: &str,
-        alias: &str,
-    ) -> Result<(ProviderRegistry, ModelRef)> {
-        let reference = ModelRef::from(format!("{family}.{alias}"));
-        let registry = self.chat_registry_for_input(None, reference.as_str())?;
-        Ok((registry, reference))
     }
 
     /// Normalize catalog CLI input; exact model keys always take precedence.
@@ -172,9 +126,6 @@ impl Config {
             "openai-compatible" | "openai_compatible" => "custom",
             other => other,
         };
-        let (family, _, legacy_defaults) =
-            crate::schema::v2::normalize_provider_type(family, "default");
-        let family = family.as_str();
         // Only the config migration recognizes historical vendor spellings.
         // Every other dot belongs to a registered key, never profile ancestry.
         ensure!(
@@ -192,8 +143,7 @@ impl Config {
             .as_ref()
             .and_then(|key| registry.resolve_chat(key).ok())
             .map(|selected| selected.options);
-        if legacy_defaults.is_empty()
-            && let Some(model) = selected.as_ref()
+        if let Some(model) = selected.as_ref()
             && registry
                 .connections
                 .get(model.provider())
@@ -229,19 +179,15 @@ impl Config {
             registry.validate()?;
             return Ok(registry);
         }
-        let mut raw = json!({});
-        for (field, value) in legacy_defaults {
-            raw[field] = serde_json::to_value(value)?;
-        }
+        let mut connection = json!({"kind":family});
         if let Some(uri) = uri {
             ensure!(
                 uri.starts_with("http://") || uri.starts_with("https://"),
                 "invalid provider URL"
             );
-            raw["uri"] = uri.into();
+            connection["uri"] = uri.into();
         }
-        let (connection, mut model) =
-            crate::migration::legacy_chat_definition(&raw, family, None, None)?;
+        let mut model = json!({"capability":"chat", "provider":""});
         // Preserve model policy when a CLI transport override inherits its model
         // from an agent, while constructing the requested connection afresh.
         if let Some(ModelDefinition::Chat(selected)) = selected {
@@ -275,171 +221,22 @@ impl Config {
         Ok(registry)
     }
 
-    /// Resolve an old speech binding once, before the manager consumes it.
-    /// Explicit exact keys take precedence, including keys containing dots.
+    /// Validate an exact capability-model key; no legacy name rewriting.
     pub fn capability_model_ref(
         &self,
         reference: &str,
         capability: Capability,
     ) -> Result<ModelRef> {
         let registry = self.provider_registry()?;
-        self.capability_model_ref_in_registry(&registry, reference, capability)
-    }
-
-    /// Share input normalization with editor promotion without rebuilding the
-    /// registry or duplicating legacy namespace precedence.
-    pub(crate) fn capability_model_ref_in_registry(
-        &self,
-        registry: &ProviderRegistry,
-        reference: &str,
-        capability: Capability,
-    ) -> Result<ModelRef> {
         let key = ModelRef::from(reference.trim());
-        if let Some(model) = registry.models.get(&key) {
-            // Explicit canonical keys are authoritative. Historical chat and
-            // speech namespaces, however, could use the very same alias; the
-            // projection prefixes speech keys when such a collision occurs.
-            if self.providers.models.canonical_model(&key).is_some() {
-                ensure!(
-                    model.capability() == capability,
-                    "model `{reference}` does not support {capability:?}"
-                );
-            }
-            if model.capability() == capability {
-                return Ok(key);
-            }
-        }
-        let prefix = match capability {
-            Capability::Tts => "tts",
-            Capability::Asr => "asr",
-            _ => "chat",
-        };
-        let projected = ModelRef::from(format!("{prefix}.{}", key.as_str()));
-        if !registry.models.contains_key(&projected) && !reference.contains('.') {
-            let default = ModelRef::from(format!("{}.default", key.as_str()));
-            if registry
-                .models
-                .get(&default)
-                .is_some_and(|model| model.capability() == capability)
-            {
-                return Ok(default);
-            }
-        }
-        ensure!(
-            registry
-                .models
-                .get(&projected)
-                .is_some_and(|model| model.capability() == capability),
-            "unknown {prefix} model reference `{reference}`"
-        );
-        Ok(projected)
+        registry.selection(&key, capability)?;
+        Ok(key)
     }
-}
-
-/// Fold section-only ASR input into the same typed migration adapter. Existing
-/// explicit connections/models remain authoritative over these historical rows.
-pub(crate) fn providers_for_input(config: &Config) -> Result<crate::providers::Providers> {
-    let mut providers = config.providers.clone();
-    let raw = serde_json::to_value(&config.transcription)?;
-    for family in [
-        "groq",
-        "openai",
-        "deepgram",
-        "assemblyai",
-        "google",
-        "local_whisper",
-    ] {
-        let input = if family == "groq" {
-            if config
-                .transcription
-                .api_key
-                .as_deref()
-                .is_none_or(|key| key.trim().is_empty())
-            {
-                continue;
-            }
-            json!({"api_key": config.transcription.api_key, "uri": config.transcription.api_url,
-                "model": config.transcription.model, "language": config.transcription.language,
-                "initial_prompt": config.transcription.initial_prompt})
-        } else {
-            let Some(input) = raw.get(family).filter(|value| !value.is_null()) else {
-                continue;
-            };
-            input.clone()
-        };
-        let key = ModelRef::from(format!("asr.{family}"));
-        if providers.models.canonical_model(&key).is_some() {
-            continue;
-        }
-        let provider = ProviderId::from(format!("legacy.asr.section.{family}"));
-        let (connection, model) = asr_definition(&input, family, &provider)?;
-        providers.connections.entry(provider).or_insert(connection);
-        providers
-            .models
-            .insert_canonical_model(key, serde_json::from_value(serde_json::to_value(model)?)?);
-    }
-    Ok(providers)
-}
-
-/// One compatibility decoder for both historical ASR shapes.
-pub(crate) fn asr_definition(
-    raw: &serde_json::Value,
-    family: &str,
-    provider: &ProviderId,
-) -> Result<(super::ProviderConnection, ModelDefinition)> {
-    let mut connection = json!({"kind": family});
-    if let Some(uri) = raw
-        .get("uri")
-        .or_else(|| raw.get("url"))
-        .or_else(|| raw.get("api_url"))
-        .filter(|value| !value.is_null())
-    {
-        connection["uri"] = uri.clone();
-    }
-    if let Some(key) = raw
-        .get("api_key")
-        .or_else(|| raw.get("bearer_token"))
-        .filter(|value| !value.is_null())
-    {
-        connection["auth"] = json!({"mode":"api_key", "api_key":key});
-    }
-    if family == "local_whisper" {
-        let mut api = json!({});
-        for (old, new) in [
-            ("timeout_secs", "request_timeout_secs"),
-            ("max_audio_bytes", "max_audio_bytes"),
-        ] {
-            if let Some(value) = raw.get(old).filter(|value| !value.is_null()) {
-                api[new] = value.clone();
-            }
-        }
-        connection["api"] = json!({"asr":api});
-    }
-    let mut model = json!({"capability":"asr", "provider":provider.as_str(), "options":{}});
-    if let Some(value) = raw.get("model").filter(|value| !value.is_null()) {
-        model["model"] = value.clone();
-    } else if family == "groq" {
-        model["model"] = "whisper-large-v3-turbo".into();
-    }
-    for field in ["language", "initial_prompt"] {
-        let value = raw.get(field).or_else(|| {
-            (field == "language")
-                .then(|| raw.get("language_code"))
-                .flatten()
-        });
-        if let Some(value) = value.filter(|value| !value.is_null()) {
-            model["options"][field] = value.clone();
-        }
-    }
-    Ok((
-        serde_json::from_value(connection)?,
-        serde_json::from_value(model)?,
-    ))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use registry::*;
 
     fn fixture() -> Config {
         let mut config = Config {
@@ -524,12 +321,16 @@ mod tests {
             .unwrap(),
             ..Config::default()
         };
+        crate::migration::normalize_test_input(&mut config);
         let source = crate::traits::AliasSource::ModelProviders;
         assert_eq!(
             config.resolve_alias_source(source),
             vec!["openai.primary.prod"]
         );
-        config.providers.connections = fixture().providers.connections;
+        config
+            .providers
+            .connections
+            .extend(fixture().providers.connections);
         config.providers.models.insert_canonical_model(
             "chat.independent".into(),
             serde_json::from_value(json!({
@@ -578,7 +379,7 @@ mod tests {
         );
         assert_eq!(model.upstream_model(), Some("wire-fast"));
         assert!(
-            matches!(model.options.temperature, Some(super::super::Override::Set(value)) if value == 0.3)
+            matches!(model.options.temperature, Some(registry::registry::Override::Set(value)) if value == 0.3)
         );
         assert_eq!(
             registry.fallback_chain(&reference.into()).unwrap(),

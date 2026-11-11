@@ -1302,7 +1302,8 @@ mod tests {
         let prefix = config.providers.models.ensure("custom", "gw").unwrap();
         prefix.pricing.insert("shared-id".into(), 1.0);
         config.providers.models.ensure("custom", "gw.v2").unwrap();
-        let pricing = build_model_provider_pricing(&config);
+        let pricing =
+            build_model_provider_pricing(&zeroclaw_config::migration::admit_test_input(&config));
         assert!(
             provider_pricing(&pricing, "custom.gw.v2.fast")
                 .unwrap()
@@ -1433,7 +1434,8 @@ mod tests {
             },
         );
 
-        let pricing = build_model_provider_pricing(&config);
+        let pricing =
+            build_model_provider_pricing(&zeroclaw_config::migration::admit_test_input(&config));
         assert_eq!(
             provider_pricing(&pricing, "openai.fast")
                 .unwrap()
@@ -1568,7 +1570,8 @@ output_per_mtok = 4.0
             },
         );
 
-        let alias_map = build_model_provider_pricing(&config);
+        let alias_map =
+            build_model_provider_pricing(&zeroclaw_config::migration::admit_test_input(&config));
         let deepseek = alias_map
             .get("deepseek.default")
             .expect("deepseek alias pricing");
@@ -1608,7 +1611,8 @@ output_per_mtok = 4.0
             },
         );
 
-        let alias_map = build_model_provider_pricing(&config);
+        let alias_map =
+            build_model_provider_pricing(&zeroclaw_config::migration::admit_test_input(&config));
         let work = alias_map.get("deepseek.work").expect("work alias pricing");
         let personal = alias_map
             .get("deepseek.personal")
@@ -1648,7 +1652,8 @@ output_per_mtok = 4.0
                 },
             },
         );
-        let alias_map = build_model_provider_pricing(&config);
+        let alias_map =
+            build_model_provider_pricing(&zeroclaw_config::migration::admit_test_input(&config));
         let flash = alias_map
             .get("deepseek.work.flash")
             .expect("flash model pricing");
@@ -1707,7 +1712,8 @@ output_per_mtok = 4.0
             },
         );
 
-        let map = build_model_provider_pricing(&config);
+        let map =
+            build_model_provider_pricing(&zeroclaw_config::migration::admit_test_input(&config));
 
         // Builder keys each alias separately.
         assert!(map.contains_key("custom.cheap"), "cheap alias has a slot");
@@ -2138,7 +2144,8 @@ output_per_mtok = 4.0
                 cache_write_per_mtok: None,
             },
         );
-        let mut pricing = build_model_provider_pricing(&config);
+        let mut pricing =
+            build_model_provider_pricing(&zeroclaw_config::migration::admit_test_input(&config));
         pricing.insert(
             "partial".to_string(),
             HashMap::from([("partial-model.input".to_string(), 2.0)]),

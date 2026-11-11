@@ -123,8 +123,12 @@ Accepted-call reports carry the construction selection on ordinary and streamed
 calls. Capacity is resolved from the admitted Config generation at consumption.
 
 All configured consumers construct through `zeroclaw_providers::model`.
-`zeroclaw-config` alone decodes historical profiles, speech bindings, embedding
-bindings, and bare-family/URL CLI input into an ephemeral canonical registry.
+`zeroclaw-config` converts historical profiles, speech bindings and embedding
+bindings at configuration deserialization, before returning `Config`. Loaded
+configuration contains canonical connections and models; historical input tables
+are empty. Registry getters, Quickstart, validation, exports, and runtime consumers
+never project those tables. Explicit bare-family/URL CLI invocations may construct
+an ephemeral registry from the already admitted model and connection.
 Exact model keys always win; dots inside a key never imply profile ancestry.
 A same-family CLI input inherits the admitted agent model and its connection
 policy; an explicit URL replaces the connection URI for that construction.
@@ -132,9 +136,12 @@ An explicit upstream model argument changes only the primary model ID. Hint
 routes and fallback targets still materialize their own complete definitions.
 Unknown dotted references and wrong-capability targets fail construction.
 
-CLI and tool writes use the shared registry editor with typed keys. A successful
-save promotes historical inputs, retires the old tables, and translates their
-environment-override restore records through the same config projection.
+CLI and tool writes use the shared registry editor with typed keys. The editor
+validates and replaces canonical definitions only. Historical provider tables are
+retired during loading and structural disk migration, including files already
+stamped V4. Environment-input normalization translates restore records to their
+canonical field identities, preserving pre-override credentials and bindings on
+save.
 Embedding construction is prepared before the live config commit; disabling
 embeddings installs the empty implementation instead of retaining an old one.
 Speech managers accept the full admitted Config and register exact capability

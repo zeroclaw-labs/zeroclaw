@@ -66,8 +66,6 @@ fn check_env_reference(config: &Config, section: &str, key: &str) -> Result<()> 
 
 pub fn delete_entry(config: &mut Config, section: &str, key: &str) -> Result<()> {
     let mut candidate = config.clone();
-    // Normalize legacy consumers before evaluating references to a canonical key.
-    super::update(&mut candidate, |_| Ok(()))?;
     check_env_reference(&candidate, section, key)?;
     let expected = super::snapshot(&candidate)?;
     let mut registry = document(&candidate)?;
@@ -84,7 +82,6 @@ pub fn delete_entry(config: &mut Config, section: &str, key: &str) -> Result<()>
 pub fn rename_entry(config: &mut Config, section: &str, from: &str, to: &str) -> Result<()> {
     ensure!(!to.trim().is_empty(), "registry key must not be empty");
     let mut candidate = config.clone();
-    super::update(&mut candidate, |_| Ok(()))?;
     let before = candidate.clone();
     check_env_reference(&candidate, section, from)?;
     let expected = super::snapshot(&candidate)?;
@@ -171,6 +168,23 @@ pub fn rename_entry(config: &mut Config, section: &str, from: &str, to: &str) ->
             !managed,
             "rename would change an environment-owned reference; update the environment first"
         );
+    }
+    if section == "connections" {
+        let from_prefix = format!(
+            "/providers/connections/{}/",
+            from.replace('~', "~0").replace('/', "~1")
+        );
+        let to_prefix = format!(
+            "/providers/connections/{}/",
+            to.replace('~', "~0").replace('/', "~1")
+        );
+        for (path, reference) in &before.onepassword_reference_snapshots {
+            if let Some(tail) = path.strip_prefix(&from_prefix) {
+                candidate
+                    .onepassword_reference_snapshots
+                    .insert(format!("{to_prefix}{tail}"), reference.clone());
+            }
+        }
     }
     *config = candidate;
     Ok(())

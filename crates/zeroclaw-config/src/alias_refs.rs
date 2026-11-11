@@ -3633,36 +3633,32 @@ model_provider = "custom.gw.v2.fast.v1"
 "#,
         )
         .unwrap();
-        let refs = cfg.resolve_alias_source(crate::traits::AliasSource::ModelProviders);
-        assert!(refs.is_empty(), "retired profiles are not picker options");
+        let refs = cfg.configured_model_entries(None);
         assert!(
-            find_all_references(&cfg, &model_alias_kind("custom", "gw"), "v2.fast.v1").is_empty()
+            refs.iter()
+                .any(|entry| entry.model_ref == "custom.gw.v2.fast.v1")
         );
-        let kind = alias_kind_for_map_path("providers.models.custom.gw.v2.models").unwrap();
-        assert!(!plan_delete(&cfg, &kind, "fast.v1").allowed);
-        rename_with_cascade(&mut cfg, &kind, "fast.v1", "fast_v2").unwrap();
+        crate::provider_registry::editor::rename_entry(
+            &mut cfg,
+            "models",
+            "custom.gw.v2.fast.v1",
+            "custom.gw.v2.fast_v2",
+        )
+        .unwrap();
         assert_eq!(
             cfg.agents["bot"].model_provider.as_str(),
             "custom.gw.v2.fast_v2"
         );
         let reloaded: Config = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
         assert_eq!(
-            reloaded
-                .resolve_model_selection("custom.gw.v2.fast_v2")
-                .unwrap()
-                .model_id
-                .as_deref(),
+            reloaded.resolve_model_id("custom.gw.v2.fast_v2").as_deref(),
             Some("versioned-model")
         );
-        assert!(
-            reloaded
-                .providers
-                .models
-                .find("custom", "gw")
-                .unwrap()
-                .models
-                .contains_key("v2.fast")
+        assert_eq!(
+            reloaded.resolve_model_id("custom.gw.v2.fast").as_deref(),
+            Some("short-profile-model")
         );
+        assert!(reloaded.providers.models.iter_entries().next().is_none());
     }
 
     fn model_alias_kind(family: &str, profile_alias: &str) -> AliasKind {

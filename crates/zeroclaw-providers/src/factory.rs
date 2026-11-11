@@ -461,17 +461,12 @@ pub(crate) fn build_kimi_code_compat(
 }
 
 pub fn dispatch_family_factory(
-    config: Option<&zeroclaw_config::schema::Config>,
     family: &str,
     alias: &str,
     key: Option<&str>,
     api_url: Option<&str>,
     opts: &ModelProviderRuntimeOptions,
 ) -> Result<Box<dyn ModelProvider>> {
-    if let Some(config) = config {
-        let (registry, reference) = config.chat_registry_for_legacy_alias(family, alias)?;
-        return dispatch_model_ref_with_registry(&registry, &reference, opts, key);
-    }
     // openai missing-entry fallback: see `openai_missing_entry_fallback_config`.
     // A persisted entry keeps its stored `wire_api`; an implicit dispatch with no
     // entry (bare `openai` ref or a dangling alias) stays on the chat-completions
@@ -2439,13 +2434,25 @@ fn dispatch_resolved_chat(
         _ => None,
     });
     dispatch_family_factory(
-        None,
         provider_kind,
         model_ref.as_str(),
         api_key,
         endpoint,
         &runtime,
     )
+}
+
+/// Admit historical test input before exercising the canonical factory.
+#[cfg(test)]
+pub(crate) fn dispatch_test_alias(
+    config: &zeroclaw_config::schema::Config,
+    family: &str,
+    alias: &str,
+    key: Option<&str>,
+    options: &ModelProviderRuntimeOptions,
+) -> Result<Box<dyn ModelProvider>> {
+    let (registry, reference) = config.chat_registry_for_legacy_alias(family, alias)?;
+    dispatch_model_ref_with_registry(&registry, &reference, options, key)
 }
 
 #[cfg(test)]
@@ -3376,7 +3383,6 @@ mod tests {
         // must keep the historical chat-completions wire and prompt-guided tools,
         // so existing installs don't silently flip wire + tool-calling on upgrade.
         let provider = dispatch_family_factory(
-            None,
             "openai",
             "default",
             Some("sk-test"),
@@ -3410,12 +3416,11 @@ mod tests {
                 },
             },
         );
-        let provider = dispatch_family_factory(
-            Some(&config),
+        let provider = dispatch_test_alias(
+            &config,
             "openai",
             "default",
             Some("sk-test"),
-            None,
             &ModelProviderRuntimeOptions::default(),
         )
         .expect("persisted openai dispatch should build");

@@ -28,35 +28,7 @@ pub(crate) fn path(config: &Config, tail: &str) -> Option<String> {
             segments.extend(rest.iter().map(|part| (*part).to_owned()));
         }
         "models" => {
-            // Read compatibility only: old family/alias leaves are redirected
-            // after their definition has been promoted by the registry editor.
-            let [alias, field] = rest else {
-                return None;
-            };
-            let reference = format!("{key}.{alias}");
-            let model = config
-                .providers
-                .models
-                .canonical_model(&reference.as_str().into())?;
-            segments[2] = reference;
-            match *field {
-                "model" => segments.push("model".into()),
-                "temperature" | "max_tokens" | "think" => {
-                    segments.extend(["options".into(), (*field).into()])
-                }
-                "context_window" | "vision" => {
-                    segments.extend(["metadata".into(), (*field).into()])
-                }
-                "api_key" | "uri" => {
-                    segments[1] = "connections".into();
-                    segments[2] = model.provider().to_string();
-                    if *field == "api_key" {
-                        segments.push("auth".into());
-                    }
-                    segments.push((*field).into());
-                }
-                _ => return None,
-            }
+            segments = crate::migration::provider_inputs::legacy_env_segments(config, &parts)?;
         }
         _ => return None,
     }
@@ -97,6 +69,8 @@ pub(crate) fn snapshot_document(document: &Value, path: &str) -> Result<String> 
 pub(crate) fn remap_after_promotion(source: &Config, candidate: &mut Config) -> Result<()> {
     fn retired_input(path: &str) -> bool {
         path.starts_with("providers.")
+            || path.starts_with("memory.embedding_")
+            || path.starts_with("embedding_routes.")
             || matches!(
                 path,
                 "transcription.api_key"
@@ -124,8 +98,9 @@ pub(crate) fn remap_after_promotion(source: &Config, candidate: &mut Config) -> 
     }
     let mut clean = source.clone();
     crate::env_overrides::mask_env_overrides_for_save(&mut clean, &source.pre_override_snapshots)?;
+    crate::migration::provider_inputs::normalize_definitions(&mut clean)?;
     let original = serde_json::to_value(clean.provider_registry()?)?;
-    let admitted = serde_json::to_value(source.provider_registry()?)?;
+    let admitted = serde_json::to_value(candidate.provider_registry()?)?;
     fn differences(original: &Value, admitted: &Value, path: &str, out: &mut Vec<String>) {
         if original == admitted {
             return;
@@ -158,6 +133,41 @@ pub(crate) fn remap_after_promotion(source: &Config, candidate: &mut Config) -> 
     candidate
         .env_overridden_paths
         .retain(|path| !retired_input(path));
+    // Migration may also change the consumer reference. Restore that reference
+    // alongside env-created model/connection entries when saving.
+    for (path, original, admitted) in [
+        (
+            "memory.embedding_model_ref",
+            serde_json::to_value(&clean.memory.embedding_model_ref)?,
+            serde_json::to_value(&candidate.memory.embedding_model_ref)?,
+        ),
+        (
+            "memory.embedding_dimensions",
+            serde_json::to_value(clean.memory.embedding_dimensions)?,
+            serde_json::to_value(candidate.memory.embedding_dimensions)?,
+        ),
+        (
+            "embedding_routes",
+            serde_json::to_value(&clean.embedding_routes)?,
+            serde_json::to_value(&candidate.embedding_routes)?,
+        ),
+    ] {
+        if original != admitted {
+            let saved = if original.is_null() {
+                String::new()
+            } else if let Some(value) = original.as_str() {
+                value.to_owned()
+            } else {
+                original.to_string()
+            };
+            candidate
+                .pre_override_snapshots
+                .entry(path.into())
+                .or_insert(saved);
+            candidate.env_overridden_paths.insert(path.into());
+        }
+    }
+
     for path in paths {
         let saved = snapshot_document(&original, &path)?;
         candidate

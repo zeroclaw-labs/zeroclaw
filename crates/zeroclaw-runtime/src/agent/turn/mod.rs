@@ -7463,7 +7463,7 @@ mod sop_step_reassembly_tests {
         )));
 
         let reader = assemble_owned_execution(
-            &config,
+            &zeroclaw_config::migration::admit_test_input(&config),
             None,
             "reader",
             Arc::clone(&engine),
@@ -7474,7 +7474,7 @@ mod sop_step_reassembly_tests {
         .await
         .expect("reader assembles");
         let writer = assemble_owned_execution(
-            &config,
+            &zeroclaw_config::migration::admit_test_input(&config),
             None,
             "writer",
             Arc::clone(&engine),
@@ -7761,7 +7761,7 @@ mod sop_step_reassembly_tests {
         )));
 
         let owned = assemble_owned_execution(
-            &config,
+            &zeroclaw_config::migration::admit_test_input(&config),
             Some(live_config.handle()),
             "stepper",
             Arc::clone(&engine),
@@ -7859,7 +7859,7 @@ mod sop_step_reassembly_tests {
             &zeroclaw_config::schema::RiskProfileConfig::default(),
         );
         let owned = assemble_owned_execution(
-            &config,
+            &zeroclaw_config::migration::admit_test_input(&config),
             None,
             "restricted",
             Arc::clone(&engine),
@@ -9993,7 +9993,7 @@ mod sop_step_reassembly_tests {
                 None,
                 None,
                 &mut exec_cache,
-                Some(&config),
+                Some(&zeroclaw_config::migration::admit_test_input(&config)),
                 &config.multimodal,
                 // ...but a capability binding.
                 Some(&bound),
@@ -10177,7 +10177,7 @@ mod sop_step_reassembly_tests {
             .unwrap()
             .temperature = Some(0.42);
         let handle = SopStepReassembly {
-            config: &config,
+            config: &zeroclaw_config::migration::admit_test_input(&config),
             live_config: None,
             memory_owner: None,
             capabilities: None,

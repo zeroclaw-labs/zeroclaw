@@ -8799,7 +8799,7 @@ mod tests {
             ..crate::composition::test_support::capabilities_with_providers(providers)
         };
         let agent = crate::agent::agent::Agent::from_config_with_capabilities(
-            &config,
+            &zeroclaw_config::migration::admit_test_input(&config),
             "caller",
             &caps,
             Some(&principal),
@@ -10057,8 +10057,14 @@ mod tests {
         let inner_memory = Arc::new(SqliteMemory::new("delegate-test", &data_dir).unwrap());
         let caller_uuid = inner_memory.ensure_agent_uuid("caller").await.unwrap();
         let target_uuid = inner_memory.ensure_agent_uuid("target").await.unwrap();
-        let root_config = Arc::new(root_config);
-        let caller_security = Arc::new(SecurityPolicy::for_agent(&root_config, "caller").unwrap());
+        let root_config = Arc::new(zeroclaw_config::migration::admit_test_input(&root_config));
+        let caller_security = Arc::new(
+            SecurityPolicy::for_agent(
+                &zeroclaw_config::migration::admit_test_input(&root_config),
+                "caller",
+            )
+            .unwrap(),
+        );
         let caller_memory = scoped_sqlite_memory(inner_memory.clone(), &caller_uuid);
         let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
             HashMap::new();
@@ -10070,7 +10076,7 @@ mod tests {
         let (parent_tools, origins) = memory_parent_tools(
             Arc::clone(&caller_memory),
             Arc::clone(&caller_security),
-            &root_config,
+            &zeroclaw_config::migration::admit_test_input(&root_config),
         );
 
         let tool = DelegateTool::new(
@@ -12376,7 +12382,9 @@ target = "memory_recall"
         .unwrap();
         fixture.tool = fixture
             .tool
-            .with_root_config(Arc::new(config.clone()))
+            .with_root_config(Arc::new(zeroclaw_config::migration::admit_test_input(
+                &config,
+            )))
             .with_risk_profiles(config.risk_profiles.clone())
             .with_runtime(Arc::new(DelegateTestRuntime));
         let owner = owner_session_scope("user:owner")
@@ -13254,15 +13262,20 @@ target = "memory_recall"
                 },
             );
         }
-        let config = Arc::new(config);
+        let config = Arc::new(zeroclaw_config::migration::admit_test_input(&config));
         let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
             HashMap::new();
         providers_models
             .entry("custom".to_string())
             .or_default()
             .insert("local".to_string(), model_provider_config);
-        let caller_security =
-            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let caller_security = Arc::new(
+            SecurityPolicy::for_agent(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                "caller",
+            )
+            .expect("caller policy resolves"),
+        );
         let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_security))
             .with_root_config(Arc::clone(&config))
             .with_caller_alias("caller")
@@ -13353,15 +13366,20 @@ target = "memory_recall"
                 ..AliasedAgentConfig::default()
             },
         );
-        let config = Arc::new(config);
+        let config = Arc::new(zeroclaw_config::migration::admit_test_input(&config));
         let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
             HashMap::new();
         providers_models
             .entry("custom".to_string())
             .or_default()
             .insert("local".to_string(), model_provider_config);
-        let caller_security =
-            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let caller_security = Arc::new(
+            SecurityPolicy::for_agent(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                "caller",
+            )
+            .expect("caller policy resolves"),
+        );
         let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_security))
             .with_root_config(Arc::clone(&config))
             .with_caller_alias("caller")
@@ -13938,15 +13956,20 @@ options = { extract_text_tool_calls = false }
                 ..AliasedAgentConfig::default()
             },
         );
-        let config = Arc::new(config);
+        let config = Arc::new(zeroclaw_config::migration::admit_test_input(&config));
         let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
             HashMap::new();
         providers_models
             .entry("custom".to_string())
             .or_default()
             .insert("local".to_string(), model_provider_config);
-        let caller_security =
-            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let caller_security = Arc::new(
+            SecurityPolicy::for_agent(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                "caller",
+            )
+            .expect("caller policy resolves"),
+        );
         let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_security))
             .with_root_config(Arc::clone(&config))
             .with_caller_alias("caller")
@@ -14121,15 +14144,20 @@ options = { extract_text_tool_calls = false }
                 ..AliasedAgentConfig::default()
             },
         );
-        let config = Arc::new(config);
+        let config = Arc::new(zeroclaw_config::migration::admit_test_input(&config));
         let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
             HashMap::new();
         providers_models
             .entry("custom".to_string())
             .or_default()
             .insert("local".to_string(), model_provider_config);
-        let caller_security =
-            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let caller_security = Arc::new(
+            SecurityPolicy::for_agent(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                "caller",
+            )
+            .expect("caller policy resolves"),
+        );
         let tool = DelegateTool::new(config.agents.clone(), None, caller_security)
             .with_root_config(Arc::clone(&config))
             .with_caller_alias("caller")
@@ -14278,15 +14306,20 @@ options = { extract_text_tool_calls = false }
                 ..AliasedAgentConfig::default()
             },
         );
-        let config = Arc::new(config);
+        let config = Arc::new(zeroclaw_config::migration::admit_test_input(&config));
         let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
             HashMap::new();
         providers_models
             .entry("custom".to_string())
             .or_default()
             .insert("local".to_string(), model_provider_config);
-        let caller_security =
-            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let caller_security = Arc::new(
+            SecurityPolicy::for_agent(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                "caller",
+            )
+            .expect("caller policy resolves"),
+        );
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
         let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_security))
@@ -16938,9 +16971,15 @@ options = { extract_text_tool_calls = false }
             .unwrap()
             .context_window = Some(100_000);
         let target_agent = target.agents["target"].clone();
-        let security = Arc::new(SecurityPolicy::for_agent(&startup, "caller").unwrap());
+        let security = Arc::new(
+            SecurityPolicy::for_agent(
+                &zeroclaw_config::migration::admit_test_input(&startup),
+                "caller",
+            )
+            .unwrap(),
+        );
         let tool = DelegateTool::from_config(
-            Arc::new(startup),
+            Arc::new(zeroclaw_config::migration::admit_test_input(&startup)),
             "caller",
             security,
             DelegateBuildContext {
@@ -16963,7 +17002,7 @@ options = { extract_text_tool_calls = false }
             &prompt,
             None,
             DelegateAdmission::Prevalidated,
-            Some(&target),
+            Some(&zeroclaw_config::migration::admit_test_input(&target)),
         ))
         .await
         .unwrap();
@@ -18768,7 +18807,7 @@ options = { extract_text_tool_calls = false }
                 },
             );
         }
-        Arc::new(config)
+        Arc::new(zeroclaw_config::migration::admit_test_input(&config))
     }
 
     /// Caller-owned delegate tool whose parent registry carries EchoTool plus
@@ -19092,7 +19131,7 @@ options = { extract_text_tool_calls = false }
                 },
             );
         }
-        Arc::new(config)
+        Arc::new(zeroclaw_config::migration::admit_test_input(&config))
     }
 
     #[tokio::test]
@@ -21122,9 +21161,14 @@ target = "sessions_history"
             },
         );
 
-        let config = Arc::new(config);
-        let caller_policy =
-            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let config = Arc::new(zeroclaw_config::migration::admit_test_input(&config));
+        let caller_policy = Arc::new(
+            SecurityPolicy::for_agent(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                "caller",
+            )
+            .expect("caller policy resolves"),
+        );
         let delegate = DelegateTool::new(config.agents.clone(), None, caller_policy)
             .with_root_config(Arc::clone(&config))
             .with_caller_alias("caller")
@@ -23283,7 +23327,7 @@ options = {{ {backup_options} }}
                     ..Default::default()
                 };
                 config.agents.insert("target".into(), target.clone());
-                let config = Arc::new(config);
+                let config = Arc::new(zeroclaw_config::migration::admit_test_input(&config));
                 let tool = DelegateTool::new(config.agents.clone(), None, test_security())
                     .with_root_config(Arc::clone(&config))
                     .with_runtime(Arc::new(DelegateTestRuntime));
@@ -23291,7 +23335,7 @@ options = {{ {backup_options} }}
                     .execute_sync_dispatched(
                         "target",
                         &target,
-                        Some(&config),
+                        Some(&zeroclaw_config::migration::admit_test_input(&config)),
                         "hello",
                         "",
                         agentic,
@@ -23596,8 +23640,14 @@ options = {{ {backup_options} }}
             .agents
             .insert("target2".to_string(), target_config);
 
-        let root_config = Arc::new(root_config);
-        let caller_security = Arc::new(SecurityPolicy::for_agent(&root_config, "caller").unwrap());
+        let root_config = Arc::new(zeroclaw_config::migration::admit_test_input(&root_config));
+        let caller_security = Arc::new(
+            SecurityPolicy::for_agent(
+                &zeroclaw_config::migration::admit_test_input(&root_config),
+                "caller",
+            )
+            .unwrap(),
+        );
         let tool = DelegateTool::new(root_config.agents.clone(), None, caller_security)
             .with_root_config(Arc::clone(&root_config))
             .with_workspace_dir(workspace_dir)
@@ -24174,8 +24224,14 @@ options = {{ {backup_options} }}
         root_config.agents.insert("target".to_string(), hop);
         root_config.agents.insert("target2".to_string(), leaf);
 
-        let root_config = Arc::new(root_config);
-        let caller_security = Arc::new(SecurityPolicy::for_agent(&root_config, "caller").unwrap());
+        let root_config = Arc::new(zeroclaw_config::migration::admit_test_input(&root_config));
+        let caller_security = Arc::new(
+            SecurityPolicy::for_agent(
+                &zeroclaw_config::migration::admit_test_input(&root_config),
+                "caller",
+            )
+            .unwrap(),
+        );
         let tool = DelegateTool::new(root_config.agents.clone(), None, caller_security)
             .with_root_config(Arc::clone(&root_config))
             .with_workspace_dir(workspace_dir)
@@ -24291,8 +24347,14 @@ options = {{ {backup_options} }}
         root_config.agents.insert("target".to_string(), hop);
         root_config.agents.insert("target2".to_string(), leaf);
 
-        let root_config = Arc::new(root_config);
-        let caller_security = Arc::new(SecurityPolicy::for_agent(&root_config, "caller").unwrap());
+        let root_config = Arc::new(zeroclaw_config::migration::admit_test_input(&root_config));
+        let caller_security = Arc::new(
+            SecurityPolicy::for_agent(
+                &zeroclaw_config::migration::admit_test_input(&root_config),
+                "caller",
+            )
+            .unwrap(),
+        );
         let tool = DelegateTool::new(root_config.agents.clone(), None, caller_security)
             .with_root_config(Arc::clone(&root_config))
             .with_workspace_dir(workspace_dir)
@@ -24730,12 +24792,18 @@ options = {{ {backup_options} }}
         root_config.agents.insert("target".to_string(), hop);
         root_config.agents.insert("target2".to_string(), leaf);
 
-        let root_config = Arc::new(root_config);
+        let root_config = Arc::new(zeroclaw_config::migration::admit_test_input(&root_config));
         let live_config = Arc::new(zeroclaw_config::live::LiveConfig::new(
             (*root_config).clone(),
         ));
         let task_store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
-        let caller_security = Arc::new(SecurityPolicy::for_agent(&root_config, "caller").unwrap());
+        let caller_security = Arc::new(
+            SecurityPolicy::for_agent(
+                &zeroclaw_config::migration::admit_test_input(&root_config),
+                "caller",
+            )
+            .unwrap(),
+        );
         let tool = DelegateTool::new(root_config.agents.clone(), None, caller_security)
             .with_root_config(Arc::clone(&root_config))
             .with_live_config(Some(live_config.handle()))

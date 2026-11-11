@@ -27,6 +27,22 @@ impl ProviderRegistry {
         name: &super::ProviderId,
         connection: &ProviderConnection,
     ) -> Result<(), RegistryError> {
+        if let Some(uri) = connection
+            .uri()
+            .map(str::trim)
+            .filter(|uri| !uri.is_empty())
+        {
+            let parsed = reqwest::Url::parse(uri).map_err(|_| {
+                RegistryError::connection(name, "uri", "uri must be a valid HTTP(S) URL")
+            })?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                return Err(RegistryError::connection(
+                    name,
+                    "uri",
+                    "uri must use http/https",
+                ));
+            }
+        }
         let configured = connection.configured_apis();
         for capability in configured {
             if !connection.supports(capability) {
@@ -152,6 +168,45 @@ impl ProviderRegistry {
         config: &ChatModelConfig,
         connection: &ProviderConnection,
     ) -> Result<(), RegistryError> {
+        if config
+            .model
+            .as_deref()
+            .is_some_and(|model| model.trim().is_empty())
+        {
+            return Err(RegistryError::model(
+                name,
+                "model",
+                "model must not be empty when set",
+            ));
+        }
+        if config.metadata.context_window == Some(0) {
+            return Err(RegistryError::model(
+                name,
+                "metadata.context_window",
+                "context window must be greater than 0",
+            ));
+        }
+        let effective = self.resolve_chat(name)?;
+        if let Some(super::Override::Set(temperature)) = effective.options.temperature {
+            crate::schema::validate_temperature(temperature)
+                .map_err(|error| RegistryError::model(name, "options.temperature", error))?;
+        }
+        if let Some(pricing) = &config.metadata.pricing {
+            for (field, value) in [
+                ("input_per_mtok", pricing.input_per_mtok),
+                ("output_per_mtok", pricing.output_per_mtok),
+                ("cached_input_per_mtok", pricing.cached_input_per_mtok),
+                ("cache_write_per_mtok", pricing.cache_write_per_mtok),
+            ] {
+                if value.is_some_and(|value| !value.is_finite() || value < 0.0) {
+                    return Err(RegistryError::model(
+                        name,
+                        &format!("metadata.pricing.{field}"),
+                        "rate must be finite and non-negative",
+                    ));
+                }
+            }
+        }
         if config
             .api
             .as_ref()

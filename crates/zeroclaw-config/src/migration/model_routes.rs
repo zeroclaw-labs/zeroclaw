@@ -31,9 +31,18 @@ pub(super) fn migrate(mut document: toml::Value) -> Result<toml::Value> {
         .as_table_mut()
         .context("config must be a table")?
         .remove("model_routes");
-    let config: Config = input
-        .try_into()
-        .context("read V3 route provider definitions")?;
+    // Route-owned overrides need the historical profile before full admission
+    // (for example, pricing must follow an overridden upstream model).
+    let config = Config {
+        providers: input
+            .get("providers")
+            .cloned()
+            .map(toml::Value::try_into)
+            .transpose()
+            .context("read V3 route provider definitions")?
+            .unwrap_or_default(),
+        ..Config::default()
+    };
     let mut providers = document
         .get("providers")
         .cloned()
@@ -141,6 +150,38 @@ pub(super) fn migrate(mut document: toml::Value) -> Result<toml::Value> {
     Ok(document)
 }
 
+pub(super) fn legacy_chat_api_fields(kind: &str) -> &'static [(&'static str, &'static str)] {
+    match kind {
+        "gemini_cli" | "kilocli" => &[("binary_path", "binary_path")],
+        "grok_cli" => &[
+            ("binary_path", "binary_path"),
+            ("working_directory", "working_directory"),
+            ("env_passthrough", "env_passthrough"),
+            ("extra_args", "extra_args"),
+            ("max_acp_stdout_bytes", "max_acp_stdout_bytes"),
+        ],
+        "hailo_ollama" => &[("queue_timeout_secs", "queue_timeout_secs")],
+        _ => &[
+            ("wire_api", "wire_api"),
+            ("timeout_secs", "request_timeout_secs"),
+            ("live_pricing", "live_pricing"),
+        ],
+    }
+}
+
+pub(super) const LEGACY_CONNECTION_EXTRA_FIELDS: &[(&str, &str)] = &[
+    ("resource", "resource"),
+    ("api_version", "api_version"),
+    ("region", "region"),
+    ("oauth_project", "project"),
+];
+
+pub(super) const LEGACY_OAUTH_FIELDS: &[(&str, &str)] = &[
+    ("oauth_refresh_token", "refresh_token"),
+    ("oauth_client_id", "client_id"),
+    ("oauth_client_secret", "client_secret"),
+];
+
 pub(super) fn legacy_model(
     raw: &Value,
     family: &str,
@@ -171,12 +212,7 @@ pub(super) fn legacy_model(
         connection["uri"] = resource.clone();
     }
     let mut extra = Map::new();
-    for (old, new) in [
-        ("resource", "resource"),
-        ("api_version", "api_version"),
-        ("region", "region"),
-        ("oauth_project", "project"),
-    ] {
+    for &(old, new) in LEGACY_CONNECTION_EXTRA_FIELDS {
         if let Some(value) = raw.get(old).filter(|value| !value.is_null()) {
             extra.insert(new.into(), value.clone());
         }
@@ -218,11 +254,7 @@ pub(super) fn legacy_model(
             .is_some_and(|mode| matches!(mode, "o_auth" | "oauth"))
     {
         let mut auth = json!({"mode":"oauth"});
-        for (old, new) in [
-            ("oauth_refresh_token", "refresh_token"),
-            ("oauth_client_id", "client_id"),
-            ("oauth_client_secret", "client_secret"),
-        ] {
+        for &(old, new) in LEGACY_OAUTH_FIELDS {
             if let Some(value) = raw.get(old).filter(|value| !value.is_null()) {
                 auth[new] = value.clone();
             }
@@ -235,22 +267,7 @@ pub(super) fn legacy_model(
         }
     }
     let mut api = Map::new();
-    let fields: &[(&str, &str)] = match kind {
-        "gemini_cli" | "kilocli" => &[("binary_path", "binary_path")],
-        "grok_cli" => &[
-            ("binary_path", "binary_path"),
-            ("working_directory", "working_directory"),
-            ("env_passthrough", "env_passthrough"),
-            ("extra_args", "extra_args"),
-            ("max_acp_stdout_bytes", "max_acp_stdout_bytes"),
-        ],
-        "hailo_ollama" => &[("queue_timeout_secs", "queue_timeout_secs")],
-        _ => &[
-            ("wire_api", "wire_api"),
-            ("timeout_secs", "request_timeout_secs"),
-            ("live_pricing", "live_pricing"),
-        ],
-    };
+    let fields = legacy_chat_api_fields(kind);
     for &(old, new) in fields {
         if let Some(value) = raw.get(old).filter(|value| !value.is_null()) {
             api.insert(new.into(), value.clone());

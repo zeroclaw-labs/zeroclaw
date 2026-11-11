@@ -1978,9 +1978,17 @@ mod tests {
         let profile = config.providers.models.ensure("custom", "keyless").unwrap();
         profile.uri = Some(format!("{}/v1", server.uri()));
         profile.model = Some("local-model".into());
-        let tool = ModelRoutingConfigTool::new(Arc::new(config.clone()), test_security());
+        let tool = ModelRoutingConfigTool::new(
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
+            test_security(),
+        );
         assert_eq!(
-            tool.probe_model(&config, "custom.keyless").await.unwrap(),
+            tool.probe_model(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                "custom.keyless"
+            )
+            .await
+            .unwrap(),
             ModelProbeOutcome::Verified
         );
     }
@@ -2068,10 +2076,16 @@ preset = "chat.shared"
             },
         );
         assert_eq!(
-            ModelRoutingConfigTool::new(Arc::new(config.clone()), test_security())
-                .probe_model(&config, "custom.probe.nested")
-                .await
-                .unwrap(),
+            ModelRoutingConfigTool::new(
+                Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
+                test_security()
+            )
+            .probe_model(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                "custom.probe.nested"
+            )
+            .await
+            .unwrap(),
             ModelProbeOutcome::Verified
         );
     }
@@ -2089,7 +2103,10 @@ preset = "chat.shared"
         profile.api_key = Some("test-key".into());
         profile.model = Some("old-model".into());
         config.save().await.unwrap();
-        let tool = ModelRoutingConfigTool::new(Arc::new(config), test_security());
+        let tool = ModelRoutingConfigTool::new(
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
+            test_security(),
+        );
         let result = tool
             .execute(json!({
                 "action": "set_default", "model_provider": "custom.probe", "model": "new-model"
@@ -2172,7 +2189,10 @@ preset = "chat.shared"
             },
         );
         config.save().await.unwrap();
-        let tool = ModelRoutingConfigTool::new(Arc::new(config), test_security());
+        let tool = ModelRoutingConfigTool::new(
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
+            test_security(),
+        );
 
         let result = tool
             .execute(json!({
@@ -2411,7 +2431,10 @@ preset = "chat.shared"
         let before = with_agent_sentinels;
         std::fs::write(&cfg_path, &before).unwrap();
 
-        let tool = ModelRoutingConfigTool::new(Arc::new(config), test_security());
+        let tool = ModelRoutingConfigTool::new(
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
+            test_security(),
+        );
         let result = tool
             .execute(json!({
                 "action": "upsert_agent",
@@ -2483,7 +2506,10 @@ preset = "chat.shared"
         }
         config.save().await.unwrap();
 
-        let tool = ModelRoutingConfigTool::new(Arc::new(config), test_security());
+        let tool = ModelRoutingConfigTool::new(
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
+            test_security(),
+        );
         let result = tool
             .execute(json!({
                 "action": "upsert_agent",
@@ -2552,7 +2578,10 @@ preset = "chat.shared"
         );
         config.save().await.unwrap();
 
-        let tool = ModelRoutingConfigTool::new(Arc::new(config), test_security());
+        let tool = ModelRoutingConfigTool::new(
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
+            test_security(),
+        );
         let result = tool
             .execute(json!({
                 "action": "upsert_agent",
@@ -2632,7 +2661,10 @@ preset = "chat.shared"
         config.save().await.unwrap();
         let before = std::fs::read_to_string(&cfg_path).unwrap();
 
-        let tool = ModelRoutingConfigTool::new(Arc::new(config), test_security());
+        let tool = ModelRoutingConfigTool::new(
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
+            test_security(),
+        );
         let result = tool
             .execute(json!({
                 "action": "upsert_agent",
@@ -2717,7 +2749,10 @@ preset = "chat.shared"
         shared_config.save().await.unwrap();
         let shared_before = std::fs::read_to_string(&shared_path).unwrap();
 
-        let shared_tool = ModelRoutingConfigTool::new(Arc::new(shared_config), test_security());
+        let shared_tool = ModelRoutingConfigTool::new(
+            Arc::new(zeroclaw_config::migration::admit_test_input(&shared_config)),
+            test_security(),
+        );
         let shared_risk_result = shared_tool
             .execute(json!({
                 "action": "upsert_agent",
@@ -2797,7 +2832,10 @@ preset = "chat.shared"
         assert_ne!(current, legacy, "fixture must downgrade the schema label");
         std::fs::write(&cfg_path, &legacy).unwrap();
 
-        let tool = ModelRoutingConfigTool::new(Arc::new(config), test_security());
+        let tool = ModelRoutingConfigTool::new(
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
+            test_security(),
+        );
         let result = tool
             .execute(json!({
                 "action": "upsert_agent",
@@ -3317,7 +3355,12 @@ preset = "chat.shared"
             entry.model = Some("gpt-test".to_string());
         }
 
-        let against_saved = tool.probe_model(&saved, "openai.default").await;
+        let against_saved = tool
+            .probe_model(
+                &zeroclaw_config::migration::admit_test_input(&saved),
+                "openai.default",
+            )
+            .await;
         assert!(
             against_saved.is_err(),
             "probe must resolve credentials from the saved alias config, not the stale runtime snapshot"
@@ -3334,9 +3377,17 @@ preset = "chat.shared"
             entry.api_key = Some("sk-ant-not-an-openai-key".to_string());
             entry.model = Some("gpt-test".to_string());
         }
-        let tool = ModelRoutingConfigTool::new(Arc::new(cfg.clone()), test_security());
+        let tool = ModelRoutingConfigTool::new(
+            Arc::new(zeroclaw_config::migration::admit_test_input(&cfg)),
+            test_security(),
+        );
 
-        let result = tool.probe_model(&cfg, "openai.default").await;
+        let result = tool
+            .probe_model(
+                &zeroclaw_config::migration::admit_test_input(&cfg),
+                "openai.default",
+            )
+            .await;
         let error = result.expect_err(
             "a model_provider that fails to construct must not be reported as a passing probe",
         );
@@ -3359,7 +3410,12 @@ preset = "chat.shared"
             .ensure("openai", "default")
             .unwrap()
             .api_key = Some("sk-ant-env-sourced-key".to_string());
-        let tool = ModelRoutingConfigTool::new(Arc::new(runtime_snapshot), test_security());
+        let tool = ModelRoutingConfigTool::new(
+            Arc::new(zeroclaw_config::migration::admit_test_input(
+                &runtime_snapshot,
+            )),
+            test_security(),
+        );
 
         // The saved config - what `load_config_without_env` produced - has
         // the model this update just wrote but no credential for the alias at
@@ -3372,7 +3428,12 @@ preset = "chat.shared"
             .unwrap()
             .model = Some("gpt-test".to_string());
 
-        let result = tool.probe_model(&saved, "openai.default").await;
+        let result = tool
+            .probe_model(
+                &zeroclaw_config::migration::admit_test_input(&saved),
+                "openai.default",
+            )
+            .await;
         assert!(
             result.is_ok(),
             "a startup-only credential must not override the current no-key skip: {result:?}"
@@ -3395,7 +3456,12 @@ preset = "chat.shared"
             .ensure("openai", "default")
             .unwrap()
             .api_key = Some("sk-ant-env-sourced-key".to_string());
-        let tool = ModelRoutingConfigTool::new(Arc::new(runtime_snapshot), test_security());
+        let tool = ModelRoutingConfigTool::new(
+            Arc::new(zeroclaw_config::migration::admit_test_input(
+                &runtime_snapshot,
+            )),
+            test_security(),
+        );
 
         let mut saved = (*base).clone();
         saved
@@ -3411,7 +3477,12 @@ preset = "chat.shared"
             "",
         );
 
-        let result = tool.probe_model(&saved, "openai.default").await;
+        let result = tool
+            .probe_model(
+                &zeroclaw_config::migration::admit_test_input(&saved),
+                "openai.default",
+            )
+            .await;
         assert!(
             result.is_ok(),
             "an explicitly cleared credential must take the no-credential skip instead of \
@@ -3522,7 +3593,11 @@ preset = "chat.shared"
         let tool = ModelRoutingConfigTool::new(Arc::clone(&base), test_security());
         let probe = {
             let _key = TestEnvVar::set(&_env_guard, key_var, "sk-ant-env-key");
-            tool.probe_model(&saved, &format!("openai.{ALIAS}")).await
+            tool.probe_model(
+                &zeroclaw_config::migration::admit_test_input(&saved),
+                &format!("openai.{ALIAS}"),
+            )
+            .await
         };
 
         let failure = probe.expect_err(
@@ -3546,7 +3621,10 @@ preset = "chat.shared"
         let effective = {
             let _key = TestEnvVar::set(&_env_guard, key_var, "sk-ant-env-key");
             let _uri = TestEnvVar::set(&_env_guard, uri_var, "https://env.invalid/v1");
-            ModelRoutingConfigTool::effective_config_for_probe(&saved).await
+            ModelRoutingConfigTool::effective_config_for_probe(
+                &zeroclaw_config::migration::admit_test_input(&saved),
+            )
+            .await
         };
 
         let effective = effective.expect("effective config must build");
@@ -3617,7 +3695,10 @@ preset = "chat.shared"
                 entry.temperature = configured;
             }
             let probe = tool
-                .probe_model(&saved, &format!("anthropic.{ALIAS}"))
+                .probe_model(
+                    &zeroclaw_config::migration::admit_test_input(&saved),
+                    &format!("anthropic.{ALIAS}"),
+                )
                 .await;
             assert!(probe.is_ok(), "the mock accepts the probe: {probe:?}");
 
@@ -3683,7 +3764,12 @@ preset = "chat.shared"
         let _model = TestEnvVar::set(&_env_guard, model_var, "gpt-env");
 
         let tool = ModelRoutingConfigTool::new(Arc::clone(&base), test_security());
-        let probe = tool.probe_model(&saved, &format!("openai.{ALIAS}")).await;
+        let probe = tool
+            .probe_model(
+                &zeroclaw_config::migration::admit_test_input(&saved),
+                &format!("openai.{ALIAS}"),
+            )
+            .await;
 
         assert!(probe.is_ok(), "the mock accepts the probe: {probe:?}");
 
@@ -3744,7 +3830,10 @@ preset = "chat.shared"
         let model_var = "ZEROCLAW_providers__models__openai__probe_env_only_model_case__model";
         let _model = TestEnvVar::set(&_env_guard, model_var, "gpt-env-only");
 
-        let tool = ModelRoutingConfigTool::new(Arc::new(saved), test_security());
+        let tool = ModelRoutingConfigTool::new(
+            Arc::new(zeroclaw_config::migration::admit_test_input(&saved)),
+            test_security(),
+        );
         let result = tool
             .execute(json!({
                 "action": "set_default",
@@ -3819,7 +3908,10 @@ preset = "chat.shared"
         let model_var = "ZEROCLAW_providers__models__openai__probe_env_cleared_model_case__model";
         let _model = TestEnvVar::set(&_env_guard, model_var, "");
 
-        let tool = ModelRoutingConfigTool::new(Arc::new(saved), test_security());
+        let tool = ModelRoutingConfigTool::new(
+            Arc::new(zeroclaw_config::migration::admit_test_input(&saved)),
+            test_security(),
+        );
         let result = tool
             .execute(json!({
                 "action": "set_default",
@@ -3930,7 +4022,12 @@ preset = "chat.shared"
             "ZEROCLAW_providers__models__openai__probe_env_cleared_api_key_case__api_key";
         let _api_key = TestEnvVar::set(&_env_guard, api_key_var, "");
 
-        let tool = ModelRoutingConfigTool::new(Arc::new(runtime_snapshot), test_security());
+        let tool = ModelRoutingConfigTool::new(
+            Arc::new(zeroclaw_config::migration::admit_test_input(
+                &runtime_snapshot,
+            )),
+            test_security(),
+        );
         let result = tool
             .execute(json!({
                 "action": "set_default",
@@ -4008,7 +4105,10 @@ preset = "chat.shared"
             entry.model = Some("gpt-before".to_string());
         }
         saved.save().await.unwrap();
-        let tool = ModelRoutingConfigTool::new(Arc::new(saved), test_security());
+        let tool = ModelRoutingConfigTool::new(
+            Arc::new(zeroclaw_config::migration::admit_test_input(&saved)),
+            test_security(),
+        );
         let mut current = (*test_config(&tmp).await).clone();
         let entry = current.providers.models.ensure("openai", ALIAS).unwrap();
         entry.uri = Some(format!("{}/v1", server.uri()));
@@ -4071,7 +4171,10 @@ preset = "chat.shared"
         saved.providers.models.ensure("openai", ALIAS).unwrap().uri =
             Some(format!("{}/v1", server.uri()));
         saved.save().await.unwrap();
-        let tool = ModelRoutingConfigTool::new(Arc::new(saved), test_security());
+        let tool = ModelRoutingConfigTool::new(
+            Arc::new(zeroclaw_config::migration::admit_test_input(&saved)),
+            test_security(),
+        );
         let _api_key = TestEnvVar::set(
             &_env_guard,
             "ZEROCLAW_providers__models__openai__probe_current_env_key_case__api_key",
@@ -4123,7 +4226,10 @@ preset = "chat.shared"
         let before = read_saved_provider_entry(&cfg_path, "openai", ALIAS)
             .expect("precondition: the alias exists before set_default updates it");
 
-        let tool = ModelRoutingConfigTool::new(Arc::new(saved), test_security());
+        let tool = ModelRoutingConfigTool::new(
+            Arc::new(zeroclaw_config::migration::admit_test_input(&saved)),
+            test_security(),
+        );
         let result = tool
             .execute(json!({
                 "action": "set_default",
@@ -4203,7 +4309,10 @@ preset = "chat.shared"
             "ZEROCLAW_providers__models__openai__probe_env_model_diagnostic_case__model";
         let _model = TestEnvVar::set(&_env_guard, model_var, "gpt-env-missing");
 
-        let tool = ModelRoutingConfigTool::new(Arc::new(saved), test_security());
+        let tool = ModelRoutingConfigTool::new(
+            Arc::new(zeroclaw_config::migration::admit_test_input(&saved)),
+            test_security(),
+        );
         let result = tool
             .execute(json!({
                 "action": "set_default",

@@ -7459,13 +7459,17 @@ path = "{trigger_path}"
             },
         );
 
-        let boot = resolve_gateway_boot_selection(&config);
+        let boot =
+            resolve_gateway_boot_selection(&zeroclaw_config::migration::admit_test_input(&config));
         assert_eq!(boot.provider_ref(), "openai.gateway.only");
         assert_eq!(boot.model(), "nested-boot-model");
         assert_eq!(boot.temperature(), Some(0.25));
-        let provider = create_gateway_boot_provider(Arc::new(config.clone()), &boot.provider_ref())
-            .await
-            .expect("nested-only boot provider should construct");
+        let provider = create_gateway_boot_provider(
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
+            &boot.provider_ref(),
+        )
+        .await
+        .expect("nested-only boot provider should construct");
         let messages = [ChatMessage::user("hello")];
         provider
             .chat(
@@ -7505,14 +7509,18 @@ path = "{trigger_path}"
         *config.providers.models.ensure("custom", "gateway").unwrap() = compatible_profile;
         let boot = GatewayBootSelection {
             model_ref: "custom.gateway.only".into(),
-            model_id: config.resolve_model_id("custom.gateway.only"),
+            model_id: zeroclaw_config::migration::admit_test_input(&config)
+                .resolve_model_id("custom.gateway.only"),
             temperature: config.resolve_model_temperature("custom.gateway.only"),
             api_key: None,
         };
         assert_eq!(boot.provider_ref(), "custom.gateway.only");
-        let provider = create_gateway_boot_provider(Arc::new(config.clone()), &boot.provider_ref())
-            .await
-            .expect("a non-default nested selection should construct");
+        let provider = create_gateway_boot_provider(
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
+            &boot.provider_ref(),
+        )
+        .await
+        .expect("a non-default nested selection should construct");
         provider
             .chat(
                 ChatRequest::new(&messages),

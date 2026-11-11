@@ -683,8 +683,11 @@ mod graceful_summary_metering_tests {
             },
         );
         config.multimodal.vision_model_provider = Some("custom.vision.selected".into());
-        let primary =
-            zeroclaw_providers::create_model_provider_from_ref(&config, "custom.text").unwrap();
+        let primary = zeroclaw_providers::create_model_provider_from_ref(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "custom.text",
+        )
+        .unwrap();
         for (input, expected) in [
             (Temperature::from(None), 0.8),
             (Temperature::from(Some(0.2)), 0.2),
@@ -711,7 +714,7 @@ mod graceful_summary_metering_tests {
                 None,
                 None,
                 None,
-                Some(&config),
+                Some(&zeroclaw_config::migration::admit_test_input(&config)),
                 &config.multimodal,
                 None,
                 None,
@@ -750,8 +753,11 @@ mod graceful_summary_metering_tests {
         let profile = config.providers.models.ensure("custom", "primary").unwrap();
         profile.uri = Some(server.uri());
         profile.model = Some("model-id".into());
-        let provider =
-            zeroclaw_providers::create_model_provider_from_ref(&config, "custom.primary").unwrap();
+        let provider = zeroclaw_providers::create_model_provider_from_ref(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "custom.primary",
+        )
+        .unwrap();
         let output = finish_after_max_iterations(
             &mut None,
             provider.as_ref(),
@@ -770,7 +776,7 @@ mod graceful_summary_metering_tests {
             None,
             None,
             None,
-            Some(&config),
+            Some(&zeroclaw_config::migration::admit_test_input(&config)),
             &config.multimodal,
             None,
             None,

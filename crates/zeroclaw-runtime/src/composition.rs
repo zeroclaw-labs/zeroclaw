@@ -522,9 +522,7 @@ pub(crate) mod test_support {
                 .push(SeenProviderRequest::from_request(request));
             let target_model = request
                 .provider_ref
-                .and_then(|provider_ref| provider_ref.split_once('.'))
-                .and_then(|(family, alias)| request.config.providers.models.find(family, alias))
-                .and_then(|entry| entry.model.clone());
+                .and_then(|reference| request.config.resolve_model_id(reference));
             self.switch_target_models.lock().push(target_model);
             Ok(Arc::new(StubProvider))
         }

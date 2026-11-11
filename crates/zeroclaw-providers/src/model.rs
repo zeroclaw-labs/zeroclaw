@@ -527,14 +527,20 @@ mod tests {
                 ..Default::default()
             },
         );
-        let built = build_model(&config, "worker", "openai", Some("gpt-test")).unwrap();
+        let built = build_model(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "worker",
+            "openai",
+            Some("gpt-test"),
+        )
+        .unwrap();
         assert_eq!(
             built.provider().role(),
             Role::Provider(ProviderKind::Model(ModelProviderKind::OpenAi))
         );
         assert_eq!(built.identity().provider_ref(), "openai");
         let built = build_model(
-            &config,
+            &zeroclaw_config::migration::admit_test_input(&config),
             "worker",
             "custom:http://127.0.0.1:9/v1",
             Some("proxy-model"),
@@ -551,8 +557,12 @@ mod tests {
         let mut config = Config::default();
         config.providers.models.ensure("openai", "primary").unwrap();
         assert_eq!(
-            crate::provider_runtime_options_for_alias(&config, "openai", "primary")
-                .provider_timeout_secs,
+            crate::provider_runtime_options_for_alias(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                "openai",
+                "primary"
+            )
+            .provider_timeout_secs,
             None
         );
         config
@@ -562,8 +572,12 @@ mod tests {
             .unwrap()
             .timeout_secs = Some(37);
         assert_eq!(
-            crate::provider_runtime_options_for_alias(&config, "openai", "primary")
-                .provider_timeout_secs,
+            crate::provider_runtime_options_for_alias(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                "openai",
+                "primary"
+            )
+            .provider_timeout_secs,
             Some(37)
         );
     }
@@ -622,43 +636,73 @@ mod tests {
         );
 
         for reference in ["custom", "custom:http://127.0.0.1:3/v1"] {
-            assert!(inherits_agent_selection(&config, reference));
-            let identity = resolve_model_identity(&config, "worker", reference, None).unwrap();
+            assert!(inherits_agent_selection(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                reference
+            ));
+            let identity = resolve_model_identity(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                "worker",
+                reference,
+                None,
+            )
+            .unwrap();
             assert_eq!(identity.provider_ref(), reference);
             assert_eq!(identity.model_id, "inherited-model");
             assert_eq!(
-                build_model(&config, "worker", reference, None)
-                    .unwrap()
-                    .identity(),
+                build_model(
+                    &zeroclaw_config::migration::admit_test_input(&config),
+                    "worker",
+                    reference,
+                    None
+                )
+                .unwrap()
+                .identity(),
                 &identity
             );
             assert!(routed_selection_depends_on_model_ref(
-                &config,
+                &zeroclaw_config::migration::admit_test_input(&config),
                 "worker",
                 reference,
                 "custom.primary.fast"
             ));
             assert!(!routed_selection_depends_on_model_ref(
-                &config,
+                &zeroclaw_config::migration::admit_test_input(&config),
                 "worker",
                 reference,
                 "custom.backup"
             ));
             assert_eq!(
-                resolve_model_identity(&config, "worker", reference, Some("explicit-model"))
-                    .unwrap()
-                    .model_id,
+                resolve_model_identity(
+                    &zeroclaw_config::migration::admit_test_input(&config),
+                    "worker",
+                    reference,
+                    Some("explicit-model")
+                )
+                .unwrap()
+                .model_id,
                 "explicit-model"
             );
         }
         assert!(!routed_selection_depends_on_model_ref(
-            &config,
+            &zeroclaw_config::migration::admit_test_input(&config),
             "worker",
             "custom.primary.fast",
             "custom.backup"
         ));
-        assert!(!inherits_agent_selection(&config, "custom.missing"));
-        assert!(resolve_model_identity(&config, "worker", "custom.missing", None).is_none());
+        assert!(!inherits_agent_selection(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "custom.missing"
+        ));
+        assert!(
+            resolve_model_identity(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                "worker",
+                "custom.missing",
+                None
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -720,35 +764,37 @@ model = "backup"
             );
         }
         assert!(!selection_depends_on_model_ref(
-            &config,
+            &zeroclaw_config::migration::admit_test_input(&config),
             "custom.gateway.prod.fast",
             "custom.gateway.prod"
         ));
         assert!(!selection_depends_on_model_ref(
-            &config,
+            &zeroclaw_config::migration::admit_test_input(&config),
             "custom.gateway.prod.slow",
             "custom.gateway.prod"
         ));
         assert!(!selection_depends_on_model_ref(
-            &config,
+            &zeroclaw_config::migration::admit_test_input(&config),
             "custom.gateway.prod.fast",
             "custom.gateway.prod.slow"
         ));
         assert!(!selection_depends_on_model_ref(
-            &config,
+            &zeroclaw_config::migration::admit_test_input(&config),
             "custom.gateway.prod",
             "custom.gateway.prod.fast"
         ));
 
         // An explicit exact-key model shadows the profile's projected key.
-        let registry = config.provider_registry().unwrap();
+        let registry = zeroclaw_config::migration::admit_test_input(&config)
+            .provider_registry()
+            .unwrap();
         let model = registry.models["custom.gateway.prod"].clone();
         config.providers.models.insert_canonical_model(
             "custom.gateway.prod".into(),
             serde_json::from_value(serde_json::to_value(model).unwrap()).unwrap(),
         );
         assert!(!selection_depends_on_model_ref(
-            &config,
+            &zeroclaw_config::migration::admit_test_input(&config),
             "custom.gateway.prod.fast",
             "custom.gateway.prod"
         ));
@@ -867,20 +913,50 @@ model = "backup-model"
                 ..Default::default()
             },
         );
-        let built = build_model(&config, "worker", " custom.target.v2.fast ", None).unwrap();
+        let built = build_model(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "worker",
+            " custom.target.v2.fast ",
+            None,
+        )
+        .unwrap();
         assert_eq!(built.model_name(), "fast-id");
         assert_eq!(built.identity().provider_ref(), "custom.target.v2.fast");
         assert_eq!(
             built.route_resolver().resolve("fast-id").provider_name,
             "custom.target.v2.fast"
         );
-        assert!(build_model(&config, "worker", " custom.target.v2.missing ", None).is_err());
-        assert!(build_model(&config, "worker", " llamacpp.typo ", Some("model-id")).is_err());
+        assert!(
+            build_model(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                "worker",
+                " custom.target.v2.missing ",
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            build_model(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                "worker",
+                " llamacpp.typo ",
+                Some("model-id")
+            )
+            .is_err()
+        );
         config.model_routes = vec![ModelRouteConfig {
             hint: "fast".into(),
             model_ref: "llamacpp.typo".into(),
         }];
-        assert!(build_model(&config, "worker", "custom.target.v2.fast", None).is_err());
+        assert!(
+            build_model(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                "worker",
+                "custom.target.v2.fast",
+                None
+            )
+            .is_err()
+        );
         config
             .providers
             .models
@@ -888,10 +964,24 @@ model = "backup-model"
             .unwrap()
             .uri = Some("http://127.0.0.1:2/v1".into());
         config.model_routes[0].model_ref = "custom.unfinished".into();
-        assert!(build_model(&config, "worker", "custom.target.v2.fast", None).is_err());
+        assert!(
+            build_model(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                "worker",
+                "custom.target.v2.fast",
+                None
+            )
+            .is_err()
+        );
         config.model_routes.clear();
         let url_ref = "custom:http://127.0.0.1:1/v1";
-        let built = build_model(&config, "worker", url_ref, Some("model-id")).unwrap();
+        let built = build_model(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "worker",
+            url_ref,
+            Some("model-id"),
+        )
+        .unwrap();
         assert_eq!(built.identity().provider_ref(), url_ref);
         assert_eq!(built.model_name(), "model-id");
     }
@@ -951,12 +1041,19 @@ model = "backup-model"
             },
         );
 
-        let inherited_options = crate::provider_runtime_options_for_agent(&config, "worker");
+        let inherited_options = crate::provider_runtime_options_for_agent(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "worker",
+        );
         for reference in [
             format!("custom:{explicit_url}"),
             "custom:https://api.example.test/v1".into(),
         ] {
-            let options = crate::options_for_provider_ref(&config, &reference, &inherited_options);
+            let options = crate::options_for_provider_ref(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                &reference,
+                &inherited_options,
+            );
             assert!(!options.merge_system_into_user);
             assert_eq!(options.provider_max_tokens, None);
             assert_eq!(
@@ -973,7 +1070,13 @@ model = "backup-model"
             ),
             ("custom".into(), None, "inherited-id"),
         ] {
-            let built = build_model(&config, "worker", &reference, override_model).unwrap();
+            let built = build_model(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                "worker",
+                &reference,
+                override_model,
+            )
+            .unwrap();
             assert_eq!(built.model_name(), expected_model);
             built
                 .provider()

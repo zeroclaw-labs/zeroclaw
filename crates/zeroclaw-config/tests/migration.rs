@@ -94,23 +94,27 @@ provider_max_tokens = 4096
 "User-Agent" = "ZeroClaw-V1-Test/1.0"
 "#;
     let cfg = migrate_to_current(raw).expect("V1 globals migrate");
-    let entry = cfg
-        .providers
-        .models
-        .find("openai", "default")
-        .expect("openai.default synthesized from V1 default_provider");
-    assert_eq!(entry.api_key.as_deref(), Some("sk-fold-target"));
+    let registry = cfg.provider_registry().unwrap();
+    let resolved = registry.resolve_chat(&"openai.default".into()).unwrap();
+    let connection = resolved.selection.connection;
+    assert_eq!(connection.api_key(), Some("sk-fold-target"));
     assert_eq!(
-        entry.uri.as_deref(),
-        Some("https://api.fold.test/v1/chat/completions"),
-        "V1 api_url + api_path merged into the per-provider entry's uri"
+        connection.uri(),
+        Some("https://api.fold.test/v1/chat/completions")
     );
-    assert_eq!(entry.model.as_deref(), Some("gpt-4o-mini"));
-    assert_eq!(entry.temperature, Some(0.5));
-    assert_eq!(entry.timeout_secs, Some(90));
-    assert_eq!(entry.max_tokens, Some(4096));
+    assert_eq!(resolved.upstream_model(), Some("gpt-4o-mini"));
+    use zeroclaw_config::provider_registry::Override;
+    assert_eq!(resolved.options.temperature, Some(Override::Set(0.5)));
+    assert!(
+        matches!(resolved.request_timeout_secs, Some(Override::Set(value)) if value.get() == 90)
+    );
+    assert_eq!(resolved.options.max_tokens, Some(Override::Set(4096)));
     assert_eq!(
-        entry.extra_headers.get("User-Agent").map(String::as_str),
+        connection
+            .extra_headers()
+            .unwrap()
+            .get("User-Agent")
+            .map(String::as_str),
         Some("ZeroClaw-V1-Test/1.0")
     );
 }
@@ -1374,18 +1378,20 @@ api_key = "sk-zai-test"
 "#;
     let cfg =
         migrate_to_current(raw).expect("migration succeeds despite colon-URL default_provider");
-    let entry = cfg
-        .providers
-        .models
-        .find("anthropic", "custom")
-        .expect("V2 anthropic-custom synonym must fold under model_providers.anthropic.custom");
+    let registry = cfg.provider_registry().unwrap();
+    let entry = registry
+        .selection(
+            &"anthropic.custom".into(),
+            zeroclaw_api::capability::Capability::Chat,
+        )
+        .unwrap();
     assert_eq!(
-        entry.uri.as_deref(),
+        entry.connection.uri(),
         Some("https://api.z.ai/api/anthropic"),
         "the URL portion of the V2 colon-URL form must land in uri on the alias entry"
     );
-    assert_eq!(entry.model.as_deref(), Some("claude-sonnet-4"));
-    assert_eq!(entry.api_key.as_deref(), Some("sk-zai-test"));
+    assert_eq!(entry.model.upstream_model(), Some("claude-sonnet-4"));
+    assert_eq!(entry.connection.api_key(), Some("sk-zai-test"));
 }
 
 #[test]
@@ -1396,17 +1402,19 @@ default_model = "local-model"
 "#;
     let cfg =
         migrate_to_current(raw).expect("migration succeeds for plain `custom:` colon-URL form");
-    let entry = cfg
-        .providers
-        .models
-        .find("custom", "default")
-        .expect("V3 outer key must be `custom`, not the raw colon-URL");
+    let registry = cfg.provider_registry().unwrap();
+    let entry = registry
+        .selection(
+            &"custom.default".into(),
+            zeroclaw_api::capability::Capability::Chat,
+        )
+        .unwrap();
     assert_eq!(
-        entry.uri.as_deref(),
+        entry.connection.uri(),
         Some("http://localhost:8080/v1"),
         "the URL portion of the V2 colon-URL form must land in uri"
     );
-    assert_eq!(entry.model.as_deref(), Some("local-model"));
+    assert_eq!(entry.model.upstream_model(), Some("local-model"));
 }
 
 #[test]
@@ -2866,7 +2874,7 @@ fn lookup_dotted<'a>(value: &'a toml::Value, path: &str) -> Option<&'a toml::Val
 }
 
 #[test]
-fn get_prop_resolves_model_field_for_typed_provider_alias() {
+fn migrated_aliases_resolve_through_canonical_model_references() {
     use zeroclaw_config::schema::Config;
     let raw = r#"
 schema_version = 4
@@ -2879,24 +2887,19 @@ max_tokens = 25000
 model = "claude-sonnet-4-6"
 "#;
     let cfg: Config = toml::from_str(raw).expect("parse");
-    let glados_model = cfg
-        .get_prop("providers.models.anthropic.glados.model")
-        .expect("get_prop must resolve for typed provider alias .model field");
-    let clamps_model = cfg
-        .get_prop("providers.models.anthropic.clamps.model")
-        .expect("get_prop must resolve for the other alias too");
-    eprintln!("glados.model = {glados_model:?}");
-    eprintln!("clamps.model = {clamps_model:?}");
-    assert_eq!(glados_model, "claude-opus-4-7");
-    assert_eq!(clamps_model, "claude-sonnet-4-6");
+    assert_eq!(
+        cfg.resolve_model_id("anthropic.glados").as_deref(),
+        Some("claude-opus-4-7")
+    );
+    assert_eq!(
+        cfg.resolve_model_id("anthropic.clamps").as_deref(),
+        Some("claude-sonnet-4-6")
+    );
+    assert!(cfg.providers.models.anthropic.is_empty());
 }
 
 #[test]
-fn prop_fields_includes_providers_models_alias_model_path() {
-    // The gateway's /api/config/prop handler does lookup_prop_field(&config, &path).
-    // lookup_prop_field walks Config::prop_fields() and finds a matching entry.
-    // If the model path isn't in prop_fields(), the gateway returns 404 and
-    // the frontend's resolveModelToProviderType walk silently drops the alias.
+fn migrated_alias_is_exposed_by_registry_instead_of_legacy_property_paths() {
     use zeroclaw_config::schema::Config;
     let raw = r#"
 schema_version = 4
@@ -2905,17 +2908,16 @@ schema_version = 4
 model = "claude-opus-4-7"
 "#;
     let cfg: Config = toml::from_str(raw).expect("parse");
-    let want = "providers.models.anthropic.glados.model";
-    let all = cfg.prop_fields();
-    let found = all.iter().any(|f| f.name == want);
-    if !found {
-        let candidates: Vec<String> = all
+    let registry = zeroclaw_config::provider_registry::editor::snapshot(&cfg).unwrap();
+    assert_eq!(
+        registry["models"]["anthropic.glados"]["model"],
+        "claude-opus-4-7"
+    );
+    assert!(
+        cfg.prop_fields()
             .iter()
-            .filter(|f| f.name.contains("anthropic.glados"))
-            .map(|f| f.name.clone())
-            .collect();
-        panic!("prop_fields() missing `{want}` — candidates: {candidates:?}",);
-    }
+            .all(|field| !field.name.starts_with("providers.models.anthropic.glados."))
+    );
 }
 
 #[test]
@@ -2933,8 +2935,8 @@ model = "claude-opus-4-7"
     );
     assert_eq!(
         cfg.get_map_keys("providers.models.anthropic"),
-        Some(vec!["glados".to_string()]),
-        "the per-type slot IS a map keyed by alias",
+        Some(vec![]),
+        "retired input slots are empty after admission",
     );
 }
 
@@ -3014,7 +3016,7 @@ api_key = "sk-openai-lead"
             agent.runtime_profile
         );
         assert!(
-            cfg.model_provider_for_agent(alias).is_some(),
+            cfg.resolve_model_id(&agent.model_provider).is_some(),
             "agent `{alias}` references model_provider `{}` which does not resolve",
             agent.model_provider
         );

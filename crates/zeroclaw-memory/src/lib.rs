@@ -81,7 +81,7 @@ use anyhow::Context;
 use std::path::Path;
 use std::sync::Arc;
 #[cfg(test)]
-use zeroclaw_config::provider_registry::embedding_input::{
+use zeroclaw_config::migration::embedding_fixtures::{
     ResolvedEmbeddingConfig, resolve_embedding_config,
 };
 #[cfg(test)]
@@ -299,13 +299,17 @@ fn resolve_canonical_embedding_config(
     config: &Config,
     inherited_api_key: Option<&str>,
 ) -> anyhow::Result<Option<Arc<dyn zeroclaw_api::embedding::EmbeddingProvider>>> {
-    let (registry, reference) = config.embedding_registry_for_input(inherited_api_key)?;
+    let (registry, reference) = config.embedding_registry()?;
     let Some(model_ref) = reference else {
         return Ok(None);
     };
     let resolved = registry.resolve_embedding(&model_ref)?;
-    let api_key = config
-        .embedding_api_key_for_input(resolved.selection.connection.api_key(), inherited_api_key);
+    let api_key = resolved
+        .selection
+        .connection
+        .api_key()
+        .or(inherited_api_key)
+        .map(str::to_owned);
     let settings = zeroclaw_providers::embedding::EmbeddingProviderConfig::from_resolved(
         &resolved,
         config.memory.embedding_dimensions,

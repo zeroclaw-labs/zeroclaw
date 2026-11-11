@@ -729,7 +729,9 @@ options.temperature = "null"
                 ..Default::default()
             },
         );
-        let generation = Arc::new(std::sync::RwLock::new(Arc::new(config)));
+        let generation = Arc::new(std::sync::RwLock::new(Arc::new(
+            zeroclaw_config::migration::admit_test_input(&config),
+        )));
         let source = Arc::clone(&generation);
         let tool = LlmTaskTool::with_config_resolver(
             Arc::new(SecurityPolicy::default()),
@@ -742,7 +744,8 @@ options.temperature = "null"
         let entry = profile.models.get_mut("default").unwrap();
         entry.id = Some("nested-next".into());
         entry.temperature = Some(0.6);
-        *generation.write().unwrap() = Arc::new(next);
+        *generation.write().unwrap() =
+            Arc::new(zeroclaw_config::migration::admit_test_input(&next));
 
         for (args, model, temperature) in [
             (json!({"prompt": "test"}), "nested-next", 0.6),
@@ -936,7 +939,7 @@ options.temperature = "null"
             // ── 3. Build LlmTaskTool targeting the Qwen OAuth alias ───
             let tool = LlmTaskTool::new(
                 Arc::new(SecurityPolicy::default()),
-                Arc::new(config),
+                Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
                 "test",
             );
 
@@ -1053,7 +1056,7 @@ options.temperature = "null"
 
         let tool = LlmTaskTool::new(
             Arc::new(SecurityPolicy::default()),
-            Arc::new(config),
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
             "test",
         );
 

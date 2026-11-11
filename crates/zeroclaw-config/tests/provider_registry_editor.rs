@@ -2,6 +2,10 @@ use serde_json::json;
 use zeroclaw_config::provider_registry::editor::{RegistryEdit, snapshot, stage};
 use zeroclaw_config::schema::Config;
 
+fn admit(config: Config) -> Config {
+    serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap()
+}
+
 fn config() -> Config {
     let providers = toml::from_str(
         r#"
@@ -39,7 +43,7 @@ model = "model-two"
 }
 
 #[test]
-fn registry_save_promotes_legacy_embedding_consumers_and_reuses_the_connection() {
+fn input_admission_promotes_embedding_consumers_before_registry_editing() {
     let mut config = config();
     config.memory.embedding_provider = "openai.legacy.prod".into();
     config.memory.embedding_model = "text-embedding-3-small".into();
@@ -53,6 +57,7 @@ fn registry_save_promotes_legacy_embedding_consumers_and_reuses_the_connection()
             dimensions: Some(3072),
             api_key: Some("route-secret".into()),
         });
+    config = admit(config);
     let expected = snapshot(&config).unwrap();
     stage(
         &mut config,
@@ -73,14 +78,12 @@ fn registry_save_promotes_legacy_embedding_consumers_and_reuses_the_connection()
         .unwrap();
     assert_eq!(route.model, "text-embedding-3-large");
     assert_eq!(route.dimensions, Some(3072));
-    assert_eq!(
+    assert_ne!(
         route.selection.model.provider(),
         memory.selection.model.provider()
     );
-    assert_eq!(
-        config.embedding_routes[0].api_key.as_deref(),
-        Some("route-secret")
-    );
+    assert_eq!(route.selection.connection.api_key(), Some("route-secret"));
+    assert!(config.embedding_routes[0].api_key.is_none());
     let before = snapshot(&config).unwrap();
     stage(
         &mut config,
@@ -128,11 +131,12 @@ fn registry_save_preserves_embeddings_on_chat_only_compatible_endpoints() {
             dimensions: Some(3072),
             api_key: None,
         });
+    config = admit(config);
     let expected = snapshot(&config).unwrap();
     let mut registry = expected.clone();
-    registry["connections"]["legacy.deepseek.gateway.prod"]["uri"] =
+    registry["connections"]["embedding.route.semantic.v1"]["uri"] =
         json!("https://edited.example.test/v1");
-    registry["connections"]["legacy.deepseek.gateway.prod"]["auth"]["api_key"] =
+    registry["connections"]["embedding.route.semantic.v1"]["auth"]["api_key"] =
         json!("edited-secret");
     // A user-owned connection at the generated name must not be overwritten.
     registry["connections"]["embedding.legacy.deepseek.gateway.prod"] = json!({
@@ -157,11 +161,11 @@ fn registry_save_preserves_embeddings_on_chat_only_compatible_endpoints() {
     );
     assert_eq!(
         memory.selection.model.provider().as_str(),
-        "embedding.legacy.deepseek.gateway.prod.2"
+        "embedding.route.semantic.v1"
     );
     let connection = memory.selection.connection;
     assert_eq!(connection.kind(), "custom");
-    assert_eq!(connection.capabilities().len(), 1);
+
     assert!(connection.supports(Capability::Embedding));
     assert_eq!(connection.uri(), Some("https://edited.example.test/v1"));
     assert_eq!(connection.api_key(), Some("edited-secret"));
@@ -197,6 +201,7 @@ fn registry_save_does_not_bypass_explicitly_disabled_embeddings() {
     let mut config = config();
     config.memory.embedding_provider = "openai.legacy.prod".into();
     config.memory.embedding_model = "embedding-small".into();
+    config = admit(config);
     let expected = snapshot(&config).unwrap();
     let mut registry = expected.clone();
     registry["connections"]["legacy.openai.legacy.prod"]["capabilities"] = json!(["chat"]);
@@ -208,10 +213,7 @@ fn registry_save_does_not_bypass_explicitly_disabled_embeddings() {
         },
     )
     .unwrap_err();
-    assert!(
-        error.to_string().contains("does not support embeddings"),
-        "{error}"
-    );
+    assert!(error.to_string().contains("capability"), "{error}");
     assert_eq!(snapshot(&config).unwrap(), expected);
 }
 
@@ -220,6 +222,7 @@ fn registry_save_rejects_deleting_a_legacy_embedding_connection_atomically() {
     let mut config = config();
     config.memory.embedding_provider = "openai.legacy.prod".into();
     config.memory.embedding_model = "text-embedding-3-small".into();
+    config = admit(config);
     let expected = snapshot(&config).unwrap();
     let mut registry = expected.clone();
     registry["connections"]
@@ -282,11 +285,13 @@ fn connection_presets_require_matching_capabilities_even_without_models() {
 #[test]
 fn registry_editor_rejects_deleting_a_connection_preset_atomically() {
     let mut config = config();
+    config = admit(config);
     let expected = snapshot(&config).unwrap();
     let mut registry = expected.clone();
     registry["model_presets"] = json!({"voice.default": {"capability": "tts", "options": {}}});
     registry["connections"]["gateway.prod"]["api"] = json!({"tts": {"preset": "voice.default"}});
     stage(&mut config, RegistryEdit { expected, registry }).unwrap();
+    config = admit(config);
     let expected = snapshot(&config).unwrap();
     let mut registry = expected.clone();
     registry["model_presets"] = json!({});
@@ -341,6 +346,7 @@ fn chat_defaults_apply_to_driver_specific_api_objects() {
 #[test]
 fn registry_editor_preserves_exact_keys_and_secrets_while_promoting_legacy_maps() {
     let mut config = config();
+    config = admit(config);
     let expected = snapshot(&config).unwrap();
     assert!(!expected.to_string().contains("test-secret"));
     assert!(!expected.to_string().contains("test-header"));
@@ -388,6 +394,7 @@ fn registry_editor_promotes_masked_legacy_credentials_and_keeps_later_edits() {
         .ensure("openai", "legacy.prod")
         .unwrap()
         .api_key = Some("legacy-test-secret".into());
+    config = admit(config);
     let expected = snapshot(&config).unwrap();
     assert!(!expected.to_string().contains("legacy-test-secret"));
     stage(
@@ -402,6 +409,7 @@ fn registry_editor_promotes_masked_legacy_credentials_and_keeps_later_edits() {
         config.providers.connections["legacy.openai.legacy.prod"].api_key(),
         Some("legacy-test-secret")
     );
+    config = admit(config);
     let expected = snapshot(&config).unwrap();
     let mut registry = expected.clone();
     registry["connections"]["legacy.openai.legacy.prod"]["uri"] = json!("https://updated.test/v1");
@@ -448,6 +456,7 @@ fn legacy_chat_and_speech_names_are_normalized_before_editor_promotion() {
             ..Default::default()
         },
     );
+    config = admit(config);
     for (capability, expected) in [
         (Capability::Chat, "openai.default"),
         (Capability::Tts, "tts.openai.default"),
@@ -455,13 +464,14 @@ fn legacy_chat_and_speech_names_are_normalized_before_editor_promotion() {
     ] {
         assert_eq!(
             config
-                .capability_model_ref("openai.default", capability)
+                .capability_model_ref(expected, capability)
                 .unwrap()
                 .as_str(),
             expected
         );
     }
     config.validate().unwrap();
+    config = admit(config);
     let expected = snapshot(&config).unwrap();
     stage(
         &mut config,
@@ -499,6 +509,7 @@ fn legacy_chat_and_speech_names_are_normalized_before_editor_promotion() {
 #[test]
 fn registry_voice_pickers_use_complete_model_refs_and_correct_capabilities() {
     let mut config = config();
+    config = admit(config);
     let expected = snapshot(&config).unwrap();
     let mut registry = expected.clone();
     for (name, capability) in [
@@ -528,6 +539,7 @@ fn registry_voice_pickers_use_complete_model_refs_and_correct_capabilities() {
 #[test]
 fn registry_editor_rejects_stale_or_invalid_replacements_atomically() {
     let mut config = config();
+    config = admit(config);
     let expected = snapshot(&config).unwrap();
     let before = serde_json::to_value(&config.providers).unwrap();
     let mut invalid = expected.clone();
@@ -561,6 +573,7 @@ fn registry_editor_rejects_stale_or_invalid_replacements_atomically() {
 #[test]
 fn registry_editor_rejects_orphan_mask_but_accepts_explicit_secret_replacement() {
     let mut config = config();
+    config = admit(config);
     let expected = snapshot(&config).unwrap();
     let mut registry = expected.clone();
     registry["connections"]["new.connection"] = registry["connections"]["gateway.prod"].clone();
@@ -586,12 +599,14 @@ fn registry_editor_rejects_orphan_mask_but_accepts_explicit_secret_replacement()
 #[test]
 fn registry_editor_retains_models_referenced_by_memory() {
     let mut config = config();
+    config = admit(config);
     let expected = snapshot(&config).unwrap();
     let mut registry = expected.clone();
     registry["models"]["embed.active"] =
         json!({"capability": "embedding", "provider": "gateway.prod", "model": "embedding-v1"});
     stage(&mut config, RegistryEdit { expected, registry }).unwrap();
     config.memory.embedding_model_ref = Some("embed.active".into());
+    config = admit(config);
     let expected = snapshot(&config).unwrap();
     for replacement in [
         None,
@@ -746,7 +761,7 @@ fn preset_rename_updates_api_and_model_bindings() {
 
 #[test]
 fn registry_rename_refuses_environment_owned_consumer_bindings_atomically() {
-    let mut config = config();
+    let mut config = admit(config());
     config
         .agents
         .insert("test-agent".into(), Default::default());
@@ -784,6 +799,7 @@ fn legacy_gemini_oauth_clients_survive_projection_and_editor_save() {
             .unwrap(),
             ..Config::default()
         };
+        config = admit(config);
         let credentials = Some(("test-client".to_owned(), "test-client-secret".to_owned()));
         assert_eq!(
             config
@@ -791,6 +807,7 @@ fn legacy_gemini_oauth_clients_survive_projection_and_editor_save() {
                 .unwrap(),
             credentials
         );
+        config = admit(config);
         let expected = snapshot(&config).unwrap();
         assert!(!expected.to_string().contains("test-client-secret"));
         stage(
@@ -830,6 +847,7 @@ fn legacy_gemini_explicit_api_key_keeps_priority_over_oauth_clients() {
         .unwrap(),
         ..Config::default()
     };
+    let config = admit(config);
     let registry = config.provider_registry().unwrap();
     let selection = registry.resolve_chat(&"gemini.work".into()).unwrap();
     assert_eq!(selection.selection.connection.api_key(), Some("test-key"));
@@ -839,4 +857,69 @@ fn legacy_gemini_explicit_api_key_keeps_priority_over_oauth_clients() {
             .unwrap(),
         None
     );
+}
+
+#[test]
+fn registry_edits_preserve_only_unchanged_external_secret_references() {
+    use zeroclaw_config::provider_registry::editor::{delete_entry, rename_entry, update};
+    let mut config = admit(config());
+    let original = "/providers/connections/gateway.prod/auth/api_key";
+    let header = "/providers/connections/gateway.prod/extra_headers/X-Custom-Auth";
+    config
+        .onepassword_reference_snapshots
+        .insert(original.into(), "op://test/api/key".into());
+    config
+        .onepassword_reference_snapshots
+        .insert(header.into(), "op://test/header/key".into());
+
+    update(&mut config, |registry| {
+        if let zeroclaw_config::provider_registry::ModelDefinition::Chat(model) =
+            registry.models.get_mut("chat.fast.us").unwrap()
+        {
+            model.model = Some("new-model".into());
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(config.onepassword_reference_snapshots.len(), 2);
+    rename_entry(
+        &mut config,
+        "connections",
+        "gateway.prod",
+        "gateway.prod/renamed",
+    )
+    .unwrap();
+    let renamed = "/providers/connections/gateway.prod~1renamed/auth/api_key";
+    assert_eq!(
+        config
+            .onepassword_reference_snapshots
+            .get(renamed)
+            .map(String::as_str),
+        Some("op://test/api/key")
+    );
+    assert!(
+        !config
+            .onepassword_reference_snapshots
+            .contains_key(original)
+    );
+    let expected = snapshot(&config).unwrap();
+    let mut replacement = expected.clone();
+    replacement["connections"]["gateway.prod/renamed"]["auth"]["api_key"] =
+        "replacement-key".into();
+    stage(
+        &mut config,
+        RegistryEdit {
+            expected,
+            registry: replacement,
+        },
+    )
+    .unwrap();
+    assert!(!config.onepassword_reference_snapshots.contains_key(renamed));
+    assert_eq!(config.onepassword_reference_snapshots.len(), 1);
+
+    delete_entry(&mut config, "fallback", "chat.fast.us").unwrap();
+    delete_entry(&mut config, "models", "chat.fast.us").unwrap();
+    delete_entry(&mut config, "models", "chat.backup").unwrap();
+    delete_entry(&mut config, "connections", "gateway.prod/renamed").unwrap();
+    assert!(config.onepassword_reference_snapshots.is_empty());
 }

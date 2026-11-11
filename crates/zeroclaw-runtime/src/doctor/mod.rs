@@ -1997,12 +1997,20 @@ mod tests {
 
         // Full label (type.alias) should validate successfully when uri is in config.
         assert!(
-            provider_validation_error(&config, "custom.vllm").is_none(),
+            provider_validation_error(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                "custom.vllm"
+            )
+            .is_none(),
             "custom.vllm should be valid when uri is defined in config"
         );
 
         // Bare "custom" without alias should still fail (no config entry to resolve).
-        let bare_error = provider_validation_error(&config, "custom").unwrap_or_default();
+        let bare_error = provider_validation_error(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "custom",
+        )
+        .unwrap_or_default();
         assert!(
             bare_error.contains("requires `uri`"),
             "bare 'custom' without alias should require uri"
@@ -2030,7 +2038,10 @@ mod tests {
             .expect("known model_provider type")
             .temperature = Some(5.0);
         let mut items = Vec::new();
-        check_config_semantics(&config, &mut items);
+        check_config_semantics(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            &mut items,
+        );
         let temp_item = items.iter().find(|i| i.message.contains("temperature"));
         assert!(temp_item.is_some());
         assert_eq!(temp_item.unwrap().severity, Severity::Error);
@@ -2046,7 +2057,10 @@ mod tests {
             .expect("known model_provider type")
             .temperature = Some(0.7);
         let mut items = Vec::new();
-        check_config_semantics(&config, &mut items);
+        check_config_semantics(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            &mut items,
+        );
         let temp_item = items.iter().find(|i| i.message.contains("temperature"));
         assert!(temp_item.is_some());
         assert_eq!(temp_item.unwrap().severity, Severity::Ok);
@@ -2199,7 +2213,10 @@ mod tests {
         profile.model = Some("qwen3".to_string());
 
         let mut unset_items = Vec::new();
-        check_config_semantics(&unset, &mut unset_items);
+        check_config_semantics(
+            &zeroclaw_config::migration::admit_test_input(&unset),
+            &mut unset_items,
+        );
         let unset_message = crate::i18n::get_required_cli_string_with_args(
             "cli-doctor-context-window-unset",
             &[
@@ -2224,7 +2241,10 @@ mod tests {
             .expect("known model provider type")
             .context_window = Some(32_000);
         let mut explicit_items = Vec::new();
-        check_config_semantics(&explicit, &mut explicit_items);
+        check_config_semantics(
+            &zeroclaw_config::migration::admit_test_input(&explicit),
+            &mut explicit_items,
+        );
         let explicit_message = crate::i18n::get_required_cli_string_with_args(
             "cli-doctor-context-window-ok",
             &[
@@ -2259,7 +2279,10 @@ mod tests {
             .expect("known model provider type")
             .context_window = Some(0);
         let mut zero_items = Vec::new();
-        check_config_semantics(&zero, &mut zero_items);
+        check_config_semantics(
+            &zeroclaw_config::migration::admit_test_input(&zero),
+            &mut zero_items,
+        );
         let zero_message = crate::i18n::get_required_cli_string_with_args(
             "cli-doctor-context-window-zero",
             &[("provider_ref", "ollama.local")],
@@ -2422,9 +2445,12 @@ mod tests {
         profile.uri = Some(format!("{}/v1", server.uri()));
 
         assert_eq!(
-            fetch_provider_catalog(&config, "custom.local")
-                .await
-                .unwrap(),
+            fetch_provider_catalog(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                "custom.local"
+            )
+            .await
+            .unwrap(),
             vec!["catalog-model"]
         );
         let profile = config.providers.models.custom.remove("local").unwrap();
@@ -2434,7 +2460,12 @@ mod tests {
             .custom
             .insert("default".into(), profile);
         assert_eq!(
-            fetch_provider_catalog(&config, "custom").await.unwrap(),
+            fetch_provider_catalog(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                "custom"
+            )
+            .await
+            .unwrap(),
             vec!["catalog-model"]
         );
     }
@@ -2484,13 +2515,21 @@ mod tests {
             },
         );
 
-        let diagnostics = diagnose_nonblocking(&config).await.unwrap();
+        let diagnostics =
+            diagnose_nonblocking(&zeroclaw_config::migration::admit_test_input(&config))
+                .await
+                .unwrap();
         assert!(diagnostics.iter().any(|item| {
             item.message == "model_provider \"qwen.oauth\" is valid"
                 && item.severity == Severity::Ok
         }));
         assert_eq!(
-            fetch_provider_catalog(&config, "qwen.oauth").await.unwrap(),
+            fetch_provider_catalog(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                "qwen.oauth"
+            )
+            .await
+            .unwrap(),
             vec!["qwen-catalog-model"]
         );
     }
@@ -2506,7 +2545,10 @@ mod tests {
         profile.api_key = Some("redacted-test-key".to_string());
         profile.uri = Some("https://models.example.test/v1".to_string());
 
-        if let Err(error) = create_doctor_model_provider(&config, "custom.local") {
+        if let Err(error) = create_doctor_model_provider(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "custom.local",
+        ) {
             panic!("doctor model probe should build custom providers from alias config: {error}");
         }
     }
@@ -2522,14 +2564,16 @@ mod tests {
         profile.api_key = Some("redacted-test-key".to_string());
         profile.uri = Some("http://127.0.0.1:9/v1".to_string());
 
-        let baseline = diagnose(&config);
+        let baseline = diagnose(&zeroclaw_config::migration::admit_test_input(&config));
         assert!(
             !baseline
                 .iter()
                 .any(|item| item.category == "providers.models")
         );
 
-        let full = run_structured(&config).await.unwrap();
+        let full = run_structured(&zeroclaw_config::migration::admit_test_input(&config))
+            .await
+            .unwrap();
         assert!(
             full.iter().any(|item| item.category == "providers.models"),
             "shared structured runner should include the same model probe rows as the CLI"
@@ -2767,7 +2811,13 @@ mod tests {
 
         std::fs::write(tmp.path().join("state"), "not a directory").unwrap();
 
-        let result = run_models(&config, Some("ollama.default"), false, false).await;
+        let result = run_models(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            Some("ollama.default"),
+            false,
+            false,
+        )
+        .await;
 
         assert!(
             result.is_err(),
@@ -2923,9 +2973,14 @@ mod tests {
             .expect("known model_provider type")
             .uri = Some(format!("{}/v1", server.uri()));
 
-        run_models(&config, Some("ollama"), false, false)
-            .await
-            .expect("a bare family with one configured alias must probe that alias");
+        run_models(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            Some("ollama"),
+            false,
+            false,
+        )
+        .await
+        .expect("a bare family with one configured alias must probe that alias");
     }
 
     #[test]
@@ -2942,7 +2997,10 @@ mod tests {
         }
 
         assert_eq!(
-            doctor_model_targets(&config, Some("ollama")),
+            doctor_model_targets(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                Some("ollama")
+            ),
             vec!["ollama.homelab".to_owned(), "ollama.workstation".to_owned()],
             "a bare family must fan out to its aliases rather than collapse to a config-less default"
         );
@@ -2977,7 +3035,10 @@ mod tests {
             .uri = Some("http://example.invalid".to_owned());
 
         assert_eq!(
-            doctor_model_targets(&config, Some("ollama.homelab")),
+            doctor_model_targets(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                Some("ollama.homelab")
+            ),
             vec!["ollama.homelab".to_owned()]
         );
     }
@@ -3055,7 +3116,10 @@ mod tests {
             });
 
         let mut items = Vec::new();
-        check_config_semantics(&config, &mut items);
+        check_config_semantics(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            &mut items,
+        );
         assert!(
             !items.iter().any(|item| item
                 .message
@@ -3736,7 +3800,10 @@ mod tests {
             .models
             .openai
             .insert("codex".to_string(), openai_codex_slot());
-        let items = codex_auth_wiring_items(false, &config);
+        let items = codex_auth_wiring_items(
+            false,
+            &zeroclaw_config::migration::admit_test_input(&config),
+        );
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].severity, Severity::Warn);
         assert!(
@@ -3754,7 +3821,8 @@ mod tests {
             .models
             .openai
             .insert("codex".to_string(), openai_codex_slot());
-        let items = codex_auth_wiring_items(true, &config);
+        let items =
+            codex_auth_wiring_items(true, &zeroclaw_config::migration::admit_test_input(&config));
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].severity, Severity::Ok);
     }
@@ -4035,7 +4103,10 @@ mod tests {
         }
 
         let mut items = Vec::new();
-        check_config_semantics(&config, &mut items);
+        check_config_semantics(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            &mut items,
+        );
         let messages: Vec<&str> = items.iter().map(|i| i.message.as_str()).collect();
         let expected_temperature_error = crate::i18n::get_required_cli_string_with_args(
             "cli-doctor-temperature-out-of-range",

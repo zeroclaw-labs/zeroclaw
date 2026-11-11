@@ -272,7 +272,12 @@ mod tests {
                     },
                 );
         }
-        let configured = Temperature::default().for_call(Some(Arc::new(config)), "custom.entrance");
+        let configured = Temperature::default().for_call(
+            Some(Arc::new(zeroclaw_config::migration::admit_test_input(
+                &config,
+            ))),
+            "custom.entrance",
+        );
         let dispatch = crate::ProviderDispatch::from_ref(&router);
         let messages = [ChatMessage::user("hello")];
         for (sampling, expected) in [
@@ -408,7 +413,7 @@ mod tests {
             },
         );
         config.providers.models.ensure("custom", "unset").unwrap();
-        let config = Arc::new(config);
+        let config = Arc::new(zeroclaw_config::migration::admit_test_input(&config));
         for (input, expected) in [
             (Temperature::adjusted(None, 0.1), 0.3),
             (Temperature::adjusted(Some(0.2), 0.1), 0.3),
@@ -421,7 +426,10 @@ mod tests {
             );
             assert_eq!(
                 sampling.resolve_for(Some("custom.unset")),
-                input.resolve(Some(&config), "custom.unset")
+                input.resolve(
+                    Some(&zeroclaw_config::migration::admit_test_input(&config)),
+                    "custom.unset"
+                )
             );
             assert_eq!(
                 CallSampling::Explicit(None).resolve_for(Some("custom.gw.chosen")),
@@ -444,7 +452,7 @@ mod tests {
             .unwrap()
             .temperature = Some(0.2);
         config.providers.models.ensure("ollama", "unset").unwrap();
-        let config = Arc::new(config);
+        let config = Arc::new(zeroclaw_config::migration::admit_test_input(&config));
         let input = Temperature::adjusted(None, 0.1);
         let unknown = input.for_call_with_fallback(Some(Arc::clone(&config)), "ollama", Some(0.7));
         assert_eq!(unknown.resolve_for(None), Some(0.7));

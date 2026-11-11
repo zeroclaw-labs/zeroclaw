@@ -4545,17 +4545,24 @@ mod tests {
             cloud_escalation: CloudEscalationPolicy::Auto,
         };
 
-        let local = effort_turn_route(&config, Some(&policy), "say hello")
-            .unwrap()
-            .unwrap();
+        let local = effort_turn_route(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            Some(&policy),
+            "say hello",
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(local.model_provider, "custom.local");
         assert_eq!(local.model, "small");
         assert_eq!(
             local.allowed_provider_refs.as_ref(),
             &std::collections::HashSet::from(["custom.local".to_string()])
         );
-        let local_config =
-            effort_scoped_provider_config(&config, local.allowed_provider_refs.as_ref()).unwrap();
+        let local_config = effort_scoped_provider_config(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            local.allowed_provider_refs.as_ref(),
+        )
+        .unwrap();
         assert!(
             !local_config.providers.fallback.contains_key(
                 &zeroclaw_config::provider_registry::ModelRef::new("custom.local")
@@ -4571,9 +4578,13 @@ mod tests {
             "direct turns must remove excluded profiles so side routes such as vision cannot construct them"
         );
 
-        let cloud = effort_turn_route(&config, Some(&policy), &"a".repeat(201))
-            .unwrap()
-            .unwrap();
+        let cloud = effort_turn_route(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            Some(&policy),
+            &"a".repeat(201),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(cloud.model_provider, "custom.cloud");
         assert_eq!(cloud.model, "large");
         assert_eq!(
@@ -19912,7 +19923,7 @@ Let me check the result."#;
             };
 
             crate::skills::review::maybe_run_skill_review(
-                Some(&config),
+                Some(&zeroclaw_config::migration::admit_test_input(&config)),
                 workspace.path().to_path_buf(),
                 review_config,
                 false,
@@ -20747,7 +20758,10 @@ Let me check the result."#;
             },
         );
 
-        let result = super::agent_provider_composite(&config, "my_agent");
+        let result = super::agent_provider_composite(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "my_agent",
+        );
 
         // Must be the full dotted ref so the alias-aware factory path is taken.
         assert_eq!(
@@ -25245,7 +25259,7 @@ mod capability_entry_point_tests {
         let principal = PrincipalId::for_oidc("https://issuer.example", "subject-vision");
 
         let error = super::process_message_with_capabilities(
-            Arc::new(config),
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
             capabilities_with_providers(Arc::clone(&providers) as _),
             Some(principal.clone()),
             "test-agent",
@@ -25319,7 +25333,7 @@ mod capability_entry_point_tests {
         let principal = PrincipalId::for_oidc("https://issuer.example", "subject-2");
 
         let reply = super::process_message_with_capabilities(
-            Arc::new(config),
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
             recording_capabilities(
                 Arc::clone(&providers),
                 Arc::clone(&memory),

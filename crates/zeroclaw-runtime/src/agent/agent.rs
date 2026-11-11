@@ -6081,7 +6081,13 @@ mod tests {
         entry.api_key = Some("dotted-key".into());
         entry.uri = Some(selected.uri());
         entry.model = Some("dotted-model".into());
-        let runtime = build_model(&config, "worker", "custom.edge.v2", None).unwrap();
+        let runtime = build_model(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "worker",
+            "custom.edge.v2",
+            None,
+        )
+        .unwrap();
         assert_eq!(runtime.model.provider_name(), "custom.edge.v2");
         let response = zeroclaw_providers::ProviderDispatch::from_ref(runtime.model.provider())
             .simple_chat(
@@ -6117,7 +6123,13 @@ mod tests {
             },
         );
 
-        let runtime = build_model(&config, "tester", "openai.fast", None).unwrap();
+        let runtime = build_model(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "tester",
+            "openai.fast",
+            None,
+        )
+        .unwrap();
         assert_eq!(runtime.model.provider_name(), "openai.fast");
         assert_eq!(runtime.model.model_name(), "gpt-4o-mini");
     }
@@ -6162,7 +6174,13 @@ mod tests {
         for (override_model, expected) in
             [(None, "nested-id"), (Some("explicit-id"), "explicit-id")]
         {
-            let runtime = build_model(&config, "worker", "openai", override_model).unwrap();
+            let runtime = build_model(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                "worker",
+                "openai",
+                override_model,
+            )
+            .unwrap();
             assert_eq!(runtime.model.provider_name(), "openai");
             assert_eq!(runtime.model.identity().provider_ref(), "openai");
             zeroclaw_providers::ProviderDispatch::from_ref(runtime.model.provider())
@@ -6227,7 +6245,13 @@ mod tests {
                 let mut agent = Agent::builder()
                     .agent_alias("worker".into())
                     .model_runtime(
-                        build_model(&config, "worker", "custom", override_model).unwrap(),
+                        build_model(
+                            &zeroclaw_config::migration::admit_test_input(&config),
+                            "worker",
+                            "custom",
+                            override_model,
+                        )
+                        .unwrap(),
                     )
                     .context_limits_resolver(Arc::new(move |provider, model| {
                         limits_config.resolved_context_limits_for_route("worker", provider, model)
@@ -6238,7 +6262,9 @@ mod tests {
                     .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
                     .observer(Arc::new(crate::observability::NoopObserver))
                     .provider_switch_config(ProviderSwitchConfig {
-                        config: Some(Arc::new(config.clone())),
+                        config: Some(Arc::new(zeroclaw_config::migration::admit_test_input(
+                            &config,
+                        ))),
                         live_config: None,
                         live: None,
                     })
@@ -6510,7 +6536,15 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
         for override_value in [None, Some(0.2)] {
             for streamed in [false, true] {
                 let mut agent = Agent::builder()
-                    .model_runtime(build_model(&config, "worker", "custom.text", None).unwrap())
+                    .model_runtime(
+                        build_model(
+                            &zeroclaw_config::migration::admit_test_input(&config),
+                            "worker",
+                            "custom.text",
+                            None,
+                        )
+                        .unwrap(),
+                    )
                     .temperature(override_value)
                     .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
                         Vec::new(),
@@ -6519,7 +6553,9 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
                     .observer(Arc::new(crate::observability::NoopObserver))
                     .multimodal_config(config.multimodal.clone())
                     .provider_switch_config(ProviderSwitchConfig {
-                        config: Some(Arc::new(config.clone())),
+                        config: Some(Arc::new(zeroclaw_config::migration::admit_test_input(
+                            &config,
+                        ))),
                         live_config: None,
                         live: None,
                     })
@@ -6598,7 +6634,9 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
                 .workspace_dir(temp.path().to_path_buf())
                 .turn_datetime(fixed_response_cache_turn_datetime)
                 .provider_switch_config(ProviderSwitchConfig {
-                    config: Some(Arc::new(config.clone())),
+                    config: Some(Arc::new(zeroclaw_config::migration::admit_test_input(
+                        &config,
+                    ))),
                     live_config: None,
                     live: None,
                 })
@@ -6609,7 +6647,10 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
             let message = format!("same cache request streamed={streamed}");
             let before = server.received_requests().await.unwrap().len();
             let mut current_config = config.clone();
-            let mut agent = build(&current_config, "custom.cache.first");
+            let mut agent = build(
+                &zeroclaw_config::migration::admit_test_input(&current_config),
+                "custom.cache.first",
+            );
             for (reference, tokens, reload, effort) in [
                 ("custom.cache.first", 11, false, None),
                 ("custom.cache.second", 77, false, None),
@@ -6632,9 +6673,17 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
                 }
                 current_config.runtime.reasoning_effort = effort.map(str::to_string);
                 agent.install_model_runtime(
-                    build_model(&current_config, "worker", reference, None).unwrap(),
+                    build_model(
+                        &zeroclaw_config::migration::admit_test_input(&current_config),
+                        "worker",
+                        reference,
+                        None,
+                    )
+                    .unwrap(),
                 );
-                agent.set_config_generation(Arc::new(current_config.clone()));
+                agent.set_config_generation(Arc::new(
+                    zeroclaw_config::migration::admit_test_input(&current_config),
+                ));
                 agent.history.clear();
                 let answer = if streamed {
                     let (tx, _rx) = tokio::sync::mpsc::channel(128);
@@ -6686,7 +6735,13 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
             profile.merge_system_into_user = merge;
         }
         for (alias, merge) in [("plain", false), ("merged", true)] {
-            let rt = build_model(&config, "worker", &format!("custom.{alias}"), None).unwrap();
+            let rt = build_model(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                "worker",
+                &format!("custom.{alias}"),
+                None,
+            )
+            .unwrap();
             zeroclaw_providers::ProviderDispatch::from_ref(rt.model.provider())
                 .chat_with_system(Some("fixture system"), "hello", rt.model.model_name(), None)
                 .await
@@ -6739,7 +6794,13 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
             ),
         ]);
         for override_value in [None, Some(0.42)] {
-            let rt = build_model(&config, "worker", "custom.gw.first", None).unwrap();
+            let rt = build_model(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                "worker",
+                "custom.gw.first",
+                None,
+            )
+            .unwrap();
             let mut agent = Agent::builder()
                 .model_runtime(rt)
                 .temperature(override_value)
@@ -6749,7 +6810,9 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
                 .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
                 .observer(Arc::new(crate::observability::NoopObserver))
                 .provider_switch_config(ProviderSwitchConfig {
-                    config: Some(Arc::new(config.clone())),
+                    config: Some(Arc::new(zeroclaw_config::migration::admit_test_input(
+                        &config,
+                    ))),
                     live_config: None,
                     live: None,
                 })
@@ -6757,7 +6820,13 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
                 .unwrap();
             agent.turn("hello").await.unwrap();
             agent.install_model_runtime(
-                build_model(&config, "worker", "custom.gw.second", None).unwrap(),
+                build_model(
+                    &zeroclaw_config::migration::admit_test_input(&config),
+                    "worker",
+                    "custom.gw.second",
+                    None,
+                )
+                .unwrap(),
             );
             agent.turn("hello again").await.unwrap();
             let requests = server.received_requests().await.unwrap();
@@ -6837,7 +6906,13 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
             } else {
                 Vec::new()
             };
-            let rt = build_model(&config, "worker", "custom.gw.small", None).unwrap();
+            let rt = build_model(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                "worker",
+                "custom.gw.small",
+                None,
+            )
+            .unwrap();
             let limits_config = config.clone();
             let mut agent = Agent::builder()
                 .model_runtime(rt)
@@ -6850,7 +6925,9 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
                     limits_config.resolved_context_limits_for_route("worker", provider, model)
                 }))
                 .provider_switch_config(ProviderSwitchConfig {
-                    config: Some(Arc::new(config.clone())),
+                    config: Some(Arc::new(zeroclaw_config::migration::admit_test_input(
+                        &config,
+                    ))),
                     live_config: None,
                     live: None,
                 })
@@ -6935,7 +7012,13 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
         );
 
         // Three-segment ref: the selected entry's tuning wins.
-        let rt = build_model(&config, "tester", "openai.gw.cheap", None).unwrap();
+        let rt = build_model(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "tester",
+            "openai.gw.cheap",
+            None,
+        )
+        .unwrap();
         assert_eq!(
             config
                 .resolve_model_selection(&rt.model.identity().provider_ref())
@@ -6953,7 +7036,13 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
         );
 
         // Two-segment ref: the profile's values (default entry sets none).
-        let rt = build_model(&config, "tester", "openai.gw", None).unwrap();
+        let rt = build_model(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "tester",
+            "openai.gw",
+            None,
+        )
+        .unwrap();
         assert_eq!(
             config
                 .resolve_model_selection(&rt.model.identity().provider_ref())
@@ -6979,7 +7068,13 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
                 },
             },
         );
-        let rt = build_model(&bare, "tester", "openai.minimal", None).unwrap();
+        let rt = build_model(
+            &zeroclaw_config::migration::admit_test_input(&bare),
+            "tester",
+            "openai.minimal",
+            None,
+        )
+        .unwrap();
         assert_eq!(
             bare.effective_model_context_window_for_route(
                 &rt.model.identity().provider_ref(),
@@ -7030,7 +7125,13 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
             },
         );
 
-        let rt = build_model(&config, "tester", "openai.gw.cheap", None).unwrap();
+        let rt = build_model(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "tester",
+            "openai.gw.cheap",
+            None,
+        )
+        .unwrap();
 
         assert_eq!(rt.model.provider_name(), "openai.gw.cheap");
         assert_eq!(rt.model.model_name(), "gpt-4o-mini");
@@ -7097,8 +7198,13 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
             },
         );
 
-        let rt = build_model(&config, "tester", "custom.target.cheap", None)
-            .expect("target profile builds");
+        let rt = build_model(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "tester",
+            "custom.target.cheap",
+            None,
+        )
+        .expect("target profile builds");
         let response = zeroclaw_providers::ProviderDispatch::from_ref(rt.model.provider())
             .simple_chat(
                 "hello",
@@ -7117,8 +7223,13 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
             .ensure("custom", "target")
             .expect("custom target profile")
             .api_key = None;
-        let keyless_rt = build_model(&config, "tester", "custom.target.cheap", None)
-            .expect("keyless target profile builds");
+        let keyless_rt = build_model(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "tester",
+            "custom.target.cheap",
+            None,
+        )
+        .expect("keyless target profile builds");
         zeroclaw_providers::ProviderDispatch::from_ref(keyless_rt.model.provider())
             .simple_chat(
                 "hello again",
@@ -14734,9 +14845,12 @@ options = { extract_text_tool_calls = true }
         };
         config.agents.insert("test-agent".to_string(), agent_cfg);
 
-        let mut agent = Agent::from_config(&config, "test-agent")
-            .await
-            .expect("agent from config");
+        let mut agent = Agent::from_config(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "test-agent",
+        )
+        .await
+        .expect("agent from config");
         let response = agent.turn("hello").await.expect("agent turn");
 
         assert_eq!(response, "hello from mock");
@@ -14783,7 +14897,7 @@ options = { extract_text_tool_calls = true }
             },
         );
         let agent = Agent::from_config_with_model_overrides(
-            &config,
+            &zeroclaw_config::migration::admit_test_input(&config),
             "worker",
             ModelOverrides {
                 model: Some("explicit-model"),
@@ -14795,10 +14909,8 @@ options = { extract_text_tool_calls = true }
         assert_eq!(agent.attribution_fields().2, "explicit-model");
         assert_eq!(agent.effective_temperature(), Some(0.3));
         assert!(
-            config
-                .model_provider_for_agent("worker")
-                .unwrap()
-                .model
+            zeroclaw_config::migration::admit_test_input(&config)
+                .resolve_model_id("openai.chosen")
                 .is_none()
         );
     }
@@ -14844,7 +14956,12 @@ options = { extract_text_tool_calls = true }
                 ..Default::default()
             },
         );
-        let mut agent = Agent::from_config(&config, "worker").await.unwrap();
+        let mut agent = Agent::from_config(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "worker",
+        )
+        .await
+        .unwrap();
         let profile = config.providers.models.ensure("custom", "gateway").unwrap();
         profile.models.remove("original");
         profile.models.insert(
@@ -14859,7 +14976,7 @@ options = { extract_text_tool_calls = true }
         config.agents.get_mut("worker").unwrap().model_provider = "custom.gateway.renamed".into();
         agent.install_model_update(
             PreparedModelUpdate::build(
-                Arc::new(config),
+                Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
                 "worker",
                 "custom.gateway.renamed",
                 None,
@@ -14949,7 +15066,11 @@ options = { extract_text_tool_calls = true }
             },
         );
 
-        let result = Agent::from_config(&config, "test-agent").await;
+        let result = Agent::from_config(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "test-agent",
+        )
+        .await;
 
         assert!(
             result.is_ok(),
@@ -15025,7 +15146,7 @@ options = { extract_text_tool_calls = true }
             .unwrap();
 
         let agent = Agent::from_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions(
-            &config,
+            &zeroclaw_config::migration::admit_test_input(&config),
             "test-agent",
             Some(&data_dir),
             false,
@@ -15163,13 +15284,20 @@ options = { extract_text_tool_calls = true }
             },
         );
 
-        let agent = Agent::from_config(&config, "test-agent").await.unwrap();
+        let agent = Agent::from_config(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "test-agent",
+        )
+        .await
+        .unwrap();
         assert_eq!(agent.model_provider_name, "openai.fast");
 
         let tracker = Arc::new(CostTracker::new(config.cost.clone(), &config.data_dir).unwrap());
         let context = ToolLoopCostTrackingContext::new(
             Arc::clone(&tracker),
-            Arc::new(build_model_provider_pricing(&config)),
+            Arc::new(build_model_provider_pricing(
+                &zeroclaw_config::migration::admit_test_input(&config),
+            )),
         );
         let usage = zeroclaw_providers::traits::TokenUsage {
             input_tokens: Some(1_000_000),
@@ -15279,15 +15407,20 @@ options = { extract_text_tool_calls = true }
             },
         );
 
-        let mut agent = Agent::from_config(&config, "test-agent")
-            .await
-            .expect("agent from config");
+        let mut agent = Agent::from_config(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "test-agent",
+        )
+        .await
+        .expect("agent from config");
         assert_eq!(agent.model_provider_name, "custom.premium");
 
         let tracker = Arc::new(CostTracker::new(config.cost.clone(), &config.data_dir).unwrap());
         let context = ToolLoopCostTrackingContext::new(
             Arc::clone(&tracker),
-            Arc::new(build_model_provider_pricing(&config)),
+            Arc::new(build_model_provider_pricing(
+                &zeroclaw_config::migration::admit_test_input(&config),
+            )),
         );
         let response = TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(Some(context), agent.turn("hello"))
@@ -23015,7 +23148,7 @@ model_provider = "custom.primary"
             },
         );
         let identity = zeroclaw_providers::model::resolve_model_identity(
-            &config,
+            &zeroclaw_config::migration::admit_test_input(&config),
             "test",
             "openai.default",
             None,
@@ -23026,7 +23159,9 @@ model_provider = "custom.primary"
             "openai.default",
             "gpt-4o-mini",
             Some(ProviderSwitchConfig {
-                config: Some(std::sync::Arc::new(config)),
+                config: Some(std::sync::Arc::new(
+                    zeroclaw_config::migration::admit_test_input(&config),
+                )),
                 live: None,
                 live_config: None,
             }),
@@ -23092,7 +23227,9 @@ model_provider = "custom.primary"
             "openai.gw",
             "gpt-4o-mini",
             Some(ProviderSwitchConfig {
-                config: Some(std::sync::Arc::new(config)),
+                config: Some(std::sync::Arc::new(
+                    zeroclaw_config::migration::admit_test_input(&config),
+                )),
                 live: None,
                 live_config: None,
             }),
@@ -23239,7 +23376,9 @@ model_provider = "custom.primary"
         );
 
         let switch_config = ProviderSwitchConfig {
-            config: Some(Arc::new(config)),
+            config: Some(Arc::new(zeroclaw_config::migration::admit_test_input(
+                &config,
+            ))),
             live_config: None,
             live: None,
         };
@@ -23276,7 +23415,9 @@ model_provider = "custom.primary"
         let mut config = Config::default();
         config.providers.models.ensure("ollama", "local").unwrap();
         let switch_cfg = ProviderSwitchConfig {
-            config: Some(Arc::new(config)),
+            config: Some(Arc::new(zeroclaw_config::migration::admit_test_input(
+                &config,
+            ))),
             live_config: None,
             live: None,
         };
@@ -23329,7 +23470,7 @@ model_provider = "custom.primary"
         provider_b.context_window = Some(1_000_000);
         provider_b.model = Some("llama3".into());
 
-        let cfg_arc = std::sync::Arc::new(cfg);
+        let cfg_arc = std::sync::Arc::new(zeroclaw_config::migration::admit_test_input(&cfg));
         let switch_cfg = ProviderSwitchConfig {
             config: Some(cfg_arc.clone()),
             live_config: None,
@@ -23374,7 +23515,9 @@ model_provider = "custom.primary"
         let mut config = Config::default();
         config.providers.models.ensure("ollama", "second").unwrap();
         let switch_cfg = ProviderSwitchConfig {
-            config: Some(Arc::new(config)),
+            config: Some(Arc::new(zeroclaw_config::migration::admit_test_input(
+                &config,
+            ))),
             live_config: None,
             live: None,
         };
@@ -23430,7 +23573,9 @@ model_provider = "custom.primary"
         let mut config = Config::default();
         config.providers.models.ensure("ollama", "small").unwrap();
         let switch_cfg = ProviderSwitchConfig {
-            config: Some(Arc::new(config)),
+            config: Some(Arc::new(zeroclaw_config::migration::admit_test_input(
+                &config,
+            ))),
             live_config: None,
             live: None,
         };
@@ -23506,7 +23651,9 @@ model_provider = "custom.primary"
             Some("connection-key"),
         );
         let switch_cfg = ProviderSwitchConfig {
-            config: Some(std::sync::Arc::new(route_config)),
+            config: Some(std::sync::Arc::new(
+                zeroclaw_config::migration::admit_test_input(&route_config),
+            )),
             live_config: None,
             live: None,
         };
@@ -23702,7 +23849,7 @@ model_provider = "custom.primary"
                 .unwrap()
                 .model = Some("reasoning-model".into());
             let identity = zeroclaw_providers::model::resolve_model_identity(
-                &config,
+                &zeroclaw_config::migration::admit_test_input(&config),
                 "test",
                 "openai.primary",
                 None,
@@ -23751,7 +23898,9 @@ model_provider = "custom.primary"
                     }],
                 })
                 .provider_switch_config(ProviderSwitchConfig {
-                    config: Some(Arc::new(config)),
+                    config: Some(Arc::new(zeroclaw_config::migration::admit_test_input(
+                        &config,
+                    ))),
                     ..Default::default()
                 })
                 .build()
@@ -24115,7 +24264,9 @@ model_provider = "custom.primary"
             entry.wire_api = Some(zeroclaw_config::schema::WireApi::ChatCompletions);
         }
         let switch_cfg = ProviderSwitchConfig {
-            config: Some(Arc::new(config)),
+            config: Some(Arc::new(zeroclaw_config::migration::admit_test_input(
+                &config,
+            ))),
             live_config: None,
             live: None,
         };
@@ -25749,7 +25900,7 @@ mod capability_construction_tests {
         let principal = PrincipalId::for_oidc("https://issuer.example", "subject-spawn");
 
         let agent = Agent::from_config_with_capabilities(
-            &config,
+            &zeroclaw_config::migration::admit_test_input(&config),
             "test-agent",
             &capabilities(Arc::clone(&providers), Arc::clone(&memory)),
             Some(&principal),

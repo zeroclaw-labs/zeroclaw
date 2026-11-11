@@ -477,7 +477,11 @@ fn visit_connection_secrets(
     match value {
         Value::Object(object) => {
             for (key, child) in object {
-                let child_path = format!("{path}.{key}");
+                let child_path = if path.starts_with('/') {
+                    format!("{path}/{}", key.replace('~', "~0").replace('/', "~1"))
+                } else {
+                    format!("{path}.{key}")
+                };
                 if secret_map || is_connection_secret_key(key) {
                     if let Value::String(secret) = child {
                         visit(secret, &child_path)?;
@@ -494,7 +498,12 @@ fn visit_connection_secrets(
         }
         Value::Array(items) => {
             for (index, child) in items.iter_mut().enumerate() {
-                visit_connection_secrets(child, &format!("{path}[{index}]"), false, visit)?;
+                let child_path = if path.starts_with('/') {
+                    format!("{path}/{index}")
+                } else {
+                    format!("{path}[{index}]")
+                };
+                visit_connection_secrets(child, &child_path, false, visit)?;
             }
         }
         _ => {}
@@ -571,6 +580,23 @@ impl ProviderConnection {
         visit_connection_secrets(&mut value, field, false, &mut visit)?;
         *self = serde_json::from_value(value).context("deserialize provider connection")?;
         Ok(())
+    }
+
+    /// Collect external references through the same secret-field traversal as
+    /// encryption. The caller supplies an escaped JSON pointer for exact keys.
+    pub(crate) fn onepassword_references(
+        &self,
+        pointer: &str,
+    ) -> anyhow::Result<std::collections::HashMap<String, String>> {
+        let mut value = serde_json::to_value(self).context("serialize provider secrets")?;
+        let mut references = std::collections::HashMap::new();
+        visit_connection_secrets(&mut value, pointer, false, &mut |secret, path| {
+            if SecretStore::is_onepassword_ref(secret) {
+                references.insert(path.to_owned(), secret.clone());
+            }
+            Ok(())
+        })?;
+        Ok(references)
     }
 
     pub fn encrypt_secrets(&mut self, store: &SecretStore, field: &str) -> anyhow::Result<()> {

@@ -1402,22 +1402,6 @@ fn carry_model_provider(
         visited.pop();
         return;
     }
-
-    // Legacy V4 family/alias entries remain exportable during migration, but
-    // they no longer carry profile-local fallback edges.
-    let Some((family, entry, _provider)) = config.providers.models.find_by_name(trimmed) else {
-        return;
-    };
-    let resolved = format!("{family}.{entry}");
-    if !carried.insert(resolved.clone()) {
-        return;
-    }
-    carry(
-        out,
-        masked_root,
-        &["providers", "models", family, &entry],
-        &toml::Table::new(),
-    );
 }
 
 /// The masked table for one MCP server, matched by natural key.
