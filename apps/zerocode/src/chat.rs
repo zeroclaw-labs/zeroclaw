@@ -32623,6 +32623,7 @@ mod tests {
                     &input,
                     Some(&result),
                     false,
+                    false,
                     ToolDisclosure::Collapsed
                 )
                 .is_some()
@@ -32638,6 +32639,7 @@ mod tests {
                 name,
                 &input,
                 Some(&result),
+                false,
                 false,
                 ToolDisclosure::Full,
             );
@@ -32943,6 +32945,7 @@ mod tests {
             &input,
             Some("Only A and C now, B waits for the dogfood rebase"),
             false,
+            false,
             ToolDisclosure::Collapsed,
         );
         let text = rendered_text(&lines);
@@ -32973,6 +32976,7 @@ mod tests {
             &input,
             None,
             false,
+            false,
             ToolDisclosure::Full,
         );
         let text = rendered_text(&lines);
@@ -32987,6 +32991,7 @@ mod tests {
             "ask_user",
             &input,
             None,
+            false,
             false,
             ToolDisclosure::Collapsed,
         );
@@ -33009,6 +33014,7 @@ mod tests {
             "poll",
             &serde_json::json!({ "options": choices, "question": "Pick" }).to_string(),
             None,
+            false,
             false,
             ToolDisclosure::Full,
         );

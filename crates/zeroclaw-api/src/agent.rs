@@ -260,6 +260,7 @@ pub enum TurnEvent {
 /// One child tool call start or finish, attributed to the parent's delegate
 /// call. See [`TurnEvent::DelegateActivity`].
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct DelegateActivity {
     /// The parent turn's `delegate` tool call this activity belongs to.
     pub parent_tool_call_id: String,
@@ -277,6 +278,7 @@ pub struct DelegateActivity {
 
 /// Whether a [`DelegateActivity`] reports a call starting or finishing.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "phase", rename_all = "snake_case")]
 pub enum DelegateActivityPhase {
     Started {
