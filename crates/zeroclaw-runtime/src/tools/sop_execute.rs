@@ -283,8 +283,10 @@ impl Tool for SopExecuteTool {
             );
         }
 
-        // A run this call cancelled is closed in the audit trail too.
-        if let Some(ref audit) = self.audit
+        // A run this call cancelled is closed in the audit trail too, on the plane
+        // its start was logged to: the session-routed logger resolved above, not
+        // the one captured at construction.
+        if let Some(ref audit) = audit
             && let Some(ref run) = cancelled_run
             && let Err(e) = audit.log_run_complete(run).await
         {
@@ -611,6 +613,66 @@ mod tests {
             Some(SopRunStatus::WaitingApproval),
             "the run must still show its pre-cancellation status, not a terminal one that \
              was never actually persisted"
+        );
+    }
+
+    /// The audit rows of one run stay on one plane. In a session pinned to an
+    /// owner, `log_run_start` goes to the owner's plane (through the session
+    /// route); a run this call then cancels must be closed on that same plane,
+    /// not on the logger the tool captured at construction. Otherwise the
+    /// owner's trail keeps a run that never closes, and a completion with no
+    /// start lands on the shared plane.
+    #[tokio::test]
+    async fn a_cancelled_run_is_closed_on_the_plane_its_start_was_logged_to() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("shared")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("owner")).unwrap();
+        let shared: Arc<dyn zeroclaw_memory::Memory> = Arc::new(
+            zeroclaw_memory::SqliteMemory::new("shared", &tmp.path().join("shared")).unwrap(),
+        );
+        let owner: Arc<dyn zeroclaw_memory::Memory> = Arc::new(
+            zeroclaw_memory::SqliteMemory::new("owner", &tmp.path().join("owner")).unwrap(),
+        );
+        let route = Arc::new(zeroclaw_tools::session_memory::SessionMemoryRoute::default());
+        route
+            .pin(
+                Arc::clone(&owner),
+                Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+            )
+            .expect("pin the owner's plane");
+
+        let engine = engine_with_sops(vec![test_sop("test-sop", SopExecutionMode::Supervised)]);
+        let tool = SopExecuteTool::new(Arc::clone(&engine))
+            .with_audit(Arc::new(crate::sop::audit::SopAuditLogger::new(
+                Arc::clone(&shared),
+            )))
+            .with_session_memory(route)
+            .with_caller_ceiling(Some(sealed_ceiling(&["sop_execute"])));
+
+        let result = tool.execute(json!({"name": "test-sop"})).await.unwrap();
+        assert!(!result.success, "the parked run is refused: {result:?}");
+        let run_id = result
+            .error
+            .as_deref()
+            .and_then(|e| e.split("run ").nth(1))
+            .and_then(|rest| rest.split_whitespace().next())
+            .map(str::to_string)
+            .expect("the refusal names the cancelled run");
+
+        let owners = crate::sop::audit::SopAuditLogger::new(Arc::clone(&owner));
+        let on_owner = owners.get_run(&run_id).await.unwrap();
+        assert_eq!(
+            on_owner.map(|run| run.status),
+            Some(SopRunStatus::Cancelled),
+            "the owner's plane must hold the run's start AND its closing"
+        );
+        let on_shared = crate::sop::audit::SopAuditLogger::new(Arc::clone(&shared))
+            .get_run(&run_id)
+            .await
+            .unwrap();
+        assert!(
+            on_shared.is_none(),
+            "nothing of an owned run reaches the shared plane: {on_shared:?}"
         );
     }
 
