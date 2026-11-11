@@ -16961,8 +16961,7 @@ async fn dispatch_models_command(model_command: ModelCommands, config: &mut Conf
                 return Ok(());
             };
             let (provider, model) = config
-                .resolve_model_selection(&winner.profile_ref)
-                .and_then(|s| s.model_id)
+                .resolve_model_id(&winner.profile_ref)
                 .filter(|m| !m.trim().is_empty())
                 .map(|m| (winner.profile_ref.clone(), m))
                 .unwrap_or_else(|| {

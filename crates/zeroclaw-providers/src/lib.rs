@@ -2211,6 +2211,24 @@ pub fn create_routed_model_provider_with_options_and_resolver(
     default_model: &str,
     options: &ModelProviderRuntimeOptions,
 ) -> anyhow::Result<(Box<dyn ModelProvider>, Arc<router::ModelRouteResolver>)> {
+    // A named target is an operator selection, not an unfinished form row.
+    // Validate it before filtering staged routes, otherwise an unresolved
+    // reference has an empty effective model and silently disappears.
+    let registry = config.provider_registry()?;
+    for route in model_routes
+        .iter()
+        .filter(|route| !route.hint.trim().is_empty() && !route.model_ref.trim().is_empty())
+    {
+        let target = registry.resolve_chat(&route.model_ref.trim().into())?;
+        anyhow::ensure!(
+            target
+                .upstream_model()
+                .is_some_and(|model| !model.trim().is_empty()),
+            "model route `{}` target `{}` has no model configured",
+            route.hint,
+            route.model_ref,
+        );
+    }
     // Config map editing creates a default route entry and then fills its
     // required fields through separate writes. Such a staged entry is not yet
     // a routing fact: omit it from the materialized provider/resolver until the

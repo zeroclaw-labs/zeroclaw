@@ -4263,16 +4263,11 @@ async fn handle_webhook(
     let model_label = {
         let cfg = state.config.read();
         let resolved_agent_alias = resolve_gateway_chat_agent_alias(&cfg, agent_override);
-        // Label with the agent's selected model — a three-segment ref names the
-        // nested model entry, so resolve through the selection rather than the
-        // profile-level `model` field.
+        // Resolve the exact model key through config's canonical read boundary.
         resolved_agent_alias
             .as_deref()
             .and_then(|alias| cfg.agents.get(alias))
-            .and_then(|agent| {
-                cfg.resolve_model_selection(agent.model_provider.as_str())
-                    .and_then(|selection| selection.model_id)
-            })
+            .and_then(|agent| cfg.resolve_model_id(agent.model_provider.as_str()))
             .or_else(|| cfg.resolve_default_model())
             .unwrap_or_else(|| "<unresolved>".to_string())
     };

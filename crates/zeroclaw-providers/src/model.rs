@@ -1115,6 +1115,14 @@ model = "backup-model"
             model_ref: "llamacpp.typo".into(),
         }];
         assert!(build_model(&config, "worker", "custom.target.v2.fast", None).is_err());
+        config
+            .providers
+            .models
+            .ensure("custom", "unfinished")
+            .unwrap()
+            .uri = Some("http://127.0.0.1:2/v1".into());
+        config.model_routes[0].model_ref = "custom.unfinished".into();
+        assert!(build_model(&config, "worker", "custom.target.v2.fast", None).is_err());
         config.model_routes.clear();
         let url_ref = "custom:http://127.0.0.1:1/v1";
         let built = build_model(&config, "worker", url_ref, Some("model-id")).unwrap();
