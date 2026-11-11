@@ -358,6 +358,12 @@ export function AgentProvider({
   // hydration, a conversation switch or clear, a model switch, unmount and
   // the close of the socket do that (the reopen reloads and asks again).
   const detachedTurnWatchRef = useRef<AbortController | null>(null);
+  // Set while a hydration may still start such a watch: from its first state
+  // check until it has loaded the transcript. A clear or model switch in that
+  // window aborts it, so a late `running` answer cannot start a watch the
+  // page no longer wants. Kept apart from `detachedTurnWatchRef` because a
+  // conversation switch leaves only a watched turn running.
+  const pendingTurnCheckRef = useRef<AbortController | null>(null);
   // The last definite answer on whether the gateway stores transcripts.
   // `sessionPersistence` is null again while each reload is in flight, and a
   // `session_start` arriving then still needs to know.
@@ -468,7 +474,14 @@ export function AgentProvider({
 
     (async () => {
       let watching = false;
+      pendingTurnCheckRef.current = watch;
       try {
+        // Ask before loading the transcript. The gateway stores a turn before
+        // it leaves `running`, so a turn that ends after this answer is either
+        // in the transcript or caught by the watch; asked afterwards, a turn
+        // ending between the two reads would leave its answer unloaded.
+        const runningBeforeLoad = await turnStillRunning();
+        if (cancelled) return;
         const res = await sessionRuntime.getMessages(sid);
         if (cancelled) return;
         serverKeepsTranscriptsRef.current = res.session_persistence;
@@ -485,13 +498,11 @@ export function AgentProvider({
             // Keep that uncommitted tail instead of replacing it.
             setMessages([...hydrated, ...uncommittedLocalTail(snapshotUsers, browserCopy)]);
           }
-          // A turn still running on the gateway is not in this snapshot, and
-          // its answer will not reach this page's socket. Ask before the
-          // composer unlocks, so the page shows the turn as running instead
-          // of offering to send into it.
-          const running = await turnStillRunning();
-          if (cancelled) return;
-          if (running && !typingRef.current) {
+          // A turn running on the gateway may not be in this snapshot, and its
+          // answer will not reach this page's socket. Show it as running before
+          // the composer unlocks, instead of offering to send into it, unless
+          // a clear or model switch has ended the watch since.
+          if (runningBeforeLoad && !watch.signal.aborted && !typingRef.current) {
             watching = true;
             detachedTurnWatchRef.current = watch;
             typingRef.current = true;
@@ -521,6 +532,7 @@ export function AgentProvider({
           }
         }
       } finally {
+        if (pendingTurnCheckRef.current === watch) pendingTurnCheckRef.current = null;
         if (!cancelled) setHydratedSessionId(sid);
       }
 
@@ -1344,6 +1356,8 @@ export function AgentProvider({
       typingRef.current = false;
       detachedTurnWatchRef.current?.abort();
       detachedTurnWatchRef.current = null;
+      pendingTurnCheckRef.current?.abort();
+      pendingTurnCheckRef.current = null;
       // The old socket's request_id no longer maps to anything on the server
       // after we tear it down. Clear here explicitly because we null out the
       // old socket's callbacks below, so its onClose will not fire to do it.
@@ -1414,6 +1428,8 @@ export function AgentProvider({
     localMessageMutationVersionRef.current += 1;
     detachedTurnWatchRef.current?.abort();
     detachedTurnWatchRef.current = null;
+    pendingTurnCheckRef.current?.abort();
+    pendingTurnCheckRef.current = null;
     setMessages([]);
     foldTurnStream({ type: 'reset' });
     setStreamingContent('');
