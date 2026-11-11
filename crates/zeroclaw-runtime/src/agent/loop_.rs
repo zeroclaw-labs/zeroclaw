@@ -21835,7 +21835,13 @@ Let me check the result."#;
             Vec::new(),
             false,
             None,
-            Some(vec!["cron_add".to_string(), "file_read".to_string()]),
+            // The caller's list names `shell` and `file_read`; the runner's
+            // profile allows only `cron_add`, so the turn holds neither.
+            Some(vec![
+                "cron_add".to_string(),
+                "file_read".to_string(),
+                "shell".to_string(),
+            ]),
             TurnOrigin::Channel,
             super::AgentRunOverrides::default(),
         )
@@ -21855,13 +21861,10 @@ Let me check the result."#;
             .allowed_tools
             .clone()
             .expect("a job saved under the run's ceiling stores the ceiling, not an unset list");
-        assert!(
-            stored.iter().any(|name| name == "cron_add"),
-            "the sealed ceiling names what the turn holds, got {stored:?}"
-        );
-        assert!(
-            !stored.iter().any(|name| name == "shell"),
-            "the sealed ceiling must not name a tool the turn never held, got {stored:?}"
+        assert_eq!(
+            stored,
+            vec!["cron_add".to_string()],
+            "the sealed ceiling is the caller's list narrowed to what the turn holds"
         );
     }
 
