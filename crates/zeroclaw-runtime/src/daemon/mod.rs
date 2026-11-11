@@ -2423,6 +2423,53 @@ async fn retry_heartbeat_mcp_registry(
     Ok(())
 }
 
+/// The sampling temperature a heartbeat turn sends: the agent's configured
+/// provider temperature, or none, so the provider's own default applies.
+/// Never a fixed value: some models reject any temperature, and the
+/// heartbeat's turns must work wherever the agent's own turns do.
+fn heartbeat_temperature(config: &Config, agent_alias: &str) -> Option<f64> {
+    config
+        .model_provider_for_agent(agent_alias)
+        .and_then(|e| e.temperature)
+}
+
+/// Phase 1 of a two-phase tick: ask the agent which of `tasks` to run. Returns
+/// the turn itself rather than wrapping it in another `async fn`, as
+/// [`crate::agent::run`] does, so the caller's `Send` future stays shallow.
+fn heartbeat_decision_turn<'a>(
+    config: &Config,
+    agent_alias: &'a str,
+    tasks: &[crate::heartbeat::engine::HeartbeatTask],
+    mcp_registry: Option<&std::sync::Arc<crate::tools::McpRegistry>>,
+    execution_capability: &crate::live_config_authority::AgentExecutionCapability,
+) -> impl std::future::Future<Output = Result<String>> + 'a {
+    let decision_prompt = format!(
+        "[Heartbeat Task | decision] {}",
+        crate::heartbeat::engine::HeartbeatEngine::build_decision_prompt(tasks),
+    );
+    crate::agent::run(
+        config.clone(),
+        agent_alias,
+        Some(decision_prompt),
+        None,
+        None,
+        heartbeat_temperature(config, agent_alias),
+        vec![],
+        false,
+        None,
+        None,
+        zeroclaw_api::ingress::TurnOrigin::Daemon,
+        crate::agent::loop_::AgentRunOverrides {
+            mcp_registry: mcp_registry.map(std::sync::Arc::clone),
+            execution_capability: Some(execution_capability.clone()),
+            internal_principal: Some(zeroclaw_api::ingress::InternalPrincipal::Daemon {
+                task: "heartbeat:decision".to_string(),
+            }),
+            ..crate::agent::loop_::AgentRunOverrides::default()
+        },
+    )
+}
+
 async fn run_heartbeat_worker(
     config: Config,
     execution_capability: crate::live_config_authority::AgentExecutionCapability,
@@ -2570,30 +2617,12 @@ async fn run_heartbeat_worker(
 
         // ── Phase 1: LLM decision (two-phase mode) ──────────────
         let tasks_to_run = if two_phase {
-            let decision_prompt = format!(
-                "[Heartbeat Task | decision] {}",
-                HeartbeatEngine::build_decision_prompt(&tasks),
-            );
-            let phase1_fut = Box::pin(crate::agent::run(
-                config.clone(),
+            let phase1_fut = Box::pin(heartbeat_decision_turn(
+                &config,
                 &agent_alias,
-                Some(decision_prompt),
-                None,
-                None,
-                Some(0.0),
-                vec![],
-                false,
-                None,
-                None,
-                zeroclaw_api::ingress::TurnOrigin::Daemon,
-                crate::agent::loop_::AgentRunOverrides {
-                    mcp_registry: shared_mcp_registry.as_ref().map(Arc::clone),
-                    execution_capability: Some(execution_capability.clone()),
-                    internal_principal: Some(zeroclaw_api::ingress::InternalPrincipal::Daemon {
-                        task: "heartbeat:decision".to_string(),
-                    }),
-                    ..crate::agent::loop_::AgentRunOverrides::default()
-                },
+                &tasks,
+                shared_mcp_registry.as_ref(),
+                &execution_capability,
             ));
             let phase1_result = if config.heartbeat.task_timeout_secs > 0 {
                 match tokio::time::timeout(
@@ -2696,9 +2725,7 @@ async fn run_heartbeat_worker(
                 Some(sc) => format!("{sc}\n\n{task_prompt}"),
                 None => task_prompt,
             };
-            let temp: Option<f64> = config
-                .model_provider_for_agent(&agent_alias)
-                .and_then(|e| e.temperature);
+            let temp = heartbeat_temperature(&config, &agent_alias);
             let phase2_fut = Box::pin(crate::agent::run(
                 config.clone(),
                 &agent_alias,
@@ -3725,6 +3752,100 @@ mod tests {
 
         assert!(workspace_dir.join("HEARTBEAT.md").exists());
         assert!(!config.data_dir.join("HEARTBEAT.md").exists());
+    }
+
+    /// Phase 1's decision turn sends the agent's configured temperature, or
+    /// none when it is unset, never a fixed value a model may reject. Drives
+    /// the real decision turn against a local Messages API for
+    /// `claude-opus-5-5` and reads the request body it received.
+    #[tokio::test]
+    async fn heartbeat_decision_turn_sends_only_the_configured_temperature() {
+        use crate::heartbeat::engine::{HeartbeatTask, TaskPriority, TaskStatus};
+        use axum::{Json, Router, routing::post};
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::{AliasedAgentConfig, RiskProfileConfig};
+
+        let received: Arc<Mutex<Vec<serde_json::Value>>> = Arc::default();
+        let sink = Arc::clone(&received);
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    sink.lock().unwrap().push(body);
+                    Json(serde_json::json!({
+                        "id": "msg_heartbeat", "type": "message", "role": "assistant",
+                        "content": [{"type": "text", "text": "[]"}],
+                        "model": "claude-opus-5-5", "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let tasks = vec![HeartbeatTask {
+            text: "check the inbox".to_string(),
+            priority: TaskPriority::Medium,
+            status: TaskStatus::Active,
+        }];
+        for configured in [None, Some(0.25)] {
+            let tmp = TempDir::new().unwrap();
+            let mut config = test_config(&tmp);
+            let provider = config
+                .providers
+                .models
+                .ensure("anthropic", "heartbeat")
+                .expect("anthropic provider slot");
+            provider.api_key = Some("sk-ant-fixture".to_string());
+            provider.model = Some("claude-opus-5-5".to_string());
+            provider.uri = Some(format!("http://{addr}"));
+            provider.temperature = configured;
+            config.memory.backend = "none".to_string();
+            config.memory.auto_save = false;
+            config.risk_profiles.insert(
+                "heartbeat-profile".to_string(),
+                RiskProfileConfig {
+                    level: crate::security::AutonomyLevel::Full,
+                    ..RiskProfileConfig::default()
+                },
+            );
+            config.agents.insert(
+                "ops".to_string(),
+                AliasedAgentConfig {
+                    model_provider: "anthropic.heartbeat".into(),
+                    risk_profile: "heartbeat-profile".into(),
+                    ..Default::default()
+                },
+            );
+            let authority = crate::LiveConfigAuthority::new(config.clone());
+            heartbeat_decision_turn(
+                &config,
+                "ops",
+                &tasks,
+                None,
+                &authority.execution_capability(),
+            )
+            .await
+            .expect("the decision turn completes");
+            let body = received
+                .lock()
+                .unwrap()
+                .pop()
+                .expect("the decision turn reached the provider");
+            assert_eq!(body["model"], "claude-opus-5-5");
+            assert_eq!(
+                body.get("temperature").cloned(),
+                configured.map(|t| serde_json::json!(t)),
+                "the decision turn must send the configured temperature ({configured:?}), \
+                 and none when unset: {body}"
+            );
+        }
+        server.abort();
     }
 
     #[tokio::test]
