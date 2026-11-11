@@ -2010,6 +2010,45 @@ mod tests {
     }
 
     #[test]
+    fn line_offset_pagination_uses_utf8_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("trace.jsonl");
+        let messages = ["开始🦀", "e\u{301}\n第二行", "🌍终点"];
+        let events: Vec<_> = messages
+            .iter()
+            .enumerate()
+            .map(|(index, message)| {
+                let mut event = make_event("test", None);
+                event.id = format!("evt-{index}");
+                event.message = Some((*message).to_string());
+                event
+            })
+            .collect();
+        write_jsonl(&path, &events);
+        let bytes = std::fs::read(&path).unwrap();
+        let line_ends: Vec<_> = bytes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, byte)| (*byte == b'\n').then_some((index + 1) as u64))
+            .collect();
+        assert_eq!(line_ends.len(), messages.len());
+
+        let mut filter = LogFilter::default();
+        for index in (0..messages.len()).rev() {
+            let page = load_page(&path, &filter, 1).unwrap();
+            assert_eq!(page.events.len(), 1);
+            assert_eq!(page.events[0].id, events[index].id);
+            assert_eq!(page.events[0].message.as_deref(), Some(messages[index]));
+            assert_eq!(page.next_cursor_line_offset, Some(line_ends[index]));
+            filter.until_line_offset = page.next_cursor_line_offset;
+        }
+        let exhausted = load_page(&path, &filter, 1).unwrap();
+        assert!(exhausted.events.is_empty());
+        assert!(exhausted.at_end);
+        assert!(exhausted.next_cursor_line_offset.is_none());
+    }
+
+    #[test]
     fn line_offset_cursor_advances_monotonically() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("trace.jsonl");
