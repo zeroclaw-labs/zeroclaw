@@ -29982,8 +29982,7 @@ command = "rm independent-delegate-marker"
         allowed.extend(CEILING_CARRYING);
         let config = bounded_reuse_config(&allowed, false, &tmp);
         let parent = || -> Vec<Arc<dyn Tool>> {
-            let mut tools: Vec<Arc<dyn Tool>> =
-                vec![Arc::new(crate::tools::CalculatorTool::new())];
+            let mut tools: Vec<Arc<dyn Tool>> = vec![Arc::new(crate::tools::CalculatorTool::new())];
             tools.extend(
                 CEILING_CARRYING
                     .iter()
