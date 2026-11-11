@@ -1374,8 +1374,8 @@ mod tests {
         assert_eq!(embedder.dimensions(), 3072);
     }
 
-    #[test]
-    fn registry_save_keeps_chat_only_compatible_embeddings_dispatchable() {
+    #[tokio::test]
+    async fn registry_save_keeps_chat_only_compatible_embeddings_dispatchable() {
         use zeroclaw_config::provider_registry::editor::{RegistryEdit, snapshot, stage};
 
         let mut config = Config::default();
@@ -1396,6 +1396,27 @@ mod tests {
             dimensions: Some(3072),
             api_key: None,
         });
+        let before = build_embedder_from_config(&config, None)
+            .unwrap()
+            .identity();
+        let mut routed = config.clone();
+        routed.memory.embedding_model = "hint:semantic.v1".into();
+        let route_before = build_embedder_from_config(&routed, None)
+            .unwrap()
+            .identity();
+        let tmp = TempDir::new().unwrap();
+        let memory = static_sqlite(tmp.path(), 1536);
+        memory.record_embedding_identity(&before).unwrap();
+        memory
+            .store(
+                "existing",
+                "existing semantic memory",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(embedded_rows(&memory), 1);
         let expected = snapshot(&config).unwrap();
         stage(
             &mut config,
@@ -1409,6 +1430,18 @@ mod tests {
         assert_eq!(embedder.name(), "custom");
         assert_eq!(embedder.identity().model, "embedding-small");
         assert_eq!(embedder.dimensions(), 1536);
+        assert_eq!(embedder.identity(), before);
+        assert_eq!(
+            reconcile_embedding_identity(&memory, &embedder.identity(), false),
+            EmbeddingIdentityOutcome::Match
+        );
+        assert_eq!(embedded_rows(&memory), 1);
+        let cached: i64 = memory
+            .connection()
+            .lock()
+            .query_row("SELECT COUNT(*) FROM embedding_cache", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(cached, 1);
 
         config.memory.embedding_model_ref = None;
         config.memory.embedding_model = "hint:semantic.v1".into();
@@ -1416,6 +1449,7 @@ mod tests {
         assert_eq!(embedder.name(), "custom");
         assert_eq!(embedder.identity().model, "embedding-large");
         assert_eq!(embedder.dimensions(), 3072);
+        assert_eq!(embedder.identity(), route_before);
     }
 
     #[test]

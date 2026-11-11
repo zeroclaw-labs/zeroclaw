@@ -516,30 +516,21 @@ pub fn selection_depends_on_model_ref(
 ) -> bool {
     let selection_ref = selection_ref.trim();
     let changed_model_ref = changed_model_ref.trim();
-    // V4 profile references such as `custom.gateway.fast` still resolve
-    // their connection and defaults from `custom.gateway`. Keep live-edit
-    // invalidation wired to that owner while canonical dotted model keys
-    // remain opaque TOML keys and take precedence over the legacy parser.
-    let selection_is_canonical = config.is_canonical_model_ref(selection_ref);
-    let changed_is_canonical = config.is_canonical_model_ref(changed_model_ref);
-    if !selection_is_canonical
-        && !changed_is_canonical
-        && let (Some((selection_family, selection_alias)), Some((changed_family, changed_alias))) = (
-            config.providers.models.profile_ref(selection_ref),
-            config.providers.models.profile_ref(changed_model_ref),
-        )
-    {
-        return selection_family == changed_family && selection_alias == changed_alias;
-    }
     let Ok(registry) = config.provider_registry() else {
         return false;
     };
     let root = zeroclaw_config::provider_registry::ModelRef::from(selection_ref);
     let changed = zeroclaw_config::provider_registry::ModelRef::from(changed_model_ref);
+    // Legacy profiles refresh as a unit, including their default/sole-entry
+    // projections. Exact model edits have no such effect on sibling models,
+    // even when they share a connection. Explicit model keys take precedence.
+    let shared_profile_edit = config.providers.models.canonical_model(&changed).is_none()
+        && config.resolve_model_selection(changed_model_ref).is_some();
     fn visit(
         registry: &zeroclaw_config::provider_registry::ProviderRegistry,
         current: &zeroclaw_config::provider_registry::ModelRef,
         changed: &zeroclaw_config::provider_registry::ModelRef,
+        shared_profile_edit: bool,
         visited: &mut HashSet<zeroclaw_config::provider_registry::ModelRef>,
     ) -> bool {
         if current == changed {
@@ -548,24 +539,28 @@ pub fn selection_depends_on_model_ref(
         if !visited.insert(current.clone()) {
             return false;
         }
-        // A compatibility profile edit may change the shared connection for
-        // every model projected from it. Compare the registry's connection
-        // identity rather than parsing either exact model key.
-        if registry
-            .models
-            .get(current)
-            .zip(registry.models.get(changed))
-            .is_some_and(|(model, edited)| model.provider() == edited.provider())
+        if shared_profile_edit
+            && registry
+                .models
+                .get(current)
+                .zip(registry.models.get(changed))
+                .is_some_and(|(model, edited)| model.provider() == edited.provider())
         {
             return true;
         }
         registry.fallback.get(current).is_some_and(|targets| {
             targets
                 .iter()
-                .any(|target| visit(registry, target, changed, visited))
+                .any(|target| visit(registry, target, changed, shared_profile_edit, visited))
         })
     }
-    visit(&registry, &root, &changed, &mut HashSet::new())
+    visit(
+        &registry,
+        &root,
+        &changed,
+        shared_profile_edit,
+        &mut HashSet::new(),
+    )
 }
 
 /// Dependencies of the routed graph built by [`build_model`], including each
@@ -577,23 +572,10 @@ pub fn routed_selection_depends_on_model_ref(
     selection_ref: &str,
     changed_model_ref: &str,
 ) -> bool {
-    let inherited_selection = if !inherits_agent_selection(config, selection_ref) {
-        false
-    } else {
-        let changed_owner = if config.is_canonical_model_ref(changed_model_ref.trim()) {
-            changed_model_ref.trim().to_string()
-        } else {
-            config
-                .providers
-                .models
-                .profile_ref(changed_model_ref)
-                .map(|(family, alias)| format!("{family}.{alias}"))
-                .unwrap_or_else(|| changed_model_ref.trim().to_string())
-        };
-        configured_selection_for_construction(config, agent_alias, selection_ref).is_some_and(
-            |selection| format!("{}.{}", selection.family, selection.alias) == changed_owner,
-        )
-    };
+    let inherited_selection = inherits_agent_selection(config, selection_ref)
+        && config.agent(agent_alias).is_some_and(|agent| {
+            selection_depends_on_model_ref(config, &agent.model_provider, changed_model_ref)
+        });
     inherited_selection
         || selection_depends_on_model_ref(config, selection_ref, changed_model_ref)
         || config.model_routes.iter().any(|route| {
@@ -949,6 +931,60 @@ model = "backup"
             &config,
             "chat.backup.v2",
             "chat.prod.v1"
+        ));
+    }
+
+    #[test]
+    fn projected_model_dependencies_preserve_profile_refresh_and_exact_key_precedence() {
+        let mut config = Config::default();
+        let profile = config
+            .providers
+            .models
+            .ensure("custom", "gateway.prod")
+            .unwrap();
+        profile.uri = Some("https://example.invalid/v1".into());
+        profile.model = Some("primary".into());
+        for name in ["fast", "slow"] {
+            profile.models.insert(
+                name.into(),
+                ModelEntryConfig {
+                    id: Some(name.into()),
+                    ..Default::default()
+                },
+            );
+        }
+        assert!(selection_depends_on_model_ref(
+            &config,
+            "custom.gateway.prod.fast",
+            "custom.gateway.prod"
+        ));
+        assert!(selection_depends_on_model_ref(
+            &config,
+            "custom.gateway.prod.slow",
+            "custom.gateway.prod"
+        ));
+        assert!(selection_depends_on_model_ref(
+            &config,
+            "custom.gateway.prod.fast",
+            "custom.gateway.prod.slow"
+        ));
+        assert!(selection_depends_on_model_ref(
+            &config,
+            "custom.gateway.prod",
+            "custom.gateway.prod.fast"
+        ));
+
+        // An explicit exact-key model shadows the profile's projected key.
+        let registry = config.provider_registry().unwrap();
+        let model = registry.models["custom.gateway.prod"].clone();
+        config.providers.models.insert_canonical_model(
+            "custom.gateway.prod".into(),
+            serde_json::from_value(serde_json::to_value(model).unwrap()).unwrap(),
+        );
+        assert!(!selection_depends_on_model_ref(
+            &config,
+            "custom.gateway.prod.fast",
+            "custom.gateway.prod"
         ));
     }
 

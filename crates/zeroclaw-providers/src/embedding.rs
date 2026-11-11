@@ -76,7 +76,7 @@ impl EmbeddingProvider for OpenAiEmbedding {
 
     fn identity(&self) -> zeroclaw_api::embedding::EmbeddingIdentity {
         let mut digest = Sha256::new();
-        digest.update(self.transport.base_url.as_bytes());
+        digest.update(self.transport.base_url.trim_end_matches('/').as_bytes());
         for (name, value) in &self.transport.extra_headers {
             digest.update((name.len() as u64).to_le_bytes());
             digest.update(name.as_bytes());
@@ -84,7 +84,10 @@ impl EmbeddingProvider for OpenAiEmbedding {
             digest.update(value.as_bytes());
         }
         zeroclaw_api::embedding::EmbeddingIdentity {
-            provider: format!("{}:{:x}", self.provider_name, digest.finalize()),
+            // Persist the wire protocol namespace, independently of the
+            // configured connection kind used for display/attribution. A
+            // registry promotion must not change an unchanged vector space.
+            provider: format!("openai:{:x}", digest.finalize()),
             model: self.model.clone(),
             dimensions: self.dims,
         }
@@ -242,6 +245,39 @@ mod tests {
         let p = create_embedding_provider("custom:http://localhost:1234", None, "model", 768);
         assert_eq!(p.name(), "openai"); // uses OpenAiEmbedding internally
         assert_eq!(p.dimensions(), 768);
+    }
+
+    #[test]
+    fn compatible_identity_tracks_vector_space_independently_of_connection_kind() {
+        let legacy =
+            OpenAiEmbedding::new("https://embedding.example.test/v1/", "old-key", "model", 4);
+        for kind in ["openai", "custom", "vllm", "openrouter"] {
+            let mut provider = OpenAiEmbedding::from_config(EmbeddingProviderConfig {
+                transport: HttpTransportConfig::with_base_url(
+                    "https://embedding.example.test/v1/",
+                    Some("new-key".into()),
+                ),
+                provider_name: kind.into(),
+                model: "model".into(),
+                dimensions: 4,
+            });
+            assert_eq!(provider.name(), kind);
+            assert_eq!(provider.identity(), legacy.identity());
+            provider
+                .transport
+                .extra_headers
+                .insert("X-Tenant".into(), "other".into());
+            assert_ne!(provider.identity(), legacy.identity());
+            provider.transport.extra_headers.clear();
+            provider.transport.base_url = "https://other.example.test/v1".into();
+            assert_ne!(provider.identity(), legacy.identity());
+            provider.transport.base_url = legacy.transport.base_url.clone();
+            provider.model = "other-model".into();
+            assert_ne!(provider.identity(), legacy.identity());
+            provider.model = "model".into();
+            provider.dims = 8;
+            assert_ne!(provider.identity(), legacy.identity());
+        }
     }
 
     // ── Edge cases ───────────────────────────────────────────────
