@@ -52,10 +52,14 @@ port 9781 and the gateway at
 by default: use `--gateway-url` to name its TLS-terminating proxy. A gateway
 path prefix is supported. Plain HTTP is accepted only on loopback.
 
-Public clients that enforce PKCE are supported: zerocode sends an S256
-challenge on device authorization and the matching verifier only when polling
-for its token. The verifier lives only for the sign-in, is never persisted, and
-is not part of the gateway's device-start response.
+Every device grant zerocode performs sends an S256 PKCE challenge,
+including `zerocode login` and the legacy automatic enrollment path
+(`[connection.wss]` with `auth_provider = "oidc.<alias>"`, an `enroll_url`
+and no token). The matching verifier is sent only when polling for the token,
+lives only for that grant, is never persisted, and is not part of the
+gateway's device-start response. A provider that rejects `code_challenge` on
+its device authorization endpoint will fail both paths; providers that ignore
+unrecognized parameters, as RFC 8628 section 3.1 requires, continue to work.
 
 Login works from a completely empty client configuration directory:
 
@@ -118,6 +122,33 @@ if a token expires during an active TUI session, restart zerocode to sign in
 again. You can also rerun `zerocode login corp <url>` explicitly. A saved
 custom gateway URL is reused when omitted on a subsequent login.
 
+Login issues a device client certificate valid for 30 days. `cert/renew` is
+authenticated by the presented client certificate, not by an OIDC principal,
+so 30 days is not an absolute device lifetime: zerocode renews about halfway
+through, and an unrevoked device can keep renewing. Removing a user's OIDC
+mapping stops principal-authorized operations, but it does not retire the
+device or stop renewal.
+
+Revoking the device is a separate operator step:
+
+1. Run `zeroclaw security list-client-certs`. The certificate issued at
+   sign-in has an `actor` that starts with `oidc:` and names the user's
+   issuer and subject. Note its `device`.
+2. Run `zeroclaw security revoke-client-cert --device <id>`. That revokes
+   every active certificate the device holds.
+
+Revoke by device, not by fingerprint. A renewed certificate is recorded with
+the actor `renew`, so only the device ID ties it to the user, and revoking
+one fingerprint leaves the device's other certificates able to renew. Each
+sign-in that issues a certificate creates a new device ID, so one user can
+have several. The CRL is checked at the next TLS handshake, so a revoke does
+not drop an already established connection.
+
+A leaked access token can be used to obtain a device certificate, and that
+device can keep renewing until it is revoked. The certificate alone
+authorizes only renewal: every other operation still needs a valid access
+token.
+
 Startup renewal and a rejected-token retry honor the current `--tls-ca-cert`,
 `--tls-client-cert`, `--tls-client-key`, and `--tls-skip-verify` choices. Those
 one-run flags are not copied into the saved login during automatic renewal;
@@ -125,8 +156,23 @@ use an explicit `zerocode login` invocation to save replacement TLS settings.
 
 `ZEROCLAW_AUTH_TOKEN` still overrides the selected token for a one-off run;
 login warns if that environment variable would shadow the token it just
-saved. Existing manually configured `[connection.wss]` credentials continue to
-work for connections without a saved URL login.
+saved.
+
+Manually configured `[connection.wss]` credentials (a token, a provider, TLS
+files or a relay) keep working, with limits once any URL login is saved:
+
+- With no saved login, they are used for whichever URL is selected, including
+  a `--connect` to another daemon, as before.
+- Once a login exists, they are used only for the URL in
+  `[connection.wss] uri`. Any other `--connect` URL gets none of them, even
+  on the same host with a different port or path. Two spellings of one URL,
+  such as with and without a trailing slash, count as the same URL.
+- `zerocode login` makes the URL it signed in to the default by rewriting
+  `[connection.wss] uri`. If the manual credentials were for a different
+  daemon, they are no longer used after that, and `zerocode --connect` to
+  that daemon runs without them. To keep using them, set `uri` back to that
+  daemon and reach the signed-in one with `--connect`, or run `zerocode login`
+  for that daemon too.
 
 Use `--config-dir` to select a separate client configuration directory.
 `--enroll` forces a fresh OIDC-authorized device certificate, without any

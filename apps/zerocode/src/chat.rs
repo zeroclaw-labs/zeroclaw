@@ -22574,7 +22574,10 @@ mod tests {
             active_info_notice(&chat),
             crate::i18n::t_args(
                 "zc-chat-session-cap",
-                &[("max", &crate::config::DEFAULT_MAX_TRACKED_SESSIONS_PER_PANE.to_string())]
+                &[(
+                    "max",
+                    &crate::config::DEFAULT_MAX_TRACKED_SESSIONS_PER_PANE.to_string()
+                )]
             )
         );
     }
