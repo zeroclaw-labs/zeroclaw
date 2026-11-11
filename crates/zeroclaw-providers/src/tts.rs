@@ -1232,14 +1232,18 @@ impl TtsManager {
                                     .starts_with("legacy.tts.")
                             })
                         {
-                            if let Ok((legacy_provider, _)) =
-                                build_canonical_tts_provider(model_ref.as_str(), &resolved)
-                            {
-                                tts_providers
-                                    .entry(legacy_key.to_owned())
-                                    .or_insert(legacy_provider);
-                                if let Some(voice) = voice_by_alias.get(&key).cloned() {
-                                    voice_by_alias.entry(legacy_key.to_owned()).or_insert(voice);
+                            // An explicitly canonical model may already own
+                            // the legacy-shaped key (`openai.voice`).  Keep
+                            // its provider and default voice intact; only
+                            // create the alias when no canonical model owns it.
+                            if !tts_providers.contains_key(legacy_key) {
+                                if let Ok((legacy_provider, _)) =
+                                    build_canonical_tts_provider(model_ref.as_str(), &resolved)
+                                {
+                                    tts_providers.insert(legacy_key.to_owned(), legacy_provider);
+                                    if let Some(voice) = voice_by_alias.get(&key).cloned() {
+                                        voice_by_alias.insert(legacy_key.to_owned(), voice);
+                                    }
                                 }
                             }
                         }
