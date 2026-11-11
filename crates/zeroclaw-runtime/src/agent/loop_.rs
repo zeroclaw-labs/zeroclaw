@@ -21722,6 +21722,149 @@ Let me check the result."#;
         );
     }
 
+    /// The `run` entry point (the one that carries a per-run allowlist) hands
+    /// the ceiling it seals to the scheduler tools of its own registry. An agent
+    /// job stored by that turn's `cron_add` WITHOUT `allowed_tools` inherits the
+    /// sealed ceiling, so its stored list is set and names what the turn holds;
+    /// were the registry built without the handle, the list would stay unset,
+    /// which the scheduler reads back as the owning agent's whole registry.
+    #[tokio::test]
+    async fn run_hands_the_turns_scheduler_tools_the_callers_ceiling() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use tempfile::TempDir;
+        use tokio::net::TcpListener;
+        use zeroclaw_config::schema::{AliasedAgentConfig, RiskProfileConfig};
+
+        #[derive(Clone)]
+        struct ProviderState {
+            calls: Arc<AtomicUsize>,
+        }
+
+        async fn respond_with_agent_cron_add_then_done(
+            State(state): State<ProviderState>,
+            Json(_body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            let call = state.calls.fetch_add(1, Ordering::SeqCst);
+            Json(if call == 0 {
+                let arguments = serde_json::json!({
+                    "schedule": {"kind": "every", "every_ms": 3_600_000},
+                    "job_type": "agent",
+                    "prompt": "report back",
+                })
+                .to_string();
+                serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call-cron-add",
+                                "type": "function",
+                                "function": {"name": "cron_add", "arguments": arguments}
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }]
+                })
+            } else {
+                serde_json::json!({"choices": [{"message": {"content": "done"}}]})
+            })
+        }
+
+        let tmp = TempDir::new().expect("temp dir");
+        let provider_state = ProviderState {
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test provider listener should bind");
+        let provider_addr = listener.local_addr().expect("test provider address");
+        let app = Router::new()
+            .route(
+                "/chat/completions",
+                post(respond_with_agent_cron_add_then_done),
+            )
+            .with_state(provider_state.clone());
+        let provider_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test provider serves");
+        });
+
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        let provider = config
+            .providers
+            .models
+            .ensure("custom", "default")
+            .expect("custom provider slot");
+        provider.api_key = Some("test-key".to_string());
+        provider.model = Some("test-model".to_string());
+        provider.uri = Some(format!("http://{provider_addr}"));
+        provider.native_tools = Some(true);
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config.risk_profiles.insert(
+            "scheduler".to_string(),
+            RiskProfileConfig {
+                level: crate::security::AutonomyLevel::Full,
+                allowed_tools: vec!["cron_add".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "runner".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.default".into(),
+                risk_profile: "scheduler".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        std::fs::create_dir_all(config.agent_workspace_dir("runner")).expect("runner workspace");
+        let jobs_config = config.clone();
+
+        let result = super::run(
+            config,
+            "runner",
+            Some("schedule the agent job".to_string()),
+            None,
+            None,
+            None,
+            Vec::new(),
+            false,
+            None,
+            Some(vec!["cron_add".to_string(), "file_read".to_string()]),
+            TurnOrigin::Channel,
+            super::AgentRunOverrides::default(),
+        )
+        .await
+        .expect("the bounded run should complete");
+
+        provider_server.abort();
+        assert_eq!(result, "done");
+        assert_eq!(
+            provider_state.calls.load(Ordering::SeqCst),
+            2,
+            "the second model call should receive the cron_add result"
+        );
+        let jobs = crate::cron::list_jobs_by_agent(&jobs_config, "runner").expect("list jobs");
+        assert_eq!(jobs.len(), 1, "the turn stores one job, got {jobs:?}");
+        let stored = jobs[0]
+            .allowed_tools
+            .clone()
+            .expect("a job saved under the run's ceiling stores the ceiling, not an unset list");
+        assert!(
+            stored.iter().any(|name| name == "cron_add"),
+            "the sealed ceiling names what the turn holds, got {stored:?}"
+        );
+        assert!(
+            !stored.iter().any(|name| name == "shell"),
+            "the sealed ceiling must not name a tool the turn never held, got {stored:?}"
+        );
+    }
+
     #[tokio::test]
     async fn process_message_seam_narrows_safe_defaults_outside_allowed_tools() {
         let mut config = zeroclaw_config::schema::Config::default();
