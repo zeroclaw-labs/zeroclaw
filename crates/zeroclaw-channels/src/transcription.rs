@@ -1438,6 +1438,38 @@ pub(crate) fn manager_from_snapshot(
     }
 }
 
+/// Compose the transcription manager the media pipeline attaches to inbound
+/// media.
+///
+/// The seed constructor reads the legacy `[transcription]` section only; when
+/// it fails (typed-only deployment, no legacy api key) the composition falls
+/// back to [`TranscriptionManager::empty`], which cannot carry config. The
+/// configured `default_provider` is therefore restored explicitly after the
+/// typed providers are added — on the non-fallback path this is the value
+/// `new` already set, so the call is idempotent. Returns `None` when no
+/// provider registered at all, and the pipeline then processes media without
+/// transcription.
+pub(crate) fn build_media_pipeline_transcription_manager(
+    transcription_config: &TranscriptionConfig,
+    typed_providers: &TranscriptionProviders,
+    agent_provider: &str,
+) -> Option<TranscriptionManager> {
+    let base = TranscriptionManager::new(
+        transcription_config,
+        transcription_config.default_provider.clone(),
+    )
+    .unwrap_or_else(|_| TranscriptionManager::empty());
+    let manager = base
+        .with_typed_providers(typed_providers)
+        .with_default_provider(transcription_config.default_provider.clone())
+        .with_agent_transcription_provider(agent_provider.to_string());
+    if manager.available_providers().is_empty() {
+        None
+    } else {
+        Some(manager)
+    }
+}
+
 impl ::zeroclaw_api::attribution::Attributable for GroqProvider {
     fn role(&self) -> ::zeroclaw_api::attribution::Role {
         ::zeroclaw_api::attribution::Role::Provider(
@@ -1970,11 +2002,12 @@ mod tests {
 
     #[test]
     fn typed_only_media_pipeline_preserves_the_configured_default() {
-        // Mirror the media pipeline's production composition: transcription
-        // enabled, no legacy provider keys (so the seed constructor bails and
-        // the typed-only fallback shell is used), typed providers registered,
-        // and `[transcription].default_provider` set. The default must
-        // survive the empty-shell fallback.
+        // Production assembly path (orchestrator media pipeline): the legacy
+        // `[transcription]` section has no provider keys, so the seed
+        // constructor bails and the typed-only fallback shell is used; the
+        // typed providers are registered and `[transcription].
+        // default_provider` is set. The default must survive the empty-shell
+        // fallback.
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("GROQ_API_KEY") };
 
@@ -1995,14 +2028,8 @@ mod tests {
             ..TranscriptionConfig::default()
         };
 
-        let manager = TranscriptionManager::new(
-            &transcription_config,
-            transcription_config.default_provider.clone(),
-        )
-        .unwrap_or_else(|_| TranscriptionManager::empty())
-        .with_typed_providers(&typed)
-        .with_default_provider(transcription_config.default_provider.clone())
-        .with_agent_transcription_provider(String::new());
+        let manager = build_media_pipeline_transcription_manager(&transcription_config, &typed, "")
+            .expect("typed-only construction must produce a manager");
 
         assert!(
             manager.available_providers().contains(&"groq.main"),
@@ -2012,6 +2039,26 @@ mod tests {
             manager.resolved_agent_alias(),
             "groq.main",
             "typed-only construction must preserve the configured default"
+        );
+
+        let no_default = TranscriptionConfig {
+            default_provider: None,
+            ..transcription_config.clone()
+        };
+        let unbound = build_media_pipeline_transcription_manager(&no_default, &typed, "")
+            .expect("typed-only construction must produce a manager");
+        assert_eq!(
+            unbound.resolved_agent_alias(),
+            "",
+            "without a default the agent stays unbound; resolution must not \
+             silently pick the only typed provider"
+        );
+
+        let empty_registry = TranscriptionProviders::default();
+        assert!(
+            build_media_pipeline_transcription_manager(&transcription_config, &empty_registry, "")
+                .is_none(),
+            "no registered provider means no manager, not an empty shell"
         );
     }
 
@@ -3228,6 +3275,29 @@ mod channel_builder_tests {
         assert!(
             manager.agent_transcription_provider.is_empty(),
             "with several providers the choice stays unbound rather than silently picked"
+        );
+    }
+
+    #[test]
+    fn an_unavailable_default_stays_selected_instead_of_binding_the_other_provider() {
+        // Production channel assembly with the operator's selected default
+        // failing to register while another provider is the sole registered
+        // one: the default must win over the lone-provider convenience
+        // binding, so transcription fails loud on the selected provider
+        // instead of silently routing audio to the other vendor.
+        let mut config = config_with_legacy_groq();
+        config.transcription.default_provider = Some("deepgram.missing".to_string());
+
+        let manager = build_channel_transcription_manager(&config, "")
+            .expect("legacy groq registers as the sole provider");
+        assert!(
+            manager.agent_transcription_provider.is_empty(),
+            "the lone provider must not silently override the configured default"
+        );
+        assert_eq!(
+            manager.resolved_agent_alias(),
+            "deepgram.missing",
+            "resolution must stay on the operator's selected default"
         );
     }
 
