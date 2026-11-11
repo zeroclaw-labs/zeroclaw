@@ -3648,6 +3648,37 @@ fn replace_available_skills_section(base_prompt: &str, refreshed_skills: &str) -
         return refreshed;
     }
 
+    // Neither the skills header nor the Workspace heading survived the
+    // startup cap: earlier tool, safety, or bootstrap content filled the
+    // retained budget, and the post-builder additions (text tool protocol,
+    // channel delivery instructions) were appended after the cut. Appending
+    // the refreshed skills after the cached prompt would place them behind
+    // that mandatory tail; the turn-time cap reserves the whole tail, and
+    // optional skill bodies inside the reservation would take the
+    // reserve-or-exceed fallback and blow the budget. Insert the refreshed
+    // section before the earliest mandatory block instead. Without a
+    // recognizable mandatory tail the legacy append behavior stays: a prompt
+    // with no mandatory tail takes the plain cap, so nothing is reserved
+    // over the budget.
+    let mandatory_start = [
+        channel_delivery_tail_start(base_prompt),
+        base_prompt.find(TEXT_TOOL_PROTOCOL_HEADER),
+    ]
+    .into_iter()
+    .flatten()
+    .min();
+    if let Some(start) = mandatory_start {
+        let mut refreshed = String::with_capacity(base_prompt.len() + refreshed_skills.len() + 2);
+        refreshed.push_str(&base_prompt[..start]);
+        if !refreshed.ends_with("\n\n") {
+            refreshed.push_str("\n\n");
+        }
+        refreshed.push_str(refreshed_skills);
+        refreshed.push_str("\n\n");
+        refreshed.push_str(&base_prompt[start..]);
+        return refreshed;
+    }
+
     format!("{base_prompt}\n\n{refreshed_skills}")
 }
 
@@ -48098,6 +48129,116 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             text_tool_protocol_advertised(&capped),
             "the re-cap must retain the complete text tool protocol"
+        );
+        assert!(
+            capped.chars().count() <= PROMPT_CAP,
+            "the spliced and re-capped prompt ({} chars) must respect the cap \
+             when the mandatory additions fit",
+            capped.chars().count()
+        );
+    }
+
+    #[test]
+    fn truncated_startup_prompt_before_skills_header_inserts_refresh_before_protocol() {
+        const PROMPT_CAP: usize = 2_000;
+
+        // Startup where earlier content fills the retained budget: the base
+        // builder's tool catalogue (one tool carrying a long description)
+        // pushes the skills section past the cap, so the startup reservation
+        // cuts before the skills header — neither `## Available Skills` nor
+        // `## Workspace` survives — and appends the tool protocol after.
+        let workspace = make_workspace();
+        let mut config = Config {
+            data_dir: workspace.path().to_path_buf(),
+            ..Default::default()
+        };
+        config.skills.open_skills_enabled = false;
+        config.skills.prompt_injection_mode =
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full;
+        let skill_dir = workspace.path().join("skills").join("tiny");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.toml"),
+            "prompts = [\"Tiny skill instructions.\"]\n\
+             [skill]\n\
+             name = \"tiny\"\n\
+             description = \"A tiny skill\"\n\
+             version = \"1\"\n",
+        )
+        .unwrap();
+        let skills = zeroclaw_runtime::skills::load_skills_with_config(workspace.path(), &config);
+        let bulky_description = "tool detail ".repeat(300);
+        let tools = [("shell", bulky_description.as_str())];
+        let base = build_system_prompt_with_mode_and_effective_tools(
+            workspace.path(),
+            "test-model",
+            &tools,
+            |_| false,
+            &skills,
+            None,
+            None,
+            None,
+            false,
+            config.skills.prompt_injection_mode,
+            false,
+            PROMPT_CAP,
+            true,
+            false,
+            None,
+        );
+        let additions = format!(
+            "{TEXT_TOOL_PROTOCOL_HEADER}{TEXT_TOOL_TOOLS_HEADER}\
+             **read_skill**: Read a skill.\nParameters: {{`args`}}\n"
+        );
+        let cached = finalize_base_reserving_additions(base, &additions, PROMPT_CAP, "test-agent");
+        assert!(
+            !cached.contains("## Available Skills"),
+            "scenario setup: the startup cap must cut before the skills header"
+        );
+        assert!(
+            !cached.contains("## Workspace"),
+            "scenario setup: the startup cap must cut before the Workspace heading"
+        );
+        assert!(
+            cached.ends_with(&additions),
+            "scenario setup: the reserved protocol must be appended after the capped base"
+        );
+
+        // Turn time: an oversized refresh must insert the refreshed section
+        // ahead of the mandatory tail, not append it behind the protocol —
+        // otherwise the re-cap's reservation swallows the optional skill
+        // bodies and the reserve-or-exceed fallback exceeds the budget.
+        let refreshed = format!(
+            "## Available Skills\n\n<available_skills>\n\n- **bulky**: A bulky skill.\n\n{}\
+             </available_skills>\n\n",
+            "skill body ".repeat(300)
+        );
+        let spliced = replace_available_skills_section(&cached, &refreshed);
+        let skills_at = spliced.find("## Available Skills").unwrap();
+        let protocol_at = spliced.find(TEXT_TOOL_PROTOCOL_HEADER).unwrap();
+        assert!(
+            skills_at < protocol_at,
+            "the refreshed skills must stay ahead of the tool protocol even \
+             when neither startup header survived"
+        );
+        assert!(
+            !spliced[protocol_at..].contains("</available_skills>"),
+            "no refreshed skill content may migrate behind the reserved protocol tail"
+        );
+        assert!(
+            spliced.chars().count() > PROMPT_CAP,
+            "scenario setup: the oversized refresh must exceed the cap so the \
+             re-cap has to cut"
+        );
+
+        let capped = cap_channel_system_prompt(spliced, PROMPT_CAP, "test-agent");
+        assert!(
+            text_tool_protocol_advertised(&capped),
+            "the re-cap must retain the complete text tool protocol"
+        );
+        assert!(
+            capped.ends_with(&additions),
+            "the re-cap must keep the whole protocol tail, not cut into it"
         );
         assert!(
             capped.chars().count() <= PROMPT_CAP,
