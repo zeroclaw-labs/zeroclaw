@@ -258,6 +258,7 @@ fn full_chat_fixture_names() -> BTreeSet<String> {
         "sessions_current",
         "sessions_history",
         "sessions_list",
+        "sessions_message",
         "sessions_send",
         "shell",
         "spawn_subagent",
