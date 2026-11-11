@@ -327,6 +327,77 @@ fn root_index_html(target: &str) -> String {
     )
 }
 
+/// Emit the gh-pages root `404.html`. GitHub Pages serves it, with status 404,
+/// for every missing path. Retention pruning removes old release dirs, and the
+/// legacy docs host forwards their URLs here unchanged, so a script sends a
+/// `/<version>/<locale>/<page>` link, or one from the pre-versioned
+/// `/<locale>/<page>` layout, to the same page under the stable alias (master
+/// when no pointer resolves). Any other missing path shows the message. Prints
+/// HTML to stdout.
+pub fn gen_root_404() -> anyhow::Result<()> {
+    let mut present = Vec::new();
+    for entry in fs::read_dir(".")?.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if entry.file_type()?.is_dir() && is_version_dir(&name) {
+            present.push(name);
+        }
+    }
+    let (target, source) = match resolve_stable(&present) {
+        Some(tag) => (STABLE_ALIAS, tag),
+        None => ("master", "master".to_string()),
+    };
+    let mut locales = Vec::new();
+    if let Ok(entries) = fs::read_dir(&source) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if entry.path().join("index.html").is_file() && is_locale_code(&name) {
+                locales.push(name);
+            }
+        }
+    }
+    locales.sort();
+    print!("{}", root_404_html(target, &locales)?);
+    Ok(())
+}
+
+/// Locale directory names are interpolated into a script, so only plain codes
+/// such as `en` or `zh-CN` qualify.
+fn is_locale_code(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .split('-')
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric()))
+}
+
+/// The root 404 page's redirect logic. [`root_404_html`] sets its `target`
+/// and `locales` on the two lines before it, and
+/// `scripts/docs/promote_stable.py` rewrites those two lines on promotion, so
+/// their shape (`var target = "...";`, `var locales = [...];`) is shared.
+const ROOT_404_SCRIPT: &str = include_str!("root_404.js");
+
+fn root_404_html(target: &str, locales: &[String]) -> anyhow::Result<String> {
+    let locales = serde_json::to_string(locales)?;
+    Ok(format!(
+        r#"<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Page not found · ZeroClaw Docs</title>
+<style>body{{font:16px/1.5 system-ui,sans-serif;max-width:40rem;margin:4rem auto;padding:0 1rem}}</style>
+<script>
+var target = "{target}";
+var locales = {locales};
+{script}</script>
+<h1>Page not found</h1>
+<p>This page is not in the ZeroClaw docs. It may have moved in a newer release.</p>
+<p><a href="/">Go to the documentation home</a></p>
+</html>
+"#,
+        script = ROOT_404_SCRIPT,
+    ))
+}
+
 /// Rebuild the `stable/` alias as a copy of the stable-pointer target, or
 /// remove it when no pointer resolves. Run after `gen-seo`: the release dir then
 /// already carries canonical tags that name the alias, so the copy is
@@ -618,5 +689,23 @@ mod tests {
             err.to_string().contains("refusing to copy symlink"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn root_404_names_the_redirect_target_and_only_plain_locale_codes() {
+        let html = root_404_html(STABLE_ALIAS, &["en".into(), "zh-CN".into()]).unwrap();
+        assert!(html.contains("<meta name=\"robots\" content=\"noindex\">"));
+        // promote_stable.py rewrites exactly these two lines.
+        assert!(html.contains("\nvar target = \"stable\";\n"));
+        assert!(html.contains("\nvar locales = [\"en\",\"zh-CN\"];\n"));
+        assert!(html.contains(ROOT_404_SCRIPT));
+        assert!(html.contains("<a href=\"/\">"));
+
+        for ok in ["en", "zh-CN", "pt-BR"] {
+            assert!(is_locale_code(ok), "{ok}");
+        }
+        for bad in ["", "-", "en-", "a b", "en\"", "</script>", "api/x"] {
+            assert!(!is_locale_code(bad), "{bad:?}");
+        }
     }
 }
