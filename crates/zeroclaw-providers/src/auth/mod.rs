@@ -1330,12 +1330,15 @@ impl AuthProviderFlow for OpenaiCodexFlow {
 pub struct GeminiFlow;
 
 impl GeminiFlow {
-    /// Look up the per-alias OAuth client credentials. The auth profile
-    /// name doubles as the Gemini family alias key
-    /// (`[providers.models.gemini.<profile>]`); the alias config carries
-    /// the operator's Google Cloud OAuth app credentials.
-    fn alias_creds<'a>(config: &'a Config, profile: &str) -> Result<(&'a str, &'a str)> {
-        let alias_cfg = config.providers.models.gemini.get(profile).ok_or_else(|| {
+    /// Consume connection-owned OAuth credentials. Historical alias decoding
+    /// stays in config, alongside the rest of provider input migration.
+    fn client_credentials(config: &Config, profile: &str) -> Result<(String, String)> {
+        let (client_id, client_secret) = config
+            .gemini_oauth_client_credentials(profile)?
+            .unwrap_or_default();
+        let client_id = client_id.trim();
+        let client_secret = client_secret.trim();
+        if client_id.is_empty() || client_secret.is_empty() {
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
@@ -1343,59 +1346,17 @@ impl GeminiFlow {
                     .with_attrs(::serde_json::json!({
                         "oauth_provider": "gemini",
                         "profile": profile,
-                        "missing": "alias_cfg",
+                        "missing": if client_id.is_empty() { "client_id" } else { "client_secret" },
                     })),
-                "auth: gemini OAuth missing alias config"
+                "auth: gemini OAuth missing client credentials"
             );
-            anyhow::Error::msg(format!(
-                "Gemini OAuth requires `[providers.models.gemini.{profile}]` to exist with \
-                 `oauth_client_id` and `oauth_client_secret` set. Register a Google Cloud \
-                 OAuth app and configure the credentials before running this auth flow.",
-            ))
-        })?;
-        let client_id = alias_cfg
-            .oauth_client_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "oauth_provider": "gemini",
-                            "profile": profile,
-                            "missing": "oauth_client_id",
-                        })),
-                    "auth: gemini OAuth missing oauth_client_id"
-                );
-                anyhow::Error::msg(format!(
-                    "Gemini OAuth requires `oauth_client_id` on `[providers.models.gemini.{profile}]`.",
-                ))
-            })?;
-        let client_secret = alias_cfg
-            .oauth_client_secret
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "oauth_provider": "gemini",
-                            "profile": profile,
-                            "missing": "oauth_client_secret",
-                        })),
-                    "auth: gemini OAuth missing oauth_client_secret"
-                );
-                anyhow::Error::msg(format!(
-                    "Gemini OAuth requires `oauth_client_secret` on `[providers.models.gemini.{profile}]`.",
-                ))
-            })?;
-        Ok((client_id, client_secret))
+            return Err(anyhow::Error::msg(format!(
+                "Gemini OAuth profile `{profile}` must select a configured Gemini connection \
+                 with auth.mode = oauth, auth.client_id and auth.client_secret. \
+                 An exact model reference may also select that connection.",
+            )));
+        }
+        Ok((client_id.to_owned(), client_secret.to_owned()))
     }
 }
 
@@ -1413,10 +1374,10 @@ impl AuthProviderFlow for GeminiFlow {
                 "`auth login --import` currently supports only --model-provider openai-codex and xai.",
             );
         }
-        let (client_id, client_secret) = Self::alias_creds(ctx.config, profile)?;
+        let (client_id, client_secret) = Self::client_credentials(ctx.config, profile)?;
 
         if device_code {
-            match crate::auth::gemini_oauth::start_device_code_flow(ctx.client, client_id).await {
+            match crate::auth::gemini_oauth::start_device_code_flow(ctx.client, &client_id).await {
                 Ok(device) => {
                     println!("Google/Gemini device-code login started.");
                     println!("Visit: {}", device.verification_uri);
@@ -1426,8 +1387,8 @@ impl AuthProviderFlow for GeminiFlow {
                     }
                     let token_set = crate::auth::gemini_oauth::poll_device_code_tokens(
                         ctx.client,
-                        client_id,
-                        client_secret,
+                        &client_id,
+                        &client_secret,
                         &device,
                     )
                     .await?;
@@ -1449,7 +1410,7 @@ impl AuthProviderFlow for GeminiFlow {
         }
 
         let pkce = crate::auth::gemini_oauth::generate_pkce_state();
-        let authorize_url = crate::auth::gemini_oauth::build_authorize_url(client_id, &pkce)?;
+        let authorize_url = crate::auth::gemini_oauth::build_authorize_url(&client_id, &pkce)?;
 
         let pending = PendingOAuthLogin {
             model_provider: "gemini".into(),
@@ -1485,8 +1446,8 @@ impl AuthProviderFlow for GeminiFlow {
 
         let token_set = crate::auth::gemini_oauth::exchange_code_for_tokens(
             ctx.client,
-            client_id,
-            client_secret,
+            &client_id,
+            &client_secret,
             &code,
             &pkce,
         )
@@ -1509,7 +1470,7 @@ impl AuthProviderFlow for GeminiFlow {
         profile: &str,
         input: Option<&str>,
     ) -> Result<()> {
-        let (client_id, client_secret) = Self::alias_creds(ctx.config, profile)?;
+        let (client_id, client_secret) = Self::client_credentials(ctx.config, profile)?;
         let pending = load_pending_oauth_login(ctx.config, "gemini")?.ok_or_else(|| {
             ::zeroclaw_log::record!(
                 WARN,
@@ -1551,8 +1512,8 @@ impl AuthProviderFlow for GeminiFlow {
         };
         let token_set = crate::auth::gemini_oauth::exchange_code_for_tokens(
             ctx.client,
-            client_id,
-            client_secret,
+            &client_id,
+            &client_secret,
             &code,
             &pkce,
         )
@@ -1575,21 +1536,25 @@ impl AuthProviderFlow for GeminiFlow {
         ctx: &AuthFlowContext<'_>,
         profile_override: Option<&str>,
     ) -> Result<RefreshStatus> {
-        let alias_name = profile_override.unwrap_or("default");
-        let alias_cfg = ctx.config.providers.models.gemini.get(alias_name);
-        let client_id = alias_cfg
-            .and_then(|c| c.oauth_client_id.as_deref())
-            .unwrap_or("");
-        let client_secret = alias_cfg
-            .and_then(|c| c.oauth_client_secret.as_deref())
-            .unwrap_or("");
+        let Some(selected) = ctx
+            .auth_service
+            .get_gemini_profile(profile_override)
+            .await?
+        else {
+            return Ok(RefreshStatus::NoProfile);
+        };
+        let profile_name = selected.profile_name;
+        let (client_id, client_secret) = ctx
+            .config
+            .gemini_oauth_client_credentials(&profile_name)?
+            .unwrap_or_default();
         match ctx
             .auth_service
-            .get_valid_gemini_access_token(profile_override, client_id, client_secret)
+            .get_valid_gemini_access_token(Some(&profile_name), &client_id, &client_secret)
             .await?
         {
             Some(_) => Ok(RefreshStatus::Refreshed {
-                profile: alias_name.to_string(),
+                profile: profile_name,
             }),
             None => Ok(RefreshStatus::NoProfile),
         }
@@ -1890,10 +1855,95 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
+    fn gemini_login_resolves_connection_and_model_keys_and_legacy_input() {
+        let config = Config {
+            providers: serde_json::from_value(serde_json::json!({
+                "connections": {
+                    "google.prod":{"kind":"gemini", "auth":{
+                        "mode":"oauth", "client_id":" fixture-client ", "client_secret":" fixture-secret "
+                    }},
+                    "other.prod":{"kind":"openai"}
+                },
+                "models": {
+                    "chat.google.prod":{"capability":"chat", "provider":"google.prod", "model":"gemini-model"},
+                    "gemini":{"old.alias":{"oauth_client_id":"fixture-client", "oauth_client_secret":"fixture-secret"}}
+                }
+            }))
+            .unwrap(),
+            ..Config::default()
+        };
+        for profile in ["google.prod", "chat.google.prod", "old.alias"] {
+            assert_eq!(
+                GeminiFlow::client_credentials(&config, profile).unwrap(),
+                ("fixture-client".into(), "fixture-secret".into())
+            );
+        }
+        assert!(GeminiFlow::client_credentials(&config, "other.prod").is_err());
+        assert!(GeminiFlow::client_credentials(&config, "missing").is_err());
+        assert!(
+            config
+                .gemini_oauth_client_credentials("missing")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn normalize_provider_aliases() {
         assert_eq!(normalize_model_provider("codex").unwrap(), "openai-codex");
         assert_eq!(normalize_model_provider("claude").unwrap(), "anthropic");
         assert_eq!(normalize_model_provider("openai").unwrap(), "openai");
+    }
+
+    #[tokio::test]
+    async fn gemini_refresh_uses_the_selected_auth_profile_connection() {
+        let config = Config {
+            providers: serde_json::from_value(serde_json::json!({
+                "connections": {
+                    "google.prod":{"kind":"gemini", "auth":{
+                        "mode":"oauth", "client_id":"fixture-client", "client_secret":"fixture-secret"
+                    }},
+                    "default":{"kind":"openai"}
+                }
+            }))
+            .unwrap(),
+            ..Config::default()
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let auth_service = AuthService::new(directory.path(), false);
+        let client = reqwest::Client::new();
+        let ctx = AuthFlowContext {
+            config: &config,
+            auth_service: &auth_service,
+            client: &client,
+            format_cli: &|_, _, fallback| fallback.to_owned(),
+        };
+        assert!(matches!(
+            GeminiFlow.refresh_status(&ctx, None).await.unwrap(),
+            RefreshStatus::NoProfile
+        ));
+        auth_service
+            .store_gemini_tokens(
+                "google.prod",
+                TokenSet {
+                    access_token: "fixture-access-token".into(),
+                    refresh_token: None,
+                    id_token: None,
+                    expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                    token_type: Some("Bearer".into()),
+                    scope: None,
+                },
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        for selected in [None, Some("google.prod"), Some("gemini:google.prod")] {
+            let status = GeminiFlow.refresh_status(&ctx, selected).await.unwrap();
+            assert!(
+                matches!(status, RefreshStatus::Refreshed { profile } if profile == "google.prod")
+            );
+        }
     }
 
     #[test]

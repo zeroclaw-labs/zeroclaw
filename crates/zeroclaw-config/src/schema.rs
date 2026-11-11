@@ -4724,9 +4724,7 @@ impl Config {
         // them from the typed maps, never from flattened property paths.
         if source == crate::traits::AliasSource::ModelProviders {
             let mut refs = Vec::new();
-            if self.providers.models.has_canonical_models()
-                && let Ok(registry) = self.provider_registry()
-            {
+            if let Ok(registry) = self.provider_registry() {
                 refs.extend(
                     registry
                         .models
@@ -4849,8 +4847,8 @@ impl Config {
             .unwrap_or_default()
     }
 
-    /// Resolve a model's configured temperature from the canonical registry,
-    /// falling back to the legacy selection lens. Explicit Clear means the
+    /// Resolve a model's configured temperature from the projected canonical
+    /// registry. Explicit Clear means the
     /// request omits temperature and therefore resolves to `None`.
     #[must_use]
     pub fn resolve_model_temperature(&self, model_ref: &str) -> Option<f64> {

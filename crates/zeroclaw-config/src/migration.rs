@@ -1505,9 +1505,13 @@ fn migrate_toml(value: toml::Value) -> Result<Option<Migrated>> {
             apply_retired_keys(&mut value, version, RETIRED_KEYS, &mut notices);
         }
         lower_capped_keys(&mut value, &mut notices);
-        if notices.is_empty() && !selector_omitted {
+        // Master already stamped V4 before routes became exact model refs.
+        // Accept that input shape at the same boundary as the V3 migration.
+        let routes_changed = model_routes::needs_migration(&value);
+        if notices.is_empty() && !selector_omitted && !routes_changed {
             return Ok(None);
         }
+        value = model_routes::migrate(value)?;
         (value, notices)
     } else {
         let mut notices: Vec<MigrationNotice> =
@@ -1553,8 +1557,9 @@ pub fn migrate_file(input: &str) -> Result<Option<String>> {
 }
 
 /// The oldest schema version from which reaching [`CURRENT_SCHEMA_VERSION`]
-/// changes a config only by retiring keys and re-stamping `schema_version`.
-/// A file at or above it is migrated by editing its document in place, so
+/// can change a config only by retiring keys and re-stamping `schema_version`.
+/// Files requiring structural route conversion are excluded from this path.
+/// Other files at or above it are edited in place, so
 /// everything the migration does not change keeps its exact bytes: quoting,
 /// number spelling, comments. Older files need the structural steps and are
 /// rebuilt from the migrated value. Raise this if a later version adds a
@@ -1566,6 +1571,7 @@ pub fn migrate_file_with_notices(input: &str) -> Result<Option<(String, Vec<Migr
     let value: toml::Value = toml::from_str(input).context("failed to parse config TOML")?;
     let from = detect_version(&value)?;
     if (FIRST_RETIREMENT_ONLY_VERSION..=CURRENT_SCHEMA_VERSION).contains(&from)
+        && !model_routes::needs_migration(&value)
         && let Ok(mut doc) = input.parse::<toml_edit::DocumentMut>()
     {
         let selector_omitted = !value
@@ -1753,7 +1759,7 @@ fn encrypt_in_place(value: &mut toml::Value, store: &crate::secrets::SecretStore
     Ok(())
 }
 
-/// Versioned TOML → validated V3 `Config`, strict: any defect errors.
+/// Versioned TOML → current `Config`, strict: any deserialize defect errors.
 /// Used by repair tooling (`zeroclaw config migrate`, `model_routing_config`)
 /// that needs the precise failure. Daemon load uses the resilient path.
 pub fn migrate_to_current(input: &str) -> Result<Config> {
@@ -6201,6 +6207,77 @@ model = "fast-model"
                 .as_table()
                 .is_some_and(|models| models.contains_key("chat.fast.prod"))
         );
+    }
+
+    #[test]
+    fn old_routes_migrate_identically_in_memory_and_on_disk_from_v3_and_v4() {
+        for version in [3, CURRENT_SCHEMA_VERSION] {
+            let raw = format!(
+                r#"schema_version = {version}
+[tools]
+optional = ["*"]
+[providers.models.openai."primary.prod"]
+model = "primary-model"
+api_key = "profile-fixture-key"
+temperature = 0.4
+[providers.connections."stable.connection"]
+kind = "openai"
+[providers.models."chat.stable"]
+capability = "chat"
+provider = "stable.connection"
+model = "stable-model"
+[[model_routes]]
+hint = "fast"
+model_provider = "openai.primary.prod"
+model = "route-model"
+api_key = "route-fixture-key"
+[[model_routes]]
+hint = "inherited"
+model_provider = "openai.primary.prod"
+[[model_routes]]
+hint = "stable"
+model_ref = "chat.stable"
+"#
+            );
+            let in_memory = migrate_to_current(&raw).unwrap();
+            let (migrated, notices) = migrate_file_with_notices(&raw).unwrap().unwrap();
+            assert!(notices.is_empty());
+            let from_disk = migrate_to_current(&migrated).unwrap();
+            assert_eq!(from_disk.schema_version, CURRENT_SCHEMA_VERSION);
+            assert_eq!(
+                serde_json::to_value(&in_memory.model_routes).unwrap(),
+                serde_json::to_value(&from_disk.model_routes).unwrap()
+            );
+            let memory_registry = in_memory.provider_registry().unwrap();
+            let disk_registry = from_disk.provider_registry().unwrap();
+            assert_eq!(
+                serde_json::to_value(&memory_registry).unwrap(),
+                serde_json::to_value(&disk_registry).unwrap()
+            );
+            for (index, model, key) in [
+                (0, "route-model", "route-fixture-key"),
+                (1, "primary-model", "profile-fixture-key"),
+            ] {
+                let reference = from_disk.model_routes[index].model_ref.as_str().into();
+                let resolved = disk_registry.resolve_chat(&reference).unwrap();
+                assert_eq!(resolved.upstream_model(), Some(model));
+                assert_eq!(resolved.selection.connection.api_key(), Some(key));
+                assert_eq!(
+                    resolved.options.temperature,
+                    Some(crate::provider_registry::Override::Set(0.4))
+                );
+            }
+            assert_eq!(from_disk.model_routes[2].model_ref, "chat.stable");
+            assert_eq!(
+                from_disk.resolve_model_id("openai.primary.prod").as_deref(),
+                Some("primary-model"),
+                "route overrides must not change the original model"
+            );
+            let salvaged = migrate_to_current_salvaged(&raw);
+            assert!(salvaged.dropped.is_empty() && salvaged.dropped_security.is_empty());
+            assert_eq!(salvaged.config.model_routes.len(), 3);
+            assert!(migrate_file_with_notices(&migrated).unwrap().is_none());
+        }
     }
 
     #[test]

@@ -426,6 +426,77 @@ fn registry_editor_promotes_masked_legacy_credentials_and_keeps_later_edits() {
 }
 
 #[test]
+fn legacy_chat_and_speech_names_are_normalized_before_editor_promotion() {
+    use zeroclaw_api::capability::Capability;
+    use zeroclaw_config::schema::AliasedAgentConfig;
+
+    let mut config = Config {
+        providers: serde_json::from_value(json!({
+            "models": {"openai": {"default": {"model":"chat-model"}}},
+            "tts": {"openai": {"default": {"model":"tts-1", "voice":"alloy"}}},
+            "transcription": {"openai": {"default": {"model":"whisper-1"}}}
+        }))
+        .unwrap(),
+        ..Config::default()
+    };
+    config.agents.insert(
+        "agent".into(),
+        AliasedAgentConfig {
+            model_provider: "openai.default".into(),
+            tts_provider: "openai.default".into(),
+            transcription_provider: "openai.default".into(),
+            ..Default::default()
+        },
+    );
+    for (capability, expected) in [
+        (Capability::Chat, "openai.default"),
+        (Capability::Tts, "tts.openai.default"),
+        (Capability::Asr, "asr.openai.default"),
+    ] {
+        assert_eq!(
+            config
+                .capability_model_ref("openai.default", capability)
+                .unwrap()
+                .as_str(),
+            expected
+        );
+    }
+    config.validate().unwrap();
+    let expected = snapshot(&config).unwrap();
+    stage(
+        &mut config,
+        RegistryEdit {
+            registry: expected.clone(),
+            expected,
+        },
+    )
+    .unwrap();
+    let agent = config.agent("agent").unwrap();
+    assert_eq!(agent.model_provider.as_str(), "openai.default");
+    assert_eq!(agent.tts_provider.as_str(), "tts.openai.default");
+    assert_eq!(agent.transcription_provider.as_str(), "asr.openai.default");
+    assert!(config.providers.models.openai.is_empty());
+    assert!(config.providers.tts.openai.is_empty());
+    assert!(config.providers.transcription.openai.is_empty());
+    let reloaded: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+    reloaded.validate().unwrap();
+    assert_eq!(snapshot(&reloaded).unwrap(), snapshot(&config).unwrap());
+
+    zeroclaw_config::provider_registry::editor::rename_entry(
+        &mut config,
+        "models",
+        "tts.openai.default",
+        "voice.renamed",
+    )
+    .unwrap();
+    assert_eq!(
+        config.agent("agent").unwrap().tts_provider.as_str(),
+        "voice.renamed"
+    );
+    config.validate().unwrap();
+}
+
+#[test]
 fn registry_voice_pickers_use_complete_model_refs_and_correct_capabilities() {
     let mut config = config();
     let expected = snapshot(&config).unwrap();

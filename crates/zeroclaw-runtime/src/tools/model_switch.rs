@@ -98,7 +98,7 @@ impl Tool for ModelSwitchTool {
     }
 
     fn description(&self) -> &str {
-        "Request a runtime model switch using an exact configured model reference. Use 'get' to see the pending switch, 'list_model_providers' to see provider families, 'list_models' to see models for a provider family, or 'set' with a model reference such as 'chat.fast'. The switch is runtime/session state and does not write config."
+        "Request a runtime model switch using an exact configured model reference. Use 'get' to see the pending switch, 'list_model_providers' to see configured model references and available provider kinds, 'list_models' to query upstream model IDs through a configured model's connection, or 'set' with a model reference such as 'chat.fast'. The switch is runtime/session state and does not write config."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -108,7 +108,7 @@ impl Tool for ModelSwitchTool {
                 "action": {
                     "type": "string",
                     "enum": ["get", "set", "list_model_providers", "list_models"],
-                    "description": "Action to perform: get pending switch state, set an exact model switch, list available provider families, or list models for a provider family"
+                    "description": "Action to perform: get pending switch state, set an exact model switch, list configured model references and provider kinds, or query upstream model IDs through a configured model's connection"
                 },
                 "model_provider": {
                     "type": "string",
@@ -193,13 +193,13 @@ impl ModelSwitchTool {
             Ok(resolved) => resolved,
             Err(error) => {
                 let known_model_providers = zeroclaw_providers::list_model_providers();
-                let configured_profiles = configured_models(&config);
+                let configured_model_refs = configured_models(&config);
                 return Ok(ToolResult {
                         success: false,
                         output: serde_json::to_string_pretty(&json!({
                             "provider_ref_shape": "exact TOML model key",
                             "available_provider_families": known_model_providers.iter().map(|p| p.name).collect::<Vec<_>>(),
-                            "configured_models": configured_profiles
+                            "configured_models": configured_model_refs
                         }))?.into(),
                         error: Some(error),
                     });
@@ -221,7 +221,7 @@ impl ModelSwitchTool {
             });
         }
 
-        // Explicit `model` wins; otherwise a three-segment ref supplies it.
+        // Explicit upstream `model` wins; otherwise resolve the exact configured model key.
         let model = match model
             .map(str::trim)
             .filter(|m| !m.is_empty())
@@ -283,8 +283,8 @@ impl ModelSwitchTool {
 
     fn handle_list_providers(&self) -> anyhow::Result<ToolResult> {
         let providers_list = zeroclaw_providers::list_model_providers();
-        let configured_profiles = configured_models(&(self.config)());
-        let configured_count = configured_profiles.len();
+        let configured_model_refs = configured_models(&(self.config)());
+        let configured_count = configured_model_refs.len();
 
         let model_providers: Vec<serde_json::Value> = providers_list
             .iter()
@@ -302,7 +302,7 @@ impl ModelSwitchTool {
             output: serde_json::to_string_pretty(&json!({
                 "model_providers": model_providers,
                 "count": model_providers.len(),
-                "configured_models": configured_profiles,
+                "configured_models": configured_model_refs,
                 "configured_count": configured_count,
                 "provider_ref_shape": "exact TOML model key",
                 "example": "Use action 'set' with an exact model reference such as 'chat.fast'"
@@ -425,7 +425,7 @@ impl ModelSwitchTool {
                 output: serde_json::to_string_pretty(&json!({
                     "model_provider": model_provider,
                     "models": [],
-                    "note": "No common models listed for this model_provider family. Check model_provider documentation for available models."
+                    "note": "No upstream models were listed for the selected configured model's connection. Check the provider documentation for available model IDs."
                 }))?.into(),
                 error: None,
             });
@@ -436,7 +436,7 @@ impl ModelSwitchTool {
             output: serde_json::to_string_pretty(&json!({
                 "model_provider": model_provider,
                 "models": models,
-                "example": "Use action 'set' with this model_provider and a model ID to switch"
+                "example": "Use action 'set' with this exact model_provider reference; optionally provide an upstream model ID override"
             }))?
             .into(),
             error: None,

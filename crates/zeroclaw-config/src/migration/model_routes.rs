@@ -1,6 +1,6 @@
 //! V3 route-owned model/credential values become ordinary V4 model definitions.
-//! This conversion runs only at the version boundary; current routes have no
-//! legacy dispatch path.
+//! Conversion belongs to config loading, including files already stamped V4
+//! by releases with the old route shape. Runtime routes have no legacy path.
 
 use anyhow::{Context, Result};
 use serde_json::{Map, Value, json};
@@ -8,16 +8,24 @@ use serde_json::{Map, Value, json};
 use crate::provider_registry::{ChatOptionsPatch, ModelRef, ProviderConnection};
 use crate::schema::Config;
 
+pub(super) fn needs_migration(document: &toml::Value) -> bool {
+    document
+        .get("model_routes")
+        .and_then(toml::Value::as_array)
+        .is_some_and(|routes| {
+            routes
+                .iter()
+                .any(|route| route.get("model_provider").is_some())
+        })
+}
+
 pub(super) fn migrate(mut document: toml::Value) -> Result<toml::Value> {
-    let Some(routes) = document.get("model_routes").and_then(toml::Value::as_array) else {
-        return Ok(document);
-    };
-    if !routes
-        .iter()
-        .any(|route| route.get("model_provider").is_some())
-    {
+    if !needs_migration(&document) {
         return Ok(document);
     }
+    let routes = document["model_routes"]
+        .as_array()
+        .context("model_routes must be an array")?;
     let mut input = document.clone();
     input
         .as_table_mut()

@@ -1,7 +1,7 @@
 //! Normalize historical input at the config boundary. Consumers receive exact
 //! keys and complete definitions, including for an explicit temporary CLI input.
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde_json::json;
 use zeroclaw_api::capability::Capability;
 
@@ -76,6 +76,46 @@ impl Config {
         let registry = self.provider_registry().ok()?;
         let selected = registry.resolve_chat(&reference.into()).ok()?;
         selected.selection.connection.api_key().map(str::to_owned)
+    }
+
+    /// Resolve Gemini OAuth client input at the config boundary. New auth
+    /// profiles select an exact connection or model key. A historical Gemini
+    /// alias is decoded here, including credentials configured before login
+    /// without an explicit legacy `auth_mode`.
+    pub fn gemini_oauth_client_credentials(
+        &self,
+        profile: &str,
+    ) -> Result<Option<(String, String)>> {
+        let registry = self.provider_registry()?;
+        let connection =
+            if let Some(connection) = registry.connections.get(&ProviderId::from(profile)) {
+                connection
+            } else if let Some(model) = registry.models.get(&ModelRef::from(profile)) {
+                registry
+                    .connections
+                    .get(model.provider())
+                    .context("OAuth model has no connection")?
+            } else if let Some(legacy) = self.providers.models.gemini.get(profile) {
+                return Ok(Some((
+                    legacy.oauth_client_id.clone().unwrap_or_default(),
+                    legacy.oauth_client_secret.clone().unwrap_or_default(),
+                )));
+            } else {
+                return Ok(None);
+            };
+        let super::ProviderConnection::Gemini(connection) = connection else {
+            anyhow::bail!("OAuth profile must select a Gemini connection");
+        };
+        Ok(match &connection.auth {
+            Some(super::GeminiAuth::OAuth {
+                client_id,
+                client_secret,
+            }) => Some((
+                client_id.clone().unwrap_or_default(),
+                client_secret.clone().unwrap_or_default(),
+            )),
+            _ => None,
+        })
     }
 
     /// Historical family/alias input used by fixture-level factory adapters.
@@ -243,13 +283,31 @@ impl Config {
         capability: Capability,
     ) -> Result<ModelRef> {
         let registry = self.provider_registry()?;
+        self.capability_model_ref_in_registry(&registry, reference, capability)
+    }
+
+    /// Share input normalization with editor promotion without rebuilding the
+    /// registry or duplicating legacy namespace precedence.
+    pub(crate) fn capability_model_ref_in_registry(
+        &self,
+        registry: &ProviderRegistry,
+        reference: &str,
+        capability: Capability,
+    ) -> Result<ModelRef> {
         let key = ModelRef::from(reference.trim());
         if let Some(model) = registry.models.get(&key) {
-            ensure!(
-                model.capability() == capability,
-                "model `{reference}` does not support {capability:?}"
-            );
-            return Ok(key);
+            // Explicit canonical keys are authoritative. Historical chat and
+            // speech namespaces, however, could use the very same alias; the
+            // projection prefixes speech keys when such a collision occurs.
+            if self.providers.models.canonical_model(&key).is_some() {
+                ensure!(
+                    model.capability() == capability,
+                    "model `{reference}` does not support {capability:?}"
+                );
+            }
+            if model.capability() == capability {
+                return Ok(key);
+            }
         }
         let prefix = match capability {
             Capability::Tts => "tts",
@@ -445,6 +503,60 @@ mod tests {
                 .is_err()
         );
         assert!(config.chat_registry_for_input(None, "audio.ref").is_err());
+    }
+
+    #[test]
+    fn agent_key_inheritance_uses_the_exact_selected_connection() {
+        let config = fixture();
+        assert_eq!(
+            config.agent_model_api_key("agent").as_deref(),
+            Some("fixture-key")
+        );
+        assert_eq!(config.agent_model_api_key("absent"), None);
+    }
+
+    #[test]
+    fn legacy_only_models_are_available_to_canonical_pickers() {
+        let mut config = Config {
+            providers: serde_json::from_value(json!({
+                "models": {"openai": {"primary.prod": {"model": "legacy-chat"}}}
+            }))
+            .unwrap(),
+            ..Config::default()
+        };
+        let source = crate::traits::AliasSource::ModelProviders;
+        assert_eq!(
+            config.resolve_alias_source(source),
+            vec!["openai.primary.prod"]
+        );
+        config.providers.connections = fixture().providers.connections;
+        config.providers.models.insert_canonical_model(
+            "chat.independent".into(),
+            serde_json::from_value(json!({
+                "capability":"chat", "provider":"gateway.Prod", "model":"other"
+            }))
+            .unwrap(),
+        );
+        assert_eq!(
+            config.resolve_alias_source(source),
+            vec!["chat.independent", "openai.primary.prod"]
+        );
+    }
+
+    #[test]
+    fn explicit_canonical_capability_mismatch_never_uses_a_prefixed_alternative() {
+        let mut config = fixture();
+        config.providers.models.insert_canonical_model(
+            "asr.chat.Fast.v2".into(),
+            serde_json::from_value(json!({
+                "capability":"asr", "provider":"speech.local", "model":"whisper-1"
+            }))
+            .unwrap(),
+        );
+        let error = config
+            .capability_model_ref("chat.Fast.v2", Capability::Asr)
+            .unwrap_err();
+        assert!(error.to_string().contains("does not support"));
     }
 
     #[test]

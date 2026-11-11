@@ -93,20 +93,22 @@ pub fn stage(config: &mut Config, edit: RegistryEdit) -> Result<()> {
     let mut agents_changed = false;
     for agent in candidate.agents.values_mut() {
         if let Some(reference) = projected_speech_reference(
+            config,
             &projected_current,
+            &registry,
             agent.tts_provider.as_str(),
             zeroclaw_api::capability::Capability::Tts,
-            "tts",
-        ) {
+        )? {
             agent.tts_provider = reference.into();
             agents_changed = true;
         }
         if let Some(reference) = projected_speech_reference(
+            config,
             &projected_current,
+            &registry,
             agent.transcription_provider.as_str(),
             zeroclaw_api::capability::Capability::Asr,
-            "asr",
-        ) {
+        )? {
             agent.transcription_provider = reference.into();
             agents_changed = true;
         }
@@ -306,25 +308,24 @@ fn promote_embedding_bindings(
 }
 
 fn projected_speech_reference(
-    registry: &super::ProviderRegistry,
+    config: &Config,
+    current: &super::ProviderRegistry,
+    candidate: &super::ProviderRegistry,
     reference: &str,
     capability: zeroclaw_api::capability::Capability,
-    prefix: &str,
-) -> Option<String> {
-    if reference.is_empty()
-        || registry
+) -> Result<Option<String>> {
+    if reference.trim().is_empty()
+        || candidate
             .models
-            .get(&super::ModelRef::from(reference))
+            .get(&super::ModelRef::from(reference.trim()))
             .is_some_and(|model| model.capability() == capability)
     {
-        return None;
+        // A rename may already have rewritten this binding to a new exact
+        // key which exists only in the candidate, not the current registry.
+        return Ok(None);
     }
-    let projected = super::ModelRef::from(format!("{prefix}.{reference}"));
-    registry
-        .models
-        .get(&projected)
-        .is_some_and(|model| model.capability() == capability)
-        .then(|| projected.to_string())
+    let projected = config.capability_model_ref_in_registry(current, reference, capability)?;
+    Ok((projected.as_str() != reference).then(|| projected.to_string()))
 }
 
 impl super::ProviderConnection {

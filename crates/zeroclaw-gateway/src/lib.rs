@@ -1683,9 +1683,7 @@ pub async fn run_gateway_with_plugin_webhooks(
                 &config.web_fetch,
                 &config.data_dir,
                 &config.agents,
-                config
-                    .model_provider_for_agent(agent_alias)
-                    .and_then(|e| e.api_key.as_deref()),
+                config.agent_model_api_key(agent_alias).as_deref(),
                 &config,
                 Some(canvas_store.clone()),
                 false,
@@ -1834,9 +1832,7 @@ pub async fn run_gateway_with_plugin_webhooks(
             &config.web_fetch,
             &config.data_dir,
             &config.agents,
-            config
-                .model_provider_for_agent(&alias)
-                .and_then(|e| e.api_key.as_deref()),
+            config.agent_model_api_key(&alias).as_deref(),
             &config,
             Some(canvas_store.clone()),
             false,

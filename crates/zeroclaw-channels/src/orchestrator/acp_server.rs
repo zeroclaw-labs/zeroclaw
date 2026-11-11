@@ -952,8 +952,8 @@ impl AcpServer {
                     .map(|a| a.model_provider.to_string())
                     .unwrap_or_default();
                 let model = config
-                    .model_provider_for_agent(&agent_alias)
-                    .and_then(|mp| mp.model.clone())
+                    .agent(&agent_alias)
+                    .and_then(|agent| config.resolve_model_id(agent.model_provider.as_str()))
                     .unwrap_or_default();
                 // `anyhow::Error::to_string()` only renders the outer context,
                 // which hid actionable provider failures (for example, an API
@@ -1070,8 +1070,8 @@ impl AcpServer {
                         .map(|a| a.model_provider.to_string())
                         .unwrap_or_default(),
                     model: config
-                        .model_provider_for_agent(&agent_alias)
-                        .and_then(|mp| mp.model.clone())
+                        .agent(&agent_alias)
+                        .and_then(|agent| config.resolve_model_id(agent.model_provider.as_str()))
                         .unwrap_or_default(),
                     workspace_dir: workspace_dir.clone(),
                 })),
@@ -1083,8 +1083,8 @@ impl AcpServer {
             .map(|a| a.model_provider.to_string())
             .unwrap_or_default();
         let model_name = config
-            .model_provider_for_agent(&agent_alias)
-            .and_then(|mp| mp.model.clone())
+            .agent(&agent_alias)
+            .and_then(|agent| config.resolve_model_id(agent.model_provider.as_str()))
             .unwrap_or_default();
         ::zeroclaw_log::record!(
             INFO,
@@ -1388,8 +1388,8 @@ impl AcpServer {
                         .map(|a| a.model_provider.to_string())
                         .unwrap_or_default(),
                     model: config
-                        .model_provider_for_agent(&restore_alias)
-                        .and_then(|mp| mp.model.clone())
+                        .agent(&restore_alias)
+                        .and_then(|agent| config.resolve_model_id(agent.model_provider.as_str()))
                         .unwrap_or_default(),
                     workspace_dir: workspace_dir.to_string_lossy().into_owned(),
                 })),
@@ -1435,8 +1435,8 @@ impl AcpServer {
             .map(|a| a.model_provider.to_string())
             .unwrap_or_default();
         let model_name = config
-            .model_provider_for_agent(&restore_alias)
-            .and_then(|mp| mp.model.clone())
+            .agent(&restore_alias)
+            .and_then(|agent| config.resolve_model_id(agent.model_provider.as_str()))
             .unwrap_or_default();
         ::zeroclaw_log::record!(
             INFO,
@@ -1687,8 +1687,8 @@ impl AcpServer {
                         .map(|a| a.model_provider.to_string())
                         .unwrap_or_default(),
                     model: config
-                        .model_provider_for_agent(&restore_alias)
-                        .and_then(|mp| mp.model.clone())
+                        .agent(&restore_alias)
+                        .and_then(|agent| config.resolve_model_id(agent.model_provider.as_str()))
                         .unwrap_or_default(),
                     workspace_dir: workspace_dir.to_string_lossy().into_owned(),
                 })),
@@ -1706,8 +1706,8 @@ impl AcpServer {
             .map(|a| a.model_provider.to_string())
             .unwrap_or_default();
         let model_name = config
-            .model_provider_for_agent(&restore_alias)
-            .and_then(|mp| mp.model.clone())
+            .agent(&restore_alias)
+            .and_then(|agent| config.resolve_model_id(agent.model_provider.as_str()))
             .unwrap_or_default();
 
         // Replay the durable TodoWrite plan so the resuming client's tracker

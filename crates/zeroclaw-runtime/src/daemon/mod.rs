@@ -2423,16 +2423,6 @@ async fn retry_heartbeat_mcp_registry(
     Ok(())
 }
 
-/// The sampling temperature a heartbeat turn sends: the agent's configured
-/// provider temperature, or none, so the provider's own default applies.
-/// Never a fixed value: some models reject any temperature, and the
-/// heartbeat's turns must work wherever the agent's own turns do.
-fn heartbeat_temperature(config: &Config, agent_alias: &str) -> Option<f64> {
-    config
-        .model_provider_for_agent(agent_alias)
-        .and_then(|e| e.temperature)
-}
-
 /// Phase 1 of a two-phase tick: ask the agent which of `tasks` to run. Returns
 /// the turn itself rather than wrapping it in another `async fn`, as
 /// [`crate::agent::run`] does, so the caller's `Send` future stays shallow.
@@ -2453,7 +2443,8 @@ fn heartbeat_decision_turn<'a>(
         Some(decision_prompt),
         None,
         None,
-        heartbeat_temperature(config, agent_alias),
+        // Inherit sampling from each selected route/fallback model.
+        None,
         vec![],
         false,
         None,
@@ -2703,13 +2694,12 @@ async fn run_heartbeat_worker(
             None
         };
 
+        let heartbeat_api_key = config.agent_model_api_key(&agent_alias);
         let heartbeat_memory: Option<Arc<dyn zeroclaw_memory::Memory>> =
             zeroclaw_memory::create_memory_for_agent(
                 &config,
                 &agent_alias,
-                config
-                    .model_provider_for_agent(&agent_alias)
-                    .and_then(|e| e.api_key.as_deref()),
+                heartbeat_api_key.as_deref(),
             )
             .await
             .ok();
@@ -2727,14 +2717,14 @@ async fn run_heartbeat_worker(
                 Some(sc) => format!("{sc}\n\n{task_prompt}"),
                 None => task_prompt,
             };
-            let temp = heartbeat_temperature(&config, &agent_alias);
             let phase2_fut = Box::pin(crate::agent::run(
                 config.clone(),
                 &agent_alias,
                 Some(prompt),
                 None,
                 None,
-                temp,
+                // Keep configured sampling as a model default, not an invocation override.
+                None,
                 vec![],
                 false,
                 None,
@@ -3756,10 +3746,9 @@ mod tests {
         assert!(!config.data_dir.join("HEARTBEAT.md").exists());
     }
 
-    /// Phase 1's decision turn sends the agent's configured temperature, or
-    /// none when it is unset, never a fixed value a model may reject. Drives
-    /// the real decision turn against a local Messages API for
-    /// `claude-opus-5-5` and reads the request body it received.
+    /// Phase 1 inherits canonical model sampling, including preset inheritance,
+    /// overrides and explicit omission. Drives the real decision turn against
+    /// a local Messages API and reads the request body it received.
     #[tokio::test]
     async fn heartbeat_decision_turn_sends_only_the_configured_temperature() {
         use crate::heartbeat::engine::{HeartbeatTask, TaskPriority, TaskStatus};
@@ -3795,18 +3784,38 @@ mod tests {
             priority: TaskPriority::Medium,
             status: TaskStatus::Active,
         }];
-        for configured in [None, Some(0.25)] {
+        for (preset, options, expected) in [
+            (serde_json::json!({}), serde_json::json!({}), None),
+            (
+                serde_json::json!({"temperature":0.8}),
+                serde_json::json!({}),
+                Some(0.8),
+            ),
+            (
+                serde_json::json!({"temperature":0.8}),
+                serde_json::json!({"temperature":0.25}),
+                Some(0.25),
+            ),
+            (
+                serde_json::json!({"temperature":0.8}),
+                serde_json::json!({"temperature":"null"}),
+                None,
+            ),
+        ] {
             let tmp = TempDir::new().unwrap();
             let mut config = test_config(&tmp);
-            let provider = config
-                .providers
-                .models
-                .ensure("anthropic", "heartbeat")
-                .expect("anthropic provider slot");
-            provider.api_key = Some("sk-ant-fixture".to_string());
-            provider.model = Some("claude-opus-5-5".to_string());
-            provider.uri = Some(format!("http://{addr}"));
-            provider.temperature = configured;
+            config.providers = serde_json::from_value(serde_json::json!({
+                "connections":{"heartbeat.connection":{
+                    "kind":"anthropic", "uri":format!("http://{addr}"),
+                    "auth":{"mode":"api_key", "api_key":"sk-ant-fixture"}
+                }},
+                "model_presets":{"heartbeat.defaults":{"capability":"chat", "options":preset}},
+                "models":{"chat.heartbeat":{
+                    "capability":"chat", "provider":"heartbeat.connection", "model":"claude-opus-5-5",
+                    "preset":"heartbeat.defaults", "options":options
+                }}
+            }))
+            .unwrap();
             config.memory.backend = "none".to_string();
             config.memory.auto_save = false;
             config.risk_profiles.insert(
@@ -3819,7 +3828,7 @@ mod tests {
             config.agents.insert(
                 "ops".to_string(),
                 AliasedAgentConfig {
-                    model_provider: "anthropic.heartbeat".into(),
+                    model_provider: "chat.heartbeat".into(),
                     risk_profile: "heartbeat-profile".into(),
                     ..Default::default()
                 },
@@ -3842,9 +3851,8 @@ mod tests {
             assert_eq!(body["model"], "claude-opus-5-5");
             assert_eq!(
                 body.get("temperature").cloned(),
-                configured.map(|t| serde_json::json!(t)),
-                "the decision turn must send the configured temperature ({configured:?}), \
-                 and none when unset: {body}"
+                expected.map(|t| serde_json::json!(t)),
+                "the decision turn must inherit model sampling ({expected:?}): {body}"
             );
         }
         server.abort();

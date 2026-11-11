@@ -19,6 +19,11 @@ secret encryption lifecycle. A stale editor must reload before saving.
 
 Saving promotes historical provider input into the canonical registries and
 retires the old provider tables, so deleted models cannot reappear on reload.
+Legacy-only configurations use the same projected model lists in Quickstart,
+agent settings, and model pickers. When historical chat, TTS, and ASR aliases
+coincide, the config boundary resolves the speech bindings to their projected
+capability keys before promotion. Explicit canonical keys remain authoritative;
+a capability mismatch is rejected rather than redirected to another model.
 Environment overrides retain their original values for persistence across this
 promotion; environment credentials are never written to the configuration file.
 Because a registry replacement
@@ -26,6 +31,18 @@ can add, update, and remove entries, a scoped principal needs Config create,
 update, and delete grants with write access to `providers`. Dashboard saves use
 the normal configuration application/reload flow; RPC saves also prepare and
 publish updated providers for active sessions before committing the generation.
+
+V3 → V4 migration converts route-owned model IDs and credentials into ordinary
+model and connection definitions, leaving each route as `hint` → `model_ref`.
+The same conversion accepts V4 files produced before this route shape changed.
+In-memory loading and `zeroclaw config migrate` use the same conversion; loading
+alone does not rewrite the file. Routes already using `model_ref` are preserved.
+
+For Gemini OAuth, `zeroclaw auth login --model-provider gemini --profile <key>`
+reads `auth.client_id` and `auth.client_secret` from the selected Gemini
+connection (`auth.mode = "oauth"`). The key can name that connection directly
+or a configured model using it. Historical Gemini alias input is decoded by
+the config boundary; the login and token refresh flows share this resolver.
 
 ## Canonical connections and models
 
