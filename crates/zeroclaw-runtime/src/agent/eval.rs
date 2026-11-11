@@ -424,13 +424,10 @@ model = "cloud-model"
             ModelRouteConfig {
                 hint: "local".into(),
                 model_ref: "custom.local.edge.small".into(),
-                ..Default::default()
             },
             ModelRouteConfig {
                 hint: "cloud".into(),
                 model_ref: "custom.cloud".into(),
-
-                ..Default::default()
             },
         ];
         let mut policy = EffortRoutingConfig {

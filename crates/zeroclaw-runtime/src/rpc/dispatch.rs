@@ -44782,7 +44782,6 @@ model = "before"
             .push(zeroclaw_config::schema::ModelRouteConfig {
                 hint: "reasoning".into(),
                 model_ref: "openai.route-only".into(),
-                ..Default::default()
             });
         let dispatcher = make_config_set_test_dispatcher(config);
         let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;

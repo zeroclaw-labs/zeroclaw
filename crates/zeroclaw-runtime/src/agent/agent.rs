@@ -6035,12 +6035,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        zeroclaw_config::migration::bind_test_route_model(
-            &mut cfg,
-            &(provider_ref),
-            &(model.to_string()),
-            None,
-        );
+        zeroclaw_config::migration::bind_test_route_model(&mut cfg, &provider_ref, model, None);
         cfg.model_routes = vec![zeroclaw_config::schema::ModelRouteConfig {
             hint: "fast".to_string(),
             model_ref: provider_ref,
@@ -6394,8 +6389,6 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
         config.model_routes = vec![ModelRouteConfig {
             hint: "target".into(),
             model_ref: "custom.target.selected".into(),
-
-            ..Default::default()
         }];
         // The explicit value deliberately equals the primary's default. Its
         // provenance, not numerical equality, determines whether it survives.
@@ -6841,8 +6834,6 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
                 vec![ModelRouteConfig {
                     hint: "large".into(),
                     model_ref: "custom.gw".into(),
-
-                    ..Default::default()
                 }]
             } else {
                 Vec::new()

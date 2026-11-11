@@ -800,10 +800,13 @@ fn unversioned_shape(table: &toml::Table) -> UnversionedShape {
         }
         // A canonical model row also sits directly below `providers.models`,
         // but its `capability` discriminator makes it a model definition, not
-        // a V2 family field or V3 alias map.
+        // a V2 family field or V3 alias map. Partial dotted model rows are
+        // current-layout evidence too; legacy URL family names can contain
+        // dots in their hostname and must remain on the V1 migration path.
         if section.contains_key("capability")
             || (root == "providers.models"
                 && name.contains('.')
+                && !name.contains("://")
                 && section.values().any(|value| !value.is_table()))
         {
             current.get_or_insert_with(|| format!("`[{root}.{name}]` is a canonical model"));

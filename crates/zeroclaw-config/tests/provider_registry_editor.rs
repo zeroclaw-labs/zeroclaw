@@ -100,6 +100,122 @@ fn registry_save_promotes_legacy_embedding_consumers_and_reuses_the_connection()
 }
 
 #[test]
+fn registry_save_preserves_embeddings_on_chat_only_compatible_endpoints() {
+    use zeroclaw_api::capability::Capability;
+
+    let mut config = config();
+    let profile = config
+        .providers
+        .models
+        .ensure("deepseek", "gateway.prod")
+        .unwrap();
+    profile.model = Some("chat-model".into());
+    profile.uri = Some("https://old.example.test/v1".into());
+    profile.api_key = Some("embedding-secret".into());
+    profile
+        .extra_headers
+        .insert("X-Private".into(), "header-secret".into());
+    profile.tls_ca_cert_path = Some("/tmp/test-ca.pem".into());
+    config.memory.embedding_provider = "deepseek.gateway.prod".into();
+    config.memory.embedding_model = "embedding-small".into();
+    config.memory.embedding_dimensions = 1536;
+    config
+        .embedding_routes
+        .push(zeroclaw_config::schema::EmbeddingRouteConfig {
+            hint: "semantic.v1".into(),
+            model_provider: "deepseek.gateway.prod".into(),
+            model: "embedding-large".into(),
+            dimensions: Some(3072),
+            api_key: None,
+        });
+    let expected = snapshot(&config).unwrap();
+    let mut registry = expected.clone();
+    registry["connections"]["legacy.deepseek.gateway.prod"]["uri"] =
+        json!("https://edited.example.test/v1");
+    registry["connections"]["legacy.deepseek.gateway.prod"]["auth"]["api_key"] =
+        json!("edited-secret");
+    // A user-owned connection at the generated name must not be overwritten.
+    registry["connections"]["embedding.legacy.deepseek.gateway.prod"] = json!({
+        "kind": "custom", "uri": "https://other.example.test/v1"
+    });
+    stage(&mut config, RegistryEdit { expected, registry }).unwrap();
+
+    let registry = config.provider_registry().unwrap();
+    let memory = registry
+        .resolve_embedding(&config.memory.embedding_model_ref.as_deref().unwrap().into())
+        .unwrap();
+    let route = registry
+        .resolve_embedding(&config.embedding_routes[0].model_provider.as_str().into())
+        .unwrap();
+    assert_eq!(memory.model, "embedding-small");
+    assert_eq!(memory.dimensions, Some(1536));
+    assert_eq!(route.model, "embedding-large");
+    assert_eq!(route.dimensions, Some(3072));
+    assert_eq!(
+        memory.selection.model.provider(),
+        route.selection.model.provider()
+    );
+    assert_eq!(
+        memory.selection.model.provider().as_str(),
+        "embedding.legacy.deepseek.gateway.prod.2"
+    );
+    let connection = memory.selection.connection;
+    assert_eq!(connection.kind(), "custom");
+    assert_eq!(connection.capabilities().len(), 1);
+    assert!(connection.supports(Capability::Embedding));
+    assert_eq!(connection.uri(), Some("https://edited.example.test/v1"));
+    assert_eq!(connection.api_key(), Some("edited-secret"));
+    assert_eq!(
+        connection.extra_headers().unwrap()["X-Private"],
+        "header-secret"
+    );
+    assert_eq!(connection.tls_ca_cert_path(), Some("/tmp/test-ca.pem"));
+    let chat = &registry.connections["legacy.deepseek.gateway.prod"];
+    assert_eq!(chat.kind(), "deepseek");
+    assert!(!chat.supports(Capability::Embedding));
+    assert_eq!(
+        registry.connections["embedding.legacy.deepseek.gateway.prod"].uri(),
+        Some("https://other.example.test/v1")
+    );
+
+    let before = snapshot(&config).unwrap();
+    stage(
+        &mut config,
+        RegistryEdit {
+            registry: before.clone(),
+            expected: before.clone(),
+        },
+    )
+    .unwrap();
+    assert_eq!(snapshot(&config).unwrap(), before);
+    let reloaded: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+    reloaded.validate().unwrap();
+}
+
+#[test]
+fn registry_save_does_not_bypass_explicitly_disabled_embeddings() {
+    let mut config = config();
+    config.memory.embedding_provider = "openai.legacy.prod".into();
+    config.memory.embedding_model = "embedding-small".into();
+    let expected = snapshot(&config).unwrap();
+    let mut registry = expected.clone();
+    registry["connections"]["legacy.openai.legacy.prod"]["capabilities"] = json!(["chat"]);
+    let error = stage(
+        &mut config,
+        RegistryEdit {
+            expected: expected.clone(),
+            registry,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("does not support embeddings"),
+        "{error}"
+    );
+    assert_eq!(snapshot(&config).unwrap(), expected);
+}
+
+#[test]
 fn registry_save_rejects_deleting_a_legacy_embedding_connection_atomically() {
     let mut config = config();
     config.memory.embedding_provider = "openai.legacy.prod".into();

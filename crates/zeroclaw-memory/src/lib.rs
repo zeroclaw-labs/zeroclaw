@@ -1375,6 +1375,50 @@ mod tests {
     }
 
     #[test]
+    fn registry_save_keeps_chat_only_compatible_embeddings_dispatchable() {
+        use zeroclaw_config::provider_registry::editor::{RegistryEdit, snapshot, stage};
+
+        let mut config = Config::default();
+        let profile = config
+            .providers
+            .models
+            .ensure("deepseek", "gateway.prod")
+            .unwrap();
+        profile.uri = Some("https://embeddings.example.test/v1".into());
+        profile.model = Some("chat-model".into());
+        config.memory.embedding_provider = "deepseek.gateway.prod".into();
+        config.memory.embedding_model = "embedding-small".into();
+        config.memory.embedding_dimensions = 1536;
+        config.embedding_routes.push(EmbeddingRouteConfig {
+            hint: "semantic.v1".into(),
+            model_provider: "deepseek.gateway.prod".into(),
+            model: "embedding-large".into(),
+            dimensions: Some(3072),
+            api_key: None,
+        });
+        let expected = snapshot(&config).unwrap();
+        stage(
+            &mut config,
+            RegistryEdit {
+                registry: expected.clone(),
+                expected,
+            },
+        )
+        .unwrap();
+        let embedder = build_embedder_from_config(&config, None).unwrap();
+        assert_eq!(embedder.name(), "custom");
+        assert_eq!(embedder.identity().model, "embedding-small");
+        assert_eq!(embedder.dimensions(), 1536);
+
+        config.memory.embedding_model_ref = None;
+        config.memory.embedding_model = "hint:semantic.v1".into();
+        let embedder = build_embedder_from_config(&config, None).unwrap();
+        assert_eq!(embedder.name(), "custom");
+        assert_eq!(embedder.identity().model, "embedding-large");
+        assert_eq!(embedder.dimensions(), 3072);
+    }
+
+    #[test]
     fn factory_sqlite() {
         let tmp = TempDir::new().unwrap();
         let cfg = MemoryConfig {

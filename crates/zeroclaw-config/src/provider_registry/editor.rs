@@ -121,13 +121,68 @@ pub fn stage(config: &mut Config, edit: RegistryEdit) -> Result<()> {
 }
 
 /// Materialize legacy embedding consumers before retiring their profiles.
-/// The generated model owns its upstream ID/dimensions and reuses the edited
-/// connection; no second transport snapshot or legacy table is retained.
+/// The generated model owns its upstream ID/dimensions. Native embedding
+/// connections are reused; chat-only kinds with an explicit compatible endpoint
+/// need a separate custom connection to retain their legacy embedding protocol.
 fn promote_embedding_bindings(
     config: &mut Config,
     current: &super::ProviderRegistry,
     candidate: &mut super::ProviderRegistry,
 ) -> Result<()> {
+    fn embedding_connection(
+        candidate: &mut super::ProviderRegistry,
+        provider: &super::ProviderId,
+    ) -> Result<super::ProviderId> {
+        use zeroclaw_api::capability::Capability;
+
+        let connection = candidate
+            .connections
+            .get(provider)
+            .context("cannot delete a connection used by legacy embeddings")?;
+        if connection
+            .implemented_capabilities()
+            .contains(&Capability::Embedding)
+        {
+            ensure!(
+                connection.supports(Capability::Embedding),
+                "legacy embedding connection does not support embeddings"
+            );
+            return Ok(provider.clone());
+        }
+        // The legacy embedder used any explicit profile URI as an OpenAI
+        // compatible embedding endpoint, independently of the chat driver.
+        // Preserve that protocol without broadening the native driver's
+        // capabilities. The edited connection is the sole migration input.
+        let uri = connection
+            .uri()
+            .map(str::trim)
+            .filter(|uri| !uri.is_empty())
+            .context("legacy embeddings on a chat-only connection require an explicit URI")?;
+        let promoted = super::ProviderConnection::Custom(super::CompatibleConnection {
+            capabilities: [Capability::Embedding].into_iter().collect(),
+            uri: Some(uri.to_owned()),
+            auth: Some(super::ApiKeyAuth::ApiKey {
+                api_key: connection.api_key().map(str::to_owned),
+            }),
+            extra_headers: connection.extra_headers().cloned().unwrap_or_default(),
+            tls_ca_cert_path: connection.tls_ca_cert_path().map(str::to_owned),
+            api: Default::default(),
+        });
+        let definition = serde_json::to_value(&promoted)?;
+        let base = format!("embedding.{provider}");
+        let mut id = super::ProviderId::from(base.as_str());
+        let mut suffix = 2;
+        while let Some(existing) = candidate.connections.get(&id) {
+            if serde_json::to_value(existing)? == definition {
+                return Ok(id);
+            }
+            id = format!("{base}.{suffix}").into();
+            suffix += 1;
+        }
+        candidate.connections.insert(id.clone(), promoted);
+        Ok(id)
+    }
+
     fn promote(
         profiles: &crate::providers::ModelProviders,
         current: &super::ProviderRegistry,
@@ -149,14 +204,7 @@ fn promote_embedding_bindings(
         if source.capability() != zeroclaw_api::capability::Capability::Chat {
             return Ok(None);
         }
-        let connection = candidate
-            .connections
-            .get(source.provider())
-            .context("cannot delete a connection used by legacy embeddings")?;
-        ensure!(
-            connection.supports(zeroclaw_api::capability::Capability::Embedding),
-            "legacy embedding connection does not support embeddings"
-        );
+        let provider = embedding_connection(candidate, source.provider())?;
         ensure!(
             !model.trim().is_empty() && dimensions > 0,
             "legacy embedding model and dimensions must be configured"
@@ -170,7 +218,7 @@ fn promote_embedding_bindings(
         candidate.models.insert(
             name.clone(),
             super::ModelDefinition::Embedding(super::EmbeddingModelConfig {
-                provider: source.provider().clone(),
+                provider,
                 model: model.trim().to_owned(),
                 metadata: super::EmbeddingMetadata {
                     dimensions: Some(dimensions),
