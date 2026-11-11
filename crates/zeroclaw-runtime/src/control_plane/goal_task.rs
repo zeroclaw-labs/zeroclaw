@@ -370,7 +370,12 @@ pub trait GoalTaskRegistry: Send + Sync {
     ) -> anyhow::Result<GoalTransitionResult>;
 
     /// Complete a lifecycle transition only for the exact running or paused
-    /// Goal epoch. Terminal state remains owned by the task record.
+    /// Goal epoch. Terminal state remains owned by the task record. This method
+    /// does not inspect or clear the pending-operation slot; callers must
+    /// settle that slot before finishing. If an executor disappears with the
+    /// slot still reserved, the Goal remains fenced for the rest of that daemon
+    /// boot because there is no same-boot reaper. Startup recovery classifies
+    /// the reservation on a later daemon boot.
     async fn finish_session_goal(
         &self,
         task_id: &str,
@@ -382,8 +387,11 @@ pub trait GoalTaskRegistry: Send + Sync {
 
     /// Reserve the one durable pending-operation slot for the exact running
     /// Goal epoch. This is an execution fence, not a usage reservation.
-    /// Callers must settle the exact slot on every local completion path; an
-    /// unsettled slot remains fenced until recovery classifies it.
+    /// `pending_call_id` must be unique across all currently occupied Goal
+    /// slots. Callers must settle the exact slot on every local completion
+    /// path. If an executor disappears before settlement, the slot remains
+    /// fenced for the rest of that daemon boot; recovery classifies it during
+    /// a later daemon's startup. There is no same-boot reaper.
     async fn admit_pending_operation(
         &self,
         task_id: &str,
