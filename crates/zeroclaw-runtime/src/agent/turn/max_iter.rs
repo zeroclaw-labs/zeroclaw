@@ -37,12 +37,14 @@ impl CompletionLimit {
     /// The iteration-cap stop, shared by the `ErrorAtCap` exit and the
     /// graceful-summary failure paths so all of them carry one code and one message.
     fn stop(self) -> TurnStop {
-        let code = if matches!(self, Self::LoopDetected) {
-            TurnStopCode::LoopDetector
-        } else {
-            TurnStopCode::MaxIterations
-        };
-        TurnStop::close_out(code, self.explanation())
+        TurnStop::close_out(self.code(), self.explanation())
+    }
+
+    fn code(self) -> TurnStopCode {
+        match self {
+            Self::LoopDetected => TurnStopCode::LoopDetector,
+            Self::LocalIterations(_) | Self::ExecutionTree => TurnStopCode::MaxIterations,
+        }
     }
 }
 
@@ -436,7 +438,7 @@ pub(crate) async fn finish_after_max_iterations(
         }
         SummaryCall::TimedOut(step_secs) => {
             return Err(TurnStop::close_out(
-                TurnStopCode::MaxIterations,
+                limit.code(),
                 format!("Final summary LLM call timed out after {step_secs}s (step_timeout_secs)"),
             )
             .into());
@@ -574,10 +576,12 @@ mod graceful_summary_metering_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
     use zeroclaw_api::model_provider::{
         ChatRequest, ChatResponse, ProviderCapabilities, SemanticEmptyTerminalCompletion,
     };
+    use zeroclaw_api::turn_stop::TurnStopCode;
     use zeroclaw_config::schema::{
         CostConfig, MultimodalConfig, PacingConfig, ResolvedContextLimits,
     };
@@ -589,6 +593,7 @@ mod graceful_summary_metering_tests {
     /// Provider stub that counts calls and returns a summary WITH token usage.
     struct CountingUsageProvider {
         calls: Arc<AtomicUsize>,
+        delay: Duration,
     }
 
     #[async_trait]
@@ -614,6 +619,9 @@ mod graceful_summary_metering_tests {
                 "closeout must never dispatch tools"
             );
             self.calls.fetch_add(1, Ordering::SeqCst);
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
             Ok(ChatResponse {
                 text: Some("wrap-up summary".to_string()),
                 tool_calls: Vec::new(),
@@ -682,6 +690,7 @@ mod graceful_summary_metering_tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let provider = CountingUsageProvider {
             calls: Arc::clone(&calls),
+            delay: Duration::ZERO,
         };
         let result = run_summary_with_limit(
             &provider,
@@ -689,12 +698,39 @@ mod graceful_summary_metering_tests {
             None,
             None,
             CompletionLimit::LoopDetected,
+            None,
         )
         .await
         .expect("loop closes out gracefully");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(result.contains("wrap-up summary"));
         assert!(result.contains(&crate::i18n::get_required_cli_string("turn-loop-detected")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn summary_timeout_preserves_the_selected_stop_code() {
+        for (limit, expected) in [
+            (CompletionLimit::LoopDetected, TurnStopCode::LoopDetector),
+            (
+                CompletionLimit::LocalIterations(2),
+                TurnStopCode::MaxIterations,
+            ),
+            (CompletionLimit::ExecutionTree, TurnStopCode::MaxIterations),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let provider = CountingUsageProvider {
+                calls: Arc::clone(&calls),
+                delay: Duration::from_secs(2),
+            };
+            let error =
+                run_summary_with_limit(&provider, String::new(), None, None, limit, Some(1))
+                    .await
+                    .expect_err("summary should time out");
+            let stop = zeroclaw_api::turn_stop::turn_stop(&error).expect("typed turn stop");
+            assert_eq!(stop.code, expected);
+            assert!(error.to_string().contains("timed out after 1s"));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
     }
 
     async fn run_summary_with_events(
@@ -709,6 +745,7 @@ mod graceful_summary_metering_tests {
             event_tx,
             on_delta,
             CompletionLimit::LocalIterations(2),
+            None,
         )
         .await
     }
@@ -719,9 +756,13 @@ mod graceful_summary_metering_tests {
         event_tx: Option<&Sender<TurnEvent>>,
         on_delta: Option<&Sender<StreamDelta>>,
         limit: CompletionLimit,
+        step_timeout_secs: Option<u64>,
     ) -> anyhow::Result<String> {
         let mut history = vec![ChatMessage::user("do the work")];
-        let pacing = PacingConfig::default();
+        let pacing = PacingConfig {
+            step_timeout_secs,
+            ..PacingConfig::default()
+        };
         let knobs = LoopKnobs::default(); // GracefulSummary
         let multimodal_config = MultimodalConfig::default();
         finish_after_max_iterations(
@@ -768,6 +809,7 @@ mod graceful_summary_metering_tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let provider = CountingUsageProvider {
             calls: Arc::clone(&calls),
+            delay: Duration::ZERO,
         };
         let ctx = ToolLoopCostTrackingContext::usage_only();
         let turn_usage = Arc::clone(&ctx.turn_usage);
@@ -800,6 +842,7 @@ mod graceful_summary_metering_tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let provider = CountingUsageProvider {
             calls: Arc::clone(&calls),
+            delay: Duration::ZERO,
         };
         let ctx = ToolLoopCostTrackingContext::usage_only();
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
@@ -881,6 +924,7 @@ mod graceful_summary_metering_tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let provider = CountingUsageProvider {
             calls: Arc::clone(&calls),
+            delay: Duration::ZERO,
         };
         let tmp = tempfile::TempDir::new().unwrap();
         let cfg = CostConfig {
