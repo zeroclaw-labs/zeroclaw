@@ -7595,6 +7595,134 @@ mod sop_step_reassembly_tests {
         );
     }
 
+    /// A config with a step agent `stepper` whose profile allows the scheduler
+    /// tool `cron_add` and `file_read`, so a ceiling naming both is satisfiable
+    /// and the step agent holds the tool whose stored list is observed.
+    fn scheduler_step_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
+        use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, ModelProviderConfig, OllamaModelProviderConfig,
+            RiskProfileConfig,
+        };
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).expect("data dir");
+        config.risk_profiles.insert(
+            "stepper".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["cron_add".to_string(), "file_read".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.providers.models.ollama.insert(
+            "p".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("test-model".to_string()),
+                    ..ModelProviderConfig::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        config.agents.insert(
+            "stepper".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "ollama.p".into(),
+                risk_profile: "stepper".into(),
+                memory: AgentMemoryConfig {
+                    backend: MemoryBackendKind::Markdown,
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config
+    }
+
+    /// Store an agent job through the step registry's own `cron_add`, with NO
+    /// `allowed_tools`, and return the tool list the job was stored with.
+    ///
+    /// An unset list under a ceiling is stored as the ceiling itself
+    /// (`caller_ceiling::cap_stored_allowed_tools`), so this reads back the
+    /// ceiling VALUE the step agent's scheduler tool holds; with no ceiling the
+    /// list stays unset.
+    async fn step_cron_add_stored_tools(
+        config: &zeroclaw_config::schema::Config,
+        owned: &OwnedAgentExecution,
+    ) -> Option<Vec<String>> {
+        let stored = run_step_tool(
+            owned,
+            "cron_add",
+            serde_json::json!({
+                "job_type": "agent",
+                "prompt": "report back",
+                "schedule": { "kind": "every", "every_ms": 3_600_000 },
+                "approved": true,
+            }),
+        )
+        .await;
+        assert!(stored.success, "the step agent stores the job: {stored:?}");
+        let jobs = crate::cron::list_jobs_by_agent(config, "stepper").expect("list jobs");
+        assert_eq!(jobs.len(), 1, "one job stored by the step agent: {jobs:?}");
+        jobs[0].allowed_tools.clone()
+    }
+
+    /// The ceiling handed to a step agent reaches its scheduler tools as a
+    /// VALUE: a job the step agent stores without `allowed_tools` carries the
+    /// caller's ceiling, not the step agent's own registry. Membership in the
+    /// ceiling alone (which tools the step is offered) does not show this, and
+    /// a job outlives the step.
+    #[tokio::test]
+    async fn assembling_a_step_agent_hands_its_scheduler_tools_the_callers_ceiling_value() {
+        let engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+            zeroclaw_config::schema::SopConfig::default(),
+        )));
+        let ceiling = vec!["file_read".to_string(), "cron_add".to_string()];
+
+        let tmp_control = tempfile::TempDir::new().expect("tempdir");
+        let control_config = scheduler_step_config(&tmp_control);
+        let unbounded = assemble_owned_execution(
+            &control_config,
+            None,
+            "stepper",
+            Arc::clone(&engine),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("unbounded step agent assembles");
+        assert_eq!(
+            step_cron_add_stored_tools(&control_config, &unbounded).await,
+            None,
+            "control: with no ceiling the stored list stays unset"
+        );
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let config = scheduler_step_config(&tmp);
+        let bounded = assemble_owned_execution(
+            &config,
+            None,
+            "stepper",
+            Arc::clone(&engine),
+            None,
+            None,
+            None,
+            Some(ceiling.as_slice()),
+        )
+        .await
+        .expect("bounded step agent assembles");
+        assert_eq!(
+            step_cron_add_stored_tools(&config, &bounded).await,
+            Some(ceiling),
+            "the step agent's scheduler tool stores the caller's ceiling"
+        );
+    }
+
     /// A config with a step agent `stepper` on SQLite memory whose policy
     /// admits the memory tools, as a cross-agent SOP step names it.
     fn memory_step_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
@@ -9521,6 +9649,81 @@ mod sop_step_reassembly_tests {
                 .unwrap()
                 .is_some(),
             "the bound step writes the owner's plane for the step agent"
+        );
+    }
+
+    /// Drive one cross-agent step through the real driver with `caller_allowed`
+    /// on the handle (bound to `capabilities` when given) and return the tool
+    /// list the re-assembled step agent's `cron_add` stores for an unrestricted
+    /// job. The step's model call fails; assembly and caching have already run.
+    async fn driven_step_cron_add_stored_tools(
+        caller_allowed: &[String],
+        capabilities: Option<&crate::composition::BoundCapabilities>,
+    ) -> Option<Vec<String>> {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let config = scheduler_step_config(&tmp);
+        let (engine, _run_id, action) = start_single_cross_agent_step("stepper");
+        let handle = SopStepReassembly {
+            caller_allowed: Some(caller_allowed),
+            config: &config,
+            capabilities,
+            live_config: None,
+            memory_owner: None,
+        };
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        let mut history = vec![ChatMessage::system("parent system prompt")];
+        let mut exec_cache = std::collections::HashMap::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            drive_step(
+                Arc::clone(&engine),
+                action,
+                &TextProvider,
+                &parent_tools,
+                &crate::observability::NoopObserver {},
+                &mut history,
+                None,
+                None,
+                None,
+                Some("outer"),
+                Some(handle),
+                None,
+                &mut exec_cache,
+            ),
+        )
+        .await
+        .expect("the driver settles");
+        let owned = exec_cache
+            .get("stepper")
+            .expect("the driver re-assembled the step agent");
+        step_cron_add_stored_tools(&config, owned).await
+    }
+
+    /// Through the real driver, a turn with NO supplied capabilities hands the
+    /// handle's `caller_allowed` on to the step agent it re-assembles: the job
+    /// that agent's `cron_add` stores carries the ceiling.
+    #[tokio::test]
+    async fn the_driver_hands_an_unbound_steps_scheduler_tools_the_callers_ceiling() {
+        let ceiling = vec!["file_read".to_string(), "cron_add".to_string()];
+        assert_eq!(
+            driven_step_cron_add_stored_tools(&ceiling, None).await,
+            Some(ceiling),
+            "the unbound arm must pass the caller's ceiling to the step assembly"
+        );
+    }
+
+    /// The same through the bound-capabilities arm.
+    #[tokio::test]
+    async fn the_driver_hands_a_bound_steps_scheduler_tools_the_callers_ceiling() {
+        let ceiling = vec!["file_read".to_string(), "cron_add".to_string()];
+        let bound = crate::composition::BoundCapabilities {
+            capabilities: crate::composition::RuntimeCapabilities::config_backed_unobserved(),
+            principal: None,
+        };
+        assert_eq!(
+            driven_step_cron_add_stored_tools(&ceiling, Some(&bound)).await,
+            Some(ceiling),
+            "the bound arm must pass the caller's ceiling to the step assembly"
         );
     }
 
