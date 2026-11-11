@@ -1133,9 +1133,194 @@ impl Providers {
     pub fn canonical_registry(
         &self,
     ) -> Result<ProviderRegistry, super::provider_registry::RegistryError> {
+        // Compatibility is confined to this config read boundary. Consumers
+        // receive one exact-key registry and never parse family/profile refs.
+        let mut connections = self.connections.clone();
+        let mut models = self.models.canonical_models.clone();
+        let legacy = serde_json::to_value(&self.models).map_err(|error| {
+            super::provider_registry::RegistryError::new(["providers", "models"], error.to_string())
+        })?;
+        for (family, alias, profile) in self.models.iter_entries() {
+            let profile_ref = format!("{family}.{alias}");
+            let mut raw = legacy[family][alias].clone();
+            if profile.uri.is_none()
+                && family != "qwen"
+                && let Some(uri) = self.models.resolved_endpoint_uri(family, alias)
+            {
+                raw["uri"] = serde_json::Value::String(uri.to_string());
+            }
+            let selected = profile.models.get("default").or_else(|| {
+                (profile.models.len() == 1)
+                    .then(|| profile.models.values().next())
+                    .flatten()
+            });
+            let entries = std::iter::once((profile_ref.clone(), selected)).chain(
+                profile
+                    .models
+                    .iter()
+                    .map(|(name, entry)| (format!("{profile_ref}.{name}"), Some(entry))),
+            );
+            for (reference, entry) in entries {
+                let model_ref = ModelRef::from(reference.as_str());
+                if models.contains_key(&model_ref) {
+                    continue;
+                }
+                let (connection, mut model) = crate::migration::legacy_chat_definition(
+                    &raw, family, entry, None,
+                )
+                .map_err(|error| {
+                    super::provider_registry::RegistryError::new(
+                        ["providers", "models", reference.as_str()],
+                        error.to_string(),
+                    )
+                })?;
+                let provider_id = ProviderId::from(format!("legacy.{profile_ref}"));
+                if self.connections.contains_key(&provider_id) {
+                    return Err(super::provider_registry::RegistryError::new(
+                        ["providers", "connections", provider_id.as_str()],
+                        "legacy connection name conflicts with an explicit connection",
+                    ));
+                }
+                let connection = serde_json::from_value(connection).map_err(|error| {
+                    super::provider_registry::RegistryError::new(
+                        ["providers", "models", reference.as_str()],
+                        error.to_string(),
+                    )
+                })?;
+                connections.entry(provider_id.clone()).or_insert(connection);
+                model["provider"] = serde_json::Value::String(provider_id.to_string());
+                models.insert(
+                    model_ref,
+                    serde_json::from_value(model).map_err(|error| {
+                        super::provider_registry::RegistryError::new(
+                            ["providers", "models", reference.as_str()],
+                            error.to_string(),
+                        )
+                    })?,
+                );
+            }
+        }
+
+        // Project the remaining typed compatibility tables into the same
+        // exact-key registry. This keeps TTS/ASR consumers independent from
+        // their retired family maps while preserving their legacy defaults.
+        for (family, alias, base) in self.tts.iter_entries() {
+            let reference = ModelRef::from(format!("tts.{family}.{alias}"));
+            if models.contains_key(&reference) {
+                continue;
+            }
+            let provider_id = ProviderId::from(format!("legacy.tts.{family}.{alias}"));
+            let mut connection = serde_json::json!({"kind": family});
+            if let Some(uri) = base.uri.as_deref() {
+                connection["uri"] = serde_json::Value::String(uri.to_owned());
+            }
+            if let Some(api_key) = base.api_key.as_deref() {
+                connection["auth"] = serde_json::json!({"mode":"api_key","api_key":api_key});
+            }
+            let mut options = serde_json::Map::new();
+            for (field, value) in [
+                ("voice", base.voice.clone().map(serde_json::Value::String)),
+                ("speed", base.speed.map(serde_json::Value::from)),
+                ("stability", base.stability.map(serde_json::Value::from)),
+                (
+                    "similarity_boost",
+                    base.similarity_boost.map(serde_json::Value::from),
+                ),
+                (
+                    "language",
+                    base.language_code.clone().map(serde_json::Value::String),
+                ),
+                (
+                    "format",
+                    base.response_format.clone().map(serde_json::Value::String),
+                ),
+            ] {
+                if let Some(value) = value {
+                    options.insert(field.to_owned(), value);
+                }
+            }
+            let mut model = serde_json::json!({
+                "capability": "tts",
+                "provider": provider_id.as_str(),
+                "options": options,
+            });
+            if let Some(model_id) = base.model.as_deref() {
+                model["model"] = serde_json::Value::String(model_id.to_owned());
+            }
+            connections.insert(
+                provider_id.clone(),
+                serde_json::from_value(connection).map_err(|error| {
+                    super::provider_registry::RegistryError::new(
+                        ["providers", "tts", family, alias],
+                        error.to_string(),
+                    )
+                })?,
+            );
+            models.insert(
+                reference,
+                serde_json::from_value(model).map_err(|error| {
+                    super::provider_registry::RegistryError::new(
+                        ["providers", "tts", family, alias],
+                        error.to_string(),
+                    )
+                })?,
+            );
+        }
+        for (family, alias, entry) in self.transcription.iter_entries() {
+            let reference = ModelRef::from(format!("asr.{family}.{alias}"));
+            if models.contains_key(&reference) {
+                continue;
+            }
+            let raw = match entry {
+                TranscriptionProviderEntry::Groq(value) => serde_json::to_value(value),
+                TranscriptionProviderEntry::OpenAi(value) => serde_json::to_value(value),
+                TranscriptionProviderEntry::Deepgram(value) => serde_json::to_value(value),
+                TranscriptionProviderEntry::AssemblyAi(value) => serde_json::to_value(value),
+                TranscriptionProviderEntry::Google(value) => serde_json::to_value(value),
+                TranscriptionProviderEntry::LocalWhisper(value) => serde_json::to_value(value),
+            }
+            .map_err(|error| {
+                super::provider_registry::RegistryError::new(
+                    ["providers", "transcription", family, alias],
+                    error.to_string(),
+                )
+            })?;
+            let provider_id = ProviderId::from(format!("legacy.asr.{family}.{alias}"));
+            let kind = if family == "openai" { "openai" } else { family };
+            let mut connection = serde_json::json!({"kind": kind});
+            if let Some(uri) = raw.get("uri").and_then(serde_json::Value::as_str) {
+                connection["uri"] = serde_json::Value::String(uri.to_owned());
+            }
+            if let Some(api_key) = raw.get("api_key").and_then(serde_json::Value::as_str) {
+                connection["auth"] = serde_json::json!({"mode":"api_key","api_key":api_key});
+            }
+            let model_id = raw
+                .get("model")
+                .cloned()
+                .unwrap_or_else(|| serde_json::Value::String("whisper-1".into()));
+            let model = serde_json::json!({"capability":"asr","provider":provider_id.as_str(),"model":model_id});
+            connections.insert(
+                provider_id.clone(),
+                serde_json::from_value(connection).map_err(|error| {
+                    super::provider_registry::RegistryError::new(
+                        ["providers", "transcription", family, alias],
+                        error.to_string(),
+                    )
+                })?,
+            );
+            models.insert(
+                reference,
+                serde_json::from_value(model).map_err(|error| {
+                    super::provider_registry::RegistryError::new(
+                        ["providers", "transcription", family, alias],
+                        error.to_string(),
+                    )
+                })?,
+            );
+        }
         ProviderRegistry::from_raw_parts(
-            self.connections.clone(),
-            self.models.canonical_models.clone(),
+            connections,
+            models,
             self.model_presets.clone(),
             self.fallback.clone(),
         )

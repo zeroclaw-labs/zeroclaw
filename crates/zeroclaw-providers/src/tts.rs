@@ -1166,10 +1166,12 @@ pub struct TtsManager {
 #[must_use]
 pub fn is_enabled(config: &Config) -> bool {
     config.tts.enabled
-        || config
-            .providers
-            .models
-            .has_canonical_capability(zeroclaw_api::capability::Capability::Tts)
+        || config.provider_registry().is_ok_and(|registry| {
+            registry
+                .models
+                .values()
+                .any(|model| model.capability() == zeroclaw_api::capability::Capability::Tts)
+        })
 }
 
 impl TtsManager {
@@ -1185,7 +1187,12 @@ impl TtsManager {
         // before the legacy family maps so a new model such as
         // `voice.gateway.prod` is never split or shadowed by a dotted legacy
         // profile parser.
-        if config.providers.models.has_canonical_models() {
+        if config.provider_registry().is_ok_and(|registry| {
+            registry
+                .models
+                .values()
+                .any(|model| model.capability() == zeroclaw_api::capability::Capability::Tts)
+        }) {
             let registry = config.provider_registry().map_err(|error| {
                 anyhow::Error::msg(format!("invalid canonical provider registry: {error}"))
             })?;
@@ -1228,40 +1235,47 @@ impl TtsManager {
             }
         }
 
-        // Typed dispatch over the TtsProviders container's named slots. The
-        // unknown-type warn-and-skip arm is gone — the typed container can't
-        // hold an unrecognized family.
-        for (family, alias, instance) in config.providers.tts.iter_entries() {
-            let dotted = format!("{family}.{alias}");
-            let result: Result<Box<dyn TtsProvider>> = match family {
-                "openai" => OpenAiTtsProvider::new(alias, instance).map(|p| Box::new(p) as _),
-                "elevenlabs" => {
-                    ElevenLabsTtsProvider::new(alias, instance).map(|p| Box::new(p) as _)
-                }
-                "google" => GoogleTtsProvider::new(alias, instance).map(|p| Box::new(p) as _),
-                "edge" => EdgeTtsProvider::new(alias, instance).map(|p| Box::new(p) as _),
-                "piper" => Ok(Box::new(PiperTtsProvider::new(alias, instance)) as _),
-                _ => Err(anyhow::Error::msg(format!(
-                    "unsupported typed TTS family: {family}"
-                ))),
-            };
-            match result {
-                Ok(p) => {
-                    tts_providers.entry(dotted.clone()).or_insert(p);
-                    if let Some(voice) = instance
-                        .voice
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|v| !v.is_empty())
-                    {
-                        voice_by_alias
-                            .entry(dotted)
-                            .or_insert_with(|| voice.to_string());
+        // Legacy typed entries are projected into the registry at the config
+        // boundary. Keep this fallback only for an invalid/incomplete
+        // registry so normal consumers have one exact-key path.
+        let registry_has_tts = config.provider_registry().is_ok_and(|registry| {
+            registry
+                .models
+                .values()
+                .any(|model| model.capability() == zeroclaw_api::capability::Capability::Tts)
+        });
+        if !registry_has_tts {
+            for (family, alias, instance) in config.providers.tts.iter_entries() {
+                let dotted = format!("{family}.{alias}");
+                let result: Result<Box<dyn TtsProvider>> = match family {
+                    "openai" => OpenAiTtsProvider::new(alias, instance).map(|p| Box::new(p) as _),
+                    "elevenlabs" => {
+                        ElevenLabsTtsProvider::new(alias, instance).map(|p| Box::new(p) as _)
                     }
-                }
-                Err(e) => {
-                    let config_path = format!("[providers.tts.{dotted}]");
-                    ::zeroclaw_log::record!(
+                    "google" => GoogleTtsProvider::new(alias, instance).map(|p| Box::new(p) as _),
+                    "edge" => EdgeTtsProvider::new(alias, instance).map(|p| Box::new(p) as _),
+                    "piper" => Ok(Box::new(PiperTtsProvider::new(alias, instance)) as _),
+                    _ => Err(anyhow::Error::msg(format!(
+                        "unsupported typed TTS family: {family}"
+                    ))),
+                };
+                match result {
+                    Ok(p) => {
+                        tts_providers.entry(dotted.clone()).or_insert(p);
+                        if let Some(voice) = instance
+                            .voice
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|v| !v.is_empty())
+                        {
+                            voice_by_alias
+                                .entry(dotted)
+                                .or_insert_with(|| voice.to_string());
+                        }
+                    }
+                    Err(e) => {
+                        let config_path = format!("[providers.tts.{dotted}]");
+                        ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
@@ -1270,6 +1284,7 @@ impl TtsManager {
                             ),
                         "typed TTS provider skipped (config error)"
                     );
+                    }
                 }
             }
         }

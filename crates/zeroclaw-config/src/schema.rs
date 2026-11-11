@@ -4842,22 +4842,15 @@ impl Config {
     /// never split on `.`.
     #[must_use]
     pub fn resolve_model_id(&self, model_ref: &str) -> Option<String> {
-        let model_ref = model_ref.trim();
-        if self.providers.models.has_canonical_models()
-            && let Ok(registry) = self.provider_registry()
-            && let Ok(selection) =
-                registry.resolve_chat(&crate::provider_registry::ModelRef::from(model_ref))
-        {
-            return selection
-                .upstream_model()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned);
-        }
-        self.resolve_model_selection(model_ref)
-            .and_then(|selection| selection.model_id)
-            .map(|model| model.trim().to_owned())
+        let registry = self.provider_registry().ok()?;
+        let resolved = registry
+            .resolve_chat(&crate::provider_registry::ModelRef::from(model_ref.trim()))
+            .ok()?;
+        resolved
+            .upstream_model()
+            .map(str::trim)
             .filter(|model| !model.is_empty())
+            .map(str::to_owned)
     }
 
     /// Resolve model-owned text extraction after API/preset/model overlays.
@@ -4872,22 +4865,9 @@ impl Config {
             .ok()
             .and_then(|registry| {
                 registry
-                    .resolve_chat(&crate::provider_registry::ModelRef::from(model_ref))
+                    .resolve_chat(&crate::provider_registry::ModelRef::from(model_ref.trim()))
                     .ok()
                     .map(|chat| chat.text_extraction())
-            })
-            .or_else(|| {
-                self.resolve_model_selection(model_ref).map(|selection| {
-                    let native_tools = selection
-                        .model_entry
-                        .and_then(|model| model.native_tools)
-                        .or(selection.entry.native_tools);
-                    crate::provider_registry::TextExtraction::for_provider(
-                        selection.entry.kind.as_deref().unwrap_or(selection.family),
-                        selection.entry.wire_api,
-                        native_tools,
-                    )
-                })
             })
             .unwrap_or_default()
     }
@@ -4897,22 +4877,18 @@ impl Config {
     /// request omits temperature and therefore resolves to `None`.
     #[must_use]
     pub fn resolve_model_temperature(&self, model_ref: &str) -> Option<f64> {
-        if self.providers.models.has_canonical_models()
-            && let Ok(registry) = self.provider_registry()
-            && let Ok(selection) =
-                registry.resolve_chat(&crate::provider_registry::ModelRef::from(model_ref.trim()))
-        {
-            return selection
-                .options
-                .temperature
-                .as_ref()
-                .and_then(|value| match value {
-                    crate::provider_registry::Override::Set(value) => Some(*value),
-                    crate::provider_registry::Override::Clear => None,
-                });
-        }
-        self.resolve_model_selection(model_ref)
-            .and_then(|selection| selection.temperature())
+        let registry = self.provider_registry().ok()?;
+        let resolved = registry
+            .resolve_chat(&crate::provider_registry::ModelRef::from(model_ref.trim()))
+            .ok()?;
+        resolved
+            .options
+            .temperature
+            .as_ref()
+            .and_then(|value| match value {
+                crate::provider_registry::Override::Set(value) => Some(*value),
+                crate::provider_registry::Override::Clear => None,
+            })
     }
 
     /// Test whether a reference names an exact-key model in the canonical
@@ -4922,12 +4898,11 @@ impl Config {
     /// provider fields.
     #[must_use]
     pub fn is_canonical_model_ref(&self, model_ref: &str) -> bool {
-        self.providers.models.has_canonical_models()
-            && self
-                .providers
+        self.provider_registry().is_ok_and(|registry| {
+            registry
                 .models
-                .canonical_model(&crate::provider_registry::ModelRef::from(model_ref.trim()))
-                .is_some()
+                .contains_key(&crate::provider_registry::ModelRef::from(model_ref.trim()))
+        })
     }
 
     /// Test whether a reference names a canonical model or a legacy model
@@ -4936,7 +4911,6 @@ impl Config {
     #[must_use]
     pub fn is_configured_model_ref(&self, model_ref: &str) -> bool {
         self.is_canonical_model_ref(model_ref)
-            || self.resolve_model_selection(model_ref.trim()).is_some()
     }
 
     /// Resolve the risk profile for an explicit agent alias.
@@ -5657,80 +5631,35 @@ impl Config {
         &self,
         provider_override: Option<&str>,
     ) -> Vec<ConfiguredModelEntry> {
-        let filter = provider_override.map(str::trim).filter(|p| !p.is_empty());
-        let mut entries = Vec::new();
-        // Canonical models are already complete model references.  List
-        // them before the legacy family maps and compare filters against the
-        // exact key or its referenced connection; never split a dotted key.
-        if self.providers.models.has_canonical_models()
-            && let Ok(registry) = self.provider_registry()
-        {
-            for (model_ref, model) in &registry.models {
+        let Ok(registry) = self.provider_registry() else {
+            return Vec::new();
+        };
+        let filter = provider_override
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        registry
+            .models
+            .iter()
+            .filter_map(|(reference, model)| {
                 if model.capability() != zeroclaw_api::capability::Capability::Chat {
-                    continue;
+                    return None;
                 }
-                let provider_ref = model_ref.to_string();
-                let connection_ref = model.provider().to_string();
-                if filter.is_some_and(|f| f != provider_ref && f != connection_ref) {
-                    continue;
+                let connection = registry.connections.get(model.provider())?;
+                if filter.is_some_and(|filter| {
+                    filter != reference.as_str()
+                        && filter != model.provider().as_str()
+                        && filter != connection.kind()
+                }) {
+                    return None;
                 }
-                entries.push(ConfiguredModelEntry {
-                    provider_ref,
-                    profile_ref: connection_ref,
+                Some(ConfiguredModelEntry {
+                    provider_ref: reference.to_string(),
+                    profile_ref: model.provider().to_string(),
                     model_alias: None,
                     model_id: model.upstream_model().map(str::to_owned),
-                });
-            }
-        }
-        for (ty, alias, entry) in self.providers.models.iter_entries() {
-            let profile_ref = format!("{ty}.{alias}");
-            let selected_model_alias = filter
-                .and_then(|f| f.strip_prefix(&format!("{profile_ref}.")))
-                .filter(|model_alias| entry.models.contains_key(*model_alias));
-            let passes = match filter {
-                Some(f) => {
-                    profile_ref == f
-                        || profile_ref.split('.').next() == Some(f)
-                        || selected_model_alias.is_some()
-                }
-                None => true,
-            };
-            if !passes {
-                continue;
-            }
-            if !entry.models.is_empty() {
-                // One three-segment entry per nested model alias, using the
-                // resolved model id from the model entry (or profile
-                // fallback).
-                let mut model_aliases: Vec<&str> =
-                    entry.models.keys().map(String::as_str).collect();
-                model_aliases.sort_unstable();
-                for model_alias in model_aliases {
-                    if selected_model_alias.is_some_and(|selected| selected != model_alias) {
-                        continue;
-                    }
-                    let three_seg = format!("{profile_ref}.{model_alias}");
-                    let model_id = self
-                        .resolve_model_selection(&three_seg)
-                        .and_then(|s| s.model_id);
-                    entries.push(ConfiguredModelEntry {
-                        provider_ref: three_seg,
-                        profile_ref: profile_ref.clone(),
-                        model_alias: Some(model_alias.to_string()),
-                        model_id,
-                    });
-                }
-            } else {
-                // Legacy path: no nested models, the profile-level model.
-                entries.push(ConfiguredModelEntry {
-                    provider_ref: profile_ref.clone(),
-                    profile_ref,
-                    model_alias: None,
-                    model_id: entry.model.clone(),
-                });
-            }
-        }
-        entries
+                })
+            })
+            .collect()
     }
 
     /// Reverse-lookup the agent alias that owns a configured channel

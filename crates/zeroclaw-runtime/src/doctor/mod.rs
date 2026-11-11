@@ -402,72 +402,43 @@ fn classify_model_probe_error(err_message: &str) -> ModelProbeOutcome {
 }
 
 fn doctor_model_targets(config: &Config, provider_override: Option<&str>) -> Vec<String> {
-    if config.providers.models.has_canonical_models() {
-        let references =
-            config.resolve_alias_source(zeroclaw_config::traits::AliasSource::ModelProviders);
-        let Some(requested) = provider_override
+    let Ok(registry) = config.provider_registry() else {
+        return provider_override
             .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            return references;
-        };
-        if config.is_canonical_model_ref(requested) {
-            return vec![requested.to_owned()];
-        }
-        // A bare provider kind expands via the connection, never via model
-        // name segments. Unrecognized input is left for the builder to reject.
-        if let Ok(registry) = config.provider_registry() {
-            let matches: Vec<String> = references
-                .into_iter()
-                .filter(|reference| {
-                    registry
-                        .resolve_chat(&reference.as_str().into())
-                        .is_ok_and(|model| model.selection.connection.kind() == requested)
-                })
-                .collect();
-            if !matches.is_empty() {
-                return matches;
-            }
-        }
+            .filter(|v| !v.is_empty())
+            .map(|v| vec![v.to_owned()])
+            .unwrap_or_default();
+    };
+    let references: Vec<String> = registry
+        .models
+        .iter()
+        .filter(|(_, model)| model.capability() == zeroclaw_api::capability::Capability::Chat)
+        .map(|(reference, _)| reference.to_string())
+        .collect();
+    let Some(requested) = provider_override.map(str::trim).filter(|v| !v.is_empty()) else {
+        return references;
+    };
+    if registry
+        .resolve_chat(&zeroclaw_config::provider_registry::ModelRef::from(
+            requested,
+        ))
+        .is_ok()
+    {
         return vec![requested.to_owned()];
     }
-    if let Some(model_provider) = provider_override.map(str::trim).filter(|p| !p.is_empty()) {
-        if model_provider.contains('.') {
-            return vec![model_provider.to_string()];
-        }
-
-        // A bare family name expands to every alias configured under it.
-        // Passing it through undotted reaches `create_model_provider_with_options`,
-        // which nulls `provider_api_url` and never looks the alias up — so the
-        // probe silently used the family's compiled-in default endpoint and
-        // reported a self-hosted gateway as unreachable at an address the
-        // operator never configured. Expanding here keeps the same invariant
-        // the orchestrator states for `/models`: a bare family must never
-        // construct a provider that ignores `[providers.models.<f>.<alias>]`.
-        let mut aliases: Vec<String> = config
-            .providers
-            .models
-            .aliases_of(model_provider)
-            .map(ToString::to_string)
-            .collect();
-        aliases.sort();
-        if aliases.is_empty() {
-            // Unknown or unconfigured family: hand the raw name downstream so
-            // the existing "no such provider" diagnostics still fire.
-            return vec![model_provider.to_string()];
-        }
-        return aliases
-            .into_iter()
-            .map(|alias| format!("{model_provider}.{alias}"))
-            .collect();
+    let matches: Vec<String> = references
+        .into_iter()
+        .filter(|reference| {
+            registry
+                .resolve_chat(&reference.as_str().into())
+                .is_ok_and(|model| model.selection.connection.kind() == requested)
+        })
+        .collect();
+    if matches.is_empty() {
+        vec![requested.to_owned()]
+    } else {
+        matches
     }
-
-    config
-        .providers
-        .models
-        .iter_entries()
-        .map(|(type_k, alias_k, _)| format!("{type_k}.{alias_k}"))
-        .collect()
 }
 
 fn create_doctor_model_provider(

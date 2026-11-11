@@ -30,18 +30,8 @@ pub struct TurnUsage {
 pub fn build_model_provider_pricing(config: &Config) -> ModelProviderPricing {
     let mut pricing: ModelProviderPricing = HashMap::new();
 
-    for (type_k, alias_k, profile) in config.providers.models.iter_entries() {
-        let mut slot = profile.pricing.clone();
-        apply_rate_sheet_pricing(config, type_k, &mut slot);
-        // Empty profiles fence dotted aliases and ambiguous bare families;
-        // otherwise a nested ref could borrow a prefix sibling's prices.
-        pricing.insert(format!("{type_k}.{alias_k}"), slot);
-    }
-
-    // Canonical V4 models own their pricing in model metadata. Keep the
-    // exact registry key as the billing owner, then index the configured
-    // upstream model id inside that slot so both canonical routing and the
-    // provider's wire model resolve to the same rates.
+    // The registry includes the config compatibility projection for legacy
+    // profiles. Every billing owner is therefore an exact model reference.
     if let Ok(registry) = config.provider_registry() {
         for (model_ref, model) in &registry.models {
             let zeroclaw_config::provider_registry::ModelDefinition::Chat(chat) = model else {

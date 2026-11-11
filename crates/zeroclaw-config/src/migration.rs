@@ -7,6 +7,17 @@ use crate::schema::v2::V2Config;
 
 mod model_routes;
 
+/// Legacy input adapter for the canonical registry. Keep this conversion in
+/// config; downstream consumers only resolve exact model references.
+pub(crate) fn legacy_chat_definition(
+    raw: &serde_json::Value,
+    family: &str,
+    entry: Option<&crate::schema::ModelEntryConfig>,
+    model_override: Option<&str>,
+) -> anyhow::Result<(serde_json::Value, serde_json::Value)> {
+    model_routes::legacy_model(raw, family, entry, model_override)
+}
+
 /// Adapt existing provider test fixtures to canonical route model definitions.
 /// This is test-only fixture construction; current configuration never accepts
 /// route-owned model ids or credentials.

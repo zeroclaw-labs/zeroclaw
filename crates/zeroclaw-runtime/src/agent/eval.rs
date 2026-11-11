@@ -98,24 +98,15 @@ impl ResolvedEffortRoute<'_> {
                 continue;
             }
             let canonical = zeroclaw_config::provider_registry::ModelRef::from(trimmed);
-            if config
-                .providers
-                .models
-                .canonical_model(&canonical)
-                .is_some()
-            {
+            if config.is_canonical_model_ref(canonical.as_str()) {
                 // Admission is defined by the effort policy, not reliability.
                 // A local turn must not grant a cloud fallback implicitly.
                 allowed.insert(trimmed.to_owned());
                 continue;
             }
 
-            // Preserve the raw nested legacy reference for attempt filtering,
-            // and its owning two-segment profile for legacy map scoping.
+            // Preserve the exact model reference for attempt filtering.
             allowed.insert(trimmed.to_owned());
-            if let Some((family, alias)) = config.providers.models.profile_ref(trimmed) {
-                allowed.insert(format!("{family}.{alias}"));
-            }
         }
         allowed
     }

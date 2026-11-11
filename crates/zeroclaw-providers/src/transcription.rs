@@ -1150,12 +1150,24 @@ impl TranscriptionManager {
 
         let mut transcription_providers: HashMap<String, Box<dyn AsrProvider>> = HashMap::new();
 
-        Self::register_legacy_providers(&mut transcription_providers, config);
-        if let Some(typed) = typed {
+        let registry_has_asr = config.provider_registry().is_ok_and(|registry| {
+            registry
+                .models
+                .values()
+                .any(|model| model.capability() == Capability::Asr)
+        });
+        if !registry_has_asr {
+            Self::register_legacy_providers(&mut transcription_providers, config);
+        }
+        if !registry_has_asr && let Some(typed) = typed {
             Self::register_typed_providers(&mut transcription_providers, typed);
         }
 
-        if config.enabled && transcription_providers.is_empty() && !canonical_available {
+        if config.enabled
+            && transcription_providers.is_empty()
+            && !canonical_available
+            && !registry_has_asr
+        {
             bail!(
                 "Transcription is enabled but no transcription provider registered \
                  successfully. Configure at least one of: [transcription] (Groq) \
@@ -1203,9 +1215,6 @@ impl TranscriptionManager {
     }
 
     fn register_canonical_providers(&mut self, config: &Config) -> Result<()> {
-        if !config.providers.models.has_canonical_models() {
-            return Ok(());
-        }
         let registry = config.provider_registry().map_err(|error| {
             anyhow::Error::msg(format!("invalid canonical provider registry: {error}"))
         })?;

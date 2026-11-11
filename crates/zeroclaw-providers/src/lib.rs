@@ -938,36 +938,47 @@ pub fn provider_runtime_options_for_agent(
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
 ) -> ModelProviderRuntimeOptions {
-    let selection = config
-        .agent(agent_alias)
-        .and_then(|agent| config.resolve_model_selection(&agent.model_provider));
-    let mut options = selection.as_ref().map_or_else(
-        || model_provider_runtime_options_from_model_provider_entry(config, None),
-        |selection| provider_runtime_options_for_alias(config, selection.family, selection.alias),
-    );
-    apply_model_entry_options(
-        &mut options,
-        selection
-            .as_ref()
-            .and_then(|selection| selection.model_entry),
-    );
-    options
+    // The registry is the only runtime source of model and connection
+    // policy. Model-specific overlays are applied by the factory after this
+    // provider-agnostic base is created; no consumer should re-read the
+    // legacy family maps here.
+    let _ = config.agent(agent_alias);
+    provider_runtime_options_for_bare_family(config)
 }
 pub fn provider_runtime_options_for_alias(
     config: &zeroclaw_config::schema::Config,
     family: &str,
     alias: &str,
 ) -> ModelProviderRuntimeOptions {
-    let entry = config.providers.models.find(family, alias);
-    let mut options = model_provider_runtime_options_from_model_provider_entry(config, entry);
-    // Qwen resolves its OAuth resource before falling back to the region enum.
-    // A synthesized region URL here would masquerade as an explicit override.
-    if family != "qwen"
-        && options.provider_api_url.is_none()
-        && let Some(uri) = config.providers.models.resolved_endpoint_uri(family, alias)
-    {
-        options.provider_api_url = Some(uri.to_string());
-    }
+    let reference = format!("{family}.{alias}");
+    let Ok(registry) = config.provider_registry() else {
+        return provider_runtime_options_for_bare_family(config);
+    };
+    let Ok(resolved) = registry.resolve_chat(&zeroclaw_config::provider_registry::ModelRef::from(
+        reference.as_str(),
+    )) else {
+        return provider_runtime_options_for_bare_family(config);
+    };
+    let mut options = provider_runtime_options_for_bare_family(config);
+    options.provider_kind = Some(resolved.selection.connection.kind().to_owned());
+    options.provider_api_url = resolved.selection.connection.uri().map(str::to_owned);
+    options.extra_headers = resolved
+        .selection
+        .connection
+        .extra_headers()
+        .map(|headers| {
+            headers
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    options.tls_ca_cert_path = resolved
+        .selection
+        .connection
+        .tls_ca_cert_path()
+        .map(str::to_owned);
+    options.wire_api = resolved.wire_api.map(|wire| wire.as_str().to_owned());
     options
 }
 

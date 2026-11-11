@@ -43,8 +43,12 @@ pub fn provider_registry_section(config: &zeroclaw_config::schema::Config) -> Co
         label: crate::i18n::get_required_cli_string("cli-config-provider-registry-label"),
         help: crate::i18n::get_required_cli_string("cli-config-provider-registry-help"),
         has_picker: false,
-        completed: config.providers.models.has_canonical_models(),
-        ready: config.providers.models.has_canonical_models(),
+        completed: config
+            .provider_registry()
+            .is_ok_and(|registry| !registry.models.is_empty()),
+        ready: config
+            .provider_registry()
+            .is_ok_and(|registry| !registry.models.is_empty()),
         group: zeroclaw_config::sections::SectionGroup::Foundation
             .label()
             .into(),

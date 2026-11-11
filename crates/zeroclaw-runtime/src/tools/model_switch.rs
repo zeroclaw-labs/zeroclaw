@@ -34,96 +34,32 @@ where
     }
 }
 
-fn configured_model_provider_profiles(config: &Config) -> Vec<String> {
-    let mut profiles = config
-        .providers
-        .models
-        .iter_entries()
-        .map(|(family, alias, _profile)| format!("{family}.{alias}"))
-        .collect::<Vec<_>>();
-    profiles.sort();
-    profiles
+fn configured_models(config: &Config) -> Vec<String> {
+    config
+        .provider_registry()
+        .map(|registry| {
+            registry
+                .models
+                .into_iter()
+                .filter(|(_, model)| {
+                    model.capability() == zeroclaw_api::capability::Capability::Chat
+                })
+                .map(|(reference, _)| reference.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
-/// Resolve a `model_provider` argument while preserving the full reference
-/// plus, when it is a three-segment `<type>.<alias>.<model_alias>` ref, the
-/// model id selected by that entry.
-fn resolve_model_provider_profile_ref(
-    config: &Config,
-    raw: &str,
-) -> Result<(String, Option<String>), String> {
+/// Model references are opaque keys, including every dot in the TOML key.
+fn resolve_model_ref(config: &Config, raw: &str) -> Result<(String, Option<String>), String> {
     let raw = raw.trim();
-    let (family, alias) = config.providers.models.profile_ref(raw).ok_or_else(|| {
-        crate::i18n::get_required_cli_string_with_args(
-            "cli-model-switch-invalid-reference",
-            &[("provider_ref", raw)],
-        )
-    })?;
-    let profile_ref = format!("{family}.{alias}");
-    let model_alias = raw
-        .strip_prefix(&profile_ref)
-        .and_then(|suffix| suffix.strip_prefix('.'));
-
-    if config.providers.models.find(family, alias).is_none() {
-        let available = configured_model_provider_profiles(config);
-        let available = if available.is_empty() {
-            crate::i18n::get_required_cli_string("cli-model-switch-no-profiles")
-        } else {
-            available.join(", ")
-        };
-        return Err(crate::i18n::get_required_cli_string_with_args(
-            "cli-model-switch-profile-missing",
-            &[
-                ("provider_ref", raw),
-                ("family", family),
-                ("alias", alias),
-                ("available", &available),
-            ],
-        ));
-    }
-
-    // Three-segment ref: the model entry must exist; derive its id.
-    let derived_model = if let Some(model_alias) = model_alias {
-        match config
-            .providers
-            .models
-            .find_model(family, alias, model_alias)
-        {
-            Some(entry) => Some(
-                entry
-                    .id
-                    .clone()
-                    .or_else(|| {
-                        config
-                            .providers
-                            .models
-                            .find(family, alias)
-                            .and_then(|p| p.model.clone())
-                    })
-                    .ok_or_else(|| {
-                        crate::i18n::get_required_cli_string_with_args(
-                            "cli-model-switch-model-id-missing",
-                            &[("provider_ref", raw)],
-                        )
-                    })?,
-            ),
-            None => {
-                return Err(crate::i18n::get_required_cli_string_with_args(
-                    "cli-model-switch-entry-missing",
-                    &[
-                        ("provider_ref", raw),
-                        ("model_alias", model_alias),
-                        ("family", family),
-                        ("alias", alias),
-                    ],
-                ));
-            }
-        }
-    } else {
-        None
-    };
-
-    Ok((raw.to_string(), derived_model))
+    let registry = config
+        .provider_registry()
+        .map_err(|error| error.to_string())?;
+    let resolved = registry
+        .resolve_chat(&zeroclaw_config::provider_registry::ModelRef::from(raw))
+        .map_err(|error| error.to_string())?;
+    Ok((raw.to_owned(), resolved.upstream_model().map(str::to_owned)))
 }
 
 pub struct ModelSwitchTool {
@@ -162,7 +98,7 @@ impl Tool for ModelSwitchTool {
     }
 
     fn description(&self) -> &str {
-        "Request a runtime model switch using a configured provider profile plus provider-local model. Use 'get' to see the pending switch, 'list_model_providers' to see provider families, 'list_models' to see common models for a provider profile, or 'set' with a dotted provider profile ref such as 'openai.default'. The switch is runtime/session state and does not write config."
+        "Request a runtime model switch using an exact configured model reference. Use 'get' to see the pending switch, 'list_model_providers' to see provider families, 'list_models' to see models for a provider family, or 'set' with a model reference such as 'chat.fast'. The switch is runtime/session state and does not write config."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -172,15 +108,15 @@ impl Tool for ModelSwitchTool {
                 "action": {
                     "type": "string",
                     "enum": ["get", "set", "list_model_providers", "list_models"],
-                    "description": "Action to perform: get pending switch state, set a runtime provider-profile/model switch, list available provider families, or list common models for a provider profile"
+                    "description": "Action to perform: get pending switch state, set an exact model switch, list available provider families, or list models for a provider family"
                 },
                 "model_provider": {
                     "type": "string",
-                    "description": "Dotted provider profile reference (e.g., 'openai.default', 'anthropic.sonnet', 'ollama.local'). Required for 'set' and 'list_models' actions."
+                    "description": "Exact configured model reference (for example, 'chat.fast'). Required for 'set' and 'list_models' actions."
                 },
                 "model": {
                     "type": "string",
-                    "description": "Model ID (e.g., 'gpt-4o', 'claude-sonnet-4-6'). Required for 'set' action."
+                    "description": "Optional provider-local model override. Usually omit this when the model reference already selects a model."
                 }
             },
             "required": ["action"]
@@ -230,7 +166,7 @@ impl ModelSwitchTool {
             success: true,
             output: serde_json::to_string_pretty(&json!({
                 "pending_switch": pending,
-                "note": "To switch models, use action 'set' with dotted <type>.<alias> model_provider and model parameters"
+                "note": "To switch models, use action 'set' with an exact configured model_provider reference"
             }))?.into(),
             error: None,
         })
@@ -253,34 +189,24 @@ impl ModelSwitchTool {
 
         let model = args.get("model").and_then(|v| v.as_str());
 
-        let (model_provider, derived_model) = match resolve_model_provider_profile_ref(
-            &config,
-            model_provider,
-        ) {
+        let (model_provider, derived_model) = match resolve_model_ref(&config, model_provider) {
             Ok(resolved) => resolved,
             Err(error) => {
                 let known_model_providers = zeroclaw_providers::list_model_providers();
-                let configured_profiles = configured_model_provider_profiles(&config);
+                let configured_profiles = configured_models(&config);
                 return Ok(ToolResult {
                         success: false,
                         output: serde_json::to_string_pretty(&json!({
-                            "provider_ref_shape": "<type>.<alias> or <type>.<alias>.<model>",
+                            "provider_ref_shape": "exact TOML model key",
                             "available_provider_families": known_model_providers.iter().map(|p| p.name).collect::<Vec<_>>(),
-                            "configured_provider_profiles": configured_profiles
+                            "configured_models": configured_profiles
                         }))?.into(),
                         error: Some(error),
                     });
             }
         };
 
-        let policy_ref = config
-            .providers
-            .models
-            .profile_ref(&model_provider)
-            .map_or_else(
-                || model_provider.clone(),
-                |(family, alias)| format!("{family}.{alias}"),
-            );
+        let policy_ref = model_provider.clone();
         if !crate::agent::turn::model_switch_provider_allowed(&policy_ref) {
             return Ok(ToolResult {
                 success: false,
@@ -357,7 +283,7 @@ impl ModelSwitchTool {
 
     fn handle_list_providers(&self) -> anyhow::Result<ToolResult> {
         let providers_list = zeroclaw_providers::list_model_providers();
-        let configured_profiles = configured_model_provider_profiles(&(self.config)());
+        let configured_profiles = configured_models(&(self.config)());
         let configured_count = configured_profiles.len();
 
         let model_providers: Vec<serde_json::Value> = providers_list
@@ -376,11 +302,12 @@ impl ModelSwitchTool {
             output: serde_json::to_string_pretty(&json!({
                 "model_providers": model_providers,
                 "count": model_providers.len(),
-                "configured_provider_profiles": configured_profiles,
+                "configured_models": configured_profiles,
                 "configured_count": configured_count,
-                "provider_ref_shape": "<type>.<alias>",
-                "example": "Use action 'set' with a dotted provider profile ref such as 'openai.default'"
-            }))?.into(),
+                "provider_ref_shape": "exact TOML model key",
+                "example": "Use action 'set' with an exact model reference such as 'chat.fast'"
+            }))?
+            .into(),
             error: None,
         })
     }
@@ -395,9 +322,15 @@ impl ModelSwitchTool {
             return resolver(provider_ref.to_string()).await;
         }
 
-        let family = provider_ref
-            .split_once('.')
-            .map_or(provider_ref, |(family, _)| family);
+        let registry = config.provider_registry()?;
+        let family = registry
+            .resolve_chat(&zeroclaw_config::provider_registry::ModelRef::from(
+                provider_ref,
+            ))?
+            .selection
+            .connection
+            .kind()
+            .to_owned();
         let reference = provider_ref.to_owned();
         let provider = zeroclaw_providers::model::build_nonblocking(move || {
             zeroclaw_providers::create_model_provider_from_ref(&config, &reference)
@@ -407,7 +340,7 @@ impl ModelSwitchTool {
             .list_models()
             .await;
         fallback_if_model_listing_unsupported(live_result, || {
-            zeroclaw_providers::catalog::list_models_for_family(family)
+            zeroclaw_providers::catalog::list_models_for_family(&family)
         })
         .await
     }
@@ -429,25 +362,29 @@ impl ModelSwitchTool {
             }
         };
 
-        let model_provider = match resolve_model_provider_profile_ref(&config, model_provider) {
+        let model_provider = match resolve_model_ref(&config, model_provider) {
             Ok((model_provider, _derived_model)) => model_provider,
             Err(error) => {
                 return Ok(ToolResult {
                     success: false,
                     output: serde_json::to_string_pretty(&json!({
-                        "provider_ref_shape": "<type>.<alias> or <type>.<alias>.<model>",
-                        "configured_provider_profiles": configured_model_provider_profiles(&config)
+                        "provider_ref_shape": "exact TOML model key",
+                        "configured_models": configured_models(&config)
                     }))?
                     .into(),
                     error: Some(error),
                 });
             }
         };
-        let provider_family = model_provider
-            .split_once('.')
-            .map(|(family, _alias)| family)
-            .unwrap_or(model_provider.as_str());
-        let provider_family = provider_family.to_lowercase();
+        let registry = config.provider_registry()?;
+        let provider_family = registry
+            .resolve_chat(&zeroclaw_config::provider_registry::ModelRef::from(
+                model_provider.as_str(),
+            ))?
+            .selection
+            .connection
+            .kind()
+            .to_owned();
 
         let models: Vec<String> = match self
             .resolve_catalog(Arc::clone(&config), &model_provider)
@@ -465,13 +402,13 @@ impl ModelSwitchTool {
                             "provider_family": provider_family,
                             "error": error.to_string(),
                         })),
-                    "model_switch list_models: configured profile catalog failed"
+                    "model_switch list_models: configured model catalog failed"
                 );
                 return Ok(ToolResult {
                     success: false,
                     output: serde_json::to_string_pretty(&json!({
                         "model_provider": model_provider,
-                        "configured_provider_profiles": configured_model_provider_profiles(&config),
+                        "configured_models": configured_models(&config),
                     }))?
                     .into(),
                     error: Some(crate::i18n::get_required_cli_string_with_args(
@@ -658,7 +595,7 @@ mod tests {
                     .error
                     .as_deref()
                     .unwrap_or_default()
-                    .contains("dotted `<type>.<alias>`"),
+                    .contains("exact model reference"),
                 "unexpected error: {:?}",
                 result.error
             );
@@ -749,7 +686,7 @@ mod tests {
                     .error
                     .as_deref()
                     .unwrap_or_default()
-                    .contains("configured provider profile"),
+                    .contains("configured model reference"),
                 "unexpected error: {:?}",
                 result.error
             );
@@ -1161,7 +1098,7 @@ mod tests {
             .expect("list_models should return a tool result");
         assert!(
             !result.success,
-            "configured profile errors must not become empty success"
+            "configured model errors must not become empty success"
         );
         assert!(
             result
@@ -1316,7 +1253,7 @@ mod tests {
                     let is_catalog_failure = value
                         .get("message")
                         .and_then(|v| v.as_str())
-                        .map(|s| s.contains("configured profile catalog failed"))
+                        .map(|s| s.contains("configured model catalog failed"))
                         .unwrap_or(false);
                     let is_hailo = value
                         .get("attributes")

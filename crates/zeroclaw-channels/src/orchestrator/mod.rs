@@ -2885,31 +2885,33 @@ fn resolve_models_command(
 ) -> ModelsCommandResolution {
     let candidate = raw.trim();
     if config.is_configured_model_ref(candidate) && config.resolve_model_id(candidate).is_some() {
-        return ModelsCommandResolution::Resolved(candidate.to_string());
+        return ModelsCommandResolution::Resolved(candidate.to_owned());
     }
-    if let Some((family, alias)) = config.providers.models.profile_ref(candidate) {
-        return match config.providers.models.find(family, alias) {
-            Some(_) if config.resolve_model_selection(candidate).is_some() => {
-                ModelsCommandResolution::Resolved(candidate.to_string())
-            }
-            _ => ModelsCommandResolution::NoAlias(candidate.to_string()),
-        };
-    }
-
     let Some(family) = canonical_model_provider_name(candidate) else {
         return ModelsCommandResolution::Unknown;
     };
-
-    let mut aliases: Vec<String> = config
-        .providers
-        .models
-        .aliases_of(&family)
-        .map(ToString::to_string)
-        .collect();
-    aliases.sort();
+    let aliases: Vec<String> = config
+        .provider_registry()
+        .ok()
+        .map(|registry| {
+            registry
+                .models
+                .keys()
+                .filter(|reference| reference.starts_with(&format!("{family}.")))
+                .filter(|reference| {
+                    registry
+                        .resolve_chat(&zeroclaw_config::provider_registry::ModelRef::from(
+                            reference.as_str(),
+                        ))
+                        .is_ok()
+                })
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
     match aliases.len() {
         0 => ModelsCommandResolution::NoAlias(family),
-        1 => ModelsCommandResolution::Resolved(format!("{family}.{}", aliases[0])),
+        1 => ModelsCommandResolution::Resolved(aliases[0].clone()),
         _ => ModelsCommandResolution::Ambiguous { family, aliases },
     }
 }
@@ -2955,29 +2957,19 @@ fn resolved_runtime_model_provider_ref(
     if config.is_configured_model_ref(configured) {
         return Ok(configured.to_owned());
     }
-    let (model_provider, _) = model_provider_entry_for_ref(config, configured)?;
-    Ok(model_provider)
+    model_provider_entry_for_ref(config, configured)
 }
 
-fn model_provider_entry_for_ref<'a>(
-    config: &'a Config,
-    model_provider: &str,
-) -> anyhow::Result<(String, &'a zeroclaw_config::schema::ModelProviderConfig)> {
+fn model_provider_entry_for_ref(config: &Config, model_provider: &str) -> anyhow::Result<String> {
     let trimmed = model_provider.trim();
     if trimmed.is_empty() {
         anyhow::bail!("model_provider reference must not be empty");
     }
 
-    // Accept both `<type>.<alias>` and `<type>.<alias>.<model>`. The provider
-    // profile is keyed by the first two segments, while the complete reference
-    // remains the identity of the selected model for reload and routing.
-    let Some((provider_type, provider_alias)) = config.providers.models.profile_ref(trimmed) else {
-        anyhow::bail!("model_provider `{trimmed}` must use `<type>.<alias>` form");
+    if !config.is_configured_model_ref(trimmed) {
+        anyhow::bail!("model_provider `{trimmed}` does not resolve to a configured model");
     };
-    let Some(entry) = config.providers.models.find(provider_type, provider_alias) else {
-        anyhow::bail!("model_provider `{trimmed}` does not resolve to a configured provider");
-    };
-    Ok((trimmed.to_string(), entry))
+    Ok(trimmed.to_owned())
 }
 
 /// Resolve runtime defaults from `config` against a specific dotted
@@ -3006,14 +2998,9 @@ fn runtime_defaults_from_config(
             api_key,
         });
     }
-    let (default_model_provider, entry) = model_provider_entry_for_ref(config, model_provider)?;
-    // Resolve explicit and implicit nested model entries together with their
-    // sampling defaults.
-    let selection = config.resolve_model_selection(model_provider.trim());
-    let model = selection
-        .as_ref()
-        .and_then(|s| s.model_id.clone())
-        .or_else(|| entry.model.clone())
+    let default_model_provider = model_provider_entry_for_ref(config, model_provider)?;
+    let model = config
+        .resolve_model_id(model_provider.trim())
         .map(|m| m.trim().to_string())
         .filter(|model| !model.is_empty())
         .ok_or_else(|| {
@@ -3033,15 +3020,21 @@ fn runtime_defaults_from_config(
                  fallback entry."
             ))
         })?;
-    let temperature = selection
-        .as_ref()
-        .and_then(|s| s.temperature())
-        .or(entry.temperature);
+    let temperature = config.resolve_model_temperature(model_provider);
+    let api_key = config.provider_registry().ok().and_then(|registry| {
+        registry
+            .resolve_chat(&zeroclaw_config::provider_registry::ModelRef::from(
+                model_provider.trim(),
+            ))
+            .ok()
+            .and_then(|resolved| resolved.selection.connection.api_key())
+            .map(str::to_owned)
+    });
     Ok(ChannelRuntimeDefaults {
         default_model_provider,
         model,
         temperature,
-        api_key: entry.api_key.clone(),
+        api_key,
     })
 }
 
@@ -5994,104 +5987,14 @@ async fn resolve_classifier_route(
         ));
     }
 
-    let (type_key, alias_key) = match defaults_snapshot
-        .config
-        .providers
-        .models
-        .profile_ref(provider_str)
-    {
-        Some(parts) => parts,
-        None => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"provider": provider_str})),
-                "classifier_provider must be dotted `<type>.<alias>`; falling back to main agent"
-            );
-            return None;
-        }
-    };
-
-    let model_cfg = match defaults_snapshot
-        .config
-        .providers
-        .models
-        .find(type_key, alias_key)
-    {
-        Some(cfg) => cfg,
-        None => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"provider": provider_str})),
-                "classifier_provider references an unknown [providers.models.<type>.<alias>] entry; falling back to main agent"
-            );
-            return None;
-        }
-    };
-
-    // Resolve the (possibly three-segment) selection so a
-    // `<type>.<alias>.<model>` classifier ref picks the model entry's id/temp.
-    let selection = defaults_snapshot
-        .config
-        .resolve_model_selection(provider_str.trim());
-    let model = selection
-        .as_ref()
-        .and_then(|s| s.model_id.clone())
-        .or_else(|| model_cfg.model.clone())
-        .unwrap_or_default();
-    if model.is_empty() {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"provider": provider_str})),
-            "classifier_provider points to a [providers.models] entry without a `model` field; falling back to main agent"
-        );
-        return None;
-    }
-
-    let provider = match get_or_create_provider(
-        ctx,
-        // Pass the complete (possibly three-segment) ref so the provider
-        // cache keys on the named model entry and its per-model tuning is
-        // resolved, matching the id/temperature pair derived above.
-        provider_str,
-        &model,
-        model_cfg.api_key.as_deref(),
-        defaults_snapshot,
-    )
-    .await
-    {
-        Ok(p) => p,
-        Err(e) => {
-            let safe_err = zeroclaw_providers::sanitize_api_error(&e.to_string());
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"provider": provider_str, "error": safe_err})),
-                "Failed to initialize classifier_provider; falling back to main agent provider"
-            );
-            return None;
-        }
-    };
-
     ::zeroclaw_log::record!(
-        INFO,
+        WARN,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-            .with_attrs(::serde_json::json!({"provider": provider_str, "model": model.as_str()})),
-        "classifier_provider override active"
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({"provider": provider_str})),
+        "classifier_provider does not resolve to a configured canonical model; falling back to main agent"
     );
-
-    Some((
-        provider,
-        model,
-        zeroclaw_providers::temperature::Temperature::default()
-            .for_call(Some(Arc::clone(&defaults_snapshot.config)), provider_str),
-    ))
+    None
 }
 
 fn outcome_for_no_reply(reason: &str, kind: NoReplyKind) -> AssistantChannelOutcome {
@@ -10011,8 +9914,7 @@ async fn process_channel_message_body(
             } else {
                 let configured_classifier_allowed = configured_provider_allowed_for_turn(
                     attempt_allowlist.as_deref(),
-                    &runtime_defaults.config.providers.models.profile_ref(&ctx.agent_cfg.classifier_provider)
-                        .map_or_else(|| ctx.agent_cfg.classifier_provider.to_string(), |(family, alias)| format!("{family}.{alias}")),
+                    &ctx.agent_cfg.classifier_provider,
                 );
                 if !configured_classifier_allowed {
                     ::zeroclaw_log::record!(

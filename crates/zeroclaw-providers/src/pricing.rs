@@ -298,92 +298,22 @@ struct GatewayGroup {
 fn enabled_pricing_groups(
     config: &zeroclaw_config::schema::Config,
 ) -> (Vec<GatewayGroup>, HashMap<String, usize>) {
-    // Count TOTAL aliases per family (opted-in and not), used later to decide
-    // whether a bare-family snapshot entry is safe to add.
+    // The registry includes the compatibility projection for legacy provider
+    // profiles, so pricing has one model enumeration and one exact-key path.
     let mut total_aliases_per_family: HashMap<String, usize> = HashMap::new();
-    for (ty, _alias, _base) in config.providers.models.iter_entries() {
-        *total_aliases_per_family.entry(ty.to_string()).or_default() += 1;
+    if let Ok(registry) = config.provider_registry() {
+        for model in registry.models.values() {
+            if model.capability() == zeroclaw_api::capability::Capability::Chat {
+                if let Some(connection) = registry.connections.get(model.provider()) {
+                    *total_aliases_per_family
+                        .entry(connection.kind().to_owned())
+                        .or_default() += 1;
+                }
+            }
+        }
     }
 
-    // gateway key -> (representative built handle, wanted models)
     let mut groups: HashMap<String, GatewayGroup> = HashMap::new();
-    for (ty, alias, base) in config.providers.models.iter_entries() {
-        if !base.live_pricing {
-            continue;
-        }
-        let composite = format!("{ty}.{alias}");
-        let selection = config.resolve_model_selection(&composite);
-        let Some(model_id) = selection
-            .as_ref()
-            .and_then(|selection| selection.model_id.as_deref())
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-        else {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({ "provider": format!("{ty}.{alias}") })),
-                "live pricing: provider opted in but has no effective model selection"
-            );
-            continue;
-        };
-        // Aliases on the same explicit endpoint share one call; aliases on a
-        // family default share one call per family type.
-        let gateway_key = base
-            .uri
-            .as_deref()
-            .map(str::trim)
-            .filter(|u| !u.is_empty())
-            .map_or_else(|| format!("type:{ty}"), str::to_string);
-
-        let wanted = WantedModel {
-            // Keyed by composite alias to preserve the alias boundary; the
-            // snapshot uses this directly so a non-opted-in alias can never
-            // inherit rates from an opted-in same-family alias.
-            provider_key: composite.clone(),
-            alias_family: Some(ty.to_string()),
-            composite,
-            model_id: model_id.to_string(),
-            // models.dev provider key for this family, for the fallback path.
-            models_dev_key: crate::catalog::catalog_source_for(ty)
-                .and_then(|(md_key, _)| md_key)
-                .map(str::to_string),
-        };
-
-        if let Some(group) = groups.get_mut(&gateway_key) {
-            group.wanted.push(wanted);
-            continue;
-        }
-        // First alias for this gateway: build the representative handle.
-        match crate::model::build_raw_provider(
-            config,
-            &wanted.composite,
-            crate::model::ProviderOverrides::default(),
-        ) {
-            Ok(binding) => {
-                groups.insert(
-                    gateway_key,
-                    GatewayGroup {
-                        handle: Arc::from(binding.provider),
-                        wanted: vec![wanted],
-                    },
-                );
-            }
-            Err(error) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "provider": wanted.composite,
-                            "error": format!("{error}"),
-                        })),
-                    "live pricing: could not build provider; skipping gateway"
-                );
-            }
-        }
-    }
 
     // Canonical models own `live_pricing` on their chat API. Keep these exact
     // model refs separate from legacy family aliases so a canonical key such

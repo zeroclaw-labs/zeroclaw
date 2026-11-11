@@ -149,12 +149,7 @@ pub async fn build_model_nonblocking(
 /// Explicit endpoints may still be probed anonymously by their caller.
 pub fn selection_auth_ready(config: &Config, selection_ref: &str) -> anyhow::Result<bool> {
     let canonical_ref = zeroclaw_config::provider_registry::ModelRef::from(selection_ref.trim());
-    if config
-        .providers
-        .models
-        .canonical_model(&canonical_ref)
-        .is_some()
-    {
+    if config.is_canonical_model_ref(canonical_ref.as_str()) {
         let registry = config.provider_registry()?;
         let selection = registry.resolve_chat(&canonical_ref)?;
         return Ok(crate::factory::canonical_auth_ready(
@@ -198,14 +193,7 @@ pub fn build_reliable_provider(
 /// Whether routed construction borrows model and connection defaults from its
 /// agent rather than resolving a named provider profile.
 pub fn inherits_agent_selection(config: &Config, selection_ref: &str) -> bool {
-    if config
-        .providers
-        .models
-        .canonical_model(&zeroclaw_config::provider_registry::ModelRef::from(
-            selection_ref.trim(),
-        ))
-        .is_some()
-    {
+    if config.is_canonical_model_ref(selection_ref) {
         return false;
     }
     !config
@@ -239,14 +227,7 @@ pub fn resolve_model_identity(
     model_override: Option<&str>,
 ) -> Option<ModelIdentity> {
     let selection_ref = selection_ref.trim();
-    if config
-        .providers
-        .models
-        .canonical_model(&zeroclaw_config::provider_registry::ModelRef::from(
-            selection_ref,
-        ))
-        .is_some()
-    {
+    if config.is_canonical_model_ref(selection_ref) {
         let model_id = model_override
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -297,12 +278,7 @@ fn build_provider(
     // fallback graph. The legacy family/alias parser is only considered when
     // this lookup does not find a canonical model.
     let canonical_ref = zeroclaw_config::provider_registry::ModelRef::from(selection_ref);
-    if config
-        .providers
-        .models
-        .canonical_model(&canonical_ref)
-        .is_some()
-    {
+    if config.is_canonical_model_ref(canonical_ref.as_str()) {
         let options = crate::provider_runtime_options_for_bare_family(config);
         let registry = config.provider_registry()?;
         let mut reliable_candidates = Vec::new();
@@ -544,20 +520,8 @@ pub fn selection_depends_on_model_ref(
     // their connection and defaults from `custom.gateway`. Keep live-edit
     // invalidation wired to that owner while canonical dotted model keys
     // remain opaque TOML keys and take precedence over the legacy parser.
-    let selection_is_canonical = config
-        .providers
-        .models
-        .canonical_model(&zeroclaw_config::provider_registry::ModelRef::from(
-            selection_ref,
-        ))
-        .is_some();
-    let changed_is_canonical = config
-        .providers
-        .models
-        .canonical_model(&zeroclaw_config::provider_registry::ModelRef::from(
-            changed_model_ref,
-        ))
-        .is_some();
+    let selection_is_canonical = config.is_canonical_model_ref(selection_ref);
+    let changed_is_canonical = config.is_canonical_model_ref(changed_model_ref);
     if !selection_is_canonical
         && !changed_is_canonical
         && let (Some((selection_family, selection_alias)), Some((changed_family, changed_alias))) = (
@@ -608,14 +572,7 @@ pub fn routed_selection_depends_on_model_ref(
     let inherited_selection = if !inherits_agent_selection(config, selection_ref) {
         false
     } else {
-        let changed_owner = if config
-            .providers
-            .models
-            .canonical_model(&zeroclaw_config::provider_registry::ModelRef::from(
-                changed_model_ref.trim(),
-            ))
-            .is_some()
-        {
+        let changed_owner = if config.is_canonical_model_ref(changed_model_ref.trim()) {
             changed_model_ref.trim().to_string()
         } else {
             config
@@ -657,12 +614,7 @@ pub fn build_model(
 ) -> anyhow::Result<BuiltModel> {
     let model_provider_ref = model_provider_ref.trim();
     let canonical_ref = zeroclaw_config::provider_registry::ModelRef::from(model_provider_ref);
-    if config
-        .providers
-        .models
-        .canonical_model(&canonical_ref)
-        .is_some()
-    {
+    if config.is_canonical_model_ref(canonical_ref.as_str()) {
         let registry = config.provider_registry()?;
         registry.resolve_chat(&canonical_ref)?;
         let options = crate::provider_runtime_options_for_agent(config, agent_alias);

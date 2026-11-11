@@ -1749,15 +1749,7 @@ async fn run_tool_call_loop_impl<'a>(
 
     let temperature_input = temperature;
     // Legacy CLI bare-family overrides inherit the configured agent selection.
-    let sampling_ref = config
-        .and_then(|config| {
-            (config.resolve_model_selection(provider_name).is_none()
-                && !provider_name.contains('.'))
-            .then(|| agent_alias.and_then(|alias| config.agent(alias)))
-            .flatten()
-            .map(|agent| agent.model_provider.as_str())
-        })
-        .unwrap_or(provider_name);
+    let sampling_ref = provider_name;
     let temperature = temperature_input.resolve(config, sampling_ref);
     // Admit one generation for this turn; retries and streams share the Arc.
     let sampling_config = config.map(|config| Arc::new(config.clone()));
@@ -2907,18 +2899,7 @@ async fn run_tool_call_loop_impl<'a>(
         // If only the nested suffix was normalized, the selected entry's
         // capacity still applies; the same model ID cannot identify an entry.
         let same_selected_model = served_model_key == provider_request_model
-            && config.is_some_and(|config| {
-                match (
-                    config
-                        .providers
-                        .models
-                        .profile_ref(active_model_provider_name),
-                    config.providers.models.profile_ref(&served_provider),
-                ) {
-                    (Some(active), Some(served)) => active == served,
-                    _ => false,
-                }
-            });
+            && active_model_provider_name == served_provider;
         let accepted_selection = accepted_route
             .as_ref()
             .and_then(|route| route.selection_ref());

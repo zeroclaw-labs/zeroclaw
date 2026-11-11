@@ -305,49 +305,27 @@ pub async fn model_catalog_with_config_result(
     Option<std::collections::HashMap<String, zeroclaw_api::model_provider::ModelPricing>>,
     bool,
 )> {
-    let canonical_ref = zeroclaw_config::provider_registry::ModelRef::from(model_provider);
-    let canonical_family = match config {
-        Some(cfg)
-            if cfg
-                .providers
-                .models
-                .canonical_model(&canonical_ref)
-                .is_some() =>
-        {
-            let registry = cfg.provider_registry()?;
-            Some(
-                registry
-                    .resolve_chat(&canonical_ref)?
-                    .selection
-                    .connection
-                    .kind()
-                    .to_owned(),
-            )
-        }
-        _ => None,
-    };
-    let resolved = config.and_then(|cfg| cfg.providers.models.find_by_name(model_provider));
-    // Catalog construction accepts both exact canonical model refs and the
-    // legacy family/alias form. Canonical refs derive their provider family
-    // from the referenced connection; their dots are never split as alias
-    // boundaries.
-    let family = canonical_family
-        .as_deref()
-        .or_else(|| resolved.as_ref().map(|(family, _, _)| *family))
-        .unwrap_or_else(|| {
-            model_provider
-                .split_once('.')
-                .map_or(model_provider, |(f, _)| f)
-        });
-
-    let configured_profile = canonical_family.is_some() || resolved.is_some();
-    let has_dotted_profile_shape = model_provider
-        .split_once('.')
-        .is_some_and(|(family, _)| !family.contains(':'));
-    if has_dotted_profile_shape && !configured_profile {
-        anyhow::bail!(
-            "configured provider profile `{model_provider}` does not exist; expected `<type>.<alias>` from providers.models"
-        );
+    let canonical_ref = zeroclaw_config::provider_registry::ModelRef::from(model_provider.trim());
+    let canonical_family = config.and_then(|cfg| {
+        let registry = cfg.provider_registry().ok()?;
+        registry
+            .resolve_chat(&canonical_ref)
+            .ok()
+            .map(|resolved| resolved.selection.connection.kind().to_owned())
+    });
+    let family = canonical_family.as_deref().unwrap_or_else(|| {
+        model_provider.split_once(':').map_or_else(
+            || {
+                model_provider
+                    .split_once('.')
+                    .map_or(model_provider, |(family, _)| family)
+            },
+            |(family, _)| family,
+        )
+    });
+    let configured_profile = canonical_family.is_some();
+    if model_provider.contains('.') && !configured_profile {
+        anyhow::bail!("configured model `{model_provider}` does not exist");
     }
 
     // A configured alias is the canonical source for provider construction:
@@ -356,20 +334,7 @@ pub async fn model_catalog_with_config_result(
     let configured = config
         .filter(|_| configured_profile)
         .map(|config| Box::new(config.clone()));
-    let reference = if canonical_family.is_some() {
-        model_provider.to_owned()
-    } else {
-        resolved.as_ref().map_or_else(
-            || model_provider.to_owned(),
-            |(family, alias, _)| {
-                if model_provider.contains('.') {
-                    model_provider.to_owned()
-                } else {
-                    format!("{family}.{alias}")
-                }
-            },
-        )
-    };
+    let reference = model_provider.to_owned();
     let family_for_build = family.to_owned();
     let handle = crate::model::build_nonblocking(move || match configured {
         Some(config) => crate::model::build_raw_provider(

@@ -45,13 +45,7 @@ impl<'a> VisionProviderSource<'a> {
 /// vision factory reports it: `None` for a bare family, a colon ref, an alias
 /// with no configured entry, or an entry without a model.
 fn configured_route_model(config: &Config, provider_ref: &str) -> Option<String> {
-    config
-        .resolve_model_selection(provider_ref)?
-        .model_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .map(ToString::to_string)
+    config.resolve_model_id(provider_ref)
 }
 
 /// The exact `file_read` read ledger for one image-marker path: the
@@ -115,9 +109,7 @@ pub(crate) async fn resolve_vision_provider_with_allowed_refs(
         && !model_provider.capabilities_for_model(dispatch_model).vision
     {
         if let Some(ref vp) = multimodal_config.vision_model_provider {
-            let policy_ref = config
-                .and_then(|config| config.providers.models.profile_ref(vp))
-                .map_or_else(|| vp.clone(), |(family, alias)| format!("{family}.{alias}"));
+            let policy_ref = vp.clone();
             let provider_allowed = allowed_provider_refs.map_or_else(
                 || zeroclaw_providers::reliable::provider_ref_allowed_for_turn(&policy_ref),
                 |allowed| allowed.contains(&policy_ref),
