@@ -177,6 +177,44 @@ impl SessionActorQueue {
         }
     }
 
+    /// Acquire exclusive access to a session only when it is free now: no
+    /// holder and nothing queued. Returns `Ok(None)` instead of waiting when
+    /// the session is busy. The check and the claim happen under the slot map
+    /// lock, so two callers cannot both see the session idle.
+    pub async fn try_acquire(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionGuard>, SessionQueueError> {
+        let registration = {
+            let mut slots = self.slots.lock().await;
+            let slot = slots
+                .entry(session_id.to_string())
+                .or_insert_with(|| {
+                    Arc::new(SessionSlot {
+                        semaphore: Arc::new(Semaphore::new(1)),
+                        last_active: Mutex::new(Instant::now()),
+                        pending: AtomicUsize::new(0),
+                    })
+                })
+                .clone();
+            if slot.pending.load(Ordering::Relaxed) > 0 {
+                return Ok(None);
+            }
+            let Ok(permit) = slot.semaphore.clone().try_acquire_owned() else {
+                return Ok(None);
+            };
+            slot.pending.fetch_add(1, Ordering::Relaxed);
+            (permit, PendingRegistration { slot })
+        };
+        let (permit, registration) = registration;
+        *registration.slot.last_active.lock().await = Instant::now();
+        Ok(Some(SessionGuard {
+            _permit: permit,
+            _registration: registration,
+            session_id: session_id.to_string(),
+        }))
+    }
+
     #[cfg(test)]
     fn set_registration_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
         *self.registration_hook.lock().unwrap() = Some(hook);

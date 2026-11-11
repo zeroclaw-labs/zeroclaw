@@ -1826,6 +1826,7 @@ impl DelegateTool {
                 live_config: self.live_config.clone(),
                 execution_capability: self.execution_capability.clone(),
                 acp_sessions: None,
+                session_prompts: false,
             })?,
             None => crate::tools::supplied_registry_base()?,
         };
@@ -5599,6 +5600,10 @@ impl DelegateTool {
                 tool.name() == Self::NAME || !tool.requires_unrestricted_principal()
             });
         }
+        // `sessions_prompt` speaks as the agent whose registry built it, and
+        // a foreground child still runs inside that agent's RPC turn. A child
+        // never inherits it.
+        sub_tools.retain(|tool| tool.name() != "sessions_prompt");
 
         // A delegation from inside a headless SOP step carries that step's tool
         // boundary onto the target. Both modes reach it: bounded starts from the
@@ -9908,6 +9913,7 @@ mod tests {
                 live_config: None,
                 execution_capability: None,
                 acp_sessions: None,
+                session_prompts: false,
             },
         )
         .unwrap();
@@ -17734,6 +17740,98 @@ target = "memory_recall"
     }
 
     #[tokio::test]
+    async fn bounded_children_never_inherit_sessions_prompt() {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "caller".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec![
+                    "sessions_prompt".to_string(),
+                    DelegateTool::NAME.to_string(),
+                ],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "target".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["sessions_prompt".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "caller".into(),
+                model_provider: "ollama.caller".into(),
+                delegates: vec![DelegateTargetConfig::bounded("target")],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "target".into(),
+                runtime_profile: "agentic".into(),
+                model_provider: "ollama.target".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_policy))
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(
+                zeroclaw_tools::sessions_prompt::SessionsPromptTool::new("caller"),
+            )])));
+        let target_config = config
+            .agents
+            .get("target")
+            .expect("target agent exists")
+            .clone();
+
+        // The provider fails the turn if it is offered any tool.
+        let result = tool
+            .execute_agentic(
+                "target",
+                &target_config,
+                "ollama",
+                "test-model",
+                &ToolCountModelProvider { expected_tools: 0 },
+                "prompt another session",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "got: {:?}", result.error);
+    }
+
+    #[tokio::test]
     async fn bounded_agentic_tools_drop_deliver_file_without_acp_transport() {
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
         use zeroclaw_config::schema::{
@@ -20275,9 +20373,11 @@ target = "spawn_subagent"
         // A credential that is no longer an administrator withholds every
         // tool that requires an unrestricted principal, the session-data
         // tools included, and keeps the rest.
+        // Only RPC session registries hold `sessions_prompt`.
         let withheld: Vec<&str> = crate::tools::SESSION_DATA_TOOL_NAMES
             .iter()
             .copied()
+            .filter(|name| *name != "sessions_prompt")
             .chain(["spawn_subagent", alias.as_str()])
             .collect();
         let before = target_tool_names(&tool).await;
@@ -20686,9 +20786,11 @@ target = "sessions_history"
             .with_runtime(Arc::new(DelegateTestRuntime));
         let alias = crate::tools::skill_tool::composed_tool_name("peek", "history");
 
+        // Only RPC session registries hold `sessions_prompt`.
         let withheld: Vec<&str> = crate::tools::SESSION_DATA_TOOL_NAMES
             .iter()
             .copied()
+            .filter(|name| *name != "sessions_prompt")
             .chain(["spawn_subagent", alias.as_str()])
             .collect();
         let before = target_tool_names(&tool).await;

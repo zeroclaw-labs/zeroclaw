@@ -445,6 +445,15 @@ pub struct SessionStore {
     test_retirement_commit_hook: std::sync::Mutex<Option<RetirementCommitHook>>,
 }
 
+/// How a prompt waits for its session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptAdmission {
+    /// Queue behind the running turn.
+    Wait,
+    /// Refuse at once when a turn is running or queued.
+    IfIdle,
+}
+
 /// Generation-owned handle for the canonical cancellation-token registration.
 ///
 /// The token map in [`SessionStore`] remains the source of truth. This handle
@@ -2090,6 +2099,7 @@ impl SessionStore {
     /// with respect to cancellation signals. Each poll releases the token lock
     /// before yielding, so queued prompts neither block signals nor replace the
     /// active prompt's token.
+    #[cfg(test)]
     pub(crate) async fn acquire_prompt<'a>(
         &'a self,
         id: &'a str,
@@ -2102,16 +2112,45 @@ impl SessionStore {
         ),
         zeroclaw_infra::session_queue::SessionQueueError,
     > {
+        let admitted = self
+            .acquire_prompt_with(id, session_generation, token, PromptAdmission::Wait)
+            .await?;
+        Ok(admitted.expect("a waiting admission always admits or errors"))
+    }
+
+    /// [`Self::acquire_prompt`] with a choice of admission. Under
+    /// [`PromptAdmission::IfIdle`] a busy session yields `Ok(None)` at once
+    /// and nothing is registered.
+    pub(crate) async fn acquire_prompt_with<'a>(
+        &'a self,
+        id: &'a str,
+        session_generation: Option<u64>,
+        token: tokio_util::sync::CancellationToken,
+        admission_mode: PromptAdmission,
+    ) -> Result<
+        Option<(
+            zeroclaw_infra::session_queue::SessionGuard,
+            CancelTokenRegistration<'a>,
+        )>,
+        zeroclaw_infra::session_queue::SessionQueueError,
+    > {
         use std::future::{Future, poll_fn};
         use std::task::Poll;
 
-        let mut admission = std::pin::pin!(self.session_queue.acquire(id));
+        let queue = &self.session_queue;
+        let mut admission = std::pin::pin!(async move {
+            match admission_mode {
+                PromptAdmission::Wait => queue.acquire(id).await.map(Some),
+                PromptAdmission::IfIdle => queue.try_acquire(id).await,
+            }
+        });
         poll_fn(|cx| {
             let mut tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
             let guard = match admission.as_mut().poll(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                Poll::Ready(Ok(guard)) => guard,
+                Poll::Ready(Ok(None)) => return Poll::Ready(Ok(None)),
+                Poll::Ready(Ok(Some(guard))) => guard,
             };
             #[cfg(test)]
             if let Some(hook) = self.test_prompt_admission_hook.lock().unwrap().as_ref() {
@@ -2123,14 +2162,14 @@ impl SessionStore {
                 session_generation,
                 token.clone(),
             );
-            Poll::Ready(Ok((
+            Poll::Ready(Ok(Some((
                 guard,
                 CancelTokenRegistration {
                     store: self,
                     session_id: id,
                     generation: Some(generation),
                 },
-            )))
+            ))))
         })
         .await
     }

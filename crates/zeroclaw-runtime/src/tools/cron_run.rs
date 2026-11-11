@@ -492,6 +492,7 @@ mod tests {
             None,
             Some(execution_capability),
             None,
+            false,
         )
         .unwrap();
         if let Some(capabilities) = capabilities {

@@ -2565,6 +2565,7 @@ impl Agent {
             None,
             None,
             CapabilityBinding::ConfigBacked,
+            false,
         )
         .await
     }
@@ -2625,6 +2626,7 @@ impl Agent {
             None,
             execution_capability,
             CapabilityBinding::ConfigBacked,
+            false,
         )
         .await
     }
@@ -2659,6 +2661,7 @@ impl Agent {
             None,
             None,
             CapabilityBinding::ConfigBacked,
+            false,
         )
         .await
     }
@@ -2723,6 +2726,7 @@ impl Agent {
             None,
             execution_capability,
             CapabilityBinding::ConfigBacked,
+            false,
         )
         .await
     }
@@ -2815,6 +2819,7 @@ impl Agent {
             None,
             execution_capability,
             CapabilityBinding::ConfigBacked,
+            false,
         )
         .await
     }
@@ -2877,6 +2882,7 @@ impl Agent {
             None,
             execution_capability,
             CapabilityBinding::ConfigBacked,
+            false,
         )
         .await
     }
@@ -3079,6 +3085,7 @@ impl Agent {
             None,
             None,
             None,
+            false,
         )
         .await
     }
@@ -3197,6 +3204,7 @@ impl Agent {
                 principal_allowed_tools,
                 execution_capability,
                 binding,
+                true,
             ));
             drop(construction_admission);
             result
@@ -3228,6 +3236,7 @@ impl Agent {
         principal_allowed_tools: Option<Vec<String>>,
         execution_capability: Option<AgentExecutionCapability>,
         binding: CapabilityBinding,
+        session_prompts: bool,
     ) -> Result<Self> {
         let (capabilities, principal, supplied) = match binding {
             CapabilityBinding::ConfigBacked => (
@@ -3266,6 +3275,7 @@ impl Agent {
             live_model_config,
             principal_allowed_tools,
             execution_capability,
+            session_prompts,
         )
         .await
     }
@@ -3294,6 +3304,8 @@ impl Agent {
         // agent). Fed by the RPC dispatcher from the resolved grants.
         principal_allowed_tools: Option<Vec<String>>,
         execution_capability: Option<AgentExecutionCapability>,
+        // RPC session agents offer `sessions_prompt`; no other entry does.
+        session_prompts: bool,
     ) -> Result<Self> {
         let agent_cfg = config
             .agent(agent_alias)
@@ -3419,6 +3431,7 @@ impl Agent {
                 live_config: live_config.clone(),
                 execution_capability,
                 acp_sessions,
+                session_prompts,
             })?,
             None => tools::supplied_registry_base()?,
         };
@@ -6782,6 +6795,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .unwrap();
         crate::tools::scoped::ScopedToolRegistry::assemble(crate::tools::scoped::ScopedAssembly {
@@ -7108,6 +7122,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .unwrap();
         let registry = crate::tools::scoped::ScopedToolRegistry::assemble(

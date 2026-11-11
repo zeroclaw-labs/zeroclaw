@@ -4170,6 +4170,7 @@ pub(crate) async fn assemble_owned_execution_with_capabilities(
                 .as_ref()
                 .map(AgentExecutionAdmission::capability),
             acp_sessions: None,
+            session_prompts: false,
         })?,
         None => crate::tools::supplied_registry_base()?,
     };

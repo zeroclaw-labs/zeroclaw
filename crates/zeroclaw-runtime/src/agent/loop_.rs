@@ -1818,6 +1818,7 @@ async fn run_inner(
                     .map(AgentExecutionCapability::config_handle),
                 execution_capability: execution_capability.clone(),
                 acp_sessions: None,
+                session_prompts: false,
             })?,
             None => tools::supplied_registry_base()?,
         };
@@ -3905,6 +3906,7 @@ async fn process_message_inner(
                 live_config: live_config.clone(),
                 execution_capability: execution_capability.clone(),
                 acp_sessions: None,
+                session_prompts: false,
             })?,
             None => tools::supplied_registry_base()?,
         };
