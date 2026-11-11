@@ -1974,8 +1974,13 @@ impl UsageFold {
 /// event is authoritative for this retained-context estimate; `UsageFold`
 /// remains the provider-measured ledger. Any later accepted call (even one
 /// without usage) supersedes the estimate. Rejected billable attempts do not.
+///
+/// Both chat relays keep one: the in-process relay observes `TurnEvent`s, and
+/// the scoped relay in `chat_core` observes the core's `session/update`
+/// notifications, where `context_usage` is sent for exactly the accepted
+/// calls. Both go through [`Self::accepted_call`] and [`Self::trimmed`].
 #[derive(Debug, Default)]
-struct ContextDisplay {
+pub(crate) struct ContextDisplay {
     trimmed_input: Option<(u64, Option<&'static str>)>,
 }
 
@@ -1983,21 +1988,40 @@ impl ContextDisplay {
     fn observe(&mut self, event: &zeroclaw_api::agent::TurnEvent) {
         use zeroclaw_api::agent::TurnEvent;
         match event {
-            TurnEvent::Usage { accepted: true, .. } => self.trimmed_input = None,
+            TurnEvent::Usage { accepted: true, .. } => self.accepted_call(),
             TurnEvent::HistoryTrimmed {
                 dropped_messages,
-                tokens_after: Some(after),
+                tokens_after,
                 tokens_after_source,
                 ..
-            } if *dropped_messages > 0 => {
-                self.trimmed_input =
-                    Some((*after, tokens_after_source.map(|source| source.as_str())));
-            }
+            } => self.trimmed(*dropped_messages, *tokens_after, *tokens_after_source),
             _ => {}
         }
     }
 
-    fn add_to_done(&self, done: &mut serde_json::Value) {
+    /// A later accepted call measured the context again.
+    pub(crate) fn accepted_call(&mut self) {
+        self.trimmed_input = None;
+    }
+
+    /// A trim notice. Only one that dropped history and reports what was
+    /// kept moves the displayed count: a zero-drop floor notice describes a
+    /// rejected request, and a message-limit trim has no token count.
+    pub(crate) fn trimmed(
+        &mut self,
+        dropped_messages: usize,
+        tokens_after: Option<u64>,
+        tokens_after_source: Option<zeroclaw_api::agent::TokenCountSource>,
+    ) {
+        if dropped_messages == 0 {
+            return;
+        }
+        if let Some(after) = tokens_after {
+            self.trimmed_input = Some((after, tokens_after_source.map(|source| source.as_str())));
+        }
+    }
+
+    pub(crate) fn add_to_done(&self, done: &mut serde_json::Value) {
         if let Some((input, source)) = self.trimmed_input {
             done["context_input_tokens"] = input.into();
             if let Some(source) = source {
