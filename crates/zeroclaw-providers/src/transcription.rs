@@ -1150,12 +1150,11 @@ impl TranscriptionManager {
 
         let mut transcription_providers: HashMap<String, Box<dyn AsrProvider>> = HashMap::new();
 
-        let registry_has_asr = config.provider_registry().is_ok_and(|registry| {
-            registry
-                .models
-                .values()
-                .any(|model| model.capability() == Capability::Asr)
-        });
+        // The full `Config` is intentionally inspected by the caller before
+        // entering this legacy-section helper.  `TranscriptionConfig` is only
+        // the typed compatibility section and has no registry accessor of its
+        // own; use the admission result passed alongside it.
+        let registry_has_asr = canonical_available;
         if !registry_has_asr {
             Self::register_legacy_providers(&mut transcription_providers, config);
         }

@@ -1201,20 +1201,48 @@ impl TtsManager {
                     continue;
                 }
                 let result = registry.resolve_tts(model_ref).and_then(|resolved| {
-                    build_canonical_tts_provider(model_ref.as_str(), &resolved).map_err(|error| {
-                        zeroclaw_config::provider_registry::RegistryError::new(
-                            ["providers", "models", model_ref.as_str()],
-                            error.to_string(),
-                        )
-                    })
+                    build_canonical_tts_provider(model_ref.as_str(), &resolved)
+                        .map(|(provider, voice)| (resolved, provider, voice))
+                        .map_err(|error| {
+                            zeroclaw_config::provider_registry::RegistryError::new(
+                                ["providers", "models", model_ref.as_str()],
+                                error.to_string(),
+                            )
+                        })
                 });
                 match result {
-                    Ok((provider, voice)) => {
+                    Ok((resolved, provider, voice)) => {
                         let key = model_ref.to_string();
                         if let Some(voice) = voice {
                             voice_by_alias.insert(key.clone(), voice);
                         }
-                        tts_providers.insert(key, provider);
+                        tts_providers.insert(key.clone(), provider);
+                        // Legacy agents store typed speech selections as
+                        // `<family>.<alias>`.  The compatibility projection
+                        // names their canonical model `tts.<family>.<alias>`;
+                        // expose the old exact key while that source remains
+                        // present so loading a v3/v4 config does not break
+                        // its next synthesis request.
+                        if let Some(legacy_key) =
+                            model_ref.as_str().strip_prefix("tts.").filter(|_| {
+                                resolved
+                                    .selection
+                                    .provider_id
+                                    .as_str()
+                                    .starts_with("legacy.tts.")
+                            })
+                        {
+                            if let Ok((legacy_provider, _)) =
+                                build_canonical_tts_provider(model_ref.as_str(), &resolved)
+                            {
+                                tts_providers
+                                    .entry(legacy_key.to_owned())
+                                    .or_insert(legacy_provider);
+                                if let Some(voice) = voice_by_alias.get(&key).cloned() {
+                                    voice_by_alias.entry(legacy_key.to_owned()).or_insert(voice);
+                                }
+                            }
+                        }
                     }
                     Err(error) => {
                         ::zeroclaw_log::record!(

@@ -44,15 +44,35 @@ pub fn stage(config: &mut Config, edit: RegistryEdit) -> Result<()> {
     );
     let mut registry: super::ProviderRegistry =
         serde_json::from_value(edit.registry).context("invalid provider registry")?;
+    // `snapshot` is built from the projected registry, so legacy typed
+    // providers appear as generated `legacy.*` connections even though they
+    // are not stored in `providers.connections`.  Use that same projection to
+    // restore masked credentials during an unchanged edit.
+    let projected_current = config.provider_registry()?;
     for (id, connection) in &mut registry.connections {
-        if let Some(current) = config.providers.connections.get(id) {
+        if let Some(current) = config
+            .providers
+            .connections
+            .get(id)
+            .or_else(|| projected_current.connections.get(id))
+        {
             connection.restore_secrets_from(current);
         }
         connection.validate_editor_secrets()?;
     }
     let raw_models = serde_json::from_value(serde_json::to_value(&registry.models)?)?;
     let mut candidate = config.clone();
-    candidate.providers.connections = registry.connections;
+    // Generated compatibility connections are reconstructed from the legacy
+    // sections by `canonical_registry`; persisting them would make the next
+    // projection report a false explicit-name collision.  Keep only the
+    // connections that belong to the canonical source document.
+    candidate.providers.connections = registry
+        .connections
+        .into_iter()
+        .filter(|(id, _)| {
+            config.providers.connections.contains_key(id) || !id.as_str().starts_with("legacy.")
+        })
+        .collect();
     candidate.providers.models.canonical_models = raw_models;
     candidate.providers.model_presets = registry.model_presets;
     candidate.providers.fallback = registry.fallback;
