@@ -703,7 +703,9 @@ impl ModelRoutingConfigTool {
         zeroclaw_config::provider_registry::editor::update(&mut cfg, |registry| {
             let selected = registry
                 .models
-                .get_mut(&provider_name.as_str().into())
+                .get_mut(&zeroclaw_config::provider_registry::ModelRef::from(
+                    provider_name.as_str(),
+                ))
                 .ok_or_else(|| anyhow::Error::msg("Model reference does not exist"))?;
             let zeroclaw_config::provider_registry::ModelDefinition::Chat(selected) = selected
             else {
