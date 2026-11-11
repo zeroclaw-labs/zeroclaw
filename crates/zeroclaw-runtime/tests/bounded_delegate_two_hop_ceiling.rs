@@ -268,7 +268,8 @@ async fn drive_chain() -> Vec<BTreeSet<String>> {
         .position(|body| is_user_prompt(body, "work the second subtask"))
         .unwrap_or_else(|| {
             panic!(
-                "the chain never reached the leaf: {} model requests, none carrying the                  leaf's prompt",
+                "the chain never reached the leaf: {} model requests, none carrying the \
+                 leaf's prompt",
                 bodies.len()
             )
         });
@@ -293,17 +294,12 @@ fn drive_chain_blocking() -> Vec<BTreeSet<String>> {
     })
 }
 
-/// Requests 0, 1 and 2 are the caller, `mid` and `leaf`; later requests are the
-/// chain unwinding, where a set legitimately grows again.
+/// `drive_chain` returns exactly the caller's, `mid`'s and the leaf's requests, in
+/// that order, and panics when the leaf's prompt never reaches the provider.
 const DESCENT_LEVELS: usize = 3;
 
 fn descent() -> Vec<BTreeSet<String>> {
     let levels = drive_chain_blocking();
-    assert!(
-        levels.len() >= DESCENT_LEVELS,
-        "chain did not reach the leaf: only {} model requests, sets {levels:?}",
-        levels.len()
-    );
     assert!(
         levels[1].contains("delegate"),
         "the middle level was never offered `delegate`, so the second hop is not what \

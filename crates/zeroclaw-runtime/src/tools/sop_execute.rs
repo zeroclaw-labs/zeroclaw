@@ -616,9 +616,9 @@ mod tests {
         );
     }
 
-    /// The audit rows of one run stay on one plane. In a session pinned to an
-    /// owner, `log_run_start` goes to the owner's plane (through the session
-    /// route); a run this call then cancels must be closed on that same plane,
+    /// The audit rows of one run stay on one plane. In a session whose route is
+    /// pinned to another plane, `log_run_start` goes to that plane (through the
+    /// session route); a run this call then cancels must be closed on that same plane,
     /// not on the logger the tool captured at construction. Otherwise the
     /// owner's trail keeps a run that never closes, and a completion with no
     /// start lands on the shared plane.
@@ -672,7 +672,7 @@ mod tests {
             .unwrap();
         assert!(
             on_shared.is_none(),
-            "nothing of an owned run reaches the shared plane: {on_shared:?}"
+            "nothing of a run logged on the pinned plane reaches the shared plane: {on_shared:?}"
         );
     }
 
