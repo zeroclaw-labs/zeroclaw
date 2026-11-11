@@ -1484,7 +1484,7 @@ impl TelegramChannel {
     ) -> Option<ModelPickerExclusion> {
         if !Self::is_safe_model_picker_field(&selected.hint)
             || !Self::is_safe_model_picker_field(&selected.model_provider)
-            || !Self::is_safe_model_picker_field(&selected.model)
+            || (!selected.model.is_empty() && !Self::is_safe_model_picker_field(&selected.model))
         {
             return Some(ModelPickerExclusion::UnsafeField);
         }
@@ -14156,7 +14156,7 @@ mod tests {
         assert!(markup.contains("✓ anthropic.team"));
         assert!(!markup.contains("gpt-5.6"));
         let pending = channel.pending_model_pickers.lock().await;
-        assert_eq!(pending.len(), 4);
+        assert_eq!(pending.len(), 5, "four model categories plus cancel");
         assert!(pending.values().all(|state| {
             state.requesting_user_id == "123"
                 && state.reply_target == "-10042:9"
@@ -14226,7 +14226,7 @@ mod tests {
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 2);
         let pending = channel.pending_model_pickers.lock().await;
-        assert_eq!(pending.len(), 4);
+        assert_eq!(pending.len(), 5, "four model categories plus cancel");
         assert!(pending.values().all(|state| {
             state.requesting_user_id == "123"
                 && state.reply_target == "-10042:9"

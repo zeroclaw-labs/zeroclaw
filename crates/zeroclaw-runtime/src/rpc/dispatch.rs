@@ -45502,13 +45502,13 @@ model = "before"
                 hint: "reasoning".into(),
                 model_ref: "openai.routed-provider".into(),
             });
+        let expected = zeroclaw_config::provider_registry::editor::snapshot(&config).unwrap();
+        let mut registry = expected.clone();
+        registry["models"]["openai.routed-provider"]["metadata"]["context_window"] = json!(16_000);
         let dispatcher = make_config_set_test_dispatcher(config);
         let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
         let res = dispatcher
-            .handle_config_set(&json!({
-                "prop": "providers.models.openai.routed-provider.context_window",
-                "value": 16_000
-            }))
+            .handle_config_registry_set(&json!({"expected": expected, "registry": registry}))
             .await;
         assert!(
             res.is_ok(),

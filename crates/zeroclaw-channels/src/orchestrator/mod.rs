@@ -30775,7 +30775,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 generation: 1,
             }));
         context.provider_cache.lock().unwrap().insert(
-            provider_cache_key("custom.local", "old-model", None, 1),
+            provider_cache_key("custom.local", "admitted-model", None, 1),
             Arc::new(NativeModelToolsProvider),
         );
         process_channel_message(
@@ -33944,8 +33944,7 @@ BTC is currently around $65,000 based on latest tool output."#
              the same synthetic row again"
         );
 
-        // After the switch handler runs, the route override must be
-        // persisted for this sender with the resolved api_key.
+        // Persist only the selection; credentials remain connection-owned.
         let persisted = runtime_ctx
             .route_overrides
             .lock()
@@ -33961,9 +33960,8 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(persisted.model, "switched-model");
         assert_eq!(
             persisted.api_key.as_deref(),
-            Some("route-specific-key"),
-            "the route-specific api_key from model_routes must be persisted, \
-             not the global key or None — otherwise the next turn loses route auth"
+            None,
+            "canonical route credentials must be resolved from its connection"
         );
 
         // Send a second message from the same sender, with no pending
@@ -34053,7 +34051,10 @@ BTC is currently around $65,000 based on latest tool output."#
             .provider_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert("openai.my-classifier".to_string(), classifier_provider);
+            .insert(
+                provider_cache_key("openai.my-classifier", "fast-intent", None, 0),
+                classifier_provider,
+            );
 
         process_channel_message(
             runtime_ctx,
@@ -43613,14 +43614,14 @@ BTC is currently around $65,000 based on latest tool output."#
                     },
                 ));
                 let switching = Arc::new(ModelSwitchRequestProvider::default());
-                ctx.provider_cache
-                    .lock()
-                    .unwrap()
-                    .insert("custom.cloud".into(), switching.clone());
-                ctx.provider_cache
-                    .lock()
-                    .unwrap()
-                    .insert("openrouter.default".into(), provider.clone());
+                ctx.provider_cache.lock().unwrap().insert(
+                    provider_cache_key("custom.cloud", "cloud-model", None, 0),
+                    switching.clone(),
+                );
+                ctx.provider_cache.lock().unwrap().insert(
+                    provider_cache_key("openrouter.default", "switched-model", None, 0),
+                    provider.clone(),
+                );
                 let ctx = Arc::new(ctx);
                 let channel: Arc<dyn Channel> = channel_impl;
                 let mut command = scope_test_msg("alice", "chan-1", None);

@@ -92,7 +92,6 @@ impl ResolvedEffortRoute<'_> {
         config: &zeroclaw_config::schema::Config,
     ) -> HashSet<String> {
         let mut allowed = HashSet::new();
-        let registry = config.provider_registry().ok();
         for reference in &self.allowed_provider_refs {
             let trimmed = reference.trim();
             if trimmed.is_empty() {
@@ -105,14 +104,9 @@ impl ResolvedEffortRoute<'_> {
                 .canonical_model(&canonical)
                 .is_some()
             {
-                // Canonical model names are exact TOML keys. Include their
-                // reachable fallback chain under the same exact spelling.
+                // Admission is defined by the effort policy, not reliability.
+                // A local turn must not grant a cloud fallback implicitly.
                 allowed.insert(trimmed.to_owned());
-                if let Some(registry) = registry.as_ref()
-                    && let Ok(fallbacks) = registry.fallback_chain(&canonical)
-                {
-                    allowed.extend(fallbacks.into_iter().map(|item| item.to_string()));
-                }
                 continue;
             }
 
@@ -456,7 +450,7 @@ model = "cloud-model"
         zeroclaw_config::migration::bind_test_route_model(
             &mut config,
             "custom.local.edge.small",
-            "small",
+            "local-model",
             None,
         );
         zeroclaw_config::migration::bind_test_route_model(

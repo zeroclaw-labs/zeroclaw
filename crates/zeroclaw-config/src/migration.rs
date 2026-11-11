@@ -34,6 +34,7 @@ pub fn bind_test_route_model(
             &profiles[selection.family][selection.alias],
             selection.family,
             selection.model_entry,
+            Some(model_id),
         )
         .unwrap()
     } else {
@@ -6592,9 +6593,10 @@ model = "fast-model"
 
     /// The value at a dotted path, or `None`.
     fn value_at<'a>(value: &'a toml::Value, dotted: &str) -> Option<&'a toml::Value> {
-        dotted
-            .split('.')
-            .try_fold(value, |value, key| value.get(key))
+        toml_edit::Key::parse(dotted)
+            .ok()?
+            .iter()
+            .try_fold(value, |value, key| value.get(key.get()))
     }
 
     /// One file per way an older layout differs from the current one, each
@@ -7320,8 +7322,9 @@ model = "fast-model"
         match value {
             toml::Value::Table(table) => {
                 for (key, child) in table {
+                    let key = toml_edit::Key::new(key.as_str()).to_string();
                     let path = if prefix.is_empty() {
-                        key.clone()
+                        key
                     } else {
                         format!("{prefix}.{key}")
                     };
@@ -7409,6 +7412,12 @@ model = "fast-model"
         let mut fixture: toml::Table = toml::from_str(include_str!("../fixtures/v4.toml")).unwrap();
         for key in ["schema_version", "tools"] {
             fixture.remove(key);
+        }
+        // Canonical registry sections are also newer-layout evidence.
+        if let Some(toml::Value::Table(providers)) = fixture.get_mut("providers") {
+            for key in ["connections", "model_presets", "fallback"] {
+                providers.remove(key);
+            }
         }
         for path in V3_ONLY_SECTIONS {
             let (last, parents) = path.split_last().unwrap();
@@ -7720,17 +7729,17 @@ model = "fast-model"
 
     /// `root` with `value` set at a dotted path, creating tables on the way.
     fn set_at(root: &mut toml::Value, dotted: &str, value: toml::Value) {
-        let mut keys: Vec<&str> = dotted.split('.').collect();
+        let mut keys = toml_edit::Key::parse(dotted).unwrap();
         let last = keys.pop().unwrap();
         let mut table = root.as_table_mut().unwrap();
         for key in keys {
             table = table
-                .entry(key)
+                .entry(key.get())
                 .or_insert_with(|| toml::Value::Table(toml::Table::new()))
                 .as_table_mut()
                 .unwrap_or_else(|| panic!("`{dotted}` crosses a value"));
         }
-        table.insert(last.to_string(), value);
+        table.insert(last.get().to_string(), value);
     }
 
     /// An older setting beside a V3 value at a place its own migration

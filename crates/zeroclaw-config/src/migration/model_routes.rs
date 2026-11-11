@@ -78,12 +78,17 @@ pub(super) fn migrate(mut document: toml::Value) -> Result<toml::Value> {
             } else if let Some(selection) = config.resolve_model_selection(reference) {
                 let profiles = serde_json::to_value(&config.providers.models)?;
                 let raw = profiles[selection.family][selection.alias].clone();
-                legacy_model(&raw, selection.family, selection.model_entry)?
+                legacy_model(
+                    &raw,
+                    selection.family,
+                    selection.model_entry,
+                    explicit_model,
+                )?
             } else if !reference.is_empty() && explicit_model.is_some() {
                 let family = reference
                     .split_once('.')
                     .map_or(reference, |(family, _)| family);
-                legacy_model(&json!({}), family, None)?
+                legacy_model(&json!({}), family, None, explicit_model)?
             } else {
                 // Keep an invalid/incomplete reference invalid for the normal
                 // config validator; never silently substitute the primary.
@@ -132,6 +137,7 @@ pub(super) fn legacy_model(
     raw: &Value,
     family: &str,
     entry: Option<&crate::schema::ModelEntryConfig>,
+    model_override: Option<&str>,
 ) -> Result<(Value, Value)> {
     let kind = raw.get("kind").and_then(Value::as_str).unwrap_or(family);
     let kind = if kind == "openai-compatible" {
@@ -194,14 +200,23 @@ pub(super) fn legacy_model(
         }
     }
     let mut api = Map::new();
-    for (old, new) in [
-        ("wire_api", "wire_api"),
-        ("timeout_secs", "request_timeout_secs"),
-        ("live_pricing", "live_pricing"),
-        ("binary_path", "binary_path"),
-        ("extra_args", "extra_args"),
-        ("timeout_ms", "timeout_ms"),
-    ] {
+    let fields: &[(&str, &str)] = match kind {
+        "gemini_cli" | "kilocli" => &[("binary_path", "binary_path")],
+        "grok_cli" => &[
+            ("binary_path", "binary_path"),
+            ("working_directory", "working_directory"),
+            ("env_passthrough", "env_passthrough"),
+            ("extra_args", "extra_args"),
+            ("max_acp_stdout_bytes", "max_acp_stdout_bytes"),
+        ],
+        "hailo_ollama" => &[("queue_timeout_secs", "queue_timeout_secs")],
+        _ => &[
+            ("wire_api", "wire_api"),
+            ("timeout_secs", "request_timeout_secs"),
+            ("live_pricing", "live_pricing"),
+        ],
+    };
+    for &(old, new) in fields {
         if let Some(value) = raw.get(old).filter(|value| !value.is_null()) {
             api.insert(new.into(), value.clone());
         }
@@ -235,14 +250,40 @@ pub(super) fn legacy_model(
             metadata.insert(field.into(), value.clone());
         }
     }
+    let model_id = model_override.map(Value::from).or_else(|| {
+        entry
+            .get("id")
+            .filter(|value| !value.is_null())
+            .cloned()
+            .or_else(|| raw.get("model").filter(|value| !value.is_null()).cloned())
+    });
+    if let Some(id) = model_id.as_ref().and_then(Value::as_str)
+        && let Some(prices) = raw.get("pricing").and_then(Value::as_object)
+    {
+        let mut rates = Map::new();
+        for (suffix, field) in [
+            ("input", "input_per_mtok"),
+            ("output", "output_per_mtok"),
+            ("cached_input", "cached_input_per_mtok"),
+            ("cache_write", "cache_write_per_mtok"),
+        ] {
+            let rate = prices.get(&format!("{id}.{suffix}")).or_else(|| {
+                matches!(suffix, "input" | "output")
+                    .then(|| prices.get(id))
+                    .flatten()
+            });
+            if let Some(rate) = rate {
+                rates.insert(field.into(), rate.clone());
+            }
+        }
+        if !rates.is_empty() {
+            metadata.insert("pricing".into(), rates.into());
+        }
+    }
     let mut model =
         json!({"capability":"chat", "provider":"", "options":options, "metadata":metadata});
-    if let Some(id) = entry
-        .get("id")
-        .or_else(|| raw.get("model"))
-        .filter(|value| !value.is_null())
-    {
-        model["model"] = id.clone();
+    if let Some(id) = model_id {
+        model["model"] = id;
     }
     if kind == "azure"
         && let Some(deployment) = raw.get("deployment")
@@ -257,4 +298,60 @@ pub(super) fn legacy_model(
         model["extra"] = json!({"server_fallback_models":fallbacks});
     }
     Ok((connection, model))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_routes_preserve_driver_settings_without_http_fields() {
+        for kind in ["gemini_cli", "kilocli", "grok_cli", "hailo_ollama"] {
+            let raw = json!({
+                "model":"selected", "timeout_secs":30, "binary_path":"/usr/bin/driver",
+                "working_directory":"/workspace", "env_passthrough":["XAI_API_KEY"],
+                "extra_args":["--sandbox=strict"], "max_acp_stdout_bytes":1048576,
+                "queue_timeout_secs":12
+            });
+            let (connection, _) = legacy_model(&raw, kind, None, None).unwrap();
+            let decoded: ProviderConnection = serde_json::from_value(connection.clone()).unwrap();
+            assert_eq!(decoded.kind(), kind);
+            assert!(
+                connection["api"]["chat"]
+                    .get("request_timeout_secs")
+                    .is_none()
+            );
+            if kind == "grok_cli" {
+                for field in [
+                    "binary_path",
+                    "working_directory",
+                    "env_passthrough",
+                    "extra_args",
+                    "max_acp_stdout_bytes",
+                ] {
+                    assert_eq!(connection["api"]["chat"][field], raw[field]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn route_prices_follow_the_selected_model_including_explicit_override() {
+        let raw = json!({"model":"primary", "pricing":{
+            "primary":1.0, "target":2.0, "target.output":5.0,
+            "target.cached_input":0.5, "target.cache_write":3.0
+        }});
+        let (_, model) = legacy_model(&raw, "openai", None, Some("target")).unwrap();
+        assert_eq!(model["model"], "target");
+        assert_eq!(
+            model["metadata"]["pricing"],
+            json!({
+                "input_per_mtok":2.0, "output_per_mtok":5.0,
+                "cached_input_per_mtok":0.5, "cache_write_per_mtok":3.0
+            })
+        );
+        let (_, model) = legacy_model(&raw, "openai", None, None).unwrap();
+        assert_eq!(model["metadata"]["pricing"]["input_per_mtok"], 1.0);
+        assert_eq!(model["metadata"]["pricing"]["output_per_mtok"], 1.0);
+    }
 }
