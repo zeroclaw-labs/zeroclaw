@@ -637,11 +637,19 @@ impl ProviderDispatch {
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(&*self.inner);
         accounted_chat_call(&*self.inner, model, async move {
-            zeroclaw_log::scope!(
+            let result = zeroclaw_log::scope!(
                 model: model,
                 => self.inner.chat_with_attempt_budget(request, model, temperature, policy, budget)
             )
-            .await
+            .await;
+            if let Err(error) = &result
+                && error.chain().any(|source| {
+                    source.is::<zeroclaw_api::model_provider::BoundedChatUnsupported>()
+                })
+            {
+                accounting::suppress_current_attempt();
+            }
+            result
         })
         .instrument(span)
         .await
@@ -1019,11 +1027,19 @@ impl<'a> ProviderDispatchRef<'a> {
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(self.inner);
         accounted_chat_call(self.inner, model, async move {
-            zeroclaw_log::scope!(
+            let result = zeroclaw_log::scope!(
                 model: model,
                 => self.inner.chat_with_attempt_budget(request, model, temperature, policy, budget)
             )
-            .await
+            .await;
+            if let Err(error) = &result
+                && error.chain().any(|source| {
+                    source.is::<zeroclaw_api::model_provider::BoundedChatUnsupported>()
+                })
+            {
+                accounting::suppress_current_attempt();
+            }
+            result
         })
         .instrument(span)
         .await

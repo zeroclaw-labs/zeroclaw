@@ -437,6 +437,140 @@ async fn unsupported_default_sends_nothing_and_failover_can_continue() {
     assert_eq!(budget.remaining(), 1);
 }
 
+async fn dispatch_call(
+    provider: Arc<dyn ModelProvider>,
+    owned: bool,
+    budget: &GenerationAttemptBudget,
+    tools: Option<&[zeroclaw_api::tool::ToolSpec]>,
+) -> anyhow::Result<zeroclaw_api::model_provider::ChatResponse> {
+    let messages = [ChatMessage::user("fixture")];
+    let request = ChatRequest {
+        messages: &messages,
+        tools,
+        thinking: None,
+    };
+    if owned {
+        crate::ProviderDispatch::new(provider)
+            .chat_with_attempt_budget(request, "gpt-5", None, ToolRoundPolicy::Single, budget)
+            .await
+    } else {
+        crate::ProviderDispatch::from_ref(&*provider)
+            .chat_with_attempt_budget(request, "gpt-5", None, ToolRoundPolicy::Single, budget)
+            .await
+    }
+}
+
+#[tokio::test]
+async fn dispatch_unsupported_declines_are_not_physical_attempts() {
+    for owned in [false, true] {
+        let providers: Vec<Arc<dyn ModelProvider>> = vec![
+            Arc::new(Unsupported),
+            Arc::new(WrappedRejection {
+                terminal: false,
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
+        ];
+        for provider in providers {
+            let scope = crate::dispatch::AccountedChatScope::new();
+            let budget = GenerationAttemptBudget::new(2);
+            let error = scope
+                .scope(dispatch_call(provider, owned, &budget, None))
+                .await
+                .unwrap_err();
+            assert!(error.chain().any(|source| {
+                source.is::<zeroclaw_api::model_provider::BoundedChatUnsupported>()
+            }));
+            assert_eq!(budget.remaining(), 2);
+            let report = scope.take();
+            assert!(report.attempts().is_empty(), "owned={owned}: {report:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn dispatch_unsupported_failover_keeps_complete_accounting() {
+    for owned in [false, true] {
+        let server = server(vec![Reply::json(
+            200,
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":3,"completion_tokens":2}}"#,
+        )])
+        .await;
+        let provider = crate::reliable::ReliableModelProvider::new(
+            "fixture",
+            vec![
+                ("unsupported".into(), Box::new(Unsupported)),
+                ("fallback".into(), leaf("fallback")),
+            ],
+            2,
+            0,
+        );
+        let budget = GenerationAttemptBudget::new(2);
+        let scope = crate::dispatch::AccountedChatScope::new();
+        let response = scope
+            .scope(at_endpoint(
+                &server.url,
+                dispatch_call(Arc::new(provider), owned, &budget, None),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.text.as_deref(), Some("ok"));
+        scope.mark_logical_success();
+        let report = scope.take();
+        assert_eq!(server.requests.lock().len(), 1);
+        assert_eq!(budget.remaining(), 1);
+        assert_eq!(report.attempts().len(), 1, "owned={owned}: {report:?}");
+        assert_eq!(report.attempts()[0].provider_ref(), "fallback");
+        assert_eq!(report.attempts()[0].model(), "gpt-5");
+        assert!(matches!(
+            report.attempts()[0].outcome(),
+            crate::dispatch::AttemptUsageOutcome::Complete(usage)
+                if usage.input_tokens == Some(3) && usage.output_tokens == Some(2)
+        ));
+        assert_eq!(
+            report.accounting_state(),
+            crate::dispatch::CallAccountingState::Complete
+        );
+    }
+}
+
+#[tokio::test]
+async fn dispatch_adapter_exhaustion_keeps_sent_attempt() {
+    for owned in [false, true] {
+        let server = server(vec![Reply::json(
+            400,
+            r#"{"error":{"message":"Function tools with reasoning effort are not supported"}}"#,
+        )])
+        .await;
+        let budget = GenerationAttemptBudget::new(1);
+        let tools = [zeroclaw_api::tool::ToolSpec::new(
+            "fixture",
+            "fixture",
+            serde_json::json!({"type":"object"}),
+        )];
+        let scope = crate::dispatch::AccountedChatScope::new();
+        let error = scope
+            .scope(at_endpoint(
+                &server.url,
+                dispatch_call(Arc::from(leaf("http")), owned, &budget, Some(&tools)),
+            ))
+            .await
+            .unwrap_err();
+        assert!(error.is::<GenerationAttemptBudgetExhausted>(), "{error:#}");
+        assert_eq!(server.requests.lock().len(), 1);
+        assert_eq!(budget.remaining(), 0);
+        let report = scope.take();
+        assert_eq!(report.attempts().len(), 1, "owned={owned}: {report:?}");
+        assert!(matches!(
+            report.attempts()[0].outcome(),
+            crate::dispatch::AttemptUsageOutcome::OutcomeUnknown { observed: None }
+        ));
+        assert_eq!(
+            report.accounting_state(),
+            crate::dispatch::CallAccountingState::OutcomeUnknown
+        );
+    }
+}
+
 #[tokio::test]
 async fn wrappers_forward_one_budget_and_the_pinned_model() {
     let server = server(vec![Reply::json(200, CHAT_OK), Reply::json(200, CHAT_OK)]).await;
