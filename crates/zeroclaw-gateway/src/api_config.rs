@@ -2556,7 +2556,9 @@ pub async fn handle_refresh_context_window(
     if let Err(error) =
         zeroclaw_config::provider_registry::editor::update(&mut working, |registry| {
             let Some(zeroclaw_config::provider_registry::ModelDefinition::Chat(model)) =
-                registry.models.get_mut(&reference.as_str().into())
+                    registry.models.get_mut(
+                        &zeroclaw_config::provider_registry::ModelRef::from(reference.as_str()),
+                    )
             else {
                 anyhow::bail!("chat model reference no longer exists");
             };

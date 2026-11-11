@@ -785,7 +785,9 @@ pub async fn update_context_windows(
         zeroclaw_config::provider_registry::editor::update(config, |registry| {
             for (reference, window) in &windows {
                 let Some(zeroclaw_config::provider_registry::ModelDefinition::Chat(model)) =
-                    registry.models.get_mut(&reference.as_str().into())
+                    registry.models.get_mut(
+                        &zeroclaw_config::provider_registry::ModelRef::from(reference.as_str()),
+                    )
                 else {
                     anyhow::bail!("context-window target disappeared");
                 };
