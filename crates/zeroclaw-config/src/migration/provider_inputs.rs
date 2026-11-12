@@ -231,7 +231,27 @@ fn providers_for_input(config: &Config) -> Result<crate::providers::Providers> {
         let key = ModelRef::from(alias.as_str());
         // An exact canonical selection is authoritative, including its
         // capability. Never reinterpret a colliding chat model as decision.
-        if providers.models.canonical_model(&key).is_some() {
+        // A legacy environment override is still applied to that model's
+        // admitted connection before the retired table is discarded.
+        if let Some(model) = providers.models.canonical_model(&key) {
+            let path = format!("decision_models.{alias}.api_key");
+            if config.env_overridden_paths.contains(&path) {
+                if let Some(api_key) = legacy.api_key.as_deref() {
+                    if let Some(connection) = providers.connections.get_mut(model.provider()) {
+                        let mut value = serde_json::to_value(&*connection)?;
+                        let Some(object) = value.as_object_mut() else {
+                            continue;
+                        };
+                        let auth = object.entry("auth").or_insert_with(|| json!({}));
+                        let Some(auth) = auth.as_object_mut() else {
+                            continue;
+                        };
+                        auth.insert("mode".into(), json!("api_key"));
+                        auth.insert("api_key".into(), json!(api_key));
+                        *connection = serde_json::from_value(value)?;
+                    }
+                }
+            }
             continue;
         }
         let Some((uri, model)) = legacy.endpoint() else {
@@ -1285,6 +1305,38 @@ mod tests {
         assert_eq!(
             config.providers.connections["legacy.decision.hosted"].api_key(),
             Some("disk-fixture-key")
+        );
+        assert!(config.decision_models.is_empty());
+    }
+
+    #[test]
+    fn decision_env_credentials_override_colliding_canonical_connection() {
+        let mut config: Config = toml::from_str(
+            r#"
+            [decision_models.shared]
+            api_key = "disk-fixture-key"
+
+            [providers.connections.native]
+            kind = "openai"
+
+            [providers.models.shared]
+            capability = "decision"
+            provider = "native"
+            model = "native-decision"
+        "#,
+        )
+        .unwrap();
+        let path = "decision_models.shared.api_key";
+        let saved = crate::env_overrides::raw_value_for_path(&config, path).unwrap();
+        config.decision_models.get_mut("shared").unwrap().api_key = Some("env-fixture-key".into());
+        config.pre_override_snapshots.insert(path.into(), saved);
+        config.env_overridden_paths.insert(path.into());
+
+        normalize(&mut config).unwrap();
+
+        assert_eq!(
+            config.providers.connections["native"].api_key(),
+            Some("env-fixture-key")
         );
         assert!(config.decision_models.is_empty());
     }
