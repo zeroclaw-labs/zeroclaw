@@ -707,6 +707,16 @@ identity it presented in its handshake until it is dropped or closed. Dropping
 it, or cancelling the call that is still opening it, releases the
 configuration together with the connection lease.
 
+Authenticated operators can manage the values for existing profile bindings
+under **Config → Storage → Secrets → Plugin TLS credentials**. The panel
+lists the plugin instance, property, TLS profiles, destination hosts, and
+whether the property is configured. Enter a new PEM value to set or replace
+it. Saving requires secret encryption and an initialized encryption key.
+
+Deleting a value can interrupt connections that depend on its TLS profile.
+Deletion affects the current ZeroClaw configuration. Upstream credential
+revocation and backup retention are separate operations.
+
 ### Per-plugin config (`__config` and `config.get`)
 
 **Permission:** `config_read`

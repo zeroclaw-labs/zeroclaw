@@ -1,3 +1,4 @@
+import PluginTlsCredentials from "../components/sections/PluginTlsCredentials";
 // Schema-driven config editor (#6175). Curated section explorer
 // but lands on a per-section overview: pick a section in the sidebar, see
 // what's currently configured under it, click an item to edit, click +Add
@@ -227,6 +228,29 @@ export default function Config() {
 
   const mainContent = (() => {
     if (!activeSection) return null;
+
+    if (activeSection.key === "secrets") {
+      return (
+        <SectionTabs
+          tabs={[
+            { key: "settings", label: "Settings", render: () => (
+                <FieldForm
+                  key={reloadKey}
+                  prefix="secrets"
+                  title={activeSection.label}
+                  onSaved={fetchDrift}
+                  drift={drifted}
+                />
+              ) },
+            {
+              key: "plugin-tls-credentials",
+              label: "Plugin TLS credentials",
+              render: () => <PluginTlsCredentials />,
+            },
+          ]}
+        />
+      );
+    }
 
     if (!activeSection.has_picker) {
       return (

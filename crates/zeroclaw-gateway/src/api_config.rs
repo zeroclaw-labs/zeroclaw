@@ -730,7 +730,9 @@ fn reject_masked_secret_value(
     value: &str,
 ) -> Result<(), ConfigApiError> {
     if is_sensitive
-        && (value == zeroclaw_config::traits::MASKED_SECRET || value == "****" || value.is_empty())
+        && (reject_masked_secret_value("", true, &value).is_err()
+            || value == "****"
+            || value.is_empty())
     {
         return Err(ConfigApiError::new(
             ConfigApiCode::ValidationFailed,
@@ -1000,6 +1002,217 @@ pub(crate) async fn try_compute_drift(
 }
 
 // ── Handlers ────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct PluginTlsCredential {
+    instance: String,
+    property: String,
+    configured: bool,
+    profiles: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+fn plugin_tls_credentials(config: &zeroclaw_config::schema::Config) -> Vec<PluginTlsCredential> {
+    let mut credentials = std::collections::BTreeMap::new();
+    for entry in &config.plugins.entries {
+        for profile in &entry.tls_profiles {
+            for property in [
+                &profile.custom_ca_secret,
+                &profile.client_certificate_secret,
+                &profile.client_private_key_secret,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let credential = credentials
+                    .entry((&entry.name, property))
+                    .or_insert_with(|| PluginTlsCredential {
+                        instance: entry.name.clone(),
+                        property: property.clone(),
+                        configured: entry
+                            .config
+                            .get(property)
+                            .is_some_and(|value| !value.is_empty()),
+                        profiles: Default::default(),
+                    });
+                credential
+                    .profiles
+                    .insert(profile.name.clone(), profile.hosts.clone());
+            }
+        }
+    }
+    credentials.into_values().collect()
+}
+
+fn credential_no_store(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+pub async fn list_plugin_tls_credentials(
+    State(state): State<AppState>,
+    principal: RequestPrincipal,
+) -> Response {
+    let response = async {
+        let Ok(guard) = state.begin_config_commit().await else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        if let Err(denied) = crate::principal_gate::require_config_operator(&principal, &guard) {
+            return denied.into_response();
+        }
+        let config = guard.current_config();
+        Json(serde_json::json!({
+            "encryption_enabled": config.secrets.encrypt,
+            "credentials": plugin_tls_credentials(&config)
+        }))
+        .into_response()
+    }
+    .await;
+    credential_no_store(response)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginTlsCredentialMutation {
+    instance: String,
+    property: String,
+    operation: PluginTlsCredentialOperation,
+    value: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PluginTlsCredentialOperation {
+    Create,
+    Replace,
+    Delete,
+}
+
+pub async fn mutate_plugin_tls_credential(
+    State(state): State<AppState>,
+    principal: RequestPrincipal,
+    body: axum::body::Bytes,
+) -> Response {
+    let response = mutate_plugin_tls_credential_inner(&state, &principal, &body).await;
+    credential_no_store(response)
+}
+
+async fn mutate_plugin_tls_credential_inner(
+    state: &AppState,
+    principal: &RequestPrincipal,
+    body: &[u8],
+) -> Response {
+    let Ok(guard) = state.begin_config_commit().await else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    if let Err(denied) = crate::principal_gate::require_config_operator(principal, &guard) {
+        return denied.into_response();
+    }
+    let Ok(mutation) = serde_json::from_slice::<PluginTlsCredentialMutation>(body) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let mut config = guard.current_config();
+    if !config.secrets.encrypt {
+        return StatusCode::PRECONDITION_FAILED.into_response();
+    }
+    let Some(entry) = config
+        .plugins
+        .entries
+        .iter_mut()
+        .find(|entry| entry.name == mutation.instance)
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let bound = entry.tls_profiles.iter().any(|profile| {
+        [
+            profile.custom_ca_secret.as_deref(),
+            profile.client_certificate_secret.as_deref(),
+            profile.client_private_key_secret.as_deref(),
+        ]
+        .contains(&Some(mutation.property.as_str()))
+    });
+    if !bound {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let present = entry
+        .config
+        .get(&mutation.property)
+        .is_some_and(|value| !value.is_empty());
+    let (operation, value, configured, verb) = match (mutation.operation, mutation.value) {
+        (PluginTlsCredentialOperation::Create, Some(value)) if !present => {
+            ("create", Some(value), true, Verb::Create)
+        }
+        (PluginTlsCredentialOperation::Replace, Some(value)) if present => {
+            ("replace", Some(value), true, Verb::Update)
+        }
+        (PluginTlsCredentialOperation::Delete, None) if present => {
+            ("delete", None, false, Verb::Delete)
+        }
+        (PluginTlsCredentialOperation::Delete, Some(_))
+        | (PluginTlsCredentialOperation::Create | PluginTlsCredentialOperation::Replace, None) => {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+        _ => return StatusCode::CONFLICT.into_response(),
+    };
+    let path = format!("plugins.entries.{}.config", mutation.instance);
+    if let Some(value) = value {
+        if value.trim().is_empty()
+            || value.len() > 32 * 1024
+            || reject_masked_secret_value("", true, &value).is_err()
+            || zeroclaw_config::secrets::SecretStore::is_encrypted(&value)
+        {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+        entry.config.insert(mutation.property.clone(), value);
+    } else {
+        entry.config.remove(&mutation.property);
+    }
+    // Keep key provisioning out of the credential editor. Recreating a missing
+    // key here would orphan ciphertext already stored under the old key.
+    let Some(config_dir) = config.config_path.parent() else {
+        return StatusCode::PRECONDITION_FAILED.into_response();
+    };
+    if !tokio::fs::metadata(config_dir.join(".secret_key"))
+        .await
+        .is_ok_and(|metadata| metadata.is_file())
+    {
+        return StatusCode::PRECONDITION_FAILED.into_response();
+    }
+    if config.validate().is_err() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    config.mark_dirty(&path);
+    let authorization = match authorize_config_write(
+        principal,
+        ConfigWriteSet::default().with(path, verb),
+        &guard,
+    ) {
+        Ok(authorization) => authorization,
+        Err(denied) => return denied.into_response(),
+    };
+    let saved = persist_and_swap(state, authorization, config, guard)
+        .await
+        .is_ok();
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            serde_json::json!({
+                "actor": "operator",
+                "consumer": mutation.instance,
+                "credential": mutation.property,
+                "operation": operation,
+                "saved": saved
+            })
+        ),
+        "Plugin TLS credential mutation"
+    );
+    if saved {
+        Json(serde_json::json!({ "configured": configured })).into_response()
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    }
+}
 
 pub async fn handle_prop_get(
     State(state): State<AppState>,
