@@ -462,7 +462,7 @@ max_context_tokens = 200000
 [agents]
 
 [agents.astra]
-model_provider = "chat.astra"
+model_provider = "openai.astra_api"
 runtime_profile = "astra"
 risk_profile = "supervised"
 ```

@@ -3427,10 +3427,6 @@ impl DelegateTool {
                 })
             });
         let dispatcher = ProviderDispatch::from_ref(&*model_provider);
-        let response_extraction = authoritative_config
-            .or(self.root_config.as_deref())
-            .map(|config| config.model_text_extraction(&agent_config.model_provider))
-            .unwrap_or_default();
         let policy_config = authoritative_config
             .map(|config| Arc::new(config.clone()))
             .or_else(|| self.root_config.clone());
@@ -3473,9 +3469,7 @@ impl DelegateTool {
         }
 
         let result = match result {
-            Ok(inner) => inner.map(|text| {
-                zeroclaw_providers::response::normalize_text(&text, response_extraction)
-            }),
+            Ok(inner) => inner,
             Err(_elapsed) => {
                 return Ok(ToolResult {
                     success: false,
@@ -13623,7 +13617,7 @@ options = { extract_text_tool_calls = false }
     }
 
     #[tokio::test]
-    async fn non_agentic_delegate_rejects_think_only_terminal_completion() {
+    async fn non_agentic_delegate_keeps_unextracted_think_text() {
         let result = DelegateTool::render_non_agentic_result(
             "delegate",
             "test-provider",
@@ -13631,13 +13625,14 @@ options = { extract_text_tool_calls = false }
             Ok("<think>internal reasoning</think>".to_string()),
         );
 
-        assert!(!result.success, "think-only terminal completion must fail");
+        assert!(result.success, "unextracted text is still a response");
+        assert!(result.error.is_none());
         assert!(
-            result.output.is_empty(),
-            "failed delegate must not emit output"
+            result
+                .output
+                .to_string()
+                .contains("<think>internal reasoning</think>")
         );
-        let error = result.error.as_deref().unwrap_or_default();
-        assert_eq!(error, invalid_semantic_completion_error("delegate"));
     }
 
     #[tokio::test]

@@ -220,21 +220,19 @@ impl ChatResponse {
 
     /// True when this response cannot make progress or complete a turn.
     ///
-    /// Inline reasoning is always excluded from this terminal check; the
-    /// provider response layer owns the configurable extraction policy for
-    /// user-visible text. A response containing a tool call is valid even when
-    /// its text is empty.
+    /// The caller must apply the selected text-extraction policy before this
+    /// check. Keeping this predicate policy-free is important: when a model
+    /// deliberately disables reasoning extraction, literal `<think>` text is
+    /// still user-visible content and must not be discarded here. A response
+    /// containing a tool call is valid even when its text is empty.
     pub fn is_semantically_empty_terminal(&self) -> bool {
-        strip_think_tags(self.text_or_empty()).is_empty() && self.tool_calls.is_empty()
+        self.text_or_empty().trim().is_empty() && self.tool_calls.is_empty()
     }
 }
 
-/// Remove inline reasoning tags before terminal-response classification.
-///
-/// API and reliable paths use this primitive to determine whether a response
-/// made progress even when a provider returned only an inline `<think>` block.
-/// Provider-specific extraction policy is applied by the shared provider
-/// response normalizer before runtime consumes the response.
+/// Remove inline reasoning tags for callers that explicitly opt into the
+/// shared extraction policy. Terminal classification itself intentionally does
+/// not call this helper; the cleaned response must reach that boundary first.
 pub fn strip_think_tags(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut remaining = text;
@@ -1724,7 +1722,7 @@ mod turn_order_tests {
     }
 
     #[test]
-    fn semantic_empty_terminal_strips_inline_reasoning() {
+    fn semantic_empty_terminal_keeps_unextracted_inline_reasoning() {
         let response = ChatResponse {
             text: Some("<think>internal reasoning</think>".to_string()),
             tool_calls: Vec::new(),
@@ -1732,7 +1730,7 @@ mod turn_order_tests {
             reasoning_content: None,
         };
 
-        assert!(response.is_semantically_empty_terminal());
+        assert!(!response.is_semantically_empty_terminal());
     }
 
     #[test]

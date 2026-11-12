@@ -9466,7 +9466,7 @@ model = "backup"
         assert!(paths.contains(&"providers.models.custom.gateway.prod.fallback"));
         assert!(paths.contains(&"providers.models.custom.gateway.prod.fallback_models"));
         let value: toml::Value = toml::from_str(&migrated).unwrap();
-        let profile = &value["providers"]["models"]["custom"]["gateway.prod"];
+        let profile = &value["providers"]["models"]["custom.gateway.prod"];
         assert!(profile.get("fallback").is_none());
         assert!(profile.get("fallback_models").is_none());
         assert!(notices.iter().all(|notice| matches!(
