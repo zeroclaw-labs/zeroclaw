@@ -5356,12 +5356,6 @@ impl Config {
             .unwrap_or(self.skills.prompt_injection_mode)
     }
 
-    /// Canonical model edits already address the complete model key.
-    #[must_use]
-    pub fn effective_model_edit_path(&self, requested_path: &str) -> String {
-        requested_path.to_owned()
-    }
-
     /// Enumerate canonical chat models in deterministic exact-key order.
     /// CLI status and Doctor share this view. A filter matches the complete
     /// model reference, complete connection ID, or connection kind.
@@ -26985,6 +26979,13 @@ impl Config {
     }
 
     pub fn set_prop_persistent(&mut self, name: &str, value_str: &str) -> Result<()> {
+        // A programmatically assembled Config is also used by migration and
+        // fixture builders before it has a loaded file provenance. Keep that
+        // construction surface available; persisted interactive edits are
+        // checked once the config has been admitted from disk.
+        if self.loaded_from.is_some() {
+            reject_retired_provider_edit_path(self, name)?;
+        }
         self.reject_ambiguous_persistent_map_key_path(name)?;
         self.set_prop(name, value_str)?;
         self.mark_dirty(name);
@@ -26992,6 +26993,9 @@ impl Config {
     }
 
     pub fn set_secret_persistent(&mut self, name: &str, value: String) -> Result<()> {
+        if self.loaded_from.is_some() {
+            reject_retired_provider_edit_path(self, name)?;
+        }
         self.reject_ambiguous_persistent_map_key_path(name)?;
         self.set_secret(name, value)?;
         self.mark_dirty(name);
@@ -27354,6 +27358,27 @@ impl Config {
         self.clear_dirty();
         Ok(())
     }
+}
+
+/// Reject a retired flattened provider profile path at an interactive edit
+/// boundary. Historical tables remain deserializable so V3→V4 admission can
+/// project them into the canonical registry; runtime editors must use the
+/// exact-key registry document.
+pub fn reject_retired_provider_edit_path(config: &Config, name: &str) -> Result<()> {
+    if [
+        "providers.models.",
+        "providers.tts.",
+        "providers.transcription.",
+    ]
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
+        && config.provider_registry().is_ok()
+    {
+        anyhow::bail!(
+            "retired provider profile path `{name}`; edit the canonical provider registry instead"
+        );
+    }
+    Ok(())
 }
 
 /// What a save may do with the config file already on disk.

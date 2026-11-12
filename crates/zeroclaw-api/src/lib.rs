@@ -39,8 +39,16 @@ pub mod webhook;
 
 use std::sync::Arc;
 
-/// Resolver for per-model text extraction policy.
-pub type TextExtractionResolver = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+/// Admitted model policy for extracting protocol data embedded in text.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TextExtraction {
+    pub reasoning: bool,
+    pub tool_calls: bool,
+}
+
+/// Resolver over the admitted configuration generation. No provider keeps a
+/// second copy of model parsing policy.
+pub type TextExtractionResolver = Arc<dyn Fn(&str) -> TextExtraction + Send + Sync>;
 
 tokio::task_local! {
     /// Current thread/sender ID for per-sender rate limiting.
@@ -82,8 +90,13 @@ where
     TEXT_EXTRACTION_RESOLVER.scope(resolver, future).await
 }
 
-pub fn text_extraction_reasoning_for(model: &str) -> bool {
+pub fn text_extraction_for(model: &str) -> TextExtraction {
     TEXT_EXTRACTION_RESOLVER
-        .try_with(|resolver| resolver.as_ref().is_some_and(|resolve| resolve(model)))
-        .unwrap_or(false)
+        .try_with(|resolver| {
+            resolver
+                .as_ref()
+                .map(|resolve| resolve(model))
+                .unwrap_or_default()
+        })
+        .unwrap_or_default()
 }

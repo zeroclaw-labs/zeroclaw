@@ -2971,8 +2971,8 @@ mod tests {
                 &[("provider", "openai.default")][..],
                 [
                     "openai.default",
-                    "[providers.models.openai.default]",
-                    "api_key/uri",
+                    "[providers.connections.\"<connection>\"]",
+                    "[providers.models.\"<model-ref>\"]",
                     "/models",
                 ]
                 .as_slice(),

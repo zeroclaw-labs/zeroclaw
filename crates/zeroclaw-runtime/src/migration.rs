@@ -138,7 +138,7 @@ fn target_memory_backend(config: &Config) -> Result<Box<dyn Memory>> {
 /// embedding-route handling, so `migrate openclaw --reindex` is equivalent to
 /// running the standalone reindex command right after the import.
 fn reindex_memory_backend(config: &Config) -> Result<Box<dyn Memory>> {
-    zeroclaw_memory::create_memory_from_config(config, None)
+    zeroclaw_memory::create_memory_from_config(config)
 }
 
 fn collect_source_entries(

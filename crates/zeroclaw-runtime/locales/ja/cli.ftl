@@ -1199,7 +1199,7 @@ channel-runtime-set-provider-init-failed =
     詳細: { $error }
 channel-runtime-effort-routing-invalid = ⚠️ エフォートルーティングの設定が無効です。設定済みのローカルおよびクラウドルートを確認してください。
 channel-runtime-provider-ambiguous = ModelProvider `{ $family }` には設定済みエイリアスが複数あります。`/models { $family }.<alias>` で指定してください: { $list }
-channel-runtime-provider-no-alias = `{ $provider }` に対応する設定済み provider エントリがありません。`[providers.models.{ $provider }]`（api_key/uri を含む）を追加するか、設定済み provider を選択してください。`/models` で有効な項目を確認できます。
+channel-runtime-provider-no-alias = `{ $provider }` に対応する設定済みモデルエントリがありません。`[providers.connections."<connection>"]` に接続、`[providers.models."<model-ref>"]` にモデルを追加するか、設定済みモデルを選択してください。`/models` で有効な項目を確認できます。
 channel-runtime-provider-unknown = 不明な model_provider `{ $provider }` です。`/models` で有効な model_provider を一覧表示してください。
 channel-runtime-scoped-model-empty = モデル ID は空にできません。`/model --user|--agent <model-id>` を使用してください。
 channel-runtime-scoped-model-switched = **{ $scope }** スコープのモデルを `{ $model }`（model_provider: `{ $provider }`）に設定しました。セッション内のみ有効で、再起動するとリセットされます。

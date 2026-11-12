@@ -1568,8 +1568,7 @@ impl DelegateTool {
                     target_alias,
                     model_provider,
                     None,
-                    false,
-                    false,
+                    crate::composition::ModelBuildIntent::AgentDefault,
                 )
                 .await?;
             let (provider, identity, _) = built.into_parts();
@@ -3428,6 +3427,10 @@ impl DelegateTool {
                 })
             });
         let dispatcher = ProviderDispatch::from_ref(&*model_provider);
+        let response_extraction = authoritative_config
+            .or(self.root_config.as_deref())
+            .map(|config| config.model_text_extraction(&agent_config.model_provider))
+            .unwrap_or_default();
         let policy_config = authoritative_config
             .map(|config| Arc::new(config.clone()))
             .or_else(|| self.root_config.clone());
@@ -3435,10 +3438,16 @@ impl DelegateTool {
             .as_ref()
             .map(|config| {
                 let config = Arc::clone(config);
-                Arc::new(move |model: &str| config.model_text_extraction(model).reasoning)
-                    as Arc<dyn Fn(&str) -> bool + Send + Sync>
+                Arc::new(move |model: &str| config.model_text_extraction(model))
+                    as Arc<dyn Fn(&str) -> zeroclaw_api::TextExtraction + Send + Sync>
             })
-            .unwrap_or_else(|| Arc::new(|_: &str| true) as Arc<dyn Fn(&str) -> bool + Send + Sync>);
+            .unwrap_or_else(|| {
+                Arc::new(|_: &str| zeroclaw_api::TextExtraction {
+                    reasoning: true,
+                    tool_calls: false,
+                })
+                    as Arc<dyn Fn(&str) -> zeroclaw_api::TextExtraction + Send + Sync>
+            });
         // A single-call background delegate has no tool loop to observe, so
         // its one model request and the reply are recorded here.
         if let Some(sink) = self.progress.as_deref() {
@@ -3464,7 +3473,9 @@ impl DelegateTool {
         }
 
         let result = match result {
-            Ok(inner) => inner,
+            Ok(inner) => inner.map(|text| {
+                zeroclaw_providers::response::normalize_text(&text, response_extraction)
+            }),
             Err(_elapsed) => {
                 return Ok(ToolResult {
                     success: false,
@@ -3491,15 +3502,11 @@ impl DelegateTool {
         result: anyhow::Result<String>,
     ) -> ToolResult {
         match result {
-            Ok(response)
-                if zeroclaw_api::model_provider::strip_think_tags(&response).is_empty() =>
-            {
-                ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(invalid_semantic_completion_error(agent_name)),
-                }
-            }
+            Ok(response) if response.trim().is_empty() => ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(invalid_semantic_completion_error(agent_name)),
+            },
             Ok(response) => ToolResult {
                 success: true,
                 output: format!("[Agent '{agent_name}' ({provider_type}/{model})]\n{response}",)
@@ -12550,25 +12557,38 @@ target = "memory_recall"
             owner.clone(),
         ));
         let build = |memory| {
-            crate::tools::all_tools(
-                Arc::clone(config),
-                &fixture.tool.security,
-                &config.risk_profiles["agentic_test"],
-                "caller",
-                memory,
-                None,
-                None,
-                &config.browser,
-                &config.http_request,
-                &config.web_fetch,
-                &fixture.tool.workspace_dir,
-                &config.agents,
-                None,
-                config,
-                None,
-                false,
-                None,
-            )
+            {
+                let registry_config = Arc::clone(config);
+                (|| -> anyhow::Result<_> {
+                    let registry_environment: Option<crate::tools::ForwardedEnvironment> = None;
+                    let registry_path = registry_environment
+                        .as_ref()
+                        .and_then(|env| env.get("PATH"))
+                        .map(std::ffi::OsStr::new);
+                    let registry_runtime: std::sync::Arc<
+                        dyn zeroclaw_config::platform::RuntimeAdapter,
+                    > = std::sync::Arc::from(zeroclaw_config::platform::create_runtime_with_path(
+                        &registry_config.runtime,
+                        registry_path,
+                    )?);
+                    let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = memory;
+                    let registry_request = crate::composition::ToolRequest {
+                        config: &registry_config,
+                        agent_alias: "caller",
+                        security: &fixture.tool.security,
+                        runtime: &registry_runtime,
+                        memory: &registry_memory,
+                    };
+                    let registry_inputs = crate::composition::NativeRecipeInputs::new(
+                        &registry_request,
+                        &fixture.tool.workspace_dir,
+                    );
+                    crate::tools::build_native_registry(
+                        registry_inputs,
+                        &config.risk_profiles["agentic_test"],
+                    )
+                })()
+            }
             .unwrap()
             .delegate_tool
             .expect("nonempty agents construct the real delegate")
@@ -22748,29 +22768,28 @@ options = {{ {backup_options} }}
                     Arc::new(zeroclaw_memory::none::NoneMemory::new("caller"));
                 let runtime: Arc<dyn crate::platform::RuntimeAdapter> =
                     Arc::new(crate::platform::NativeRuntime::new());
-                let built = crate::tools::all_tools_with_runtime(
-                    Arc::clone(&config),
-                    &caller,
-                    config.risk_profiles.get("caller").unwrap(),
-                    "caller",
-                    Arc::clone(&runtime),
-                    memory,
-                    None,
-                    None,
-                    &config.browser,
-                    &config.http_request,
-                    &config.web_fetch,
-                    &caller.workspace_dir,
-                    &config.agents,
-                    None,
-                    &config,
-                    None,
-                    false,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
+                let built = {
+                    let registry_config = Arc::clone(&config);
+                    let registry_runtime: std::sync::Arc<
+                        dyn zeroclaw_config::platform::RuntimeAdapter,
+                    > = Arc::clone(&runtime);
+                    let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = memory;
+                    let registry_request = crate::composition::ToolRequest {
+                        config: &registry_config,
+                        agent_alias: "caller",
+                        security: &caller,
+                        runtime: &registry_runtime,
+                        memory: &registry_memory,
+                    };
+                    let registry_inputs = crate::composition::NativeRecipeInputs::new(
+                        &registry_request,
+                        &caller.workspace_dir,
+                    );
+                    crate::tools::build_native_registry(
+                        registry_inputs,
+                        config.risk_profiles.get("caller").unwrap(),
+                    )
+                }
                 .unwrap();
                 let delegate = Arc::clone(built.delegate_tool.as_ref().unwrap());
                 assert!(

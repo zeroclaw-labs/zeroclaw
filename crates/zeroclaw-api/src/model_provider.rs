@@ -220,42 +220,21 @@ impl ChatResponse {
 
     /// True when this response cannot make progress or complete a turn.
     ///
-    /// This deliberately performs only the unconditional check. Inline
-    /// reasoning is treated as ordinary text until the admitted model policy
-    /// is applied through [`Self::is_semantically_empty_terminal_with`]. A
-    /// response containing one or more tool calls remains valid even when its
-    /// text is empty.
+    /// Inline reasoning is always excluded from this terminal check; the
+    /// provider response layer owns the configurable extraction policy for
+    /// user-visible text. A response containing a tool call is valid even when
+    /// its text is empty.
     pub fn is_semantically_empty_terminal(&self) -> bool {
-        self.is_semantically_empty_terminal_with(false)
-    }
-
-    /// Classify a response after the caller has applied its admitted text
-    /// extraction policy. Providers must parse/normalize first; this method
-    /// only decides whether the normalized result can make progress.
-    pub fn is_semantically_empty_terminal_with(&self, extract_reasoning: bool) -> bool {
-        let text = if extract_reasoning {
-            strip_think_tags(self.text_or_empty())
-        } else {
-            self.text_or_empty().trim().to_owned()
-        };
-        text.is_empty() && self.tool_calls.is_empty()
-    }
-
-    /// Apply the admitted textual reasoning parser once at the provider
-    /// boundary. Runtime then receives a clean answer and only handles tool
-    /// admission, execution, events, and cancellation.
-    pub fn normalize_text_for_policy(&mut self, extract_reasoning: bool) {
-        if extract_reasoning && let Some(text) = self.text.as_mut() {
-            *text = strip_think_tags(text);
-        }
+        strip_think_tags(self.text_or_empty()).is_empty() && self.tool_calls.is_empty()
     }
 }
 
-/// Remove inline `<think>...</think>` reasoning before terminal-response
-/// classification or user-visible parsing.
+/// Remove inline reasoning tags before terminal-response classification.
 ///
-/// An unclosed opening tag suppresses the remainder so partial reasoning never
-/// becomes final output.
+/// API and reliable paths use this primitive to determine whether a response
+/// made progress even when a provider returned only an inline `<think>` block.
+/// Provider-specific extraction policy is applied by the shared provider
+/// response normalizer before runtime consumes the response.
 pub fn strip_think_tags(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut remaining = text;
@@ -1582,18 +1561,24 @@ mod capability_tests {
     async fn default_chat_adapters_preserve_wire_text_for_candidate_normalization() {
         let text = "<think>literal content</think>";
         let messages = [super::ChatMessage::user(text)];
-        crate::scope_text_extraction(Some(std::sync::Arc::new(|_| true)), async {
-            let response = NativeAccessorOnlyProvider
-                .chat(super::ChatRequest::new(&messages), "upstream-id", None)
-                .await
-                .unwrap();
-            assert_eq!(response.text.as_deref(), Some(text));
-            let response = NativeAccessorOnlyProvider
-                .chat_with_tools(&messages, &[], "upstream-id", None)
-                .await
-                .unwrap();
-            assert_eq!(response.text.as_deref(), Some(text));
-        })
+        crate::scope_text_extraction(
+            Some(std::sync::Arc::new(|_| crate::TextExtraction {
+                reasoning: true,
+                tool_calls: false,
+            })),
+            async {
+                let response = NativeAccessorOnlyProvider
+                    .chat(super::ChatRequest::new(&messages), "upstream-id", None)
+                    .await
+                    .unwrap();
+                assert_eq!(response.text.as_deref(), Some(text));
+                let response = NativeAccessorOnlyProvider
+                    .chat_with_tools(&messages, &[], "upstream-id", None)
+                    .await
+                    .unwrap();
+                assert_eq!(response.text.as_deref(), Some(text));
+            },
+        )
         .await;
     }
 
@@ -1739,7 +1724,7 @@ mod turn_order_tests {
     }
 
     #[test]
-    fn semantic_empty_terminal_requires_the_admitted_reasoning_policy() {
+    fn semantic_empty_terminal_strips_inline_reasoning() {
         let response = ChatResponse {
             text: Some("<think>internal reasoning</think>".to_string()),
             tool_calls: Vec::new(),
@@ -1747,8 +1732,7 @@ mod turn_order_tests {
             reasoning_content: None,
         };
 
-        assert!(!response.is_semantically_empty_terminal());
-        assert!(response.is_semantically_empty_terminal_with(true));
+        assert!(response.is_semantically_empty_terminal());
     }
 
     #[test]

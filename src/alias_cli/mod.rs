@@ -668,7 +668,7 @@ fn build_owned_state_handles(config: &Config) -> Result<OwnedStateHandles> {
         Arc::new(zeroclaw_memory::NoneMemory::new("none"))
     } else {
         Arc::from(
-            zeroclaw_memory::create_memory_from_config(config, None)
+            zeroclaw_memory::create_memory_from_config(config)
                 .context("open memory backend for the owned-state cascade")?,
         )
     };

@@ -408,7 +408,7 @@ async fn parity_l2_sop_live_step_agent_isolation() {
             .expect("per-agent policy must resolve for the restricted step agent"),
     );
     // Scoped comparison: the two paths' FULL built sets differ by construction —
-    // the helper builds the agent's real tools via `all_tools_with_runtime`, this
+    // the helper builds the agent's real tools via `build_native_registry`, this
     // direct call uses a controlled fixture of real built-in names — so the
     // security-relevant comparison is over that shared name universe.
     let universe = ["file_read", "shell", "memory_recall"];

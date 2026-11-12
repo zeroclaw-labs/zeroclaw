@@ -363,7 +363,7 @@ impl ResolvedChat<'_> {
     /// Resolve explicit API/preset/model options over provider defaults.
     #[must_use]
     pub fn text_extraction(&self) -> super::TextExtraction {
-        let defaults = super::TextExtraction::for_provider(
+        let defaults = super::options::text_extraction_defaults(
             self.selection.connection.kind(),
             self.wire_api,
             self.options.native_tools,

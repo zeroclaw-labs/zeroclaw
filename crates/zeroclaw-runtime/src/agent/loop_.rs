@@ -2007,8 +2007,7 @@ async fn run_inner(
                 agent_alias,
                 build_ref,
                 build_override,
-                false,
-                true,
+                crate::composition::ModelBuildIntent::Explicit,
             )
             .await?;
         let mut provider_name = entry_model.provider_name();
@@ -2606,8 +2605,7 @@ async fn run_inner(
                                 agent_alias,
                                 &new_model_provider,
                                 Some(&new_model),
-                                true,
-                                true,
+                                crate::composition::ModelBuildIntent::Switch,
                             )
                             .await?;
                             provider_name = model.provider_name();
@@ -2665,10 +2663,9 @@ async fn run_inner(
                             temperature: temperature_input,
                         };
                         let policy_config = Arc::clone(&config);
-                        let resolver = Arc::new(move |model: &str| {
-                            policy_config.model_text_extraction(model).reasoning
-                        })
-                            as Arc<dyn Fn(&str) -> bool + Send + Sync>;
+                        let resolver =
+                            Arc::new(move |model: &str| policy_config.model_text_extraction(model))
+                                as Arc<dyn Fn(&str) -> zeroclaw_api::TextExtraction + Send + Sync>;
                         TOOL_LOOP_COST_TRACKING_CONTEXT
                             .scope(
                                 cost_tracking_context.clone(),
@@ -2948,8 +2945,7 @@ async fn run_inner(
                                 agent_alias,
                                 &selection.model_provider,
                                 Some(&selection.model),
-                                false,
-                                true,
+                                crate::composition::ModelBuildIntent::Explicit,
                             )
                             .await?;
                         provider_name = built.provider_name();
@@ -3303,8 +3299,7 @@ async fn run_inner(
                                     agent_alias,
                                     &new_model_provider,
                                     Some(&new_model),
-                                    true,
-                                    true,
+                                    crate::composition::ModelBuildIntent::Switch,
                                 )
                                 .await?;
                                 provider_name = model.provider_name();
@@ -4086,8 +4081,7 @@ async fn process_message_inner(
                 agent_alias,
                 build_ref,
                 build_override,
-                false,
-                false,
+                crate::composition::ModelBuildIntent::AgentDefault,
             )
             .await?;
         let provider_name = entry_model.provider_name();
@@ -21439,25 +21433,35 @@ Let me check the result."#;
             Arc::new(zeroclaw_memory::NoneMemory::new("test"));
 
         // Build the real eager built-in registry, as process_message does.
-        let built = crate::tools::all_tools(
-            Arc::new(config.clone()),
-            &security,
-            &risk,
-            "test",
-            mem,
-            None,
-            None,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &security.workspace_dir,
-            &config.agents,
-            None,
-            &config,
-            None,
-            false,
-            None,
-        )
+        let built = {
+            let registry_config = Arc::new(config.clone());
+            (|| -> anyhow::Result<_> {
+                let registry_environment: Option<crate::tools::ForwardedEnvironment> = None;
+                let registry_path = registry_environment
+                    .as_ref()
+                    .and_then(|env| env.get("PATH"))
+                    .map(std::ffi::OsStr::new);
+                let registry_runtime: std::sync::Arc<
+                    dyn zeroclaw_config::platform::RuntimeAdapter,
+                > = std::sync::Arc::from(zeroclaw_config::platform::create_runtime_with_path(
+                    &registry_config.runtime,
+                    registry_path,
+                )?);
+                let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = mem;
+                let registry_request = crate::composition::ToolRequest {
+                    config: &registry_config,
+                    agent_alias: "test",
+                    security: &security,
+                    runtime: &registry_runtime,
+                    memory: &registry_memory,
+                };
+                let registry_inputs = crate::composition::NativeRecipeInputs::new(
+                    &registry_request,
+                    &security.workspace_dir,
+                );
+                crate::tools::build_native_registry(registry_inputs, &risk)
+            })()
+        }
         .expect("tool registry builds");
 
         let before = tool_names(&built.tools);

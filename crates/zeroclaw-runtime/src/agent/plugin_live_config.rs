@@ -332,7 +332,7 @@ async fn live_agent_plugin_tool_observes_config_reload_after_construction() {
 /// pins.
 ///
 /// The delegate instance under test is the one the **production** registry
-/// built (`Agent.delegate_tool`, captured from `all_tools_with_runtime`), not a
+/// built (`Agent.delegate_tool`, captured from `build_native_registry`), not a
 /// hand-rolled one: re-deriving the builder chain in the test would keep
 /// passing if the production chain dropped the handle, which is exactly the
 /// defect class here.

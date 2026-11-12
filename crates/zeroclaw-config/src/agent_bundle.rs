@@ -558,24 +558,19 @@ pub fn plan_export(config: &Config, alias: &str) -> Result<ExportPlan, ExportErr
         &mut dropped,
     );
 
-    let provider_refs = [
-        ("providers.tts", agent.tts_provider.trim()),
-        (
-            "providers.transcription",
-            agent.transcription_provider.trim(),
-        ),
-    ];
-    let canonical_speech_refs: Vec<&str> = provider_refs
-        .iter()
-        .map(|(_, reference)| *reference)
-        .filter(|reference| {
-            config
-                .providers
-                .models
-                .canonical_model(&(*reference).into())
-                .is_some()
-        })
-        .collect();
+    let canonical_speech_refs: Vec<&str> = [
+        agent.tts_provider.trim(),
+        agent.transcription_provider.trim(),
+    ]
+    .into_iter()
+    .filter(|reference| {
+        config
+            .providers
+            .models
+            .canonical_model(&(*reference).into())
+            .is_some()
+    })
+    .collect();
     carry_model_provider_closure(
         &mut out,
         &masked_root,
@@ -583,32 +578,6 @@ pub fn plan_export(config: &Config, alias: &str) -> Result<ExportPlan, ExportErr
         &canonical_speech_refs,
         &mut dropped,
     );
-    let mut carried_providers: BTreeSet<String> = BTreeSet::new();
-    for (section, reference) in provider_refs {
-        if config
-            .providers
-            .models
-            .canonical_model(&reference.into())
-            .is_some()
-        {
-            continue;
-        }
-        let Some((family, entry)) = split_provider_ref(reference) else {
-            continue;
-        };
-        let path = format!("{section}.{family}.{entry}");
-        if !carried_providers.insert(path) {
-            continue;
-        }
-        let mut segments: Vec<&str> = section.split('.').collect();
-        segments.push(family);
-        segments.push(entry);
-        // Provider entries are pruned against an empty default: the typed
-        // default varies per family, and an over-pruned provider entry is
-        // worse than a verbose one (a dropped `api_url` silently re-points
-        // the agent at the family's built-in endpoint).
-        carry(&mut out, &masked_root, &segments, &toml::Table::new());
-    }
 
     // ── scrub, then verify the scrub ─────────────────────────────────────
     let mut required_secrets = Vec::new();
@@ -1511,13 +1480,6 @@ fn dedup(values: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Split a dotted `<family>.<alias>` provider reference. Returns `None` for an
-/// empty or malformed reference — `Config::validate()` owns reporting those.
-fn split_provider_ref(reference: &str) -> Option<(&str, &str)> {
-    let (family, entry) = reference.split_once('.')?;
-    (!family.is_empty() && !entry.is_empty()).then_some((family, entry))
-}
-
 /// Walk every string leaf, passing the dotted path and a mutable handle.
 ///
 /// Array elements carrying a `name` are addressed by that natural key
@@ -1814,6 +1776,13 @@ mod tests {
     use crate::multi_agent::AgentWorkspaceConfig;
     use std::collections::HashMap;
 
+    // Historical Rust-built fixtures are admitted through the same migration
+    // boundary as loaded files. Export itself consumes only current refs.
+    fn plan_export(config: &Config, alias: &str) -> Result<ExportPlan, ExportError> {
+        let config = crate::migration::admit_test_input(config);
+        super::plan_export(&config, alias)
+    }
+
     #[test]
     fn canonical_export_visits_shared_fallbacks_once_and_carries_api_presets() {
         let mut source = String::from(
@@ -2051,7 +2020,7 @@ model = "asr-model"
         );
         assert!(
             plan.required_secrets
-                .contains(&"providers.models.anthropic.main.api_key".to_string()),
+                .contains(&"providers.connections.legacy.anthropic.main.auth.api_key".to_string()),
             "{:?}",
             plan.required_secrets
         );
@@ -2062,7 +2031,13 @@ model = "asr-model"
         let plan = plan_export(&fixture(), "researcher").unwrap();
         let key = lookup(
             &plan.config,
-            &["providers", "models", "anthropic", "main", "api_key"],
+            &[
+                "providers",
+                "connections",
+                "legacy.anthropic.main",
+                "auth",
+                "api_key",
+            ],
         )
         .and_then(toml::Value::as_str);
         assert_eq!(key, Some(""));
@@ -2336,12 +2311,12 @@ model = "asr-model"
         }
         let plan = plan_export(&config, "researcher").unwrap();
         assert!(
-            lookup(&plan.config, &["providers", "tts", "openai", "voice"]).is_some(),
-            "tts provider carried"
+            lookup(&plan.config, &["providers", "models", "openai.voice"]).is_some(),
+            "canonical TTS model carried"
         );
         assert!(
-            lookup(&plan.config, &["providers", "models", "anthropic", "main"]).is_some(),
-            "model provider carried"
+            lookup(&plan.config, &["providers", "models", "anthropic.main"]).is_some(),
+            "canonical chat model carried"
         );
     }
 
@@ -2616,7 +2591,7 @@ model = "asr-model"
         assert!(
             lookup(
                 &plan.config,
-                &["providers", "models", "anthropic", "summarizer"]
+                &["providers", "models", "anthropic.summarizer"]
             )
             .is_some(),
             "the profile's own summarizer provider is carried"

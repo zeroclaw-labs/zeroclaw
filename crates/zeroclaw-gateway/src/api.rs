@@ -1116,17 +1116,14 @@ async fn resolve_memory_handle(
             )})),
         ));
     }
-    let api_key = config.agent_model_api_key(alias);
-    zeroclaw_memory::create_memory_for_agent(&config, alias, api_key.as_deref())
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(
-                    serde_json::json!({"error": format!("Failed to build per-agent memory: {e:#}")}),
-                ),
-            )
-        })
+    zeroclaw_memory::create_memory_for_agent(&config, alias)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to build per-agent memory: {e:#}")})),
+        )
+    })
 }
 
 /// GET /api/memory — list or search memory entries

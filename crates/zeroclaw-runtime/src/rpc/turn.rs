@@ -1295,7 +1295,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed"),
         );
         let workspace = tempfile::TempDir::new().expect("temp dir");
@@ -1462,7 +1462,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed"),
         );
 
@@ -1609,7 +1609,7 @@ mod tests {
                 ..zeroclaw_config::schema::MemoryConfig::default()
             };
             let mem: Arc<dyn Memory> = Arc::from(
-                zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                     .expect("memory creation should succeed"),
             );
 
@@ -1864,7 +1864,7 @@ mod tests {
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed"),
         );
 
@@ -2177,7 +2177,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed"),
         );
         let agent = Agent::builder()

@@ -24,11 +24,13 @@ impl IterationToolSpecs {
         text_tool_calls_disabled: bool,
         extract_text_reasoning: bool,
     ) -> bool {
-        let text = if extract_text_reasoning {
-            zeroclaw_tool_call_parser::strip_think_tags(response.text_or_empty())
-        } else {
-            response.text_or_empty().to_owned()
-        };
+        let text = zeroclaw_providers::response::normalize_text(
+            response.text_or_empty(),
+            zeroclaw_api::TextExtraction {
+                reasoning: extract_text_reasoning,
+                tool_calls: false,
+            },
+        );
         exceeds_single_tool_round(
             &text,
             response.tool_calls.len(),

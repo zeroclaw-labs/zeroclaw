@@ -14,7 +14,6 @@ use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::turn_stop::{TurnStop, TurnStopCode};
 use zeroclaw_config::schema::{Config, MultimodalConfig, PacingConfig, ResolvedContextLimits};
 use zeroclaw_providers::{ChatMessage, ModelProvider};
-use zeroclaw_tool_call_parser::{strip_think_tags, strip_trailing_terminal_markers};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum CompletionLimit {
@@ -386,14 +385,17 @@ pub(crate) async fn finish_after_max_iterations(
             // recorded no cost; through the seam it now fails closed when the turn's
             // budget is exhausted and its token usage is charged like any in-loop
             // call. Metering is a no-op when the turn is unscoped.
-            let resolver: std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync> = match config {
+            let resolver: std::sync::Arc<
+                dyn Fn(&str) -> zeroclaw_api::TextExtraction + Send + Sync,
+            > = match config {
                 Some(config) => {
                     let config = std::sync::Arc::new(config.clone());
-                    std::sync::Arc::new(move |model: &str| {
-                        config.model_text_extraction(model).reasoning
-                    })
+                    std::sync::Arc::new(move |model: &str| config.model_text_extraction(model))
                 }
-                None => std::sync::Arc::new(|_: &str| false),
+                None => std::sync::Arc::new(|_: &str| zeroclaw_api::TextExtraction {
+                    reasoning: true,
+                    tool_calls: false,
+                }),
             };
             zeroclaw_api::scope_text_extraction(
                 Some(resolver),
@@ -516,12 +518,7 @@ pub(crate) async fn finish_after_max_iterations(
         .map_or_else(Default::default, |config| {
             config.model_text_extraction(served_ref)
         });
-    let display_text = if extraction.reasoning {
-        strip_think_tags(&raw_text)
-    } else {
-        raw_text.clone()
-    };
-    let display_text = strip_trailing_terminal_markers(&display_text);
+    let display_text = zeroclaw_providers::response::normalize_text(&raw_text, extraction);
     let protocol_suppressed = extraction.tool_calls
         && super::protocol_detect::detect_internal_protocol_without_tools(&display_text).is_some();
     if protocol_suppressed {

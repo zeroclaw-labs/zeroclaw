@@ -87,8 +87,7 @@ use zeroclaw_config::migration::embedding_fixtures::{
 #[cfg(test)]
 use zeroclaw_config::providers::ModelProviders;
 use zeroclaw_config::schema::{
-    ActiveStorage, Config, EmbeddingRouteConfig, MemoryConfig, MemoryPolicyConfig,
-    PostgresStorageConfig,
+    ActiveStorage, Config, MemoryConfig, MemoryPolicyConfig, PostgresStorageConfig,
 };
 
 #[cfg(feature = "memory-postgres")]
@@ -178,7 +177,7 @@ where
         MemoryBackendKind::Postgres => {
             anyhow::bail!(
                 "postgres backend requires storage config; \
-                 call create_memory_with_storage_and_routes instead of create_memory_with_builders"
+                 call create_memory_from_config instead of create_memory_with_builders"
             )
         }
         MemoryBackendKind::Qdrant => {
@@ -282,12 +281,11 @@ fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
         .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
 }
 
-/// Construct the selected capability model from the full admitted config.
+/// Construct the selected embedding model from the full admitted config.
 pub fn build_embedder_from_config(
     config: &Config,
-    api_key: Option<&str>,
 ) -> anyhow::Result<Arc<dyn zeroclaw_api::embedding::EmbeddingProvider>> {
-    Ok(resolve_canonical_embedding_config(config, api_key)?
+    Ok(resolve_canonical_embedding_config(config)?
         .unwrap_or_else(|| Arc::new(zeroclaw_providers::embedding::NoopEmbedding)))
 }
 
@@ -297,23 +295,15 @@ pub fn build_embedder_from_config(
 /// remains the source of truth for subsequent refreshes.
 fn resolve_canonical_embedding_config(
     config: &Config,
-    inherited_api_key: Option<&str>,
 ) -> anyhow::Result<Option<Arc<dyn zeroclaw_api::embedding::EmbeddingProvider>>> {
     let (registry, reference) = config.embedding_registry()?;
     let Some(model_ref) = reference else {
         return Ok(None);
     };
     let resolved = registry.resolve_embedding(&model_ref)?;
-    let api_key = resolved
-        .selection
-        .connection
-        .api_key()
-        .or(inherited_api_key)
-        .map(str::to_owned);
     let settings = zeroclaw_providers::embedding::EmbeddingProviderConfig::from_resolved(
         &resolved,
         config.memory.embedding_dimensions,
-        api_key,
     )?;
     Ok(Some(Arc::from(
         zeroclaw_providers::embedding::build_embedding_provider(settings),
@@ -323,7 +313,6 @@ fn resolve_canonical_embedding_config(
 pub fn create_memory(
     config: &MemoryConfig,
     workspace_dir: &Path,
-    api_key: Option<&str>,
 ) -> anyhow::Result<Box<dyn Memory>> {
     if config.backend.trim().contains('.') {
         anyhow::bail!(
@@ -332,19 +321,16 @@ pub fn create_memory(
         );
     }
 
-    create_memory_with_storage_and_routes(config, &[], ActiveStorage::None, workspace_dir, api_key)
+    create_memory_with_storage(config, ActiveStorage::None, workspace_dir)
 }
 
 /// Construct memory from the canonical loaded configuration.
 ///
 /// Config-aware production paths should use this entrypoint so the selected
 /// storage alias, embedding route, and provider settings are applied together.
-pub fn create_memory_from_config(
-    config: &Config,
-    api_key: Option<&str>,
-) -> anyhow::Result<Box<dyn Memory>> {
-    let canonical_embedding = resolve_canonical_embedding_config(config, api_key)?;
-    create_memory_with_storage_and_routes_inner(
+pub fn create_memory_from_config(config: &Config) -> anyhow::Result<Box<dyn Memory>> {
+    let canonical_embedding = resolve_canonical_embedding_config(config)?;
+    create_memory_with_embedding(
         &config.memory,
         config.resolve_active_storage(),
         &config.data_dir,
@@ -380,21 +366,20 @@ fn build_lucid_memory(
     )
 }
 
-pub fn create_memory_with_storage_and_routes(
+/// Construct a keyword-only backend from an already resolved storage binding.
+/// Embedding-enabled consumers must use [`create_memory_from_config`].
+pub fn create_memory_with_storage(
     config: &MemoryConfig,
-    embedding_routes: &[EmbeddingRouteConfig],
     active_storage: ActiveStorage<'_>,
     workspace_dir: &Path,
-    _api_key: Option<&str>,
 ) -> anyhow::Result<Box<dyn Memory>> {
     anyhow::ensure!(
         config.embedding_model_ref.is_none()
             && config.embedding_provider == "none"
-            && !config.embedding_model.starts_with("hint:")
-            && embedding_routes.is_empty(),
+            && !config.embedding_model.starts_with("hint:"),
         "embedding model bindings require the full Config; use create_memory_from_config"
     );
-    create_memory_with_storage_and_routes_inner(
+    create_memory_with_embedding(
         config,
         active_storage,
         workspace_dir,
@@ -402,7 +387,7 @@ pub fn create_memory_with_storage_and_routes(
     )
 }
 
-fn create_memory_with_storage_and_routes_inner(
+fn create_memory_with_embedding(
     config: &MemoryConfig,
     active_storage: ActiveStorage<'_>,
     workspace_dir: &Path,
@@ -800,7 +785,7 @@ pub fn create_memory_for_migration(config: &Config) -> anyhow::Result<Box<dyn Me
     // rejected so an import never stops partway through, and read-time
     // withholding is disabled so `memory list` / `get` show every stored
     // row for inspection and removal. The runtime factory
-    // (`create_memory_with_storage_and_routes`) applies the configured
+    // (`create_memory_from_config`) applies the configured
     // `[memory.policy]`, so flagged rows remain withheld from recall
     // wherever `threat_scan_load_time` is enabled.
     //
@@ -821,7 +806,7 @@ pub fn create_memory_for_migration(config: &Config) -> anyhow::Result<Box<dyn Me
 
     let qdrant_embedding = if matches!(classify_memory_backend(&backend), MemoryBackendKind::Qdrant)
     {
-        Some(build_embedder_from_config(config, None)?)
+        Some(build_embedder_from_config(config)?)
     } else {
         None
     };
@@ -869,11 +854,11 @@ fn wrap_in_retrieval_pipeline(memory: Arc<dyn Memory>, config: &MemoryConfig) ->
 /// Cross-backend allowlist entries are rejected at config load, so by
 /// the time we get here every entry on
 /// `agents.<alias>.workspace.read_memory_from` is guaranteed to point
-/// at a sibling on the same backend kind.
+/// at a sibling on the same backend kind. The selected embedding connection
+/// supplies its own credentials; chat model credentials are never inherited.
 pub async fn create_memory_for_agent(
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
-    api_key: Option<&str>,
 ) -> anyhow::Result<Arc<dyn Memory>> {
     use zeroclaw_config::multi_agent::MemoryBackendKind as ConfigBackend;
     let agent_cfg = config
@@ -988,7 +973,7 @@ pub async fn create_memory_for_agent(
         )?));
     }
 
-    let inner = create_memory_from_config(config, api_key)?;
+    let inner = create_memory_from_config(config)?;
     let inner_arc: Arc<dyn Memory> = Arc::from(inner);
 
     let bound_id = inner_arc.ensure_agent_uuid(agent_alias).await?;
@@ -1082,7 +1067,7 @@ mod tests {
             },
         )
         .unwrap();
-        let embedder = build_embedder_from_config(&config, None).unwrap();
+        let embedder = build_embedder_from_config(&config).unwrap();
         assert_eq!(embedder.name(), "openai");
         assert_eq!(embedder.dimensions(), 3072);
         assert_eq!(embedder.identity().model, "embedding-large");
@@ -1092,7 +1077,7 @@ mod tests {
         config.embedding_routes[0].model.clear();
         config.embedding_routes[0].dimensions = Some(1);
         config.validate().unwrap();
-        let embedder = build_embedder_from_config(&config, None).unwrap();
+        let embedder = build_embedder_from_config(&config).unwrap();
         assert_eq!(embedder.identity().model, "embedding-large");
         assert_eq!(embedder.dimensions(), 3072);
     }
@@ -1120,9 +1105,7 @@ mod tests {
             api_key: None,
         });
         zeroclaw_config::migration::normalize_test_input(&mut config);
-        let before = build_embedder_from_config(&config, None)
-            .unwrap()
-            .identity();
+        let before = build_embedder_from_config(&config).unwrap().identity();
         let mut routed = config.clone();
         routed.memory.embedding_model_ref = Some(
             routed.embedding_routes[0]
@@ -1130,9 +1113,7 @@ mod tests {
                 .as_str()
                 .to_owned(),
         );
-        let route_before = build_embedder_from_config(&routed, None)
-            .unwrap()
-            .identity();
+        let route_before = build_embedder_from_config(&routed).unwrap().identity();
         let tmp = TempDir::new().unwrap();
         let memory = static_sqlite(tmp.path(), 1536);
         memory.record_embedding_identity(&before).unwrap();
@@ -1155,7 +1136,7 @@ mod tests {
             },
         )
         .unwrap();
-        let embedder = build_embedder_from_config(&config, None).unwrap();
+        let embedder = build_embedder_from_config(&config).unwrap();
         assert_eq!(embedder.name(), "custom");
         assert_eq!(embedder.identity().model, "embedding-small");
         assert_eq!(embedder.dimensions(), 1536);
@@ -1178,7 +1159,7 @@ mod tests {
                 .as_str()
                 .to_owned(),
         );
-        let embedder = build_embedder_from_config(&config, None).unwrap();
+        let embedder = build_embedder_from_config(&config).unwrap();
         assert_eq!(embedder.name(), "custom");
         assert_eq!(embedder.identity().model, "embedding-large");
         assert_eq!(embedder.dimensions(), 3072);
@@ -1192,7 +1173,7 @@ mod tests {
             backend: "sqlite".into(),
             ..MemoryConfig::default()
         };
-        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        let mem = create_memory(&cfg, tmp.path()).unwrap();
         assert_eq!(mem.name(), "sqlite");
     }
 
@@ -1242,9 +1223,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mem = create_memory_for_agent(&config, "alpha", None)
-            .await
-            .unwrap();
+        let mem = create_memory_for_agent(&config, "alpha").await.unwrap();
         let err = mem
             .store(
                 "own-held",
@@ -1301,7 +1280,7 @@ mod tests {
         config.agents.insert("alpha".into(), alpha);
         config.agents.insert("beta".into(), beta);
 
-        let err = match create_memory_for_agent(&config, "alpha", None).await {
+        let err = match create_memory_for_agent(&config, "alpha").await {
             Ok(_) => panic!("Markdown factory must fail closed for scoped grants"),
             Err(error) => error,
         };
@@ -1474,7 +1453,7 @@ mod tests {
             backend: "sqlite".into(),
             ..MemoryConfig::default()
         };
-        drop(create_memory(&cfg, tmp.path(), None).unwrap());
+        drop(create_memory(&cfg, tmp.path()).unwrap());
 
         let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         assert_eq!(mem.stored_embedding_identity().unwrap(), None);
@@ -1510,7 +1489,7 @@ mod tests {
             );
             config
         };
-        drop(create_memory_from_config(&config_for("model-a"), None).unwrap());
+        drop(create_memory_from_config(&config_for("model-a")).unwrap());
         {
             let mem = SqliteMemory::new("test", tmp.path()).unwrap();
             let identity = mem.stored_embedding_identity().unwrap().unwrap();
@@ -1520,10 +1499,10 @@ mod tests {
         }
 
         // Same config again → identity unchanged (Match path, no churn).
-        drop(create_memory_from_config(&config_for("model-a"), None).unwrap());
+        drop(create_memory_from_config(&config_for("model-a")).unwrap());
 
         // Model change → factory reconciles to the new identity.
-        drop(create_memory_from_config(&config_for("model-b"), None).unwrap());
+        drop(create_memory_from_config(&config_for("model-b")).unwrap());
         let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         let identity = mem.stored_embedding_identity().unwrap().unwrap();
         assert!(identity.provider.starts_with("openai:"));
@@ -1540,7 +1519,7 @@ mod tests {
         };
         assert!(!cfg.audit_enabled, "audit must stay opt-in by default");
 
-        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        let mem = create_memory(&cfg, tmp.path()).unwrap();
         mem.store("audit_off", "value", MemoryCategory::Core, None)
             .await
             .unwrap();
@@ -1557,7 +1536,7 @@ mod tests {
             ..MemoryConfig::default()
         };
 
-        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        let mem = create_memory(&cfg, tmp.path()).unwrap();
         mem.store("audit_on", "value", MemoryCategory::Core, None)
             .await
             .unwrap();
@@ -1592,7 +1571,7 @@ mod tests {
             ..MemoryConfig::default()
         };
 
-        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        let mem = create_memory(&cfg, tmp.path()).unwrap();
         let error = mem
             .store(
                 "blocked",
@@ -1649,7 +1628,7 @@ mod tests {
             },
         );
 
-        let mem = create_memory_for_agent(&cfg, "scribe", None)
+        let mem = create_memory_for_agent(&cfg, "scribe")
             .await
             .expect("per-agent markdown memory");
         mem.store("agent_key", "agent value", MemoryCategory::Core, None)
@@ -1712,7 +1691,7 @@ mod tests {
             },
         );
 
-        let mem = create_memory_for_agent(&cfg, "scribe", None)
+        let mem = create_memory_for_agent(&cfg, "scribe")
             .await
             .expect("per-agent markdown memory");
         mem.store("agent_key", "agent value", MemoryCategory::Core, None)
@@ -1749,7 +1728,7 @@ mod tests {
             },
         );
 
-        let mem = create_memory_for_agent(&cfg, "ghost", None)
+        let mem = create_memory_for_agent(&cfg, "ghost")
             .await
             .expect("per-agent none memory");
         mem.store("ghost_key", "dropped", MemoryCategory::Core, None)
@@ -1796,7 +1775,7 @@ mod tests {
             },
         );
 
-        let err = match create_memory_for_agent(&cfg, "scribe", None).await {
+        let err = match create_memory_for_agent(&cfg, "scribe").await {
             Ok(_) => panic!("typed flags with a non-sqlite agent backend must fail startup"),
             Err(err) => err,
         };
@@ -1830,7 +1809,7 @@ mod tests {
             },
         );
 
-        create_memory_for_agent(&cfg, "scribe", None)
+        create_memory_for_agent(&cfg, "scribe")
             .await
             .expect("typed flags on the default sqlite backend must construct");
     }
@@ -1923,7 +1902,7 @@ User: how was the deploy?
             backend: "markdown".into(),
             ..MemoryConfig::default()
         };
-        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        let mem = create_memory(&cfg, tmp.path()).unwrap();
         assert_eq!(mem.name(), "markdown");
     }
 
@@ -1934,7 +1913,7 @@ User: how was the deploy?
             backend: "lucid".into(),
             ..MemoryConfig::default()
         };
-        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        let mem = create_memory(&cfg, tmp.path()).unwrap();
         assert_eq!(mem.name(), "lucid");
     }
 
@@ -2037,7 +2016,7 @@ store_timeout_ms = 40000
         assert_eq!(store_timeout, std::time::Duration::from_secs(20));
 
         let memory =
-            create_memory_from_config(&config, None).expect("build Lucid memory from parsed alias");
+            create_memory_from_config(&config).expect("build Lucid memory from parsed alias");
 
         memory
             .store(
@@ -2133,7 +2112,7 @@ store_timeout_ms = 40000
             backend: "none".into(),
             ..MemoryConfig::default()
         };
-        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        let mem = create_memory(&cfg, tmp.path()).unwrap();
         assert_eq!(mem.name(), "none");
     }
 
@@ -2150,15 +2129,9 @@ store_timeout_ms = 40000
             db_url: Some("postgres://placeholder".into()),
             ..PostgresStorageConfig::default()
         };
-        let error = create_memory_with_storage_and_routes(
-            &cfg,
-            &[],
-            ActiveStorage::Postgres(&storage),
-            tmp.path(),
-            None,
-        )
-        .err()
-        .expect("backend=postgres without memory-postgres feature should fail");
+        let error = create_memory_with_storage(&cfg, ActiveStorage::Postgres(&storage), tmp.path())
+            .err()
+            .expect("backend=postgres without memory-postgres feature should fail");
         assert!(
             error.to_string().contains("memory-postgres"),
             "error should mention the feature flag: {error}"
@@ -2172,7 +2145,7 @@ store_timeout_ms = 40000
             backend: "postgres.default".into(),
             ..MemoryConfig::default()
         };
-        let error = create_memory(&cfg, tmp.path(), None)
+        let error = create_memory(&cfg, tmp.path())
             .err()
             .expect("dotted backend references require the full Config");
         assert!(
@@ -2188,7 +2161,7 @@ store_timeout_ms = 40000
             backend: "lucid.selected".into(),
             ..MemoryConfig::default()
         };
-        let error = create_memory(&cfg, tmp.path(), None)
+        let error = create_memory(&cfg, tmp.path())
             .err()
             .expect("dotted Lucid aliases require the full Config");
         assert!(
@@ -2214,7 +2187,7 @@ store_timeout_ms = 40000
                 ..Default::default()
             },
         ] {
-            let error = create_memory(&cfg, tmp.path(), None).err().unwrap();
+            let error = create_memory(&cfg, tmp.path()).err().unwrap();
             assert!(error.to_string().contains("full Config"));
         }
         assert!(!tmp.path().join("memory").exists());
@@ -2227,7 +2200,7 @@ store_timeout_ms = 40000
             backend: "qdrant.default".into(),
             ..MemoryConfig::default()
         };
-        let error = create_memory(&cfg, tmp.path(), None)
+        let error = create_memory(&cfg, tmp.path())
             .err()
             .expect("dotted backend references require the full Config");
         assert!(
@@ -2294,7 +2267,7 @@ url = "http://localhost:6333"
     /// compiled in, or without a `[storage.postgres.<alias>]` entry, the
     /// migration factory now surfaces the same storage-aware error the
     /// runtime gives — not the old unconditional "postgres backend requires
-    /// storage config; call create_memory_with_storage_and_routes instead"
+    /// storage config; call create_memory_from_config instead"
     /// bail that made `zeroclaw memory list` unusable for every Postgres
     /// user regardless of config.
     #[test]
@@ -2308,7 +2281,7 @@ url = "http://localhost:6333"
             .expect("backend=postgres without a storage alias must be rejected");
         let message = error.to_string();
         assert!(
-            !message.contains("call create_memory_with_storage_and_routes"),
+            !message.contains("call create_memory_from_config"),
             "must not surface the internal builder-only factory error: {message}"
         );
     }
@@ -2328,14 +2301,8 @@ url = "http://localhost:6333"
             url: Some("http://localhost:6333".into()),
             ..QdrantStorageConfig::default()
         };
-        let mem = create_memory_with_storage_and_routes(
-            &cfg,
-            &[],
-            ActiveStorage::Qdrant(&storage),
-            tmp.path(),
-            None,
-        )
-        .expect("qdrant with resolved storage config must still construct");
+        let mem = create_memory_with_storage(&cfg, ActiveStorage::Qdrant(&storage), tmp.path())
+            .expect("qdrant with resolved storage config must still construct");
         assert_eq!(mem.name(), "qdrant");
     }
 
@@ -2354,7 +2321,7 @@ url = "http://localhost:6333"
             backend: "redis".into(),
             ..MemoryConfig::default()
         };
-        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        let mem = create_memory(&cfg, tmp.path()).unwrap();
         assert_eq!(mem.name(), "markdown");
     }
 
@@ -2404,7 +2371,7 @@ url = "http://localhost:6333"
             .unwrap();
         assert!(operator.get("imported").await.unwrap().is_some());
 
-        let runtime = create_memory(&MemoryConfig::default(), tmp.path(), None).unwrap();
+        let runtime = create_memory(&MemoryConfig::default(), tmp.path()).unwrap();
         assert!(runtime.get("imported").await.unwrap().is_none());
         assert!(operator.forget("imported").await.unwrap());
     }
@@ -2974,8 +2941,8 @@ url = "http://localhost:6333"
         let tmp = TempDir::new().unwrap();
         let config = agent_config(&tmp);
 
-        let handle_a = create_memory_for_agent(&config, "ops", None).await.unwrap();
-        let handle_b = create_memory_for_agent(&config, "ops", None).await.unwrap();
+        let handle_a = create_memory_for_agent(&config, "ops").await.unwrap();
+        let handle_b = create_memory_for_agent(&config, "ops").await.unwrap();
 
         handle_a
             .store("k1", "first fact", MemoryCategory::Core, None)
@@ -3031,7 +2998,7 @@ url = "http://localhost:6333"
                 .unwrap()
                 .workspace
                 .read_memory_from = grants.into();
-            let error = match create_memory_for_agent(&candidate, "ops", None).await {
+            let error = match create_memory_for_agent(&candidate, "ops").await {
                 Ok(_) => panic!("ambiguous duplicate grants must fail closed"),
                 Err(error) => error,
             };
@@ -3047,8 +3014,8 @@ url = "http://localhost:6333"
         let mut config = agent_config(&tmp);
         config.memory.retrieval_stages = vec!["fts".to_string(), "vector".to_string()];
 
-        let handle_a = create_memory_for_agent(&config, "ops", None).await.unwrap();
-        let handle_b = create_memory_for_agent(&config, "ops", None).await.unwrap();
+        let handle_a = create_memory_for_agent(&config, "ops").await.unwrap();
+        let handle_b = create_memory_for_agent(&config, "ops").await.unwrap();
 
         handle_a
             .store("k1", "first fact", MemoryCategory::Core, None)
@@ -3083,7 +3050,7 @@ url = "http://localhost:6333"
         let mut config = agent_config(&tmp);
         config.memory.retrieval_stages = vec!["cache".to_string()];
 
-        let handle = create_memory_for_agent(&config, "ops", None).await.unwrap();
+        let handle = create_memory_for_agent(&config, "ops").await.unwrap();
         handle
             .store("k1", "first fact", MemoryCategory::Core, None)
             .await

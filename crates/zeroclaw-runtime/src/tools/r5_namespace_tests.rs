@@ -2,6 +2,7 @@
 use super::*;
 use crate::tools::scoped::{ScopedAssembled, ScopedAssembly, ScopedToolRegistry};
 use tempfile::TempDir;
+use zeroclaw_config::schema::AliasedAgentConfig;
 
 type BuiltCase = (
     TempDir,
@@ -60,29 +61,25 @@ fn build_case(optional: &[&str], pipeline_enabled: bool, plugins_enabled: bool) 
     });
     let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::new());
     let memory: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("namespace"));
-    let built = all_tools_with_runtime(
-        Arc::new(config.clone()),
-        &security,
-        &zeroclaw_config::schema::RiskProfileConfig::default(),
-        "namespace",
-        Arc::clone(&runtime),
-        memory,
-        None,
-        None,
-        &config.browser,
-        &config.http_request,
-        &config.web_fetch,
-        tmp.path(),
-        &config.agents,
-        None,
-        &config,
-        None,
-        false,
-        None,
-        None,
-        None,
-        None,
-    )
+    let built = {
+        let registry_config = Arc::new(config.clone());
+        let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
+            Arc::clone(&runtime);
+        let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = memory;
+        let registry_request = crate::composition::ToolRequest {
+            config: &registry_config,
+            agent_alias: "namespace",
+            security: &security,
+            runtime: &registry_runtime,
+            memory: &registry_memory,
+        };
+        let registry_inputs =
+            crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+        crate::tools::build_native_registry(
+            registry_inputs,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+        )
+    }
     .unwrap();
     (tmp, config, security, built, runtime)
 }
@@ -822,29 +819,25 @@ async fn late_build(
     let security = Arc::new(security);
     let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::new());
     let memory: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("namespace"));
-    let built = all_tools_with_runtime(
-        Arc::new(config.clone()),
-        &security,
-        &zeroclaw_config::schema::RiskProfileConfig::default(),
-        "namespace",
-        Arc::clone(&runtime),
-        memory,
-        None,
-        None,
-        &config.browser,
-        &config.http_request,
-        &config.web_fetch,
-        tmp.path(),
-        &config.agents,
-        None,
-        &config,
-        None,
-        false,
-        None,
-        None,
-        None,
-        None,
-    )
+    let built = {
+        let registry_config = Arc::new(config.clone());
+        let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
+            Arc::clone(&runtime);
+        let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = memory;
+        let registry_request = crate::composition::ToolRequest {
+            config: &registry_config,
+            agent_alias: "namespace",
+            security: &security,
+            runtime: &registry_runtime,
+            memory: &registry_memory,
+        };
+        let registry_inputs =
+            crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+        crate::tools::build_native_registry(
+            registry_inputs,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+        )
+    }
     .unwrap();
     let name = if default_guest {
         "config-echo"

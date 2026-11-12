@@ -32,6 +32,7 @@ pub mod openrouter_catalog;
 pub mod pricing;
 mod protocols;
 pub mod reliable;
+pub mod response;
 pub mod router;
 pub mod safeguard_notice;
 pub(crate) mod stream_guard;

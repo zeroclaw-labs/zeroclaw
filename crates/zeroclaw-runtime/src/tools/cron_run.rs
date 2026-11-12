@@ -468,32 +468,23 @@ mod tests {
         let mut factory_config = (**config).clone();
         factory_config.tools.optional = vec!["cron_run".into()];
         let factory_config = Arc::new(factory_config);
-        let mut built = crate::tools::all_tools_with_runtime_context(
-            factory_config,
-            &security,
-            &config.risk_profiles[TEST_AGENT],
-            TEST_AGENT,
-            runtime.clone(),
-            memory.clone(),
-            None,
-            None,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &workspace,
-            &config.agents,
-            None,
-            config,
-            None,
-            false,
-            None,
-            None,
-            None,
-            None,
-            Some(execution_capability),
-            None,
-            None,
-        )
+        let mut built = {
+            let registry_config = factory_config;
+            let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
+                runtime.clone();
+            let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = memory.clone();
+            let registry_request = crate::composition::ToolRequest {
+                config: &registry_config,
+                agent_alias: TEST_AGENT,
+                security: &security,
+                runtime: &registry_runtime,
+                memory: &registry_memory,
+            };
+            let mut registry_inputs =
+                crate::composition::NativeRecipeInputs::new(&registry_request, &workspace);
+            registry_inputs.execution_capability = Some(execution_capability);
+            crate::tools::build_native_registry(registry_inputs, &config.risk_profiles[TEST_AGENT])
+        }
         .unwrap();
         if let Some(capabilities) = capabilities {
             built = capabilities

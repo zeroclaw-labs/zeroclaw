@@ -114,7 +114,6 @@ pub fn derive_section_status(cfg: &zeroclaw_config::schema::Config) -> ConfigSta
         || cfg
             .provider_registry()
             .is_ok_and(|registry| !registry.models.is_empty())
-        || cfg.providers.models.has_canonical_models()
         || !cfg.providers.connections.is_empty()
         || !cfg.providers.model_presets.is_empty()
         || !cfg.risk_profiles.is_empty()

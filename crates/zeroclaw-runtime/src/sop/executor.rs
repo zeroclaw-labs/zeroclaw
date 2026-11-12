@@ -758,8 +758,7 @@ async fn headless_step_memory(
     let Some(owner) = owner else {
         return Ok(None);
     };
-    let api_key = config.agent_model_api_key(agent_alias);
-    crate::agent::turn::step_agent_memory(config, agent_alias, api_key.as_deref(), Some(owner))
+    crate::agent::turn::step_agent_memory(config, agent_alias, Some(owner))
         .await
         .map(Some)
 }
@@ -1996,7 +1995,7 @@ mod tests {
         };
         let tmp = tempfile::tempdir().unwrap();
         let memory: Arc<dyn zeroclaw_memory::Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
         let logger = SopAuditLogger::new(memory);
 
         let run_id = "run-canonical-attribution-0001";

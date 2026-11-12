@@ -1096,6 +1096,14 @@ pub async fn handle_prop_put(
         Err(e) => return error_response(config_commit_admission_error(e)),
     };
     let mut new_config = _cfg_guard.current_config();
+    if let Err(error) =
+        zeroclaw_config::schema::reject_retired_provider_edit_path(&new_config, &body.path)
+    {
+        return error_response(
+            ConfigApiError::new(ConfigApiCode::ValidationFailed, error.to_string())
+                .with_path(&body.path),
+        );
+    }
     if new_config.ensure_map_key_for_path(&body.path) {
         // Refused to vivify the reserved `default` agent: surface the same
         // reserved error the explicit create surfaces do, not a generic 404.
@@ -1298,10 +1306,6 @@ pub async fn handle_list(State(state): State<AppState>, Query(q): Query<ListQuer
             None => true,
         })
         .filter(|info| !field_visibility::is_excluded(&info.name, &excluded))
-        // A migrated profile keeps its legacy `model` for compatibility, but
-        // the runtime resolver selects the nested entry. Do not offer the
-        // shadowed field as a second editable model in the Web form.
-        .filter(|info| config.effective_model_edit_path(&info.name) == info.name)
         .map(|info| {
             let populated = info.display_value != zeroclaw_config::traits::UNSET_DISPLAY;
             let is_sensitive = info.is_secret || info.derived_from_secret;
@@ -1481,6 +1485,14 @@ pub async fn handle_delete_map_key(
     principal: RequestPrincipal,
     Query(q): Query<MapKeyQuery>,
 ) -> Response {
+    if let Err(error) =
+        zeroclaw_config::schema::reject_retired_provider_edit_path(&state.config.read(), &q.path)
+    {
+        return error_response(
+            ConfigApiError::new(ConfigApiCode::ValidationFailed, error.to_string())
+                .with_path(&q.path),
+        );
+    }
     let agent_lifecycle_lease = if q.path == "agents" {
         match state.agent_lifecycle.begin_delete(q.key.clone()) {
             Ok(lease) => Some(lease),
@@ -1796,6 +1808,14 @@ pub async fn handle_map_key(
 ) -> Response {
     let path = q.path.clone();
     let key = q.key.clone();
+    if let Err(error) =
+        zeroclaw_config::schema::reject_retired_provider_edit_path(&state.config.read(), &path)
+    {
+        return error_response(
+            ConfigApiError::new(ConfigApiCode::ValidationFailed, error.to_string())
+                .with_path(&path),
+        );
+    }
     let _cfg_guard = match state.begin_config_commit().await {
         Ok(commit) => commit,
         Err(e) => return error_response(config_commit_admission_error(e)),
@@ -2105,6 +2125,14 @@ pub async fn handle_rename_map_key(
     principal: RequestPrincipal,
     axum::Json(body): axum::Json<RenameMapKeyBody>,
 ) -> Response {
+    if let Err(error) =
+        zeroclaw_config::schema::reject_retired_provider_edit_path(&state.config.read(), &body.path)
+    {
+        return error_response(
+            ConfigApiError::new(ConfigApiCode::ValidationFailed, error.to_string())
+                .with_path(&body.path),
+        );
+    }
     let agent_lifecycle_leases = if body.path == "agents" {
         let from = match state.agent_lifecycle.begin_delete(body.from.clone()) {
             Ok(lease) => lease,
@@ -2627,11 +2655,7 @@ pub async fn handle_patch(
         if !drifted.is_empty() {
             let mut touched = std::collections::HashSet::new();
             for op in &ops {
-                let requested = json_pointer_to_dotted(&op.path);
-                touched.insert(requested.clone());
-                if matches!(op.op.as_str(), "add" | "replace" | "test") {
-                    touched.insert(working.effective_model_edit_path(&requested));
-                }
+                touched.insert(json_pointer_to_dotted(&op.path));
             }
             let conflicts: Vec<&DriftEntry> = drifted
                 .iter()
@@ -2658,12 +2682,7 @@ pub async fn handle_patch(
     let mut results = Vec::with_capacity(ops.len());
 
     for (idx, op) in ops.iter().enumerate() {
-        let requested_path = json_pointer_to_dotted(&op.path);
-        let path = if matches!(op.op.as_str(), "add" | "replace" | "test") {
-            working.effective_model_edit_path(&requested_path)
-        } else {
-            requested_path
-        };
+        let path = json_pointer_to_dotted(&op.path);
         if matches!(op.op.as_str(), "add" | "replace") && working.ensure_map_key_for_path(&path) {
             // Refused to vivify the reserved `default` agent: surface the same
             // reserved error the explicit create surfaces do, not a generic 404.

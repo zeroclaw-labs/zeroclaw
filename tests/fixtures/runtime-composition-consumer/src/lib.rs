@@ -497,25 +497,39 @@ mod tests {
         let security =
             Arc::new(zeroclaw_config::policy::SecurityPolicy::for_agent(&c, AGENT).unwrap());
         let memory: Arc<dyn Memory> = Arc::new(SuppliedMemory(Arc::new(Evidence::default())));
-        let built = zeroclaw_runtime::tools::all_tools(
-            Arc::new(c.clone()),
-            &security,
-            c.risk_profile_for_agent(AGENT).unwrap(),
-            AGENT,
-            memory,
-            None,
-            None,
-            &c.browser,
-            &c.http_request,
-            &c.web_fetch,
-            &c.data_dir,
-            &c.agents,
-            None,
-            &c,
-            None,
-            false,
-            None,
-        )
+        let built = {
+            let registry_config = Arc::new(c.clone());
+            (|| -> anyhow::Result<_> {
+                let registry_environment: Option<zeroclaw_runtime::tools::ForwardedEnvironment> =
+                    None;
+                let registry_path = registry_environment
+                    .as_ref()
+                    .and_then(|env| env.get("PATH"))
+                    .map(std::ffi::OsStr::new);
+                let registry_runtime: std::sync::Arc<
+                    dyn zeroclaw_config::platform::RuntimeAdapter,
+                > = std::sync::Arc::from(zeroclaw_config::platform::create_runtime_with_path(
+                    &registry_config.runtime,
+                    registry_path,
+                )?);
+                let registry_memory: std::sync::Arc<dyn Memory> = memory;
+                let registry_request = zeroclaw_runtime::composition::ToolRequest {
+                    config: &registry_config,
+                    agent_alias: AGENT,
+                    security: &security,
+                    runtime: &registry_runtime,
+                    memory: &registry_memory,
+                };
+                let registry_inputs = zeroclaw_runtime::composition::NativeRecipeInputs::new(
+                    &registry_request,
+                    &c.data_dir,
+                );
+                zeroclaw_runtime::tools::build_native_registry(
+                    registry_inputs,
+                    c.risk_profile_for_agent(AGENT).unwrap(),
+                )
+            })()
+        }
         .unwrap();
         assert!(
             built.tools.iter().any(|t| t.name() == "sessions_list"),

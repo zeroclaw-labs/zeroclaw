@@ -1750,28 +1750,16 @@ fn context_failure_aggregate(message: &str, failures: &FailureEvents) -> String 
     )
 }
 
-fn is_empty_completion(resp: &ChatResponse, model: &str) -> bool {
-    resp.is_semantically_empty_terminal_with(zeroclaw_api::text_extraction_reasoning_for(model))
+fn is_empty_completion(resp: &ChatResponse) -> bool {
+    resp.is_semantically_empty_terminal()
 }
 
 fn normalize_completion(resp: &mut ChatResponse, model: &str) {
-    resp.normalize_text_for_policy(zeroclaw_api::text_extraction_reasoning_for(model));
-}
-
-fn is_empty_text_completion(text: &str, model: &str) -> bool {
-    if zeroclaw_api::text_extraction_reasoning_for(model) {
-        zeroclaw_api::model_provider::strip_think_tags(text).is_empty()
-    } else {
-        text.trim().is_empty()
-    }
+    crate::response::normalize_response(resp, zeroclaw_api::text_extraction_for(model));
 }
 
 fn normalize_text_completion(text: String, model: &str) -> String {
-    if zeroclaw_api::text_extraction_reasoning_for(model) {
-        zeroclaw_api::model_provider::strip_think_tags(&text)
-    } else {
-        text
-    }
+    crate::response::normalize_text(&text, zeroclaw_api::text_extraction_for(model))
 }
 
 fn is_semantic_empty_completion_error(error: &anyhow::Error) -> bool {
@@ -2664,7 +2652,7 @@ impl ModelProvider for ReliableModelProvider {
                         Ok(resp) => {
                             let policy_model = entry.text_extraction_ref(current_model);
                             let resp = normalize_text_completion(resp, policy_model);
-                            if is_empty_text_completion(&resp, policy_model) {
+                            if resp.trim().is_empty() {
                                 if attempt < self.max_retries {
                                     self.backoff_after_empty_completion(
                                         &mut failures,
@@ -2972,7 +2960,7 @@ impl ModelProvider for ReliableModelProvider {
                         Ok(resp) => {
                             let policy_model = entry.text_extraction_ref(current_model);
                             let resp = normalize_text_completion(resp, policy_model);
-                            if is_empty_text_completion(&resp, policy_model) {
+                            if resp.trim().is_empty() {
                                 if attempt < self.max_retries {
                                     self.backoff_after_empty_completion(
                                         &mut failures,
@@ -3431,7 +3419,7 @@ impl ModelProvider for ReliableModelProvider {
                         Ok(mut resp) => {
                             let policy_model = entry.text_extraction_ref(current_model);
                             normalize_completion(&mut resp, policy_model);
-                            if is_empty_completion(&resp, policy_model) {
+                            if is_empty_completion(&resp) {
                                 if let Some(usage) = resp.usage.clone()
                                     && !has_reliable_call_accounting()
                                 {
@@ -3836,7 +3824,7 @@ impl ModelProvider for ReliableModelProvider {
                         Ok(mut resp) => {
                             let policy_model = entry.text_extraction_ref(current_model);
                             normalize_completion(&mut resp, policy_model);
-                            if is_empty_completion(&resp, policy_model) {
+                            if is_empty_completion(&resp) {
                                 if let Some(usage) = resp.usage.clone()
                                     && !has_reliable_call_accounting()
                                 {

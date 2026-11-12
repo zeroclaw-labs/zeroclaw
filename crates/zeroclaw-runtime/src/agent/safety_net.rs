@@ -46,8 +46,7 @@ fn mem_none(workspace: &Path) -> Arc<dyn Memory> {
         ..zeroclaw_config::schema::MemoryConfig::default()
     };
     Arc::from(
-        zeroclaw_memory::create_memory(&cfg, workspace, None)
-            .expect("memory creation should succeed"),
+        zeroclaw_memory::create_memory(&cfg, workspace).expect("memory creation should succeed"),
     )
 }
 

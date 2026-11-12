@@ -53,52 +53,46 @@ options_patch!(ChatOptionsPatch {
 
 /// Effective model-owned textual extraction policy. Missing options inherit;
 /// explicit values are ordinary booleans and never accept the `"null"` sentinel.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct TextExtraction {
-    pub reasoning: bool,
-    pub tool_calls: bool,
-}
+pub use zeroclaw_api::TextExtraction;
 
-impl TextExtraction {
-    /// Provider-specific baselines for the two model options. This is the
-    /// sole declaration of these defaults, shared by canonical and legacy
-    /// selections; it does not describe the upstream's native capabilities.
-    pub(crate) fn for_provider(
-        kind: &str,
-        wire_api: Option<WireApi>,
-        native_tools: Option<bool>,
-    ) -> Self {
-        // MiniMax's unsplit reasoning and Groq's raw reasoning format put
-        // <think> blocks in content. Other providers must
-        // opt in when a particular model/server emits inline reasoning.
-        let reasoning = matches!(kind, "minimax" | "groq");
-        // These adapters currently use prompt-guided tool calls by default.
-        // Several upstreams also support native tools; enabling that mode
-        // removes the need to infer calls from arbitrary response text.
-        let native_tool_mode = match kind {
-            "groq" => native_tools == Some(true),
-            "venice" | "atomic_chat" => {
-                native_tools == Some(true) || wire_api == Some(WireApi::Responses)
-            }
-            _ => false,
-        };
-        let tool_calls = !native_tool_mode
-            && matches!(
-                kind,
-                "ollama"
-                    | "hailo_ollama"
-                    | "gemini"
-                    | "gemini_cli"
-                    | "grok_cli"
-                    | "kilocli"
-                    | "groq"
-                    | "venice"
-                    | "atomic_chat"
-            );
-        Self {
-            reasoning,
-            tool_calls,
+/// Provider-specific baselines for the two model options. This is the
+/// sole declaration of these defaults, shared by canonical and legacy
+/// selections; it does not describe the upstream's native capabilities.
+pub(crate) fn text_extraction_defaults(
+    kind: &str,
+    wire_api: Option<WireApi>,
+    native_tools: Option<bool>,
+) -> TextExtraction {
+    // MiniMax's unsplit reasoning and Groq's raw reasoning format put
+    // <think> blocks in content. Other providers must
+    // opt in when a particular model/server emits inline reasoning.
+    let reasoning = matches!(kind, "minimax" | "groq");
+    // These adapters currently use prompt-guided tool calls by default.
+    // Several upstreams also support native tools; enabling that mode
+    // removes the need to infer calls from arbitrary response text.
+    let native_tool_mode = match kind {
+        "groq" => native_tools == Some(true),
+        "venice" | "atomic_chat" => {
+            native_tools == Some(true) || wire_api == Some(WireApi::Responses)
         }
+        _ => false,
+    };
+    let tool_calls = !native_tool_mode
+        && matches!(
+            kind,
+            "ollama"
+                | "hailo_ollama"
+                | "gemini"
+                | "gemini_cli"
+                | "grok_cli"
+                | "kilocli"
+                | "groq"
+                | "venice"
+                | "atomic_chat"
+        );
+    TextExtraction {
+        reasoning,
+        tool_calls,
     }
 }
 

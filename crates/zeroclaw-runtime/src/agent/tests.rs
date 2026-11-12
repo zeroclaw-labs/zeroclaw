@@ -314,7 +314,7 @@ fn make_memory() -> Arc<dyn Memory> {
         backend: "none".into(),
         ..MemoryConfig::default()
     };
-    Arc::from(zeroclaw_memory::create_memory(&cfg, &std::env::temp_dir(), None).unwrap())
+    Arc::from(zeroclaw_memory::create_memory(&cfg, &std::env::temp_dir()).unwrap())
 }
 
 fn make_sqlite_memory() -> (Arc<dyn Memory>, tempfile::TempDir) {
@@ -323,7 +323,7 @@ fn make_sqlite_memory() -> (Arc<dyn Memory>, tempfile::TempDir) {
         backend: "sqlite".into(),
         ..MemoryConfig::default()
     };
-    let mem = Arc::from(zeroclaw_memory::create_memory(&cfg, tmp.path(), None).unwrap());
+    let mem = Arc::from(zeroclaw_memory::create_memory(&cfg, tmp.path()).unwrap());
     (mem, tmp)
 }
 

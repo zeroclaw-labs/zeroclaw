@@ -922,7 +922,6 @@ struct GatewayBootSelection {
     model_ref: String,
     model_id: Option<String>,
     temperature: Option<f64>,
-    api_key: Option<String>,
 }
 impl GatewayBootSelection {
     fn provider_ref(&self) -> String {
@@ -936,9 +935,6 @@ impl GatewayBootSelection {
     }
     fn temperature(&self) -> Option<f64> {
         self.temperature
-    }
-    fn api_key(&self) -> Option<&str> {
-        self.api_key.as_deref()
     }
 }
 fn resolve_gateway_boot_selection(config: &Config) -> GatewayBootSelection {
@@ -956,15 +952,10 @@ fn resolve_gateway_boot_selection(config: &Config) -> GatewayBootSelection {
                 .map(|(reference, _)| reference.to_string())
         })
         .unwrap_or_default();
-    let api_key = config.provider_registry().ok().and_then(|registry| {
-        let selected = registry.resolve_chat(&model_ref.as_str().into()).ok()?;
-        selected.selection.connection.api_key().map(str::to_owned)
-    });
     GatewayBootSelection {
         model_id: config.resolve_model_id(&model_ref),
         temperature: config.resolve_model_temperature(&model_ref),
         model_ref,
-        api_key,
     }
 }
 
@@ -1596,7 +1587,7 @@ pub async fn run_gateway_with_plugin_webhooks(
     let mem: Arc<dyn Memory> = if config.agents.is_empty() {
         Arc::new(zeroclaw_memory::NoneMemory::new("none"))
     } else {
-        match zeroclaw_memory::create_memory_from_config(&config, boot.api_key()) {
+        match zeroclaw_memory::create_memory_from_config(&config) {
             Ok(m) => Arc::from(m),
             Err(e) => {
                 ::zeroclaw_log::record!(
@@ -1639,15 +1630,6 @@ pub async fn run_gateway_with_plugin_webhooks(
     let canvas_store = canvas_store.unwrap_or_default();
     let agent_alias_opt = default_agent_alias(&config);
 
-    let (composio_key, composio_entity_id) = if config.composio.enabled {
-        (
-            config.composio.api_key.as_deref(),
-            Some(config.composio.entity_id.as_str()),
-        )
-    } else {
-        (None, None)
-    };
-
     let agent_setup: Option<(
         zeroclaw_config::schema::RiskProfileConfig,
         Arc<SecurityPolicy>,
@@ -1669,29 +1651,30 @@ pub async fn run_gateway_with_plugin_webhooks(
 
     let (tools_registry_raw, _delegate_handle_gw) = match (&agent_alias_opt, agent_setup) {
         (Some(agent_alias), Some((risk_profile, security))) => {
-            match tools::all_tools_with_runtime(
-                Arc::new(config.clone()),
-                &security,
-                &risk_profile,
-                agent_alias,
-                Arc::clone(&runtime),
-                Arc::clone(&mem),
-                composio_key,
-                composio_entity_id,
-                &config.browser,
-                &config.http_request,
-                &config.web_fetch,
-                &config.data_dir,
-                &config.agents,
-                config.agent_model_api_key(agent_alias).as_deref(),
-                &config,
-                Some(canvas_store.clone()),
-                false,
-                None,
-                sop_engine.clone(),
-                sop_audit.clone(),
-                None,
-            ) {
+            match {
+                let registry_config = Arc::new(config.clone());
+                let registry_environment: Option<zeroclaw_runtime::tools::ForwardedEnvironment> =
+                    None;
+                let registry_runtime: std::sync::Arc<
+                    dyn zeroclaw_config::platform::RuntimeAdapter,
+                > = Arc::clone(&runtime);
+                let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = Arc::clone(&mem);
+                let registry_request = zeroclaw_runtime::composition::ToolRequest {
+                    config: &registry_config,
+                    agent_alias,
+                    security: &security,
+                    runtime: &registry_runtime,
+                    memory: &registry_memory,
+                };
+                let mut registry_inputs = zeroclaw_runtime::composition::NativeRecipeInputs::new(
+                    &registry_request,
+                    &config.data_dir,
+                );
+                registry_inputs.canvas_store = Some(canvas_store.clone());
+                registry_inputs.sop_engine = sop_engine.clone();
+                registry_inputs.sop_audit = sop_audit.clone();
+                zeroclaw_runtime::tools::build_native_registry(registry_inputs, &risk_profile)
+            } {
                 Ok(all_tools_result) => {
                     let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
                         config: &config,
@@ -1818,29 +1801,27 @@ pub async fn run_gateway_with_plugin_webhooks(
                 continue;
             }
         };
-        let agent_tools_result = match tools::all_tools_with_runtime(
-            Arc::new(config.clone()),
-            &security,
-            &risk_profile,
-            &alias,
-            Arc::clone(&runtime),
-            Arc::clone(&mem),
-            composio_key,
-            composio_entity_id,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &config.data_dir,
-            &config.agents,
-            config.agent_model_api_key(&alias).as_deref(),
-            &config,
-            Some(canvas_store.clone()),
-            false,
-            None,
-            sop_engine.clone(),
-            sop_audit.clone(),
-            None,
-        ) {
+        let agent_tools_result = match {
+            let registry_config = Arc::new(config.clone());
+            let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
+                Arc::clone(&runtime);
+            let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = Arc::clone(&mem);
+            let registry_request = zeroclaw_runtime::composition::ToolRequest {
+                config: &registry_config,
+                agent_alias: &alias,
+                security: &security,
+                runtime: &registry_runtime,
+                memory: &registry_memory,
+            };
+            let mut registry_inputs = zeroclaw_runtime::composition::NativeRecipeInputs::new(
+                &registry_request,
+                &config.data_dir,
+            );
+            registry_inputs.canvas_store = Some(canvas_store.clone());
+            registry_inputs.sop_engine = sop_engine.clone();
+            registry_inputs.sop_audit = sop_audit.clone();
+            zeroclaw_runtime::tools::build_native_registry(registry_inputs, &risk_profile)
+        } {
             Ok(result) => result,
             Err(e) => {
                 ::zeroclaw_log::record!(
@@ -7512,7 +7493,6 @@ path = "{trigger_path}"
             model_id: zeroclaw_config::migration::admit_test_input(&config)
                 .resolve_model_id("custom.gateway.only"),
             temperature: config.resolve_model_temperature("custom.gateway.only"),
-            api_key: None,
         };
         assert_eq!(boot.provider_ref(), "custom.gateway.only");
         let provider = create_gateway_boot_provider(

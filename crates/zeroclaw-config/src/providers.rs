@@ -992,7 +992,8 @@ mod tests {
 #[prefix = "providers"]
 #[secret_hook = "crate::providers::canonical_connection_secrets"]
 pub struct Providers {
-    /// Model providers — `[providers.models.<type>.<alias>]`.
+    /// Model providers — legacy family maps are retained solely for input
+    /// migration; canonical consumers resolve through the provider registry.
     #[serde(default)]
     #[nested]
     pub models: ModelProviders,

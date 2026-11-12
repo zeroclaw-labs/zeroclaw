@@ -180,7 +180,7 @@ impl SopCapability for LlmGenerateCapability {
             usage: None,
             reasoning_content: None,
         };
-        if response.is_semantically_empty_terminal_with(false) {
+        if response.is_semantically_empty_terminal() {
             return Ok(CapabilityResult::failure(format!(
                 "llm.generate: model call failed: {}",
                 crate::agent::semantic_empty_terminal_completion_message(None)
@@ -248,9 +248,9 @@ impl ProviderLlmAdapter {
                     Temperature::default().for_call(Some(Arc::clone(&config)), &provider_ref);
                 let (provider, identity, _) = built.into_parts();
                 let policy_config = Arc::clone(&config);
-                let resolver = Arc::new(move |model: &str| {
-                    policy_config.model_text_extraction(model).reasoning
-                }) as Arc<dyn Fn(&str) -> bool + Send + Sync>;
+                let resolver =
+                    Arc::new(move |model: &str| policy_config.model_text_extraction(model))
+                        as Arc<dyn Fn(&str) -> zeroclaw_api::TextExtraction + Send + Sync>;
                 let scope = zeroclaw_providers::dispatch::AccountedChatScope::new();
                 let text = scope
                     .scope(zeroclaw_api::scope_text_extraction(
@@ -274,11 +274,10 @@ impl ProviderLlmAdapter {
                 // capability boundary so an adapter implementation that
                 // returns raw text cannot turn a reasoning-only completion
                 // into visible SOP output or bypass the empty check.
-                Ok(if config.model_text_extraction(served_ref).reasoning {
-                    zeroclaw_api::model_provider::strip_think_tags(&text)
-                } else {
-                    text
-                })
+                Ok(zeroclaw_providers::response::normalize_text(
+                    &text,
+                    config.model_text_extraction(served_ref),
+                ))
             },
             GENERATE_TIMEOUT,
             "model call",

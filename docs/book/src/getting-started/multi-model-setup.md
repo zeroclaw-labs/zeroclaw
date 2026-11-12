@@ -83,8 +83,9 @@ a catalog name may differ from an Ollama tag or a server's model ID.
 
 For Ollama, follow the [Ollama configuration example](../providers/configuration.md#ollama).
 The [local-small profile below](#local-small-no-text-fallback-profile) shows
-how `providers.models.ollama.local` connects to `agents.local` through
-`model_provider = "ollama.local"`, together with risk and runtime profiles.
+how an `ollama.local` connection and the exact model reference
+`chat.ollama.local` connect to `agents.local`, together with risk and runtime
+profiles.
 Replace its example model with your selected, installed Ollama tag. Set
 `num_ctx` on the Ollama provider to the context length you intend to test,
 and review the runtime profile's prompt and history limits alongside it.
@@ -139,12 +140,17 @@ The `dev` agent runs from the CLI (no channel binding required, `zeroclaw agent 
 Small local models usually need a runtime profile, not a provider-specific mode. Keep the Ollama provider focused on connection details, then use `[runtime_profiles.<alias>]` to tighten the prompt/tool loop behavior. ZeroClaw exposes a built-in `local_small` runtime preset for code paths that install runtime presets directly. If you edit config by hand, use this equivalent block:
 
 ```toml
-[providers.models.ollama.local]
-uri   = "http://localhost:11434"
+[providers.connections."ollama.local"]
+kind = "ollama"
+uri = "http://localhost:11434"
+
+[providers.models."chat.ollama.local"]
+capability = "chat"
+provider = "ollama.local"
 model = "qwen2.5-coder:7b"
 
 [agents.local]
-model_provider  = "ollama.local"
+model_provider  = "chat.ollama.local"
 risk_profile    = "supervised"
 runtime_profile = "local_small"
 

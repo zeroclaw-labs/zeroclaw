@@ -1204,7 +1204,7 @@ channel-runtime-set-provider-init-failed =
     Détails : { $error }
 channel-runtime-effort-routing-invalid = ⚠️ La configuration du routage selon l'effort n'est pas valide. Vérifiez les routes locale et cloud configurées.
 channel-runtime-provider-ambiguous = ModelProvider `{ $family }` a plusieurs alias configurés. Précisez lequel avec `/models { $family }.<alias>` : { $list }
-channel-runtime-provider-no-alias = Aucune entrée de provider configurée pour `{ $provider }`. Ajoutez `[providers.models.{ $provider }]` (avec api_key/uri) ou sélectionnez un provider configuré ; `/models` liste les valeurs valides.
+channel-runtime-provider-no-alias = Aucune entrée de modèle configurée pour `{ $provider }`. Ajoutez une connexion sous `[providers.connections."<connection>"]` et un modèle sous `[providers.models."<model-ref>"]`, ou sélectionnez un modèle configuré ; `/models` liste les valeurs valides.
 channel-runtime-provider-unknown = model_provider inconnu `{ $provider }`. Utilisez `/models` pour lister les model_providers valides.
 channel-runtime-scoped-model-empty = L'ID du modèle ne peut pas être vide. Utilisez `/model --user|--agent <model-id>`.
 channel-runtime-scoped-model-switched = Modèle défini sur `{ $model }` (model_provider : `{ $provider }`) pour le périmètre **{ $scope }**. Session uniquement ; réinitialisé au redémarrage.

@@ -6024,23 +6024,7 @@ fn looks_like_meta_instruction_echo(reason: &str) -> bool {
 /// Strip `<think>...</think>` blocks from streaming draft text so reasoning
 /// tokens are never shown to the user in partial updates.
 fn strip_think_tags_inline(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut rest = s;
-    loop {
-        if let Some(start) = rest.find("<think>") {
-            result.push_str(&rest[..start]);
-            if let Some(end) = rest[start..].find("</think>") {
-                rest = &rest[start + end + "</think>".len()..];
-            } else {
-                // Unclosed tag: drop the tail to avoid leaking partial reasoning.
-                break;
-            }
-        } else {
-            result.push_str(rest);
-            break;
-        }
-    }
-    result.trim().to_string()
+    zeroclaw_tool_call_parser::strip_think_tags(s)
 }
 
 /// Drop the tail from the first scratchpad envelope that has opened but not
@@ -9956,8 +9940,8 @@ async fn process_channel_message_body(
                 let started = Instant::now();
                 let policy_config = Arc::clone(&runtime_defaults.config);
                 let resolver = Arc::new(move |model: &str| {
-                    policy_config.model_text_extraction(model).reasoning
-                }) as Arc<dyn Fn(&str) -> bool + Send + Sync>;
+                    policy_config.model_text_extraction(model)
+                }) as Arc<dyn Fn(&str) -> zeroclaw_api::TextExtraction + Send + Sync>;
                 let precheck_future = zeroclaw_providers::reliable::scope_provider_attempt_allowlist(
                     attempt_allowlist.clone(),
                     zeroclaw_api::scope_text_extraction(
@@ -17152,7 +17136,6 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
         let provider_name = runtime_defaults.default_model_provider.clone();
         let model = runtime_defaults.model.clone();
         let temperature = runtime_defaults.temperature;
-        let provider_api_key = runtime_defaults.api_key.clone();
         let model_provider: Arc<dyn ModelProvider> = Arc::from(
             create_resilient_model_provider_nonblocking(
                 Arc::new(config.clone()),
@@ -17176,51 +17159,37 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
         }
 
         let security = Arc::new(SecurityPolicy::for_agent(&config, agent_alias)?);
-        let mem: Arc<dyn Memory> = zeroclaw_memory::create_memory_for_agent(
-            &config,
-            agent_alias,
-            provider_api_key.as_deref(),
-        )
-        .await?;
-        let (composio_key, composio_entity_id) = if config.composio.enabled {
-            (
-                config.composio.api_key.as_deref(),
-                Some(config.composio.entity_id.as_str()),
-            )
-        } else {
-            (None, None)
-        };
-
+        let mem: Arc<dyn Memory> =
+            zeroclaw_memory::create_memory_for_agent(&config, agent_alias).await?;
         let workspace = config.agent_workspace_dir(agent_alias);
         // Per-agent skills: install-wide workspace + open_skills set,
         // unioned with this agent's declared `skill_bundles`.
         let skills =
             zeroclaw_runtime::skills::load_skills_for_agent(&workspace, &config, agent_alias);
 
-        let all_tools_result_ch = tools::all_tools_with_runtime_and_execution_capability(
-            Arc::new(config.clone()),
-            &security,
-            &risk_profile,
-            agent_alias,
-            Arc::clone(&runtime),
-            Arc::clone(&mem),
-            composio_key,
-            composio_entity_id,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &workspace,
-            &config.agents,
-            provider_api_key.as_deref(),
-            &config,
-            canvas_store.clone(),
-            false,
-            None,
-            sop_engine.clone(),
-            sop_audit.clone(),
-            Some(config_arc.clone()),
-            Some(authority.execution_capability()),
-        )?;
+        let all_tools_result_ch = {
+            let registry_config = Arc::new(config.clone());
+            let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
+                Arc::clone(&runtime);
+            let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = Arc::clone(&mem);
+            let registry_request = zeroclaw_runtime::composition::ToolRequest {
+                config: &registry_config,
+                agent_alias,
+                security: &security,
+                runtime: &registry_runtime,
+                memory: &registry_memory,
+            };
+            let mut registry_inputs = zeroclaw_runtime::composition::NativeRecipeInputs::new(
+                &registry_request,
+                &workspace,
+            );
+            registry_inputs.canvas_store = canvas_store.clone();
+            registry_inputs.sop_engine = sop_engine.clone();
+            registry_inputs.sop_audit = sop_audit.clone();
+            registry_inputs.live_config = Some(config_arc.clone());
+            registry_inputs.execution_capability = Some(authority.execution_capability());
+            zeroclaw_runtime::tools::build_native_registry(registry_inputs, &risk_profile)
+        }?;
         // Route the per-agent tool registry through the one gated seam - see
         // `assemble_channel_agent_tools` for the knobs and why. `mut` because the
         // text-tool prompt policy below may clear `deferred_section` for a
@@ -21274,25 +21243,45 @@ pub(crate) mod tests {
 
         let config = Arc::new(config);
         let security = Arc::new(SecurityPolicy::default());
-        let registry = tools::all_tools(
-            Arc::clone(&config),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "test-agent",
-            Arc::new(NoopMemory),
-            None,
-            None,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            temp.path(),
-            &HashMap::new(),
-            None,
-            config.as_ref(),
-            None,
-            false,
-            None,
-        )
+        let registry = {
+            let registry_config = Arc::clone(&config);
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.agents = HashMap::new();
+                std::sync::Arc::new(fixture)
+            };
+            (|| -> anyhow::Result<_> {
+                let registry_environment: Option<zeroclaw_runtime::tools::ForwardedEnvironment> =
+                    None;
+                let registry_path = registry_environment
+                    .as_ref()
+                    .and_then(|env| env.get("PATH"))
+                    .map(std::ffi::OsStr::new);
+                let registry_runtime: std::sync::Arc<
+                    dyn zeroclaw_config::platform::RuntimeAdapter,
+                > = std::sync::Arc::from(zeroclaw_config::platform::create_runtime_with_path(
+                    &registry_config.runtime,
+                    registry_path,
+                )?);
+                let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> =
+                    Arc::new(NoopMemory);
+                let registry_request = zeroclaw_runtime::composition::ToolRequest {
+                    config: &registry_config,
+                    agent_alias: "test-agent",
+                    security: &security,
+                    runtime: &registry_runtime,
+                    memory: &registry_memory,
+                };
+                let registry_inputs = zeroclaw_runtime::composition::NativeRecipeInputs::new(
+                    &registry_request,
+                    temp.path(),
+                );
+                zeroclaw_runtime::tools::build_native_registry(
+                    registry_inputs,
+                    &zeroclaw_config::schema::RiskProfileConfig::default(),
+                )
+            })()
+        }
         .expect("tool registry builds");
         let schemas: HashMap<String, Arc<serde_json::Value>> = registry
             .tools
@@ -30569,30 +30558,29 @@ BTC is currently around $65,000 based on latest tool output."#
             ..SecurityPolicy::default()
         });
         let runtime: Arc<dyn platform::RuntimeAdapter> = Arc::new(platform::NativeRuntime::new());
-        let mut built = tools::all_tools_with_runtime_and_execution_capability(
-            Arc::clone(&startup),
-            &security,
-            risk_profile,
-            "test-agent",
-            Arc::clone(&runtime),
-            Arc::new(NoopMemory),
-            None,
-            None,
-            &startup.browser,
-            &startup.http_request,
-            &startup.web_fetch,
-            workspace.path(),
-            &HashMap::new(),
-            None,
-            &startup,
-            None,
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        let mut built = {
+            let registry_config = Arc::clone(&startup);
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.agents = HashMap::new();
+                std::sync::Arc::new(fixture)
+            };
+            let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
+                Arc::clone(&runtime);
+            let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = Arc::new(NoopMemory);
+            let registry_request = zeroclaw_runtime::composition::ToolRequest {
+                config: &registry_config,
+                agent_alias: "test-agent",
+                security: &security,
+                runtime: &registry_runtime,
+                memory: &registry_memory,
+            };
+            let registry_inputs = zeroclaw_runtime::composition::NativeRecipeInputs::new(
+                &registry_request,
+                workspace.path(),
+            );
+            zeroclaw_runtime::tools::build_native_registry(registry_inputs, risk_profile)
+        }
         .unwrap();
         let results = Arc::new(Mutex::new(Vec::new()));
         built.tools.push(Box::new(ModelToolsProbe {

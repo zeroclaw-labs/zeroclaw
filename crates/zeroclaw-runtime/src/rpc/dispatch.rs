@@ -708,7 +708,7 @@ struct PreparedLiveSessionRefresh {
 fn prepare_memory_embedder(
     config: &Config,
 ) -> Result<std::sync::Arc<dyn zeroclaw_api::embedding::EmbeddingProvider>, JsonRpcError> {
-    zeroclaw_memory::build_embedder_from_config(config, None).map_err(|error| {
+    zeroclaw_memory::build_embedder_from_config(config).map_err(|error| {
         rpc_err(
             INVALID_PARAMS,
             format!("Invalid embedding configuration: {error:#}"),
@@ -9574,8 +9574,7 @@ impl RpcDispatcher {
         if private_plane {
             return Ok((memory, Some(alias.to_string())));
         }
-        let api_key = config.agent_model_api_key(alias);
-        let shared = zeroclaw_memory::create_memory_for_agent(&config, alias, api_key.as_deref())
+        let shared = zeroclaw_memory::create_memory_for_agent(&config, alias)
             .await
             .map_err(|error| {
                 rpc_err(
@@ -10118,12 +10117,7 @@ impl RpcDispatcher {
         // the heap rather than inflating this async fn's stack frame across the
         // awaits below.
         let mut config = Box::new(old_config.clone());
-        let effective_prop = config.effective_model_edit_path(&req.prop);
-        self.recheck_config_write_authority(
-            Method::ConfigSet,
-            Some(&effective_prop),
-            &config_commit,
-        )?;
+        self.recheck_config_write_authority(Method::ConfigSet, Some(&req.prop), &config_commit)?;
         Self::stage_config_set(&mut config, &req.prop, &req.value)?;
         let effects = RpcConfigCommitEffects {
             config_reservations: _agent_config_reservation.into_iter().collect(),
@@ -10277,10 +10271,9 @@ impl RpcDispatcher {
         )?;
         let mut config = old_config.clone();
         for (index, entry) in req.sets.iter().enumerate() {
-            let effective_prop = config.effective_model_edit_path(&entry.prop);
             self.recheck_config_write_authority(
                 Method::ConfigSetMany,
-                Some(&effective_prop),
+                Some(&entry.prop),
                 &config_commit,
             )?;
             Self::stage_config_set(&mut config, &entry.prop, &entry.value).map_err(|e| {
@@ -10343,8 +10336,8 @@ impl RpcDispatcher {
         prop: &str,
         value: &Value,
     ) -> Result<(), JsonRpcError> {
-        let effective_prop = config.effective_model_edit_path(prop);
-        let prop = effective_prop.as_str();
+        zeroclaw_config::schema::reject_retired_provider_edit_path(config, prop)
+            .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
         if config.ensure_map_key_for_path(prop) {
             // Refused to vivify the reserved `default` agent: return a
             // reserved error rather than a downstream "Unknown property".
@@ -10752,7 +10745,6 @@ impl RpcDispatcher {
                 None => true,
             })
             .filter(|info| !field_visibility::is_excluded(&info.name, &excluded))
-            .filter(|info| config.effective_model_edit_path(&info.name) == info.name)
             .map(|info| {
                 let env = config.prop_is_env_overridden(&info.name);
                 ConfigFieldEntry::from_prop_field(info, env)
@@ -10843,6 +10835,11 @@ impl RpcDispatcher {
     async fn handle_config_map_key_create(&self, params: &Value) -> RpcResult {
         let req: ConfigMapKeyCreateParams = parse_params(params)?;
         let key_path = format!("{}.{}", req.path, req.key);
+        zeroclaw_config::schema::reject_retired_provider_edit_path(
+            &self.ctx.config.read(),
+            &key_path,
+        )
+        .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
         self.selector_config_write(Method::ConfigMapKeyCreate, &key_path)?;
         let _agent_config_reservation = (req.path == "agents")
             .then(|| self.ctx.agent_lifecycle.reserve_config_mutation(&req.key))
@@ -10913,6 +10910,11 @@ impl RpcDispatcher {
     async fn handle_config_map_key_delete(&self, params: &Value) -> RpcResult {
         let req: ConfigMapKeyDeleteParams = parse_params(params)?;
         let key_path = format!("{}.{}", req.path, req.key);
+        zeroclaw_config::schema::reject_retired_provider_edit_path(
+            &self.ctx.config.read(),
+            &key_path,
+        )
+        .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
         self.selector_config_write(Method::ConfigMapKeyDelete, &key_path)?;
         if req.path == "agents" {
             let result = self
@@ -11058,6 +11060,15 @@ impl RpcDispatcher {
             Ok(req) => req,
             Err(err) => return Box::pin(std::future::ready(Err(err))),
         };
+        if let Err(error) = zeroclaw_config::schema::reject_retired_provider_edit_path(
+            &self.ctx.config.read(),
+            &req.path,
+        ) {
+            return Box::pin(std::future::ready(Err(rpc_err(
+                INVALID_PARAMS,
+                error.to_string(),
+            ))));
+        }
         // A rename mutates both the old and new key paths.
         if let Err(err) = self
             .selector_config_write(
@@ -21167,7 +21178,6 @@ mod tests {
                         ..Default::default()
                     },
                     tmp.path(),
-                    None,
                 )
                 .unwrap();
                 let ctx = RpcContext::minimal_with_sop_engine_and_audit(
@@ -27088,8 +27098,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         ctx.memory = Some(Arc::from(
-            zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None)
-                .expect("sqlite memory for tests"),
+            zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).expect("sqlite memory for tests"),
         ));
         let ctx = Arc::new(ctx);
 
@@ -27213,9 +27222,8 @@ mod tests {
             backend: "sqlite".into(),
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
-        let memory: Arc<dyn zeroclaw_memory::Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).expect("sqlite memory"),
-        );
+        let memory: Arc<dyn zeroclaw_memory::Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).expect("sqlite memory"));
         ctx.memory = Some(Arc::clone(&memory));
         (Arc::new(ctx), sessions, memory)
     }
@@ -29876,7 +29884,7 @@ mod tests {
         };
         let temp = tempfile::tempdir().unwrap();
         let memory: Arc<dyn zeroclaw_api::memory_traits::Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, temp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, temp.path()).unwrap());
         let audit = Arc::new(crate::sop::SopAuditLogger::new(memory));
         let ctx = RpcContext::minimal_with_sop_engine_and_audit(
             config,
@@ -42210,9 +42218,8 @@ mod tests {
         cfg.memory.embedding_dimensions = 3;
 
         // Long-lived handle built via the real factory → embedder points at A.
-        let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory_from_config(&cfg, None).expect("build memory"),
-        );
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory_from_config(&cfg).expect("build memory"));
 
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
@@ -45195,7 +45202,6 @@ model = "before"
             .unwrap()
             .id = None;
         let path = "providers.models.openai.test-provider.model";
-        assert_eq!(inherited.effective_model_edit_path(path), path);
         RpcDispatcher::stage_config_set(&mut inherited, path, &json!("inherited-after")).unwrap();
         assert_eq!(
             inherited
@@ -54543,7 +54549,7 @@ model = "before"
             config.gateway.paired_tokens = vec!["zc_steering_env_test".into()];
             config.memory.backend = "sqlite".into();
             config.memory.auto_save = true;
-            let memory = zeroclaw_memory::create_memory_for_agent(&config, "test-agent", None)
+            let memory = zeroclaw_memory::create_memory_for_agent(&config, "test-agent")
                 .await
                 .unwrap();
             let (ctx, backend, _) = persistence_enforcement_ctx(config);
@@ -54710,7 +54716,7 @@ model = "before"
             let mut config = make_acp_test_config(&tmp);
             config.memory.backend = "sqlite".into();
             config.memory.auto_save = true;
-            let memory = zeroclaw_memory::create_memory_for_agent(&config, "test-agent", None)
+            let memory = zeroclaw_memory::create_memory_for_agent(&config, "test-agent")
                 .await
                 .unwrap();
             let (ctx, backend, _) = persistence_enforcement_ctx(config);

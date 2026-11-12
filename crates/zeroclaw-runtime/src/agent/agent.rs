@@ -3417,8 +3417,7 @@ impl Agent {
                 agent_alias,
                 model_ref,
                 model_overrides.model,
-                false,
-                false,
+                crate::composition::ModelBuildIntent::AgentDefault,
             )
             .await
             .with_context(|| format!("agents.{agent_alias}.model_provider"))?;
@@ -4159,8 +4158,7 @@ impl Agent {
                     &self.agent_alias,
                     &new_model_provider,
                     Some(&new_model),
-                    true,
-                    true,
+                    crate::composition::ModelBuildIntent::Switch,
                 )
                 .await?;
             let tool_dispatcher =
@@ -5948,7 +5946,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, Path::new("/tmp"))
                 .expect("memory creation"),
         );
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -7734,7 +7732,7 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -8057,32 +8055,27 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
         skills: &[crate::skills::Skill],
     ) -> crate::tools::scoped::ScopedToolRegistry {
         let config = Config::default();
-        let built = crate::tools::all_tools_with_runtime_context(
-            Arc::new(config.clone()),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "default",
-            Arc::new(crate::platform::NativeRuntime::new()),
-            memory,
-            None,
-            None,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &security.workspace_dir,
-            &config.agents,
-            None,
-            &config,
-            None,
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        let built = {
+            let registry_config = Arc::new(config.clone());
+            let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
+                Arc::new(crate::platform::NativeRuntime::new());
+            let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = memory;
+            let registry_request = crate::composition::ToolRequest {
+                config: &registry_config,
+                agent_alias: "default",
+                security: &security,
+                runtime: &registry_runtime,
+                memory: &registry_memory,
+            };
+            let registry_inputs = crate::composition::NativeRecipeInputs::new(
+                &registry_request,
+                &security.workspace_dir,
+            );
+            crate::tools::build_native_registry(
+                registry_inputs,
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )
+        }
         .unwrap();
         crate::tools::scoped::ScopedToolRegistry::assemble(crate::tools::scoped::ScopedAssembly {
             config: &config,
@@ -8295,7 +8288,7 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
             "session".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig::default(),
         );
-        let memory = zeroclaw_memory::create_memory_for_agent(&config, "session", None)
+        let memory = zeroclaw_memory::create_memory_for_agent(&config, "session")
             .await
             .expect("per-agent memory stack");
 
@@ -8384,32 +8377,27 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
         workspace: &std::path::Path,
     ) -> Agent {
         let config = Config::default();
-        let built = crate::tools::all_tools_with_runtime_context(
-            Arc::new(config.clone()),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "default",
-            Arc::new(crate::platform::NativeRuntime::new()),
-            Arc::clone(&shared),
-            None,
-            None,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &security.workspace_dir,
-            &config.agents,
-            None,
-            &config,
-            None,
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        let built = {
+            let registry_config = Arc::new(config.clone());
+            let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
+                Arc::new(crate::platform::NativeRuntime::new());
+            let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = Arc::clone(&shared);
+            let registry_request = crate::composition::ToolRequest {
+                config: &registry_config,
+                agent_alias: "default",
+                security: &security,
+                runtime: &registry_runtime,
+                memory: &registry_memory,
+            };
+            let registry_inputs = crate::composition::NativeRecipeInputs::new(
+                &registry_request,
+                &security.workspace_dir,
+            );
+            crate::tools::build_native_registry(
+                registry_inputs,
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )
+        }
         .unwrap();
         let registry = crate::tools::scoped::ScopedToolRegistry::assemble(
             crate::tools::scoped::ScopedAssembly {
@@ -8577,25 +8565,44 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
         memory: Arc<dyn Memory>,
         security: &Arc<crate::security::SecurityPolicy>,
     ) -> crate::tools::scoped::ScopedToolRegistry {
-        let built = crate::tools::all_tools(
-            Arc::new(config.clone()),
-            security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "alpha",
-            memory,
-            None,
-            None,
-            &zeroclaw_config::schema::BrowserConfig::default(),
-            &zeroclaw_config::schema::HttpRequestConfig::default(),
-            &zeroclaw_config::schema::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            config,
-            None,
-            false,
-            None,
-        )
+        let built = {
+            let registry_config = Arc::new(config.clone());
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.browser = zeroclaw_config::schema::BrowserConfig::default();
+                fixture.http_request = zeroclaw_config::schema::HttpRequestConfig::default();
+                fixture.web_fetch = zeroclaw_config::schema::WebFetchConfig::default();
+                fixture.agents = HashMap::new();
+                std::sync::Arc::new(fixture)
+            };
+            (|| -> anyhow::Result<_> {
+                let registry_environment: Option<crate::tools::ForwardedEnvironment> = None;
+                let registry_path = registry_environment
+                    .as_ref()
+                    .and_then(|env| env.get("PATH"))
+                    .map(std::ffi::OsStr::new);
+                let registry_runtime: std::sync::Arc<
+                    dyn zeroclaw_config::platform::RuntimeAdapter,
+                > = std::sync::Arc::from(zeroclaw_config::platform::create_runtime_with_path(
+                    &registry_config.runtime,
+                    registry_path,
+                )?);
+                let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = memory;
+                let registry_request = crate::composition::ToolRequest {
+                    config: &registry_config,
+                    agent_alias: "alpha",
+                    security,
+                    runtime: &registry_runtime,
+                    memory: &registry_memory,
+                };
+                let registry_inputs =
+                    crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+                crate::tools::build_native_registry(
+                    registry_inputs,
+                    &zeroclaw_config::schema::RiskProfileConfig::default(),
+                )
+            })()
+        }
         .expect("the tool factory builds");
         crate::tools::scoped::ScopedToolRegistry::assemble(crate::tools::scoped::ScopedAssembly {
             config,
@@ -9090,29 +9097,35 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
         let shared_audit =
             with_audit.then(|| Arc::new(crate::sop::SopAuditLogger::new(Arc::clone(&shared))));
         let security = Arc::new(crate::security::SecurityPolicy::default());
-        let built = crate::tools::all_tools_with_runtime(
-            Arc::new(config.clone()),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "alpha",
-            Arc::new(crate::platform::NativeRuntime::new()),
-            Arc::clone(&shared),
-            None,
-            None,
-            &zeroclaw_config::schema::BrowserConfig::default(),
-            &zeroclaw_config::schema::HttpRequestConfig::default(),
-            &zeroclaw_config::schema::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &config,
-            None,
-            false,
-            None,
-            Some(Arc::clone(&engine)),
-            shared_audit,
-            None,
-        )
+        let built = {
+            let registry_config = Arc::new(config.clone());
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.browser = zeroclaw_config::schema::BrowserConfig::default();
+                fixture.http_request = zeroclaw_config::schema::HttpRequestConfig::default();
+                fixture.web_fetch = zeroclaw_config::schema::WebFetchConfig::default();
+                fixture.agents = HashMap::new();
+                std::sync::Arc::new(fixture)
+            };
+            let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
+                Arc::new(crate::platform::NativeRuntime::new());
+            let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = Arc::clone(&shared);
+            let registry_request = crate::composition::ToolRequest {
+                config: &registry_config,
+                agent_alias: "alpha",
+                security: &security,
+                runtime: &registry_runtime,
+                memory: &registry_memory,
+            };
+            let mut registry_inputs =
+                crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+            registry_inputs.sop_engine = Some(Arc::clone(&engine));
+            registry_inputs.sop_audit = shared_audit;
+            crate::tools::build_native_registry(
+                registry_inputs,
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )
+        }
         .expect("the tool factory builds");
         let registry = crate::tools::scoped::ScopedToolRegistry::assemble(
             crate::tools::scoped::ScopedAssembly {
@@ -10662,7 +10675,7 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let memory: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("test memory must initialize"),
         );
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -10802,7 +10815,6 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
                         ..Default::default()
                     },
                     std::path::Path::new("/tmp"),
-                    None,
                 )
                 .expect("test memory must initialize"),
             ))
@@ -11032,7 +11044,7 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
             ..Default::default()
         };
         let memory: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed"),
         );
         let config = Arc::new(config);
@@ -12452,7 +12464,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -13174,7 +13186,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -13203,7 +13215,7 @@ options = { extract_text_tool_calls = true }
         };
         let workspace = tempfile::TempDir::new().expect("temp dir");
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+            zeroclaw_memory::create_memory(&memory_cfg, workspace.path())
                 .expect("memory creation should succeed with valid config"),
         );
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -13252,7 +13264,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+            zeroclaw_memory::create_memory(&memory_cfg, workspace.path())
                 .expect("memory creation should succeed"),
         );
         let risk_profile = zeroclaw_config::schema::RiskProfileConfig {
@@ -13765,7 +13777,7 @@ options = { extract_text_tool_calls = true }
             };
             let workspace = tempfile::TempDir::new().expect("temp dir");
             let mem: Arc<dyn Memory> = Arc::from(
-                zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+                zeroclaw_memory::create_memory(&memory_cfg, workspace.path())
                     .expect("memory creation should succeed"),
             );
             let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -13806,7 +13818,7 @@ options = { extract_text_tool_calls = true }
                 ..zeroclaw_config::schema::MemoryConfig::default()
             };
             let mem: Arc<dyn Memory> = Arc::from(
-                zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+                zeroclaw_memory::create_memory(&memory_cfg, workspace.path())
                     .expect("memory creation should succeed"),
             );
             let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -13964,7 +13976,7 @@ options = { extract_text_tool_calls = true }
                 ..zeroclaw_config::schema::MemoryConfig::default()
             };
             let mem: Arc<dyn Memory> = Arc::from(
-                zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+                zeroclaw_memory::create_memory(&memory_cfg, workspace.path())
                     .expect("memory creation should succeed"),
             );
             let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -14007,7 +14019,7 @@ options = { extract_text_tool_calls = true }
                 ..zeroclaw_config::schema::MemoryConfig::default()
             };
             let mem: Arc<dyn Memory> = Arc::from(
-                zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+                zeroclaw_memory::create_memory(&memory_cfg, workspace.path())
                     .expect("memory creation should succeed"),
             );
             let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -14105,7 +14117,7 @@ options = { extract_text_tool_calls = true }
                 ..zeroclaw_config::schema::MemoryConfig::default()
             };
             let mem: Arc<dyn Memory> = Arc::from(
-                zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+                zeroclaw_memory::create_memory(&memory_cfg, workspace.path())
                     .expect("memory creation should succeed"),
             );
             let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -14329,7 +14341,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -14379,7 +14391,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -14695,7 +14707,7 @@ options = { extract_text_tool_calls = true }
         };
         let workspace = tempfile::tempdir().expect("temp workspace");
         let memory: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+            zeroclaw_memory::create_memory(&memory_cfg, workspace.path())
                 .expect("memory creation should succeed"),
         );
         let mut hooks = crate::hooks::HookRunner::new();
@@ -15452,7 +15464,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -15485,7 +15497,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -15551,7 +15563,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -15600,7 +15612,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -15652,7 +15664,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -16047,7 +16059,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -16166,7 +16178,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -16250,7 +16262,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -16437,7 +16449,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -16592,7 +16604,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -16668,7 +16680,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -16731,7 +16743,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -16773,7 +16785,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         let agent_config = zeroclaw_config::schema::AliasedAgentConfig {
@@ -17009,7 +17021,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         let capturing = Arc::new(CapturingObserver::default());
@@ -17434,7 +17446,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -17590,7 +17602,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -17643,11 +17655,11 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem_a: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         let mem_b: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -17738,7 +17750,7 @@ options = { extract_text_tool_calls = true }
         };
         let memory = || -> Arc<dyn Memory> {
             Arc::from(
-                zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                     .expect("memory creation should succeed"),
             )
         };
@@ -17885,7 +17897,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let memory: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+            zeroclaw_memory::create_memory(&memory_cfg, tmp.path())
                 .expect("memory creation should succeed"),
         );
         let mut hooks = crate::hooks::HookRunner::new();
@@ -18048,7 +18060,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let memory: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+            zeroclaw_memory::create_memory(&memory_cfg, tmp.path())
                 .expect("memory creation should succeed"),
         );
         let mut hooks = crate::hooks::HookRunner::new();
@@ -18116,7 +18128,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let memory: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+            zeroclaw_memory::create_memory(&memory_cfg, tmp.path())
                 .expect("memory creation should succeed"),
         );
         let mut hooks = crate::hooks::HookRunner::new();
@@ -18180,7 +18192,7 @@ options = { extract_text_tool_calls = true }
         };
         let memory = || -> Arc<dyn Memory> {
             Arc::from(
-                zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+                zeroclaw_memory::create_memory(&memory_cfg, tmp.path())
                     .expect("memory creation should succeed"),
             )
         };
@@ -18240,7 +18252,6 @@ options = { extract_text_tool_calls = true }
                     ..zeroclaw_config::schema::MemoryConfig::default()
                 },
                 workspace,
-                None,
             )
             .expect("memory creation should succeed"),
         );
@@ -18386,7 +18397,7 @@ options = { extract_text_tool_calls = true }
         };
         let memory = || -> Arc<dyn Memory> {
             Arc::from(
-                zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+                zeroclaw_memory::create_memory(&memory_cfg, tmp.path())
                     .expect("memory creation should succeed"),
             )
         };
@@ -18465,7 +18476,7 @@ options = { extract_text_tool_calls = true }
         };
         let memory = || -> Arc<dyn Memory> {
             Arc::from(
-                zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+                zeroclaw_memory::create_memory(&memory_cfg, tmp.path())
                     .expect("memory creation should succeed"),
             )
         };
@@ -18543,7 +18554,7 @@ options = { extract_text_tool_calls = true }
         };
         let memory = || -> Arc<dyn Memory> {
             Arc::from(
-                zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+                zeroclaw_memory::create_memory(&memory_cfg, tmp.path())
                     .expect("memory creation should succeed"),
             )
         };
@@ -18610,7 +18621,7 @@ options = { extract_text_tool_calls = true }
         };
         let memory = || -> Arc<dyn Memory> {
             Arc::from(
-                zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+                zeroclaw_memory::create_memory(&memory_cfg, tmp.path())
                     .expect("memory creation should succeed"),
             )
         };
@@ -18681,7 +18692,7 @@ options = { extract_text_tool_calls = true }
         };
         let memory = || -> Arc<dyn Memory> {
             Arc::from(
-                zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+                zeroclaw_memory::create_memory(&memory_cfg, tmp.path())
                     .expect("memory creation should succeed"),
             )
         };
@@ -18758,7 +18769,7 @@ options = { extract_text_tool_calls = true }
         };
         let memory = || -> Arc<dyn Memory> {
             Arc::from(
-                zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+                zeroclaw_memory::create_memory(&memory_cfg, tmp.path())
                     .expect("memory creation should succeed"),
             )
         };
@@ -18853,7 +18864,7 @@ options = { extract_text_tool_calls = true }
         };
         let memory = || -> Arc<dyn Memory> {
             Arc::from(
-                zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+                zeroclaw_memory::create_memory(&memory_cfg, tmp.path())
                     .expect("memory creation should succeed"),
             )
         };
@@ -18932,7 +18943,7 @@ options = { extract_text_tool_calls = true }
         };
         let memory = || -> Arc<dyn Memory> {
             Arc::from(
-                zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+                zeroclaw_memory::create_memory(&memory_cfg, tmp.path())
                     .expect("memory creation should succeed"),
             )
         };
@@ -19193,7 +19204,7 @@ options = { extract_text_tool_calls = true }
         };
         let none_mem = || -> Arc<dyn Memory> {
             Arc::from(
-                zeroclaw_memory::create_memory(&none_cfg, std::path::Path::new("/tmp"), None)
+                zeroclaw_memory::create_memory(&none_cfg, std::path::Path::new("/tmp"))
                     .expect("none memory"),
             )
         };
@@ -19233,7 +19244,6 @@ options = { extract_text_tool_calls = true }
                         ..zeroclaw_config::schema::MemoryConfig::default()
                     },
                     std::path::Path::new("/tmp"),
-                    None,
                 )
                 .expect("memory"),
             ))
@@ -19341,7 +19351,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         let observer = Arc::new(CapturingObserver::default());
@@ -19490,7 +19500,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         let model_provider = Box::new(StreamingSteeringModelProvider {
@@ -19589,7 +19599,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -19801,7 +19811,7 @@ options = { extract_text_tool_calls = true }
                 })],
             ))
             .memory(Arc::from(
-                zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                     .expect("memory creation should succeed with valid config"),
             ))
             .observer(Arc::from(crate::observability::NoopObserver {}))
@@ -19980,7 +19990,7 @@ options = { extract_text_tool_calls = true }
                 })],
             ))
             .memory(Arc::from(
-                zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                     .expect("memory creation should succeed with valid config"),
             ))
             .observer(Arc::from(crate::observability::NoopObserver {}))
@@ -20030,7 +20040,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         let calls = Arc::new(AtomicUsize::new(0));
@@ -20093,7 +20103,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -20185,7 +20195,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         let calls = AtomicUsize::new(0);
@@ -20300,7 +20310,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         let (started_tx, mut started_rx) = tokio::sync::mpsc::channel(1);
@@ -20353,7 +20363,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -20421,7 +20431,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -20495,7 +20505,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -20560,7 +20570,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -20618,7 +20628,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -20723,7 +20733,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -21145,7 +21155,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -21431,11 +21441,11 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem_a: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         let mem_b: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -21517,7 +21527,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         let capturing = Arc::new(CapturingObserver::default());
@@ -21606,7 +21616,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         let workspace = tempfile::TempDir::new().expect("temp dir");
@@ -21708,7 +21718,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         let workspace = tempfile::TempDir::new().expect("temp dir");
@@ -21808,7 +21818,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         let capturing = Arc::new(CapturingObserver::default());
@@ -21848,7 +21858,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -21896,7 +21906,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -21952,7 +21962,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         // Single response with no token usage.
@@ -22026,7 +22036,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         // Single response carrying usage WITHOUT token counts (kilocli-style).
@@ -22079,7 +22089,7 @@ options = { extract_text_tool_calls = true }
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         // Call 1: a tool request WITH usage (drives iteration 2 and emits a
@@ -22332,7 +22342,7 @@ vision_model_provider = "custom.vision"
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, temp.path(), None)
+            zeroclaw_memory::create_memory(&memory_cfg, temp.path())
                 .expect("memory creation should succeed"),
         );
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -22672,7 +22682,7 @@ model_provider = "custom.primary"
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, temp.path(), None)
+            zeroclaw_memory::create_memory(&memory_cfg, temp.path())
                 .expect("memory creation should succeed"),
         );
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -23970,7 +23980,7 @@ model_provider = "custom.primary"
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation"),
         );
         let switch_cfg = ProviderSwitchConfig {
@@ -24052,7 +24062,7 @@ model_provider = "custom.primary"
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation"),
         );
         let capturing = Arc::new(CapturingObserver::default());
@@ -24286,8 +24296,7 @@ model_provider = "custom.primary"
         };
         let workspace = tempfile::TempDir::new().expect("temp dir");
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
-                .expect("memory creation"),
+            zeroclaw_memory::create_memory(&memory_cfg, workspace.path()).expect("memory creation"),
         );
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
@@ -24360,7 +24369,7 @@ model_provider = "custom.primary"
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});

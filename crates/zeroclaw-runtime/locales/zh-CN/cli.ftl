@@ -1200,7 +1200,7 @@ channel-runtime-set-provider-init-failed =
     详情：{ $error }
 channel-runtime-effort-routing-invalid = ⚠️ 工作量路由配置无效。请检查已配置的本地和云端路由。
 channel-runtime-provider-ambiguous = ModelProvider `{ $family }` 有多个已配置别名。请用 `/models { $family }.<alias>` 指定其中一个：{ $list }
-channel-runtime-provider-no-alias = 未找到 `{ $provider }` 的已配置 provider 条目。请添加 `[providers.models.{ $provider }]`（含 api_key/uri），或选择一个已配置的 provider；`/models` 会列出有效项。
+channel-runtime-provider-no-alias = 未找到 `{ $provider }` 的已配置模型条目。请在 `[providers.connections."<connection>"]` 下添加连接，并在 `[providers.models."<model-ref>"]` 下添加模型，或选择已配置的模型；`/models` 会列出有效项。
 channel-runtime-provider-unknown = 未知 model_provider `{ $provider }`。使用 `/models` 查看有效的 model_provider。
 channel-runtime-scoped-model-empty = 模型 ID 不能为空。请使用 `/model --user|--agent <model-id>`。
 channel-runtime-scoped-model-switched = 已为 **{ $scope }** 范围设置模型 `{ $model }`（model_provider：`{ $provider }`）。仅会话内有效，重启后重置。

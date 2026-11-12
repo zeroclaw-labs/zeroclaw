@@ -12912,12 +12912,9 @@ mod tests {
 
     #[test]
     fn effective_content_preserves_literal_think_tags() {
-        // The deleted `strip_think_tags()` helper searched for the exact
-        // substring `<think>` / `</think>` and stripped those blocks
-        // unconditionally. This regression pins that literal `<think>` tags
-        // now round-trip byte-for-byte, including legitimate uses where the
-        // model legitimately discusses the tag (HTML sample, code quoting,
-        // meta-discussion).
+        // Wire deserialization preserves literal content byte-for-byte.
+        // Think extraction is a later, admitted response policy rather than a
+        // transport-side mutation, so HTML/code examples remain intact here.
         let json = r#"{"choices":[{"message":{"content":"Here is the HTML: <think>internal note</think>"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
@@ -14046,11 +14043,9 @@ mod tests {
 
     #[test]
     fn effective_content_preserves_unclosed_think_tag() {
-        // An unclosed literal `<think>` tag must NOT discard the rest of the
-        // response. The old `strip_think_tags()` helper saw no closing
-        // `</think>` and dropped the trailing tail, collapsing
-        // "Visible <think>hidden tail" to "Visible". The new path returns
-        // the input unchanged.
+        // An unclosed literal `<think>` tag must not discard the rest of the
+        // wire response. Deserialization preserves the input unchanged; any
+        // admitted extraction policy runs after the provider response exists.
         let json = r#"{"choices":[{"message":{"content":"Visible <think>hidden tail"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
@@ -14059,12 +14054,9 @@ mod tests {
 
     #[test]
     fn effective_content_preserves_multiple_think_blocks() {
-        // Multiple literal `<think>` blocks in `content` survive the removal
-        // intact. The old `strip_think_tags()` helper would have collapsed
-        // the visible text to "Answer A  and B  done" — the double spaces
-        // mark where `<think>hidden 1</think>` and `<think>hidden 2</think>`
-        // used to be — losing the inter-block separators and the tag
-        // delimiters themselves.
+        // Multiple literal `<think>` blocks in wire content survive intact.
+        // The shared response normalizer decides later whether this model's
+        // admitted policy extracts them.
         let json = r#"{"choices":[{"message":{"content":"Answer A <think>hidden 1</think> and B <think>hidden 2</think> done"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
@@ -14141,15 +14133,9 @@ mod tests {
 
     #[test]
     fn reasoning_content_preserved_when_content_only_think_tags() {
-        // The compatible provider no longer strips literal
-        // `<think>...</think>` blocks from `content`. Previously the
-        // `<think>secret</think>`-only content was collapsed to the empty
-        // string by `strip_think_tags()`, and `effective_content()` returned
-        // `""` so the visible-text field was effectively replaced by the
-        // model's chain-of-thought marker. Now the literal `<think>` tags
-        // round-trip into `effective_content()` byte-for-byte, and
-        // `reasoning_content` is still preserved separately and not leaked
-        // into the response text.
+        // Wire content and reasoning metadata remain separate. The shared
+        // response normalizer, rather than this deserializer, decides whether
+        // an admitted model policy extracts inline reasoning from content.
         let json = r#"{"choices":[{"message":{"content":"<think>secret</think>","reasoning_content":"Thinking text"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;

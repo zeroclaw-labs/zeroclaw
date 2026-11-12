@@ -154,8 +154,6 @@ pub use zeroclaw_tools::web_fetch::WebFetchTool;
 pub use zeroclaw_tools::web_search_tool::WebSearchTool;
 pub use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
 
-use crate::live_config_authority::AgentExecutionCapability;
-
 // Traits from zeroclaw-api
 pub use zeroclaw_api::schema::{CleaningStrategy, SchemaCleanr};
 pub use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, ToolSpec};
@@ -199,18 +197,18 @@ pub const REENTRANT_AGENT_TOOLS: &[&str] = &[SpawnSubagentTool::NAME, DelegateTo
 
 use crate::platform::{NativeRuntime, RuntimeAdapter};
 use crate::security::{Sandbox, SecurityPolicy, create_sandbox};
-use crate::sop::audit::SopAuditLogger;
 use crate::sop::engine::SopEngine;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use std::collections::HashMap;
+#[cfg(test)]
 use std::ffi::OsStr;
 use std::sync::{Arc, Mutex};
 use zeroclaw_api::memory_traits::{
     ExportFilter, MemoryCategory, MemoryEntry, MemoryStats, PrincipalScope, ProceduralMessage,
     StoreOptions,
 };
-use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+use zeroclaw_config::schema::Config;
 use zeroclaw_memory::Memory;
 
 pub type PerToolChannelHandle =
@@ -1547,7 +1545,8 @@ impl NativeMemoryProjection {
     }
 }
 
-fn runtime_for_all_tools(
+#[cfg(test)]
+fn runtime_for_tool_registry(
     root_config: &zeroclaw_config::schema::Config,
     tui_env: Option<&HashMap<String, String>>,
 ) -> anyhow::Result<Arc<dyn RuntimeAdapter>> {
@@ -1555,57 +1554,6 @@ fn runtime_for_all_tools(
     Ok(Arc::from(
         zeroclaw_config::platform::create_runtime_with_path(&root_config.runtime, tui_path)?,
     ))
-}
-
-/// Create full tool registry including memory tools and optional Composio
-#[allow(
-    clippy::implicit_hasher,
-    clippy::too_many_arguments,
-    clippy::type_complexity
-)]
-pub fn all_tools(
-    config: Arc<Config>,
-    security: &Arc<SecurityPolicy>,
-    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
-    agent_alias: &str,
-    memory: Arc<dyn Memory>,
-    composio_key: Option<&str>,
-    composio_entity_id: Option<&str>,
-    browser_config: &zeroclaw_config::schema::BrowserConfig,
-    http_config: &zeroclaw_config::schema::HttpRequestConfig,
-    web_fetch_config: &zeroclaw_config::schema::WebFetchConfig,
-    workspace_dir: &std::path::Path,
-    agents: &HashMap<String, AliasedAgentConfig>,
-    fallback_api_key: Option<&str>,
-    root_config: &zeroclaw_config::schema::Config,
-    canvas_store: Option<CanvasStore>,
-    is_subagent_caller: bool,
-    tui_env: Option<HashMap<String, String>>,
-) -> anyhow::Result<AllToolsResult> {
-    let runtime = runtime_for_all_tools(root_config, tui_env.as_ref())?;
-    all_tools_with_runtime(
-        config,
-        security,
-        risk_profile,
-        agent_alias,
-        runtime,
-        memory,
-        composio_key,
-        composio_entity_id,
-        browser_config,
-        http_config,
-        web_fetch_config,
-        workspace_dir,
-        agents,
-        fallback_api_key,
-        root_config,
-        canvas_store,
-        is_subagent_caller,
-        tui_env,
-        None,
-        None,
-        None,
-    )
 }
 
 /// Peer groups that include `agent_alias`, cloned from `config`. Used as the
@@ -2006,111 +1954,17 @@ fn warm_lazy_regexes() {
     zeroclaw_providers::multimodal::warm_lazy_regexes();
 }
 
-/// Create the full tool registry on a dedicated builder thread.
+/// Build native tools from one config generation and the caller's resources.
 ///
-/// The registry build is the deepest synchronous subtree reachable from
-/// `session/new` and from every turn path. Built inline it consumed the RPC
-/// caller's stack down to a few KiB of the 2 MiB `session/new` regression
-/// budget, so any change deepening it overflowed Windows debug builds. The
-/// build now runs on a thread with its own explicit stack; the caller's
-/// stack pays only the cheap per-call prep below.
-///
-/// Ordering and panic semantics are unchanged: the caller blocks until the
-/// registry is built (as the inline build did), and a builder panic is
-/// resumed on the caller's thread. A scoped thread keeps the borrowed
-/// parameters (`browser_config`/`http_config`/`web_fetch_config`/`agents`/
-/// `root_config`) semantically independent at the API boundary while avoiding
-/// deep clones on the caller's limited stack.
-#[allow(
-    clippy::implicit_hasher,
-    clippy::too_many_arguments,
-    clippy::type_complexity
-)]
-pub fn all_tools_with_runtime(
-    config: Arc<Config>,
-    security: &Arc<SecurityPolicy>,
+/// Configuration fields are resolved from `inputs.request.config`. The supplied
+/// risk profile is the caller's admitted sandbox policy, just like its security,
+/// runtime, and memory handles. Construction stays on the existing dedicated
+/// stack; the scoped thread permits borrowed inputs without cloning Config.
+pub fn build_native_registry(
+    inputs: crate::composition::NativeRecipeInputs<'_>,
     risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
-    agent_alias: &str,
-    runtime: Arc<dyn RuntimeAdapter>,
-    memory: Arc<dyn Memory>,
-    composio_key: Option<&str>,
-    composio_entity_id: Option<&str>,
-    browser_config: &zeroclaw_config::schema::BrowserConfig,
-    http_config: &zeroclaw_config::schema::HttpRequestConfig,
-    web_fetch_config: &zeroclaw_config::schema::WebFetchConfig,
-    workspace_dir: &std::path::Path,
-    agents: &HashMap<String, AliasedAgentConfig>,
-    fallback_api_key: Option<&str>,
-    root_config: &zeroclaw_config::schema::Config,
-    canvas_store: Option<CanvasStore>,
-    is_subagent_caller: bool,
-    tui_env: Option<HashMap<String, String>>,
-    sop_engine: Option<Arc<Mutex<SopEngine>>>,
-    sop_audit: Option<Arc<SopAuditLogger>>,
-    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
 ) -> anyhow::Result<AllToolsResult> {
-    all_tools_with_runtime_and_acp_sessions(
-        config,
-        security,
-        risk_profile,
-        agent_alias,
-        runtime,
-        memory,
-        composio_key,
-        composio_entity_id,
-        browser_config,
-        http_config,
-        web_fetch_config,
-        workspace_dir,
-        agents,
-        fallback_api_key,
-        root_config,
-        canvas_store,
-        is_subagent_caller,
-        tui_env.map(Arc::new),
-        sop_engine,
-        sop_audit,
-        live_config,
-        None,
-    )
-}
-
-/// Build the registry on its dedicated stack with lifecycle and ACP context.
-#[allow(
-    clippy::implicit_hasher,
-    clippy::too_many_arguments,
-    clippy::type_complexity
-)]
-pub(crate) fn all_tools_with_runtime_context(
-    config: Arc<Config>,
-    security: &Arc<SecurityPolicy>,
-    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
-    agent_alias: &str,
-    runtime: Arc<dyn RuntimeAdapter>,
-    memory: Arc<dyn Memory>,
-    composio_key: Option<&str>,
-    composio_entity_id: Option<&str>,
-    browser_config: &zeroclaw_config::schema::BrowserConfig,
-    http_config: &zeroclaw_config::schema::HttpRequestConfig,
-    web_fetch_config: &zeroclaw_config::schema::WebFetchConfig,
-    workspace_dir: &std::path::Path,
-    agents: &HashMap<String, AliasedAgentConfig>,
-    _fallback_api_key: Option<&str>,
-    root_config: &zeroclaw_config::schema::Config,
-    canvas_store: Option<CanvasStore>,
-    is_subagent_caller: bool,
-    tui_env: Option<ForwardedEnvironment>,
-    sop_engine: Option<Arc<Mutex<SopEngine>>>,
-    sop_audit: Option<Arc<SopAuditLogger>>,
-    // Live config handle for `send_via` peer-group authority. `Some` from the
-    // channel daemon (so reloads take effect); `None` for one-shot / non-channel
-    // callers, which fall back to a snapshot of `root_config`.
-    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
-    execution_capability: Option<AgentExecutionCapability>,
-    acp_sessions: Option<AcpSessionReadView>,
-    model_config: Option<zeroclaw_tools::llm_task::ModelConfigResolver>,
-) -> anyhow::Result<AllToolsResult> {
-    let owner = memory.principal_scope();
+    let owner = inputs.request.memory.principal_scope();
     #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
     let late_trace = late_tool_search_observer::capture();
     let builder = move || {
@@ -2124,31 +1978,7 @@ pub(crate) fn all_tools_with_runtime_context(
         // means the compile never lands on a turn stack; it costs one
         // cold-process delay of a few hundred milliseconds, once.
         warm_lazy_regexes();
-        all_tools_with_runtime_on_thread(
-            config,
-            security,
-            risk_profile,
-            agent_alias,
-            runtime,
-            memory,
-            composio_key,
-            composio_entity_id,
-            browser_config,
-            http_config,
-            web_fetch_config,
-            workspace_dir,
-            agents,
-            root_config,
-            canvas_store,
-            is_subagent_caller,
-            tui_env,
-            sop_engine,
-            sop_audit,
-            live_config,
-            execution_capability,
-            acp_sessions,
-            model_config,
-        )
+        build_native_registry_on_thread(inputs, risk_profile)
     };
     std::thread::scope(|scope| -> anyhow::Result<AllToolsResult> {
         let handle = std::thread::Builder::new()
@@ -2177,159 +2007,44 @@ pub(crate) fn all_tools_with_runtime_context(
     })
 }
 
-/// Create the full tool registry with an optional ACP session read view.
-#[allow(
-    clippy::implicit_hasher,
-    clippy::too_many_arguments,
-    clippy::type_complexity
-)]
-pub fn all_tools_with_runtime_and_acp_sessions(
-    config: Arc<Config>,
-    security: &Arc<SecurityPolicy>,
+/// Registry build body; runs on the dedicated builder thread.
+fn build_native_registry_on_thread(
+    inputs: crate::composition::NativeRecipeInputs<'_>,
     risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
-    agent_alias: &str,
-    runtime: Arc<dyn RuntimeAdapter>,
-    memory: Arc<dyn Memory>,
-    composio_key: Option<&str>,
-    composio_entity_id: Option<&str>,
-    browser_config: &zeroclaw_config::schema::BrowserConfig,
-    http_config: &zeroclaw_config::schema::HttpRequestConfig,
-    web_fetch_config: &zeroclaw_config::schema::WebFetchConfig,
-    workspace_dir: &std::path::Path,
-    agents: &HashMap<String, AliasedAgentConfig>,
-    fallback_api_key: Option<&str>,
-    root_config: &zeroclaw_config::schema::Config,
-    canvas_store: Option<CanvasStore>,
-    is_subagent_caller: bool,
-    tui_env: Option<ForwardedEnvironment>,
-    sop_engine: Option<Arc<Mutex<SopEngine>>>,
-    sop_audit: Option<Arc<SopAuditLogger>>,
-    // Live config handle for `send_via` peer-group authority. `Some` from the
-    // channel daemon (so reloads take effect); `None` for one-shot / non-channel
-    // callers, which fall back to a snapshot of `root_config`.
-    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
-    acp_sessions: Option<AcpSessionReadView>,
 ) -> anyhow::Result<AllToolsResult> {
-    all_tools_with_runtime_context(
-        config,
-        security,
-        risk_profile,
-        agent_alias,
-        runtime,
-        memory,
-        composio_key,
-        composio_entity_id,
-        browser_config,
-        http_config,
-        web_fetch_config,
+    let crate::composition::NativeRecipeInputs {
+        request,
         workspace_dir,
-        agents,
-        fallback_api_key,
-        root_config,
         canvas_store,
         is_subagent_caller,
-        tui_env,
-        sop_engine,
-        sop_audit,
-        live_config,
-        None,
-        acp_sessions,
-        None,
-    )
-}
-
-/// Create the managed registry while carrying the authority-backed execution
-/// capability into tools that can start work for another target alias.
-#[allow(
-    clippy::implicit_hasher,
-    clippy::too_many_arguments,
-    clippy::type_complexity
-)]
-pub fn all_tools_with_runtime_and_execution_capability(
-    config: Arc<Config>,
-    security: &Arc<SecurityPolicy>,
-    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
-    agent_alias: &str,
-    runtime: Arc<dyn RuntimeAdapter>,
-    memory: Arc<dyn Memory>,
-    composio_key: Option<&str>,
-    composio_entity_id: Option<&str>,
-    browser_config: &zeroclaw_config::schema::BrowserConfig,
-    http_config: &zeroclaw_config::schema::HttpRequestConfig,
-    web_fetch_config: &zeroclaw_config::schema::WebFetchConfig,
-    workspace_dir: &std::path::Path,
-    agents: &HashMap<String, AliasedAgentConfig>,
-    fallback_api_key: Option<&str>,
-    root_config: &zeroclaw_config::schema::Config,
-    canvas_store: Option<CanvasStore>,
-    is_subagent_caller: bool,
-    tui_env: Option<HashMap<String, String>>,
-    sop_engine: Option<Arc<Mutex<SopEngine>>>,
-    sop_audit: Option<Arc<SopAuditLogger>>,
-    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
-    execution_capability: Option<AgentExecutionCapability>,
-) -> anyhow::Result<AllToolsResult> {
-    all_tools_with_runtime_context(
-        config,
-        security,
-        risk_profile,
-        agent_alias,
-        runtime,
-        memory,
-        composio_key,
-        composio_entity_id,
-        browser_config,
-        http_config,
-        web_fetch_config,
-        workspace_dir,
-        agents,
-        fallback_api_key,
-        root_config,
-        canvas_store,
-        is_subagent_caller,
-        tui_env.map(Arc::new),
+        forwarded_environment: tui_env,
         sop_engine,
         sop_audit,
         live_config,
         execution_capability,
-        None,
-        None,
-    )
-}
-
-/// Registry build body; runs on the dedicated builder thread.
-#[allow(
-    clippy::implicit_hasher,
-    clippy::too_many_arguments,
-    clippy::type_complexity
-)]
-fn all_tools_with_runtime_on_thread(
-    config: Arc<Config>,
-    security: &Arc<SecurityPolicy>,
-    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
-    agent_alias: &str,
-    runtime: Arc<dyn RuntimeAdapter>,
-    memory: Arc<dyn Memory>,
-    composio_key: Option<&str>,
-    composio_entity_id: Option<&str>,
-    _browser_config: &zeroclaw_config::schema::BrowserConfig,
-    http_config: &zeroclaw_config::schema::HttpRequestConfig,
-    web_fetch_config: &zeroclaw_config::schema::WebFetchConfig,
-    workspace_dir: &std::path::Path,
-    agents: &HashMap<String, AliasedAgentConfig>,
-    root_config: &zeroclaw_config::schema::Config,
-    canvas_store: Option<CanvasStore>,
-    is_subagent_caller: bool,
-    tui_env: Option<ForwardedEnvironment>,
-    sop_engine: Option<Arc<Mutex<SopEngine>>>,
-    sop_audit: Option<Arc<SopAuditLogger>>,
-    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
-    execution_capability: Option<AgentExecutionCapability>,
-    acp_sessions: Option<AcpSessionReadView>,
-    model_config: Option<zeroclaw_tools::llm_task::ModelConfigResolver>,
-) -> anyhow::Result<AllToolsResult> {
+        acp_sessions,
+        model_config,
+    } = inputs;
+    let config = Arc::clone(request.config);
+    let root_config = request.config.as_ref();
+    let agent_alias = request.agent_alias;
+    let security = request.security;
+    let runtime = Arc::clone(request.runtime);
+    let memory = Arc::clone(request.memory);
+    let agents = &root_config.agents;
+    let composio_key = root_config
+        .composio
+        .enabled
+        .then_some(root_config.composio.api_key.as_deref())
+        .flatten();
+    let composio_entity_id = root_config
+        .composio
+        .enabled
+        .then_some(root_config.composio.entity_id.as_str());
     #[cfg(feature = "tools-external")]
-    let browser_config = _browser_config;
+    let browser_config = &root_config.browser;
+    let http_config = &root_config.http_request;
+    let web_fetch_config = &root_config.web_fetch;
     let has_shell_access = runtime.has_shell_access();
     let persistent_writes = runtime.has_filesystem_access();
     let register_coding_cli_tools = has_shell_access && persistent_writes;
@@ -4112,8 +3827,8 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use zeroclaw_config::schema::{
-        ApprovalGroupConfig, ApprovalPolicyConfig, BrowserConfig, Config, FileDownloadConfig,
-        MemoryConfig, SopApprovalConfig,
+        AliasedAgentConfig, ApprovalGroupConfig, ApprovalPolicyConfig, BrowserConfig, Config,
+        FileDownloadConfig, MemoryConfig, SopApprovalConfig,
     };
 
     #[test]
@@ -4215,7 +3930,7 @@ mod tests {
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
         let mut cfg = test_config(&tmp);
         cfg.runtime.kind = zeroclaw_config::schema::RuntimeKind::Docker;
         let risk = zeroclaw_config::schema::RiskProfileConfig {
@@ -4223,31 +3938,34 @@ mod tests {
             sandbox_backend: Some("docker".to_string()),
             ..zeroclaw_config::schema::RiskProfileConfig::default()
         };
-        let tools = all_tools_with_runtime(
-            Arc::new(cfg.clone()),
-            &security,
-            &risk,
-            "test-agent",
-            Arc::new(zeroclaw_config::platform::DockerRuntime::new(
-                cfg.runtime.docker.clone(),
-            )),
-            mem,
-            None,
-            None,
-            &BrowserConfig::default(),
-            &zeroclaw_config::schema::HttpRequestConfig::default(),
-            &zeroclaw_config::schema::WebFetchConfig::default(),
-            repository.as_path(),
-            &HashMap::new(),
-            None,
-            &cfg,
-            None,
-            false,
-            None,
-            None,
-            None,
-            None,
-        )
+        let tools = {
+            let registry_config = Arc::new(cfg.clone());
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.browser = BrowserConfig::default();
+                fixture.http_request = zeroclaw_config::schema::HttpRequestConfig::default();
+                fixture.web_fetch = zeroclaw_config::schema::WebFetchConfig::default();
+                fixture.agents = HashMap::new();
+                std::sync::Arc::new(fixture)
+            };
+            let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
+                Arc::new(zeroclaw_config::platform::DockerRuntime::new(
+                    cfg.runtime.docker.clone(),
+                ));
+            let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = mem;
+            let registry_request = crate::composition::ToolRequest {
+                config: &registry_config,
+                agent_alias: "test-agent",
+                security: &security,
+                runtime: &registry_runtime,
+                memory: &registry_memory,
+            };
+            let registry_inputs = crate::composition::NativeRecipeInputs::new(
+                &registry_request,
+                repository.as_path(),
+            );
+            crate::tools::build_native_registry(registry_inputs, &risk)
+        }
         .expect("production registry must build")
         .tools;
         let git_operations = tools
@@ -4449,29 +4167,25 @@ mod tests {
         });
         let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::new());
         let memory: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("lean"));
-        let built = all_tools_with_runtime(
-            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "lean",
-            Arc::clone(&runtime),
-            memory,
-            None,
-            None,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            tmp.path(),
-            &config.agents,
-            None,
-            &zeroclaw_config::migration::admit_test_input(&config),
-            None,
-            false,
-            None,
-            None,
-            None,
-            None,
-        )
+        let built = {
+            let registry_config = Arc::new(zeroclaw_config::migration::admit_test_input(&config));
+            let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
+                Arc::clone(&runtime);
+            let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = memory;
+            let registry_request = crate::composition::ToolRequest {
+                config: &registry_config,
+                agent_alias: "lean",
+                security: &security,
+                runtime: &registry_runtime,
+                memory: &registry_memory,
+            };
+            let registry_inputs =
+                crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+            crate::tools::build_native_registry(
+                registry_inputs,
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )
+        }
         .unwrap();
         assert!(!tmp.path().join("optional.db").exists());
         assert!(built.delegate_handle.is_none());
@@ -4537,7 +4251,6 @@ mod tests {
                     ..MemoryConfig::default()
                 },
                 tmp.path(),
-                None,
             )
             .unwrap(),
         );
@@ -4552,29 +4265,31 @@ mod tests {
                 sandbox_backend: Some("sandbox-exec".into()),
                 ..zeroclaw_config::schema::RiskProfileConfig::default()
             };
-            all_tools_with_runtime(
-                Arc::new(cfg.clone()),
-                &security,
-                &risk,
-                "test-agent",
-                Arc::new(zeroclaw_config::platform::NativeRuntime::new()),
-                memory.clone(),
-                None,
-                None,
-                &BrowserConfig::default(),
-                &zeroclaw_config::schema::HttpRequestConfig::default(),
-                &zeroclaw_config::schema::WebFetchConfig::default(),
-                tmp.path(),
-                &HashMap::new(),
-                None,
-                &cfg,
-                None,
-                false,
-                None,
-                None,
-                None,
-                None,
-            )
+            {
+                let registry_config = Arc::new(cfg.clone());
+                let registry_config = {
+                    let mut fixture = (*registry_config).clone();
+                    fixture.browser = BrowserConfig::default();
+                    fixture.http_request = zeroclaw_config::schema::HttpRequestConfig::default();
+                    fixture.web_fetch = zeroclaw_config::schema::WebFetchConfig::default();
+                    fixture.agents = HashMap::new();
+                    std::sync::Arc::new(fixture)
+                };
+                let registry_runtime: std::sync::Arc<
+                    dyn zeroclaw_config::platform::RuntimeAdapter,
+                > = Arc::new(zeroclaw_config::platform::NativeRuntime::new());
+                let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = memory.clone();
+                let registry_request = crate::composition::ToolRequest {
+                    config: &registry_config,
+                    agent_alias: "test-agent",
+                    security: &security,
+                    runtime: &registry_runtime,
+                    memory: &registry_memory,
+                };
+                let registry_inputs =
+                    crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+                crate::tools::build_native_registry(registry_inputs, &risk)
+            }
         };
         let error = build(cycle.clone(), true)
             .err()
@@ -4590,7 +4305,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn all_tools_runtime_uses_canonical_configured_shell_from_tui_path() {
+    fn tool_registry_runtime_uses_canonical_configured_shell_from_tui_path() {
         use std::ffi::OsString;
         use std::os::unix::fs::PermissionsExt;
 
@@ -4609,9 +4324,9 @@ mod tests {
         .unwrap();
         let tui_env = HashMap::from([("PATH".to_string(), path.to_string_lossy().into_owned())]);
 
-        let runtime = runtime_for_all_tools(&root_config, Some(&tui_env)).unwrap();
+        let runtime = runtime_for_tool_registry(&root_config, Some(&tui_env)).unwrap();
         let command = runtime
-            .build_shell_command("echo all-tools", tmp.path())
+            .build_shell_command("echo tool-registry", tmp.path())
             .unwrap();
 
         assert_eq!(
@@ -4622,16 +4337,16 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn all_tools_runtime_rejects_empty_or_relative_only_tui_path() {
+    fn tool_registry_runtime_rejects_empty_or_relative_only_tui_path() {
         use std::ffi::OsString;
 
         for path in [OsString::new(), OsString::from("relative-only")] {
             let mut root_config = Config::default();
-            root_config.runtime.shell = Some("all-tools-missing-shell".to_string());
+            root_config.runtime.shell = Some("tool-registry-missing-shell".to_string());
             let tui_env =
                 HashMap::from([("PATH".to_string(), path.to_string_lossy().into_owned())]);
 
-            assert!(runtime_for_all_tools(&root_config, Some(&tui_env)).is_err());
+            assert!(runtime_for_tool_registry(&root_config, Some(&tui_env)).is_err());
         }
     }
 
@@ -5552,29 +5267,25 @@ permissions = ["http_client"]
         });
         let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::new());
         let memory: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("late"));
-        let built = all_tools_with_runtime(
-            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "late",
-            Arc::clone(&runtime),
-            memory,
-            None,
-            None,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            tmp.path(),
-            &config.agents,
-            None,
-            &zeroclaw_config::migration::admit_test_input(&config),
-            None,
-            false,
-            None,
-            None,
-            None,
-            None,
-        )
+        let built = {
+            let registry_config = Arc::new(zeroclaw_config::migration::admit_test_input(&config));
+            let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
+                Arc::clone(&runtime);
+            let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = memory;
+            let registry_request = crate::composition::ToolRequest {
+                config: &registry_config,
+                agent_alias: "late",
+                security: &security,
+                runtime: &registry_runtime,
+                memory: &registry_memory,
+            };
+            let registry_inputs =
+                crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+            crate::tools::build_native_registry(
+                registry_inputs,
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )
+        }
         .unwrap();
         let is_guest = |tool: &dyn Tool| {
             matches!(
@@ -5861,7 +5572,6 @@ permissions = ["http_client"]
                     ..MemoryConfig::default()
                 },
                 tmp.path(),
-                None,
             )
             .unwrap(),
         );
@@ -5870,25 +5580,44 @@ permissions = ["http_client"]
             ..BrowserConfig::default()
         };
 
-        let tools = all_tools(
-            Arc::new(config.clone()),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "test-agent",
-            memory,
-            None,
-            None,
-            &browser,
-            &zeroclaw_config::schema::HttpRequestConfig::default(),
-            &zeroclaw_config::schema::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &config,
-            None,
-            false,
-            None,
-        )
+        let tools = {
+            let registry_config = Arc::new(config.clone());
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.browser = browser.clone();
+                fixture.http_request = zeroclaw_config::schema::HttpRequestConfig::default();
+                fixture.web_fetch = zeroclaw_config::schema::WebFetchConfig::default();
+                fixture.agents = HashMap::new();
+                std::sync::Arc::new(fixture)
+            };
+            (|| -> anyhow::Result<_> {
+                let registry_environment: Option<crate::tools::ForwardedEnvironment> = None;
+                let registry_path = registry_environment
+                    .as_ref()
+                    .and_then(|env| env.get("PATH"))
+                    .map(std::ffi::OsStr::new);
+                let registry_runtime: std::sync::Arc<
+                    dyn zeroclaw_config::platform::RuntimeAdapter,
+                > = std::sync::Arc::from(zeroclaw_config::platform::create_runtime_with_path(
+                    &registry_config.runtime,
+                    registry_path,
+                )?);
+                let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = memory;
+                let registry_request = crate::composition::ToolRequest {
+                    config: &registry_config,
+                    agent_alias: "test-agent",
+                    security: &security,
+                    runtime: &registry_runtime,
+                    memory: &registry_memory,
+                };
+                let registry_inputs =
+                    crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+                crate::tools::build_native_registry(
+                    registry_inputs,
+                    &zeroclaw_config::schema::RiskProfileConfig::default(),
+                )
+            })()
+        }
         .expect("tool registry builds")
         .tools;
 
@@ -5926,7 +5655,7 @@ permissions = ["http_client"]
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
 
         let browser = BrowserConfig {
             enabled: false,
@@ -5941,25 +5670,44 @@ permissions = ["http_client"]
         cfg.web_search.searxng_instance_url = None;
         std::fs::write(&cfg.config_path, "[web_search]\n").unwrap();
 
-        let tools = all_tools(
-            Arc::new(Config::default()),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "test-agent",
-            mem,
-            None,
-            None,
-            &browser,
-            &http,
-            &zeroclaw_config::schema::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &cfg,
-            None,
-            false,
-            None,
-        )
+        let tools = {
+            let registry_config = Arc::new(Config::default());
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.browser = browser.clone();
+                fixture.http_request = http.clone();
+                fixture.web_fetch = zeroclaw_config::schema::WebFetchConfig::default();
+                fixture.agents = HashMap::new();
+                std::sync::Arc::new(fixture)
+            };
+            (|| -> anyhow::Result<_> {
+                let registry_environment: Option<crate::tools::ForwardedEnvironment> = None;
+                let registry_path = registry_environment
+                    .as_ref()
+                    .and_then(|env| env.get("PATH"))
+                    .map(std::ffi::OsStr::new);
+                let registry_runtime: std::sync::Arc<
+                    dyn zeroclaw_config::platform::RuntimeAdapter,
+                > = std::sync::Arc::from(zeroclaw_config::platform::create_runtime_with_path(
+                    &registry_config.runtime,
+                    registry_path,
+                )?);
+                let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = mem;
+                let registry_request = crate::composition::ToolRequest {
+                    config: &registry_config,
+                    agent_alias: "test-agent",
+                    security: &security,
+                    runtime: &registry_runtime,
+                    memory: &registry_memory,
+                };
+                let registry_inputs =
+                    crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+                crate::tools::build_native_registry(
+                    registry_inputs,
+                    &zeroclaw_config::schema::RiskProfileConfig::default(),
+                )
+            })()
+        }
         .expect("tool registry builds")
         .tools;
 
@@ -5986,7 +5734,7 @@ permissions = ["http_client"]
 
     /// Regression: SOP tools must NOT appear in the tool registry when the
     /// engine handle is not provided (i.e. no `sops_dir` configured).
-    /// Proves the production gating path at `all_tools_with_runtime`.
+    /// Proves the production gating path at `build_native_registry`.
     #[test]
     fn sop_tools_absent_when_engine_not_provided() {
         let tmp = TempDir::new().unwrap();
@@ -5996,7 +5744,7 @@ permissions = ["http_client"]
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
 
         let browser = BrowserConfig {
             enabled: false,
@@ -6007,25 +5755,44 @@ permissions = ["http_client"]
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let tools = all_tools(
-            Arc::new(Config::default()),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "test-agent",
-            mem,
-            None,
-            None,
-            &browser,
-            &http,
-            &zeroclaw_config::schema::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &cfg,
-            None,
-            false,
-            None,
-        )
+        let tools = {
+            let registry_config = Arc::new(Config::default());
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.browser = browser.clone();
+                fixture.http_request = http.clone();
+                fixture.web_fetch = zeroclaw_config::schema::WebFetchConfig::default();
+                fixture.agents = HashMap::new();
+                std::sync::Arc::new(fixture)
+            };
+            (|| -> anyhow::Result<_> {
+                let registry_environment: Option<crate::tools::ForwardedEnvironment> = None;
+                let registry_path = registry_environment
+                    .as_ref()
+                    .and_then(|env| env.get("PATH"))
+                    .map(std::ffi::OsStr::new);
+                let registry_runtime: std::sync::Arc<
+                    dyn zeroclaw_config::platform::RuntimeAdapter,
+                > = std::sync::Arc::from(zeroclaw_config::platform::create_runtime_with_path(
+                    &registry_config.runtime,
+                    registry_path,
+                )?);
+                let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = mem;
+                let registry_request = crate::composition::ToolRequest {
+                    config: &registry_config,
+                    agent_alias: "test-agent",
+                    security: &security,
+                    runtime: &registry_runtime,
+                    memory: &registry_memory,
+                };
+                let registry_inputs =
+                    crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+                crate::tools::build_native_registry(
+                    registry_inputs,
+                    &zeroclaw_config::schema::RiskProfileConfig::default(),
+                )
+            })()
+        }
         .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -6059,7 +5826,7 @@ permissions = ["http_client"]
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
         let browser = BrowserConfig {
             enabled: false,
             allowed_domains: vec![],
@@ -6069,29 +5836,33 @@ permissions = ["http_client"]
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let tools = all_tools_with_runtime(
-            Arc::new(Config::default()),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "test-agent",
-            Arc::new(NativeRuntime::new()),
-            mem,
-            None,
-            None,
-            &browser,
-            &http,
-            &zeroclaw_config::schema::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &cfg,
-            None,
-            false,
-            None,
-            None,
-            None,
-            None,
-        )
+        let tools = {
+            let registry_config = Arc::new(Config::default());
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.browser = browser.clone();
+                fixture.http_request = http.clone();
+                fixture.web_fetch = zeroclaw_config::schema::WebFetchConfig::default();
+                fixture.agents = HashMap::new();
+                std::sync::Arc::new(fixture)
+            };
+            let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
+                Arc::new(NativeRuntime::new());
+            let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = mem;
+            let registry_request = crate::composition::ToolRequest {
+                config: &registry_config,
+                agent_alias: "test-agent",
+                security: &security,
+                runtime: &registry_runtime,
+                memory: &registry_memory,
+            };
+            let registry_inputs =
+                crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+            crate::tools::build_native_registry(
+                registry_inputs,
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )
+        }
         .expect("tool registry builds")
         .tools;
 
@@ -6115,7 +5886,7 @@ permissions = ["http_client"]
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
 
         let browser = BrowserConfig {
             enabled: false,
@@ -6131,29 +5902,34 @@ permissions = ["http_client"]
             zeroclaw_config::schema::SopConfig::default(),
         )));
 
-        let tools = all_tools_with_runtime(
-            Arc::new(Config::default()),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "test-agent",
-            Arc::new(NativeRuntime::new()),
-            mem,
-            None,
-            None,
-            &browser,
-            &http,
-            &zeroclaw_config::schema::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &cfg,
-            None,
-            false,
-            None,
-            Some(engine),
-            None,
-            None,
-        )
+        let tools = {
+            let registry_config = Arc::new(Config::default());
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.browser = browser.clone();
+                fixture.http_request = http.clone();
+                fixture.web_fetch = zeroclaw_config::schema::WebFetchConfig::default();
+                fixture.agents = HashMap::new();
+                std::sync::Arc::new(fixture)
+            };
+            let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
+                Arc::new(NativeRuntime::new());
+            let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = mem;
+            let registry_request = crate::composition::ToolRequest {
+                config: &registry_config,
+                agent_alias: "test-agent",
+                security: &security,
+                runtime: &registry_runtime,
+                memory: &registry_memory,
+            };
+            let mut registry_inputs =
+                crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+            registry_inputs.sop_engine = Some(engine);
+            crate::tools::build_native_registry(
+                registry_inputs,
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )
+        }
         .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -6275,7 +6051,7 @@ permissions = ["http_client"]
                 ..MemoryConfig::default()
             };
             let mem: Arc<dyn Memory> =
-                Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+                Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
             let browser = BrowserConfig {
                 enabled: false,
                 ..BrowserConfig::default()
@@ -6294,32 +6070,34 @@ permissions = ["http_client"]
             };
             let seen_command = Arc::new(Mutex::new(None));
 
-            let tools = all_tools_with_runtime(
-                Arc::new(cfg.clone()),
-                &security,
-                &risk,
-                "test-agent",
-                Arc::new(CapturingRuntime {
+            let tools = {
+                let registry_config = Arc::new(cfg.clone());
+                let registry_config = {
+                    let mut fixture = (*registry_config).clone();
+                    fixture.browser = browser.clone();
+                    fixture.http_request = zeroclaw_config::schema::HttpRequestConfig::default();
+                    fixture.web_fetch = zeroclaw_config::schema::WebFetchConfig::default();
+                    fixture.agents = HashMap::new();
+                    std::sync::Arc::new(fixture)
+                };
+                let registry_runtime: std::sync::Arc<
+                    dyn zeroclaw_config::platform::RuntimeAdapter,
+                > = Arc::new(CapturingRuntime {
                     seen_command: Arc::clone(&seen_command),
                     filesystem_access: true,
-                }),
-                mem,
-                None,
-                None,
-                &browser,
-                &zeroclaw_config::schema::HttpRequestConfig::default(),
-                &zeroclaw_config::schema::WebFetchConfig::default(),
-                tmp.path(),
-                &HashMap::new(),
-                None,
-                &cfg,
-                None,
-                false,
-                None,
-                None,
-                None,
-                None,
-            )
+                });
+                let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = mem;
+                let registry_request = crate::composition::ToolRequest {
+                    config: &registry_config,
+                    agent_alias: "test-agent",
+                    security: &security,
+                    runtime: &registry_runtime,
+                    memory: &registry_memory,
+                };
+                let registry_inputs =
+                    crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+                crate::tools::build_native_registry(registry_inputs, &risk)
+            }
             .expect("tool registry builds")
             .tools;
             let tool = tools
@@ -6373,7 +6151,7 @@ permissions = ["http_client"]
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
         let browser = BrowserConfig {
             enabled: false,
             ..BrowserConfig::default()
@@ -6391,31 +6169,32 @@ permissions = ["http_client"]
             ..zeroclaw_config::schema::RiskProfileConfig::default()
         };
 
-        let tools = all_tools_with_runtime(
-            Arc::new(cfg.clone()),
-            &security,
-            &risk,
-            "test-agent",
-            Arc::new(zeroclaw_config::platform::DockerRuntime::new(
-                cfg.runtime.docker.clone(),
-            )),
-            mem,
-            None,
-            None,
-            &browser,
-            &zeroclaw_config::schema::HttpRequestConfig::default(),
-            &zeroclaw_config::schema::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &cfg,
-            None,
-            false,
-            None,
-            None,
-            None,
-            None,
-        )
+        let tools = {
+            let registry_config = Arc::new(cfg.clone());
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.browser = browser.clone();
+                fixture.http_request = zeroclaw_config::schema::HttpRequestConfig::default();
+                fixture.web_fetch = zeroclaw_config::schema::WebFetchConfig::default();
+                fixture.agents = HashMap::new();
+                std::sync::Arc::new(fixture)
+            };
+            let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
+                Arc::new(zeroclaw_config::platform::DockerRuntime::new(
+                    cfg.runtime.docker.clone(),
+                ));
+            let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = mem;
+            let registry_request = crate::composition::ToolRequest {
+                config: &registry_config,
+                agent_alias: "test-agent",
+                security: &security,
+                runtime: &registry_runtime,
+                memory: &registry_memory,
+            };
+            let registry_inputs =
+                crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+            crate::tools::build_native_registry(registry_inputs, &risk)
+        }
         .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
@@ -6448,7 +6227,7 @@ permissions = ["http_client"]
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
         let browser = BrowserConfig {
             enabled: false,
             ..BrowserConfig::default()
@@ -6462,29 +6241,35 @@ permissions = ["http_client"]
         cfg.project_intel.enabled = true;
         cfg.composio.enabled = true;
 
-        let tools = all_tools_with_runtime(
-            Arc::new(cfg.clone()),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "test-agent",
-            Arc::new(NativeRuntime::new()),
-            mem,
-            Some("composio-key"),
-            None,
-            &browser,
-            &zeroclaw_config::schema::HttpRequestConfig::default(),
-            &zeroclaw_config::schema::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &cfg,
-            None,
-            false,
-            None,
-            None,
-            None,
-            None,
-        )
+        let tools = {
+            let registry_config = Arc::new(cfg.clone());
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.browser = browser.clone();
+                fixture.http_request = zeroclaw_config::schema::HttpRequestConfig::default();
+                fixture.web_fetch = zeroclaw_config::schema::WebFetchConfig::default();
+                fixture.agents = HashMap::new();
+                fixture.composio.api_key = (Some("composio-key")).map(str::to_owned);
+                fixture.composio.enabled = fixture.composio.api_key.is_some();
+                std::sync::Arc::new(fixture)
+            };
+            let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
+                Arc::new(NativeRuntime::new());
+            let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = mem;
+            let registry_request = crate::composition::ToolRequest {
+                config: &registry_config,
+                agent_alias: "test-agent",
+                security: &security,
+                runtime: &registry_runtime,
+                memory: &registry_memory,
+            };
+            let registry_inputs =
+                crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+            crate::tools::build_native_registry(
+                registry_inputs,
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )
+        }
         .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
@@ -6522,7 +6307,7 @@ permissions = ["http_client"]
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
 
         let browser = BrowserConfig {
             enabled: false,
@@ -6538,29 +6323,34 @@ permissions = ["http_client"]
             zeroclaw_config::schema::SopConfig::default(),
         )));
 
-        let tools = all_tools_with_runtime(
-            Arc::new(Config::default()),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "test-agent",
-            Arc::new(NativeRuntime::new()),
-            mem,
-            None,
-            None,
-            &browser,
-            &http,
-            &zeroclaw_config::schema::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &cfg,
-            None,
-            false,
-            None,
-            Some(engine),
-            None,
-            None,
-        )
+        let tools = {
+            let registry_config = Arc::new(Config::default());
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.browser = browser.clone();
+                fixture.http_request = http.clone();
+                fixture.web_fetch = zeroclaw_config::schema::WebFetchConfig::default();
+                fixture.agents = HashMap::new();
+                std::sync::Arc::new(fixture)
+            };
+            let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
+                Arc::new(NativeRuntime::new());
+            let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = mem;
+            let registry_request = crate::composition::ToolRequest {
+                config: &registry_config,
+                agent_alias: "test-agent",
+                security: &security,
+                runtime: &registry_runtime,
+                memory: &registry_memory,
+            };
+            let mut registry_inputs =
+                crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+            registry_inputs.sop_engine = Some(engine);
+            crate::tools::build_native_registry(
+                registry_inputs,
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )
+        }
         .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -6580,7 +6370,7 @@ permissions = ["http_client"]
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
 
         let cfg = test_config(&tmp);
         let browser = BrowserConfig::default();
@@ -6596,53 +6386,59 @@ permissions = ["http_client"]
         // Two independent registrations using clones of the same Arc — the
         // pattern the daemon uses when wiring gateway, channels, MQTT, and
         // RPC sessions from one engine pair.
-        let session_a = all_tools_with_runtime(
-            Arc::new(Config::default()),
-            &security,
-            &risk,
-            "session-a",
-            Arc::new(NativeRuntime::new()),
-            mem.clone(),
-            None,
-            None,
-            &browser,
-            &http,
-            &web,
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &cfg,
-            None,
-            false,
-            None,
-            Some(shared_engine.clone()),
-            Some(shared_audit.clone()),
-            None,
-        )
+        let session_a = {
+            let registry_config = Arc::new(Config::default());
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.browser = browser.clone();
+                fixture.http_request = http.clone();
+                fixture.web_fetch = web.clone();
+                fixture.agents = HashMap::new();
+                std::sync::Arc::new(fixture)
+            };
+            let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
+                Arc::new(NativeRuntime::new());
+            let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = mem.clone();
+            let registry_request = crate::composition::ToolRequest {
+                config: &registry_config,
+                agent_alias: "session-a",
+                security: &security,
+                runtime: &registry_runtime,
+                memory: &registry_memory,
+            };
+            let mut registry_inputs =
+                crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+            registry_inputs.sop_engine = Some(shared_engine.clone());
+            registry_inputs.sop_audit = Some(shared_audit.clone());
+            crate::tools::build_native_registry(registry_inputs, &risk)
+        }
         .expect("first tool registry builds");
-        let session_b = all_tools_with_runtime(
-            Arc::new(Config::default()),
-            &security,
-            &risk,
-            "session-b",
-            Arc::new(NativeRuntime::new()),
-            mem.clone(),
-            None,
-            None,
-            &browser,
-            &http,
-            &web,
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &cfg,
-            None,
-            false,
-            None,
-            Some(shared_engine.clone()),
-            Some(shared_audit.clone()),
-            None,
-        )
+        let session_b = {
+            let registry_config = Arc::new(Config::default());
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.browser = browser.clone();
+                fixture.http_request = http.clone();
+                fixture.web_fetch = web.clone();
+                fixture.agents = HashMap::new();
+                std::sync::Arc::new(fixture)
+            };
+            let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
+                Arc::new(NativeRuntime::new());
+            let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = mem.clone();
+            let registry_request = crate::composition::ToolRequest {
+                config: &registry_config,
+                agent_alias: "session-b",
+                security: &security,
+                runtime: &registry_runtime,
+                memory: &registry_memory,
+            };
+            let mut registry_inputs =
+                crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+            registry_inputs.sop_engine = Some(shared_engine.clone());
+            registry_inputs.sop_audit = Some(shared_audit.clone());
+            crate::tools::build_native_registry(registry_inputs, &risk)
+        }
         .expect("second tool registry builds");
 
         for tools in [&session_a.tools, &session_b.tools] {
@@ -6670,7 +6466,7 @@ permissions = ["http_client"]
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
         let mut groups = HashMap::new();
         groups.insert(
             "release".to_string(),
@@ -6748,29 +6544,32 @@ permissions = ["http_client"]
         let risk = zeroclaw_config::schema::RiskProfileConfig::default();
 
         let build = |agent_alias: &str, memory: Arc<dyn Memory>| {
-            all_tools_with_runtime(
-                Arc::new(Config::default()),
-                &security,
-                &risk,
-                agent_alias,
-                Arc::new(NativeRuntime::new()),
-                memory,
-                None,
-                None,
-                &browser,
-                &http,
-                &web,
-                tmp.path(),
-                &HashMap::new(),
-                None,
-                &cfg,
-                None,
-                false,
-                None,
-                Some(shared_engine.clone()),
-                None,
-                None,
-            )
+            {
+                let registry_config = Arc::new(Config::default());
+                let registry_config = {
+                    let mut fixture = (*registry_config).clone();
+                    fixture.browser = browser.clone();
+                    fixture.http_request = http.clone();
+                    fixture.web_fetch = web.clone();
+                    fixture.agents = HashMap::new();
+                    std::sync::Arc::new(fixture)
+                };
+                let registry_runtime: std::sync::Arc<
+                    dyn zeroclaw_config::platform::RuntimeAdapter,
+                > = Arc::new(NativeRuntime::new());
+                let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = memory;
+                let registry_request = crate::composition::ToolRequest {
+                    config: &registry_config,
+                    agent_alias,
+                    security: &security,
+                    runtime: &registry_runtime,
+                    memory: &registry_memory,
+                };
+                let mut registry_inputs =
+                    crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+                registry_inputs.sop_engine = Some(shared_engine.clone());
+                crate::tools::build_native_registry(registry_inputs, &risk)
+            }
             .expect("tool registry builds")
             .tools
         };
@@ -6820,7 +6619,7 @@ permissions = ["http_client"]
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
         let browser = BrowserConfig::default();
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
         let web = zeroclaw_config::schema::WebFetchConfig::default();
@@ -6845,29 +6644,36 @@ permissions = ["http_client"]
             ..Config::default()
         };
 
-        let tools = all_tools_with_runtime(
-            Arc::new(config),
-            &security,
-            &risk,
-            "test-agent",
-            Arc::new(NativeRuntime::new()),
-            mem,
-            None,
-            None,
-            &browser,
-            &http,
-            &web,
-            workspace_dir.as_path(), // DIFFERENT from data_dir
-            &HashMap::new(),
-            None,
-            &root_config,
-            None,
-            false,
-            None,
-            None,
-            None,
-            None,
-        )
+        let tools = {
+            let registry_config = Arc::new(config);
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.browser = browser.clone();
+                fixture.http_request = http.clone();
+                fixture.web_fetch = web.clone();
+                fixture.agents = (
+                    // DIFFERENT from data_dir
+                    &HashMap::new()
+                )
+                    .clone();
+                std::sync::Arc::new(fixture)
+            };
+            let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
+                Arc::new(NativeRuntime::new());
+            let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = mem;
+            let registry_request = crate::composition::ToolRequest {
+                config: &registry_config,
+                agent_alias: "test-agent",
+                security: &security,
+                runtime: &registry_runtime,
+                memory: &registry_memory,
+            };
+            let registry_inputs = crate::composition::NativeRecipeInputs::new(
+                &registry_request,
+                workspace_dir.as_path(),
+            );
+            crate::tools::build_native_registry(registry_inputs, &risk)
+        }
         .expect("tool registry builds")
         .tools;
 
@@ -6930,7 +6736,7 @@ permissions = ["http_client"]
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
         let browser = BrowserConfig::default();
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
         let web = zeroclaw_config::schema::WebFetchConfig::default();
@@ -6946,29 +6752,32 @@ permissions = ["http_client"]
             ..Config::default()
         };
 
-        let tools = all_tools_with_runtime(
-            Arc::new(config),
-            &security,
-            &risk,
-            "test-agent",
-            Arc::new(NativeRuntime::new()),
-            mem,
-            None,
-            None,
-            &browser,
-            &http,
-            &web,
-            workspace_dir.as_path(),
-            &HashMap::new(),
-            None,
-            &root_config,
-            None,
-            false,
-            None,
-            None,
-            None,
-            None,
-        )
+        let tools = {
+            let registry_config = Arc::new(config);
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.browser = browser.clone();
+                fixture.http_request = http.clone();
+                fixture.web_fetch = web.clone();
+                fixture.agents = HashMap::new();
+                std::sync::Arc::new(fixture)
+            };
+            let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
+                Arc::new(NativeRuntime::new());
+            let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = mem;
+            let registry_request = crate::composition::ToolRequest {
+                config: &registry_config,
+                agent_alias: "test-agent",
+                security: &security,
+                runtime: &registry_runtime,
+                memory: &registry_memory,
+            };
+            let registry_inputs = crate::composition::NativeRecipeInputs::new(
+                &registry_request,
+                workspace_dir.as_path(),
+            );
+            crate::tools::build_native_registry(registry_inputs, &risk)
+        }
         .expect("tool registry builds")
         .tools;
         assert!(!security.allowed_roots.contains(&data_dir));
@@ -7106,14 +6915,14 @@ permissions = ["http_client"]
         };
 
         // Using the session alias ("ops") must succeed even with no "default" agent.
-        let mem = zeroclaw_memory::create_memory_for_agent(&config, "ops", None).await;
+        let mem = zeroclaw_memory::create_memory_for_agent(&config, "ops").await;
         assert!(
             mem.is_ok(),
             "create_memory_for_agent with session alias should succeed"
         );
 
         // The old hardcoded "default" must fail — proving the fix is load-bearing.
-        let mem_default = zeroclaw_memory::create_memory_for_agent(&config, "default", None).await;
+        let mem_default = zeroclaw_memory::create_memory_for_agent(&config, "default").await;
         assert!(
             mem_default.is_err(),
             "create_memory_for_agent(\"default\") must fail when agents.default is absent"
@@ -7231,7 +7040,7 @@ permissions = ["http_client"]
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
 
         let browser = BrowserConfig {
             enabled: false,
@@ -7242,25 +7051,44 @@ permissions = ["http_client"]
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let tools = all_tools(
-            Arc::new(Config::default()),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "test-agent",
-            mem,
-            None,
-            None,
-            &browser,
-            &http,
-            &zeroclaw_config::schema::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &cfg,
-            None,
-            false,
-            None,
-        )
+        let tools = {
+            let registry_config = Arc::new(Config::default());
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.browser = browser.clone();
+                fixture.http_request = http.clone();
+                fixture.web_fetch = zeroclaw_config::schema::WebFetchConfig::default();
+                fixture.agents = HashMap::new();
+                std::sync::Arc::new(fixture)
+            };
+            (|| -> anyhow::Result<_> {
+                let registry_environment: Option<crate::tools::ForwardedEnvironment> = None;
+                let registry_path = registry_environment
+                    .as_ref()
+                    .and_then(|env| env.get("PATH"))
+                    .map(std::ffi::OsStr::new);
+                let registry_runtime: std::sync::Arc<
+                    dyn zeroclaw_config::platform::RuntimeAdapter,
+                > = std::sync::Arc::from(zeroclaw_config::platform::create_runtime_with_path(
+                    &registry_config.runtime,
+                    registry_path,
+                )?);
+                let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = mem;
+                let registry_request = crate::composition::ToolRequest {
+                    config: &registry_config,
+                    agent_alias: "test-agent",
+                    security: &security,
+                    runtime: &registry_runtime,
+                    memory: &registry_memory,
+                };
+                let registry_inputs =
+                    crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+                crate::tools::build_native_registry(
+                    registry_inputs,
+                    &zeroclaw_config::schema::RiskProfileConfig::default(),
+                )
+            })()
+        }
         .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -7284,7 +7112,7 @@ permissions = ["http_client"]
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
         let browser = BrowserConfig {
             enabled: false,
             ..BrowserConfig::default()
@@ -7301,25 +7129,44 @@ permissions = ["http_client"]
             .to_string_lossy()
             .to_string();
 
-        let tools = all_tools(
-            Arc::new(Config::default()),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "test-agent",
-            mem,
-            None,
-            None,
-            &browser,
-            &http,
-            &zeroclaw_config::schema::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &cfg,
-            None,
-            false,
-            None,
-        )
+        let tools = {
+            let registry_config = Arc::new(Config::default());
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.browser = browser.clone();
+                fixture.http_request = http.clone();
+                fixture.web_fetch = zeroclaw_config::schema::WebFetchConfig::default();
+                fixture.agents = HashMap::new();
+                std::sync::Arc::new(fixture)
+            };
+            (|| -> anyhow::Result<_> {
+                let registry_environment: Option<crate::tools::ForwardedEnvironment> = None;
+                let registry_path = registry_environment
+                    .as_ref()
+                    .and_then(|env| env.get("PATH"))
+                    .map(std::ffi::OsStr::new);
+                let registry_runtime: std::sync::Arc<
+                    dyn zeroclaw_config::platform::RuntimeAdapter,
+                > = std::sync::Arc::from(zeroclaw_config::platform::create_runtime_with_path(
+                    &registry_config.runtime,
+                    registry_path,
+                )?);
+                let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = mem;
+                let registry_request = crate::composition::ToolRequest {
+                    config: &registry_config,
+                    agent_alias: "test-agent",
+                    security: &security,
+                    runtime: &registry_runtime,
+                    memory: &registry_memory,
+                };
+                let registry_inputs =
+                    crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+                crate::tools::build_native_registry(
+                    registry_inputs,
+                    &zeroclaw_config::schema::RiskProfileConfig::default(),
+                )
+            })()
+        }
         .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -7339,7 +7186,7 @@ permissions = ["http_client"]
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
 
         let browser = BrowserConfig {
             enabled: true,
@@ -7350,25 +7197,44 @@ permissions = ["http_client"]
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let tools = all_tools(
-            Arc::new(Config::default()),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "test-agent",
-            mem,
-            None,
-            None,
-            &browser,
-            &http,
-            &zeroclaw_config::schema::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &cfg,
-            None,
-            false,
-            None,
-        )
+        let tools = {
+            let registry_config = Arc::new(Config::default());
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.browser = browser.clone();
+                fixture.http_request = http.clone();
+                fixture.web_fetch = zeroclaw_config::schema::WebFetchConfig::default();
+                fixture.agents = HashMap::new();
+                std::sync::Arc::new(fixture)
+            };
+            (|| -> anyhow::Result<_> {
+                let registry_environment: Option<crate::tools::ForwardedEnvironment> = None;
+                let registry_path = registry_environment
+                    .as_ref()
+                    .and_then(|env| env.get("PATH"))
+                    .map(std::ffi::OsStr::new);
+                let registry_runtime: std::sync::Arc<
+                    dyn zeroclaw_config::platform::RuntimeAdapter,
+                > = std::sync::Arc::from(zeroclaw_config::platform::create_runtime_with_path(
+                    &registry_config.runtime,
+                    registry_path,
+                )?);
+                let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = mem;
+                let registry_request = crate::composition::ToolRequest {
+                    config: &registry_config,
+                    agent_alias: "test-agent",
+                    security: &security,
+                    runtime: &registry_runtime,
+                    memory: &registry_memory,
+                };
+                let registry_inputs =
+                    crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+                crate::tools::build_native_registry(
+                    registry_inputs,
+                    &zeroclaw_config::schema::RiskProfileConfig::default(),
+                )
+            })()
+        }
         .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -7399,7 +7265,7 @@ permissions = ["http_client"]
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
 
         let browser = BrowserConfig {
             enabled: true,
@@ -7411,25 +7277,44 @@ permissions = ["http_client"]
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let tools = all_tools(
-            Arc::new(Config::default()),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "test-agent",
-            mem,
-            None,
-            None,
-            &browser,
-            &http,
-            &zeroclaw_config::schema::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &cfg,
-            None,
-            false,
-            None,
-        )
+        let tools = {
+            let registry_config = Arc::new(Config::default());
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.browser = browser.clone();
+                fixture.http_request = http.clone();
+                fixture.web_fetch = zeroclaw_config::schema::WebFetchConfig::default();
+                fixture.agents = HashMap::new();
+                std::sync::Arc::new(fixture)
+            };
+            (|| -> anyhow::Result<_> {
+                let registry_environment: Option<crate::tools::ForwardedEnvironment> = None;
+                let registry_path = registry_environment
+                    .as_ref()
+                    .and_then(|env| env.get("PATH"))
+                    .map(std::ffi::OsStr::new);
+                let registry_runtime: std::sync::Arc<
+                    dyn zeroclaw_config::platform::RuntimeAdapter,
+                > = std::sync::Arc::from(zeroclaw_config::platform::create_runtime_with_path(
+                    &registry_config.runtime,
+                    registry_path,
+                )?);
+                let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = mem;
+                let registry_request = crate::composition::ToolRequest {
+                    config: &registry_config,
+                    agent_alias: "test-agent",
+                    security: &security,
+                    runtime: &registry_runtime,
+                    memory: &registry_memory,
+                };
+                let registry_inputs =
+                    crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+                crate::tools::build_native_registry(
+                    registry_inputs,
+                    &zeroclaw_config::schema::RiskProfileConfig::default(),
+                )
+            })()
+        }
         .expect("browser automation tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -7450,7 +7335,7 @@ permissions = ["http_client"]
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
 
         let browser = BrowserConfig {
             enabled: false,
@@ -7462,25 +7347,44 @@ permissions = ["http_client"]
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let tools = all_tools(
-            Arc::new(Config::default()),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "test-agent",
-            mem,
-            None,
-            None,
-            &browser,
-            &http,
-            &zeroclaw_config::schema::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &cfg,
-            None,
-            false,
-            None,
-        )
+        let tools = {
+            let registry_config = Arc::new(Config::default());
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.browser = browser.clone();
+                fixture.http_request = http.clone();
+                fixture.web_fetch = zeroclaw_config::schema::WebFetchConfig::default();
+                fixture.agents = HashMap::new();
+                std::sync::Arc::new(fixture)
+            };
+            (|| -> anyhow::Result<_> {
+                let registry_environment: Option<crate::tools::ForwardedEnvironment> = None;
+                let registry_path = registry_environment
+                    .as_ref()
+                    .and_then(|env| env.get("PATH"))
+                    .map(std::ffi::OsStr::new);
+                let registry_runtime: std::sync::Arc<
+                    dyn zeroclaw_config::platform::RuntimeAdapter,
+                > = std::sync::Arc::from(zeroclaw_config::platform::create_runtime_with_path(
+                    &registry_config.runtime,
+                    registry_path,
+                )?);
+                let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = mem;
+                let registry_request = crate::composition::ToolRequest {
+                    config: &registry_config,
+                    agent_alias: "test-agent",
+                    security: &security,
+                    runtime: &registry_runtime,
+                    memory: &registry_memory,
+                };
+                let registry_inputs =
+                    crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+                crate::tools::build_native_registry(
+                    registry_inputs,
+                    &zeroclaw_config::schema::RiskProfileConfig::default(),
+                )
+            })()
+        }
         .expect("automation-only tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -7510,7 +7414,7 @@ permissions = ["http_client"]
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
 
         let security = Arc::new(SecurityPolicy::default());
         let mut cfg = test_config(&tmp);
@@ -7521,29 +7425,36 @@ permissions = ["http_client"]
             engine.reload(tmp.path());
             let sop_engine = Arc::new(std::sync::Mutex::new(engine));
             let sop_audit = Arc::new(crate::sop::SopAuditLogger::new(mem.clone()));
-            all_tools_with_runtime(
-                Arc::new(Config::default()),
-                &security,
-                &zeroclaw_config::schema::RiskProfileConfig::default(),
-                "test-agent",
-                Arc::new(NativeRuntime::new()),
-                mem.clone(),
-                None,
-                None,
-                &BrowserConfig::default(),
-                &zeroclaw_config::schema::HttpRequestConfig::default(),
-                &zeroclaw_config::schema::WebFetchConfig::default(),
-                tmp.path(),
-                &HashMap::new(),
-                None,
-                &cfg,
-                None,
-                false,
-                None,
-                Some(sop_engine),
-                Some(sop_audit),
-                None,
-            )
+            {
+                let registry_config = Arc::new(Config::default());
+                let registry_config = {
+                    let mut fixture = (*registry_config).clone();
+                    fixture.browser = BrowserConfig::default();
+                    fixture.http_request = zeroclaw_config::schema::HttpRequestConfig::default();
+                    fixture.web_fetch = zeroclaw_config::schema::WebFetchConfig::default();
+                    fixture.agents = HashMap::new();
+                    std::sync::Arc::new(fixture)
+                };
+                let registry_runtime: std::sync::Arc<
+                    dyn zeroclaw_config::platform::RuntimeAdapter,
+                > = Arc::new(NativeRuntime::new());
+                let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = mem.clone();
+                let registry_request = crate::composition::ToolRequest {
+                    config: &registry_config,
+                    agent_alias: "test-agent",
+                    security: &security,
+                    runtime: &registry_runtime,
+                    memory: &registry_memory,
+                };
+                let mut registry_inputs =
+                    crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+                registry_inputs.sop_engine = Some(sop_engine);
+                registry_inputs.sop_audit = Some(sop_audit);
+                crate::tools::build_native_registry(
+                    registry_inputs,
+                    &zeroclaw_config::schema::RiskProfileConfig::default(),
+                )
+            }
             .expect("tool registry builds")
             .tools
         };
@@ -7669,7 +7580,7 @@ permissions = ["http_client"]
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
 
         let browser = BrowserConfig::default();
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
@@ -7684,25 +7595,44 @@ permissions = ["http_client"]
             },
         );
 
-        let tools = all_tools(
-            Arc::new(Config::default()),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "test-agent",
-            mem,
-            None,
-            None,
-            &browser,
-            &http,
-            &zeroclaw_config::schema::WebFetchConfig::default(),
-            tmp.path(),
-            &agents,
-            Some("delegate-test-credential"),
-            &cfg,
-            None,
-            false,
-            None,
-        )
+        let tools = {
+            let registry_config = Arc::new(Config::default());
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.browser = browser.clone();
+                fixture.http_request = http.clone();
+                fixture.web_fetch = zeroclaw_config::schema::WebFetchConfig::default();
+                fixture.agents = agents.clone();
+                std::sync::Arc::new(fixture)
+            };
+            (|| -> anyhow::Result<_> {
+                let registry_environment: Option<crate::tools::ForwardedEnvironment> = None;
+                let registry_path = registry_environment
+                    .as_ref()
+                    .and_then(|env| env.get("PATH"))
+                    .map(std::ffi::OsStr::new);
+                let registry_runtime: std::sync::Arc<
+                    dyn zeroclaw_config::platform::RuntimeAdapter,
+                > = std::sync::Arc::from(zeroclaw_config::platform::create_runtime_with_path(
+                    &registry_config.runtime,
+                    registry_path,
+                )?);
+                let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = mem;
+                let registry_request = crate::composition::ToolRequest {
+                    config: &registry_config,
+                    agent_alias: "test-agent",
+                    security: &security,
+                    runtime: &registry_runtime,
+                    memory: &registry_memory,
+                };
+                let registry_inputs =
+                    crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+                crate::tools::build_native_registry(
+                    registry_inputs,
+                    &zeroclaw_config::schema::RiskProfileConfig::default(),
+                )
+            })()
+        }
         .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -7718,31 +7648,50 @@ permissions = ["http_client"]
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
 
         let browser = BrowserConfig::default();
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let tools = all_tools(
-            Arc::new(Config::default()),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "test-agent",
-            mem,
-            None,
-            None,
-            &browser,
-            &http,
-            &zeroclaw_config::schema::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &cfg,
-            None,
-            false,
-            None,
-        )
+        let tools = {
+            let registry_config = Arc::new(Config::default());
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.browser = browser.clone();
+                fixture.http_request = http.clone();
+                fixture.web_fetch = zeroclaw_config::schema::WebFetchConfig::default();
+                fixture.agents = HashMap::new();
+                std::sync::Arc::new(fixture)
+            };
+            (|| -> anyhow::Result<_> {
+                let registry_environment: Option<crate::tools::ForwardedEnvironment> = None;
+                let registry_path = registry_environment
+                    .as_ref()
+                    .and_then(|env| env.get("PATH"))
+                    .map(std::ffi::OsStr::new);
+                let registry_runtime: std::sync::Arc<
+                    dyn zeroclaw_config::platform::RuntimeAdapter,
+                > = std::sync::Arc::from(zeroclaw_config::platform::create_runtime_with_path(
+                    &registry_config.runtime,
+                    registry_path,
+                )?);
+                let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = mem;
+                let registry_request = crate::composition::ToolRequest {
+                    config: &registry_config,
+                    agent_alias: "test-agent",
+                    security: &security,
+                    runtime: &registry_runtime,
+                    memory: &registry_memory,
+                };
+                let registry_inputs =
+                    crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+                crate::tools::build_native_registry(
+                    registry_inputs,
+                    &zeroclaw_config::schema::RiskProfileConfig::default(),
+                )
+            })()
+        }
         .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -7758,7 +7707,7 @@ permissions = ["http_client"]
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
 
         let browser = BrowserConfig::default();
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
@@ -7766,25 +7715,44 @@ permissions = ["http_client"]
         cfg.skills.prompt_injection_mode =
             zeroclaw_config::schema::SkillsPromptInjectionMode::Compact;
 
-        let tools = all_tools(
-            Arc::new(cfg.clone()),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "test-agent",
-            mem,
-            None,
-            None,
-            &browser,
-            &http,
-            &zeroclaw_config::schema::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &cfg,
-            None,
-            false,
-            None,
-        )
+        let tools = {
+            let registry_config = Arc::new(cfg.clone());
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.browser = browser.clone();
+                fixture.http_request = http.clone();
+                fixture.web_fetch = zeroclaw_config::schema::WebFetchConfig::default();
+                fixture.agents = HashMap::new();
+                std::sync::Arc::new(fixture)
+            };
+            (|| -> anyhow::Result<_> {
+                let registry_environment: Option<crate::tools::ForwardedEnvironment> = None;
+                let registry_path = registry_environment
+                    .as_ref()
+                    .and_then(|env| env.get("PATH"))
+                    .map(std::ffi::OsStr::new);
+                let registry_runtime: std::sync::Arc<
+                    dyn zeroclaw_config::platform::RuntimeAdapter,
+                > = std::sync::Arc::from(zeroclaw_config::platform::create_runtime_with_path(
+                    &registry_config.runtime,
+                    registry_path,
+                )?);
+                let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = mem;
+                let registry_request = crate::composition::ToolRequest {
+                    config: &registry_config,
+                    agent_alias: "test-agent",
+                    security: &security,
+                    runtime: &registry_runtime,
+                    memory: &registry_memory,
+                };
+                let registry_inputs =
+                    crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+                crate::tools::build_native_registry(
+                    registry_inputs,
+                    &zeroclaw_config::schema::RiskProfileConfig::default(),
+                )
+            })()
+        }
         .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -7800,32 +7768,51 @@ permissions = ["http_client"]
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
 
         let browser = BrowserConfig::default();
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
         let mut cfg = test_config(&tmp);
         cfg.skills.prompt_injection_mode = zeroclaw_config::schema::SkillsPromptInjectionMode::Full;
 
-        let tools = all_tools(
-            Arc::new(cfg.clone()),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "test-agent",
-            mem,
-            None,
-            None,
-            &browser,
-            &http,
-            &zeroclaw_config::schema::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &cfg,
-            None,
-            false,
-            None,
-        )
+        let tools = {
+            let registry_config = Arc::new(cfg.clone());
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.browser = browser.clone();
+                fixture.http_request = http.clone();
+                fixture.web_fetch = zeroclaw_config::schema::WebFetchConfig::default();
+                fixture.agents = HashMap::new();
+                std::sync::Arc::new(fixture)
+            };
+            (|| -> anyhow::Result<_> {
+                let registry_environment: Option<crate::tools::ForwardedEnvironment> = None;
+                let registry_path = registry_environment
+                    .as_ref()
+                    .and_then(|env| env.get("PATH"))
+                    .map(std::ffi::OsStr::new);
+                let registry_runtime: std::sync::Arc<
+                    dyn zeroclaw_config::platform::RuntimeAdapter,
+                > = std::sync::Arc::from(zeroclaw_config::platform::create_runtime_with_path(
+                    &registry_config.runtime,
+                    registry_path,
+                )?);
+                let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = mem;
+                let registry_request = crate::composition::ToolRequest {
+                    config: &registry_config,
+                    agent_alias: "test-agent",
+                    security: &security,
+                    runtime: &registry_runtime,
+                    memory: &registry_memory,
+                };
+                let registry_inputs =
+                    crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+                crate::tools::build_native_registry(
+                    registry_inputs,
+                    &zeroclaw_config::schema::RiskProfileConfig::default(),
+                )
+            })()
+        }
         .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -7841,7 +7828,7 @@ permissions = ["http_client"]
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
 
         let browser = BrowserConfig::default();
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
@@ -7857,25 +7844,44 @@ permissions = ["http_client"]
         )
         .unwrap();
 
-        let tools = all_tools(
-            Arc::new(cfg.clone()),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "test-agent",
-            mem,
-            None,
-            None,
-            &browser,
-            &http,
-            &zeroclaw_config::schema::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &cfg,
-            None,
-            false,
-            None,
-        )
+        let tools = {
+            let registry_config = Arc::new(cfg.clone());
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.browser = browser.clone();
+                fixture.http_request = http.clone();
+                fixture.web_fetch = zeroclaw_config::schema::WebFetchConfig::default();
+                fixture.agents = HashMap::new();
+                std::sync::Arc::new(fixture)
+            };
+            (|| -> anyhow::Result<_> {
+                let registry_environment: Option<crate::tools::ForwardedEnvironment> = None;
+                let registry_path = registry_environment
+                    .as_ref()
+                    .and_then(|env| env.get("PATH"))
+                    .map(std::ffi::OsStr::new);
+                let registry_runtime: std::sync::Arc<
+                    dyn zeroclaw_config::platform::RuntimeAdapter,
+                > = std::sync::Arc::from(zeroclaw_config::platform::create_runtime_with_path(
+                    &registry_config.runtime,
+                    registry_path,
+                )?);
+                let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = mem;
+                let registry_request = crate::composition::ToolRequest {
+                    config: &registry_config,
+                    agent_alias: "test-agent",
+                    security: &security,
+                    runtime: &registry_runtime,
+                    memory: &registry_memory,
+                };
+                let registry_inputs =
+                    crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+                crate::tools::build_native_registry(
+                    registry_inputs,
+                    &zeroclaw_config::schema::RiskProfileConfig::default(),
+                )
+            })()
+        }
         .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -7889,28 +7895,48 @@ permissions = ["http_client"]
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
         let cfg = test_config(tmp);
 
-        all_tools(
-            Arc::new(cfg.clone()),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "test-agent",
-            mem,
-            None,
-            None,
-            &BrowserConfig::default(),
-            &zeroclaw_config::schema::HttpRequestConfig::default(),
-            &zeroclaw_config::schema::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &cfg,
-            None,
-            is_subagent_caller,
-            None,
-        )
+        {
+            let registry_config = Arc::new(cfg.clone());
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.browser = BrowserConfig::default();
+                fixture.http_request = zeroclaw_config::schema::HttpRequestConfig::default();
+                fixture.web_fetch = zeroclaw_config::schema::WebFetchConfig::default();
+                fixture.agents = HashMap::new();
+                std::sync::Arc::new(fixture)
+            };
+            (|| -> anyhow::Result<_> {
+                let registry_environment: Option<crate::tools::ForwardedEnvironment> = None;
+                let registry_path = registry_environment
+                    .as_ref()
+                    .and_then(|env| env.get("PATH"))
+                    .map(std::ffi::OsStr::new);
+                let registry_runtime: std::sync::Arc<
+                    dyn zeroclaw_config::platform::RuntimeAdapter,
+                > = std::sync::Arc::from(zeroclaw_config::platform::create_runtime_with_path(
+                    &registry_config.runtime,
+                    registry_path,
+                )?);
+                let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = mem;
+                let registry_request = crate::composition::ToolRequest {
+                    config: &registry_config,
+                    agent_alias: "test-agent",
+                    security: &security,
+                    runtime: &registry_runtime,
+                    memory: &registry_memory,
+                };
+                let mut registry_inputs =
+                    crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+                registry_inputs.is_subagent_caller = is_subagent_caller;
+                crate::tools::build_native_registry(
+                    registry_inputs,
+                    &zeroclaw_config::schema::RiskProfileConfig::default(),
+                )
+            })()
+        }
         .expect("tool registry builds")
         .tools
         .iter()
@@ -7944,30 +7970,50 @@ permissions = ["http_client"]
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
 
         let build = |enabled: bool| {
             let mut cfg = test_config(&tmp);
             cfg.a2a.client.enabled = enabled;
-            all_tools(
-                Arc::new(cfg.clone()),
-                &security,
-                &zeroclaw_config::schema::RiskProfileConfig::default(),
-                "test-agent",
-                Arc::clone(&mem),
-                None,
-                None,
-                &BrowserConfig::default(),
-                &zeroclaw_config::schema::HttpRequestConfig::default(),
-                &zeroclaw_config::schema::WebFetchConfig::default(),
-                tmp.path(),
-                &HashMap::new(),
-                None,
-                &cfg,
-                None,
-                false,
-                None,
-            )
+            {
+                let registry_config = Arc::new(cfg.clone());
+                let registry_config = {
+                    let mut fixture = (*registry_config).clone();
+                    fixture.browser = BrowserConfig::default();
+                    fixture.http_request = zeroclaw_config::schema::HttpRequestConfig::default();
+                    fixture.web_fetch = zeroclaw_config::schema::WebFetchConfig::default();
+                    fixture.agents = HashMap::new();
+                    std::sync::Arc::new(fixture)
+                };
+                (|| -> anyhow::Result<_> {
+                    let registry_environment: Option<crate::tools::ForwardedEnvironment> = None;
+                    let registry_path = registry_environment
+                        .as_ref()
+                        .and_then(|env| env.get("PATH"))
+                        .map(std::ffi::OsStr::new);
+                    let registry_runtime: std::sync::Arc<
+                        dyn zeroclaw_config::platform::RuntimeAdapter,
+                    > = std::sync::Arc::from(zeroclaw_config::platform::create_runtime_with_path(
+                        &registry_config.runtime,
+                        registry_path,
+                    )?);
+                    let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> =
+                        Arc::clone(&mem);
+                    let registry_request = crate::composition::ToolRequest {
+                        config: &registry_config,
+                        agent_alias: "test-agent",
+                        security: &security,
+                        runtime: &registry_runtime,
+                        memory: &registry_memory,
+                    };
+                    let registry_inputs =
+                        crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+                    crate::tools::build_native_registry(
+                        registry_inputs,
+                        &zeroclaw_config::schema::RiskProfileConfig::default(),
+                    )
+                })()
+            }
             .expect("tool registry builds")
             .tools
             .iter()
@@ -8001,7 +8047,7 @@ permissions = ["http_client"]
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
 
         let browser = BrowserConfig::default();
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
@@ -8026,25 +8072,44 @@ permissions = ["http_client"]
             },
         );
 
-        let tools = all_tools(
-            Arc::new(cfg.clone()),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "test-agent",
-            mem,
-            None,
-            None,
-            &browser,
-            &http,
-            &zeroclaw_config::schema::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &cfg,
-            None,
-            false,
-            None,
-        )
+        let tools = {
+            let registry_config = Arc::new(cfg.clone());
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.browser = browser.clone();
+                fixture.http_request = http.clone();
+                fixture.web_fetch = zeroclaw_config::schema::WebFetchConfig::default();
+                fixture.agents = HashMap::new();
+                std::sync::Arc::new(fixture)
+            };
+            (|| -> anyhow::Result<_> {
+                let registry_environment: Option<crate::tools::ForwardedEnvironment> = None;
+                let registry_path = registry_environment
+                    .as_ref()
+                    .and_then(|env| env.get("PATH"))
+                    .map(std::ffi::OsStr::new);
+                let registry_runtime: std::sync::Arc<
+                    dyn zeroclaw_config::platform::RuntimeAdapter,
+                > = std::sync::Arc::from(zeroclaw_config::platform::create_runtime_with_path(
+                    &registry_config.runtime,
+                    registry_path,
+                )?);
+                let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = mem;
+                let registry_request = crate::composition::ToolRequest {
+                    config: &registry_config,
+                    agent_alias: "test-agent",
+                    security: &security,
+                    runtime: &registry_runtime,
+                    memory: &registry_memory,
+                };
+                let registry_inputs =
+                    crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+                crate::tools::build_native_registry(
+                    registry_inputs,
+                    &zeroclaw_config::schema::RiskProfileConfig::default(),
+                )
+            })()
+        }
         .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -8063,7 +8128,7 @@ permissions = ["http_client"]
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
 
         let browser = BrowserConfig::default();
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
@@ -8090,25 +8155,44 @@ permissions = ["http_client"]
             },
         );
 
-        let tools = all_tools(
-            Arc::new(cfg.clone()),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "test-agent",
-            mem,
-            None,
-            None,
-            &browser,
-            &http,
-            &zeroclaw_config::schema::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &cfg,
-            None,
-            false,
-            None,
-        )
+        let tools = {
+            let registry_config = Arc::new(cfg.clone());
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.browser = browser.clone();
+                fixture.http_request = http.clone();
+                fixture.web_fetch = zeroclaw_config::schema::WebFetchConfig::default();
+                fixture.agents = HashMap::new();
+                std::sync::Arc::new(fixture)
+            };
+            (|| -> anyhow::Result<_> {
+                let registry_environment: Option<crate::tools::ForwardedEnvironment> = None;
+                let registry_path = registry_environment
+                    .as_ref()
+                    .and_then(|env| env.get("PATH"))
+                    .map(std::ffi::OsStr::new);
+                let registry_runtime: std::sync::Arc<
+                    dyn zeroclaw_config::platform::RuntimeAdapter,
+                > = std::sync::Arc::from(zeroclaw_config::platform::create_runtime_with_path(
+                    &registry_config.runtime,
+                    registry_path,
+                )?);
+                let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = mem;
+                let registry_request = crate::composition::ToolRequest {
+                    config: &registry_config,
+                    agent_alias: "test-agent",
+                    security: &security,
+                    runtime: &registry_runtime,
+                    memory: &registry_memory,
+                };
+                let registry_inputs =
+                    crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+                crate::tools::build_native_registry(
+                    registry_inputs,
+                    &zeroclaw_config::schema::RiskProfileConfig::default(),
+                )
+            })()
+        }
         .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -8131,30 +8215,49 @@ permissions = ["http_client"]
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
 
         let mut cfg = test_config(&tmp);
         cfg.verifiable_intent.enabled = true;
 
-        let tools = all_tools(
-            Arc::new(cfg.clone()),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "test-agent",
-            mem,
-            None,
-            None,
-            &BrowserConfig::default(),
-            &zeroclaw_config::schema::HttpRequestConfig::default(),
-            &zeroclaw_config::schema::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &cfg,
-            None,
-            false,
-            None,
-        )
+        let tools = {
+            let registry_config = Arc::new(cfg.clone());
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.browser = BrowserConfig::default();
+                fixture.http_request = zeroclaw_config::schema::HttpRequestConfig::default();
+                fixture.web_fetch = zeroclaw_config::schema::WebFetchConfig::default();
+                fixture.agents = HashMap::new();
+                std::sync::Arc::new(fixture)
+            };
+            (|| -> anyhow::Result<_> {
+                let registry_environment: Option<crate::tools::ForwardedEnvironment> = None;
+                let registry_path = registry_environment
+                    .as_ref()
+                    .and_then(|env| env.get("PATH"))
+                    .map(std::ffi::OsStr::new);
+                let registry_runtime: std::sync::Arc<
+                    dyn zeroclaw_config::platform::RuntimeAdapter,
+                > = std::sync::Arc::from(zeroclaw_config::platform::create_runtime_with_path(
+                    &registry_config.runtime,
+                    registry_path,
+                )?);
+                let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = mem;
+                let registry_request = crate::composition::ToolRequest {
+                    config: &registry_config,
+                    agent_alias: "test-agent",
+                    security: &security,
+                    runtime: &registry_runtime,
+                    memory: &registry_memory,
+                };
+                let registry_inputs =
+                    crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+                crate::tools::build_native_registry(
+                    registry_inputs,
+                    &zeroclaw_config::schema::RiskProfileConfig::default(),
+                )
+            })()
+        }
         .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -8176,7 +8279,7 @@ permissions = ["http_client"]
     /// (e.g. OpenAI with `requires_openai_auth`) are constructed via the
     /// alias-aware factory, not the legacy name-only factory.
     ///
-    /// This test goes through the real `all_tools_with_runtime` registration
+    /// This test goes through the real `build_native_registry` registration
     /// path — the same code that runs in production — then calls `execute()`
     /// on the resulting `llm_task` tool and checks the error message.
     ///
@@ -8233,31 +8336,32 @@ permissions = ["http_client"]
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
 
-        let tools = all_tools_with_runtime(
-            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
-            &security,
-            &RiskProfileConfig::default(),
-            "test-agent",
-            Arc::new(NativeRuntime::new()),
-            mem,
-            None,
-            None,
-            &BrowserConfig::default(),
-            &HttpRequestConfig::default(),
-            &WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &zeroclaw_config::migration::admit_test_input(&config),
-            None,
-            false,
-            None,
-            None,
-            None,
-            None,
-        )
+        let tools = {
+            let registry_config = Arc::new(zeroclaw_config::migration::admit_test_input(&config));
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.browser = BrowserConfig::default();
+                fixture.http_request = HttpRequestConfig::default();
+                fixture.web_fetch = WebFetchConfig::default();
+                fixture.agents = HashMap::new();
+                std::sync::Arc::new(fixture)
+            };
+            let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
+                Arc::new(NativeRuntime::new());
+            let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = mem;
+            let registry_request = crate::composition::ToolRequest {
+                config: &registry_config,
+                agent_alias: "test-agent",
+                security: &security,
+                runtime: &registry_runtime,
+                memory: &registry_memory,
+            };
+            let registry_inputs =
+                crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+            crate::tools::build_native_registry(registry_inputs, &RiskProfileConfig::default())
+        }
         .expect("tool registry builds")
         .tools;
 
@@ -8300,7 +8404,7 @@ permissions = ["http_client"]
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
 
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -8318,29 +8422,34 @@ permissions = ["http_client"]
         };
         let live_config = zeroclaw_config::live::LiveConfig::new(root_config.clone());
 
-        let tools = all_tools_with_runtime(
-            Arc::new(root_config.clone()),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "test-agent",
-            Arc::new(NativeRuntime::new()),
-            mem,
-            None,
-            None,
-            &BrowserConfig::default(),
-            &zeroclaw_config::schema::HttpRequestConfig::default(),
-            &zeroclaw_config::schema::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &root_config,
-            None,
-            false,
-            None,
-            None,
-            None,
-            Some(live_config.handle()),
-        )
+        let tools = {
+            let registry_config = Arc::new(root_config.clone());
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.browser = BrowserConfig::default();
+                fixture.http_request = zeroclaw_config::schema::HttpRequestConfig::default();
+                fixture.web_fetch = zeroclaw_config::schema::WebFetchConfig::default();
+                fixture.agents = HashMap::new();
+                std::sync::Arc::new(fixture)
+            };
+            let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
+                Arc::new(NativeRuntime::new());
+            let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = mem;
+            let registry_request = crate::composition::ToolRequest {
+                config: &registry_config,
+                agent_alias: "test-agent",
+                security: &security,
+                runtime: &registry_runtime,
+                memory: &registry_memory,
+            };
+            let mut registry_inputs =
+                crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+            registry_inputs.live_config = Some(live_config.handle());
+            crate::tools::build_native_registry(
+                registry_inputs,
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )
+        }
         .expect("tool registry should build")
         .tools;
         let file_download = tools
@@ -8408,7 +8517,7 @@ permissions = ["http_client"]
             ..MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
 
         let mut cfg = test_config(tmp);
         cfg.tools.optional = vec!["*".into()];
@@ -8529,29 +8638,37 @@ permissions = ["http_client"]
         let sop_engine = Arc::new(Mutex::new(SopEngine::new(cfg.sop.clone())));
         let sop_audit = Arc::new(crate::sop::SopAuditLogger::new(Arc::clone(&mem)));
 
-        let built = all_tools_with_runtime(
-            Arc::new(zeroclaw_config::migration::admit_test_input(&cfg)),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "test-agent",
-            Arc::new(NativeRuntime::new()),
-            mem,
-            Some("inventory-placeholder"),
-            None,
-            &browser,
-            &http,
-            &web_fetch,
-            &workspace,
-            &delegate_targets,
-            None,
-            &zeroclaw_config::migration::admit_test_input(&cfg),
-            None,
-            false,
-            None,
-            Some(sop_engine),
-            Some(sop_audit),
-            None,
-        )
+        let built = {
+            let registry_config = Arc::new(zeroclaw_config::migration::admit_test_input(&cfg));
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.browser = browser.clone();
+                fixture.http_request = http.clone();
+                fixture.web_fetch = web_fetch.clone();
+                fixture.agents = delegate_targets.clone();
+                fixture.composio.api_key = (Some("inventory-placeholder")).map(str::to_owned);
+                fixture.composio.enabled = fixture.composio.api_key.is_some();
+                std::sync::Arc::new(fixture)
+            };
+            let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
+                Arc::new(NativeRuntime::new());
+            let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = mem;
+            let registry_request = crate::composition::ToolRequest {
+                config: &registry_config,
+                agent_alias: "test-agent",
+                security: &security,
+                runtime: &registry_runtime,
+                memory: &registry_memory,
+            };
+            let mut registry_inputs =
+                crate::composition::NativeRecipeInputs::new(&registry_request, &workspace);
+            registry_inputs.sop_engine = Some(sop_engine);
+            registry_inputs.sop_audit = Some(sop_audit);
+            crate::tools::build_native_registry(
+                registry_inputs,
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )
+        }
         .expect("tool registry builds");
 
         // The scoped assembly mints `execute_pipeline` and the MCP capability

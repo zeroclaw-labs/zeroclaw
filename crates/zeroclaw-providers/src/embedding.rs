@@ -131,7 +131,6 @@ impl EmbeddingProviderConfig {
     pub fn from_resolved(
         resolved: &ResolvedEmbedding<'_>,
         fallback_dimensions: usize,
-        api_key_override: Option<String>,
     ) -> anyhow::Result<Self> {
         let model = resolved.model.trim();
         if model.is_empty() {
@@ -142,14 +141,7 @@ impl EmbeddingProviderConfig {
             anyhow::bail!("embedding dimensions must be greater than zero");
         }
         Ok(Self {
-            transport: {
-                let mut transport =
-                    HttpTransportConfig::from_connection(resolved.selection.connection, None)?;
-                if api_key_override.is_some() {
-                    transport.api_key = api_key_override;
-                }
-                transport
-            },
+            transport: HttpTransportConfig::from_connection(resolved.selection.connection, None)?,
             provider_name: resolved.selection.connection.kind().to_owned(),
             model: model.to_owned(),
             dimensions,
@@ -200,6 +192,38 @@ pub fn create_embedding_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolved_embedding_owns_credentials_and_dimensions() {
+        use zeroclaw_config::provider_registry::ProviderRegistry;
+
+        for connection_key in [Some("embedding-key"), None] {
+            let mut connection = serde_json::json!({
+                "kind": "custom",
+                "uri": "https://embedding.example.test/v1",
+            });
+            if let Some(key) = connection_key {
+                connection["auth"] = serde_json::json!({"api_key": key});
+            }
+            let registry: ProviderRegistry = serde_json::from_value(serde_json::json!({
+                "connections": {"embedding.prod": connection},
+                "models": {"embedding.search.v2": {
+                    "capability": "embedding",
+                    "provider": "embedding.prod",
+                    "model": "embedding-model",
+                    "metadata": {"dimensions": 3072},
+                }},
+            }))
+            .unwrap();
+            let resolved = registry
+                .resolve_embedding(&"embedding.search.v2".into())
+                .unwrap();
+            let config = EmbeddingProviderConfig::from_resolved(&resolved, 1536).unwrap();
+            assert_eq!(config.dimensions, 3072);
+            assert_eq!(config.model, "embedding-model");
+            assert_eq!(config.transport.api_key.as_deref(), connection_key);
+        }
+    }
 
     #[test]
     fn noop_name() {

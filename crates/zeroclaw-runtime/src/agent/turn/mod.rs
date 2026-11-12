@@ -2938,7 +2938,14 @@ async fn run_tool_call_loop_impl<'a>(
         // the turn-level guard for direct/unwrapped providers: a transport
         // success with no final text and no tool calls cannot complete a turn.
         // This runs before response-success telemetry and history mutation.
-        let chat_result = chat_result.and_then(|response| {
+        let chat_result = chat_result.and_then(|mut response| {
+            zeroclaw_providers::response::normalize_response(
+                &mut response,
+                zeroclaw_api::TextExtraction {
+                    reasoning: ctx.extract_text_reasoning,
+                    tool_calls: !ctx.text_tool_calls_disabled,
+                },
+            );
             if policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single
                 && iteration_tool_specs.exceeds_single_tool_round(
                     &response,
@@ -2948,7 +2955,7 @@ async fn run_tool_call_loop_impl<'a>(
             {
                 return Err(single_tool_round_error());
             }
-            if response.is_semantically_empty_terminal_with(ctx.extract_text_reasoning) {
+            if response.is_semantically_empty_terminal() {
                 return Err(anyhow::Error::new(
                     zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
                 ));
@@ -4058,11 +4065,10 @@ impl OwnedAgentExecution {
 pub(crate) async fn step_agent_memory(
     config: &zeroclaw_config::schema::Config,
     alias: &str,
-    api_key: Option<&str>,
     owner: Option<&zeroclaw_api::memory_traits::PrincipalScope>,
 ) -> Result<Arc<dyn zeroclaw_memory::Memory>> {
     Ok(owned_step_memory(
-        zeroclaw_memory::create_memory_for_agent(config, alias, api_key).await?,
+        zeroclaw_memory::create_memory_for_agent(config, alias).await?,
         alias,
         owner,
     ))
@@ -4275,8 +4281,7 @@ pub(crate) async fn assemble_owned_execution_with_capabilities(
         alias,
         &agent.model_provider,
         None,
-        false,
-        true,
+        crate::composition::ModelBuildIntent::Explicit,
     )
     .await?;
     let (model_provider, identity, _) = built.into_parts();
@@ -7591,7 +7596,7 @@ mod sop_step_reassembly_tests {
         use zeroclaw_api::memory_traits::PrincipalScope;
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let config = memory_step_config(&tmp);
-        let step_shared = zeroclaw_memory::create_memory_for_agent(&config, "stepper", None)
+        let step_shared = zeroclaw_memory::create_memory_for_agent(&config, "stepper")
             .await
             .unwrap();
         step_shared
@@ -7688,7 +7693,7 @@ mod sop_step_reassembly_tests {
         )
         .await;
         assert!(stored.success, "{stored:?}");
-        let step_shared = zeroclaw_memory::create_memory_for_agent(&config, "stepper", None)
+        let step_shared = zeroclaw_memory::create_memory_for_agent(&config, "stepper")
             .await
             .unwrap();
         assert_eq!(
@@ -9327,7 +9332,7 @@ mod sop_step_reassembly_tests {
             serde_json::json!({"key": "d-marker", "content": "D-MARKER"}),
         )
         .await;
-        let step_shared = zeroclaw_memory::create_memory_for_agent(&config, "stepper", None)
+        let step_shared = zeroclaw_memory::create_memory_for_agent(&config, "stepper")
             .await
             .unwrap();
         assert!(
@@ -9710,7 +9715,7 @@ mod sop_step_reassembly_tests {
             serde_json::json!({"key": "f-marker", "content": "F-MARKER"}),
         )
         .await;
-        let step_shared = zeroclaw_memory::create_memory_for_agent(&config, "stepper", None)
+        let step_shared = zeroclaw_memory::create_memory_for_agent(&config, "stepper")
             .await
             .unwrap();
         assert!(

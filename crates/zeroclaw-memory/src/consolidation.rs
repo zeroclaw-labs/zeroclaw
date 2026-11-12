@@ -10,10 +10,11 @@ use crate::policy_gate;
 use crate::traits::{
     Memory, MemoryCategory, MemoryEntry, MemoryKind, SemanticSubtype, StoreOptions,
 };
-use zeroclaw_api::model_provider::{CallSampling, ModelProvider, strip_think_tags};
+use zeroclaw_api::model_provider::{CallSampling, ModelProvider};
 use zeroclaw_config::schema::MemoryConfig;
 use zeroclaw_providers::ProviderDispatch;
 use zeroclaw_providers::multimodal::strip_media_markers;
+use zeroclaw_providers::response::strip_think_tags;
 
 /// Output of consolidation extraction.
 #[derive(Debug, serde::Deserialize)]

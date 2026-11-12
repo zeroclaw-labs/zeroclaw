@@ -15,10 +15,7 @@ use crate::observability::ObserverEvent;
 use std::time::Instant;
 use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_providers::{ChatMessage, ChatResponse, ToolCall};
-use zeroclaw_tool_call_parser::{
-    ParsedToolCall, build_native_assistant_history_from_parsed_calls,
-    looks_like_tool_protocol_example, strip_think_tags, strip_trailing_terminal_markers,
-};
+use zeroclaw_tool_call_parser::{ParsedToolCall, build_native_assistant_history_from_parsed_calls};
 
 /// Build assistant history entry in JSON format for native tool-call APIs.
 /// `convert_messages` in the OpenRouter model_provider parses this JSON to reconstruct
@@ -200,53 +197,17 @@ pub(crate) async fn interpret_chat_response(
 ) -> InterpretedResponse {
     let resp_input_tokens = resp.usage.as_ref().and_then(|u| u.input_tokens);
 
-    let response_text = if ctx.extract_text_reasoning {
-        strip_think_tags(resp.text_or_empty())
-    } else {
-        resp.text_or_empty().to_string()
-    };
-    // Strip trailing terminal markers (`<eom>`, `<|eom|>`) from non-streaming responses.
-    // Handles stacked markers with arbitrary whitespace between them.
-    let response_text = strip_trailing_terminal_markers(&response_text);
-    // First try native structured tool calls (OpenAI-format).
-    // Fall back to text-based parsing (XML tags, markdown blocks,
-    // GLM format) only if the model_provider returned no native calls —
-    // this ensures we support both native and prompt-guided models.
-    let mut calls: Vec<ParsedToolCall> = if specs.tool_specs.is_empty() {
-        Vec::new()
-    } else {
-        resp.tool_calls
-            .iter()
-            .map(|call| ParsedToolCall {
-                name: call.name.clone(),
-                arguments: serde_json::from_str::<serde_json::Value>(&call.arguments)
-                    .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
-                tool_call_id: Some(call.id.clone()),
-            })
-            .collect()
-    };
-    let mut parsed_text = String::new();
-
-    if calls.is_empty()
-        && !specs.tool_specs.is_empty()
-        && !ctx.text_tool_calls_disabled
-        && !looks_like_tool_protocol_example(&response_text)
-    {
-        let (fallback_text, fallback_calls) =
-            zeroclaw_tool_call_parser::parse_tool_calls_from_text(&response_text);
-        let filtered_calls: Vec<ParsedToolCall> = fallback_calls
-            .into_iter()
-            .filter(|call| {
-                specs
-                    .known_tool_names
-                    .contains(&call.name.to_ascii_lowercase())
-            })
-            .collect();
-        if !fallback_text.is_empty() && !filtered_calls.is_empty() {
-            parsed_text = fallback_text;
-        }
-        calls = filtered_calls;
-    }
+    let interpreted = zeroclaw_providers::response::interpret_response(
+        &resp,
+        zeroclaw_api::TextExtraction {
+            reasoning: ctx.extract_text_reasoning,
+            tool_calls: !ctx.text_tool_calls_disabled,
+        },
+        &specs.known_tool_names,
+    );
+    let response_text = interpreted.text;
+    let parsed_text = interpreted.parsed_text;
+    let mut calls = interpreted.calls;
 
     for call in &mut calls {
         if let Some(spec) = specs.tool_specs.iter().find(|spec| spec.name == call.name) {

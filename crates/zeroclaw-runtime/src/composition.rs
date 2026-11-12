@@ -78,6 +78,17 @@ pub struct BoundCapabilities {
     pub principal: Option<PrincipalId>,
 }
 
+/// How a runtime entry point selected the model it is asking a source to
+/// build. Keeping this as one closed value avoids two booleans whose valid
+/// combinations are implicit and makes switch/route semantics visible at the
+/// call site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ModelBuildIntent {
+    AgentDefault,
+    Explicit,
+    Switch,
+}
+
 impl BoundCapabilities {
     /// Resolve metadata and ask this binding's provider source on a blocking-safe worker.
     /// A supplied source refusal is final; it never falls back to concrete factories.
@@ -87,8 +98,7 @@ impl BoundCapabilities {
         agent_alias: &str,
         provider_ref: &str,
         model: Option<&str>,
-        switched: bool,
-        explicit_provider_ref: bool,
+        intent: ModelBuildIntent,
     ) -> anyhow::Result<zeroclaw_providers::model::BuiltModel> {
         let bound = self.clone();
         let agent_alias = agent_alias.to_owned();
@@ -108,8 +118,7 @@ impl BoundCapabilities {
                 // route (including canonical keys containing dots). Ordinary
                 // agent admission keeps the historical `None` contract so a
                 // source can resolve its own configured default.
-                provider_ref: if explicit_provider_ref
-                    || switched
+                provider_ref: if !matches!(intent, ModelBuildIntent::AgentDefault)
                     || !config.agent(&agent_alias).is_some_and(|agent| {
                         agent.model_provider == provider_ref
                     })
@@ -121,7 +130,7 @@ impl BoundCapabilities {
                 model: Some(&identity.model_id),
                 principal: bound.principal.as_ref(),
             };
-            let provider: Box<dyn ModelProvider> = if switched {
+            let provider: Box<dyn ModelProvider> = if matches!(intent, ModelBuildIntent::Switch) {
                 Box::new(bound.capabilities.providers.switched_model_provider(&request)?)
             } else {
                 bound.capabilities.model_provider(&request)?
@@ -410,6 +419,26 @@ pub struct NativeRecipeInputs<'a> {
     pub acp_sessions: Option<crate::tools::AcpSessionReadView>,
     /// Canonical admitted model generation, when the caller follows live model updates.
     pub model_config: Option<zeroclaw_tools::llm_task::ModelConfigResolver>,
+}
+
+impl<'a> NativeRecipeInputs<'a> {
+    /// Start with the required caller-owned resources. Optional integrations
+    /// default to absent and callers set only the ones their entry point owns.
+    pub fn new(request: &'a ToolRequest<'a>, workspace_dir: &'a std::path::Path) -> Self {
+        Self {
+            request,
+            workspace_dir,
+            canvas_store: None,
+            is_subagent_caller: false,
+            forwarded_environment: None,
+            sop_engine: None,
+            sop_audit: None,
+            live_config: None,
+            execution_capability: None,
+            acp_sessions: None,
+            model_config: None,
+        }
+    }
 }
 
 /// A native compatibility recipe: builds the native registry for one eager

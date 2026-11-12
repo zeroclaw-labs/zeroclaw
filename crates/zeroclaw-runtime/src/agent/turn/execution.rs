@@ -149,19 +149,21 @@ impl ResolvedModelAccess<'_> {
             .map(|route| (route.provider_ref().to_string(), route.model().to_string()))
             .unwrap_or_else(|| (self.provider_name.to_string(), self.model.to_string()));
         match result {
-            Ok(response) => {
+            Ok(mut response) => {
                 // A terminal response without final text or tools was billed
                 // but cannot be accepted. Keep it out of context-window fill
                 // and successful response telemetry before returning its typed
                 // cause to every one-shot caller.
-                if response.is_semantically_empty_terminal_with(
-                    zeroclaw_api::text_extraction_reasoning_for(
+                zeroclaw_providers::response::normalize_response(
+                    &mut response,
+                    zeroclaw_api::text_extraction_for(
                         accepted_route
                             .as_ref()
                             .and_then(|route| route.selection_ref())
                             .unwrap_or(&served_provider),
                     ),
-                ) {
+                );
+                if response.is_semantically_empty_terminal() {
                     crate::agent::cost::settle_provider_attempts(attempts, None);
                     extend_rejected_summaries(settled_out, attempts);
                     return Err(anyhow::Error::new(SemanticEmptyTerminalCompletion));
@@ -837,7 +839,7 @@ options = {{ extract_text_reasoning = false }}
         };
         let response = zeroclaw_api::scope_text_extraction(
             Some(Arc::new(move |reference| {
-                config.model_text_extraction(reference).reasoning
+                config.model_text_extraction(reference)
             })),
             access.run_model_query(ChatRequest::new(&messages), &mut Vec::new()),
         )
@@ -870,7 +872,12 @@ options = {{ extract_text_reasoning = false }}
                     // Opt this injected fixture into reasoning extraction;
                     // unconfigured calls preserve text syntax by default.
                     zeroclaw_api::scope_text_extraction(
-                        Some(std::sync::Arc::new(|_: &str| true)),
+                        Some(std::sync::Arc::new(|_: &str| {
+                            zeroclaw_api::TextExtraction {
+                                reasoning: true,
+                                tool_calls: false,
+                            }
+                        })),
                         direct_access(&provider).run_model_query(
                             ChatRequest {
                                 messages: &messages,

@@ -134,7 +134,7 @@ fn make_memory() -> Arc<dyn Memory> {
         backend: "none".into(),
         ..MemoryConfig::default()
     };
-    Arc::from(memory::create_memory(&cfg, std::path::Path::new("/tmp"), None).unwrap())
+    Arc::from(memory::create_memory(&cfg, std::path::Path::new("/tmp")).unwrap())
 }
 
 fn make_sqlite_memory(dir: &std::path::Path) -> Arc<dyn Memory> {
@@ -142,7 +142,7 @@ fn make_sqlite_memory(dir: &std::path::Path) -> Arc<dyn Memory> {
         backend: "sqlite".into(),
         ..MemoryConfig::default()
     };
-    Arc::from(memory::create_memory(&cfg, dir, None).unwrap())
+    Arc::from(memory::create_memory(&cfg, dir).unwrap())
 }
 
 fn make_observer() -> Arc<dyn Observer> {

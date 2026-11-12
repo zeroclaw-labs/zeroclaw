@@ -3081,9 +3081,8 @@ mod tests {
             backend: "none".into(),
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
-        let mem = Arc::from(
-            zeroclaw_memory::create_memory(&mem_cfg, &std::env::temp_dir(), None).unwrap(),
-        );
+        let mem =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, &std::env::temp_dir()).unwrap());
 
         Agent::builder()
             .model_provider(Box::new(StubProvider))

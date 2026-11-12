@@ -3203,19 +3203,6 @@ fn report_agent_not_created(
     ))
 }
 
-#[cfg(feature = "agent-runtime")]
-fn model_path_selection(config: &Config, path: &str) -> Option<(String, String)> {
-    let reference = path
-        .strip_prefix("providers.models.")?
-        .strip_suffix(".model")?;
-    let registry = config.provider_registry().ok()?;
-    let selected = registry.resolve_chat(&reference.into()).ok()?;
-    Some((
-        reference.to_owned(),
-        selected.selection.connection.kind().to_owned(),
-    ))
-}
-
 #[cfg(any(feature = "agent-runtime", test))]
 fn map_key_for_prop_path<'a>(section_path: &str, prop_path: &'a str) -> Option<&'a str> {
     let tail = prop_path.strip_prefix(section_path)?.strip_prefix('.')?;
@@ -3262,6 +3249,17 @@ fn init_map_alias(config: &mut Config, section_arg: &str) -> Result<Option<Strin
     else {
         return Ok(None);
     };
+    if config.loaded_from.is_some()
+        && zeroclaw_config::schema::reject_retired_provider_edit_path(
+            config,
+            &format!("{section_path}.{alias}"),
+        )
+        .is_err()
+    {
+        anyhow::bail!(
+            "retired provider profile path `{section_path}.{alias}`; edit the canonical provider registry instead"
+        );
+    }
     match zeroclaw_config::alias_refs::create_map_key_checked(config, section_path, alias) {
         Ok(true) => Ok(Some(format!("{section_path}.{alias}"))),
         Ok(false) => Ok(None),
@@ -3294,6 +3292,18 @@ fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<
     let Some((section_path, key)) = alias_target_for_path(prop_path, map_key_for_prop_path) else {
         return Ok(false);
     };
+
+    if config.loaded_from.is_some()
+        && zeroclaw_config::schema::reject_retired_provider_edit_path(
+            config,
+            &format!("{section_path}.{key}"),
+        )
+        .is_err()
+    {
+        anyhow::bail!(
+            "retired provider profile path `{section_path}.{key}`; edit the canonical provider registry instead"
+        );
+    }
 
     // The alias already exists in the loaded config (e.g. a hyphenated cron
     // alias the TOML loader accepts and `config get`/`config list` resolve):
@@ -10814,9 +10824,8 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 // (or empty) by default, so SOP runtime behavior is off until an
                 // operator opts in by setting a directory.
                 let (sop_engine, sop_audit) = if current_config.sop.runtime_enabled() {
-                    let mem: Arc<dyn zeroclaw_memory::Memory> = Arc::from(
-                        zeroclaw_memory::create_memory_from_config(&current_config, None)?,
-                    );
+                    let mem: Arc<dyn zeroclaw_memory::Memory> =
+                        Arc::from(zeroclaw_memory::create_memory_from_config(&current_config)?);
                     let sop_adapters = build_sop_adapters(&current_config, authority.live_handle());
                     let (engine, audit) =
                         zeroclaw_runtime::sop::build_sop_engine_with_provider_registry(
@@ -12351,7 +12360,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                 }
             }
             println!(
-                "\n  Set kind and uri under [providers.connections.<key>], then bind a capability model under [providers.models.<key>]." // i18n-exempt: literal config syntax example
+                "\n  Set kind and uri under [providers.connections.<key>], then bind a capability model under [providers.models.\"<model-ref>\"]." // i18n-exempt: literal config syntax example
             );
             Ok(())
         }
@@ -12423,7 +12432,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                 });
                 let (sop_engine, sop_audit) = if config.sop.runtime_enabled() {
                     let mem: Arc<dyn zeroclaw_memory::Memory> =
-                        Arc::from(zeroclaw_memory::create_memory_from_config(&config, None)?);
+                        Arc::from(zeroclaw_memory::create_memory_from_config(&config)?);
                     let sop_adapters = build_sop_adapters(&config, authority.live_handle());
                     let (engine, audit) =
                         zeroclaw_runtime::sop::build_sop_engine_with_provider_registry(
@@ -12865,7 +12874,14 @@ Add pricing to the active provider profile or supply a catalog entry."
                 }
             }
             ConfigCommands::List { filter, secrets } => {
-                let entries = config.prop_fields();
+                let retired = zeroclaw_config::field_visibility::excluded_paths(&config, "");
+                let entries: Vec<_> = config
+                    .prop_fields()
+                    .into_iter()
+                    .filter(|entry| {
+                        !zeroclaw_config::field_visibility::is_excluded(&entry.name, &retired)
+                    })
+                    .collect();
                 println!(
                     "{}",
                     t(
@@ -13035,56 +13051,6 @@ Add pricing to the active provider profile or supply a catalog entry."
                     dialoguer::Input::<String>::new()
                         .with_prompt(format!("Enter value for {path}"))
                         .interact_text()?
-                } else if let Some((provider_ref, provider_type)) =
-                    model_path_selection(&config, &path)
-                {
-                    use dialoguer::{FuzzySelect, Input};
-                    let catalog_selector = provider_ref.as_str();
-                    let catalog = zeroclaw_runtime::quickstart::model_catalog_with_config_result(
-                        Some(&config),
-                        catalog_selector,
-                    )
-                    .await;
-                    let (models, _pricing, live) = match catalog {
-                        Ok(catalog) => catalog,
-                        Err(error) => {
-                            let error = error.to_string();
-                            eprintln!(
-                                "{}",
-                                ta(
-                                    "cli-config-catalog-unavailable-manual",
-                                    &[("provider", catalog_selector), ("error", &error)],
-                                    format!(
-                                        "  ⚠ Catalog for {catalog_selector} is unavailable ({error}); enter the model ID manually."
-                                    ),
-                                )
-                            );
-                            (Vec::new(), None, false)
-                        }
-                    };
-                    if live && !models.is_empty() {
-                        let current = config.get_prop(&path).unwrap_or_default();
-                        let default = models.iter().position(|m| m == &current).unwrap_or(0);
-                        let Some(idx) = FuzzySelect::new()
-                            .with_prompt(format!("Model id for {provider_type}"))
-                            .items(&models)
-                            .default(default)
-                            .max_length(models.len().max(1))
-                            .interact_opt()?
-                        else {
-                            anyhow::bail!("cancelled");
-                        };
-                        models[idx].clone()
-                    } else {
-                        eprintln!(
-                            "  no live catalog for `{provider_type}` — \
-                             enter the model id manually."
-                        );
-                        Input::<String>::new()
-                            .with_prompt(format!("Model id for {provider_type}"))
-                            .allow_empty(false)
-                            .interact_text()?
-                    }
                 } else {
                     let field_info = config.prop_fields().into_iter().find(|f| f.name == path);
                     let variants = field_info.as_ref().and_then(|info| {
@@ -21384,7 +21350,7 @@ mod tests {
             ..MemoryConfig::default()
         };
         let memory: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
         let audit = Arc::new(zeroclaw_runtime::sop::SopAuditLogger::new(memory));
         let cache = zeroclaw_runtime::sop::dispatch::SopCronCache::from_engine(&engine);
 

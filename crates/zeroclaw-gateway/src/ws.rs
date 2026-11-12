@@ -440,8 +440,7 @@ async fn resolve_ws_memory_handle(
         return Ok(None);
     }
 
-    let api_key = config.agent_model_api_key(agent_alias);
-    zeroclaw_memory::create_memory_for_agent(config, agent_alias, api_key.as_deref())
+    zeroclaw_memory::create_memory_for_agent(config, agent_alias)
         .await
         .map(Some)
 }

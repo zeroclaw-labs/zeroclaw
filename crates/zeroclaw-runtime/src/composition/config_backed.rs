@@ -97,20 +97,14 @@ impl ProviderSource for ConfigProviders {
     }
 }
 
-/// Opens the agent's memory with the agent provider's credential, which
-/// embedding resolution inherits when `[memory]` names none of its own.
+/// Opens the agent's memory. Embedding resolves its own connection credentials
+/// independently of the agent's chat model.
 pub struct ConfigMemory;
 
 #[async_trait]
 impl MemorySource for ConfigMemory {
     async fn memory(&self, request: &MemoryRequest<'_>) -> anyhow::Result<Arc<dyn Memory>> {
-        let api_key = request.config.agent_model_api_key(request.agent_alias);
-        zeroclaw_memory::create_memory_for_agent(
-            request.config,
-            request.agent_alias,
-            api_key.as_deref(),
-        )
-        .await
+        zeroclaw_memory::create_memory_for_agent(request.config, request.agent_alias).await
     }
 }
 
@@ -136,59 +130,12 @@ impl ToolSource for NoSuppliedTools {
 pub fn native_compat_registry(
     inputs: super::NativeRecipeInputs<'_>,
 ) -> anyhow::Result<crate::tools::AllToolsResult> {
-    let super::NativeRecipeInputs {
-        request,
-        workspace_dir,
-        canvas_store,
-        is_subagent_caller,
-        forwarded_environment: tui_env,
-        sop_engine,
-        sop_audit,
-        live_config,
-        execution_capability,
-        acp_sessions,
-        model_config,
-    } = inputs;
-    let config = request.config.as_ref();
-    let risk_profile = config
-        .risk_profile_for_agent(request.agent_alias)
+    let risk_profile = inputs
+        .request
+        .config
+        .risk_profile_for_agent(inputs.request.agent_alias)
         .ok_or_else(|| anyhow::Error::msg("native registry risk profile is not configured"))?;
-    let composio_key = config
-        .composio
-        .enabled
-        .then_some(config.composio.api_key.as_deref())
-        .flatten();
-    let composio_entity = config
-        .composio
-        .enabled
-        .then_some(config.composio.entity_id.as_str());
-    let fallback_key = config.agent_model_api_key(request.agent_alias);
-    crate::tools::all_tools_with_runtime_context(
-        Arc::clone(request.config),
-        request.security,
-        risk_profile,
-        request.agent_alias,
-        Arc::clone(request.runtime),
-        Arc::clone(request.memory),
-        composio_key,
-        composio_entity,
-        &config.browser,
-        &config.http_request,
-        &config.web_fetch,
-        workspace_dir,
-        &config.agents,
-        fallback_key.as_deref(),
-        config,
-        canvas_store,
-        is_subagent_caller,
-        tui_env,
-        sop_engine,
-        sop_audit,
-        live_config,
-        execution_capability,
-        acp_sessions,
-        model_config,
-    )
+    crate::tools::build_native_registry(inputs, risk_profile)
 }
 
 /// The config-backed channel source. Despite its name it serves one channel:

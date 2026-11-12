@@ -1063,7 +1063,7 @@ pub async fn run_with_authority(
         {
             None
         } else {
-            match zeroclaw_memory::create_memory_from_config(&config, None) {
+            match zeroclaw_memory::create_memory_from_config(&config) {
                 Ok(mem) => Some(std::sync::Arc::from(mem)),
                 Err(_e) => {
                     ::zeroclaw_log::record!(
@@ -2694,15 +2694,10 @@ async fn run_heartbeat_worker(
             None
         };
 
-        let heartbeat_api_key = config.agent_model_api_key(&agent_alias);
         let heartbeat_memory: Option<Arc<dyn zeroclaw_memory::Memory>> =
-            zeroclaw_memory::create_memory_for_agent(
-                &config,
-                &agent_alias,
-                heartbeat_api_key.as_deref(),
-            )
-            .await
-            .ok();
+            zeroclaw_memory::create_memory_for_agent(&config, &agent_alias)
+                .await
+                .ok();
 
         let mut tick_had_error = false;
         for task in &tasks_to_run {

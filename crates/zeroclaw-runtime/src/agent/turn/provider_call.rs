@@ -53,6 +53,19 @@ struct ProviderCallInput<'a> {
     guard_tools: Option<&'a [ToolSpec]>,
 }
 
+fn normalize_recovery(result: Result<ChatResponse>, ctx: &TurnCtx<'_>) -> Result<ChatResponse> {
+    result.map(|mut response| {
+        zeroclaw_providers::response::normalize_response(
+            &mut response,
+            zeroclaw_api::TextExtraction {
+                reasoning: ctx.extract_text_reasoning,
+                tool_calls: !ctx.text_tool_calls_disabled,
+            },
+        );
+        response
+    })
+}
+
 fn is_image_recovery_candidate_error(error: &anyhow::Error) -> bool {
     !zeroclaw_providers::reliable::is_context_window_exceeded(error)
         && error.chain().any(|cause| {
@@ -333,11 +346,14 @@ pub(crate) async fn call_provider(
     let resolver = match config {
         Some(config) => {
             let config = std::sync::Arc::new(config.clone());
-            std::sync::Arc::new(move |model: &str| config.model_text_extraction(model).reasoning)
-                as std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>
+            std::sync::Arc::new(move |model: &str| config.model_text_extraction(model))
+                as std::sync::Arc<dyn Fn(&str) -> zeroclaw_api::TextExtraction + Send + Sync>
         }
-        None => std::sync::Arc::new(|_: &str| false)
-            as std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>,
+        None => std::sync::Arc::new(|_: &str| zeroclaw_api::TextExtraction {
+            reasoning: true,
+            tool_calls: false,
+        })
+            as std::sync::Arc<dyn Fn(&str) -> zeroclaw_api::TextExtraction + Send + Sync>,
     };
     zeroclaw_api::scope_text_extraction(
         Some(resolver),
@@ -618,11 +634,10 @@ async fn call_provider_inner(
                                     recovery.await
                                 };
                                 let result = if recover_images {
+                                    let recovery_result = normalize_recovery(recovery_result, ctx);
                                     match recovery_result {
                                         Ok(response)
-                                            if !response.is_semantically_empty_terminal_with(
-                                                ctx.extract_text_reasoning,
-                                            ) =>
+                                            if !response.is_semantically_empty_terminal() =>
                                         {
                                             Ok(response)
                                         }
@@ -700,12 +715,8 @@ async fn call_provider_inner(
                             )),
                         )
                         .await;
-                        match recovery {
-                            Ok(response)
-                                if !response.is_semantically_empty_terminal_with(
-                                    ctx.extract_text_reasoning,
-                                ) =>
-                            {
+                        match normalize_recovery(recovery, ctx) {
+                            Ok(response) if !response.is_semantically_empty_terminal() => {
                                 image_recovery_succeeded = true;
                                 Ok(response)
                             }
