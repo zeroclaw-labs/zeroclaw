@@ -2931,23 +2931,24 @@ mod tests {
             sequential.1
         );
 
+        let admitted_config = zeroclaw_config::migration::admit_test_input(&config);
         let (concurrent_a, concurrent_b, concurrent_c) = tokio::join!(
             run_agent_job(
-                &zeroclaw_config::migration::admit_test_input(&config),
+                &admitted_config,
                 &security,
                 TEST_AGENT,
                 &job,
                 admission.clone()
             ),
             run_agent_job(
-                &zeroclaw_config::migration::admit_test_input(&config),
+                &admitted_config,
                 &security,
                 TEST_AGENT,
                 &job,
                 admission.clone()
             ),
             run_agent_job(
-                &zeroclaw_config::migration::admit_test_input(&config),
+                &admitted_config,
                 &security,
                 TEST_AGENT,
                 &job,

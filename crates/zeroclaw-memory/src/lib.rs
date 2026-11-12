@@ -1484,8 +1484,10 @@ mod tests {
     fn factory_with_embedder_stamps_and_migrates_identity() {
         let tmp = TempDir::new().unwrap();
         let config_for = |model: &str| {
-            let mut config = Config::default();
-            config.data_dir = tmp.path().to_path_buf();
+            let mut config = Config {
+                data_dir: tmp.path().to_path_buf(),
+                ..Config::default()
+            };
             config.memory.backend = "sqlite".into();
             config.memory.embedding_model_ref = Some("embedding.openai".into());
             config.memory.embedding_dimensions = 4;

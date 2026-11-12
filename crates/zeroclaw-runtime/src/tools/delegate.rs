@@ -10076,7 +10076,7 @@ mod tests {
         let (parent_tools, origins) = memory_parent_tools(
             Arc::clone(&caller_memory),
             Arc::clone(&caller_security),
-            &zeroclaw_config::migration::admit_test_input(&root_config),
+            &root_config,
         );
 
         let tool = DelegateTool::new(
