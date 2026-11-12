@@ -30,9 +30,21 @@ const fakeWindow = {
   location: { protocol: 'http:', host: 'localhost' },
   dispatchEvent: () => true,
 };
-const fakeDocument = {
-  addEventListener: () => {},
-  removeEventListener: () => {},
+// Document listeners are kept so a test can dispatch a key press to them.
+type DocumentListener = (event: { key?: string; defaultPrevented?: boolean; isComposing?: boolean }) => void;
+const documentListeners = new Map<string, Set<DocumentListener>>();
+function dispatchDocumentEvent(type: string, event: Parameters<DocumentListener>[0]): void {
+  for (const listener of [...(documentListeners.get(type) ?? [])]) listener(event);
+}
+const fakeDocument: { activeElement?: unknown } & Record<string, unknown> = {
+  addEventListener: (type: string, listener: DocumentListener) => {
+    const listeners = documentListeners.get(type) ?? new Set<DocumentListener>();
+    listeners.add(listener);
+    documentListeners.set(type, listeners);
+  },
+  removeEventListener: (type: string, listener: DocumentListener) => {
+    documentListeners.get(type)?.delete(listener);
+  },
   createElement: () => ({
     style: {},
     focus: () => {},
@@ -69,6 +81,17 @@ let configPutCalls: ConfigPutRequest[] = [];
 let missingSessions = new Set<string>();
 let deleteFailures = new Set<string>();
 let configPutHandler: ((request: ConfigPutRequest) => Promise<Response>) | null = null;
+// Config entries the mocked `/api/config/list` returns; the model picker
+// derives its choices from `providers.models.<family>.<alias>.model` paths.
+let configListEntries: Array<{ path: string }> = [];
+// The element whose node mock last received `focus()`. Read it through
+// `focusedNode()` so TypeScript doesn't narrow it after a reset.
+let lastFocused: { type: unknown; props: Record<string, unknown> } | null = null;
+const focusedNode = () => lastFocused;
+// Nodes a test treats as inside a mounted element: every node mock's
+// `contains()` answers from this set, so it shows a containment check ran,
+// not which element it ran on.
+const containedNodes = new Set<unknown>();
 
 // Every request URL, for tests that check what was (not) asked of the gateway.
 const requestedUrls: string[] = [];
@@ -89,7 +112,7 @@ globalThis.fetch = async (input, init) => {
     if (configPutHandler) return configPutHandler(request);
     body = { path: request.path, value: request.value };
   } else if (url.includes('/api/config/prop')) body = { path: '', value: '<unset>' };
-  else if (url.includes('/api/config/list')) body = { entries: [] };
+  else if (url.includes('/api/config/list')) body = { entries: configListEntries };
   else if (url.endsWith('/api/sessions')) {
     // `sessionsResponder` lets a test control when each listing resolves, so
     // out-of-order list responses can be reproduced deterministically.
@@ -301,7 +324,11 @@ async function mountChat(
       {
         createNodeMock: (element) => element.type === 'textarea'
           ? { style: {}, focus: () => {}, scrollHeight: 24 }
-          : { focus: () => {}, scrollIntoView: () => {}, contains: () => false },
+          : {
+            focus: () => { lastFocused = element as typeof lastFocused; },
+            scrollIntoView: () => {},
+            contains: (node: unknown) => containedNodes.has(node),
+          },
       },
     );
     await Promise.resolve();
@@ -365,6 +392,11 @@ beforeEach(() => {
   missingSessions = new Set();
   deleteFailures = new Set();
   configPutHandler = null;
+  configListEntries = [];
+  lastFocused = null;
+  documentListeners.clear();
+  delete fakeDocument.activeElement;
+  containedNodes.clear();
   sessionsResponder = null;
   storage.setItem('zeroclaw_active_session.ops', 'A');
   listedSessions = [
@@ -2084,3 +2116,114 @@ for (const { keepCollapsed, label, whileThinking, afterChunk } of thinkingBoxCas
     await unmount(mounted.renderer);
   });
 }
+
+// The model button is the header button with `aria-expanded` and no title
+// (the conversation picker's trigger has one).
+function isModelButton(props: Record<string, unknown>): boolean {
+  return 'aria-expanded' in props && props.title === undefined;
+}
+
+function modelButtonIn(renderer: ReactTestRenderer): ReactTestInstance | undefined {
+  return renderer.root.findAllByType('button').find((button) => isModelButton(button.props));
+}
+
+test('Escape closes the model menu and returns focus to its button', async () => {
+  configListEntries = [
+    { path: 'providers.models.openai.fast.model' },
+    { path: 'providers.models.openai.smart.model' },
+  ];
+  const runtime = new FakeSessionRuntime();
+  const mounted = await mountChat(runtime, true);
+  await openSocket(runtime, 0);
+  await settle();
+
+  const modelButton = () => modelButtonIn(mounted.renderer);
+  assert.ok(modelButton());
+  assert.equal(modelButton()!.props['aria-expanded'], false);
+
+  await act(async () => { modelButton()!.props.onClick(); });
+  assert.equal(modelButton()!.props['aria-expanded'], true);
+  const menuId = modelButton()!.props['aria-controls'];
+  assert.equal(typeof menuId, 'string');
+  const menus = () => mounted.renderer.root.findAllByProps({ id: menuId });
+  assert.equal(menus().length, 1);
+
+  // Another key, an Escape another handler already took, or one that ends an
+  // IME composition leaves the menu open.
+  for (const event of [
+    { key: 'Tab' },
+    { key: 'Escape', defaultPrevented: true },
+    { key: 'Escape', isComposing: true },
+  ]) {
+    await act(async () => { dispatchDocumentEvent('keydown', event); });
+    assert.equal(menus().length, 1);
+  }
+
+  lastFocused = null;
+  await act(async () => { dispatchDocumentEvent('keydown', { key: 'Escape' }); });
+  assert.equal(menus().length, 0);
+  assert.equal(modelButton()!.props['aria-expanded'], false);
+  assert.equal(modelButton()!.props['aria-controls'], undefined);
+  // Focus was nowhere, so it went back to the model button.
+  assert.equal(focusedNode()?.type, 'button');
+  assert.ok(isModelButton(focusedNode()?.props ?? {}));
+
+  // With focus elsewhere (the composer, say), Escape still closes the menu
+  // but leaves focus where it is.
+  await act(async () => { modelButton()!.props.onClick(); });
+  assert.equal(modelButton()!.props['aria-expanded'], true);
+  fakeDocument.activeElement = { type: 'textarea' };
+  lastFocused = null;
+  await act(async () => { dispatchDocumentEvent('keydown', { key: 'Escape' }); });
+  assert.equal(modelButton()!.props['aria-expanded'], false);
+  assert.ok(focusedNode() === null, 'Escape moved focus away from the composer');
+
+  // With focus on a menu item, Escape returns it to the model button.
+  await act(async () => { modelButton()!.props.onClick(); });
+  const menuItem = { type: 'button' };
+  containedNodes.add(menuItem);
+  fakeDocument.activeElement = menuItem;
+  lastFocused = null;
+  await act(async () => { dispatchDocumentEvent('keydown', { key: 'Escape' }); });
+  assert.equal(modelButton()!.props['aria-expanded'], false);
+  assert.ok(isModelButton(focusedNode()?.props ?? {}), 'focus did not return to the model button');
+  await unmount(mounted.renderer);
+});
+
+test('Escape in the composer closes the command hint, not the model menu', async () => {
+  configListEntries = [
+    { path: 'providers.models.openai.fast.model' },
+    { path: 'providers.models.openai.smart.model' },
+  ];
+  const runtime = new FakeSessionRuntime();
+  const mounted = await mountChat(runtime, true);
+  await openSocket(runtime, 0);
+  await settle();
+
+  const modelButton = () => modelButtonIn(mounted.renderer);
+  await act(async () => { modelButton()!.props.onClick(); });
+  assert.equal(modelButton()!.props['aria-expanded'], true);
+
+  // The command hint's rows are the buttons that apply a command on mousedown.
+  const hintRows = () => mounted.renderer.root.findAll((node) =>
+    node.type === 'button' && typeof node.props.onMouseDown === 'function');
+  await typeInComposer(mounted.renderer, '/');
+  assert.ok(hintRows().length > 0, 'the command hint did not open');
+
+  // The browser runs the textarea's React handler first, then document
+  // listeners with whatever it did to the event.
+  let prevented = false;
+  await act(async () => {
+    textarea(mounted.renderer).props.onKeyDown({
+      key: 'Escape',
+      shiftKey: false,
+      nativeEvent: { isComposing: false },
+      preventDefault: () => { prevented = true; },
+    });
+    dispatchDocumentEvent('keydown', { key: 'Escape', defaultPrevented: prevented });
+  });
+  assert.equal(prevented, true);
+  assert.equal(hintRows().length, 0);
+  assert.equal(modelButton()!.props['aria-expanded'], true);
+  await unmount(mounted.renderer);
+});
