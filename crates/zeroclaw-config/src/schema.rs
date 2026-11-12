@@ -17213,6 +17213,13 @@ pub struct TelegramConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub mention_only: bool,
+    /// When true in a `mention_only` group, voice notes from allowlisted users
+    /// are transcribed without requiring an explicit `@mention`: voice notes
+    /// carry no caption, so the mention gate would otherwise silence them
+    /// entirely. The sender allowlist still applies. Default: `false`.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub voice_without_mention: bool,
     /// Notice sent to a sender this channel has not authorized. `{identity}`
     /// expands to the sender's Telegram user ID (or username when no ID is
     /// available) and `{bind_command}` to the `zeroclaw channel bind-telegram`
@@ -17305,6 +17312,7 @@ impl Default for TelegramConfig {
             multi_message_delay_ms: default_multi_message_delay_ms(),
             interrupt_on_new_message: false,
             mention_only: false,
+            voice_without_mention: false,
             unauthorized_message: None,
             per_user_session: true,
             passive_group_context: false,
@@ -34965,6 +34973,7 @@ auto_save = true
                         debounce_ms: None,
                         interrupt_on_new_message: false,
                         mention_only: false,
+                        voice_without_mention: false,
                         unauthorized_message: None,
                         per_user_session: true,
                         passive_group_context: false,
@@ -37004,6 +37013,7 @@ default_temperature = 0.7
             multi_message_delay_ms: default_multi_message_delay_ms(),
             interrupt_on_new_message: true,
             mention_only: false,
+            voice_without_mention: false,
             unauthorized_message: None,
             per_user_session: true,
             passive_group_context: false,
@@ -43830,6 +43840,7 @@ high_entropy_tokens = false
                 multi_message_delay_ms: default_multi_message_delay_ms(),
                 interrupt_on_new_message: false,
                 mention_only: false,
+                voice_without_mention: false,
                 unauthorized_message: None,
                 per_user_session: true,
                 passive_group_context: false,
