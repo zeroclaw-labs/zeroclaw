@@ -16489,16 +16489,18 @@ options = { extract_text_tool_calls = false }
             })))
             .mount(&server)
             .await;
-        let mut config = Config::default();
-        config.data_dir = workspace.to_path_buf();
-        config.agents = sample_agents();
-        config.providers = serde_json::from_value(json!({
-            "connections": {"fixture": {"kind":"custom", "uri":server.uri()}},
-            "models": {
-                "ollama.researcher": {"capability":"chat", "provider":"fixture", "model":"fixture-model"},
-                "openrouter.coder": {"capability":"chat", "provider":"fixture", "model":"fixture-model"}
-            }
-        })).unwrap();
+        let config = Config {
+            data_dir: workspace.to_path_buf(),
+            agents: sample_agents(),
+            providers: serde_json::from_value(json!({
+                "connections": {"fixture": {"kind":"custom", "uri":server.uri()}},
+                "models": {
+                    "ollama.researcher": {"capability":"chat", "provider":"fixture", "model":"fixture-model"},
+                    "openrouter.coder": {"capability":"chat", "provider":"fixture", "model":"fixture-model"}
+                }
+            })).unwrap(),
+            ..Default::default()
+        };
         let tool = with_in_memory_task_store(
             DelegateTool::new(sample_agents(), None, test_security())
                 .with_workspace_dir(workspace.to_path_buf())

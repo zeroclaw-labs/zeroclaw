@@ -5756,7 +5756,6 @@ permissions = ["http_client"]
             ..BrowserConfig::default()
         };
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
-        let cfg = test_config(&tmp);
 
         let tools = {
             let registry_config = Arc::new(Config::default());
@@ -6250,7 +6249,7 @@ permissions = ["http_client"]
                 fixture.http_request = zeroclaw_config::schema::HttpRequestConfig::default();
                 fixture.web_fetch = zeroclaw_config::schema::WebFetchConfig::default();
                 fixture.agents = HashMap::new();
-                fixture.composio.api_key = (Some("composio-key")).map(str::to_owned);
+                fixture.composio.api_key = Some("composio-key".to_owned());
                 fixture.composio.enabled = fixture.composio.api_key.is_some();
                 std::sync::Arc::new(fixture)
             };
@@ -7193,7 +7192,6 @@ permissions = ["http_client"]
             ..BrowserConfig::default()
         };
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
-        let cfg = test_config(&tmp);
 
         let tools = {
             let registry_config = Arc::new(Config::default());
@@ -7273,7 +7271,6 @@ permissions = ["http_client"]
             ..BrowserConfig::default()
         };
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
-        let cfg = test_config(&tmp);
 
         let tools = {
             let registry_config = Arc::new(Config::default());
@@ -7343,7 +7340,6 @@ permissions = ["http_client"]
             ..BrowserConfig::default()
         };
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
-        let cfg = test_config(&tmp);
 
         let tools = {
             let registry_config = Arc::new(Config::default());
@@ -8642,7 +8638,7 @@ permissions = ["http_client"]
                 fixture.http_request = http.clone();
                 fixture.web_fetch = web_fetch.clone();
                 fixture.agents = delegate_targets.clone();
-                fixture.composio.api_key = (Some("inventory-placeholder")).map(str::to_owned);
+                fixture.composio.api_key = Some("inventory-placeholder".to_owned());
                 fixture.composio.enabled = fixture.composio.api_key.is_some();
                 std::sync::Arc::new(fixture)
             };

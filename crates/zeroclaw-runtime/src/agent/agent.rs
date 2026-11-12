@@ -6629,7 +6629,7 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
                 .turn_datetime(fixed_response_cache_turn_datetime)
                 .provider_switch_config(ProviderSwitchConfig {
                     config: Some(Arc::new(zeroclaw_config::migration::admit_test_input(
-                        &config,
+                        config,
                     ))),
                     live_config: None,
                     live: None,
