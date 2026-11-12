@@ -5143,7 +5143,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 delivery.await;
             }
             #[cfg(not(test))]
-            tokio::spawn(delivery);
+            let _delivery_task = ::zeroclaw_spawn::spawn!(delivery);
         }
     }
 
