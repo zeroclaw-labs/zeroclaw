@@ -39,14 +39,6 @@ impl DecisionProviderConfig {
             wire_api: resolved.wire_api,
         })
     }
-
-    pub fn legacy_system_one(base_url: &str, model: &str, api_key: Option<String>) -> Self {
-        Self {
-            transport: HttpTransportConfig::with_base_url(base_url, api_key),
-            model: model.to_owned(),
-            wire_api: DecisionWireApi::SystemOne,
-        }
-    }
 }
 
 pub fn build_decision_provider(config: DecisionProviderConfig) -> Result<Box<dyn DecisionModel>> {

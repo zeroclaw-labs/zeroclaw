@@ -792,12 +792,8 @@ options.temperature = "null"
         .expect("canonical construction must succeed")
         .provider;
 
-        let legacy = zeroclaw_providers::create_model_provider_with_options(
-            "openrouter",
-            None,
-            &default_opts,
-        )
-        .expect("legacy construction must succeed");
+        let legacy = zeroclaw_providers::create_model_provider("openrouter", None, &default_opts)
+            .expect("legacy construction must succeed");
 
         // Both should agree on capabilities for a normal provider.
         assert_eq!(

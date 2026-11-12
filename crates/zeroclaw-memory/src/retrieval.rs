@@ -1526,12 +1526,7 @@ mod tests {
         assert_eq!(p.cache_size(), 0, "store_procedural must invalidate");
 
         let p = primed_pipeline().await;
-        Memory::refresh_embedder(
-            &p,
-            std::sync::Arc::from(zeroclaw_providers::embedding::create_embedding_provider(
-                "openai", None, "model", 8,
-            )),
-        );
+        Memory::refresh_embedder(&p, crate::test_embedder(8));
         assert_eq!(p.cache_size(), 0, "refresh_embedder must invalidate");
     }
 

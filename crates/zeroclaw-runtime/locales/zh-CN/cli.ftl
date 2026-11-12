@@ -493,6 +493,7 @@ cli-sop-ws-subsystem-disabled = SOP 子系统未启用
 cli-sop-create-hint = {"  "}创建一个: mkdir -p <shared>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}然后添加 SOP.toml 和 SOP.md
 cli-sop-loaded-header = 已加载的 SOP ({$count}):
+cli-sop-decision-model-not-configured = [decision] 模型 '{ $model }' 未在 [providers.models] 中配置为 decision 模型；运行将回退到最严格模式
 cli-sop-none-to-validate = 未找到可验证的 SOP。
 cli-sop-valid = ✅ {$name} — 有效
 cli-sop-deleted = 已删除 SOP：{$name}

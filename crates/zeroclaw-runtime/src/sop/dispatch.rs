@@ -3786,7 +3786,6 @@ mod tests {
         use std::collections::BTreeMap;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use zeroclaw_api::decision::{Answer, Answers, DecisionModel, Question};
-        use zeroclaw_providers::decision::build_decision_provider;
 
         /// Returns a fixed answer set (or an outage) and counts calls.
         struct Scripted {
@@ -4163,14 +4162,22 @@ mod tests {
                 .unwrap_or_else(|_| "https://api.typesafe.ai".into());
             let model_id = std::env::var("SYSTEMONE_MODEL").unwrap_or_else(|_| "jev-latest".into());
             let key = std::env::var("TYPESAFE_API_KEY").ok();
-            let client: Arc<dyn DecisionModel> = Arc::from(
-                build_decision_provider(
-                    zeroclaw_providers::decision::DecisionProviderConfig::legacy_system_one(
-                        &base, &model_id, key,
-                    ),
-                )
-                .unwrap(),
-            );
+            let config = serde_json::from_value(serde_json::json!({
+                "providers": {
+                    "connections": {"live": {
+                        "kind": "system-one", "uri": base,
+                        "auth": {"mode": "api_key", "api_key": key},
+                        "api": {"decision": {"wire_api": "system_one"}}
+                    }},
+                    "models": {"live": {
+                        "capability": "decision", "provider": "live", "model": model_id
+                    }}
+                }
+            }))
+            .unwrap();
+            let client = crate::sop::decision::models_from_config(&config)
+                .remove("live")
+                .unwrap();
 
             let mut refunds = spec();
             refunds.gate = Some(

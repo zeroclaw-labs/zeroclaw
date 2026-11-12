@@ -71,13 +71,6 @@ impl ProviderSource for ConfigProviders {
         .map(|model| Arc::from(model.into_provider()))
     }
 
-    fn switched_model_provider(
-        &self,
-        request: &ProviderRequest<'_>,
-    ) -> anyhow::Result<Arc<dyn ModelProvider>> {
-        self.model_provider(request)
-    }
-
     fn vision_model_provider(
         &self,
         request: &ProviderRequest<'_>,

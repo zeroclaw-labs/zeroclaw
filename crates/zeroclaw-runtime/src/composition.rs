@@ -105,7 +105,7 @@ impl BoundCapabilities {
         let provider_ref = provider_ref.to_owned();
         let model = model.map(str::to_owned);
         zeroclaw_providers::model::build_nonblocking(move || {
-            zeroclaw_providers::ensure_known_model_entry_ref(&config, &provider_ref)?;
+            config.provider_registry()?.resolve_chat(&provider_ref.as_str().into())?;
             let identity = zeroclaw_providers::model::resolve_model_identity(
                 &config, &agent_alias, &provider_ref, model.as_deref(),
             ).ok_or_else(|| anyhow::Error::msg(format!(
@@ -136,7 +136,7 @@ impl BoundCapabilities {
                 bound.capabilities.model_provider(&request)?
             };
             let resolver = zeroclaw_providers::model_route_resolver(
-                &config, &provider_ref, &config.model_routes, &identity.model_id,
+                &config, &provider_ref, &identity.model_id,
             );
             Ok(zeroclaw_providers::model::BuiltModel::from_routed_provider(
                 provider, identity, resolver,

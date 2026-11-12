@@ -3997,10 +3997,12 @@ mod tests {
             .models
             .ensure("bedrock", "static")
             .expect("bedrock fixture profile");
-        let provider = zeroclaw_providers::create_model_provider_from_ref(
+        let provider = zeroclaw_providers::model::build_raw_provider(
             &zeroclaw_config::migration::admit_test_input(&config),
             "bedrock.static",
+            Default::default(),
         )
+        .map(|resolved| resolved.provider)
         .expect("configured Bedrock provider should construct");
         let error = zeroclaw_providers::ProviderDispatch::from_ref(&*provider)
             .list_models_with_pricing()

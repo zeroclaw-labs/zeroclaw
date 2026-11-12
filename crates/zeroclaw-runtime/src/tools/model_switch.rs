@@ -333,7 +333,8 @@ impl ModelSwitchTool {
             .to_owned();
         let reference = provider_ref.to_owned();
         let provider = zeroclaw_providers::model::build_nonblocking(move || {
-            zeroclaw_providers::create_model_provider_from_ref(&config, &reference)
+            zeroclaw_providers::model::build_raw_provider(&config, &reference, Default::default())
+                .map(|resolved| resolved.provider)
         })
         .await?;
         let live_result = zeroclaw_providers::ProviderDispatch::from_ref(&*provider)

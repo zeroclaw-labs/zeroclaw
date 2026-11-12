@@ -575,10 +575,9 @@ pub struct Config {
     #[nested]
     pub risk_profiles: HashMap<String, RiskProfileConfig>,
 
-    /// Named typed-decision models (`[decision_models.<alias>]`): TypeSafe Jev,
-    /// a self-hosted Laya, or any custom System One endpoint. An SOP selects
-    /// one by alias in its `[decision] model` field; an alias that is not
-    /// configured makes that SOP dispatch fail-closed.
+    /// Historical decision input, projected into the canonical provider
+    /// registry during configuration admission. Runtime consumers use only
+    /// `providers.models` entries with capability `decision`.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub decision_models: HashMap<String, SopDecisionModelConfig>,
@@ -27369,6 +27368,7 @@ pub fn reject_retired_provider_edit_path(config: &Config, name: &str) -> Result<
         "providers.models.",
         "providers.tts.",
         "providers.transcription.",
+        "decision_models.",
     ]
     .iter()
     .any(|prefix| name.starts_with(prefix))

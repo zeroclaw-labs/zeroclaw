@@ -750,15 +750,7 @@ mod tests {
             AgentScopedMemory::new(as_dyn(inner.clone()), "agent-1", Vec::<String>::new());
         assert_eq!(inner.embedder_dimensions(), 0);
 
-        Memory::refresh_embedder(
-            &wrapper,
-            std::sync::Arc::from(zeroclaw_providers::embedding::create_embedding_provider(
-                "openai",
-                Some("sk-test"),
-                "text-embedding-3-small",
-                1536,
-            )),
-        );
+        Memory::refresh_embedder(&wrapper, crate::test_embedder(1536));
 
         assert_eq!(
             inner.embedder_dimensions(),

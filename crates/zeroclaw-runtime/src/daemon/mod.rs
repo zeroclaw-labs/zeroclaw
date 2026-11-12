@@ -5320,7 +5320,12 @@ mod tests {
                     .unwrap();
                 let agent = crate::agent::agent::Agent::builder()
                     .model_provider(
-                        zeroclaw_providers::create_model_provider("ollama", None).unwrap(),
+                        zeroclaw_providers::create_model_provider(
+                            "ollama",
+                            None,
+                            &Default::default(),
+                        )
+                        .unwrap(),
                     )
                     .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
                         vec![],

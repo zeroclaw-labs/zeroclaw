@@ -3500,12 +3500,8 @@ impl Agent {
                 if construction == crate::composition::RegistryConstruction::NativeCompat
                     && config.sop.runtime_enabled() =>
             {
-                let (engine, audit) = crate::sop::build_sop_engine_with_provider_registry(
-                    config.sop.clone(),
+                let (engine, audit) = crate::sop::build_sop_engine(
                     config,
-                    &config.decision_models,
-                    &config.data_dir,
-                    &config.install_root_dir(),
                     Arc::clone(&memory),
                     Default::default(),
                     execution_capability.clone(),
@@ -25217,14 +25213,8 @@ mod capability_construction_tests {
                 .contains("actual-memory-identity")
         );
 
-        let (engine, audit) = crate::sop::build_sop_engine(
-            config.sop.clone(),
-            &config.decision_models,
-            &config.data_dir,
-            &config.install_root_dir(),
-            Arc::clone(&actual),
-            Default::default(),
-        );
+        let (engine, audit) =
+            crate::sop::build_sop_engine(&config, Arc::clone(&actual), Default::default(), None);
         let expected_engine = Arc::downgrade(&engine);
         let expected_audit = Arc::downgrade(&audit);
         let source = StatefulRecipe {
@@ -25875,13 +25865,8 @@ mod capability_construction_tests {
             assert_eq!(agent.model_provider_name, "chat.ollama");
             assert_eq!(
                 agent.model_route_resolver.resolve("hint:fast"),
-                zeroclaw_providers::model_route_resolver(
-                    &config,
-                    "chat.ollama",
-                    &config.model_routes,
-                    "tinyllama",
-                )
-                .resolve("hint:fast"),
+                zeroclaw_providers::model_route_resolver(&config, "chat.ollama", "tinyllama",)
+                    .resolve("hint:fast"),
                 "both agents carry the switch recipe's route resolver"
             );
         }

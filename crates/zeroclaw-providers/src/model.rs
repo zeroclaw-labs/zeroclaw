@@ -225,7 +225,7 @@ fn build_provider(
     let reference = selection_ref.trim().into();
     let options = crate::provider_runtime_options_for_bare_family(config);
     if reliable {
-        build_provider_in_registry(config, &registry, &reference, overrides, &options, true)
+        build_provider_in_registry(config, &registry, &reference, overrides, &options)
     } else {
         let provider = crate::factory::dispatch_model_ref_with_registry(
             &registry,
@@ -244,35 +244,12 @@ fn build_provider(
     }
 }
 
-/// Construct a canonical model with the caller's admitted runtime options.
-/// This is kept separate from the legacy family parser so the exact ModelRef
-/// remains intact through provider construction and fallback pinning.
-#[cfg(test)]
-pub(crate) fn build_canonical_provider_with_options(
-    config: &Config,
-    model_ref: &zeroclaw_config::provider_registry::ModelRef,
-    overrides: ProviderOverrides<'_>,
-    options: &crate::ModelProviderRuntimeOptions,
-    pin_primary_model: bool,
-) -> anyhow::Result<crate::ResolvedModelProviderRef> {
-    let registry = config.chat_registry_for_input(None, model_ref.as_str())?;
-    build_provider_in_registry(
-        config,
-        &registry,
-        model_ref,
-        overrides,
-        options,
-        pin_primary_model,
-    )
-}
-
 fn build_provider_in_registry(
     config: &Config,
     registry: &zeroclaw_config::provider_registry::ProviderRegistry,
     model_ref: &zeroclaw_config::provider_registry::ModelRef,
     overrides: ProviderOverrides<'_>,
     options: &crate::ModelProviderRuntimeOptions,
-    pin_primary_model: bool,
 ) -> anyhow::Result<crate::ResolvedModelProviderRef> {
     let mut candidates = Vec::new();
     let mut refs = vec![model_ref.clone()];
@@ -303,23 +280,13 @@ fn build_provider_in_registry(
         } else {
             configured_model
         };
-        let provider: std::sync::Arc<dyn ModelProvider> = provider.into();
-        let candidate = if candidate_ref == *model_ref && !pin_primary_model {
-            crate::reliable::ReliableModelProviderEntry::new_with_candidate(
-                candidate_ref.as_str(),
-                candidate_ref.as_str(),
-                candidate_ref.as_str(),
-                Box::new(provider),
-            )
-        } else {
-            crate::reliable::ReliableModelProviderEntry::new_pinned(
-                candidate_ref.as_str(),
-                candidate_ref.as_str(),
-                candidate_ref.as_str(),
-                &pinned_model,
-                Box::new(provider),
-            )
-        };
+        let candidate = crate::reliable::ReliableModelProviderEntry::new_pinned(
+            candidate_ref.as_str(),
+            candidate_ref.as_str(),
+            candidate_ref.as_str(),
+            &pinned_model,
+            provider,
+        );
         candidates.push(candidate.with_selection_ref(candidate_ref.as_str()));
     }
     let provider = crate::reliable::ReliableModelProvider::new_with_entries(
@@ -440,7 +407,6 @@ pub fn build_model(
             api_key: None,
         },
         &options,
-        true,
     )?
     .provider;
     let mut routes = Vec::new();
@@ -472,7 +438,6 @@ pub fn build_model(
                 &target,
                 ProviderOverrides::default(),
                 &options,
-                true,
             )?
             .provider;
             providers.push((target.to_string(), provider));
@@ -837,21 +802,14 @@ model = "backup-model"
             server.uri()
         ))
         .unwrap();
-        for mode in 0..3 {
+        for mode in 0..2 {
             let overrides = ProviderOverrides {
                 api_key: Some("route-test-key"),
                 model: Some("route-model"),
             };
             let resolved = match mode {
                 0 => build_raw_provider(&config, "chat.primary", overrides),
-                1 => build_reliable_provider(&config, "chat.primary", overrides),
-                _ => build_canonical_provider_with_options(
-                    &config,
-                    &"chat.primary".into(),
-                    overrides,
-                    &crate::provider_runtime_options_for_bare_family(&config),
-                    true,
-                ),
+                _ => build_reliable_provider(&config, "chat.primary", overrides),
             }
             .unwrap();
             let success = ResponseTemplate::new(200).set_body_json(json!({

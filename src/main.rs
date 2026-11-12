@@ -10827,17 +10827,12 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     let mem: Arc<dyn zeroclaw_memory::Memory> =
                         Arc::from(zeroclaw_memory::create_memory_from_config(&current_config)?);
                     let sop_adapters = build_sop_adapters(&current_config, authority.live_handle());
-                    let (engine, audit) =
-                        zeroclaw_runtime::sop::build_sop_engine_with_provider_registry(
-                            current_config.sop.clone(),
-                            &current_config,
-                            &current_config.decision_models,
-                            &current_config.data_dir,
-                            &current_config.install_root_dir(),
-                            mem,
-                            sop_adapters,
-                            Some(authority.execution_capability()),
-                        );
+                    let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
+                        &current_config,
+                        mem,
+                        sop_adapters,
+                        Some(authority.execution_capability()),
+                    );
                     let unsettled = std::mem::take(&mut carried_unsettled_sop_runs);
                     let pending = carried_sop_settlements.take();
                     if !unsettled.is_empty() || pending.is_some() {
@@ -12434,17 +12429,12 @@ Add pricing to the active provider profile or supply a catalog entry."
                     let mem: Arc<dyn zeroclaw_memory::Memory> =
                         Arc::from(zeroclaw_memory::create_memory_from_config(&config)?);
                     let sop_adapters = build_sop_adapters(&config, authority.live_handle());
-                    let (engine, audit) =
-                        zeroclaw_runtime::sop::build_sop_engine_with_provider_registry(
-                            config.sop.clone(),
-                            &config,
-                            &config.decision_models,
-                            &config.data_dir,
-                            &config.install_root_dir(),
-                            mem,
-                            sop_adapters,
-                            Some(authority.execution_capability()),
-                        );
+                    let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
+                        &config,
+                        mem,
+                        sop_adapters,
+                        Some(authority.execution_capability()),
+                    );
                     (Some(engine), Some(audit))
                 } else {
                     (None, None)

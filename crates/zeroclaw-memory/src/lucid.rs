@@ -672,15 +672,7 @@ mod tests {
         let lucid = LucidMemory::new("lucid", tmp.path(), local);
         assert_eq!(lucid.embedder_dimensions(), 0);
 
-        Memory::refresh_embedder(
-            &lucid,
-            std::sync::Arc::from(zeroclaw_providers::embedding::create_embedding_provider(
-                "openai",
-                Some("sk-test"),
-                "text-embedding-3-small",
-                1536,
-            )),
-        );
+        Memory::refresh_embedder(&lucid, crate::test_embedder(1536));
 
         assert_eq!(
             lucid.embedder_dimensions(),

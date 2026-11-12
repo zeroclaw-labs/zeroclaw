@@ -6422,15 +6422,11 @@ path = "{trigger_path}"
         sop_config.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
         sop_config.persist_runs = false;
         state.publish_test_config(|c| c.sop = sop_config.clone());
-        let data_dir = state.config.read().data_dir.clone();
-        let install_root = state.config.read().install_root_dir();
         let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
-            sop_config,
-            &std::collections::HashMap::new(),
-            &data_dir,
-            &install_root,
+            &state.config.read(),
             Arc::clone(&state.mem),
             Default::default(),
+            None,
         );
         state.sop_engine = Some(engine);
         state.sop_audit = Some(audit);
@@ -6479,15 +6475,11 @@ path = "{trigger_path}"
         sop_config.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
         sop_config.persist_runs = false;
         state.publish_test_config(|c| c.sop = sop_config.clone());
-        let data_dir = state.config.read().data_dir.clone();
-        let install_root = state.config.read().install_root_dir();
         let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
-            sop_config,
-            &std::collections::HashMap::new(),
-            &data_dir,
-            &install_root,
+            &state.config.read(),
             Arc::clone(&state.mem),
             Default::default(),
+            None,
         );
         state.sop_engine = Some(engine);
         state.sop_audit = Some(audit);

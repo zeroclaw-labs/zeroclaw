@@ -497,6 +497,7 @@ cli-sop-ws-subsystem-disabled = sous-système SOP non activé
 cli-sop-create-hint = {"  "}Créez-en un : mkdir -p <shared>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}puis ajoutez SOP.toml et SOP.md
 cli-sop-loaded-header = SOP chargés ({$count}) :
+cli-sop-decision-model-not-configured = Le modèle [decision] '{ $model }' n'est pas configuré comme modèle decision dans [providers.models] ; les exécutions utiliseront le mode le plus strict
 cli-sop-none-to-validate = Aucun SOP trouvé à valider.
 cli-sop-valid = ✅ {$name} — valide
 cli-sop-deleted = SOP supprimé : {$name}

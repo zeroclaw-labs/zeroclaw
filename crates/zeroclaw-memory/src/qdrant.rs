@@ -1430,15 +1430,7 @@ mod tests {
         );
         assert_eq!(mem.embedder_dimensions(), 0);
 
-        Memory::refresh_embedder(
-            &mem,
-            std::sync::Arc::from(zeroclaw_providers::embedding::create_embedding_provider(
-                "openai",
-                Some("sk-test"),
-                "text-embedding-3-small",
-                1536,
-            )),
-        );
+        Memory::refresh_embedder(&mem, crate::test_embedder(1536));
 
         assert_eq!(
             mem.embedder_dimensions(),

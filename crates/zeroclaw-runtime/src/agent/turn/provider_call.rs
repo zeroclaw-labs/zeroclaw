@@ -2457,17 +2457,19 @@ mod streaming_fallback_tests {
             "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]",
         )];
         let recovery = [ChatMessage::user("inspect")];
-        let provider = zeroclaw_providers::create_resilient_model_provider_with_options(
-            "custom",
-            None,
-            Some(&format!("http://{addr}")),
-            &zeroclaw_config::schema::ReliabilityConfig {
-                provider_retries: 0,
-                provider_backoff_ms: 1,
-                ..Default::default()
-            },
-            &zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+        let config = serde_json::from_value(serde_json::json!({
+            "reliability": {"provider_retries": 0, "provider_backoff_ms": 1},
+            "providers": {
+                "connections": {"recovery": {"kind": "custom", "uri": format!("http://{addr}")}},
+                "models": {"recovery": {"capability": "chat", "provider": "recovery", "model": "test-model"}}
+            }
+        })).expect("canonical recovery configuration");
+        let provider = zeroclaw_providers::model::build_reliable_provider(
+            &config,
+            "recovery",
+            Default::default(),
         )
+        .map(|resolved| resolved.provider)
         .expect("construct production factory and reliability wrappers");
         let provider = zeroclaw_providers::router::RouterModelProvider::new(
             "test-router",

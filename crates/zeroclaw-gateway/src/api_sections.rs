@@ -493,9 +493,11 @@ fn picker_items_for(
     use zeroclaw_config::sections::Section;
     match section {
         Section::ModelProviders => PickerDispatch::Items(providers_picker(cfg)),
-        Section::TtsProviders | Section::TranscriptionProviders => {
+        Section::TtsProviders | Section::TranscriptionProviders | Section::DecisionModels => {
             let capability = if matches!(section, Section::TtsProviders) {
                 zeroclaw_api::capability::Capability::Tts
+            } else if matches!(section, Section::DecisionModels) {
+                zeroclaw_api::capability::Capability::Decision
             } else {
                 zeroclaw_api::capability::Capability::Asr
             };
@@ -531,7 +533,6 @@ fn picker_items_for(
         // HashMap. Generic walker covers every section whose schema is
         // `<section>.<alias>` (operator-named keys, no closed kind set).
         Section::PeerGroups
-        | Section::DecisionModels
         | Section::Cron
         | Section::McpServers
         | Section::McpBundles
@@ -958,6 +959,15 @@ async fn select_section(
     };
 
     let (fields_prefix, created) = match section_enum {
+        Section::DecisionModels => {
+            return error_response(
+                ConfigApiError::new(
+                    ConfigApiCode::ValidationFailed,
+                    "configure decision models in the provider registry",
+                )
+                .with_path("providers.registry"),
+            );
+        }
         Section::ModelProviders | Section::TtsProviders | Section::TranscriptionProviders => {
             let family = section_enum.as_str();
             let created = working
@@ -1013,7 +1023,6 @@ async fn select_section(
         }
         Section::Agents
         | Section::PeerGroups
-        | Section::DecisionModels
         | Section::Cron
         | Section::McpServers
         | Section::McpBundles
@@ -1770,6 +1779,7 @@ model = "upstream-model"
             "providers.models",
             "providers.tts",
             "providers.transcription",
+            "decision_models",
         ] {
             assert!(!result.sections.iter().any(|section| section.key == retired));
         }

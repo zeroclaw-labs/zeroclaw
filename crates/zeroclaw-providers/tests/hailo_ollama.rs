@@ -2623,11 +2623,7 @@ fn production_factory_rejects_hailo_vision_override() {
         "family factory must return a typed capability error: {direct_error:?}"
     );
 
-    let error = match zeroclaw_providers::create_model_provider_with_options(
-        "hailo_ollama",
-        None,
-        &options,
-    ) {
+    let error = match zeroclaw_providers::create_model_provider("hailo_ollama", None, &options) {
         Ok(_) => panic!("text-only Hailo must reject vision=true"),
         Err(error) => error,
     };

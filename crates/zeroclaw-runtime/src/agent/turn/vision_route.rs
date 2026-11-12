@@ -133,7 +133,7 @@ pub(crate) async fn resolve_vision_provider_with_allowed_refs(
             // Resolve the configured vision provider through the alias-aware
             // factory so its per-alias `vision` override and typed config
             // (endpoint URI, credentials) are honored - the legacy
-            // `create_model_provider(vp, None)` passed `config = None` and could
+            // `create_model_provider(vp, None, &Default::default())` passed `config = None` and could
             // not see them, so a text-family alias forced to `vision = true`
             // for this route would have been ignored. `config` is `None` only on
             // configless (test-builder) agents - every production agent/loop path
@@ -179,7 +179,7 @@ pub(crate) async fn resolve_vision_provider_with_allowed_refs(
                             model: requested_model.as_deref(), ..Default::default()
                         },
                     ).map(|resolved| (resolved.provider, resolved.model)),
-                    (None, None) => zeroclaw_providers::create_model_provider(&route_ref, None)
+                    (None, None) => zeroclaw_providers::create_model_provider(&route_ref, None, &Default::default())
                         .map(|provider| (provider, None)),
                 }
             }).await
@@ -659,8 +659,7 @@ mod tests {
     /// (llama.cpp) is forced `vision = false` on its alias. With config threaded,
     /// the route builds it through the alias-aware factory, so the forced-off
     /// provider is honored as non-vision and the capability error surfaces -
-    /// proving the alias flag is read (the legacy `create_model_provider(vp,
-    /// None)` path ignored it entirely).
+    /// proving the alias flag is read (the legacy `create_model_provider(vp, /// None, &Default::default())` path ignored it entirely).
     #[tokio::test]
     async fn resolve_vision_provider_honors_configured_alias_vision_override() {
         use zeroclaw_config::schema::{Config, MultimodalConfig};

@@ -925,12 +925,9 @@ impl LineChannel {
 
     /// Configure voice transcription from a `[transcription]` snapshot.
     ///
-    /// Compatibility and test path. The daemon routes every channel through
-    /// `with_transcription_manager` with a manager built from live
-    /// config and the owning agent's resolved provider; this path can only see
-    /// the legacy section, so it binds a lone registered provider and
-    /// otherwise leaves the choice unbound (see
-    /// `transcription::build_transcription_manager_from_legacy_config`).
+    /// Test fixture only: project historical input before constructing the
+    /// canonical manager. Production injects a manager built from the live
+    /// configuration and the owning agent's exact model reference.
     #[cfg(test)]
     fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
         let manager = crate::transcription_fixture(&config);

@@ -7102,12 +7102,14 @@ mod tests {
             "filename": "voice.ogg",
             "url": audio_url,
         })];
-        let transcription =
-            TranscriptionManager::new(&zeroclaw_config::schema::Config::from_transcription_input(
+        let transcription = TranscriptionManager::from_config_for_agent(
+            &zeroclaw_config::schema::Config::from_transcription_input(
                 &local_whisper_transcription_config(&whisper_server),
-            ))
-            .expect("transcription manager")
-            .with_agent_transcription_provider("asr.local_whisper");
+            ),
+            None,
+        )
+        .expect("transcription manager")
+        .with_agent_transcription_provider("asr.local_whisper");
 
         let client = reqwest::Client::new();
         let (text, media) =
@@ -7151,12 +7153,14 @@ mod tests {
             "filename": "voice.ogg",
             "url": audio_url,
         })];
-        let transcription =
-            TranscriptionManager::new(&zeroclaw_config::schema::Config::from_transcription_input(
+        let transcription = TranscriptionManager::from_config_for_agent(
+            &zeroclaw_config::schema::Config::from_transcription_input(
                 &local_whisper_transcription_config(&whisper_server),
-            ))
-            .expect("transcription manager")
-            .with_agent_transcription_provider("asr.local_whisper");
+            ),
+            None,
+        )
+        .expect("transcription manager")
+        .with_agent_transcription_provider("asr.local_whisper");
 
         let client = reqwest::Client::new();
         let (text, media) =

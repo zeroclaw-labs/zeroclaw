@@ -1817,12 +1817,8 @@ async fn run_inner(
             == crate::composition::RegistryConstruction::NativeCompat
             && config.sop.runtime_enabled()
         {
-            let (engine, audit) = crate::sop::build_sop_engine_with_provider_registry(
-                config.sop.clone(),
+            let (engine, audit) = crate::sop::build_sop_engine(
                 &config,
-                &config.decision_models,
-                &config.data_dir,
-                &config.install_root_dir(),
                 Arc::clone(&mem),
                 Default::default(),
                 execution_capability.clone(),
@@ -3930,12 +3926,8 @@ async fn process_message_inner(
             == crate::composition::RegistryConstruction::NativeCompat
             && config.sop.runtime_enabled()
         {
-            let (engine, audit) = crate::sop::build_sop_engine_with_provider_registry(
-                config.sop.clone(),
+            let (engine, audit) = crate::sop::build_sop_engine(
                 &config,
-                &config.decision_models,
-                &config.data_dir,
-                &config.install_root_dir(),
                 Arc::clone(&mem),
                 Default::default(),
                 execution_capability.clone(),

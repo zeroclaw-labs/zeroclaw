@@ -343,7 +343,7 @@ pub async fn model_catalog_with_config_result(
             crate::model::ProviderOverrides::default(),
         )
         .map(|binding| binding.provider),
-        None => crate::create_model_provider(&family_for_build, None),
+        None => crate::create_model_provider(&family_for_build, None, &Default::default()),
     })
     .await;
 

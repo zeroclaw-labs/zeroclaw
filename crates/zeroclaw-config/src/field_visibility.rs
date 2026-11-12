@@ -25,6 +25,7 @@ pub fn excluded_paths(cfg: &Config, prefix: &str) -> Vec<String> {
         "providers.models.".to_string(),
         "providers.tts.".to_string(),
         "providers.transcription.".to_string(),
+        "decision_models.".to_string(),
     ];
     if prefix == "memory" || prefix.is_empty() {
         let backend = if cfg.memory.backend.is_empty() {

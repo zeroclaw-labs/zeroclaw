@@ -227,6 +227,44 @@ fn project_provider_tables(
 /// explicit connections/models remain authoritative over these historical rows.
 fn providers_for_input(config: &Config) -> Result<crate::providers::Providers> {
     let mut providers = config.providers.clone();
+    for (alias, legacy) in &config.decision_models {
+        let key = ModelRef::from(alias.as_str());
+        // An exact canonical selection is authoritative, including its
+        // capability. Never reinterpret a colliding chat model as decision.
+        if providers.models.canonical_model(&key).is_some() {
+            continue;
+        }
+        let Some((uri, model)) = legacy.endpoint() else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(json!({"alias": alias})),
+                "legacy decision model skipped: custom provider has no base URL"
+            );
+            continue;
+        };
+        let mut provider = ProviderId::from(format!("legacy.decision.{alias}"));
+        while providers.connections.contains_key(&provider) {
+            provider = ProviderId::from(format!("legacy.{}", provider.as_str()));
+        }
+        let mut connection = json!({
+            "kind": "system-one", "uri": uri,
+            "api": {"decision": {"wire_api": "system_one"}},
+        });
+        if let Some(api_key) = legacy.api_key.as_deref() {
+            connection["auth"] = json!({"mode": "api_key", "api_key": api_key});
+        }
+        providers
+            .connections
+            .insert(provider.clone(), serde_json::from_value(connection)?);
+        providers.models.insert_canonical_model(
+            key,
+            serde_json::from_value(json!({
+                "capability": "decision", "provider": provider, "model": model,
+            }))?,
+        );
+    }
     let raw = serde_json::to_value(&config.transcription)?;
     for family in [
         "groq",
@@ -828,6 +866,7 @@ pub(crate) fn normalize_definitions(config: &mut Config) -> Result<()> {
     config.providers.transcription = Default::default();
     config.providers.model_presets = registry.model_presets;
     config.providers.fallback = registry.fallback;
+    config.decision_models.clear();
     config.transcription.api_key = None;
     let transcription_defaults = crate::schema::TranscriptionConfig::default();
     config.transcription.api_url = transcription_defaults.api_url;
@@ -843,7 +882,8 @@ pub(crate) fn normalize_definitions(config: &mut Config) -> Result<()> {
 }
 
 fn has_legacy_input(config: &Config) -> bool {
-    config.memory.embedding_api_key.is_some()
+    !config.decision_models.is_empty()
+        || config.memory.embedding_api_key.is_some()
         // A hint is a legacy selector even when the route table is already
         // canonical.  Without this bit the normalization gate returns early
         // and the replacement `embedding_model_ref` remains unset.
@@ -876,14 +916,18 @@ fn has_legacy_input(config: &Config) -> bool {
 /// version-only migration. No provider name is split into TOML path segments.
 pub(crate) fn document_needs_migration(document: &toml::Value) -> bool {
     let providers = document.get("providers");
-    providers
-        .and_then(|value| value.get("models"))
+    document
+        .get("decision_models")
         .and_then(toml::Value::as_table)
-        .is_some_and(|models| {
-            models
-                .values()
-                .any(|model| model.get("capability").is_none())
-        })
+        .is_some_and(|models| !models.is_empty())
+        || providers
+            .and_then(|value| value.get("models"))
+            .and_then(toml::Value::as_table)
+            .is_some_and(|models| {
+                models
+                    .values()
+                    .any(|model| model.get("capability").is_none())
+            })
         || ["tts", "transcription"].iter().any(|section| {
             providers
                 .and_then(|value| value.get(*section))
@@ -939,6 +983,7 @@ pub(crate) fn migrate_document(mut document: toml::Value) -> Result<toml::Value>
         "memory",
         "embedding_routes",
         "transcription",
+        "decision_models",
     ] {
         if let Some(value) = document.get(section) {
             input.insert(section.into(), value.clone());
@@ -948,6 +993,9 @@ pub(crate) fn migrate_document(mut document: toml::Value) -> Result<toml::Value>
         .try_into()
         .context("normalize provider configuration input")?;
     document["providers"] = toml::Value::try_from(&normalized.providers)?;
+    if let Some(table) = document.as_table_mut() {
+        table.remove("decision_models");
+    }
     if let Some(agents) = document
         .get_mut("agents")
         .and_then(toml::Value::as_table_mut)
@@ -1121,6 +1169,125 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persisted_decision_migration_matches_configuration_admission() {
+        let source = r#"
+            schema_version = 3
+            [decision_models."gpu.v2"]
+            provider = "custom"
+            base_url = "http://127.0.0.1:8000"
+            model = "laya"
+            [sop]
+            sops_dir = "shared/sops"
+        "#;
+        let document = migrate_document(toml::from_str(source).unwrap()).unwrap();
+        assert!(document.get("decision_models").is_none());
+        assert_eq!(document["sop"]["sops_dir"].as_str(), Some("shared/sops"));
+        let admitted: Config = toml::from_str(source).unwrap();
+        assert_eq!(
+            document["providers"],
+            toml::Value::try_from(&admitted.providers).unwrap()
+        );
+        assert!(!document_needs_migration(&document));
+        assert_eq!(migrate_document(document.clone()).unwrap(), document);
+        let migrated = crate::migration::migrate_file(source).unwrap().unwrap();
+        let persisted: toml::Value = toml::from_str(&migrated).unwrap();
+        assert_eq!(persisted["schema_version"].as_integer(), Some(4));
+        assert!(persisted.get("decision_models").is_none());
+        assert_eq!(persisted["providers"], document["providers"]);
+    }
+
+    #[test]
+    fn decision_input_promotes_exact_keys_and_preserves_authentication() {
+        let config: Config = toml::from_str(
+            r#"
+            [decision_models."local.v1"]
+            provider = "laya"
+            api_key = "fixture-key"
+
+            [decision_models.hosted]
+
+            [decision_models.invalid]
+            provider = "custom"
+        "#,
+        )
+        .unwrap();
+        assert!(config.decision_models.is_empty());
+        let registry = config.provider_registry().unwrap();
+        let local = registry.resolve_decision(&"local.v1".into()).unwrap();
+        assert_eq!(local.model, "laya");
+        assert_eq!(
+            local.selection.connection.uri(),
+            Some("http://127.0.0.1:8000")
+        );
+        assert_eq!(local.selection.connection.api_key(), Some("fixture-key"));
+        assert_eq!(local.wire_api, crate::schema::DecisionWireApi::SystemOne);
+        let hosted = registry.resolve_decision(&"hosted".into()).unwrap();
+        assert_eq!(hosted.model, "jev-latest");
+        assert_eq!(
+            hosted.selection.connection.uri(),
+            Some("https://api.typesafe.ai")
+        );
+        assert!(registry.resolve_decision(&"invalid".into()).is_err());
+        let serialized = serde_json::to_value(&config).unwrap();
+        assert!(serialized.get("decision_models").is_none());
+        let roundtrip: Config = serde_json::from_value(serialized.clone()).unwrap();
+        assert_eq!(serde_json::to_value(roundtrip).unwrap(), serialized);
+    }
+
+    #[test]
+    fn canonical_decision_selection_wins_over_legacy_input() {
+        let config: Config = toml::from_str(
+            r#"
+            [decision_models.shared]
+            provider = "laya"
+
+            [providers.connections.native]
+            kind = "openai"
+
+            [providers.models.shared]
+            capability = "decision"
+            provider = "native"
+            model = "native-decision"
+        "#,
+        )
+        .unwrap();
+        let registry = config.provider_registry().unwrap();
+        let resolved = registry.resolve_decision(&"shared".into()).unwrap();
+        assert_eq!(resolved.model, "native-decision");
+        assert_eq!(resolved.selection.provider_id.as_str(), "native");
+        assert_eq!(config.providers.connections.len(), 1);
+    }
+
+    #[test]
+    fn decision_env_credentials_follow_promotion_without_persisting_the_override() {
+        let mut config = Config::default();
+        config.decision_models.insert(
+            "hosted".into(),
+            crate::schema::SopDecisionModelConfig {
+                api_key: Some("disk-fixture-key".into()),
+                ..Default::default()
+            },
+        );
+        let path = "decision_models.hosted.api_key";
+        let saved = crate::env_overrides::raw_value_for_path(&config, path).unwrap();
+        config.decision_models.get_mut("hosted").unwrap().api_key = Some("env-fixture-key".into());
+        config.pre_override_snapshots.insert(path.into(), saved);
+        config.env_overridden_paths.insert(path.into());
+        normalize(&mut config).unwrap();
+        assert_eq!(
+            config.providers.connections["legacy.decision.hosted"].api_key(),
+            Some("env-fixture-key")
+        );
+        let snapshots = config.pre_override_snapshots.clone();
+        crate::env_overrides::mask_env_overrides_for_save(&mut config, &snapshots).unwrap();
+        assert_eq!(
+            config.providers.connections["legacy.decision.hosted"].api_key(),
+            Some("disk-fixture-key")
+        );
+        assert!(config.decision_models.is_empty());
+    }
 
     #[test]
     fn env_credential_snapshots_follow_the_migrated_connection() {

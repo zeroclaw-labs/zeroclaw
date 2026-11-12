@@ -69,6 +69,7 @@ pub(crate) fn snapshot_document(document: &Value, path: &str) -> Result<String> 
 pub(crate) fn remap_after_promotion(source: &Config, candidate: &mut Config) -> Result<()> {
     fn retired_input(path: &str) -> bool {
         path.starts_with("providers.")
+            || path.starts_with("decision_models.")
             || path.starts_with("memory.embedding_")
             || path.starts_with("embedding_routes.")
             || matches!(

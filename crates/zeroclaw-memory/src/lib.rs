@@ -90,6 +90,18 @@ use zeroclaw_config::schema::{
     ActiveStorage, Config, MemoryConfig, MemoryPolicyConfig, PostgresStorageConfig,
 };
 
+#[cfg(test)]
+fn test_embedder(dimensions: usize) -> Arc<dyn zeroclaw_api::embedding::EmbeddingProvider> {
+    let config = serde_json::from_value(serde_json::json!({
+        "memory": {"embedding_model_ref": "embedding.fixture"},
+        "providers": {
+            "connections": {"fixture": {"kind": "openai", "auth": {"mode": "api_key", "api_key": "fixture-key"}}},
+            "models": {"embedding.fixture": {"capability": "embedding", "provider": "fixture", "model": "fixture-model", "metadata": {"dimensions": dimensions}}}
+        }
+    })).unwrap();
+    build_embedder_from_config(&config).unwrap()
+}
+
 #[cfg(feature = "memory-postgres")]
 fn build_postgres_memory(
     storage: &PostgresStorageConfig,
@@ -2663,16 +2675,6 @@ url = "http://localhost:6333"
                 api_key: Some("sk-provider".into()),
             }
         );
-
-        // End-to-end: the resolved profile builds a real OpenAI-compatible
-        // embedder, not the keyword-only Noop fallback.
-        let embedder = zeroclaw_providers::embedding::create_embedding_provider(
-            &resolved.model_provider,
-            resolved.api_key.as_deref(),
-            &resolved.model,
-            resolved.dimensions,
-        );
-        assert_eq!(embedder.name(), "openai");
     }
 
     #[test]
@@ -2699,14 +2701,6 @@ url = "http://localhost:6333"
         assert_eq!(resolved.model_provider, "openai");
         assert_eq!(resolved.api_key.as_deref(), Some("sk-provider"));
         assert_eq!(resolved.dimensions, 1536);
-
-        let embedder = zeroclaw_providers::embedding::create_embedding_provider(
-            &resolved.model_provider,
-            resolved.api_key.as_deref(),
-            &resolved.model,
-            resolved.dimensions,
-        );
-        assert_eq!(embedder.name(), "openai");
     }
 
     #[test]
@@ -2818,17 +2812,9 @@ url = "http://localhost:6333"
         let resolved =
             resolve_embedding_config(&cfg, &routes, Some("chat-provider-key"), Some(&providers));
 
-        // It must NOT be rewritten to a bare `custom` (which would silently
-        // Noop); it is left unresolved and logged loudly. The end-to-end
-        // embedder is the keyword-only Noop, surfaced rather than hidden.
+        // Keep the unresolved reference visible. Canonical admission rejects
+        // it; construction must never silently substitute keyword-only memory.
         assert_eq!(resolved.model_provider, "custom.myembed");
-        let embedder = zeroclaw_providers::embedding::create_embedding_provider(
-            &resolved.model_provider,
-            resolved.api_key.as_deref(),
-            &resolved.model,
-            resolved.dimensions,
-        );
-        assert_eq!(embedder.name(), "none");
     }
 
     #[test]
@@ -2859,13 +2845,6 @@ url = "http://localhost:6333"
 
         assert_eq!(resolved.model_provider, "custom:https://embed.local/v1");
         assert_eq!(resolved.api_key.as_deref(), Some("sk-local"));
-        let embedder = zeroclaw_providers::embedding::create_embedding_provider(
-            &resolved.model_provider,
-            resolved.api_key.as_deref(),
-            &resolved.model,
-            resolved.dimensions,
-        );
-        assert_eq!(embedder.name(), "openai");
     }
 
     #[allow(clippy::await_holding_lock)]

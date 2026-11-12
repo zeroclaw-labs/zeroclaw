@@ -12,13 +12,14 @@ use serde::{Deserialize, Serialize};
 pub use zeroclaw_rpc_proto::types::*;
 
 /// UI provider editing has one canonical surface. The retained legacy config
-/// maps are migration/runtime inputs, not separate editor destinations.
+/// maps are migration inputs, not separate editor destinations.
 pub fn project_provider_editor_sections(roots: &mut std::collections::BTreeSet<String>) {
     use zeroclaw_config::sections::Section;
     for section in [
         Section::ModelProviders,
         Section::TtsProviders,
         Section::TranscriptionProviders,
+        Section::DecisionModels,
     ] {
         roots.remove(section.as_str());
     }
@@ -304,6 +305,7 @@ mod tests {
             "providers.models",
             "providers.tts",
             "providers.transcription",
+            "decision_models",
             "agents",
         ]
         .map(str::to_owned)

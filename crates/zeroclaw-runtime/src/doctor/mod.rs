@@ -1987,7 +1987,7 @@ mod tests {
 
     #[test]
     fn provider_validation_accepts_custom_with_uri_in_config() {
-        // Regression: the Doctor previously called create_model_provider(name, None)
+        // Regression: the Doctor previously called create_model_provider(name, None, &Default::default())
         // without config, causing custom providers with uri defined in config to
         // fail validation with "Custom model_provider requires `uri`".
         let mut config = Config::default();

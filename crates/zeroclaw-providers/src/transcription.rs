@@ -1148,11 +1148,6 @@ impl TranscriptionManager {
         }
     }
 
-    /// Build from the canonical registry and the selected runtime agent.
-    pub fn new(config: &Config) -> Result<Self> {
-        Self::from_config_for_agent(config, None)
-    }
-
     pub fn from_config_for_agent(config: &Config, agent_alias: Option<&str>) -> Result<Self> {
         let agent_transcription_provider = agent_alias
             .or_else(|| config.resolved_runtime_agent_alias())
@@ -1219,7 +1214,7 @@ impl TranscriptionManager {
                 Err(error) => {
                     ::zeroclaw_log::record!(
                         WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                             .with_attrs(::serde_json::json!({
                                 "error": error.to_string(),
@@ -1238,6 +1233,7 @@ impl TranscriptionManager {
     pub fn with_typed_providers(self, typed: &TranscriptionProviders) -> Self {
         let mut config = Config::default();
         config.providers.transcription = typed.clone();
+        let config = zeroclaw_config::migration::admit_test_input(&config);
         let mut manager =
             Self::from_config_with_provider(&config, self.agent_transcription_provider.clone())
                 .unwrap();
@@ -1379,36 +1375,6 @@ pub fn build_transcription_manager(
         TranscriptionManager::from_config_with_provider(config, agent_provider.to_string())?;
     let binding = manager.agent_transcription_provider.clone();
     Ok(bind_provider(manager, &binding))
-}
-
-/// Build a manager from a legacy `[transcription]` snapshot alone.
-///
-/// This is the compatibility and test path behind every channel's
-/// `with_transcription(config)`. It cannot see typed providers or the owning
-/// agent, so it can only bind a lone registered provider (rule 3 above). It
-/// returns `None` when transcription is disabled or the manager cannot be
-/// built; the failure is logged once here rather than in every channel, and
-/// the channel stays up without transcription.
-#[cfg(test)]
-fn build_transcription_manager_from_legacy_config(
-    config: &TranscriptionConfig,
-) -> Option<std::sync::Arc<TranscriptionManager>> {
-    if !config.enabled {
-        return None;
-    }
-    match TranscriptionManager::new(&Config::from_transcription_input(config)) {
-        Ok(manager) => Some(std::sync::Arc::new(bind_provider(manager, ""))),
-        Err(e) => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"e": e.to_string()})),
-                "transcription manager init failed, voice transcription disabled"
-            );
-            None
-        }
-    }
 }
 
 impl ::zeroclaw_api::attribution::Attributable for GroqProvider {
@@ -1688,8 +1654,11 @@ mod tests {
         unsafe { std::env::remove_var("GROQ_API_KEY") };
 
         let config = TranscriptionConfig::default();
-        let manager =
-            TranscriptionManager::new(&Config::from_transcription_input(&config)).unwrap();
+        let manager = TranscriptionManager::from_config_for_agent(
+            &Config::from_transcription_input(&config),
+            None,
+        )
+        .unwrap();
         // the manager's agent_transcription_provider starts empty
         // until an orchestrator wires it via `with_agent_transcription_provider`.
         // No global default-provider concept.
@@ -1708,8 +1677,11 @@ mod tests {
             ..TranscriptionConfig::default()
         };
 
-        let manager =
-            TranscriptionManager::new(&Config::from_transcription_input(&config)).unwrap();
+        let manager = TranscriptionManager::from_config_for_agent(
+            &Config::from_transcription_input(&config),
+            None,
+        )
+        .unwrap();
         assert!(manager.transcription_providers.contains_key("asr.groq"));
         assert_eq!(manager.transcription_providers["asr.groq"].name(), "groq");
     }
@@ -1732,8 +1704,11 @@ mod tests {
             ..TranscriptionConfig::default()
         };
 
-        let manager =
-            TranscriptionManager::new(&Config::from_transcription_input(&config)).unwrap();
+        let manager = TranscriptionManager::from_config_for_agent(
+            &Config::from_transcription_input(&config),
+            None,
+        )
+        .unwrap();
         assert!(manager.transcription_providers.contains_key("asr.groq"));
         assert!(manager.transcription_providers.contains_key("asr.openai"));
         assert!(manager.transcription_providers.contains_key("asr.deepgram"));
@@ -1750,8 +1725,11 @@ mod tests {
             ..TranscriptionConfig::default()
         };
 
-        let manager =
-            TranscriptionManager::new(&Config::from_transcription_input(&config)).unwrap();
+        let manager = TranscriptionManager::from_config_for_agent(
+            &Config::from_transcription_input(&config),
+            None,
+        )
+        .unwrap();
         let err = manager
             .transcribe_with_provider(&[0u8; 100], "test.ogg", "nonexistent")
             .await
@@ -1775,9 +1753,12 @@ mod tests {
             ..TranscriptionConfig::default()
         };
 
-        let manager = TranscriptionManager::new(&Config::from_transcription_input(&config))
-            .unwrap()
-            .with_agent_transcription_provider("asr.openai");
+        let manager = TranscriptionManager::from_config_for_agent(
+            &Config::from_transcription_input(&config),
+            None,
+        )
+        .unwrap()
+        .with_agent_transcription_provider("asr.openai");
         assert_eq!(manager.agent_transcription_provider, "asr.openai");
     }
 
@@ -2133,7 +2114,10 @@ mod tests {
             ..TranscriptionConfig::default()
         };
 
-        let err = match TranscriptionManager::new(&Config::from_transcription_input(&config)) {
+        let err = match TranscriptionManager::from_config_for_agent(
+            &Config::from_transcription_input(&config),
+            None,
+        ) {
             Ok(_) => panic!("expected zero max_audio_bytes to fail manager construction"),
             Err(err) => err,
         };
@@ -2642,8 +2626,11 @@ mod tests {
             ..TranscriptionConfig::default()
         };
 
-        let manager =
-            TranscriptionManager::new(&Config::from_transcription_input(&config)).unwrap();
+        let manager = TranscriptionManager::from_config_for_agent(
+            &Config::from_transcription_input(&config),
+            None,
+        )
+        .unwrap();
         assert!(
             manager.available_providers().contains(&"asr.local_whisper"),
             "expected local_whisper in {:?}",
@@ -2672,9 +2659,12 @@ mod tests {
             ..TranscriptionConfig::default()
         };
 
-        let err = TranscriptionManager::new(&Config::from_transcription_input(&config))
-            .err()
-            .unwrap();
+        let err = TranscriptionManager::from_config_for_agent(
+            &Config::from_transcription_input(&config),
+            None,
+        )
+        .err()
+        .unwrap();
         assert!(
             err.to_string()
                 .contains("no transcription provider registered"),
@@ -2696,8 +2686,11 @@ mod tests {
             ..TranscriptionConfig::default()
         };
 
-        let manager = TranscriptionManager::new(&Config::from_transcription_input(&config))
-            .expect("blank bearer_token must not prevent provider registration");
+        let manager = TranscriptionManager::from_config_for_agent(
+            &Config::from_transcription_input(&config),
+            None,
+        )
+        .expect("blank bearer_token must not prevent provider registration");
         assert!(
             manager.available_providers().contains(&"asr.local_whisper"),
             "expected local_whisper registered with a blank token, got {:?}",
@@ -2944,23 +2937,16 @@ mod tests {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod channel_builder_tests {
     use super::*;
 
-    fn legacy_groq() -> TranscriptionConfig {
-        TranscriptionConfig {
-            enabled: true,
-            api_key: Some("k".to_string()),
-            ..TranscriptionConfig::default()
-        }
-    }
-
-    fn config_with_legacy_groq() -> Config {
-        Config {
-            transcription: legacy_groq(),
-            ..Config::default()
-        }
+    fn channel_config() -> Config {
+        serde_json::from_value(serde_json::json!({
+            "providers": {
+                "connections": {"audio": {"kind": "custom", "uri": "http://127.0.0.1:8000/v1"}},
+                "models": {"asr.main": {"capability": "asr", "provider": "audio", "model": "whisper"}}
+            }
+        })).unwrap()
     }
 
     #[tokio::test]
@@ -3005,65 +2991,39 @@ mod channel_builder_tests {
     }
 
     #[test]
-    fn an_explicit_registered_provider_wins() {
-        let manager = build_transcription_manager(&config_with_legacy_groq(), "groq")
-            .expect("legacy groq registers");
-        assert_eq!(manager.agent_transcription_provider, "groq");
+    fn an_explicit_registered_model_wins() {
+        let manager = build_transcription_manager(&channel_config(), "asr.main").unwrap();
+        assert_eq!(manager.agent_transcription_provider, "asr.main");
     }
 
     #[test]
-    fn a_typed_alias_preference_binds_the_legacy_type_when_only_the_type_is_registered() {
-        // An agent written against `groq.default` on a deployment that only has
-        // the legacy `[transcription]` section: the exact key does not exist,
-        // the type does. Binding the type is what one channel used to do by
-        // hand; every channel now gets it.
-        let manager = build_transcription_manager(&config_with_legacy_groq(), "groq.default")
-            .expect("legacy groq registers");
-        assert_eq!(manager.agent_transcription_provider, "groq");
-    }
-
-    #[test]
-    fn an_unregistered_preference_is_bound_verbatim_so_transcribe_fails_loud_naming_it() {
-        let manager = build_transcription_manager(&config_with_legacy_groq(), "deepgram.x")
-            .expect("legacy groq registers");
-        assert_eq!(manager.agent_transcription_provider, "deepgram.x");
-    }
-
-    #[test]
-    fn no_preference_binds_the_sole_provider_and_leaves_several_unbound() {
-        let sole = build_transcription_manager(&config_with_legacy_groq(), "")
-            .expect("legacy groq registers");
-        assert_eq!(sole.agent_transcription_provider, "groq");
-
-        let mut two = config_with_legacy_groq();
-        two.transcription.openai = Some(zeroclaw_config::schema::OpenAiSttConfig {
-            api_key: Some("k".to_string()),
-            ..Default::default()
-        });
-        let manager = build_transcription_manager(&two, "").expect("two providers register");
-        assert_eq!(manager.available_providers().len(), 2);
-        assert!(
-            manager.agent_transcription_provider.is_empty(),
-            "with several providers the choice stays unbound rather than silently picked"
-        );
-    }
-
-    #[test]
-    fn snapshot_path_gates_on_enabled_binds_the_sole_provider_and_swallows_failure() {
-        assert!(
-            build_transcription_manager_from_legacy_config(&TranscriptionConfig::default())
-                .is_none()
-        );
-        let manager = build_transcription_manager_from_legacy_config(&legacy_groq())
-            .expect("sole provider binds");
-        assert_eq!(manager.agent_transcription_provider, "asr.groq");
-        let enabled_but_empty = TranscriptionConfig {
-            enabled: true,
-            ..TranscriptionConfig::default()
+    fn an_unregistered_preference_fails_at_construction() {
+        let error = match build_transcription_manager(&channel_config(), "asr.missing") {
+            Ok(_) => panic!("missing ASR model must be rejected"),
+            Err(error) => error,
         };
-        assert!(
-            build_transcription_manager_from_legacy_config(&enabled_but_empty).is_none(),
-            "a manager that cannot be built is reported once and the channel stays up"
-        );
+        assert!(error.to_string().contains("asr.missing"));
+    }
+
+    #[test]
+    fn no_preference_binds_the_sole_model_and_leaves_several_unbound() {
+        let sole = build_transcription_manager(&channel_config(), "").unwrap();
+        assert_eq!(sole.agent_transcription_provider, "asr.main");
+        let mut two = channel_config();
+        two.providers.models.insert_canonical_model("asr.other".into(), serde_json::from_value(
+            serde_json::json!({"capability": "asr", "provider": "audio", "model": "whisper-other"})
+        ).unwrap());
+        let manager = build_transcription_manager(&two, "").unwrap();
+        assert_eq!(manager.available_providers().len(), 2);
+        assert!(manager.agent_transcription_provider.is_empty());
+    }
+
+    #[test]
+    fn an_enabled_manager_without_models_propagates_its_failure() {
+        let mut config = Config::default();
+        let disabled = build_transcription_manager(&config, "").unwrap();
+        assert!(disabled.available_providers().is_empty());
+        config.transcription.enabled = true;
+        assert!(build_transcription_manager(&config, "").is_err());
     }
 }

@@ -8284,15 +8284,15 @@ permissions = ["http_client"]
     /// on the resulting `llm_task` tool and checks the error message.
     ///
     /// - On old master: `LlmTaskTool` stores only the family name ("openai"),
-    ///   `execute()` uses `create_model_provider_with_options("openai", …)`
+    ///   `execute()` uses `create_model_provider("openai", …)`
     ///   which passes `config=None, alias="default"` → falls back to
     ///   `openai_missing_entry_fallback_config()` (requires_openai_auth=false)
     ///   → creates standard `OpenAiModelProvider` → fails with a generic
     ///   HTTP/auth error that does NOT mention "openai-codex".
     ///
-    /// - On fixed branch: `LlmTaskTool` stores config + family + alias,
-    ///   `execute()` uses `create_model_provider_for_alias(&config, "openai",
-    ///   "codex", …)` → finds the typed alias with requires_openai_auth=true
+    /// - On fixed branch: `LlmTaskTool` resolves the current config and exact
+    ///   model key through `model::build_raw_provider` → selects the canonical
+    ///   connection with OpenAI OAuth authentication
     ///   → creates `OpenAiCodexModelProvider` → fails at OAuth credential
     ///   resolution with an error mentioning "openai-codex".
     #[tokio::test]
@@ -9637,14 +9637,16 @@ mod native_memory_binding_tests {
         );
         assert_eq!(binding.stats().await.unwrap().total_rows, 7);
         assert_eq!(binding.reindex().await.unwrap(), 7);
-        binding.refresh_embedder(std::sync::Arc::from(
-            zeroclaw_providers::embedding::create_embedding_provider(
-                "openai",
-                Some("sentinel"),
-                "sentinel",
-                3,
-            ),
-        ));
+        let embedding_config = serde_json::from_value(serde_json::json!({
+            "memory": {"embedding_model_ref": "embedding.sentinel"},
+            "providers": {
+                "connections": {"sentinel": {"kind": "openai", "auth": {"mode": "api_key", "api_key": "sentinel"}}},
+                "models": {"embedding.sentinel": {"capability": "embedding", "provider": "sentinel", "model": "sentinel", "metadata": {"dimensions": 3}}}
+            }
+        })).unwrap();
+        binding.refresh_embedder(
+            zeroclaw_memory::build_embedder_from_config(&embedding_config).unwrap(),
+        );
         assert!(
             binding
                 .recall_namespaced(

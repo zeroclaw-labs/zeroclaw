@@ -492,6 +492,7 @@ cli-sop-ws-subsystem-disabled = SOP サブシステムは有効ではありま�
 cli-sop-create-hint = {"  "}作成: mkdir -p <shared>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}その後 SOP.toml と SOP.md を追加します
 cli-sop-loaded-header = 読み込み済みの SOP ({$count}):
+cli-sop-decision-model-not-configured = [decision] モデル '{ $model }' が [providers.models] の decision モデルに設定されていません。実行は最も厳格なモードにフォールバックします
 cli-sop-none-to-validate = 検証する SOP が見つかりません。
 cli-sop-valid = ✅ {$name} — 有効
 cli-sop-deleted = SOP を削除しました: {$name}

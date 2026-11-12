@@ -1185,10 +1185,6 @@ pub fn is_enabled(config: &Config) -> bool {
 }
 
 impl TtsManager {
-    pub fn from_config(config: &Config) -> Result<Self> {
-        Self::from_config_for_agent(config, None)
-    }
-
     pub fn from_config_for_agent(config: &Config, agent_alias: Option<&str>) -> Result<Self> {
         let mut tts_providers: HashMap<String, Box<dyn TtsProvider>> = HashMap::new();
         let mut voice_by_alias: HashMap<String, String> = HashMap::new();
@@ -1873,7 +1869,7 @@ mod tests {
     #[test]
     fn tts_manager_creation_with_defaults() {
         let config = Config::default();
-        let manager = TtsManager::from_config(&config).unwrap();
+        let manager = TtsManager::from_config_for_agent(&config, None).unwrap();
         assert!(manager.available_providers().is_empty());
     }
 
@@ -1897,13 +1893,13 @@ voice = "legacy-voice"
             .unwrap(),
             ..Config::default()
         };
-        let manager = TtsManager::from_config(&config).unwrap();
+        let manager = TtsManager::from_config_for_agent(&config, None).unwrap();
         assert!(manager.tts_providers.contains_key("openai.voice"));
         assert!(!manager.voice_by_alias.contains_key("openai.voice"));
         assert_eq!(manager.voice_by_alias["tts.openai.voice"], "legacy-voice");
 
         config.providers.models = Default::default();
-        let manager = TtsManager::from_config(&config).unwrap();
+        let manager = TtsManager::from_config_for_agent(&config, None).unwrap();
         assert!(manager.tts_providers.contains_key("openai.voice"));
         assert_eq!(manager.voice_by_alias["openai.voice"], "legacy-voice");
     }
@@ -1911,7 +1907,7 @@ voice = "legacy-voice"
     #[test]
     fn tts_manager_registers_alias_keyed_provider() {
         let cfg = config_with_edge_alias();
-        let manager = TtsManager::from_config(&cfg).unwrap();
+        let manager = TtsManager::from_config_for_agent(&cfg, None).unwrap();
         assert_eq!(manager.available_providers(), vec!["edge.default"]);
     }
 
@@ -1955,7 +1951,7 @@ voice = "legacy-voice"
     #[tokio::test]
     async fn tts_rejects_empty_text() {
         let cfg = config_with_edge_alias();
-        let manager = TtsManager::from_config(&cfg).unwrap();
+        let manager = TtsManager::from_config_for_agent(&cfg, None).unwrap();
         let err = manager
             .synthesize_with_provider("", "edge.default", "en-US-AriaNeural")
             .await
@@ -1970,7 +1966,7 @@ voice = "legacy-voice"
     async fn tts_rejects_text_exceeding_max_length() {
         let mut cfg = config_with_edge_alias();
         cfg.tts.max_text_length = 10;
-        let manager = TtsManager::from_config(&cfg).unwrap();
+        let manager = TtsManager::from_config_for_agent(&cfg, None).unwrap();
         let long_text = "a".repeat(11);
         let err = manager
             .synthesize_with_provider(&long_text, "edge.default", "en-US-AriaNeural")
@@ -1985,7 +1981,7 @@ voice = "legacy-voice"
     #[tokio::test]
     async fn tts_rejects_unknown_provider() {
         let cfg = Config::default();
-        let manager = TtsManager::from_config(&cfg).unwrap();
+        let manager = TtsManager::from_config_for_agent(&cfg, None).unwrap();
         let err = manager
             .synthesize_with_provider("hello", "nonexistent.alias", "voice")
             .await
@@ -2014,14 +2010,14 @@ voice = "legacy-voice"
     #[test]
     fn tts_manager_with_piper_alias() {
         let cfg = config_with_piper_alias();
-        let manager = TtsManager::from_config(&cfg).unwrap();
+        let manager = TtsManager::from_config_for_agent(&cfg, None).unwrap();
         assert_eq!(manager.available_providers(), vec!["piper.default"]);
     }
 
     #[tokio::test]
     async fn tts_rejects_empty_text_for_piper() {
         let cfg = config_with_piper_alias();
-        let manager = TtsManager::from_config(&cfg).unwrap();
+        let manager = TtsManager::from_config_for_agent(&cfg, None).unwrap();
         let err = manager
             .synthesize_with_provider("", "piper.default", "default")
             .await
@@ -2095,13 +2091,13 @@ voice = "legacy-voice"
     #[test]
     fn agent_output_format_resolves_active_provider() {
         let cfg = config_with_openai_wav_alias();
-        let manager = TtsManager::from_config(&cfg).unwrap();
+        let manager = TtsManager::from_config_for_agent(&cfg, None).unwrap();
         assert_eq!(manager.agent_output_format(), Some("wav"));
     }
 
     #[test]
     fn agent_output_format_none_when_no_provider() {
-        let manager = TtsManager::from_config(&Config::default()).unwrap();
+        let manager = TtsManager::from_config_for_agent(&Config::default(), None).unwrap();
         assert_eq!(manager.agent_output_format(), None);
     }
 
@@ -2109,7 +2105,7 @@ voice = "legacy-voice"
     fn tts_manager_max_text_length_zero_uses_default() {
         let mut cfg = Config::default();
         cfg.tts.max_text_length = 0;
-        let manager = TtsManager::from_config(&cfg).unwrap();
+        let manager = TtsManager::from_config_for_agent(&cfg, None).unwrap();
         assert_eq!(manager.max_text_length, DEFAULT_MAX_TEXT_LENGTH);
     }
 
@@ -2221,7 +2217,7 @@ voice = "legacy-voice"
             },
         );
 
-        let manager = TtsManager::from_config(&cfg).unwrap();
+        let manager = TtsManager::from_config_for_agent(&cfg, None).unwrap();
         assert!(
             manager.available_providers().is_empty(),
             "keyless openai provider must not register: {:?}",
