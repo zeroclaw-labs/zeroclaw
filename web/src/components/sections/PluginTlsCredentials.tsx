@@ -1,4 +1,5 @@
 import { type FormEvent, useEffect, useRef, useState } from "react";
+import { t } from "@/lib/i18n";
 import { Button } from "@/components/ui";
 import {
   changePluginTlsCredential,
@@ -21,7 +22,7 @@ export default function PluginTlsCredentials() {
     let active = true;
     void listPluginTlsCredentials().then(
       (result) => { if (active) setCatalog(result); },
-      () => { if (active) setMessage("Plugin TLS credentials are available to authenticated operators."); },
+      () => { if (active) setMessage(t("plugin_tls.operator")); },
     );
     return () => { active = false; };
   }, []);
@@ -49,9 +50,9 @@ export default function PluginTlsCredentials() {
             : row,
         ),
       }));
-      setMessage(result.configured ? "Credential saved." : "Credential deleted.");
+      setMessage(result.configured ? t("plugin_tls.saved") : t("plugin_tls.deleted"));
     } catch {
-      setMessage("The change could not be confirmed. Refresh before trying again.");
+      setMessage(t("plugin_tls.failed"));
     } finally {
       inFlight.current = false;
       setBusy(false);
@@ -69,14 +70,14 @@ export default function PluginTlsCredentials() {
 
   return (
     <section className="space-y-4">
-      <h2 className="text-lg font-semibold">Plugin TLS credentials</h2>
+      <h2 className="text-lg font-semibold">{t("plugin_tls.title")}</h2>
       {message && <p role="status">{message}</p>}
-      {!catalog && !message && <p>Loading credentials…</p>}
+      {!catalog && !message && <p>{t("plugin_tls.loading")}</p>}
       {catalog && !catalog.encryption_enabled && (
-        <p>Enable secret encryption to change credentials.</p>
+        <p>{t("plugin_tls.encryption")}</p>
       )}
       {catalog?.credentials.length === 0 && (
-        <p>Configure a TLS profile for a plugin instance to add a credential here. An initialized secret store is required to save changes.</p>
+        <p>{t("plugin_tls.empty")}</p>
       )}
       {catalog?.credentials.map((credential) => (
         <div
@@ -84,7 +85,7 @@ export default function PluginTlsCredentials() {
           className="space-y-2 rounded-md border p-3"
         >
           <p className="break-all font-medium">{credential.property}</p>
-          <p className="break-all text-sm">{credential.instance} · {credential.configured ? "Configured" : "Unset"}</p>
+          <p className="break-all text-sm">{credential.instance} · {credential.configured ? t("plugin_tls.configured") : t("plugin_tls.unset")}</p>
           <ul className="space-y-1 text-sm">
             {Object.entries(credential.profiles).map(([profile, hosts]) => (
               <li key={profile} className="break-words">{profile} · {hosts.join(", ")}</li>
@@ -93,12 +94,12 @@ export default function PluginTlsCredentials() {
           <div className="flex flex-wrap gap-2">
             <Button type="button" size="sm" disabled={busy || !catalog.encryption_enabled}
               onClick={() => { clearDraft(); setRemoving(null); setEditing(credential); }}>
-              {credential.configured ? "Replace" : "Set"}
+              {credential.configured ? t("plugin_tls.replace") : t("plugin_tls.set")}
             </Button>
             {credential.configured && (
               <Button type="button" size="sm" variant="ghost" disabled={busy || !catalog.encryption_enabled}
                 onClick={() => { clearDraft(); setRemoving(credential); }}>
-                Delete
+                {t("plugin_tls.delete")}
               </Button>
             )}
           </div>
@@ -106,7 +107,7 @@ export default function PluginTlsCredentials() {
       ))}
       {editing && (
         <form className="space-y-2" onSubmit={save}>
-          <label className="block" htmlFor="plugin-tls-draft">New value for {editing.property}</label>
+          <label className="block" htmlFor="plugin-tls-draft">{t("plugin_tls.new_value").replace("{property}", () => editing.property)}</label>
           <textarea
             className="block w-full rounded-md border p-2 font-mono"
             id="plugin-tls-draft" ref={draft} autoComplete="off" spellCheck={false}
@@ -114,20 +115,20 @@ export default function PluginTlsCredentials() {
             style={{ WebkitTextSecurity: "disc" } as React.CSSProperties}
           />
           <div className="flex gap-2">
-            <Button type="submit" disabled={busy}>Save credential</Button>
-            <Button type="button" variant="ghost" onClick={clearDraft}>Cancel</Button>
+            <Button type="submit" disabled={busy}>{t("plugin_tls.save")}</Button>
+            <Button type="button" variant="ghost" onClick={clearDraft}>{t("common.cancel")}</Button>
           </div>
         </form>
       )}
       {removing && (
         <div className="space-y-2">
-          <p>Delete {removing.property}? Its TLS profiles may stop connecting. Existing backups and upstream credentials require separate management.</p>
+          <p>{t("plugin_tls.confirm_delete").replace("{property}", () => removing.property)}</p>
           <div className="flex gap-2">
             <Button type="button" disabled={busy} onClick={() => {
               setRemoving(null);
               void update(removing, { operation: "delete" });
-            }}>Delete credential</Button>
-            <Button type="button" variant="ghost" onClick={() => setRemoving(null)}>Cancel</Button>
+            }}>{t("plugin_tls.delete_action")}</Button>
+            <Button type="button" variant="ghost" onClick={() => setRemoving(null)}>{t("common.cancel")}</Button>
           </div>
         </div>
       )}

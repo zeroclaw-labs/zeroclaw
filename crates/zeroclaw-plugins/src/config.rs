@@ -159,7 +159,12 @@ impl ResolvedPluginConfig {
         mut self,
         references: impl IntoIterator<Item = SecretPropertyRef>,
     ) -> Self {
-        self.host_only.extend(references);
+        for reference in references {
+            if let Some(public) = self.public_json.as_object_mut() {
+                public.remove(reference.as_str());
+            }
+            self.host_only.insert(reference);
+        }
         self
     }
 
@@ -1308,6 +1313,19 @@ x-secret = true
             "reserving a secret hides it from the guest, not from the host"
         );
         assert!(!resolved.public_json().to_string().contains("secret-value"));
+    }
+
+    #[test]
+    fn host_reserved_property_is_hidden_even_in_public_config() {
+        let schema = object_schema(json!({"client_key": {"type": "string"}}));
+        let manifest = manifest(Some(schema), true);
+        let scope = scope(&manifest, true);
+        let values = configured(&[("client_key", "synthetic-key")]);
+        let resolved = resolve_plugin_config(&manifest, &scope, Some(&values))
+            .unwrap()
+            .reserve_for_host([SecretPropertyRef::parse("client_key").unwrap()]);
+        assert!(resolved.is_host_only("client_key"));
+        assert_eq!(resolved.public_json(), &json!({}));
     }
 
     #[test]

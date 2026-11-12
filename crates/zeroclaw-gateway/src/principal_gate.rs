@@ -1262,6 +1262,7 @@ mod tests {
     const SCOPED: (Option<&str>, Option<&str>) = (Some("opaque-token"), Some("oidc.test"));
     const OPERATOR: (Option<&str>, Option<&str>) = (Some("zc_paired"), None);
 
+    #[cfg(feature = "plugins-wasm")]
     #[tokio::test]
     async fn plugin_tls_credential_api_is_operator_only_and_write_only() {
         use zeroclaw_config::schema::{PluginEntryConfig, PluginTlsProfileConfig};
@@ -1274,20 +1275,58 @@ mod tests {
             &[Verb::Read, Verb::Create, Verb::Update, Verb::Delete],
             &["*"],
         );
-        let instance = "zpi1_test";
+        config.plugins.plugins_dir = tmp.path().join("plugins").to_string_lossy().into_owned();
+        config.plugins.security.signature_mode = "disabled".into();
+        let plugin = tmp.path().join("plugins/test-plugin");
+        std::fs::create_dir_all(&plugin).unwrap();
+        std::fs::write(plugin.join("plugin.wasm"), b"\0asm").unwrap();
+        std::fs::write(
+            plugin.join("manifest.toml"),
+            r#"
+name = "test-plugin"
+version = "0.1.0"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+permissions = ["config_read"]
+
+[config_schema]
+"$schema" = "https://json-schema.org/draft/2020-12/schema"
+type = "object"
+additionalProperties = false
+
+[config_schema.properties."ca.pem"]
+type = "string"
+x-secret = true
+
+[config_schema.properties.unrelated]
+type = "string"
+"#,
+        )
+        .unwrap();
+        let instance = "zpi1_WyJ0ZXN0LXBsdWdpbiIsInRvb2wiLCJ0ZXN0LXBsdWdpbiJd";
         let property = "ca.pem";
         config.secrets.encrypt = true;
         config.plugins.entries.push(PluginEntryConfig {
             name: instance.into(),
             egress_hosts: vec!["example.com".into()],
-            tls_profiles: vec![PluginTlsProfileConfig {
-                name: "custom".into(),
-                hosts: vec!["example.com".into()],
-                system_roots: true,
-                custom_ca_secret: Some(property.into()),
-                client_certificate_secret: None,
-                client_private_key_secret: None,
-            }],
+            tls_profiles: vec![
+                PluginTlsProfileConfig {
+                    name: "custom".into(),
+                    hosts: vec!["example.com".into()],
+                    system_roots: true,
+                    custom_ca_secret: Some(property.into()),
+                    client_certificate_secret: None,
+                    client_private_key_secret: None,
+                },
+                PluginTlsProfileConfig {
+                    name: "public-slot".into(),
+                    hosts: vec!["example.com".into()],
+                    system_roots: true,
+                    custom_ca_secret: Some("unrelated".into()),
+                    client_certificate_secret: None,
+                    client_private_key_secret: None,
+                },
+            ],
             config: HashMap::from([("unrelated".into(), "synthetic-neighbor".into())]),
             ..PluginEntryConfig::default()
         });
@@ -1330,8 +1369,26 @@ mod tests {
         zeroclaw_config::secrets::SecretStore::new(tmp.path(), true)
             .encrypt("initialize-fixture-key")
             .unwrap();
+        let mut public_write = create.clone();
+        public_write["property"] = serde_json::json!("unrelated");
+        public_write["operation"] = serde_json::json!("replace");
+        assert_eq!(
+            send(
+                &router,
+                "POST",
+                url,
+                OPERATOR.0,
+                OPERATOR.1,
+                Some(public_write)
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
         let (status, body) = send(&router, "GET", url, OPERATOR.0, OPERATOR.1, None).await;
         assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["credentials"].as_array().unwrap().len(), 1);
+        assert_eq!(body["credentials"][0]["property"], property);
         assert_eq!(body["credentials"][0]["configured"], false);
         let (status, body) = send(
             &router,

@@ -233,7 +233,7 @@ export default function Config() {
       return (
         <SectionTabs
           tabs={[
-            { key: "settings", label: "Settings", render: () => (
+            { key: "settings", label: t("plugin_tls.settings"), render: () => (
                 <FieldForm
                   key={reloadKey}
                   prefix="secrets"
@@ -244,7 +244,7 @@ export default function Config() {
               ) },
             {
               key: "plugin-tls-credentials",
-              label: "Plugin TLS credentials",
+              label: t("plugin_tls.title"),
               render: () => <PluginTlsCredentials />,
             },
           ]}

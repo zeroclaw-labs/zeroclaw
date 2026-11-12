@@ -1009,7 +1009,83 @@ struct PluginTlsCredential {
     profiles: std::collections::BTreeMap<String, Vec<String>>,
 }
 
-fn plugin_tls_credentials(config: &zeroclaw_config::schema::Config) -> Vec<PluginTlsCredential> {
+type PluginTlsSlots = std::collections::HashSet<(String, String)>;
+
+#[cfg_attr(not(feature = "plugins-wasm"), allow(clippy::unused_async))]
+async fn admitted_plugin_tls_slots(
+    config: &zeroclaw_config::schema::Config,
+) -> Option<PluginTlsSlots> {
+    #[cfg(not(feature = "plugins-wasm"))]
+    {
+        let _ = config;
+        Some(PluginTlsSlots::new())
+    }
+    #[cfg(feature = "plugins-wasm")]
+    {
+        use zeroclaw_plugins::{host::PluginHost, instance::PluginInstanceId};
+
+        static DISCOVERY: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+        let permit = DISCOVERY.try_acquire().ok()?;
+        let directory = config.plugins.resolved_plugins_dir();
+        let mode = PluginHost::resolve_signature_mode(&config.plugins.security.signature_mode);
+        let keys = config.plugins.security.trusted_publisher_keys.clone();
+        let instances: Vec<_> = config
+            .plugins
+            .entries
+            .iter()
+            .filter(|entry| !entry.tls_profiles.is_empty())
+            .filter_map(|entry| {
+                Some((
+                    entry.name.clone(),
+                    PluginInstanceId::from_config_entry_key(&entry.name)?,
+                ))
+            })
+            .collect();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            if instances.is_empty() || !directory.try_exists().ok()? {
+                return Some(PluginTlsSlots::new());
+            }
+            let host = PluginHost::from_plugins_dir_with_security(&directory, mode, keys).ok()?;
+            let mut slots = PluginTlsSlots::new();
+            for (key, id) in instances {
+                let Some(manifest) = host.manifest(id.package()) else {
+                    continue;
+                };
+                if !matches!(
+                    id.capability(),
+                    zeroclaw_plugins::PluginCapability::Tool
+                        | zeroclaw_plugins::PluginCapability::Channel
+                ) || !manifest.capabilities.contains(&id.capability())
+                {
+                    continue;
+                }
+                if let Some(properties) = manifest
+                    .config_schema
+                    .as_ref()
+                    .and_then(|schema| schema.get("properties"))
+                    .and_then(serde_json::Value::as_object)
+                {
+                    for (name, schema) in properties {
+                        if schema.get("x-secret").and_then(serde_json::Value::as_bool) == Some(true)
+                        {
+                            slots.insert((key.clone(), name.clone()));
+                        }
+                    }
+                }
+            }
+            Some(slots)
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+}
+
+fn plugin_tls_credentials(
+    config: &zeroclaw_config::schema::Config,
+    slots: &PluginTlsSlots,
+) -> Vec<PluginTlsCredential> {
     let mut credentials = std::collections::BTreeMap::new();
     for entry in &config.plugins.entries {
         for profile in &entry.tls_profiles {
@@ -1021,6 +1097,9 @@ fn plugin_tls_credentials(config: &zeroclaw_config::schema::Config) -> Vec<Plugi
             .into_iter()
             .flatten()
             {
+                if !slots.contains(&(entry.name.clone(), property.clone())) {
+                    continue;
+                }
                 let credential = credentials
                     .entry((&entry.name, property))
                     .or_insert_with(|| PluginTlsCredential {
@@ -1060,9 +1139,15 @@ pub async fn list_plugin_tls_credentials(
             return denied.into_response();
         }
         let config = guard.current_config();
+        let Some(slots) = admitted_plugin_tls_slots(&config).await else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        if let Err(denied) = crate::principal_gate::require_config_operator(&principal, &guard) {
+            return denied.into_response();
+        }
         Json(serde_json::json!({
             "encryption_enabled": config.secrets.encrypt,
-            "credentials": plugin_tls_credentials(&config)
+            "credentials": plugin_tls_credentials(&config, &slots)
         }))
         .into_response()
     }
@@ -1113,6 +1198,12 @@ async fn mutate_plugin_tls_credential_inner(
     let mut config = guard.current_config();
     if !config.secrets.encrypt {
         return StatusCode::PRECONDITION_FAILED.into_response();
+    }
+    let Some(slots) = admitted_plugin_tls_slots(&config).await else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    if !slots.contains(&(mutation.instance.clone(), mutation.property.clone())) {
+        return StatusCode::NOT_FOUND.into_response();
     }
     let Some(entry) = config
         .plugins
