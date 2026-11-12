@@ -1653,8 +1653,6 @@ pub async fn run_gateway_with_plugin_webhooks(
         (Some(agent_alias), Some((risk_profile, security))) => {
             match {
                 let registry_config = Arc::new(config.clone());
-                let registry_environment: Option<zeroclaw_runtime::tools::ForwardedEnvironment> =
-                    None;
                 let registry_runtime: std::sync::Arc<
                     dyn zeroclaw_config::platform::RuntimeAdapter,
                 > = Arc::clone(&runtime);

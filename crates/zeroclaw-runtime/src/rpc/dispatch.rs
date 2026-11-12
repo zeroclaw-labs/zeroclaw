@@ -10134,7 +10134,7 @@ impl RpcDispatcher {
                 .map(|comment| {
                     (
                         config.config_path.clone(),
-                        vec![(effective_prop.clone(), comment.clone())],
+                        vec![(req.prop.clone(), comment.clone())],
                     )
                 }),
             ..RpcConfigCommitEffects::default()

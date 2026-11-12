@@ -4346,7 +4346,7 @@ mod tests {
             "ollama",
             None,
             &ModelProviderRuntimeOptions {
-                provider_api_url: Some((&base_url).to_string()),
+                provider_api_url: Some(base_url.to_string()),
                 ..Default::default()
             },
         )
@@ -4406,7 +4406,7 @@ mod tests {
             "ollama",
             None,
             &ModelProviderRuntimeOptions {
-                provider_api_url: Some((&base_url).to_string()),
+                provider_api_url: Some(base_url.to_string()),
                 ..Default::default()
             },
         )
@@ -5616,7 +5616,7 @@ mod tests {
             "crusoe",
             Some("cr_test-key"),
             &ModelProviderRuntimeOptions {
-                provider_api_url: Some((&base_url).to_string()),
+                provider_api_url: Some(base_url.to_string()),
                 ..Default::default()
             },
         )
@@ -5658,7 +5658,7 @@ mod tests {
             "crusoe",
             Some("cr_test-key"),
             &ModelProviderRuntimeOptions {
-                provider_api_url: Some((&base_url).to_string()),
+                provider_api_url: Some(base_url.to_string()),
                 ..Default::default()
             },
         )
