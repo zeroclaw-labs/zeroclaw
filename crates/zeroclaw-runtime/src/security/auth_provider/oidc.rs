@@ -259,7 +259,7 @@ fn oauth_basic_authorization(client_id: &str, secret: &str) -> String {
 /// and every other byte becomes `%XX`. This matches the `x-www-form-urlencoded`
 /// serialization RFC 6749 §2.3.1 (via appendix B) requires for the Basic
 /// credentials.
-fn form_urlencode_component(input: &str) -> String {
+pub(super) fn form_urlencode_component(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for &byte in input.as_bytes() {
         match byte {
@@ -866,16 +866,29 @@ impl OidcAuthProvider {
             return deny(DenyReason::MfaRequired);
         }
 
-        // A verified client_id is mandatory (RFC 9068 §2.2; the introspection
-        // contract). It keys the operator's actor declarations; the
-        // `sub`/`client_id` relationship is never consulted because
-        // service-token subjects are provider-specific (`<client>@clients`,
-        // a service-account user id, or the client id itself).
-        let Some(client_id) = claims
+        // RFC 9068 uses client_id; Keycloak also issues typed access tokens
+        // identifying the OAuth client only by signed azp. Accept that narrow
+        // JWKS interoperability spelling after signature/purpose/audience checks,
+        // never from unverified headers or subject shape. Introspection keeps
+        // its required client_id contract. Two contradictory labels fail closed.
+        let named_client = claims
             .client_id
             .as_deref()
-            .filter(|client_id| !client_id.trim().is_empty())
-        else {
+            .filter(|id| !id.trim().is_empty());
+        let party = claims.azp.as_deref().filter(|id| !id.trim().is_empty());
+        if named_client
+            .zip(party)
+            .is_some_and(|(client, party)| client != party)
+        {
+            return deny(DenyReason::BadCredential);
+        }
+        let Some(client_id) = named_client.or_else(|| {
+            if via == VerifiedVia::Jwks && claims.client_id.is_none() {
+                party
+            } else {
+                None
+            }
+        }) else {
             return deny(DenyReason::BadCredential);
         };
         let actor = match (self.declared_actor(client_id), self.actor_evidence(&raw)) {
@@ -892,6 +905,12 @@ impl OidcAuthProvider {
             // establishes the actor class, so the token authenticates nobody.
             (None, None) => return deny(DenyReason::BadCredential),
         };
+        // Keycloak also stamps azp on user tokens issued to service clients.
+        // It proves the authorized client, not machine credentials: require
+        // client_id for every service actor, whether declared or claim-derived.
+        if named_client.is_none() && actor != ActorClass::Human {
+            return deny(DenyReason::BadCredential);
+        }
         let subject = match actor {
             ActorClass::Service => IdentitySubject::Service {
                 issuer: self.config.issuer.clone(),
@@ -3125,5 +3144,166 @@ mod tests {
             PrincipalResolver::new(human_only_policy).resolve(&service_identity),
             Err(DenyReason::NotEntitled)
         ));
+    }
+    #[tokio::test]
+    async fn signed_keycloak_azp_identifies_the_declared_client_without_client_id() {
+        let idp = start_idp().await;
+        let provider = idp.provider(OidcValidation::Jwks);
+        let mut claims = idp.good_claims();
+        claims.as_object_mut().unwrap().remove("client_id");
+        claims["azp"] = serde_json::json!("zerocode-cli");
+        assert!(
+            provider
+                .verify(&bearer(idp.mint(claims.clone())))
+                .await
+                .is_allowed()
+        );
+        for client in ["undeclared-client", ""] {
+            claims["azp"] = serde_json::json!(client);
+            assert!(
+                !provider
+                    .verify(&bearer(idp.mint(claims.clone())))
+                    .await
+                    .is_allowed()
+            );
+        }
+        claims["azp"] = serde_json::json!("zerocode-cli");
+        claims["client_id"] = serde_json::json!("another-client");
+        assert!(
+            !provider
+                .verify(&bearer(idp.mint(claims.clone())))
+                .await
+                .is_allowed()
+        );
+        claims["client_id"] = serde_json::json!("");
+        assert!(
+            !provider
+                .verify(&bearer(idp.mint(claims)))
+                .await
+                .is_allowed()
+        );
+    }
+    #[tokio::test]
+    async fn azp_does_not_replace_the_introspection_client_id_contract() {
+        let idp = start_idp().await;
+        let provider = idp.provider(OidcValidation::Introspection);
+        let mut raw = idp.good_claims();
+        raw.as_object_mut().unwrap().remove("client_id");
+        raw["azp"] = serde_json::json!("zerocode-cli");
+        let claims: Claims = serde_json::from_value(raw.clone()).unwrap();
+        assert!(
+            !provider
+                .claims_to_identity(
+                    &claims,
+                    raw.as_object().unwrap().clone(),
+                    VerifiedVia::Introspection
+                )
+                .is_allowed()
+        );
+    }
+    /// Exercise the verifier and the real resolver together, with a privileged
+    /// service mapping that would make accidental service classification useful.
+    async fn assert_azp_only_cannot_receive_service_grants(
+        idp: &TestIdp,
+        config: OidcConfig,
+        mut claims: serde_json::Value,
+    ) {
+        use crate::security::principal_resolver::PrincipalResolver;
+        use zeroclaw_api::grants::ResolvedGrants;
+
+        let mut policy = resolver_policy(idp, "reporting-batch");
+        let mut service_grants = ResolvedGrants::none();
+        service_grants
+            .resources
+            .insert(Resource::Config, [Verb::Read].into());
+        policy
+            .profiles
+            .insert("service-reader".into(), service_grants);
+        policy
+            .oidc
+            .get_mut("test")
+            .unwrap()
+            .service_profile_map
+            .insert("reporting-batch".into(), "service-reader".into());
+        let resolver = PrincipalResolver::new(policy);
+        let provider = OidcAuthProvider::new("test", config).unwrap();
+
+        // A genuine client_id service token still receives its service grants.
+        claims["client_id"] = serde_json::json!("reporting-batch");
+        claims["azp"] = serde_json::json!("reporting-batch");
+        let control = provider.verify(&bearer(idp.mint(claims.clone()))).await;
+        let service = resolver
+            .resolve(control.identity().expect("client_id service verifies"))
+            .expect("client_id service resolves");
+        assert_eq!(service.principal.actor, ActorKind::Service);
+        assert!(service.grants.permits(Resource::Config, Verb::Read));
+
+        // Same signed token/role/subject, only missing client_id: azp must not
+        // reach the service profile regardless of how the actor was classified.
+        claims.as_object_mut().unwrap().remove("client_id");
+        let outcome = provider.verify(&bearer(idp.mint(claims))).await;
+        let resolved = outcome
+            .identity()
+            .ok_or(DenyReason::BadCredential)
+            .and_then(|identity| resolver.resolve(identity));
+        assert!(
+            matches!(resolved, Err(DenyReason::BadCredential)),
+            "azp-only token must never acquire service grants: {resolved:?}"
+        );
+        assert!(matches!(
+            outcome,
+            AuthOutcome::Denied {
+                reason: DenyReason::BadCredential
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn azp_only_service_client_cannot_resolve_to_service_grants() {
+        let idp = start_idp().await;
+        let mut config = idp.config(OidcValidation::Jwks);
+        config.service_clients = vec!["reporting-batch".into()];
+        assert_azp_only_cannot_receive_service_grants(&idp, config, idp.good_claims()).await;
+    }
+
+    #[tokio::test]
+    async fn azp_only_actor_claim_service_cannot_resolve_to_service_grants() {
+        let idp = start_idp().await;
+        for marks in [OidcActorKind::Service, OidcActorKind::Human] {
+            let mut config = idp.config(OidcValidation::Jwks);
+            config.actor_claim = "actor_marker".into();
+            config.actor_claim_marks = marks;
+            let mut claims = idp.good_claims();
+            // Service classification can come from presence OR absence.
+            if matches!(marks, OidcActorKind::Service) {
+                claims["actor_marker"] = serde_json::json!("service");
+            }
+            assert_azp_only_cannot_receive_service_grants(&idp, config, claims).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn azp_only_human_still_resolves_through_the_human_profile_map() {
+        use crate::security::principal_resolver::PrincipalResolver;
+        let idp = start_idp().await;
+        for actor_claim in [false, true] {
+            let mut config = idp.config(OidcValidation::Jwks);
+            if actor_claim {
+                config.interactive_clients.clear();
+                config.actor_claim = "actor_marker".into();
+                config.actor_claim_marks = OidcActorKind::Service;
+            }
+            let provider = OidcAuthProvider::new("test", config).unwrap();
+            let mut claims = idp.good_claims();
+            claims.as_object_mut().unwrap().remove("client_id");
+            claims["azp"] = serde_json::json!("zerocode-cli");
+            let outcome = provider.verify(&bearer(idp.mint(claims))).await;
+            let resolved = PrincipalResolver::new(resolver_policy(&idp, "reporting-batch"))
+                .resolve(outcome.identity().expect("azp-only human verifies"))
+                .expect("human resolves");
+            assert_eq!(resolved.principal.actor, ActorKind::Human);
+            assert!(resolved.grants.permits(Resource::Sessions, Verb::Read));
+            assert!(!resolved.grants.permits(Resource::Config, Verb::Read));
+        }
     }
 }

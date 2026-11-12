@@ -1,4 +1,4 @@
-schema_version = 3
+schema_version = 4
 
 # Ollama runs on the host. This is an endpoint, not a bearer credential.
 [providers.models.ollama.default]
@@ -28,6 +28,10 @@ web_dist_dir = "/usr/share/zeroclawlabs/web/dist"
 # Send WebSocket keepalive pings every 30 seconds; set to 0 to disable.
 # Applied when each chat WebSocket opens; reconnect clients after changing it.
 websocket_ping_interval_secs = 30
+
+# Built-in tool selection: ["*"] is full, the default; [] is minimal.
+[tools]
+optional = ["*"]
 
 # Cost tracking and budget enforcement configuration
 # Enable to track API usage costs and enforce spending limits

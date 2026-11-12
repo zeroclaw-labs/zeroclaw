@@ -773,7 +773,7 @@ pub fn config_verdict(
 /// override alike, so publisher text in it can neither steer the terminal nor
 /// reorder what it shows. Quotes and backslashes print as themselves, since
 /// the resolver's messages quote the names and paths they cite.
-fn escape_unprintable(text: &str) -> String {
+pub(crate) fn escape_unprintable(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
     for character in text.chars() {
         if matches!(character, '\'' | '"' | '\\') {
