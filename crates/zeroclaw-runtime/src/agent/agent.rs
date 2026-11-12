@@ -24174,6 +24174,70 @@ mod capability_construction_tests {
         config
     }
 
+    /// A named principal list that names `execute_pipeline`, a tool that
+    /// requires an unrestricted principal, does not hand it over. The list is
+    /// applied by name AND by the retain at assembly; a tool the list names is
+    /// dropped only by that retain, so this isolates it for `execute_pipeline`
+    /// (the list names no other unrestricted tool). Built through the
+    /// constructor, before any prompt-time posture is applied, so the retain
+    /// alone is what is observed. The same build with no principal list holds
+    /// the tool, so an absent tool cannot be a registry that never had it.
+    #[tokio::test]
+    async fn a_named_principal_list_that_names_an_unrestricted_tool_does_not_hand_it_over() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = two_provider_config(&tmp);
+        config.pipeline.enabled = true;
+        config.tools.optional.push("execute_pipeline".into());
+        let build = |principal: Option<Vec<String>>, config: Config| async move {
+            Agent::from_live_config_with_tui_env_and_principal_tools(
+                zeroclaw_config::live::LiveConfig::new(config).handle(),
+                "test-agent",
+                None,
+                false,
+                true,
+                None,
+                None,
+                None,
+                principal,
+            )
+            .await
+            .unwrap()
+        };
+
+        let control = build(None, config.clone()).await;
+        assert!(
+            control
+                .unrestricted_tool_names_for_test()
+                .contains(&"execute_pipeline"),
+            "control: with no principal list the session holds execute_pipeline; held {:?}",
+            control.tool_names()
+        );
+
+        // An ordinary tool the control holds, so the list names something the
+        // session can keep and an emptied registry cannot pass.
+        let ordinary = control
+            .tool_names()
+            .into_iter()
+            .find(|name| !control.unrestricted_tool_names_for_test().contains(name))
+            .expect("the control holds an ordinary tool")
+            .to_string();
+        let named = build(
+            Some(vec![ordinary.clone(), "execute_pipeline".to_string()]),
+            config,
+        )
+        .await;
+        assert!(
+            named.unrestricted_tool_names_for_test().is_empty(),
+            "a named principal list handed over {:?}",
+            named.unrestricted_tool_names_for_test()
+        );
+        assert!(
+            named.tool_names().contains(&ordinary.as_str()),
+            "the list's ordinary tool `{ordinary}` is kept; held {:?}",
+            named.tool_names()
+        );
+    }
+
     #[tokio::test]
     async fn public_live_capability_constructor_threads_memory_context_to_actual_parent() {
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
