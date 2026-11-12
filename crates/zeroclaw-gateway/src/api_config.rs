@@ -730,9 +730,7 @@ fn reject_masked_secret_value(
     value: &str,
 ) -> Result<(), ConfigApiError> {
     if is_sensitive
-        && (reject_masked_secret_value("", true, &value).is_err()
-            || value == "****"
-            || value.is_empty())
+        && (value == zeroclaw_config::traits::MASKED_SECRET || value == "****" || value.is_empty())
     {
         return Err(ConfigApiError::new(
             ConfigApiCode::ValidationFailed,
