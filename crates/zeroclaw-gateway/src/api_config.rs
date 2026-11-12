@@ -1014,10 +1014,11 @@ type PluginTlsSlots = std::collections::HashSet<(String, String)>;
 #[cfg_attr(not(feature = "plugins-wasm"), allow(clippy::unused_async))]
 async fn admitted_plugin_tls_slots(
     config: &zeroclaw_config::schema::Config,
+    only_instance: Option<&str>,
 ) -> Option<PluginTlsSlots> {
     #[cfg(not(feature = "plugins-wasm"))]
     {
-        let _ = config;
+        let _ = (config, only_instance);
         Some(PluginTlsSlots::new())
     }
     #[cfg(feature = "plugins-wasm")]
@@ -1033,7 +1034,9 @@ async fn admitted_plugin_tls_slots(
             .plugins
             .entries
             .iter()
-            .filter(|entry| !entry.tls_profiles.is_empty())
+            .filter(|entry| {
+                !entry.tls_profiles.is_empty() && only_instance.is_none_or(|key| key == entry.name)
+            })
             .filter_map(|entry| {
                 Some((
                     entry.name.clone(),
@@ -1046,7 +1049,8 @@ async fn admitted_plugin_tls_slots(
             if instances.is_empty() || !directory.try_exists().ok()? {
                 return Some(PluginTlsSlots::new());
             }
-            let host = PluginHost::from_plugins_dir_with_security(&directory, mode, keys).ok()?;
+            let packages = instances.iter().map(|(_, id)| id.package()).collect();
+            let host = PluginHost::from_selected_plugins(&directory, mode, keys, &packages).ok()?;
             let mut slots = PluginTlsSlots::new();
             for (key, id) in instances {
                 let Some(manifest) = host.manifest(id.package()) else {
@@ -1139,9 +1143,17 @@ pub async fn list_plugin_tls_credentials(
             return denied.into_response();
         }
         let config = guard.current_config();
-        let Some(slots) = admitted_plugin_tls_slots(&config).await else {
+        let revision = guard.published_revision();
+        drop(guard);
+        let Some(slots) = admitted_plugin_tls_slots(&config, None).await else {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         };
+        let Ok(guard) = state.begin_config_commit().await else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        if guard.published_revision() != revision {
+            return StatusCode::CONFLICT.into_response();
+        }
         if let Err(denied) = crate::principal_gate::require_config_operator(&principal, &guard) {
             return denied.into_response();
         }
@@ -1199,9 +1211,20 @@ async fn mutate_plugin_tls_credential_inner(
     if !config.secrets.encrypt {
         return StatusCode::PRECONDITION_FAILED.into_response();
     }
-    let Some(slots) = admitted_plugin_tls_slots(&config).await else {
+    let revision = guard.published_revision();
+    drop(guard);
+    let Some(slots) = admitted_plugin_tls_slots(&config, Some(&mutation.instance)).await else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let Ok(guard) = state.begin_config_commit().await else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    if let Err(denied) = crate::principal_gate::require_config_operator(principal, &guard) {
+        return denied.into_response();
+    }
+    if guard.published_revision() != revision {
+        return StatusCode::CONFLICT.into_response();
+    }
     if !slots.contains(&(mutation.instance.clone(), mutation.property.clone())) {
         return StatusCode::NOT_FOUND.into_response();
     }
