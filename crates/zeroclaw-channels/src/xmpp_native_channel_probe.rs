@@ -153,10 +153,13 @@ async fn native_omemo_actual_channel_shared_runtime_and_socket_ack() -> Result<(
         Ok::<_, anyhow::Error>(())
     })
     .await??;
+    // Publish readiness only after the JSON is complete so the poller can read it atomically.
+    let pending_report = report.with_extension("json.tmp");
     std::fs::write(
-        &report,
+        &pending_report,
         json!({"ready":true,"fixture_only":true}).to_string(),
     )?;
+    std::fs::rename(&pending_report, &report)?;
     let msg = tokio::time::timeout(Duration::from_secs(12), rx.recv())
         .await?
         .context("Channel receiver closed")?;
