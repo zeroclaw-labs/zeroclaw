@@ -5999,10 +5999,7 @@ data: {\"type\":\"message_stop\"}\n\n",
         assert!(live.snapshot().memory.consolidation_extract_facts);
 
         let config = agent.admitted_model_config().unwrap();
-        assert!(Arc::ptr_eq(
-            &zeroclaw_config::migration::admit_test_input(&config),
-            &admitted
-        ));
+        assert!(Arc::ptr_eq(&config, &admitted));
         let (_, _, model) = agent.attribution_fields();
         let (provider, model, sampling) = ws_consolidation_model(
             Arc::clone(&config),

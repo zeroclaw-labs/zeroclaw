@@ -123,10 +123,10 @@ fn project_provider_tables(
         if let Some(api_key) = base.api_key.as_deref() {
             connection["auth"] = serde_json::json!({"mode":"api_key","api_key":api_key});
         }
-        if let Some(command) = base.binary_path.as_deref() {
-            if matches!(family, "edge" | "piper") {
-                connection["api"] = serde_json::json!({"tts":{"command":command}});
-            }
+        if let Some(command) = base.binary_path.as_deref()
+            && matches!(family, "edge" | "piper")
+        {
+            connection["api"] = serde_json::json!({"tts":{"command":command}});
         }
         let mut options = serde_json::Map::new();
         for (field, value) in [
@@ -352,13 +352,12 @@ fn promote_embedding_bindings(
         {
             return Ok(None);
         }
-        if let Some(source) = current.models.get(reference) {
-            if source.capability() == Capability::Embedding
-                && model.trim().is_empty()
-                && api_key.is_none()
-            {
-                return Ok(Some(ModelRef::from(reference)));
-            }
+        if let Some(source) = current.models.get(reference)
+            && source.capability() == Capability::Embedding
+            && model.trim().is_empty()
+            && api_key.is_none()
+        {
+            return Ok(Some(ModelRef::from(reference)));
         }
         let mut connection = if let Some(source) = current.models.get(reference) {
             let connection = current
@@ -972,12 +971,11 @@ pub(crate) fn migrate_document(mut document: toml::Value) -> Result<toml::Value>
     if let Some(memory) = document
         .get_mut("memory")
         .and_then(toml::Value::as_table_mut)
+        && let Some(reference) = normalized.memory.embedding_model_ref
     {
-        if let Some(reference) = normalized.memory.embedding_model_ref {
-            memory.insert("embedding_model_ref".into(), reference.into());
-            for field in ["embedding_provider", "embedding_model", "embedding_api_key"] {
-                memory.remove(field);
-            }
+        memory.insert("embedding_model_ref".into(), reference.into());
+        for field in ["embedding_provider", "embedding_model", "embedding_api_key"] {
+            memory.remove(field);
         }
     }
     if document.get("embedding_routes").is_some() {
@@ -1092,6 +1090,31 @@ impl Config {
             model_alias: model_entry.map(|(k, _)| k.to_string()),
             model_id,
         })
+    }
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl Config {
+    /// Historical section-only injection is translated here, before any
+    /// capability consumer is constructed.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn from_transcription_input(input: &crate::schema::TranscriptionConfig) -> Self {
+        serde_json::from_value(json!({"transcription":input}))
+            .expect("valid transcription fixture input")
+    }
+    /// Historical family/alias input used by fixture-level factory adapters.
+    /// Joining this shape is config compatibility, never protocol dispatch.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn chat_registry_for_legacy_alias(
+        &self,
+        family: &str,
+        alias: &str,
+    ) -> Result<(ProviderRegistry, ModelRef)> {
+        let reference = ModelRef::from(format!("{family}.{alias}"));
+        let mut admitted = self.clone();
+        crate::migration::provider_inputs::normalize(&mut admitted)?;
+        let registry = admitted.chat_registry_for_input(None, reference.as_str())?;
+        Ok((registry, reference))
     }
 }
 
@@ -1229,30 +1252,5 @@ mod tests {
             "missing.model"
         );
         assert!(config.validate().is_err());
-    }
-}
-
-#[cfg(any(test, feature = "test-helpers"))]
-impl Config {
-    /// Historical section-only injection is translated here, before any
-    /// capability consumer is constructed.
-    #[cfg(any(test, feature = "test-helpers"))]
-    pub fn from_transcription_input(input: &crate::schema::TranscriptionConfig) -> Self {
-        serde_json::from_value(json!({"transcription":input}))
-            .expect("valid transcription fixture input")
-    }
-    /// Historical family/alias input used by fixture-level factory adapters.
-    /// Joining this shape is config compatibility, never protocol dispatch.
-    #[cfg(any(test, feature = "test-helpers"))]
-    pub fn chat_registry_for_legacy_alias(
-        &self,
-        family: &str,
-        alias: &str,
-    ) -> Result<(ProviderRegistry, ModelRef)> {
-        let reference = ModelRef::from(format!("{family}.{alias}"));
-        let mut admitted = self.clone();
-        crate::migration::provider_inputs::normalize(&mut admitted)?;
-        let registry = admitted.chat_registry_for_input(None, reference.as_str())?;
-        Ok((registry, reference))
     }
 }

@@ -1400,7 +1400,6 @@ fn carry_model_provider(
             }
         }
         visited.pop();
-        return;
     }
 }
 

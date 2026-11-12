@@ -3078,6 +3078,38 @@ pub(crate) fn toml_value_to_edit_item(value: &toml::Value) -> toml_edit::Item {
     doc.get("__v").cloned().unwrap_or(toml_edit::Item::None)
 }
 
+/// Admit an explicitly constructed historical fixture through the same input
+/// normalization as deserialization. Production consumers never call this.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn normalize_test_input(config: &mut Config) {
+    provider_inputs::normalize(config).expect("valid historical provider fixture");
+}
+
+/// An explicit input boundary for fixtures that keep their historical source
+/// mutable while exercising canonical consumers. Preserve non-serialized state.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn admit_test_input(input: &Config) -> Config {
+    let mut config = input.clone();
+    normalize_test_input(&mut config);
+    config
+}
+
+#[cfg(test)]
+/// Inspect the versioned adapter's provider output before final Config
+/// admission. This intentionally raw fixture never reaches a consumer.
+pub(crate) fn migrated_provider_input_fixture(input: &str) -> Result<Config> {
+    let (document, _) = migrate_value(input)?;
+    let providers = document
+        .get("providers")
+        .cloned()
+        .map(toml::Value::try_into)
+        .transpose()?
+        .unwrap_or_default();
+    let mut config: Config = document.try_into()?;
+    config.providers = providers;
+    Ok(config)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9467,36 +9499,4 @@ model = "backup"
             "a moved identity is not reported as removed: {notices:?}"
         );
     }
-}
-
-/// Admit an explicitly constructed historical fixture through the same input
-/// normalization as deserialization. Production consumers never call this.
-#[cfg(any(test, feature = "test-helpers"))]
-pub fn normalize_test_input(config: &mut Config) {
-    provider_inputs::normalize(config).expect("valid historical provider fixture");
-}
-
-/// An explicit input boundary for fixtures that keep their historical source
-/// mutable while exercising canonical consumers. Preserve non-serialized state.
-#[cfg(any(test, feature = "test-helpers"))]
-pub fn admit_test_input(input: &Config) -> Config {
-    let mut config = input.clone();
-    normalize_test_input(&mut config);
-    config
-}
-
-#[cfg(test)]
-/// Inspect the versioned adapter's provider output before final Config
-/// admission. This intentionally raw fixture never reaches a consumer.
-pub(crate) fn migrated_provider_input_fixture(input: &str) -> Result<Config> {
-    let (document, _) = migrate_value(input)?;
-    let providers = document
-        .get("providers")
-        .cloned()
-        .map(toml::Value::try_into)
-        .transpose()?
-        .unwrap_or_default();
-    let mut config: Config = document.try_into()?;
-    config.providers = providers;
-    Ok(config)
 }
