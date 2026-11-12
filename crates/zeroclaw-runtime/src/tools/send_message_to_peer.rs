@@ -653,12 +653,24 @@ pub fn render_sender_peer_map_for_channel(
         };
 
         let group_names = group_names_for_channel(config, sender_alias, &channel_key);
-        let agent_peers = agent_peers_for_current_channel(
+        let agent_peers: Vec<String> = agent_peers_for_current_channel(
             config,
             resolved.agent_peers.get(&channel_key),
             current_channel_ref,
-        );
-        let external_peers = set_values(resolved.external_peers.get(&channel_key));
+        )
+        .into_iter()
+        .filter(|peer| {
+            !resolved.is_ignored(&channel_key, peer)
+                && !resolved.is_ignored(current_channel_ref, peer)
+        })
+        .collect();
+        let external_peers: Vec<String> = set_values(resolved.external_peers.get(&channel_key))
+            .into_iter()
+            .filter(|peer| {
+                !resolved.is_ignored(&channel_key, peer)
+                    && !resolved.is_ignored(current_channel_ref, peer)
+            })
+            .collect();
 
         rows.push(format!(
             "- Channel scope {}: {channel_hint}; peer groups: {}; agent peers: {}; external peers: {}.",
