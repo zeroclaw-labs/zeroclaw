@@ -151,16 +151,17 @@ fn config_toml_roundtrip_preserves_agent_config() {
 #[test]
 fn config_toml_roundtrip_preserves_memory_config() {
     let mut config = Config::default();
-    config.memory.embedding_provider = "openai".into();
-    config.memory.embedding_model = "text-embedding-3-small".into();
+    config.memory.embedding_model_ref = Some("embedding.openai".into());
     config.memory.vector_weight = 0.8;
     config.memory.keyword_weight = 0.2;
 
     let toml_str = toml::to_string(&config).expect("config should serialize to TOML");
     let parsed: Config = toml::from_str(&toml_str).expect("TOML should deserialize back");
 
-    assert_eq!(parsed.memory.embedding_provider, "openai");
-    assert_eq!(parsed.memory.embedding_model, "text-embedding-3-small");
+    assert_eq!(
+        parsed.memory.embedding_model_ref.as_deref(),
+        Some("embedding.openai")
+    );
     assert!((parsed.memory.vector_weight - 0.8).abs() < f64::EPSILON);
     assert!((parsed.memory.keyword_weight - 0.2).abs() < f64::EPSILON);
 }
@@ -198,18 +199,13 @@ fn config_file_write_read_roundtrip() {
     let parsed = zeroclaw::config::migration::migrate_to_current(&read_back)
         .expect("TOML should round-trip through migration");
 
-    assert!(
-        parsed.providers.models.find("mistral", "default").is_some(),
-        "mistral.default entry should survive round-trip"
-    );
-    assert_eq!(
-        parsed
-            .providers
-            .models
-            .find("mistral", "default")
-            .and_then(|e| e.model.as_deref()),
-        Some("mistral-large")
-    );
+    let model_ref = zeroclaw_config::provider_registry::ModelRef::from("mistral.default");
+    let model = parsed
+        .providers
+        .models
+        .canonical_model(&model_ref)
+        .expect("mistral.default entry should survive round-trip");
+    assert_eq!(model.upstream_model(), Some("mistral-large"));
     assert_eq!(
         parsed
             .agents

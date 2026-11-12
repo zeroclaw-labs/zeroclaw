@@ -22,8 +22,7 @@ mod tests {
         AgentMemoryConfig, AgentWorkspaceConfig, MemoryBackendKind,
     };
     use zeroclaw_config::schema::{
-        AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig,
-        PeripheralBoardConfig, RiskProfileConfig, RuntimeProfileConfig,
+        AliasedAgentConfig, Config, PeripheralBoardConfig, RiskProfileConfig, RuntimeProfileConfig,
     };
     use zeroclaw_runtime::composition::{
         ChannelSource, MemoryRequest, MemorySource, NativeRecipeInputs, NativeRegistryRecipe,
@@ -397,16 +396,17 @@ mod tests {
         c.memory.auto_save = false;
         c.memory.response_cache_enabled = false;
         c.channels.session_backend = "sqlite".into();
-        c.providers.models.custom.insert(
-            "consumer".into(),
-            CustomModelProviderConfig {
-                base: ModelProviderConfig {
-                    uri: None,
-                    model: Some("consumer-model".into()),
-                    ..ModelProviderConfig::default()
-                },
-            },
-        );
+        c.providers = serde_json::from_value(serde_json::json!({
+            "connections": {"consumer": {"kind": "custom"}},
+            "models": {
+                "custom.consumer": {
+                    "capability": "chat",
+                    "provider": "consumer",
+                    "model": "consumer-model"
+                }
+            }
+        }))
+        .unwrap();
         // Unrestricted discovery is deliberate: a restrictive allowlist could hide native construction.
         c.risk_profiles.insert(
             "consumer".into(),

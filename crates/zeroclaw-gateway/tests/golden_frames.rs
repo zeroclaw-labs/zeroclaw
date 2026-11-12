@@ -58,8 +58,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use zeroclaw_config::multi_agent::{AgentMemoryConfig, AgentWorkspaceConfig, MemoryBackendKind};
 use zeroclaw_config::schema::{
-    AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig, RiskProfileConfig,
-    RuntimeProfileConfig,
+    AliasedAgentConfig, Config, RiskProfileConfig, RuntimeProfileConfig,
 };
 
 const RECORD_ENV: &str = "ZEROCLAW_GOLDEN_RECORD";
@@ -275,18 +274,24 @@ fn fixture_config(root: &Path, provider_url: &str) -> Config {
     config.memory.response_cache_enabled = false;
     config.reliability.provider_retries = 0;
     config.reliability.provider_backoff_ms = 0;
-    config.providers.models.custom.insert(
-        "fixture".to_string(),
-        CustomModelProviderConfig {
-            base: ModelProviderConfig {
-                api_key: Some("golden-test-key".to_string()),
-                uri: Some(provider_url.to_string()),
-                model: Some("fixture-model".to_string()),
-                temperature: Some(0.0),
-                ..ModelProviderConfig::default()
-            },
+    config.providers = serde_json::from_value(json!({
+        "connections": {
+            "fixture": {
+                "kind": "custom",
+                "uri": provider_url,
+                "auth": {"mode": "api_key", "api_key": "golden-test-key"}
+            }
         },
-    );
+        "models": {
+            "custom.fixture": {
+                "capability": "chat",
+                "provider": "fixture",
+                "model": "fixture-model",
+                "options": {"temperature": 0.0}
+            }
+        }
+    }))
+    .expect("canonical golden provider fixture");
     config.risk_profiles.insert(
         "fixture".to_string(),
         RiskProfileConfig {

@@ -12354,6 +12354,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                     println!("  {:<19} {}{}{}", p.name, p.display_name, local_tag, marker);
                 }
             }
+            // i18n-exempt: literal config syntax example
             println!(
                 "\n  Set kind and uri under [providers.connections.<key>], then bind a capability model under [providers.models.\"<model-ref>\"]." // i18n-exempt: literal config syntax example
             );

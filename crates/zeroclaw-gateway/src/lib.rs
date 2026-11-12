@@ -1652,7 +1652,7 @@ pub async fn run_gateway_with_plugin_webhooks(
 
     let (tools_registry_raw, _delegate_handle_gw) = match (&agent_alias_opt, agent_setup) {
         (Some(agent_alias), Some((risk_profile, security))) => {
-            match {
+            let all_tools_result = {
                 let registry_config = Arc::new(config.clone());
                 let registry_runtime: std::sync::Arc<
                     dyn zeroclaw_config::platform::RuntimeAdapter,
@@ -1673,7 +1673,8 @@ pub async fn run_gateway_with_plugin_webhooks(
                 registry_inputs.sop_engine = sop_engine.clone();
                 registry_inputs.sop_audit = sop_audit.clone();
                 zeroclaw_runtime::tools::build_native_registry(registry_inputs, &risk_profile)
-            } {
+            };
+            match all_tools_result {
                 Ok(all_tools_result) => {
                     let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
                         config: &config,
@@ -1800,7 +1801,7 @@ pub async fn run_gateway_with_plugin_webhooks(
                 continue;
             }
         };
-        let agent_tools_result = match {
+        let agent_tools_result = {
             let registry_config = Arc::new(config.clone());
             let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
                 Arc::clone(&runtime);
@@ -1820,7 +1821,8 @@ pub async fn run_gateway_with_plugin_webhooks(
             registry_inputs.sop_engine = sop_engine.clone();
             registry_inputs.sop_audit = sop_audit.clone();
             zeroclaw_runtime::tools::build_native_registry(registry_inputs, &risk_profile)
-        } {
+        };
+        let agent_tools_result = match agent_tools_result {
             Ok(result) => result,
             Err(e) => {
                 ::zeroclaw_log::record!(

@@ -908,12 +908,7 @@ mod tests {
             },
         );
 
-        let channel = channel(
-            "frontdoor",
-            VoiceWakeConfig::default(),
-            TranscriptionConfig::default(),
-        )
-        .with_transcription_manager_factory(move || {
+        let channel = VoiceWakeChannel::new("frontdoor", VoiceWakeConfig::default(), move || {
             TranscriptionManager::from_config_with_provider(
                 &runtime_config,
                 "local_whisper.office".to_string(),
