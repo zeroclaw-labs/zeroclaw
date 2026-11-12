@@ -892,6 +892,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'quickstart.agent_title': "Agent",
     'quickstart.alias': "alias",
     'quickstart.alias_label': "Alias",
+    'quickstart.alias_help': "The exact registry key is provider kind + '.' + alias; dots inside the alias remain part of the key.",
     'quickstart.all_channels_staged': "Every available channel has a peer-group staged.",
     'quickstart.already_exists': "already exists.",
     'quickstart.channel_label': "Channel",

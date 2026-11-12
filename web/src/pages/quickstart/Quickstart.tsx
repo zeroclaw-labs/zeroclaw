@@ -846,7 +846,12 @@ function ProviderForm({
         </select>
       </label>
 
-      <LabeledInput label={t("quickstart.alias")} value={alias} onChange={setAlias} />
+      <LabeledInput
+        label={t("quickstart.alias")}
+        help={t("quickstart.alias_help")}
+        value={alias}
+        onChange={setAlias}
+      />
 
       <label className="block">
         <div className="text-xs uppercase tracking-wider mb-1" style={MUTED}>
