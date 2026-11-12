@@ -17219,13 +17219,13 @@ pub struct TelegramConfig {
     #[serde(default)]
     pub unauthorized_message: Option<String>,
     /// Numeric chat ID where the bot delivers a short heads-up whenever it
-    /// turns an unauthorized sender away — typically the operator's DM with
+    /// turns an unauthorized sender away, typically the operator's DM with
     /// the bot. The notice names the sender identity and the source chat and
     /// carries a bounded preview of the turned-away message plus the same
     /// authorization hint the sender received, so the operator learns about
     /// unapproved callers even when the public stub is all a group sees.
     /// Unset (default): no owner notification. A value equal to the
-    /// sender's own chat is ignored — the public notice already reaches it.
+    /// sender's own chat is ignored: the public notice already reaches it.
     #[tab(Behavior)]
     #[serde(default)]
     pub owner_chat_id: Option<String>,
