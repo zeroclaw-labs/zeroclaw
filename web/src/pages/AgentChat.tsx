@@ -793,6 +793,9 @@ export function AgentChatInner({
             aria-pressed={keepThinkingCollapsed}
             className="aria-pressed:border-pc-accent aria-pressed:bg-pc-accent/10"
           >
+            {/* A check while on, so the pressed state doesn't rely on the
+                accent colour alone. */}
+            {keepThinkingCollapsed && <Check className="h-3 w-3" />}
             <Brain className="h-3 w-3" />
             {t('agent.thinking_keep_collapsed')}
           </Button>
