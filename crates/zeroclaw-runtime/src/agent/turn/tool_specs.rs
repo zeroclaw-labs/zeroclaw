@@ -24,18 +24,18 @@ impl IterationToolSpecs {
         text_tool_calls_disabled: bool,
         extract_text_reasoning: bool,
     ) -> bool {
-        let text = zeroclaw_providers::response::normalize_text(
+        let text_tool_calls = zeroclaw_providers::response::count_text_tool_calls(
             response.text_or_empty(),
             zeroclaw_api::TextExtraction {
                 reasoning: extract_text_reasoning,
-                tool_calls: false,
+                tool_calls: !text_tool_calls_disabled,
             },
         );
         exceeds_single_tool_round(
-            &text,
             response.tool_calls.len(),
             !self.tool_specs.is_empty(),
             text_tool_calls_disabled,
+            text_tool_calls,
         )
     }
 
@@ -76,10 +76,10 @@ impl IterationToolSpecs {
 }
 
 pub(super) fn exceeds_single_tool_round(
-    text: &str,
     native_calls: usize,
     has_tools: bool,
     text_tool_calls_disabled: bool,
+    text_tool_calls: usize,
 ) -> bool {
     if native_calls > 0 {
         return native_calls > 1;
@@ -87,12 +87,7 @@ pub(super) fn exceeds_single_tool_round(
     if !has_tools || text_tool_calls_disabled {
         return false;
     }
-    let text = zeroclaw_tool_call_parser::strip_trailing_terminal_markers(text);
-    !zeroclaw_tool_call_parser::looks_like_tool_protocol_example(&text)
-        && zeroclaw_tool_call_parser::parse_tool_calls_from_text(&text)
-            .1
-            .len()
-            > 1
+    text_tool_calls > 1
 }
 
 pub(crate) fn build_iteration_tool_specs(

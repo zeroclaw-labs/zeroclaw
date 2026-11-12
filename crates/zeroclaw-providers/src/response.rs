@@ -26,6 +26,21 @@ pub fn normalize_text(text: &str, policy: TextExtraction) -> String {
     strip_trailing_terminal_markers(&text)
 }
 
+/// Count text-encoded tool calls after applying the same response-boundary
+/// normalization used by provider adapters. Runtime may use the count for
+/// turn policy decisions, but it does not need to know the wire parser or
+/// terminal-marker rules.
+pub fn count_text_tool_calls(text: &str, policy: TextExtraction) -> usize {
+    if !policy.tool_calls {
+        return 0;
+    }
+    let text = normalize_text(text, policy);
+    if looks_like_tool_protocol_example(&text) {
+        return 0;
+    }
+    parse_tool_calls_from_text(&text).1.len()
+}
+
 pub struct InterpretedText {
     pub text: String,
     pub parsed_text: String,
@@ -99,5 +114,30 @@ mod tests {
             },
         );
         assert!(response.is_semantically_empty_terminal());
+    }
+
+    #[test]
+    fn text_tool_call_count_owns_wire_parser_policy() {
+        let text = r#"<think>internal</think><tool_call>{"name":"one","arguments":{}}</tool_call><tool_call>{"name":"two","arguments":{}}</tool_call>"#;
+        assert_eq!(
+            count_text_tool_calls(
+                text,
+                TextExtraction {
+                    reasoning: true,
+                    tool_calls: true,
+                },
+            ),
+            2
+        );
+        assert_eq!(
+            count_text_tool_calls(
+                text,
+                TextExtraction {
+                    reasoning: true,
+                    tool_calls: false,
+                },
+            ),
+            0
+        );
     }
 }

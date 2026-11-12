@@ -41,15 +41,6 @@ impl Config {
         Ok(())
     }
 
-    /// Optional credential inherited by consumers that support an agent-key
-    /// fallback. Explicit embedding/tool credentials retain their precedence.
-    pub fn agent_model_api_key(&self, agent: &str) -> Option<String> {
-        let reference = self.agent(agent)?.model_provider.as_str();
-        let registry = self.provider_registry().ok()?;
-        let selected = registry.resolve_chat(&reference.into()).ok()?;
-        selected.selection.connection.api_key().map(str::to_owned)
-    }
-
     /// Resolve Gemini OAuth client input at the config boundary. New auth
     /// profiles select an exact connection or model key. Historical input
     /// has already been normalized before configuration admission.
@@ -317,16 +308,6 @@ mod tests {
                 .is_err()
         );
         assert!(config.chat_registry_for_input(None, "audio.ref").is_err());
-    }
-
-    #[test]
-    fn agent_key_inheritance_uses_the_exact_selected_connection() {
-        let config = fixture();
-        assert_eq!(
-            config.agent_model_api_key("agent").as_deref(),
-            Some("fixture-key")
-        );
-        assert_eq!(config.agent_model_api_key("absent"), None);
     }
 
     #[test]

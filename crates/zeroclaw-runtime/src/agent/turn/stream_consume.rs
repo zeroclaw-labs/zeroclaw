@@ -249,10 +249,16 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
             Err(err) => {
                 if policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single
                     && super::tool_specs::exceeds_single_tool_round(
-                        &outcome.response_text,
                         outcome.tool_calls.len(),
                         request_tools.is_some_and(|tools| !tools.is_empty()),
                         text_tool_calls_disabled,
+                        zeroclaw_providers::response::count_text_tool_calls(
+                            &outcome.response_text,
+                            zeroclaw_api::TextExtraction {
+                                reasoning: false,
+                                tool_calls: !text_tool_calls_disabled,
+                            },
+                        ),
                     )
                 {
                     return Err(SingleToolRoundViolation {
