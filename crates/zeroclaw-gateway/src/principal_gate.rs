@@ -1288,6 +1288,7 @@ mod tests {
                 client_certificate_secret: None,
                 client_private_key_secret: None,
             }],
+            config: HashMap::from([("unrelated".into(), "synthetic-neighbor".into())]),
             ..PluginEntryConfig::default()
         });
         let router = router_for(config);
@@ -1356,6 +1357,8 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["credentials"][0]["configured"], true);
         assert!(!body.to_string().contains("synthetic-credential"));
+        let first: toml::Value = toml::from_str(&disk).unwrap();
+        let neighbor = first["plugins"]["entries"][0]["config"]["unrelated"].clone();
         let replace = serde_json::json!({
             "instance": instance, "property": property,
             "operation": "replace", "value": "rotated-synthetic-credential"
@@ -1374,6 +1377,11 @@ mod tests {
         let disk = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
         let config: toml::Value = toml::from_str(&disk).unwrap();
         let entry = &config["plugins"]["entries"][0];
+        assert_eq!(entry["config"]["unrelated"], neighbor);
+        assert_eq!(
+            entry["tls_profiles"][0]["custom_ca_secret"].as_str(),
+            Some(property)
+        );
         assert!(
             entry
                 .get("config")

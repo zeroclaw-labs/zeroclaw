@@ -1153,7 +1153,14 @@ async fn mutate_plugin_tls_credential_inner(
         }
         _ => return StatusCode::CONFLICT.into_response(),
     };
-    let path = format!("plugins.entries.{}.config", mutation.instance);
+    // A single dirty leaf preserves neighboring values and their references.
+    if mutation.instance.contains('.') {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let path = format!(
+        "plugins.entries.{}.config.{}",
+        mutation.instance, mutation.property
+    );
     if let Some(value) = value {
         if value.trim().is_empty()
             || value.len() > 32 * 1024
