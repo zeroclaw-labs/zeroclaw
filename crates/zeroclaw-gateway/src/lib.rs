@@ -175,7 +175,6 @@ use zeroclaw_runtime::security::pairing::{
     GATEWAY_ADMIN_TOKEN_HEADER, PairingCodePolicy, PairingGuard, PairingLimits, constant_time_eq,
     gateway_admin_token_path, is_public_bind,
 };
-use zeroclaw_runtime::tools;
 use zeroclaw_runtime::tools::CanvasStore;
 use zeroclaw_runtime::tools::scoped;
 

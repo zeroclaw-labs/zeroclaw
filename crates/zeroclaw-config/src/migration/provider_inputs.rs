@@ -235,22 +235,21 @@ fn providers_for_input(config: &Config) -> Result<crate::providers::Providers> {
         // admitted connection before the retired table is discarded.
         if let Some(model) = providers.models.canonical_model(&key) {
             let path = format!("decision_models.{alias}.api_key");
-            if config.env_overridden_paths.contains(&path) {
-                if let Some(api_key) = legacy.api_key.as_deref() {
-                    if let Some(connection) = providers.connections.get_mut(model.provider()) {
-                        let mut value = serde_json::to_value(&*connection)?;
-                        let Some(object) = value.as_object_mut() else {
-                            continue;
-                        };
-                        let auth = object.entry("auth").or_insert_with(|| json!({}));
-                        let Some(auth) = auth.as_object_mut() else {
-                            continue;
-                        };
-                        auth.insert("mode".into(), json!("api_key"));
-                        auth.insert("api_key".into(), json!(api_key));
-                        *connection = serde_json::from_value(value)?;
-                    }
-                }
+            if config.env_overridden_paths.contains(&path)
+                && let Some(api_key) = legacy.api_key.as_deref()
+                && let Some(connection) = providers.connections.get_mut(model.provider())
+            {
+                let mut value = serde_json::to_value(&*connection)?;
+                let Some(object) = value.as_object_mut() else {
+                    continue;
+                };
+                let auth = object.entry("auth").or_insert_with(|| json!({}));
+                let Some(auth) = auth.as_object_mut() else {
+                    continue;
+                };
+                auth.insert("mode".into(), json!("api_key"));
+                auth.insert("api_key".into(), json!(api_key));
+                *connection = serde_json::from_value(value)?;
             }
             continue;
         }

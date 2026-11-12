@@ -16859,9 +16859,10 @@ async fn handle_models_set(config: &mut Config, model: &str) -> Result<()> {
         })
         .ok_or_else(|| anyhow::Error::msg("No model provider configured"))?;
     zeroclaw_config::provider_registry::editor::update(config, |registry| {
+        let reference_key = zeroclaw_config::provider_registry::ModelRef::from(reference.as_str());
         let selected = registry
             .models
-            .get_mut(&reference.as_str().into())
+            .get_mut(&reference_key)
             .ok_or_else(|| anyhow::Error::msg("Selected model does not exist"))?;
         let zeroclaw_config::provider_registry::ModelDefinition::Chat(selected) = selected else {
             anyhow::bail!("Selected model is not a chat model");

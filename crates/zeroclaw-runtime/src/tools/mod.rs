@@ -197,13 +197,16 @@ pub const REENTRANT_AGENT_TOOLS: &[&str] = &[SpawnSubagentTool::NAME, DelegateTo
 
 use crate::platform::{NativeRuntime, RuntimeAdapter};
 use crate::security::{Sandbox, SecurityPolicy, create_sandbox};
+#[cfg(test)]
 use crate::sop::engine::SopEngine;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 #[cfg(test)]
 use std::ffi::OsStr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 use zeroclaw_api::memory_traits::{
     ExportFilter, MemoryCategory, MemoryEntry, MemoryStats, PrincipalScope, ProceduralMessage,
     StoreOptions,
@@ -5834,7 +5837,6 @@ permissions = ["http_client"]
             ..BrowserConfig::default()
         };
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
-        let cfg = test_config(&tmp);
 
         let tools = {
             let registry_config = Arc::new(Config::default());
@@ -5895,7 +5897,6 @@ permissions = ["http_client"]
             ..BrowserConfig::default()
         };
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
-        let cfg = test_config(&tmp);
 
         // Build a minimal SOP engine — no sops_dir needed for this test.
         let engine = Arc::new(Mutex::new(SopEngine::new(
@@ -6372,7 +6373,6 @@ permissions = ["http_client"]
         let mem: Arc<dyn Memory> =
             Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
 
-        let cfg = test_config(&tmp);
         let browser = BrowserConfig::default();
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
         let web = zeroclaw_config::schema::WebFetchConfig::default();
@@ -6537,7 +6537,6 @@ permissions = ["http_client"]
             other => panic!("expected WaitApproval, got {other:?}"),
         };
         let shared_engine = Arc::new(Mutex::new(engine));
-        let cfg = test_config(&tmp);
         let browser = BrowserConfig::default();
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
         let web = zeroclaw_config::schema::WebFetchConfig::default();
@@ -7049,7 +7048,6 @@ permissions = ["http_client"]
             ..BrowserConfig::default()
         };
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
-        let cfg = test_config(&tmp);
 
         let tools = {
             let registry_config = Arc::new(Config::default());
@@ -7584,7 +7582,6 @@ permissions = ["http_client"]
 
         let browser = BrowserConfig::default();
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
-        let cfg = test_config(&tmp);
 
         let mut agents = HashMap::new();
         agents.insert(
@@ -7652,7 +7649,6 @@ permissions = ["http_client"]
 
         let browser = BrowserConfig::default();
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
-        let cfg = test_config(&tmp);
 
         let tools = {
             let registry_config = Arc::new(Config::default());
