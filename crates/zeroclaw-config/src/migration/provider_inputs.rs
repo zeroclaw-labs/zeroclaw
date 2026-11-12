@@ -1311,21 +1311,27 @@ mod tests {
 
     #[test]
     fn decision_env_credentials_override_colliding_canonical_connection() {
-        let mut config: Config = toml::from_str(
-            r#"
-            [decision_models.shared]
-            api_key = "disk-fixture-key"
-
-            [providers.connections.native]
-            kind = "openai"
-
-            [providers.models.shared]
-            capability = "decision"
-            provider = "native"
-            model = "native-decision"
-        "#,
-        )
-        .unwrap();
+        let mut config = Config::default();
+        config.decision_models.insert(
+            "shared".into(),
+            crate::schema::SopDecisionModelConfig {
+                api_key: Some("disk-fixture-key".into()),
+                ..Default::default()
+            },
+        );
+        config.providers.connections.insert(
+            "native".into(),
+            serde_json::from_value(json!({"kind": "openai"})).unwrap(),
+        );
+        config.providers.models.insert_canonical_model(
+            "shared".into(),
+            serde_json::from_value(json!({
+                "capability": "decision",
+                "provider": "native",
+                "model": "native-decision"
+            }))
+            .unwrap(),
+        );
         let path = "decision_models.shared.api_key";
         let saved = crate::env_overrides::raw_value_for_path(&config, path).unwrap();
         config.decision_models.get_mut("shared").unwrap().api_key = Some("env-fixture-key".into());
