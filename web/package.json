@@ -53,14 +53,14 @@
     "@types/react-dom": "^19.0.3",
     "@types/react-test-renderer": "^19.1.0",
     "@vitejs/plugin-react": "^6.0.2",
-    "happy-dom": "^20.11.6",
+    "happy-dom": "^21.0.4",
     "jiti": "^2.7.0",
     "openapi-typescript": "^7.13.0",
     "rollup": "^4.59.0",
     "react-test-renderer": "19.2.4",
     "tailwindcss": "^4.0.0",
     "typescript": "~5.7.2",
-    "vite": "^8.0.16"
+    "vite": "^8.3.5"
   },
   "overrides": {
     "@redocly/openapi-core": "1.34.7",
