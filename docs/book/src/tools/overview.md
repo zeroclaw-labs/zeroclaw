@@ -141,13 +141,21 @@ The following built-in capabilities are available when compiled and selected, wh
 | `glob_search` | List files matching a glob pattern within the workspace |
 | `content_search` | Search file contents by regex within the workspace (ripgrep with grep fallback) |
 | `http_request` | HTTP GET/POST/PUT/DELETE/PATCH/HEAD/OPTIONS to allowlisted domains |
-| `web_search_tool` | Web search. Provider is configurable: DuckDuckGo (default, no key), Brave, Tavily, SearXNG, Jina, Bocha, AnySearch, Serply, or Keenable (no key required; optional key lifts rate limits) |
+| `web_search_tool` | Web search. Provider is configurable: DuckDuckGo (default, no key), Brave, Tavily, SearXNG, Jina, Bocha, AnySearch, Serply, Parallel (no key required), or Keenable (no key required; optional key lifts rate limits) |
 | `web_fetch` | Fetch a page and return clean plain text |
 | `browser` | Headless-browser automation. Opt-in: requires `[browser] automation_enabled = true`. See [Browser automation](./browser.md) |
 | `memory_recall` | Search long-term memory for relevant facts, preferences, or context |
 | `memory_store` | Store a fact, preference, or note in long-term memory |
 | `ask_user` | Send a question to the active channel and wait for a reply. Supports optional `choices` for structured responses (inline keyboard on Telegram, numbered list on CLI). On ACP, `choices` are required: free-form ask awaits the ACP elicitation RFD. Parameters: `question` (required), `choices` (optional list), `timeout_secs` (default 600). |
 | `escalate_to_human` | Send a structured escalation message with urgency routing. `high` / `critical` urgency additionally notifies any channels listed in `[escalation] alert_channels`. Parameters: `summary` (required), `context` (optional), `urgency` (`low`/`medium`/`high`/`critical`, default `medium`), `wait_for_response` (bool, default false), `timeout_secs` (default 600). On ACP, `wait_for_response: true` fails immediately if the channel cannot receive free-form replies (awaits ACP elicitation RFD). |
+
+### Parallel provider
+
+To use [Parallel Unified MCP](https://docs.parallel.ai/integrations/mcp) for
+`web_search_tool`, set `search_provider = "parallel"` under `[web_search]`
+in `config.toml`. Searches send the query to Parallel and return source links
+and excerpts. Anonymous access is rate limited and requires no API key or MCP
+bundle. The built-in tool calls only `web_search`.
 
 ### AnySearch provider
 

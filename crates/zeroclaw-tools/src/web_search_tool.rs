@@ -1,3 +1,5 @@
+mod parallel;
+
 use super::web_search_provider_routing::{
     SearchStatus, WebSearchProviderRoute, resolve_web_search_provider,
 };
@@ -195,7 +197,7 @@ impl SerplyConfigParseFailure {
 /// Jina AI (requires API key), Bocha AI (requires API key, Chinese-friendly),
 /// AnySearch (optional API key; anonymous access has a lower quota),
 /// Serply (Google web results, requires API key), and Keenable (keyless public
-/// endpoint; an optional API key lifts rate limits).
+/// endpoint; an optional API key lifts rate limits), and Parallel (anonymous Unified MCP).
 ///
 /// API keys are resolved lazily at execution time: if the boot-time key
 /// is missing or still encrypted, the tool re-reads `config.toml`, decrypts the
@@ -2410,6 +2412,9 @@ impl Tool for WebSearchTool {
             WebSearchProviderRoute::Bocha => self.search_bocha(query).await?,
             WebSearchProviderRoute::AnySearch => self.search_anysearch(query).await?,
             WebSearchProviderRoute::Serply => self.search_serply(query).await?,
+            WebSearchProviderRoute::Parallel => {
+                parallel::search(query, self.max_results, self.timeout_secs).await?
+            }
             WebSearchProviderRoute::Keenable => self.search_keenable(query).await?,
         };
 
