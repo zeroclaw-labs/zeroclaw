@@ -1615,11 +1615,10 @@ CREATE TABLE IF NOT EXISTS terminal_settlement_intents (
             connection
                 .busy_handler(Some(signal_migration_lock))
                 .unwrap();
-            let version = migrate_schema_transaction(&connection, |_| {
+            migrate_schema_transaction(&connection, |_| {
                 MIGRATION_CALLBACK_CALLED.store(true, Ordering::SeqCst);
                 Ok(())
-            });
-            version
+            })
         });
 
         let deadline = Instant::now() + std::time::Duration::from_secs(2);
