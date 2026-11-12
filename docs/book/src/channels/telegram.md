@@ -145,7 +145,7 @@ The notice reads the daemon's published configuration when it is sent. Changes p
 
 ### Notifying the operator about turned-away senders
 
-The public stub reaches the sender, but in a group it is all bystanders see, and without a second copy the operator learns about unapproved callers only from the logs. Set `owner_chat_id` — typically the operator's own DM with the bot — to also receive a short heads-up naming the sender identity, the source chat, and a bounded preview of the turned-away message, plus the same authorization hint the sender received:
+The public stub reaches the sender, but in a group it is all bystanders see, and without a second copy the operator learns about unapproved callers only from the logs. Set `owner_chat_id`, typically the operator's own DM with the bot, to also receive a short heads-up naming the sender identity, the source chat, and a bounded preview of the turned-away message, plus the same authorization hint the sender received:
 
 ```toml
 [channels.telegram.home]
