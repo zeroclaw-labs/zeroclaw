@@ -61,16 +61,23 @@ impl Default for GoalTaskRecord {
     }
 }
 
+/// Durable usage-accounting classification for Goal-owned operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum GoalAccountingState {
     #[default]
+    /// All usage known through the last settled operation is present and valid.
     Complete,
+    /// A settled operation did not provide usage data.
     Missing,
+    /// Usage data for a settled operation failed validation.
     Invalid,
+    /// An admitted operation ended without a durable outcome or usage
+    /// settlement.
     OutcomeUnknown,
 }
 
+/// Result of a guarded Goal control-plane mutation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GoalTransitionResult {
     /// The guarded mutation committed for the exact task, session, and epoch.
@@ -383,9 +390,10 @@ pub trait GoalTaskRegistry: Send + Sync {
     /// does not inspect or clear the pending-operation slot; callers must
     /// settle that slot before finishing. If an executor disappears with the
     /// slot still reserved, the Goal remains fenced for the rest of that daemon
-    /// boot. Same-boot reconciliation belongs to the later shared parent-turn
-    /// checkpoint slice; startup recovery classifies the reservation on a later
-    /// daemon boot.
+    /// boot. The store does not recover an abandoned reservation during the
+    /// same daemon boot; a controller must explicitly classify or settle it
+    /// before admitting further work. Startup recovery classifies a reservation
+    /// that remains when the daemon restarts.
     async fn finish_session_goal(
         &self,
         task_id: &str,
@@ -402,10 +410,10 @@ pub trait GoalTaskRegistry: Send + Sync {
     /// prevents a delayed duplicate settlement from matching a later operation
     /// in the same epoch. Callers must settle the exact slot on every local
     /// completion path. If an executor disappears before settlement, the slot
-    /// remains fenced for the rest of that daemon boot; this slice provides no
-    /// same-boot reaper. The later shared parent-turn checkpoint slice owns
-    /// same-boot reconciliation, while startup recovery classifies the slot on
-    /// a later daemon boot.
+    /// remains fenced until a controller explicitly classifies or settles it.
+    /// The store does not recover abandoned reservations during the same
+    /// daemon boot; startup recovery classifies a reservation that remains when
+    /// the daemon restarts.
     async fn admit_pending_operation(
         &self,
         task_id: &str,
