@@ -149,18 +149,27 @@ fn live_agent_config(tmp: &TempDir, plugins_root: &std::path::Path, instance_key
         config_path: tmp.path().join("config.toml"),
         ..Config::default()
     };
-    {
-        let entry = config
-            .providers
-            .models
-            .ensure("custom", "default")
-            .expect("custom model_provider type slot");
-        // Never called: this regression exercises tool construction and
-        // execution, not a turn.
-        entry.api_key = Some("test-key".to_string());
-        entry.model = Some("test-model".to_string());
-        entry.uri = Some("http://127.0.0.1:9".to_string());
-    }
+    // Never called: this regression exercises tool construction and
+    // execution, not a turn. Seed the canonical provider/model graph used by
+    // production constructors instead of the retired family-map input.
+    config.providers.connections.insert(
+        "custom.default".into(),
+        serde_json::from_value(serde_json::json!({
+            "kind": "custom",
+            "uri": "http://127.0.0.1:9",
+            "auth": {"api_key": "test-key"}
+        }))
+        .expect("custom fixture connection"),
+    );
+    config.providers.models.insert_canonical_model(
+        "custom.default".into(),
+        serde_json::from_value(serde_json::json!({
+            "capability": "chat",
+            "provider": "custom.default",
+            "model": "test-model"
+        }))
+        .expect("custom fixture model"),
+    );
     config.memory.backend = "none".to_string();
     config.memory.auto_save = false;
     config

@@ -211,7 +211,7 @@ impl<T: CompatFamilySpec> FamilyProviderFactory for T {
     };
 
     /// Derived, never restated: a family that opted into catalog discovery
-    /// probes it with exactly the [`CompatFamilySpec::AUTH`] its own chat
+    /// probes it with exactly the `CompatFamilySpec::AUTH` its own chat
     /// requests use. There is no second place to declare the auth style, so
     /// discovery cannot drift away from the request path — which is what
     /// would put a `ZhipuJwt` family's long-lived `id.secret` on the wire
@@ -1732,7 +1732,7 @@ impl FamilyProviderFactory for GroqModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(GROQ_DEFAULT_URL);
 
     /// Groq builds its compat provider by hand rather than through
-    /// [`CompatFamilySpec`], so it declares the catalog policy directly. It
+    /// `CompatFamilySpec`, so it declares the catalog policy directly. It
     /// was in the hand-written probe list this const replaces, and
     /// `create_provider` below authenticates with [`AuthStyle::Bearer`] —
     /// discovery states the same thing, and
