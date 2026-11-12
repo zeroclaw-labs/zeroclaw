@@ -338,20 +338,7 @@ pub fn build_model_provider(
     config.decrypt_secrets(&store)?;
     zeroclaw_config::env_overrides::apply_env_overrides(&mut config)?;
 
-    let (kind, alias, _) = config
-        .providers
-        .models
-        .find_by_name(provider_name)
-        .ok_or_else(|| {
-            anyhow::Error::msg(format!(
-                "model-provider '{provider_name}' not found or ambiguous"
-            ))
-        })?;
-    let reference = if provider_name.contains('.') {
-        provider_name.to_owned()
-    } else {
-        format!("{kind}.{alias}")
-    };
+    let reference = config.chat_catalog_ref(provider_name)?.to_string();
     let binding = zeroclaw_providers::model::build_reliable_provider(
         &config,
         &reference,
@@ -384,35 +371,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn configured_provider_accepts_nested_and_implicit_model_selection() {
+    fn configured_provider_uses_exact_canonical_model_selection() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = zeroclaw_config::schema::Config::default();
-        config
-            .providers
-            .models
-            .ensure("ollama", "translation")
-            .unwrap()
-            .models
-            .insert(
-                "fast".into(),
-                zeroclaw_config::schema::ModelEntryConfig {
-                    id: Some("nested-wire-model".into()),
-                    ..Default::default()
-                },
-            );
+        config.providers.connections.insert(
+            "ollama.translation".into(),
+            serde_json::from_value(serde_json::json!({
+                "kind": "ollama",
+                "uri": "http://127.0.0.1:9",
+                "auth": {"mode": "api_key", "api_key": "test-key"}
+            }))
+            .unwrap(),
+        );
+        config.providers.models.insert_canonical_model(
+            "ollama.translation.fast".into(),
+            serde_json::from_value(serde_json::json!({
+                "capability": "chat",
+                "provider": "ollama.translation",
+                "model": "nested-wire-model"
+            }))
+            .unwrap(),
+        );
         std::fs::write(
             tmp.path().join("config.toml"),
             toml::to_string(&config).unwrap(),
         )
         .unwrap();
-        for selection in [
-            "ollama.translation.fast",
-            "ollama.translation",
-            "translation",
-        ] {
-            let (_, model) = build_model_provider(selection, tmp.path().to_str()).unwrap();
-            assert_eq!(model, "nested-wire-model");
-        }
+
+        let (_, model) =
+            build_model_provider("ollama.translation.fast", tmp.path().to_str()).unwrap();
+        assert_eq!(model, "nested-wire-model");
     }
 
     #[test]

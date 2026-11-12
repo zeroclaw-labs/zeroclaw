@@ -157,7 +157,7 @@ fn live_agent_config(tmp: &TempDir, plugins_root: &std::path::Path, instance_key
         serde_json::from_value(serde_json::json!({
             "kind": "custom",
             "uri": "http://127.0.0.1:9",
-            "auth": {"api_key": "test-key"}
+            "auth": {"mode": "api_key", "api_key": "test-key"}
         }))
         .expect("custom fixture connection"),
     );

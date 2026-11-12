@@ -887,7 +887,7 @@ mod tests {
     async fn dotted_typed_provider_dispatches_through_voice_wake_manager() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
-        use zeroclaw_config::schema::{Config, LocalWhisperTranscriptionProviderConfig};
+        use zeroclaw_config::schema::Config;
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -900,12 +900,23 @@ mod tests {
             .await;
 
         let mut runtime_config = Config::default();
-        runtime_config.providers.transcription.local_whisper.insert(
-            "office".to_string(),
-            LocalWhisperTranscriptionProviderConfig {
-                uri: format!("{}/v1/transcribe", server.uri()),
-                ..LocalWhisperTranscriptionProviderConfig::default()
-            },
+        runtime_config.providers.connections.insert(
+            "local_whisper.office".into(),
+            serde_json::from_value(serde_json::json!({
+                "kind": "local_whisper",
+                "uri": format!("{}/v1/transcribe", server.uri()),
+                "api": {"asr": {}}
+            }))
+            .expect("canonical local whisper connection"),
+        );
+        runtime_config.providers.models.insert_canonical_model(
+            "local_whisper.office".into(),
+            serde_json::from_value(serde_json::json!({
+                "capability": "asr",
+                "provider": "local_whisper.office",
+                "model": "whisper-1"
+            }))
+            .expect("canonical local whisper model"),
         );
 
         let channel = VoiceWakeChannel::new("frontdoor", VoiceWakeConfig::default(), move || {
