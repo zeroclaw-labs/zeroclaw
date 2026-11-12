@@ -46,7 +46,7 @@ daemon atomically publishes its runtime route map.
 | `405` | empty, `Allow: GET, POST` header | `HEAD` or another unsupported method; the component is not invoked. |
 | `429` | rate-limit JSON or `webhook queue full` | The canonical per-client webhook limit or the route's bounded queue rejected admission. |
 | `502` | `invalid webhook response` | A component response exceeded the 4096-byte limit. |
-| `503` | `webhook unavailable` | The component, host service, or downstream channel receiver is unavailable. |
+| `503` | `webhook unavailable` | The component, host service, or downstream channel receiver is unavailable, or a route rebuild withdrew the path between lookup and delivery. |
 | `504` | `webhook processing timed out` | The ten-second request lifetime cancelled parsing or delivery. |
 
 The gateway never returns guest, Wasmtime, secret, config, or downstream error
