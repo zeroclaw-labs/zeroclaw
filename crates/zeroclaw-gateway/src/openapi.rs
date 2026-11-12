@@ -974,6 +974,31 @@ mod tests {
     }
 
     #[test]
+    fn docs_html_pins_scalar_with_sri() {
+        // include_str! is what handle_docs serves; assert the pin + SRI here so
+        // a regression cannot silently drop them without touching the handler.
+        let html = include_str!("openapi_docs.html");
+        assert!(
+            html.contains(
+                "cdn.jsdelivr.net/npm/@scalar/api-reference@1.76.3/dist/browser/standalone.js"
+            ),
+            "docs page must pin an exact Scalar version"
+        );
+        assert!(
+            html.contains(r#"integrity="sha384-H/jJ+XQ0S+5wKmVCrODlHKRKyDzdSBog4sUPc+AQTZddtU1FyQsiCrA47EUte2Fd""#),
+            "docs page must set Subresource Integrity on the Scalar script"
+        );
+        assert!(
+            html.contains(r#"crossorigin="anonymous""#),
+            "SRI requires crossorigin=anonymous"
+        );
+        assert!(
+            !html.contains(r#"src="https://cdn.jsdelivr.net/npm/@scalar/api-reference""#),
+            "unversioned Scalar CDN URL must not remain"
+        );
+    }
+
+    #[test]
     fn docs_csp_survives_default_security_layer() {
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(
