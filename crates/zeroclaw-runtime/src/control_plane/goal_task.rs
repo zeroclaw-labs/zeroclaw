@@ -30,7 +30,10 @@ pub struct GoalTaskRecord {
     /// goal-specific pauses.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blockers: Vec<GoalBlocker>,
-    /// Durable fence for one admitted logical provider operation.
+    /// Durable fence for one admitted logical provider operation. Producers
+    /// must use a fresh UUID for every operation and never reuse it, including
+    /// after settlement, so a delayed duplicate settlement cannot match a
+    /// later operation in the same epoch.
     #[serde(default)]
     pub pending_call_id: Option<String>,
     /// Epoch that admitted `pending_call_id`; always paired with the identifier.
@@ -394,13 +397,15 @@ pub trait GoalTaskRegistry: Send + Sync {
 
     /// Reserve the one durable pending-operation slot for the exact running
     /// Goal epoch. This is an execution fence, not a usage reservation.
-    /// `pending_call_id` must be unique across all currently occupied Goal
-    /// slots. Callers must settle the exact slot on every local completion
-    /// path. If an executor disappears before settlement, the slot remains
-    /// fenced for the rest of that daemon boot; this slice provides no same-boot
-    /// reaper. The later shared parent-turn checkpoint slice owns same-boot
-    /// reconciliation, while startup recovery classifies the slot on a later
-    /// daemon boot.
+    /// `pending_call_id` must be a fresh UUID that is globally unique across
+    /// Goal operations and is never reused, including after settlement. This
+    /// prevents a delayed duplicate settlement from matching a later operation
+    /// in the same epoch. Callers must settle the exact slot on every local
+    /// completion path. If an executor disappears before settlement, the slot
+    /// remains fenced for the rest of that daemon boot; this slice provides no
+    /// same-boot reaper. The later shared parent-turn checkpoint slice owns
+    /// same-boot reconciliation, while startup recovery classifies the slot on
+    /// a later daemon boot.
     async fn admit_pending_operation(
         &self,
         task_id: &str,
