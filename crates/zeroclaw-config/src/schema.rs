@@ -25840,7 +25840,6 @@ impl Config {
         // Proxy (delegate to existing validation)
         self.proxy.validate()?;
         self.cloud_ops.validate()?;
-        self.validate_goal_config()?;
 
         // Skills — extra registries
         {
@@ -26630,10 +26629,17 @@ impl Config {
             }
         }
 
+        // Goal validation runs last, so every other check has passed before
+        // a scoped save can keep an unrelated pre-existing Goal error as a warning.
+        self.validate_goal_config()?;
         Ok(())
     }
 
-    fn validate_goal_config(&self) -> Result<()> {
+    /// Validate local `[goal]` configuration and, when Goal Mode is enabled,
+    /// resolve its verifier through `providers.models`.
+    ///
+    /// This returns the same structured error used by [`Config::validate`].
+    pub fn validate_goal_config(&self) -> Result<()> {
         if let Err(error) = self.goal.validate() {
             match error {
                 GoalConfigError::MissingVerifierProvider => validation_bail!(
@@ -26663,8 +26669,8 @@ impl Config {
             return Ok(());
         }
 
-        let verifier = self.goal.verifier.model_provider.as_str().trim();
-        let Some((provider_type, provider_alias)) = verifier.split_once('.') else {
+        let (verifier, components) = self.goal_verifier_reference();
+        let Some((provider_type, provider_alias)) = components else {
             validation_bail!(
                 InvalidFormat,
                 "goal.verifier.model_provider",
@@ -26691,6 +26697,29 @@ impl Config {
             );
         }
         Ok(())
+    }
+
+    fn goal_verifier_reference(&self) -> (&str, Option<(&str, &str)>) {
+        let verifier = self.goal.verifier.model_provider.as_str().trim();
+        (verifier, verifier.split_once('.'))
+    }
+
+    /// Return the paths whose values decide [`Config::validate_goal_config`].
+    /// A Goal error is reported at a `goal.*` path even when another of these
+    /// paths caused it, so callers classifying errors by changed paths must
+    /// compare against all of them.
+    pub fn goal_validation_input_paths(&self) -> Vec<String> {
+        let mut paths = vec!["goal".to_owned()];
+        if self.goal.enabled {
+            let (_, components) = self.goal_verifier_reference();
+            if let Some((provider_type, provider_alias)) = components
+                && !provider_type.is_empty()
+                && !provider_alias.is_empty()
+            {
+                paths.push(format!("providers.models.{provider_type}.{provider_alias}"));
+            }
+        }
+        paths
     }
 
     pub fn mark_dirty(&mut self, path: &str) {

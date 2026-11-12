@@ -522,6 +522,70 @@ mod tests {
     }
 
     #[test]
+    fn goal_validation_runs_after_other_config_checks() {
+        // A later invalid delegate setting must win over a retained Goal error.
+        let mut config = Config::default();
+        config.goal.enabled = true;
+        config.goal.verifier.model_provider = ModelProviderRef::new("openai.missing");
+        config.delegate.timeout_secs = 0;
+
+        let error = ConfigApiError::from_validation(
+            config
+                .validate()
+                .expect_err("invalid delegate setting must be reported first"),
+        );
+        assert_eq!(error.code, ConfigApiCode::InvalidNumericRange);
+        assert_eq!(error.path.as_deref(), Some("delegate.timeout_secs"));
+
+        config.delegate.timeout_secs = Config::default().delegate.timeout_secs;
+        let error = ConfigApiError::from_validation(
+            config
+                .validate()
+                .expect_err("unresolved verifier must still fail validation"),
+        );
+        assert_eq!(error.code, ConfigApiCode::DanglingReference);
+        assert_eq!(error.path.as_deref(), Some("goal.verifier.model_provider"));
+    }
+
+    #[test]
+    fn goal_validation_input_paths_follow_enablement_and_verifier_reference() {
+        // Only enabled, well-formed verifier references add a provider input.
+        let mut config = Config::default();
+        assert_eq!(config.goal_validation_input_paths(), ["goal".to_owned()]);
+
+        config.goal.enabled = true;
+        config.goal.verifier.model_provider = ModelProviderRef::new("openai.default");
+        assert_eq!(
+            config.goal_validation_input_paths(),
+            [
+                "goal".to_owned(),
+                "providers.models.openai.default".to_owned()
+            ]
+        );
+        config.goal.verifier.model_provider = ModelProviderRef::new(" openai.default ");
+        assert_eq!(
+            config.goal_validation_input_paths(),
+            [
+                "goal".to_owned(),
+                "providers.models.openai.default".to_owned()
+            ]
+        );
+
+        config.goal.enabled = false;
+        assert_eq!(config.goal_validation_input_paths(), ["goal".to_owned()]);
+
+        config.goal.enabled = true;
+        for reference in ["openai", ".default", "openai.", ""] {
+            config.goal.verifier.model_provider = ModelProviderRef::new(reference);
+            assert_eq!(
+                config.goal_validation_input_paths(),
+                ["goal".to_owned()],
+                "reference {reference:?} must not produce a provider path"
+            );
+        }
+    }
+
+    #[test]
     fn toml_round_trip_preserves_explicit_unlimited_defaults() {
         let source = r#"
             enabled = true
