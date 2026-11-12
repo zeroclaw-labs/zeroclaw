@@ -30,8 +30,8 @@ pub struct TurnUsage {
 pub fn build_model_provider_pricing(config: &Config) -> ModelProviderPricing {
     let mut pricing: ModelProviderPricing = HashMap::new();
 
-    // The registry includes the config compatibility projection for legacy
-    // profiles. Every billing owner is therefore an exact model reference.
+    // Input migration has already normalized the registry. Every billing owner
+    // is an exact model reference.
     if let Ok(registry) = config.provider_registry() {
         for (model_ref, model) in &registry.models {
             let zeroclaw_config::provider_registry::ModelDefinition::Chat(chat) = model else {
@@ -91,26 +91,9 @@ fn provider_pricing_entry<'a>(
     pricing: &'a ModelProviderPricing,
     model_provider_name: &str,
 ) -> Option<(&'a str, &'a HashMap<String, f64>)> {
-    if let Some((profile, slot)) = pricing.get_key_value(model_provider_name) {
-        return Some((profile.as_str(), slot));
-    }
-    // This generated view includes every configured profile. Resolve the
-    // longest profile so a named model and dotted alias bill the same owner.
-    if let Some((profile, slot)) = pricing
-        .iter()
-        .filter(|(profile, _)| {
-            model_provider_name
-                .strip_prefix(profile.as_str())
-                .is_some_and(|suffix| suffix.starts_with('.'))
-        })
-        .max_by_key(|(profile, _)| profile.len())
-    {
-        return Some((profile.as_str(), slot));
-    }
-    let prefix = format!("{model_provider_name}.");
-    let mut matches = pricing.iter().filter(|(key, _)| key.starts_with(&prefix));
-    let (profile, slot) = matches.next()?;
-    matches.next().is_none().then_some((profile.as_str(), slot))
+    pricing
+        .get_key_value(model_provider_name)
+        .map(|(model_ref, slot)| (model_ref.as_str(), slot))
 }
 
 fn apply_rate_sheet_pricing(config: &Config, provider_type: &str, slot: &mut HashMap<String, f64>) {
@@ -1297,7 +1280,7 @@ mod tests {
     }
 
     #[test]
-    fn nested_prices_do_not_borrow_an_unpriced_dotted_profile_sibling() {
+    fn pricing_does_not_infer_missing_model_refs_from_admitted_keys() {
         let mut config = Config::default();
         let prefix = config.providers.models.ensure("custom", "gw").unwrap();
         prefix.pricing.insert("shared-id".into(), 1.0);
@@ -1305,21 +1288,20 @@ mod tests {
         let pricing =
             build_model_provider_pricing(&zeroclaw_config::migration::admit_test_input(&config));
         assert!(
-            provider_pricing(&pricing, "custom.gw.v2.fast")
+            provider_pricing(&pricing, "custom.gw.v2")
                 .unwrap()
                 .is_empty()
         );
         assert!(provider_pricing(&pricing, "custom").is_none());
+        assert!(provider_pricing(&pricing, "custom.gw.v2.fast").is_none());
         assert_eq!(
-            provider_pricing_entry(&pricing, "custom.gw.v2.fast")
-                .unwrap()
-                .0,
+            provider_pricing_entry(&pricing, "custom.gw.v2").unwrap().0,
             "custom.gw.v2"
         );
     }
 
     #[test]
-    fn provider_pricing_nested_refs_use_longest_profile_alias() {
+    fn provider_pricing_treats_dotted_model_keys_as_opaque() {
         let pricing = HashMap::from([
             (
                 "custom.gw".into(),
@@ -1331,23 +1313,25 @@ mod tests {
             ),
         ]);
         assert_eq!(
-            provider_pricing(&pricing, "custom.gw.small").unwrap()["shared-id"],
+            provider_pricing(&pricing, "custom.gw").unwrap()["shared-id"],
             1.0
         );
         assert_eq!(
-            provider_pricing(&pricing, "custom.gw.v2.small").unwrap()["shared-id"],
+            provider_pricing(&pricing, "custom.gw.v2").unwrap()["shared-id"],
             2.0
         );
         assert!(provider_pricing(&pricing, "custom.gw-other.small").is_none());
+        assert!(provider_pricing(&pricing, "custom.gw.small").is_none());
+        assert!(provider_pricing(&pricing, "custom.gw.v2.small").is_none());
     }
 
     #[test]
-    fn provider_pricing_resolves_composite_and_unique_bare_type() {
+    fn provider_pricing_resolves_only_exact_registered_keys() {
         let mut model_rates: HashMap<String, f64> = HashMap::new();
         model_rates.insert("glm-5.1.input".to_string(), 1.4);
         model_rates.insert("glm-5.1.output".to_string(), 4.4);
 
-        // Every builder now keys by the composite `<type>.<alias>`.
+        // A migrated key remains a whole key even when it resembles a profile.
         let mut composite_keyed: ModelProviderPricing = HashMap::new();
         composite_keyed.insert("glm.default".to_string(), model_rates.clone());
         assert!(
@@ -1355,10 +1339,10 @@ mod tests {
             "composite-keyed map must resolve via the verbatim composite lookup"
         );
 
-        // A bare-type lookup resolves to the sole alias of that type.
+        // A unique matching prefix still does not name a configured model.
         assert!(
-            provider_pricing(&composite_keyed, "glm").is_some(),
-            "bare-type lookup resolves to a unique alias entry"
+            provider_pricing(&composite_keyed, "glm").is_none(),
+            "bare-type lookup must not infer a model reference"
         );
 
         // Ambiguous bare-type lookup (two aliases of one type) must not guess.

@@ -261,9 +261,7 @@ fn providers_for_input(config: &Config) -> Result<crate::providers::Providers> {
         let provider = ProviderId::from(format!("legacy.asr.section.{family}"));
         let (connection, model) = asr_definition(&input, family, &provider)?;
         providers.connections.entry(provider).or_insert(connection);
-        providers
-            .models
-            .insert_canonical_model(key, serde_json::from_value(serde_json::to_value(model)?)?);
+        providers.models.insert_canonical_model(key, model);
     }
     Ok(providers)
 }
@@ -847,6 +845,10 @@ pub(crate) fn normalize_definitions(config: &mut Config) -> Result<()> {
 
 fn has_legacy_input(config: &Config) -> bool {
     config.memory.embedding_api_key.is_some()
+        // A hint is a legacy selector even when the route table is already
+        // canonical.  Without this bit the normalization gate returns early
+        // and the replacement `embedding_model_ref` remains unset.
+        || config.memory.embedding_model.trim().starts_with("hint:")
         || !config
             .memory
             .embedding_provider

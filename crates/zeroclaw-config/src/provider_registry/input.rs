@@ -121,9 +121,14 @@ impl Config {
         let (family, uri) = reference
             .split_once(':')
             .map_or((reference, None), |(family, uri)| (family, Some(uri)));
+        let codex_auth = family == "openai-codex";
         let family = match family {
             "anthropic-custom" => "anthropic",
             "openai-compatible" | "openai_compatible" => "custom",
+            // Codex is an authentication mode of the OpenAI adapter, not a
+            // separate provider connection kind. Keep the public CLI spelling
+            // while constructing the typed OpenAI connection.
+            "openai-codex" => "openai",
             other => other,
         };
         // Only the config migration recognizes historical vendor spellings.
@@ -150,23 +155,29 @@ impl Config {
                 .is_some_and(|connection| connection.kind() == family)
         {
             let mut model = model.clone();
-            if let Some(uri) = uri {
-                ensure!(
-                    uri.starts_with("http://") || uri.starts_with("https://"),
-                    "invalid provider URL"
-                );
+            if uri.is_some() || codex_auth {
                 let mut connection = serde_json::to_value(&registry.connections[model.provider()])?;
-                connection["uri"] = uri.into();
+                if let Some(uri) = uri {
+                    ensure!(
+                        uri.starts_with("http://") || uri.starts_with("https://"),
+                        "invalid provider URL"
+                    );
+                    connection["uri"] = uri.into();
+                }
+                if codex_auth {
+                    connection["auth"] = json!({"mode": "codex"});
+                }
                 let mut provider = ProviderId::from(format!("temporary.{reference}"));
                 while registry.connections.contains_key(&provider) {
                     provider = ProviderId::from(format!("temporary.{}", provider.as_str()));
                 }
-                let mut raw_model = serde_json::to_value(&model)?;
-                raw_model["provider"] = provider.as_str().into();
+                let ModelDefinition::Chat(chat) = &mut model else {
+                    anyhow::bail!("selected model must support chat");
+                };
+                chat.provider = provider.clone();
                 registry
                     .connections
                     .insert(provider, serde_json::from_value(connection)?);
-                model = serde_json::from_value(raw_model)?;
             }
             if let Some(targets) = selected_ref
                 .as_ref()
@@ -187,6 +198,9 @@ impl Config {
             );
             connection["uri"] = uri.into();
         }
+        if codex_auth {
+            connection["auth"] = json!({"mode": "codex"});
+        }
         let mut model = json!({"capability":"chat", "provider":""});
         // Preserve model policy when a CLI transport override inherits its model
         // from an agent, while constructing the requested connection afresh.
@@ -206,9 +220,10 @@ impl Config {
             provider = ProviderId::from(format!("temporary.{}", provider.as_str()));
         }
         model["provider"] = provider.as_str().into();
-        registry
-            .connections
-            .insert(provider, serde_json::from_value(connection)?);
+        let connection = serde_json::from_value(connection)?;
+        let model: ModelDefinition<serde_json::Value> = serde_json::from_value(model)?;
+        let model = model.associate(&connection)?;
+        registry.connections.insert(provider, connection);
         if let Some(targets) = selected_ref
             .as_ref()
             .and_then(|reference| registry.fallback.get(reference))
@@ -216,7 +231,7 @@ impl Config {
         {
             registry.fallback.insert(key.clone(), targets);
         }
-        registry.models.insert(key, serde_json::from_value(model)?);
+        registry.models.insert(key, model);
         registry.validate()?;
         Ok(registry)
     }
@@ -266,24 +281,25 @@ mod tests {
     }
 
     #[test]
-    fn historical_vendor_spellings_use_the_config_migration() {
+    fn retired_vendor_spellings_are_not_interpreted_by_consumers() {
         let config = Config::default();
-        for (input, kind) in [
-            ("google", "gemini"),
-            ("aws-bedrock", "bedrock"),
-            ("llama.cpp", "llamacpp"),
-        ] {
-            let registry = config.chat_registry_for_input(None, input).unwrap();
-            assert_eq!(
-                registry
-                    .resolve_chat(&input.into())
-                    .unwrap()
-                    .selection
-                    .connection
-                    .kind(),
-                kind
-            );
+        for input in ["google", "aws-bedrock", "llama.cpp"] {
+            assert!(config.chat_registry_for_input(None, input).is_err());
         }
+    }
+
+    #[test]
+    fn openai_codex_cli_input_uses_openai_codex_auth() {
+        let config = Config::default();
+        let registry = config
+            .chat_registry_for_input(None, "openai-codex")
+            .unwrap();
+        let model = registry
+            .resolve_chat(&ModelRef::from("openai-codex"))
+            .unwrap();
+        assert_eq!(model.selection.connection.kind(), "openai");
+        let connection = serde_json::to_value(model.selection.connection).unwrap();
+        assert_eq!(connection["auth"]["mode"], "codex");
     }
 
     #[test]
@@ -358,7 +374,11 @@ mod tests {
         let error = config
             .capability_model_ref("chat.Fast.v2", Capability::Asr)
             .unwrap_err();
-        assert!(error.to_string().contains("does not support"));
+        assert!(
+            error
+                .to_string()
+                .contains("model capability does not match the consumer")
+        );
     }
 
     #[test]
@@ -380,7 +400,7 @@ mod tests {
         );
         assert_eq!(model.upstream_model(), Some("wire-fast"));
         assert!(
-            matches!(model.options.temperature, Some(registry::registry::Override::Set(value)) if value == 0.3)
+            matches!(model.options.temperature, Some(crate::provider_registry::Override::Set(value)) if value == 0.3)
         );
         assert_eq!(
             registry.fallback_chain(&reference.into()).unwrap(),
@@ -397,6 +417,41 @@ mod tests {
             config.provider_registry().unwrap().connections["gateway.Prod"].uri(),
             Some("https://original.invalid/v1")
         );
+    }
+
+    #[test]
+    fn explicit_url_keeps_connection_associated_model_extra() {
+        let config: Config = serde_json::from_value(json!({
+            "providers": {
+                "connections": {"anthropic.prod": {
+                    "kind": "anthropic"
+                }},
+                "models": {"chat.deployed": {
+                    "capability": "chat", "provider": "anthropic.prod", "model": "upstream",
+                    "extra": {"server_fallback_models": ["upstream-backup"]}
+                }}
+            },
+            "agents": {"agent": {"model_provider": "chat.deployed"}}
+        }))
+        .unwrap();
+        let reference = "anthropic:https://override.invalid";
+        let registry = config
+            .chat_registry_for_input(Some("agent"), reference)
+            .unwrap();
+        let selected = registry.resolve_chat(&reference.into()).unwrap();
+        let ModelDefinition::Chat(model) = selected.selection.model else {
+            panic!("expected a chat model");
+        };
+        assert!(matches!(
+            &model.extra,
+            Some(crate::provider_registry::ChatModelExtra::Anthropic(extra))
+                if extra.server_fallback_models == ["upstream-backup"]
+        ));
+        assert_eq!(
+            selected.selection.connection.uri(),
+            Some("https://override.invalid")
+        );
+        assert_eq!(selected.upstream_model(), Some("upstream"));
     }
 
     #[test]

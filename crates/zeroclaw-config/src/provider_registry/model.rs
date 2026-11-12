@@ -158,9 +158,8 @@ impl<E> ModelDefinition<E> {
     }
 }
 
-/// The input form is deserializable as an intermediate value; callers must
-/// still associate it with its connection before exposing canonical state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// No `Deserialize`: callers must associate the input with its connection.
+#[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(untagged)]
 pub enum ChatModelExtra {

@@ -385,15 +385,21 @@ pub fn create_memory_with_storage_and_routes(
     embedding_routes: &[EmbeddingRouteConfig],
     active_storage: ActiveStorage<'_>,
     workspace_dir: &Path,
-    api_key: Option<&str>,
+    _api_key: Option<&str>,
 ) -> anyhow::Result<Box<dyn Memory>> {
-    let full = Config {
-        memory: config.clone(),
-        embedding_routes: embedding_routes.to_vec(),
-        ..Config::default()
-    };
-    let embedder = build_embedder_from_config(&full, api_key)?;
-    create_memory_with_storage_and_routes_inner(config, active_storage, workspace_dir, embedder)
+    anyhow::ensure!(
+        config.embedding_model_ref.is_none()
+            && config.embedding_provider == "none"
+            && !config.embedding_model.starts_with("hint:")
+            && embedding_routes.is_empty(),
+        "embedding model bindings require the full Config; use create_memory_from_config"
+    );
+    create_memory_with_storage_and_routes_inner(
+        config,
+        active_storage,
+        workspace_dir,
+        Arc::new(zeroclaw_providers::embedding::NoopEmbedding),
+    )
 }
 
 fn create_memory_with_storage_and_routes_inner(
@@ -1066,6 +1072,7 @@ mod tests {
             dimensions: Some(3072),
             api_key: None,
         });
+        zeroclaw_config::migration::normalize_test_input(&mut config);
         let expected = snapshot(&config).unwrap();
         stage(
             &mut config,
@@ -1112,11 +1119,17 @@ mod tests {
             dimensions: Some(3072),
             api_key: None,
         });
+        zeroclaw_config::migration::normalize_test_input(&mut config);
         let before = build_embedder_from_config(&config, None)
             .unwrap()
             .identity();
         let mut routed = config.clone();
-        routed.memory.embedding_model = "hint:semantic.v1".into();
+        routed.memory.embedding_model_ref = Some(
+            routed.embedding_routes[0]
+                .model_provider
+                .as_str()
+                .to_owned(),
+        );
         let route_before = build_embedder_from_config(&routed, None)
             .unwrap()
             .identity();
@@ -1159,8 +1172,12 @@ mod tests {
             .unwrap();
         assert_eq!(cached, 1);
 
-        config.memory.embedding_model_ref = None;
-        config.memory.embedding_model = "hint:semantic.v1".into();
+        config.memory.embedding_model_ref = Some(
+            config.embedding_routes[0]
+                .model_provider
+                .as_str()
+                .to_owned(),
+        );
         let embedder = build_embedder_from_config(&config, None).unwrap();
         assert_eq!(embedder.name(), "custom");
         assert_eq!(embedder.identity().model, "embedding-large");
@@ -1468,6 +1485,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config_for = |model: &str| {
             let mut config = Config::default();
+            config.data_dir = tmp.path().to_path_buf();
             config.memory.backend = "sqlite".into();
             config.memory.embedding_model_ref = Some("embedding.openai".into());
             config.memory.embedding_dimensions = 4;
@@ -2175,6 +2193,29 @@ store_timeout_ms = 40000
             error.to_string().contains("full Config"),
             "error should require config-aware construction: {error}"
         );
+    }
+
+    #[test]
+    fn partial_factory_refuses_embedding_input_instead_of_disabling_vectors() {
+        let tmp = TempDir::new().unwrap();
+        for cfg in [
+            MemoryConfig {
+                embedding_model_ref: Some("embedding.main".into()),
+                ..Default::default()
+            },
+            MemoryConfig {
+                embedding_provider: "openai".into(),
+                ..Default::default()
+            },
+            MemoryConfig {
+                embedding_model: "hint:semantic".into(),
+                ..Default::default()
+            },
+        ] {
+            let error = create_memory(&cfg, tmp.path(), None).err().unwrap();
+            assert!(error.to_string().contains("full Config"));
+        }
+        assert!(!tmp.path().join("memory").exists());
     }
 
     #[test]
