@@ -12818,6 +12818,13 @@ pub struct QdrantStorageConfig {
     #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_key: Option<String>,
+    /// Hybrid recall: when this backend creates the collection, also give it a
+    /// `bm25` sparse vector (filled by Qdrant's server-side BM25 inference,
+    /// Qdrant 1.15 or newer) and rank recall as dense + keyword with
+    /// `memory.vector_weight` / `memory.keyword_weight`, like the SQLite
+    /// backend. An existing collection is used as found. Default: `false`
+    /// (dense-only).
+    pub hybrid: bool,
 }
 
 impl Default for QdrantStorageConfig {
@@ -12826,6 +12833,7 @@ impl Default for QdrantStorageConfig {
             url: None,
             collection: default_qdrant_collection(),
             api_key: None,
+            hybrid: false,
         }
     }
 }
