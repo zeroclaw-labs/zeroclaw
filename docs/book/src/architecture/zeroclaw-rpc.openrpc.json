@@ -3038,7 +3038,7 @@
             "description": "Masked document originally read by the editor. Compared under the\nexisting config commit lock so a stale editor cannot overwrite changes."
           },
           "registry": {
-            "description": "Complete canonical registry candidate, including projected legacy entries."
+            "description": "Complete canonical registry candidate."
           }
         },
         "required": [
@@ -6353,7 +6353,7 @@
           "name": "registry",
           "required": true,
           "schema": {
-            "description": "Complete canonical registry candidate, including projected legacy entries."
+            "description": "Complete canonical registry candidate."
           }
         }
       ],
