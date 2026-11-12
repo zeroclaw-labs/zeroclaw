@@ -1534,8 +1534,9 @@ mod tests {
             .expect("failing command should return a result");
         assert!(!result.success);
         let error = result.error.as_deref().unwrap_or("");
+        let status = expected_exit_status_label(2);
         assert!(
-            error.contains("exit status 2") && error.contains("fail_msg"),
+            error.contains(&status) && error.contains("fail_msg"),
             "failed shell result must surface the exit status and stderr, got: {error:?}"
         );
     }
@@ -1549,8 +1550,9 @@ mod tests {
             .expect("failing command should return a result");
         assert!(!result.success);
         let error = result.error.as_deref().unwrap_or("");
+        let status = expected_exit_status_label(3);
         assert!(
-            error.contains("exit status 3") && error.contains("fail_out"),
+            error.contains(&status) && error.contains("fail_out"),
             "failed shell result must fall back to stdout when stderr is empty, got: {error:?}"
         );
         assert!(
@@ -1568,7 +1570,17 @@ mod tests {
             .await
             .expect("failing command should return a result");
         assert!(!result.success);
-        assert_eq!(result.error.as_deref(), Some("exit status 4"));
+        assert_eq!(
+            result.error.as_deref(),
+            Some(expected_exit_status_label(4).as_str())
+        );
+    }
+
+    /// Builds the expected status label through the same Fluent helper as the
+    /// tool, so these tests pass under any configured locale.
+    fn expected_exit_status_label(code: i32) -> String {
+        let code = code.to_string();
+        crate::i18n::get_required_cli_string_with_args("tool-shell-exit-status", &[("code", &code)])
     }
 
     // ── Ephemeral-workspace warning────────────────
