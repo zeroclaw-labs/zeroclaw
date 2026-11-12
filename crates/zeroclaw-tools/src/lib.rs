@@ -108,6 +108,7 @@ pub mod screenshot;
 pub mod send_via;
 pub mod session_memory;
 pub mod sessions;
+pub mod sessions_prompt;
 #[cfg(feature = "tools-external")]
 pub mod text_browser;
 pub mod tool_search;

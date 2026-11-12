@@ -2700,6 +2700,125 @@ impl RpcDispatcher {
         Err(self.stale_session_incarnation_error())
     }
 
+    /// Whether the calling agent may prompt the target agent's sessions: the
+    /// same agent, or one of the caller's reachable delegate targets.
+    fn agent_prompt_reaches(&self, caller_alias: &str, target_alias: &str) -> bool {
+        if target_alias == caller_alias {
+            return true;
+        }
+        // Another agent's session runs that agent's own turn, so only a
+        // delegation the caller may make, to an independent target, reaches
+        // it. A bounded target must run under the caller's limits, which an
+        // existing session cannot carry.
+        let config = self.ctx.config.read();
+        config
+            .risk_profile_for_agent(caller_alias)
+            .is_some_and(|profile| profile.delegation_policy.permits())
+            && config
+                .reachable_delegate_target_configs(caller_alias)
+                .iter()
+                .any(|target| {
+                    target.agent == target_alias
+                        && target.mode
+                            == zeroclaw_config::schema::DelegateExecutionMode::Independent
+                })
+    }
+
+    /// The `sessions_prompt` runner for turns started on this connection.
+    fn session_prompt_runner(&self) -> Arc<zeroclaw_tools::sessions_prompt::SessionPromptFn> {
+        let caller = Arc::new(self.spawn_handle());
+        Arc::new(Box::new(move |session_id, message, caller_alias| {
+            let caller = Arc::clone(&caller);
+            Box::pin(async move {
+                caller
+                    .run_agent_injected_session_prompt(session_id, message, caller_alias)
+                    .await
+            })
+        }))
+    }
+
+    /// Run one `session/prompt` turn in a live session for a calling agent
+    /// (the `sessions_prompt` tool). The target must be a session of the
+    /// caller's agent or of one of its reachable delegate targets, attached
+    /// to this connection so its owner sees the turn, and idle: admission is
+    /// a single non-waiting claim. The prompt then goes through the ordinary
+    /// `session/prompt` path and its authorization for this connection.
+    ///
+    /// The target turn runs in its own task, so dropping the caller (for
+    /// example by cancelling its turn) does not drop the target turn halfway:
+    /// the target finishes, persists, and emits `TurnComplete`, and only its
+    /// result is discarded.
+    async fn run_agent_injected_session_prompt(
+        &self,
+        session_id: String,
+        message: String,
+        caller_alias: String,
+    ) -> Result<
+        zeroclaw_tools::sessions_prompt::SessionPromptOutcome,
+        zeroclaw_tools::sessions_prompt::SessionPromptRefusal,
+    > {
+        use zeroclaw_tools::sessions_prompt::{
+            SessionPromptOutcome, SessionPromptRefusal, SessionPromptScope,
+        };
+
+        let Some(target_alias) = self.ctx.sessions.get_agent_alias(&session_id).await else {
+            return Err(SessionPromptRefusal::NotFound);
+        };
+        if !self.agent_prompt_reaches(&caller_alias, &target_alias) {
+            return Err(SessionPromptRefusal::NotReachable { target_alias });
+        }
+        let attached_here = self
+            .ctx
+            .sessions
+            .with_session_effect(&session_id, |session| {
+                session.map(|session| session.owner_tui_id() == self.tui_id.as_deref())
+            })
+            .await;
+        match attached_here {
+            None => return Err(SessionPromptRefusal::NotFound),
+            Some(false) => return Err(SessionPromptRefusal::OtherConnection),
+            Some(true) => {}
+        }
+
+        let req: SessionPromptParams = serde_json::from_value(serde_json::json!({
+            "session_id": session_id,
+            "prompt": message,
+        }))
+        .map_err(|e| SessionPromptRefusal::Failed(e.to_string()))?;
+
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Invoke)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
+                .with_attrs(::serde_json::json!({
+                    "caller_alias": caller_alias,
+                    "target_alias": target_alias,
+                    "session_id": session_id,
+                })),
+            "agent-injected session prompt accepted"
+        );
+
+        let dispatcher = self.spawn_handle();
+        let scope = SessionPromptScope::capture();
+        let turn = zeroclaw_spawn::spawn!(scope.scope(async move {
+            dispatcher
+                .run_session_prompt_with(req, None, crate::rpc::session::PromptAdmission::IfIdle)
+                .await
+        }));
+        match turn.await {
+            Ok(Ok((result, _usage))) => Ok(SessionPromptOutcome {
+                content: result.content,
+                stop_reason: result.stop_reason,
+            }),
+            Ok(Err(error)) => Err(match error.code {
+                SESSION_BUSY => SessionPromptRefusal::Busy,
+                SESSION_NOT_FOUND | FORBIDDEN => SessionPromptRefusal::NotFound,
+                _ => SessionPromptRefusal::Failed(error.message),
+            }),
+            Err(join) => Err(SessionPromptRefusal::Failed(join.to_string())),
+        }
+    }
+
     fn stale_session_incarnation_error(&self) -> JsonRpcError {
         let (code, message) = match self.access_policy {
             RpcAccessPolicy::TrustedLocal => (SESSION_NOT_FOUND, "Session changed while queued"),
@@ -6598,6 +6717,29 @@ impl RpcDispatcher {
         ),
         JsonRpcError,
     > {
+        self.run_session_prompt_with(
+            req,
+            expected_generation,
+            crate::rpc::session::PromptAdmission::Wait,
+        )
+        .await
+    }
+
+    /// [`Self::run_session_prompt`] with a choice of admission: under
+    /// [`crate::rpc::session::PromptAdmission::IfIdle`] a busy session is
+    /// refused with `SESSION_BUSY` instead of queued.
+    async fn run_session_prompt_with(
+        &self,
+        req: SessionPromptParams,
+        expected_generation: Option<u64>,
+        admission: crate::rpc::session::PromptAdmission,
+    ) -> Result<
+        (
+            SessionPromptResult,
+            Option<crate::rpc::types::TurnUsageTotals>,
+        ),
+        JsonRpcError,
+    > {
         let sid = &req.session_id;
         let authorized = self
             .authorize_session_owner(sid, Method::SessionPrompt)
@@ -6632,12 +6774,22 @@ impl RpcDispatcher {
             _ = self.connection_cancel.cancelled() => {
                 return Err(rpc_err(SESSION_BUSY, "RPC connection closed before prompt admission"));
             }
-            result = self.ctx.sessions.acquire_prompt(
+            result = self.ctx.sessions.acquire_prompt_with(
                 sid,
                 live_generation_at_entry,
                 cancel.clone(),
+                admission,
             ) => {
-                result.map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?
+                match result {
+                    Ok(Some(admitted)) => admitted,
+                    Ok(None) => {
+                        return Err(rpc_err(
+                            SESSION_BUSY,
+                            "Session busy: a turn is running or queued",
+                        ));
+                    }
+                    Err(e) => return Err(rpc_err(SESSION_BUSY, format!("Session busy: {e}"))),
+                }
             }
         };
         if self.connection_cancel.is_cancelled() {
@@ -7248,19 +7400,29 @@ impl RpcDispatcher {
                 }
             }),
         );
-        tokio::pin!(turn);
-        let mut outcome = tokio::select! {
-            biased;
-            _ = self.connection_cancel.cancelled() => {
-                self.ctx.sessions.record_cancel_cause_if_absent(
-                    sid,
-                    crate::rpc::session::CancelCause::ConnectionClosed,
-                );
-                cancel.cancel();
-                turn.await
+
+        // The turn's tools reach other sessions through a runner bound to
+        // this connection.
+        let turn_future = async {
+            tokio::pin!(turn);
+            tokio::select! {
+                biased;
+                _ = self.connection_cancel.cancelled() => {
+                    self.ctx.sessions.record_cancel_cause_if_absent(
+                        sid,
+                        crate::rpc::session::CancelCause::ConnectionClosed,
+                    );
+                    cancel.cancel();
+                    turn.await
+                }
+                outcome = &mut turn => outcome,
             }
-            outcome = &mut turn => outcome,
         };
+        let mut outcome = zeroclaw_tools::sessions_prompt::scope_session_prompt_runner(
+            Some(self.session_prompt_runner()),
+            turn_future,
+        )
+        .await;
 
         let refused_preparation = preparation_error
             .lock()
@@ -33237,6 +33399,7 @@ mod tests {
                     "sessions_history",
                     "sessions_current",
                     "sessions_send",
+                    "sessions_prompt",
                 ]
                 .into_iter()
                 .map(str::to_string)

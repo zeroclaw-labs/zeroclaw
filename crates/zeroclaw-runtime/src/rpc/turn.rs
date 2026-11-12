@@ -146,6 +146,10 @@ where
     let cancel_clone = cancel.clone();
     let session_key = attribution.session_key.clone();
 
+    // Task-locals do not cross the spawn below: carry the `sessions_prompt`
+    // runner and injected-turn origin into the turn task explicitly.
+    let session_prompt_scope = zeroclaw_tools::sessions_prompt::SessionPromptScope::capture();
+
     let turn_handle = zeroclaw_spawn::spawn!(async move {
         // Held inside the task body so the connection stays counted until this
         // task's future is actually dropped. An abort requested by the caller
@@ -167,32 +171,36 @@ where
             });
         }
         let sk = attribution.session_key.clone();
-        crate::agent::loop_::scope_session_key(attribution.session_key, async move {
-            use ::zeroclaw_log::Instrument as _;
-            let span = ::zeroclaw_log::info_span!(
-                target: "zeroclaw_log_internal_scope",
-                "zeroclaw_scope",
-                session_key = %sk.as_deref().unwrap_or(""),
-                agent_alias = %attribution.agent_alias,
-                model_provider = %attribution.model_provider,
-                model = %attribution.model,
-                channel = %attribution.channel,
-            );
-            TOOL_LOOP_COST_TRACKING_CONTEXT
-                .scope(
-                    cost_context,
-                    guard
-                        .turn_streamed_with_steering_state(
-                            &prompt,
-                            event_tx,
-                            Some(cancel_clone),
-                            steering_rx.as_mut(),
+        session_prompt_scope
+            .scope(async move {
+                crate::agent::loop_::scope_session_key(attribution.session_key, async move {
+                    use ::zeroclaw_log::Instrument as _;
+                    let span = ::zeroclaw_log::info_span!(
+                        target: "zeroclaw_log_internal_scope",
+                        "zeroclaw_scope",
+                        session_key = %sk.as_deref().unwrap_or(""),
+                        agent_alias = %attribution.agent_alias,
+                        model_provider = %attribution.model_provider,
+                        model = %attribution.model,
+                        channel = %attribution.channel,
+                    );
+                    TOOL_LOOP_COST_TRACKING_CONTEXT
+                        .scope(
+                            cost_context,
+                            guard
+                                .turn_streamed_with_steering_state(
+                                    &prompt,
+                                    event_tx,
+                                    Some(cancel_clone),
+                                    steering_rx.as_mut(),
+                                )
+                                .instrument(span),
                         )
-                        .instrument(span),
-                )
+                        .await
+                })
                 .await
-        })
-        .await
+            })
+            .await
     });
 
     let mut turn_handle_guard = TurnHandleGuard(Some(turn_handle));

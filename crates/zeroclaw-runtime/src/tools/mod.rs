@@ -521,8 +521,12 @@ pub fn default_tools_with_runtime(
 /// requires an unrestricted principal; tests use the names to check that a
 /// non-admin registry holds none of them.
 #[cfg(test)]
-pub(crate) const SESSION_DATA_TOOL_NAMES: &[&str] =
-    &["sessions_list", "sessions_history", "sessions_send"];
+pub(crate) const SESSION_DATA_TOOL_NAMES: &[&str] = &[
+    "sessions_list",
+    "sessions_history",
+    "sessions_send",
+    "sessions_prompt",
+];
 
 #[cfg(test)]
 pub(crate) fn register_skill_tools(
@@ -2111,6 +2115,9 @@ pub(crate) fn all_tools_with_runtime_context(
     live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     execution_capability: Option<AgentExecutionCapability>,
     acp_sessions: Option<AcpSessionReadView>,
+    // Only RPC session agents, whose turns carry a session prompt runner,
+    // offer `sessions_prompt`.
+    session_prompts: bool,
 ) -> anyhow::Result<AllToolsResult> {
     let owner = memory.principal_scope();
     #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
@@ -2150,6 +2157,7 @@ pub(crate) fn all_tools_with_runtime_context(
             live_config,
             execution_capability,
             acp_sessions,
+            session_prompts,
         )
     };
     std::thread::scope(|scope| -> anyhow::Result<AllToolsResult> {
@@ -2236,6 +2244,7 @@ pub fn all_tools_with_runtime_and_acp_sessions(
         live_config,
         None,
         acp_sessions,
+        false,
     )
 }
 
@@ -2294,6 +2303,7 @@ pub fn all_tools_with_runtime_and_execution_capability(
         live_config,
         execution_capability,
         None,
+        false,
     )
 }
 
@@ -2327,6 +2337,7 @@ fn all_tools_with_runtime_on_thread(
     live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     execution_capability: Option<AgentExecutionCapability>,
     acp_sessions: Option<AcpSessionReadView>,
+    session_prompts: bool,
 ) -> anyhow::Result<AllToolsResult> {
     #[cfg(feature = "tools-external")]
     let browser_config = _browser_config;
@@ -2551,6 +2562,14 @@ fn all_tools_with_runtime_on_thread(
         capability_slots.push(tool.capabilities_slot());
         Arc::new(tool)
     });
+    if session_prompts {
+        register_tool!(
+            "sessions_prompt",
+            Arc::new(zeroclaw_tools::sessions_prompt::SessionsPromptTool::new(
+                agent_alias
+            ))
+        );
+    }
     register_tool!(
         "model_routing_config",
         Arc::new(ModelRoutingConfigTool::new(
@@ -8424,6 +8443,15 @@ permissions = ["http_client"]
     /// placeholder credentials, and the MCP registry is a test stub whose one
     /// server is never contacted.
     async fn maximal_registry_names(tmp: &TempDir) -> std::collections::BTreeSet<String> {
+        maximal_registry_names_for(tmp, true).await
+    }
+
+    /// The maximal registry, built for an RPC session agent when
+    /// `session_prompts` is set and for any other entry point otherwise.
+    async fn maximal_registry_names_for(
+        tmp: &TempDir,
+        session_prompts: bool,
+    ) -> std::collections::BTreeSet<String> {
         use zeroclaw_config::schema::{
             DiscordConfig, McpBundleConfig, McpServerConfig, McpTransport, Microsoft365Config,
             OpenAIModelProviderConfig, SkillsPromptInjectionMode,
@@ -8561,7 +8589,7 @@ permissions = ["http_client"]
         let sop_engine = Arc::new(Mutex::new(SopEngine::new(cfg.sop.clone())));
         let sop_audit = Arc::new(crate::sop::SopAuditLogger::new(Arc::clone(&mem)));
 
-        let built = all_tools_with_runtime(
+        let built = all_tools_with_runtime_context(
             Arc::new(cfg.clone()),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -8583,6 +8611,9 @@ permissions = ["http_client"]
             Some(sop_engine),
             Some(sop_audit),
             None,
+            None,
+            None,
+            session_prompts,
         )
         .expect("tool registry builds");
 
@@ -8610,6 +8641,25 @@ permissions = ["http_client"]
             .iter()
             .map(|tool| tool.name().to_string())
             .collect()
+    }
+
+    /// `sessions_prompt` needs the session prompt runner that only RPC turns
+    /// carry, so only an RPC session agent's registry offers it.
+    #[tokio::test]
+    async fn only_rpc_session_registries_offer_sessions_prompt() {
+        let tmp = TempDir::new().unwrap();
+        assert!(
+            maximal_registry_names_for(&tmp, true)
+                .await
+                .contains("sessions_prompt")
+        );
+        let tmp = TempDir::new().unwrap();
+        let other = maximal_registry_names_for(&tmp, false).await;
+        assert!(
+            other.contains("sessions_send"),
+            "positive control: {other:?}"
+        );
+        assert!(!other.contains("sessions_prompt"), "{other:?}");
     }
 
     #[tokio::test]
