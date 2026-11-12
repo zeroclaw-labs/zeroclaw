@@ -2014,6 +2014,7 @@ impl ReliableModelProviderEntry {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_candidate(
         display_name: impl Into<String>,
         cooldown_key: impl Into<String>,
