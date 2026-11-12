@@ -7,6 +7,7 @@ use serde::Deserialize;
 
 const NEARAI_CATALOG_URL: &str = "https://cloud-api.near.ai/v1/model/list";
 const ATLASCLOUD_CATALOG_URL: &str = "https://api.atlascloud.ai/v1/models";
+const OBSCURIFY_CATALOG_URL: &str = "https://obscurify.ai/v1/models";
 const FETCH_TIMEOUT_SECS: u64 = 10;
 
 /// `(models.dev key, openrouter.ai vendor prefix)` for a family name.
@@ -72,6 +73,9 @@ pub fn catalog_source_for(family: &str) -> Option<(Option<&'static str>, Option<
         // Atlas Cloud exposes a no-auth OpenAI-compatible `/models` endpoint.
         // `list_models_for_family` handles that path before using this tuple.
         "atlascloud" => (None, None),
+        // Obscurify.ai also serves a no-auth OpenAI-compatible `/models`
+        // endpoint, handled in `list_models_for_family` like Atlas Cloud.
+        "obscurify" => (None, None),
         "synthetic" => (Some("synthetic"), None),
         "opencode" => (Some("opencode"), None),
         "atomic_chat" => (Some("atomic-chat"), None),
@@ -184,15 +188,11 @@ async fn list_nearai_models() -> Result<Vec<String>> {
     parse_nearai_catalog(&bytes)
 }
 
-async fn list_atlascloud_models() -> Result<Vec<String>> {
+async fn list_public_openai_models(url: &str) -> Result<Vec<String>> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
         .build()?;
-    let response = client
-        .get(ATLASCLOUD_CATALOG_URL)
-        .send()
-        .await?
-        .error_for_status()?;
+    let response = client.get(url).send().await?.error_for_status()?;
     let bytes = response.bytes().await?;
     parse_openai_models_catalog(&bytes)
 }
@@ -205,7 +205,10 @@ pub async fn list_models_for_family(family: &str) -> Result<Vec<String>> {
         return list_nearai_models().await;
     }
     if family == "atlascloud" {
-        return list_atlascloud_models().await;
+        return list_public_openai_models(ATLASCLOUD_CATALOG_URL).await;
+    }
+    if family == "obscurify" {
+        return list_public_openai_models(OBSCURIFY_CATALOG_URL).await;
     }
 
     let Some((md_key, or_prefix)) = catalog_source_for(family) else {
@@ -491,6 +494,13 @@ mod tests {
     #[test]
     fn nearai_family_uses_provider_catalog_source() {
         let (md, or) = catalog_source_for("nearai").expect("nearai is canonical");
+        assert_eq!(md, None);
+        assert_eq!(or, None);
+    }
+
+    #[test]
+    fn obscurify_family_uses_provider_catalog_source() {
+        let (md, or) = catalog_source_for("obscurify").expect("obscurify is canonical");
         assert_eq!(md, None);
         assert_eq!(or, None);
     }
