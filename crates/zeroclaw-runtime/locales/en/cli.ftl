@@ -1662,6 +1662,12 @@ tool-runtime-command-build-failed = Failed to build runtime command: {$error}
 tool-runtime-command-docker-workspace-path = Failed to build runtime command: Failed to canonicalize Docker workspace path {$path}: {$cause}
 tool-runtime-command-docker-allowed-root = Failed to build runtime command: Failed to canonicalize Docker workspace root {$path}: {$cause}
 
+# ── Shell tool failure labels (user-facing ToolComplete.error) ──
+tool-shell-exit-status = exit status { $code }
+tool-shell-killed-by-signal = killed by signal { $signal }
+tool-shell-exited-unsuccessfully = exited unsuccessfully
+tool-shell-failure-with-detail = { $status }: { $detail }
+
 # ── Terminal tool approval ──
 # The ASCII shortcut tokens stay aligned with the Rust-owned response parser.
 cli-approval-request = 🔧 Agent wants to execute: {$tool}

@@ -558,16 +558,21 @@ async fn drain_capped_into<R>(
 
 fn exit_status_label(status: std::process::ExitStatus) -> String {
     if let Some(code) = status.code() {
-        format!("exit status {code}")
+        let code = code.to_string();
+        crate::i18n::get_required_cli_string_with_args("tool-shell-exit-status", &[("code", &code)])
     } else {
         #[cfg(unix)]
         {
             use std::os::unix::process::ExitStatusExt;
             if let Some(signal) = status.signal() {
-                return format!("killed by signal {signal}");
+                let signal = signal.to_string();
+                return crate::i18n::get_required_cli_string_with_args(
+                    "tool-shell-killed-by-signal",
+                    &[("signal", &signal)],
+                );
             }
         }
-        "exited unsuccessfully".to_string()
+        crate::i18n::get_required_cli_string("tool-shell-exited-unsuccessfully")
     }
 }
 
@@ -586,7 +591,10 @@ fn format_shell_failure_error(
     if detail.is_empty() {
         status_text
     } else {
-        format!("{status_text}: {detail}")
+        crate::i18n::get_required_cli_string_with_args(
+            "tool-shell-failure-with-detail",
+            &[("status", &status_text), ("detail", detail)],
+        )
     }
 }
 
