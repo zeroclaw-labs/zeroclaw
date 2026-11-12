@@ -1,3 +1,34 @@
+/// Preview cleanup is optional and bounded. It must not turn a dropped final
+/// into an error that the orchestrator could retry through another modality.
+pub(crate) async fn cancel_draft_best_effort(
+    channel: &dyn zeroclaw_api::channel::Channel,
+    recipient: &str,
+    message_id: &str,
+) {
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        channel.cancel_draft(recipient, message_id),
+    )
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            ::zeroclaw_log::record!(WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&error.to_string())})),
+                "Draft preview cleanup failed"
+            );
+        }
+        Err(_) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "Draft preview cleanup timed out"
+            );
+        }
+    }
+}
+
 #[cfg(any(
     test,
     feature = "channel-discord",
@@ -98,7 +129,9 @@ pub(crate) fn lifecycle_progress_fluent_key(event: ProgressEvent) -> &'static st
     match event {
         ProgressEvent::Received => "channel-runtime-progress-received",
         ProgressEvent::Planning => "channel-runtime-progress-planning",
-        ProgressEvent::WaitingOnModel => "channel-runtime-progress-waiting-on-model",
+        ProgressEvent::WaitingOnModel | ProgressEvent::Reasoning => {
+            "channel-runtime-progress-waiting-on-model"
+        }
         ProgressEvent::RunningTool => "channel-runtime-progress-running-tool",
         ProgressEvent::CompactingContext => "channel-runtime-progress-compacting-context",
         ProgressEvent::FinalizingResponse => "channel-runtime-progress-finalizing-response",
@@ -997,6 +1030,7 @@ mod tests {
                 ProgressEvent::Received,
                 ProgressEvent::Planning,
                 ProgressEvent::WaitingOnModel,
+                ProgressEvent::Reasoning,
                 ProgressEvent::RunningTool,
                 ProgressEvent::CompactingContext,
                 ProgressEvent::FinalizingResponse,
@@ -1005,6 +1039,7 @@ mod tests {
             [
                 "channel-runtime-progress-received",
                 "channel-runtime-progress-planning",
+                "channel-runtime-progress-waiting-on-model",
                 "channel-runtime-progress-waiting-on-model",
                 "channel-runtime-progress-running-tool",
                 "channel-runtime-progress-compacting-context",

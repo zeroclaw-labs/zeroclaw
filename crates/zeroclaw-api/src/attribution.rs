@@ -113,6 +113,7 @@ pub enum ChannelKind {
     Qq,
     Reddit,
     Signal,
+    Simplex,
     Slack,
     Telegram,
     Twitch,

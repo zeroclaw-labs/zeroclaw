@@ -158,6 +158,9 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
     let mut visible_event_output = false;
     let mut replay_blocking_activity = false;
     let mut forwarded_text = String::new();
+    // Creates the observed reasoning phase for this physical stream. Transient
+    // ThinkingDelta events are deliberately not accumulated in replay content.
+    let mut reasoning_started = false;
 
     macro_rules! forward_visible {
         ($text:expr, $count_visible:tt) => {{
@@ -302,6 +305,14 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
                     continue;
                 }
                 replay_blocking_activity = true;
+                if !reasoning_started {
+                    reasoning_started = true;
+                    super::events::send_progress(
+                        on_delta,
+                        zeroclaw_api::channel::ProgressEvent::Reasoning,
+                    )
+                    .await;
+                }
                 if draft_reasoning == StreamReasoningMode::Full
                     && let Some(tx) = on_delta
                 {
@@ -364,6 +375,14 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
                 if let Some(reasoning) = chunk.reasoning.as_deref()
                     && !reasoning.is_empty()
                 {
+                    if !reasoning_started {
+                        reasoning_started = true;
+                        super::events::send_progress(
+                            on_delta,
+                            zeroclaw_api::channel::ProgressEvent::Reasoning,
+                        )
+                        .await;
+                    }
                     // Legacy readable-reasoning path (providers that stream
                     // unsigned reasoning text in the chunk): accumulated for
                     // history and surfaced per the visibility policy. The
@@ -1154,6 +1173,73 @@ mod tests {
                 .iter()
                 .any(|delta| matches!(delta, StreamDelta::Text(text) if text == "answer"))
         );
+    }
+
+    #[tokio::test]
+    async fn reasoning_lifecycle_is_observed_without_disclosing_hidden_content() {
+        let transient = ThinkingSplitProvider;
+        let legacy = ReasoningProvider;
+        let text_only = MarkerTestProvider {
+            text_sequence: vec!["answer"],
+            captured_tool_names: std::sync::Mutex::new(Vec::new()),
+        };
+        for mode in [
+            StreamReasoningMode::Off,
+            StreamReasoningMode::Status,
+            StreamReasoningMode::Full,
+        ] {
+            for (provider, expected) in [
+                (&transient as &dyn ModelProvider, true),
+                (&legacy as &dyn ModelProvider, true),
+                (&text_only as &dyn ModelProvider, false),
+            ] {
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
+                consume_provider_streaming_response(
+                    provider,
+                    &[ChatMessage::user("go")],
+                    None,
+                    "mock-model",
+                    None,
+                    None,
+                    Some(&tx),
+                    None,
+                    false,
+                    mode,
+                    None,
+                )
+                .await
+                .expect("consume");
+                drop(tx);
+                let deltas: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+                assert_eq!(
+                    deltas
+                        .iter()
+                        .filter(|delta| matches!(
+                            delta,
+                            StreamDelta::Lifecycle(zeroclaw_api::channel::ProgressEvent::Reasoning)
+                        ))
+                        .count(),
+                    usize::from(expected),
+                    "only actual reasoning starts the phase, once per request"
+                );
+                if expected {
+                    assert!(matches!(
+                        deltas.first(),
+                        Some(StreamDelta::Lifecycle(
+                            zeroclaw_api::channel::ProgressEvent::Reasoning
+                        ))
+                    ));
+                }
+                if mode != StreamReasoningMode::Full {
+                    assert!(
+                        deltas
+                            .iter()
+                            .all(|delta| !matches!(delta, StreamDelta::Reasoning(_))),
+                        "phase metadata must not expose private reasoning"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]

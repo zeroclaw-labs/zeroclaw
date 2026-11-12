@@ -2999,3 +2999,6 @@ mod channel_builder_tests {
         );
     }
 }
+
+#[cfg(feature = "channel-simplex")]
+pub(crate) mod live;

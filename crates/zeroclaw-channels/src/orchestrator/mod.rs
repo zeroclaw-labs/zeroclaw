@@ -631,6 +631,12 @@ fn interrupt_on_new_message_enabled(
     };
 
     match msg.channel.as_str() {
+        "simplex" => ctx
+            .prompt_config
+            .channels
+            .simplex
+            .get(alias)
+            .is_some_and(|c| c.interrupt_on_new_message),
         "telegram" => ctx
             .prompt_config
             .channels
@@ -1752,7 +1758,7 @@ fn conversation_history_key_in_scope(
     let thread_scope = match msg.thread_ts.as_deref() {
         // Matrix thread_ts is a delivery anchor, not a topic boundary: root
         // and follow-ups must share one sender+room session.
-        Some(_) if is_matrix_channel_name(&msg.channel) => None,
+        Some(_) if is_matrix_channel_name(&msg.channel) || msg.channel == "simplex" => None,
         other => other,
     };
     let raw = match (msg.conversation_scope, thread_scope) {
@@ -3477,7 +3483,8 @@ fn sender_prefers_voice(
 
     let channel_type = msg.channel.as_str();
     let matrix = channel_type.starts_with("matrix");
-    if !(matrix || channel_type.starts_with("telegram")) {
+    let simplex = channel_type == "simplex";
+    if !(matrix || simplex || channel_type.starts_with("telegram")) {
         return None;
     }
     let channel_alias = msg.channel_alias.as_deref().unwrap_or(channel_type);
@@ -3490,8 +3497,15 @@ fn sender_prefers_voice(
         .collect();
     // The normalized peers of every group of `modality` on this channel.
     let peers_of = |modality: OutputModality| -> Vec<String> {
-        ctx.prompt_config
-            .channel_modality_peers(channel_type, channel_alias, modality)
+        let peers = if simplex {
+            ctx.live_config
+                .read()
+                .channel_modality_peers(channel_type, channel_alias, modality)
+        } else {
+            ctx.prompt_config
+                .channel_modality_peers(channel_type, channel_alias, modality)
+        };
+        peers
             .into_iter()
             .map(|p| normalize_peer_username(&p))
             .collect()
@@ -3511,7 +3525,7 @@ fn sender_prefers_voice(
     if names_sender(&voice_peers) {
         return Some(true);
     }
-    if !matrix {
+    if !(matrix || simplex) {
         return None;
     }
     if names_sender(&peers_of(OutputModality::Text)) {
@@ -6456,6 +6470,7 @@ async fn run_draft_updater(
         turn_flush_narration,
         outbound_hooks,
         outbound_channel,
+        None,
         rx,
     )
     .await;
@@ -6475,10 +6490,15 @@ async fn run_draft_updater_with_leak_detection(
     turn_flush_narration: bool,
     outbound_hooks: Option<Arc<zeroclaw_runtime::hooks::HookRunner>>,
     outbound_channel: String,
+    turn_routing: Option<tools::TurnRoutingHandle>,
     mut rx: tokio::sync::mpsc::Receiver<zeroclaw_runtime::agent::loop_::DraftEvent>,
 ) {
     use zeroclaw_runtime::agent::loop_::StreamDelta;
     let mut accumulated = String::new();
+    // A Status/FlushBarrier creates the boundary between assistant text phases.
+    // Derive the current phase from the canonical accumulation rather than
+    // retaining a second text buffer for speculative speech.
+    let mut speech_phase_start = 0;
     // Watermark of narration already run through outbound policy this stream, so
     // a completed turn crosses the (non-idempotent) hook exactly once across the
     // `Status` and `FlushBarrier` events.
@@ -6528,6 +6548,18 @@ async fn run_draft_updater_with_leak_detection(
                     )
                     .await;
                 }
+                if outbound_hooks.is_none() {
+                    deliver_live_voice_phase(
+                        &channel,
+                        &reply_target,
+                        &draft_id,
+                        speech_phase_start,
+                        "",
+                        true,
+                    )
+                    .await;
+                }
+                speech_phase_start = accumulated.len();
                 let visible = sanitize_streaming_draft_text(&text, &known_tool_names);
                 if let Err(e) = channel
                     .update_draft_progress(&reply_target, &draft_id, &visible)
@@ -6546,6 +6578,29 @@ async fn run_draft_updater_with_leak_detection(
             // Matrix has its own disclosure policy in
             // `run_matrix_single_message_draft_updater`.
             event @ (StreamDelta::ToolStart { .. } | StreamDelta::ToolComplete { .. }) => {
+                if outbound_hooks.is_none() {
+                    deliver_live_voice_phase(
+                        &channel,
+                        &reply_target,
+                        &draft_id,
+                        speech_phase_start,
+                        "",
+                        true,
+                    )
+                    .await;
+                }
+                if outbound_hooks.is_none() {
+                    deliver_live_voice_phase(
+                        &channel,
+                        &reply_target,
+                        &draft_id,
+                        speech_phase_start,
+                        "",
+                        true,
+                    )
+                    .await;
+                }
+                speech_phase_start = accumulated.len();
                 if let Some(text) = event.legacy_status() {
                     let visible = sanitize_streaming_draft_text(&text, &known_tool_names);
                     if let Err(e) = channel
@@ -6570,6 +6625,64 @@ async fn run_draft_updater_with_leak_detection(
             StreamDelta::Reasoning(_) => {}
             StreamDelta::Text(text) => {
                 accumulated.push_str(&text);
+                // Hooks can make non-idempotent decisions about a completed
+                // response. Do not disclose speculative text to a TTS provider
+                // before that decision; finalization will synthesize it instead.
+                let prepare_voice = turn_routing.as_ref().is_none_or(|routing| {
+                    let routes = routing.lock().unwrap_or_else(|error| error.into_inner());
+                    routes.last().is_none_or(|route| {
+                        route.modality != zeroclaw_config::multi_agent::OutputModality::Text
+                            && route.channel.as_deref().is_none_or(str::is_empty)
+                            && route
+                                .recipient
+                                .as_deref()
+                                .is_none_or(|recipient| recipient == reply_target)
+                    })
+                });
+                if outbound_hooks.is_none() {
+                    let phase = &accumulated[speech_phase_start..];
+                    let mut speech = if prepare_voice {
+                        redact_channel_outbound_leaks(
+                            &sanitize_streaming_draft_text(phase, &known_tool_names),
+                            &leak_detection,
+                            content_format,
+                        )
+                    } else {
+                        // An explicit text route also cancels any older speculation.
+                        String::new()
+                    };
+                    // The display sanitizer trims trailing whitespace, but the
+                    // speech segmenter needs the observed sentence/paragraph
+                    // delimiter. Restore only this structural whitespace, never
+                    // any stripped or redacted content.
+                    if !speech.is_empty() {
+                        speech.truncate(speech.trim_end().len());
+                        speech.push_str(&phase[phase.trim_end().len()..]);
+                    }
+                    deliver_live_voice_phase(
+                        &channel,
+                        &reply_target,
+                        &draft_id,
+                        speech_phase_start,
+                        &speech,
+                        false,
+                    )
+                    .await;
+                    if let Err(error) = channel
+                        .prepare_voice_draft(&reply_target, &draft_id, &speech)
+                        .await
+                    {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                            "Voice draft preparation failed"
+                        );
+                    }
+                }
                 let visible = redact_channel_outbound_leaks(
                     &sanitize_streaming_draft_text(&accumulated, &known_tool_names),
                     &leak_detection,
@@ -6614,9 +6727,42 @@ async fn run_draft_updater_with_leak_detection(
                     )
                     .await;
                 }
+                if outbound_hooks.is_none() {
+                    deliver_live_voice_phase(
+                        &channel,
+                        &reply_target,
+                        &draft_id,
+                        speech_phase_start,
+                        "",
+                        true,
+                    )
+                    .await;
+                }
+                speech_phase_start = accumulated.len();
                 StreamDelta::ack_flush_barrier(&ack);
             }
         }
+    }
+}
+
+async fn deliver_live_voice_phase(
+    channel: &Arc<dyn Channel>,
+    recipient: &str,
+    draft: &str,
+    phase: usize,
+    text: &str,
+    finished: bool,
+) {
+    if let Err(error) = channel
+        .stream_voice_draft(recipient, draft, phase, text, finished)
+        .await
+    {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"error":error.to_string()})),
+            "Live call speech update failed"
+        );
     }
 }
 
@@ -10198,6 +10344,12 @@ async fn process_channel_message_body(
     // finalize the same cumulative stream they used for paragraph offsets.
     // Other draft modes still finalize the canonical response unchanged.
     let streamed_draft_text = Arc::new(Mutex::new(String::new()));
+    // Fresh per-turn routing handle, scoped into TURN_ROUTING for the duration of
+    // the tool-call loop below. Allocating per turn (rather than clearing a shared
+    // handle) keeps concurrent same-agent turns from reading each other's routes.
+    let turn_routing: tools::TurnRoutingHandle =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
     let draft_updater = if use_draft_streaming {
         // Partial: accumulate text and edit a single draft message.
         if let (Some(rx), Some(draft_id_ref), Some(channel_ref)) = (
@@ -10245,6 +10397,7 @@ async fn process_channel_message_body(
                 let streamed_draft_text = Arc::clone(&streamed_draft_text);
                 let leak_detection = ctx.prompt_config.security.leak_detection.clone();
                 let content_format = outbound_content_format_for_channel(&msg.channel);
+                let draft_routing = Arc::clone(&turn_routing);
                 Some(zeroclaw_spawn::spawn!(async move {
                     let _lease = draft_lease;
                     run_draft_updater_with_leak_detection(
@@ -10258,6 +10411,7 @@ async fn process_channel_message_body(
                         turn_flush_narration,
                         outbound_hooks,
                         outbound_channel,
+                        Some(draft_routing),
                         rx,
                     )
                     .await;
@@ -10398,12 +10552,6 @@ async fn process_channel_message_body(
             .with_attrs(::serde_json::json!({"elapsed_before_llm_ms": elapsed_before_llm_ms})),
         "starting LLM call"
     );
-    // Fresh per-turn routing handle, scoped into TURN_ROUTING for the duration of
-    // the tool-call loop below. Allocating per turn (rather than clearing a shared
-    // handle) keeps concurrent same-agent turns from reading each other's routes.
-    let turn_routing: tools::TurnRoutingHandle =
-        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-
     let tool_receipts_collector: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let receipt_scope = ctx.receipt_generator.as_ref().map(|generator| {
@@ -11058,7 +11206,8 @@ async fn process_channel_message_body(
                 let is_redirect = turn_route
                     .as_ref()
                     .and_then(|r| r.channel.as_deref())
-                    .is_some();
+                    .is_some()
+                    || delivery_recipient != msg.reply_target;
                 // Preserve the transport result until delivery logging and hooks
                 // distinguish complete, partial, and failed delivery.
                 enum ReplyDelivery {
@@ -11086,11 +11235,11 @@ async fn process_channel_message_body(
                         .await
                         .map(|()| ReplyDelivery::Complete)
                 } else if let Some(ref draft_id) = draft_message_id {
-                    // Same channel with draft. For force-voice routing: cancel the
-                    // draft placeholder and deliver via send_final() so force_voice
-                    // reaches the channel's voice path (finalize_draft has no
-                    // force_voice concept).
-                    if force_voice_override {
+                    // Same-channel voice delivery transfers any prepared audio
+                    // before releasing draft ownership.
+                    if force_voice_override && !channel.supports_voice_draft_finalization() {
+                        // Preserve the legacy path for adapters without prepared
+                        // voice support; optional preview cleanup is best-effort.
                         let _ = channel.cancel_draft(&delivery_recipient, draft_id).await;
                         channel
                             .send_final(
@@ -11121,11 +11270,12 @@ async fn process_channel_message_body(
                             delivered_response.clone()
                         };
                         match channel
-                            .finalize_draft(
+                            .finalize_draft_with_modality(
                                 &delivery_recipient,
                                 draft_id,
                                 &draft_final_response,
                                 suppress,
+                                force_voice_override,
                             )
                             .await
                         {
@@ -11157,6 +11307,26 @@ async fn process_channel_message_body(
                                      duplicating the accepted prefix"
                                 );
                                 Ok(ReplyDelivery::Partial)
+                            }
+                            Err(e)
+                                if e
+                                    .downcast_ref::<zeroclaw_api::channel::FinalizeUncertainDelivery>()
+                                    .is_some() =>
+                            {
+                                // A lost acknowledgement never authorizes replay.
+                                // Resending would only extend the penalty, and
+                                // the reply must not be reported as sent.
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Fail
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                    "Final answer delivery uncertain; not resending"
+                                );
+                                Err(e)
                             }
                             Err(e)
                                 if e
@@ -12370,6 +12540,14 @@ async fn run_message_dispatch_loop_until_cancelled(
                 None => break false,
             },
         };
+        if msg.control.is_some() && !msg.passive_context {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject),
+                "invalid_channel_transport_control"
+            );
+            continue;
+        }
         // Acquire picker-delivery ownership at the first definitive queue
         // consumption boundary. Every `continue`, semaphore shutdown, debounce
         // cancellation, worker abort, and normal completion below then settles
@@ -12443,7 +12621,11 @@ async fn run_message_dispatch_loop_until_cancelled(
         // each cancelled turn removes its own entry when it releases.
         // A passive observation carries no turn of its own and must not cancel
         // the sender's live turns or answer in the room.
-        if msg.channel != "cli" && !msg.passive_context && is_stop_command(&msg.content) {
+        let transport_interrupt =
+            msg.control == Some(zeroclaw_api::channel::ChannelControl::Interrupt);
+        if transport_interrupt
+            || (msg.channel != "cli" && !msg.passive_context && is_stop_command(&msg.content))
+        {
             let scope_key = interruption_scope_key(&msg);
             let states = {
                 let active = in_flight_by_sender
@@ -12528,53 +12710,60 @@ async fn run_message_dispatch_loop_until_cancelled(
                         })
                     });
 
-            let reply = if had_registered_turn || cancelled_bucket {
-                zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-sent")
-            } else if folded_into_another_scope {
-                zeroclaw_runtime::i18n::get_required_cli_string(
-                    "channel-runtime-stop-folded-followup",
-                )
-            } else {
-                zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-no-task")
-            };
-            let channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
-            if let Some(channel) = channel {
-                // `/stop` bypasses every admission budget so cancellation
-                // stays reachable, but its acknowledgement must not: a
-                // sender flooding `/stop` against a slow channel would
-                // otherwise accumulate detached reply tasks without bound.
-                // The cancellation above already ran; only the reply is
-                // skipped when the budget is exhausted.
-                match Arc::clone(&stop_reply_budget).try_acquire_owned() {
-                    Ok(reply_permit) => {
-                        let send_msg = stop_reply_message(&msg, reply);
-                        notice_tasks.spawn(async move {
-                            let _reply_permit = reply_permit;
-                            send_notice_with_timeout(channel, send_msg, "stop_ack").await;
-                        });
-                    }
-                    Err(_) => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"sender": msg.sender})),
-                            "stop executed without acknowledgement: reply budget exhausted"
-                        );
-                    }
+            if transport_interrupt {
+                if msg.content.is_empty() {
+                    continue;
                 }
+                // Passive playback observations use the normal conversation lane.
             } else {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                    "stop command: no registered channel found for reply"
-                );
+                let reply = if had_registered_turn || cancelled_bucket {
+                    zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-sent")
+                } else if folded_into_another_scope {
+                    zeroclaw_runtime::i18n::get_required_cli_string(
+                        "channel-runtime-stop-folded-followup",
+                    )
+                } else {
+                    zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-no-task")
+                };
+                let channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
+                if let Some(channel) = channel {
+                    // `/stop` bypasses every admission budget so cancellation
+                    // stays reachable, but its acknowledgement must not: a
+                    // sender flooding `/stop` against a slow channel would
+                    // otherwise accumulate detached reply tasks without bound.
+                    // The cancellation above already ran; only the reply is
+                    // skipped when the budget is exhausted.
+                    match Arc::clone(&stop_reply_budget).try_acquire_owned() {
+                        Ok(reply_permit) => {
+                            let send_msg = stop_reply_message(&msg, reply);
+                            notice_tasks.spawn(async move {
+                                let _reply_permit = reply_permit;
+                                send_notice_with_timeout(channel, send_msg, "stop_ack").await;
+                            });
+                        }
+                        Err(_) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({"sender": msg.sender})),
+                                "stop executed without acknowledgement: reply budget exhausted"
+                            );
+                        }
+                    }
+                } else {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        "stop command: no registered channel found for reply"
+                    );
+                }
+                continue;
             }
-            continue;
         }
 
         // ── Aggregate admission: refuse before retaining message data ───────
@@ -13375,6 +13564,16 @@ fn build_channel_by_id(
         #[cfg(not(feature = "channel-mattermost"))]
         "mattermost" => {
             anyhow::bail!("Mattermost channel requires the `channel-mattermost` feature");
+        }
+        #[cfg(feature = "channel-simplex")]
+        "simplex" => {
+            config.channels.simplex.get("default").with_context(|| {
+                channel_runtime_cli_string("channel-simplex-not-configured-error")
+            })?;
+            Ok(Arc::new(crate::simplex::SimplexChannel::new(
+                "default".into(),
+                config_arc.clone(),
+            )))
         }
         #[cfg(feature = "channel-signal")]
         "signal" => {
@@ -15106,6 +15305,20 @@ fn collect_configured_channels_with_authority(
                 matrix_skip_context
             )
         );
+    }
+
+    #[cfg(feature = "channel-simplex")]
+    for (alias, sx) in &config.channels.simplex {
+        if sx.enabled && active_channel_aliases.contains(&format!("simplex.{alias}")) {
+            channels.push(ConfiguredChannel {
+                display_name: "SimpleX",
+                alias: Some(alias.clone()),
+                channel: Arc::new(crate::simplex::SimplexChannel::new(
+                    alias.clone(),
+                    config_arc.clone(),
+                )),
+            });
+        }
     }
 
     #[cfg(feature = "channel-signal")]
@@ -16973,6 +17186,16 @@ pub async fn start_channels_with_authority(
     .await
 }
 
+fn channel_hook_runner(config: &Config) -> Option<Arc<zeroclaw_runtime::hooks::HookRunner>> {
+    if !config.hooks.enabled {
+        return None;
+    }
+    let runner = zeroclaw_runtime::hooks::HookRunner::from_root_config(config);
+    // The runner owns installed handlers; the default enabled flag alone
+    // does not mean outbound content has a hook decision to await.
+    (!runner.is_empty()).then(|| Arc::new(runner))
+}
+
 /// Start supervised channels with an owned config snapshot and the daemon
 /// generation's plugin-webhook route registry.
 #[allow(clippy::too_many_lines)]
@@ -17652,13 +17875,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
             media_pipeline: config.media_pipeline.clone(),
             transcription_config: config.transcription.clone(),
             agent_transcription_provider: agent.transcription_provider.as_str().to_string(),
-            hooks: if config.hooks.enabled {
-                Some(Arc::new(
-                    zeroclaw_runtime::hooks::HookRunner::from_root_config(&config),
-                ))
-            } else {
-                None
-            },
+            hooks: channel_hook_runner(&config),
             non_cli_excluded_tools: Arc::new(risk_profile.excluded_tools.clone()),
             autonomy_level: risk_profile.level,
             tool_call_dedup_exempt: Arc::new(agent.resolved.tool_call_dedup_exempt.clone()),
@@ -18019,6 +18236,17 @@ pub async fn deliver_announcement(
         #[cfg(not(feature = "channel-slack"))]
         "slack" => {
             anyhow::bail!("Slack channel requires the `channel-slack` feature");
+        }
+        #[cfg(feature = "channel-simplex")]
+        "simplex" => {
+            config
+                .channels
+                .simplex
+                .get(alias)
+                .ok_or_else(not_configured)?;
+            let storage = zeroclaw_config::live::LiveConfig::new(config.clone());
+            let ch = crate::simplex::SimplexChannel::new(alias.into(), storage.handle());
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         #[cfg(feature = "channel-signal")]
         "signal" => {
@@ -25799,6 +26027,7 @@ api_key = "anthropic-key"
         /// Text handed to `update_draft`, in order, so a test can assert on
         /// what the transport actually received rather than on a sanitizer it
         /// called itself. Progress text lands in `progress_messages`.
+        voice_preparations: tokio::sync::Mutex<Vec<String>>,
         draft_updates: tokio::sync::Mutex<Vec<String>>,
         /// When set, `update_draft`/`finalize_draft` faithfully model the real
         /// Discord/Matrix MultiMessage confirmed-prefix bookkeeping: each
@@ -25851,6 +26080,7 @@ api_key = "anthropic-key"
                 delivery_events: tokio::sync::Mutex::new(Vec::new()),
                 stall_start_typing: false,
                 stall_stop_typing: false,
+                voice_preparations: tokio::sync::Mutex::new(Vec::new()),
                 draft_updates: tokio::sync::Mutex::new(Vec::new()),
                 cumulative_offset: false,
                 multi_confirmed_prefix: std::sync::Mutex::new(String::new()),
@@ -26343,6 +26573,16 @@ api_key = "anthropic-key"
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .len()
+        }
+
+        async fn prepare_voice_draft(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+            text: &str,
+        ) -> anyhow::Result<()> {
+            self.voice_preparations.lock().await.push(text.to_owned());
+            Ok(())
         }
 
         async fn update_draft(
@@ -27123,6 +27363,7 @@ api_key = "anthropic-key"
         Denied,
         Partial,
         Undelivered,
+        Uncertain,
     }
 
     struct DeliveryLogChannel {
@@ -27143,6 +27384,12 @@ api_key = "anthropic-key"
                 DeliveryLogOutcome::Denied => anyhow::bail!("HTTP 403: Missing Permissions"),
                 DeliveryLogOutcome::Partial => {
                     Err(zeroclaw_api::channel::FinalizePartialDelivery { delivered: 1 }.into())
+                }
+                DeliveryLogOutcome::Uncertain => {
+                    Err(zeroclaw_api::channel::FinalizeUncertainDelivery {
+                        reason: "synthetic lost acknowledgement".into(),
+                    }
+                    .into())
                 }
                 DeliveryLogOutcome::Undelivered => {
                     Err(zeroclaw_api::channel::FinalizeUndelivered {
@@ -27247,6 +27494,7 @@ api_key = "anthropic-key"
             (DeliveryLogOutcome::Partial, true),
             (DeliveryLogOutcome::Partial, false),
             (DeliveryLogOutcome::Undelivered, true),
+            (DeliveryLogOutcome::Uncertain, true),
         ]
         .into_iter()
         .enumerate()
@@ -27317,6 +27565,9 @@ api_key = "anthropic-key"
                     "Final answer partially delivered; not resending to avoid duplicating the accepted prefix"
                 }
                 (DeliveryLogOutcome::Undelivered, _) => "Final answer not delivered; not resending",
+                (DeliveryLogOutcome::Uncertain, _) => {
+                    "Final answer delivery uncertain; not resending"
+                }
             };
             assert!(
                 after
@@ -35909,6 +36160,75 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
+    async fn transport_speech_start_cancels_without_reply_and_precedes_next_prompt() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let provider = Arc::new(DelayedHistoryCaptureModelProvider {
+            delay: Duration::from_millis(250),
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.telegram.insert(
+            "default".into(),
+            zeroclaw_config::schema::TelegramConfig {
+                interrupt_on_new_message: true,
+                ..Default::default()
+            },
+        );
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel_impl.clone(),
+            provider.clone(),
+            config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let first = shared_topic_message("alice", "first", "Please explain slowly.");
+        let mut cutoff = shared_topic_message(
+            "alice",
+            "cutoff",
+            "Playback stopped halfway through the second point.",
+        );
+        cutoff.passive_context = true;
+        cutoff.control = Some(zeroclaw_api::channel::ChannelControl::Interrupt);
+        let next = shared_topic_message("alice", "next", "What was the second point?");
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let capture = provider.clone();
+        let before_final = channel_impl.clone();
+        let send = zeroclaw_spawn::spawn!(async move {
+            tx.send(first).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while capture.calls.lock().unwrap().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            tx.send(cutoff).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                before_final.sent_messages.lock().await.is_empty(),
+                "speech-start alone must cancel before any final transcript"
+            );
+            tx.send(next).await.unwrap();
+        });
+        run_message_dispatch_loop(rx, AgentRouter::single(ctx), 4).await;
+        send.await.unwrap();
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(
+            sent.len(),
+            1,
+            "no stop acknowledgement or interrupted response"
+        );
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "the passive report must not call the model");
+        assert!(
+            calls[1]
+                .iter()
+                .any(|(role, text)| role == "user" && text.contains("Playback stopped halfway"))
+        );
+    }
+
+    #[tokio::test]
     async fn passive_stop_command_does_not_cancel_another_participants_turn() {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -39530,6 +39850,32 @@ BTC is currently around $65,000 based on latest tool output."#
         // tools_used must reflect that both events were observed
         // (the drop is on the notify side, not the observer side).
         assert!(observer.tools_used.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn simplex_call_playback_generations_share_only_the_same_contacts_context() {
+        let mut first = ChannelMessage {
+            channel: "simplex".into(),
+            channel_alias: Some("fixture".into()),
+            sender: "17".into(),
+            reply_target: "17".into(),
+            thread_ts: Some("call/first".into()),
+            interruption_scope_id: Some("call".into()),
+            ..Default::default()
+        };
+        let history = conversation_history_key(&first);
+        let cancellation = interruption_scope_key(&first);
+        first.thread_ts = Some("call/second".into());
+        assert_eq!(history, conversation_history_key(&first));
+        assert_eq!(cancellation, interruption_scope_key(&first));
+        first.thread_ts = None;
+        assert_eq!(history, conversation_history_key(&first));
+        first.channel_alias = Some("other".into());
+        assert_ne!(history, conversation_history_key(&first));
+        first.channel_alias = Some("fixture".into());
+        first.sender = "18".into();
+        first.reply_target = "18".into();
+        assert_ne!(history, conversation_history_key(&first));
     }
 
     #[test]
@@ -48103,6 +48449,7 @@ BTC is currently around $65,000 based on latest tool output."#
         process_channel_message(
             runtime_ctx.clone(),
             zeroclaw_api::channel::ChannelMessage {
+                control: None,
                 id: "msg-image-1".to_string(),
                 sender: "alice".to_string(),
                 platform_sender_id: None,
@@ -51800,6 +52147,7 @@ This is an example JSON object for profile settings."#;
         process_channel_message(
             runtime_ctx,
             zeroclaw_api::channel::ChannelMessage {
+                control: None,
                 id: "msg-image-route".to_string(),
                 sender: "alice".to_string(),
                 platform_sender_id: None,
@@ -52330,6 +52678,7 @@ This is an example JSON object for profile settings."#;
             runtime_ctx,
             zeroclaw_api::channel::ChannelMessage {
                 id: "msg-photo-1".to_string(),
+                control: None,
                 sender: "zeroclaw_user".to_string(),
                 reply_target: "chat-photo".to_string(),
                 content: format!("[IMAGE:{}]\n\nWhat is this?", photo_path.display()),
@@ -55612,6 +55961,365 @@ Done."#;
     /// asserts on the strings handed to `update_draft` and
     /// `update_draft_progress`. Unlike the per-frame tests above, this one
     /// fails if the sanitizer call is ever dropped from the wiring.
+    #[cfg(feature = "channel-telegram")]
+    struct SpeechReplyModelProvider {
+        continue_reply: Arc<tokio::sync::Notify>,
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    impl zeroclaw_api::attribution::Attributable for SpeechReplyModelProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            DummyModelProvider.role()
+        }
+        fn alias(&self) -> &str {
+            "speech-fixture"
+        }
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    #[async_trait::async_trait]
+    impl ModelProvider for SpeechReplyModelProvider {
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("speech fixture requires the streaming path")
+        }
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+        fn stream_chat(
+            &self,
+            _: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+            _: zeroclaw_api::model_provider::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_api::model_provider::StreamResult<zeroclaw_api::model_provider::StreamEvent>,
+        > {
+            use futures_util::StreamExt as _;
+            use zeroclaw_api::model_provider::{StreamChunk, StreamEvent};
+            let ready = self.continue_reply.clone();
+            Box::pin(futures_util::stream::once(async { Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                "The opening sentence is long enough to synthesize before generation has finished. ")))
+            }).chain(futures_util::stream::once(async move {
+                ready.notified().await;
+                Ok(StreamEvent::TextDelta(StreamChunk::delta("The final paragraph completes the response.")))
+            })).chain(futures_util::stream::once(async { Ok(StreamEvent::Final) })))
+        }
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    #[ignore = "requires ffmpeg with libopus; run explicitly for voice deployment"]
+    async fn speech_stream_reaches_tts_before_final_and_uploads_one_telegram_voice_note() {
+        assert_speech_reply_through_routing(false, false).await;
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    #[ignore = "requires ffmpeg with libopus; run explicitly for voice deployment"]
+    async fn speech_stream_recovers_after_speculative_tts_failure() {
+        assert_speech_reply_through_routing(true, false).await;
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    #[ignore = "requires ffmpeg with libopus; run explicitly for voice deployment"]
+    async fn speech_final_reply_survives_preview_deletion_timeout() {
+        assert_speech_reply_through_routing(false, true).await;
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    async fn assert_speech_reply_through_routing(fail_first: bool, fail_cleanup: bool) {
+        use wiremock::{
+            Mock, MockServer, Request, ResponseTemplate,
+            matchers::{method, path, path_regex},
+        };
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, OpenAITtsProviderConfig, StreamMode, TtsProviderConfig,
+        };
+        let server = MockServer::start().await;
+        let (tts_tx, mut tts_rx) = tokio::sync::mpsc::unbounded_channel();
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        Mock::given(method("POST"))
+            .and(path("/speech"))
+            .respond_with(move |request: &Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                tts_tx.send(body["input"].as_str().unwrap().to_owned()).ok();
+                if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 && fail_first {
+                    return ResponseTemplate::new(500);
+                }
+                ResponseTemplate::new(200)
+                    .set_body_bytes(crate::tts::speech::tests::silence_wav(2400))
+            })
+            .mount(&server)
+            .await;
+        let (voice_tx, mut voice_rx) = tokio::sync::mpsc::unbounded_channel();
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendVoice$"))
+            .respond_with(move |request: &Request| {
+                voice_tx.send(request.body.clone()).ok();
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok":true,"result":{"message_id":2}}))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok":true,"result":{"message_id":1}})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/deleteMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(3)))
+            .expect(if fail_cleanup { 1 } else { 0 })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/editMessageText$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok":true})))
+            .mount(&server)
+            .await;
+        let mut config = Config::default();
+        config.tts.enabled = true;
+        config.agents.insert(
+            "fixture".into(),
+            AliasedAgentConfig {
+                tts_provider: "openai.fixture".into(),
+                channels: vec!["telegram.fixture".into()],
+                ..Default::default()
+            },
+        );
+        config.providers.tts.openai.insert(
+            "fixture".into(),
+            OpenAITtsProviderConfig {
+                base: TtsProviderConfig {
+                    api_key: Some("fixture".into()),
+                    uri: Some(format!("{}/speech", server.uri())),
+                    response_format: Some("wav".into()),
+                    ..Default::default()
+                },
+            },
+        );
+        let telegram = Arc::new(
+            crate::telegram::TelegramChannel::new(
+                "fixture".into(),
+                "fixture",
+                Arc::new(Vec::new),
+                false,
+            )
+            .with_api_base(server.uri())
+            .with_streaming(
+                if fail_cleanup {
+                    StreamMode::Partial
+                } else {
+                    StreamMode::MultiMessage
+                },
+                0,
+            )
+            .with_fixture_timeout(Duration::from_secs(10))
+            .with_voice_peer_resolver(Arc::new(|| vec!["-1001234567890".into()]))
+            .with_tts(&config),
+        );
+        let continue_reply = Arc::new(tokio::sync::Notify::new());
+        let mut ctx = telegram_voice_delivery_ctx(
+            telegram.clone(),
+            Arc::new(SpeechReplyModelProvider {
+                continue_reply: continue_reply.clone(),
+            }),
+            Vec::new(),
+        );
+        assert!(
+            config.hooks.enabled,
+            "exercise the default enabled hook configuration"
+        );
+        Arc::get_mut(&mut ctx).unwrap().hooks = channel_hook_runner(&config);
+        let process = zeroclaw_spawn::spawn!(process_channel_message(
+            ctx,
+            telegram_group_message("@alice", "111"),
+            CancellationToken::new(),
+        ));
+        let opener =
+            "The opening sentence is long enough to synthesize before generation has finished.";
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), tts_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            opener
+        );
+        assert!(
+            voice_rx.try_recv().is_err(),
+            "speculation must never upload a partial voice note"
+        );
+        continue_reply.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), process)
+            .await
+            .unwrap()
+            .unwrap();
+        if fail_first {
+            assert_eq!(tts_rx.recv().await.as_deref(), Some(opener));
+        }
+        let upload = tokio::time::timeout(Duration::from_secs(5), voice_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(upload.windows(4).any(|window| window == b"OggS"));
+        assert_eq!(
+            tts_rx.recv().await.as_deref(),
+            Some("The final paragraph completes the response.")
+        );
+        assert!(
+            tts_rx.try_recv().is_err(),
+            "the early sentence must be reused"
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path().ends_with("/sendVoice"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn speech_preparation_reads_live_text_only_and_redirect_routes() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+        let recording = Arc::new(DraftRecordingChannel::new(false, false));
+        let routing: tools::TurnRoutingHandle = Arc::new(Mutex::new(Vec::new()));
+        let channel_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        channel_map.write().insert(
+            "telegram.other".into(),
+            recording.clone() as Arc<dyn Channel>,
+        );
+        let route_tool = tools::SendViaTool::new(
+            Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+            channel_map,
+            Arc::new(|| {
+                HashMap::from([(
+                    "other".into(),
+                    voice_peer_group("telegram.other", &["other-peer"]),
+                )])
+            }),
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let draft_channel = recording.clone();
+        let draft_routing = routing.clone();
+        let task = zeroclaw_spawn::spawn!(run_draft_updater_with_leak_detection(
+            draft_channel,
+            "peer".into(),
+            "draft".into(),
+            no_tools(),
+            Arc::new(Mutex::new(String::new())),
+            zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::Markdown,
+            false,
+            None,
+            "telegram".into(),
+            Some(draft_routing),
+            rx,
+        ));
+        for (arguments, allowed) in [
+            (None, true),
+            (Some(serde_json::json!({"modality": "text"})), false),
+            (
+                Some(serde_json::json!({"target": "other", "modality": "voice"})),
+                false,
+            ),
+            (Some(serde_json::json!({"modality": "voice"})), true),
+        ] {
+            routing.lock().unwrap().clear();
+            if let Some(arguments) = arguments {
+                let result = tools::TURN_ROUTING
+                    .scope(Some(routing.clone()), route_tool.execute(arguments))
+                    .await
+                    .unwrap();
+                assert!(result.success, "{result:?}");
+            }
+            let before = recording.voice_preparations.lock().await.len();
+            tx.send(StreamDelta::Text(
+                "A sufficiently long sentence for speech preparation. ".into(),
+            ))
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let prepared = recording.voice_preparations.lock().await;
+                    if let Some(text) = prepared.get(before) {
+                        assert_eq!(!text.is_empty(), allowed);
+                        break;
+                    }
+                    drop(prepared);
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        drop(tx);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn speech_preparation_uses_default_hook_configuration_and_waits_for_handlers() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+        for hooks_enabled in [false, true] {
+            let recording = Arc::new(DraftRecordingChannel::new(false, false));
+            let channel: Arc<dyn Channel> = recording.clone();
+            let (tx, rx) = tokio::sync::mpsc::channel(16);
+            for event in [
+                StreamDelta::Text("First narration.".into()),
+                StreamDelta::Status("Tool status is never speech.".into()),
+                StreamDelta::Reasoning("Hidden reasoning is never speech.".into()),
+                StreamDelta::Text(
+                    "<tool_result>{\"private\":1}</tool_result>Safe final response.".into(),
+                ),
+            ] {
+                tx.send(event).await.unwrap();
+            }
+            drop(tx);
+            let mut config = Config::default();
+            assert!(config.hooks.enabled);
+            config.hooks.builtin.command_logger = hooks_enabled;
+            let hooks = channel_hook_runner(&config);
+            run_draft_updater(
+                channel,
+                "peer".into(),
+                "draft".into(),
+                no_tools(),
+                false,
+                hooks,
+                zeroclaw_config::schema::LeakDetectionConfig::default(),
+                String::new(),
+                rx,
+            )
+            .await;
+            let prepared = recording.voice_preparations.lock().await;
+            if hooks_enabled {
+                assert!(
+                    prepared.is_empty(),
+                    "outbound hooks must decide before TTS receives text"
+                );
+            } else {
+                assert_eq!(prepared.len(), 2);
+                assert_eq!(prepared[0], "First narration.");
+                assert!(prepared[1].contains("Safe final response."));
+                assert!(!prepared[1].contains("private"));
+                assert!(!prepared[1].contains("First narration"));
+            }
+        }
+    }
+
     #[tokio::test]
     async fn draft_updater_never_hands_scratchpad_to_the_transport() {
         let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
@@ -55827,6 +56535,7 @@ Done."#;
             false,
             None,
             String::new(),
+            None,
             rx,
         )
         .await;
@@ -55907,6 +56616,7 @@ Done."#;
             false,
             None,
             String::new(),
+            None,
             rx,
         )
         .await;
@@ -55997,6 +56707,7 @@ Done."#;
             false,
             None,
             String::new(),
+            None,
             rx,
         )
         .await;
@@ -56068,6 +56779,7 @@ Done."#;
             false,
             None,
             String::new(),
+            None,
             rx,
         )
         .await;
@@ -56139,6 +56851,7 @@ Done."#;
                 false,
                 None,
                 String::new(),
+                None,
                 rx,
             )
             .await;
@@ -56251,6 +56964,7 @@ Done."#;
                 false,
                 None,
                 String::new(),
+                None,
                 rx,
             )
             .await;
@@ -56367,6 +57081,7 @@ Done."#;
             false,
             None,
             String::new(),
+            None,
             rx,
         )
         .await;
@@ -56518,6 +57233,7 @@ Done."#;
             false,
             None,
             String::new(),
+            None,
             rx,
         )
         .await;
@@ -56605,6 +57321,7 @@ Done."#;
             false,
             None,
             String::new(),
+            None,
             rx,
         )
         .await;
