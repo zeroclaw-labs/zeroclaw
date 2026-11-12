@@ -275,7 +275,7 @@ mod tests {
         config
     }
 
-    /// #12283: `ignore` must win over a grant on the same channel key,
+    /// `ignore` must win over a grant on the same channel key,
     /// independent of `HashMap` iteration order.
     #[test]
     fn resolve_peer_set_same_channel_ignore_wins_regardless_of_group_order() {
@@ -294,7 +294,7 @@ mod tests {
         }
     }
 
-    /// #12283: a type-wide `ignore` on `discord` applies to `discord.main`.
+    /// A type-wide `ignore` on `discord` applies to `discord.main`.
     #[test]
     fn resolve_peer_set_type_wide_ignore_applies_to_dotted_alias() {
         for allow_first in [true, false] {
@@ -308,7 +308,7 @@ mod tests {
         }
     }
 
-    /// #12283: `ignore = ["*"]` denies every peer on the matching channel.
+    /// `ignore = ["*"]` denies every peer on the matching channel.
     #[test]
     fn resolve_peer_set_wildcard_ignore_denies_everyone() {
         for allow_first in [true, false] {
