@@ -30417,12 +30417,22 @@ BTC is currently around $65,000 based on latest tool output."#
             config_path: workspace.path().join("config.toml"),
             ..Config::default()
         };
-        let profile = startup.providers.models.ensure("custom", "local").unwrap();
-        profile.native_tools = Some(true);
-        profile.uri = Some(format!("{}/v1/chat/completions", server.uri()));
-        profile.api_key = Some("startup-test-key".into());
-        profile.model = Some("startup-model".into());
-        profile.temperature = Some(0.1);
+        startup.providers = toml::from_str(&format!(
+            r#"
+[connections."gateway.local"]
+kind = "custom"
+uri = "{}/v1"
+auth = {{ mode = "api_key", api_key = "startup-test-key" }}
+
+[models."chat.local"]
+capability = "chat"
+provider = "gateway.local"
+model = "startup-model"
+options = {{ native_tools = true, temperature = 0.1 }}
+"#,
+            server.uri()
+        ))
+        .expect("canonical channel model-tools fixture parses");
         startup.risk_profiles.insert(
             "model-tools".into(),
             zeroclaw_config::schema::RiskProfileConfig {
@@ -30433,7 +30443,7 @@ BTC is currently around $65,000 based on latest tool output."#
         startup.agents.insert(
             "test-agent".into(),
             zeroclaw_config::schema::AliasedAgentConfig {
-                model_provider: "custom.local".into(),
+                model_provider: "chat.local".into(),
                 risk_profile: "model-tools".into(),
                 ..Default::default()
             },
@@ -30447,11 +30457,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime: Arc<dyn platform::RuntimeAdapter> = Arc::new(platform::NativeRuntime::new());
         let mut built = {
             let registry_config = Arc::clone(&startup);
-            let registry_config = {
-                let mut fixture = (*registry_config).clone();
-                fixture.agents = HashMap::new();
-                std::sync::Arc::new(fixture)
-            };
+            let registry_config = { std::sync::Arc::new((*registry_config).clone()) };
             let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
                 Arc::clone(&runtime);
             let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = Arc::new(NoopMemory);
@@ -30490,7 +30496,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let assembled = assemble_channel_agent_tools(
             &startup,
             "test-agent",
-            "custom.local",
+            "chat.local",
             "startup-model",
             &security,
             built,
@@ -30513,28 +30519,27 @@ BTC is currently around $65,000 based on latest tool output."#
             Arc::new(assembled.tools),
         );
         let mut admitted = startup.as_ref().clone();
-        let profile = admitted.providers.models.ensure("custom", "local").unwrap();
-        profile.api_key = Some("admitted-test-key".into());
-        profile.model = Some("admitted-model".into());
-        profile.temperature = Some(0.6);
-        admitted
-            .providers
-            .models
-            .ensure("custom", "admitted_only")
-            .unwrap();
-        let defaults = runtime_defaults_from_config(&admitted, "custom.local").unwrap();
+        let mut providers = serde_json::to_value(&admitted.providers).unwrap();
+        providers["connections"]["gateway.local"]["auth"]["api_key"] =
+            serde_json::json!("admitted-test-key");
+        providers["models"]["chat.local"]["model"] = serde_json::json!("admitted-model");
+        providers["models"]["chat.local"]["options"]["temperature"] = serde_json::json!(0.6);
+        providers["models"]["custom.admitted_only"] = serde_json::json!({
+            "capability": "chat",
+            "provider": "gateway.local",
+            "model": "admitted-only"
+        });
+        admitted.providers = serde_json::from_value(providers).unwrap();
+        let defaults = runtime_defaults_from_config(&admitted, "chat.local").unwrap();
         let mut later = admitted.clone();
-        later
-            .providers
-            .models
-            .ensure("custom", "local")
-            .unwrap()
-            .model = Some("later-model".into());
-        later
-            .providers
-            .models
-            .ensure("custom", "later_only")
-            .unwrap();
+        let mut providers = serde_json::to_value(&later.providers).unwrap();
+        providers["models"]["chat.local"]["model"] = serde_json::json!("later-model");
+        providers["models"]["custom.later_only"] = serde_json::json!({
+            "capability": "chat",
+            "provider": "gateway.local",
+            "model": "later-only"
+        });
+        later.providers = serde_json::from_value(providers).unwrap();
         let context = Arc::new(ChannelRuntimeContext {
             live_config: zeroclaw_config::live::LiveConfig::new(later).handle(),
             approval_manager: Arc::new(channel_approval_manager(risk_profile)),
@@ -30548,7 +30553,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 generation: 1,
             }));
         context.provider_cache.lock().unwrap().insert(
-            provider_cache_key("custom.local", "admitted-model", 1),
+            provider_cache_key("chat.local", "admitted-model", 1),
             Arc::new(NativeModelToolsProvider),
         );
         process_channel_message(
