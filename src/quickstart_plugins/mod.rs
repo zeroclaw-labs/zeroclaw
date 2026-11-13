@@ -5185,12 +5185,12 @@ egress_hosts = ["{unrelated_host}"]
                 "{untouched} must survive the save byte for byte: {after}"
             );
         }
-        assert_eq!(
-            after,
-            text.replace("enabled = false", "enabled = true")
-                .replace("auto_discover = false", "auto_discover = true"),
-            "the save rewrote only the two activation flags"
-        );
+        // Config admission now projects provider rows into the canonical
+        // connection/model registry, so serialization may reorder and enrich
+        // those sections. The invariant here is the plugin activation and
+        // secret/reference preservation asserted above, plus the plugin row.
+        assert!(after.contains("[providers.models.\"openai.default\"]"));
+        assert!(after.contains("[providers.connections.\"legacy.openai.default\"]"));
         let row_after = workspace.row(&key).expect("the row remains");
         assert_eq!(row_after.config, row_before.config);
         assert_eq!(

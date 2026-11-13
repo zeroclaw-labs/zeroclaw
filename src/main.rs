@@ -21347,15 +21347,21 @@ mod tests {
         let cache = zeroclaw_runtime::sop::dispatch::SopCronCache::from_engine(&engine);
 
         let mut providers = zeroclaw_config::providers::Providers::default();
-        {
-            let base = providers
-                .models
-                .ensure("custom", "default")
-                .expect("`custom` slot must exist on ModelProviders");
-            base.api_key = Some("test-key".into());
-            base.model = Some("test-model".into());
-            base.uri = Some(server.uri());
-        }
+        providers.connections.insert(
+            "sop.custom".into(),
+            serde_json::from_value(serde_json::json!({
+                "kind":"custom", "uri":server.uri(),
+                "auth":{"mode":"api_key","api_key":"test-key"}
+            }))
+            .unwrap(),
+        );
+        providers.models.insert_canonical_model(
+            "custom.default".into(),
+            serde_json::from_value(serde_json::json!({
+                "capability":"chat", "provider":"sop.custom", "model":"test-model"
+            }))
+            .unwrap(),
+        );
         let mut agents = std::collections::HashMap::new();
         agents.insert(
             CRON_SOP_AGENT.to_string(),

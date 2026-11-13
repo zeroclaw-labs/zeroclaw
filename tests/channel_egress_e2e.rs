@@ -41,8 +41,7 @@ use std::sync::{Arc, OnceLock};
 use tempfile::TempDir;
 use zeroclaw_config::providers::{ChannelRef, ModelProviderRef};
 use zeroclaw_config::schema::{
-    AliasedAgentConfig, AnthropicModelProviderConfig, Config, PluginChannelConfig,
-    PluginEntryConfig, RiskProfileConfig,
+    AliasedAgentConfig, Config, PluginChannelConfig, PluginEntryConfig, RiskProfileConfig,
 };
 use zeroclaw_config::secrets::SecretStore;
 use zeroclaw_plugins::PluginCapability;
@@ -215,9 +214,16 @@ fn add_owning_agent(config: &mut Config, alias: &str) {
     config
         .risk_profiles
         .insert("default".to_string(), RiskProfileConfig::default());
-    config.providers.models.anthropic.insert(
-        "default".to_string(),
-        AnthropicModelProviderConfig::default(),
+    config.providers.connections.insert(
+        "legacy.anthropic.default".into(),
+        serde_json::from_value(serde_json::json!({"kind":"anthropic"})).unwrap(),
+    );
+    config.providers.models.insert_canonical_model(
+        "anthropic.default".into(),
+        serde_json::from_value(serde_json::json!({
+            "capability":"chat", "provider":"legacy.anthropic.default", "model":"claude-test"
+        }))
+        .unwrap(),
     );
     config.agents.insert(
         "operator".to_string(),
