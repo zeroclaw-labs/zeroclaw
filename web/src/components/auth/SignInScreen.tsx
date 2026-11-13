@@ -3,7 +3,8 @@ import { getAdminPairCode, generatePairCode, PairCodeForbiddenError } from "../.
 import type { OidcMethod } from "../../lib/authSession";
 import { basePath } from "../../lib/basePath";
 import { t } from "../../lib/i18n";
-import type { SignOutNotice } from "../../hooks/useAuth";
+import type { SignInMethods, SignOutNotice } from "../../hooks/useAuth";
+import { RelayNotice } from "./RelayNotice";
 
 // Pairing dialog: the sign-in screen when no sign-in providers are configured,
 // unchanged from before dashboard sign-in existed.
@@ -102,6 +103,143 @@ export function PairingDialog({
   };
 
   return (
+    <SignInFrame
+      status={
+        codeLoading
+          ? "Checking pairing status…"
+          : displayCode
+            ? "Your pairing code — click Pair to connect"
+            : "This gateway is already paired — generate a code to add this device"
+      }
+    >
+      {children}
+
+      {/* Already paired, no code minted at startup (#5266): offer a self-serve
+          mint on localhost, or the equivalent CLI command everywhere else. */}
+      {!codeLoading && !displayCode && (
+        <div
+          className="mb-6 p-4 rounded-2xl border text-center text-sm"
+          style={{
+            background: "var(--pc-bg-elevated)",
+            borderColor: "var(--pc-border)",
+            color: "var(--pc-text-muted)",
+          }}
+        >
+          {isLocalhost && !showCliFallback ? (
+            <>
+              <p className="mb-3">
+                No pairing code was generated because a device is already
+                paired.
+              </p>
+              <button
+                type="button"
+                onClick={handleGenerate}
+                disabled={generating}
+                className="btn-electric w-full py-3 text-sm font-semibold tracking-wide"
+              >
+                {generating ? (
+                  <span className="flex items-center justify-center gap-2">
+                    <span className="h-4 w-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                    Generating…
+                  </span>
+                ) : (
+                  "Generate pairing code"
+                )}
+              </button>
+            </>
+          ) : (
+            <>
+              <p className="mb-2">
+                {isLocalhost
+                  ? "Couldn't generate a code from the browser. On the machine running the gateway, run:"
+                  : "Pairing codes can only be generated on the machine running the gateway. Run:"}
+              </p>
+              <code
+                className="block px-3 py-2 rounded-lg font-mono text-xs break-all select-all"
+                style={{
+                  background: "var(--pc-bg-code)",
+                  color: "var(--pc-text-primary)",
+                }}
+              >
+                {cliRecoveryCommand}
+              </code>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* Show the pairing code if available (localhost) */}
+      {!codeLoading && displayCode && (
+        <div
+          className="mb-6 p-4 rounded-2xl text-center border"
+          style={{
+            background: "var(--pc-accent-glow)",
+            borderColor: "var(--pc-accent-dim)",
+          }}
+        >
+          <div
+            className="text-2xl font-mono font-bold tracking-widest break-all py-2"
+            style={{ color: "var(--pc-text-primary)" }}
+          >
+            {displayCode}
+          </div>
+          <p
+            className="text-xs mt-2"
+            style={{ color: "var(--pc-text-muted)" }}
+          >
+            Enter this code below or on another device
+          </p>
+        </div>
+      )}
+
+      <form onSubmit={handleSubmit}>
+        {/* Pairing codes are case-sensitive alphanumeric by default
+            (#6613). Mobile keyboards auto-capitalise and autocorrect free
+            text, which silently corrupts a typed or pasted code, so both
+            are turned off here. */}
+        <input
+          type="text"
+          value={code}
+          onChange={(e) => setCode(e.target.value)}
+          placeholder="pairing code"
+          className="input-electric w-full px-4 py-4 text-center text-xl tracking-widest font-medium mb-4"
+          maxLength={128}
+          autoCapitalize="none"
+          autoCorrect="off"
+          spellCheck={false}
+          autoFocus
+        />
+        {error && (
+          <p
+            aria-live="polite"
+            className="text-sm mb-4 text-center animate-fade-in"
+            style={{ color: "var(--color-status-error)" }}
+          >
+            {error}
+          </p>
+        )}
+        <button
+          type="submit"
+          disabled={loading || code.length < 6}
+          className="btn-electric w-full py-3.5 text-sm font-semibold tracking-wide"
+        >
+          {loading ? (
+            <span className="flex items-center justify-center gap-2">
+              <span className="h-4 w-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+              Pairing...
+            </span>
+          ) : (
+            "Pair"
+          )}
+        </button>
+      </form>
+    </SignInFrame>
+  );
+}
+
+/** The sign-in card: logo, title and a status line above `children`. */
+function SignInFrame({ status, children }: { status: ReactNode; children: ReactNode }) {
+  return (
     <div
       className="min-h-screen flex items-center justify-center"
       style={{ background: "var(--pc-bg-base)" }}
@@ -121,135 +259,10 @@ export function PairingDialog({
             ZeroClaw
           </h1>
           <p className="text-sm" style={{ color: "var(--pc-text-muted)" }}>
-            {codeLoading
-              ? "Checking pairing status…"
-              : displayCode
-                ? "Your pairing code — click Pair to connect"
-                : "This gateway is already paired — generate a code to add this device"}
+            {status}
           </p>
         </div>
-
         {children}
-
-        {/* Already paired, no code minted at startup (#5266): offer a self-serve
-            mint on localhost, or the equivalent CLI command everywhere else. */}
-        {!codeLoading && !displayCode && (
-          <div
-            className="mb-6 p-4 rounded-2xl border text-center text-sm"
-            style={{
-              background: "var(--pc-bg-elevated)",
-              borderColor: "var(--pc-border)",
-              color: "var(--pc-text-muted)",
-            }}
-          >
-            {isLocalhost && !showCliFallback ? (
-              <>
-                <p className="mb-3">
-                  No pairing code was generated because a device is already
-                  paired.
-                </p>
-                <button
-                  type="button"
-                  onClick={handleGenerate}
-                  disabled={generating}
-                  className="btn-electric w-full py-3 text-sm font-semibold tracking-wide"
-                >
-                  {generating ? (
-                    <span className="flex items-center justify-center gap-2">
-                      <span className="h-4 w-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                      Generating…
-                    </span>
-                  ) : (
-                    "Generate pairing code"
-                  )}
-                </button>
-              </>
-            ) : (
-              <>
-                <p className="mb-2">
-                  {isLocalhost
-                    ? "Couldn't generate a code from the browser. On the machine running the gateway, run:"
-                    : "Pairing codes can only be generated on the machine running the gateway. Run:"}
-                </p>
-                <code
-                  className="block px-3 py-2 rounded-lg font-mono text-xs break-all select-all"
-                  style={{
-                    background: "var(--pc-bg-code)",
-                    color: "var(--pc-text-primary)",
-                  }}
-                >
-                  {cliRecoveryCommand}
-                </code>
-              </>
-            )}
-          </div>
-        )}
-
-        {/* Show the pairing code if available (localhost) */}
-        {!codeLoading && displayCode && (
-          <div
-            className="mb-6 p-4 rounded-2xl text-center border"
-            style={{
-              background: "var(--pc-accent-glow)",
-              borderColor: "var(--pc-accent-dim)",
-            }}
-          >
-            <div
-              className="text-2xl font-mono font-bold tracking-widest break-all py-2"
-              style={{ color: "var(--pc-text-primary)" }}
-            >
-              {displayCode}
-            </div>
-            <p
-              className="text-xs mt-2"
-              style={{ color: "var(--pc-text-muted)" }}
-            >
-              Enter this code below or on another device
-            </p>
-          </div>
-        )}
-
-        <form onSubmit={handleSubmit}>
-          {/* Pairing codes are case-sensitive alphanumeric by default
-              (#6613). Mobile keyboards auto-capitalise and autocorrect free
-              text, which silently corrupts a typed or pasted code, so both
-              are turned off here. */}
-          <input
-            type="text"
-            value={code}
-            onChange={(e) => setCode(e.target.value)}
-            placeholder="pairing code"
-            className="input-electric w-full px-4 py-4 text-center text-xl tracking-widest font-medium mb-4"
-            maxLength={128}
-            autoCapitalize="none"
-            autoCorrect="off"
-            spellCheck={false}
-            autoFocus
-          />
-          {error && (
-            <p
-              aria-live="polite"
-              className="text-sm mb-4 text-center animate-fade-in"
-              style={{ color: "var(--color-status-error)" }}
-            >
-              {error}
-            </p>
-          )}
-          <button
-            type="submit"
-            disabled={loading || code.length < 6}
-            className="btn-electric w-full py-3.5 text-sm font-semibold tracking-wide"
-          >
-            {loading ? (
-              <span className="flex items-center justify-center gap-2">
-                <span className="h-4 w-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                Pairing...
-              </span>
-            ) : (
-              "Pair"
-            )}
-          </button>
-        </form>
       </div>
     </div>
   );
@@ -262,14 +275,75 @@ export interface SignInScreenProps {
   onSignIn: (alias: string) => void;
   /** Why a signed-in session ended, if one did. */
   notice: SignOutNotice | null;
+  /** The dashboard is reached through a relay that can read the session. */
+  viaRelay?: boolean;
+  /** Whether the gateway has said how to sign in. Until it has, no pairing form. */
+  methods?: SignInMethods;
+  /** Ask the gateway again, after it didn't answer. */
+  onRetryMethods?: () => void;
 }
 
 /**
  * The sign-in screen: provider buttons when dashboard sign-in is configured,
  * then the pairing form. With no providers and no notice it is exactly the
- * pairing dialog, so installs without sign-in see no change.
+ * pairing dialog, so installs without sign-in see no change. Through a relay
+ * it offers sign-in alone: the gateway refuses pairing there, because the
+ * relay would see the code. Until the gateway has said how to sign in, it
+ * offers neither: only that answer says whether a relay carries the page.
  */
-export function SignInScreen({ onPair, providers, onSignIn, notice }: SignInScreenProps) {
+export function SignInScreen({
+  onPair,
+  providers,
+  onSignIn,
+  notice,
+  viaRelay = false,
+  methods = "known",
+  onRetryMethods,
+}: SignInScreenProps) {
+  if (methods !== "known") {
+    return (
+      <SignInFrame
+        status={t(methods === "failed" ? "auth.methods.failed" : "auth.methods.checking")}
+      >
+        {viaRelay && <RelayNotice />}
+        {notice && <SignOutNoticeMessage notice={notice} />}
+        {methods === "failed" && (
+          <button
+            type="button"
+            data-methods-retry=""
+            onClick={onRetryMethods}
+            className="btn-electric w-full py-3.5 text-sm font-semibold tracking-wide"
+          >
+            {t("auth.methods.retry")}
+          </button>
+        )}
+      </SignInFrame>
+    );
+  }
+  if (viaRelay) {
+    return (
+      <SignInFrame status={t("auth.relay.sign_in")}>
+        <RelayNotice />
+        {notice && <SignOutNoticeMessage notice={notice} />}
+        {providers.length > 0 ? (
+          <ProviderButtons providers={providers} onSignIn={onSignIn} orPair={false} />
+        ) : (
+          <p
+            role="status"
+            data-relay-no-sign-in=""
+            className="p-3 rounded-2xl border text-sm text-center"
+            style={{
+              background: "var(--pc-bg-elevated)",
+              borderColor: "var(--pc-border)",
+              color: "var(--pc-text-muted)",
+            }}
+          >
+            {t("auth.relay.no_sign_in")}
+          </p>
+        )}
+      </SignInFrame>
+    );
+  }
   if (providers.length === 0 && !notice) {
     return <PairingDialog onPair={onPair} />;
   }
@@ -304,9 +378,12 @@ function SignOutNoticeMessage({ notice }: { notice: SignOutNotice }) {
 function ProviderButtons({
   providers,
   onSignIn,
+  orPair = true,
 }: {
   providers: OidcMethod[];
   onSignIn: (alias: string) => void;
+  /** End with the divider that leads into the pairing form below. */
+  orPair?: boolean;
 }) {
   // Sign-in leaves the page; keep a second click from starting another flow.
   const [starting, setStarting] = useState<string | null>(null);
@@ -336,14 +413,16 @@ function ProviderButtons({
           </button>
         ))}
       </div>
-      <div
-        className="flex items-center gap-3 mt-6 text-xs"
-        style={{ color: "var(--pc-text-muted)" }}
-      >
-        <span className="h-px flex-1" style={{ background: "var(--pc-border)" }} />
-        <span>{t("auth.signin.or_pair")}</span>
-        <span className="h-px flex-1" style={{ background: "var(--pc-border)" }} />
-      </div>
+      {orPair && (
+        <div
+          className="flex items-center gap-3 mt-6 text-xs"
+          style={{ color: "var(--pc-text-muted)" }}
+        >
+          <span className="h-px flex-1" style={{ background: "var(--pc-border)" }} />
+          <span>{t("auth.signin.or_pair")}</span>
+          <span className="h-px flex-1" style={{ background: "var(--pc-border)" }} />
+        </div>
+      )}
     </div>
   );
 }
