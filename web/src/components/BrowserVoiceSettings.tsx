@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { t } from '@/lib/i18n';
 import { apiFetch } from '@/lib/api';
-import { Button } from '@/components/ui';
+import { Button, Select } from '@/components/ui';
 import { useGlobalVoiceTimeout, saveGlobalVoiceTimeout, localRecognitionStatus, recognitionConstructor, saveVoicePreferences, useBrowserVoices, useVoicePreferences, type VoicePreferences } from '@/lib/browserVoice';
 
 interface PairedDevice { id: string; name: string | null; device_type: string | null }
@@ -131,28 +131,47 @@ export default function BrowserVoiceSettings() {
       <fieldset disabled={!ready || saving || inventoryLoading || !selectedDeviceId} className="grid gap-3 max-w-2xl mt-3 text-sm">
         <p className="text-pc-text-muted">{t('voice.device_note')}</p>
         <label><input type="checkbox" checked={prefs.dictation} onChange={e => update({ dictation: e.target.checked })} /> {t('voice.dictation')}</label>
-        <label className="grid gap-1">{t('voice.language')}
-          <select className="border border-pc-border rounded p-2 bg-pc-base" value={prefs.language} onChange={e => void update({ language: e.target.value })}>
-            {Array.from(new Set([prefs.language, 'en-US', 'en-GB', 'pt-BR', 'pt-PT', 'es-ES', 'fr-FR', 'de-DE'])).map(lang => <option key={lang} value={lang}>{lang}</option>)}
-          </select>
-        </label>
-        <label className="grid gap-1">{t('voice.recognition')}
-          <select className="border border-pc-border rounded p-2 bg-pc-base" value={prefs.recognition} onChange={e => update({ recognition: e.target.value as 'local' | 'browser' })}>
-            <option value="local">{t('voice.local')}</option>
-            <option value="browser">{t('voice.browser')}</option>
-          </select>
-        </label>
+        <div className="grid gap-1">
+          <label htmlFor="browser-voice-language">{t('voice.language')}</label>
+          <Select id="browser-voice-language" aria-label={t('voice.language')}
+            value={prefs.language} onChange={language => void update({ language })}
+            options={Array.from(new Set([prefs.language, 'en-US', 'en-GB', 'pt-BR', 'pt-PT', 'es-ES', 'fr-FR', 'de-DE']))
+              .map(language => ({ value: language, label: language }))}
+          />
+        </div>
+        <div className="grid gap-1">
+          <label htmlFor="browser-voice-recognition">{t('voice.recognition')}</label>
+          <Select id="browser-voice-recognition" aria-label={t('voice.recognition')}
+            value={prefs.recognition} onChange={value => update({ recognition: value === 'browser' ? 'browser' : 'local' })}
+            options={[
+              { value: 'local', label: t('voice.local') },
+              { value: 'browser', label: t('voice.browser') },
+            ]}
+          />
+        </div>
         {currentDevice && <p role="status">{t('voice.local_status')} {t('voice.status_' + localStatus)}</p>}
         {currentDevice && <p>{recognitionConstructor() && window.isSecureContext ? t('voice.browser_available') : t('voice.unsupported')}</p>}
         {prefs.recognition === 'browser' && <p className="text-status-warning">{t('voice.remote_warning')}</p>}
         {currentDevice && (localStatus === 'downloadable' || localStatus === 'downloading') && <Button size="sm" disabled={installing || localStatus === 'downloading'} onClick={() => void install()}>{t('voice.install')}</Button>}
         <label><input type="checkbox" checked={prefs.reading} onChange={e => update({ reading: e.target.checked })} /> {t('voice.reading')}</label>
-        <label className="grid gap-1">{t('voice.voice')}
-          {currentDevice ? <select aria-label={t('voice.voice')} className="border border-pc-border rounded p-2 bg-pc-base" value={prefs.voice} onChange={e => update({ voice: e.target.value })}>
-            <option value="">{t('voice.select_voice')}</option>
-            {voices.map(v => <option key={v.voiceURI} value={v.voiceURI}>{v.name} · {v.lang} · {t(v.localService ? 'voice.local' : 'voice.online')}</option>)}
-          </select> : <span className="rounded border border-pc-border p-2 break-words">{prefs.voice || t('voice.select_voice')}</span>}
-        </label>
+        <div className="grid gap-1">
+          {currentDevice ? <>
+            <label htmlFor="browser-voice-narrator">{t('voice.voice')}</label>
+            <Select id="browser-voice-narrator" aria-label={t('voice.voice')}
+              value={prefs.voice} onChange={voice => update({ voice })}
+              options={[
+                { value: '', label: t('voice.select_voice') },
+                ...voices.map(v => ({
+                  value: v.voiceURI,
+                  label: `${v.name} · ${v.lang} · ${t(v.localService ? 'voice.local' : 'voice.online')}`,
+                })),
+              ]}
+            />
+          </> : <>
+            <span>{t('voice.voice')}</span>
+            <span className="rounded border border-pc-border p-2 break-words">{prefs.voice || t('voice.select_voice')}</span>
+          </>}
+        </div>
         {currentDevice && !voices.length && <p>{t('voice.no_voices')}</p>}
         {!currentDevice && <p>{t('voice.remote_device_resources')}</p>}
         <label>{t('voice.rate')} {prefs.rate}×
