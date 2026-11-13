@@ -26,6 +26,7 @@ use crate::instance::PluginInstanceScope;
 pub struct PluginHostServices {
     config: PluginConfigResolver,
     state: PluginStateService,
+    wake: AgentWakeService,
 }
 
 /// One coherent, transient bundle of schema-designated instance secrets.
@@ -296,6 +297,106 @@ impl PluginStateBackend for UnavailableState {
     }
 }
 
+/// Detail-free failures from the host-mediated agent wake service.
+///
+/// This is the native mirror of the WIT `dispatch-error` enum, so the guest
+/// boundary never has to infer a category from a message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum AgentWakeError {
+    /// The admitted instance lacks `agent_dispatch`, or the target is not in
+    /// the instance row's operator-granted `dispatch_agents` list.
+    #[error("plugin agent dispatch access denied")]
+    AccessDenied,
+    /// The target alias names no enabled agent.
+    #[error("plugin agent dispatch target unknown")]
+    UnknownAgent,
+    /// The instance exceeded its wake budget.
+    #[error("plugin agent dispatch rate limited")]
+    RateLimited,
+    /// The target or prompt failed host validation.
+    #[error("plugin agent dispatch request invalid")]
+    InvalidRequest,
+    /// Outside an authorized tool frame, or no wake backend is wired.
+    #[error("plugin agent dispatch service unavailable")]
+    Unavailable,
+}
+
+/// Async wake backend owned by the host runtime.
+///
+/// The backend receives the immutable host-issued scope, so per-instance
+/// operator grants (`dispatch_agents`, `dispatch_rate_per_min`) and the
+/// dispatch-hop ceiling are resolved from canonical host state rather than from
+/// anything the guest supplied. `caller_alias` is the host-owned alias of the
+/// agent whose turn is executing the tool, and is never guest-controlled.
+#[async_trait]
+pub trait AgentWakeBackend: Send + Sync {
+    /// Admit one asynchronous wake turn. Returning `Ok` means the turn was
+    /// admitted, not that it has run.
+    async fn wake(
+        &self,
+        scope: &PluginInstanceScope,
+        caller_alias: Option<&str>,
+        target_agent: &str,
+        prompt: &str,
+    ) -> Result<(), AgentWakeError>;
+}
+
+/// Required wake service injected into plugin stores.
+#[derive(Clone)]
+pub struct AgentWakeService {
+    backend: Arc<dyn AgentWakeBackend>,
+}
+
+impl AgentWakeService {
+    /// A wake service with no backend: every call is unavailable. This is the
+    /// default for host paths that build stores without serving dispatch.
+    #[must_use]
+    pub(crate) fn unavailable() -> Self {
+        Self::new(UnavailableWake)
+    }
+
+    /// Wrap the runtime-owned wake backend.
+    #[must_use]
+    pub fn new(backend: impl AgentWakeBackend + 'static) -> Self {
+        Self {
+            backend: Arc::new(backend),
+        }
+    }
+
+    pub(crate) async fn wake(
+        &self,
+        scope: &PluginInstanceScope,
+        caller_alias: Option<&str>,
+        target_agent: &str,
+        prompt: &str,
+    ) -> Result<(), AgentWakeError> {
+        if !scope.grants().allows(PluginPermission::AgentDispatch) {
+            return Err(AgentWakeError::AccessDenied);
+        }
+        self.backend
+            .wake(scope, caller_alias, target_agent, prompt)
+            .await
+    }
+}
+
+/// A backend that answers every call with [`AgentWakeError::Unavailable`], for
+/// host paths that instantiate a plugin without serving it (install-time load
+/// verification) and for tests.
+struct UnavailableWake;
+
+#[async_trait]
+impl AgentWakeBackend for UnavailableWake {
+    async fn wake(
+        &self,
+        _scope: &PluginInstanceScope,
+        _caller_alias: Option<&str>,
+        _target_agent: &str,
+        _prompt: &str,
+    ) -> Result<(), AgentWakeError> {
+        Err(AgentWakeError::Unavailable)
+    }
+}
+
 /// Detail-free internal result converted to each WIT world's generated enum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SecretLookupError {
@@ -315,7 +416,22 @@ impl PluginHostServices {
     /// Build the complete required host-service bundle.
     #[must_use]
     pub fn new(config: PluginConfigResolver, state: PluginStateService) -> Self {
-        Self { config, state }
+        Self {
+            config,
+            state,
+            wake: AgentWakeService::unavailable(),
+        }
+    }
+
+    /// Replace the wake service for a host path that serves dispatch.
+    ///
+    /// A builder rather than a constructor argument: every existing caller
+    /// builds stores without serving dispatch, and must keep that behaviour
+    /// fail-closed rather than being forced to name an authority it has none of.
+    #[must_use]
+    pub fn with_wake(mut self, wake: AgentWakeService) -> Self {
+        self.wake = wake;
+        self
     }
 
     /// Resolve a typed, validated config view from canonical host state.
@@ -364,6 +480,12 @@ impl PluginHostServices {
     pub(crate) fn state(&self) -> &PluginStateService {
         &self.state
     }
+
+    /// Runtime-owned agent wake service for this store.
+    #[must_use]
+    pub(crate) fn wake(&self) -> &AgentWakeService {
+        &self.wake
+    }
 }
 
 /// Empty config service for store-plumbing tests. Production callers must
@@ -402,6 +524,12 @@ pub(crate) fn test_host_services() -> PluginHostServices {
 #[cfg(test)]
 pub(crate) fn test_services(config: PluginConfigResolver) -> PluginHostServices {
     PluginHostServices::new(config, PluginStateService::unavailable())
+}
+
+/// A test bundle that serves agent dispatch through `wake`.
+#[cfg(test)]
+pub(crate) fn test_host_services_with_wake(wake: AgentWakeService) -> PluginHostServices {
+    test_host_services().with_wake(wake)
 }
 
 #[cfg(test)]
@@ -589,5 +717,162 @@ mod tests {
             Err(PluginStateError::AccessDenied)
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+/// A recording [`AgentWakeBackend`] for host-service tests.
+///
+/// It records the exact caller alias, target, and prompt it received, so a test
+/// can assert the store forwarded host-owned identity unchanged rather than
+/// re-deriving it from guest input.
+#[cfg(test)]
+pub(crate) struct RecordingWake {
+    calls: Arc<std::sync::Mutex<Vec<RecordedWake>>>,
+}
+
+/// One recorded [`RecordingWake`] call.
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RecordedWake {
+    pub(crate) caller_alias: Option<String>,
+    pub(crate) target_agent: String,
+    pub(crate) prompt: String,
+}
+
+#[cfg(test)]
+impl RecordingWake {
+    pub(crate) fn service() -> (AgentWakeService, Self) {
+        let recorder = Self {
+            calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        (AgentWakeService::new(recorder.clone()), recorder)
+    }
+
+    pub(crate) fn recorded(&self) -> Vec<RecordedWake> {
+        self.calls.lock().expect("recorded wakes").clone()
+    }
+}
+
+#[cfg(test)]
+impl Default for RecordingWake {
+    fn default() -> Self {
+        Self {
+            calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Clone for RecordingWake {
+    fn clone(&self) -> Self {
+        Self {
+            calls: Arc::clone(&self.calls),
+        }
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl AgentWakeBackend for RecordingWake {
+    async fn wake(
+        &self,
+        _scope: &PluginInstanceScope,
+        caller_alias: Option<&str>,
+        target_agent: &str,
+        prompt: &str,
+    ) -> Result<(), AgentWakeError> {
+        self.calls
+            .lock()
+            .expect("recorded wakes")
+            .push(RecordedWake {
+                caller_alias: caller_alias.map(ToOwned::to_owned),
+                target_agent: target_agent.to_string(),
+                prompt: prompt.to_string(),
+            });
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+    use crate::{PluginCapability, PluginManifest};
+
+    fn wake_scope(granted: bool) -> PluginInstanceScope {
+        let manifest = PluginManifest {
+            name: "waker".to_string(),
+            version: "0.0.0-test".to_string(),
+            description: None,
+            author: None,
+            wasm_path: Some("waker.wasm".to_string()),
+            wasm_sha256: None,
+            capabilities: vec![PluginCapability::Tool],
+            provides: None,
+            permissions: vec![PluginPermission::AgentDispatch],
+            config_schema: None,
+            signature: None,
+            publisher_key: None,
+            egress: Default::default(),
+        };
+        let grants: Vec<PluginPermission> = if granted {
+            vec![PluginPermission::AgentDispatch]
+        } else {
+            Vec::new()
+        };
+        PluginInstanceScope::from_manifest(&manifest, PluginCapability::Tool, "main", grants)
+            .expect("valid wake test scope")
+    }
+
+    #[tokio::test]
+    async fn wake_service_rechecks_permissions_before_backend_dispatch() {
+        let (service, recorder) = RecordingWake::service();
+
+        assert_eq!(
+            service.wake(&wake_scope(false), None, "alpha", "go").await,
+            Err(AgentWakeError::AccessDenied),
+            "an ungranted scope must be refused before the backend runs"
+        );
+        assert!(
+            recorder.recorded().is_empty(),
+            "a denied wake must not reach the backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_service_forwards_caller_target_and_prompt_unchanged() {
+        let (service, recorder) = RecordingWake::service();
+
+        assert_eq!(
+            service
+                .wake(
+                    &wake_scope(true),
+                    Some("redaction-primary"),
+                    "alpha-1_b",
+                    "line one\nline two\t"
+                )
+                .await,
+            Ok(())
+        );
+        assert_eq!(
+            recorder.recorded(),
+            vec![RecordedWake {
+                caller_alias: Some("redaction-primary".to_string()),
+                target_agent: "alpha-1_b".to_string(),
+                prompt: "line one\nline two\t".to_string(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn default_wake_service_fails_closed_even_when_granted() {
+        let services = test_host_services();
+        assert_eq!(
+            services
+                .wake()
+                .wake(&wake_scope(true), None, "alpha", "go")
+                .await,
+            Err(AgentWakeError::Unavailable),
+            "a host path that serves no dispatch must not report success"
+        );
     }
 }

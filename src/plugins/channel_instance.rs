@@ -98,8 +98,9 @@ impl PluginInstanceRow {
 /// Whether an instance of `manifest` owns host state, and so is owed a row.
 ///
 /// A row is owed when the instance has host-owned state to hold: a private
-/// config object (`config_schema`), a declared egress destination, or a
-/// governed transport whose reach the operator must grant. A manifest with
+/// config object (`config_schema`), a declared egress destination, a governed
+/// transport whose reach the operator must grant, or the `agent_dispatch`
+/// permission whose target agents the operator must grant. A manifest with
 /// none of those owns no state and gets no row. The rule is the same for every
 /// instance of the package, tool or channel.
 ///
@@ -109,13 +110,27 @@ impl PluginInstanceRow {
 /// `[egress]` table and often no `config_schema`. Without a row there is
 /// nowhere to author that grant: `config set plugins.entries.<key>.egress_hosts`
 /// only resolves keys already present in live config, and `plugin info` would
-/// not even print the opaque key to address. Pinned by
-/// `a_network_permission_alone_earns_a_row_so_the_operator_can_grant_reach`.
+/// not even print the opaque key to address.
+///
+/// The dispatch arm is the same argument again, for a third kind of reach. An
+/// `agent_dispatch` tool's authority is not a host or a socket but the
+/// per-instance `dispatch_agents` list, which only the operator may author and
+/// which lives on the instance row. A package with no `config_schema`, no
+/// `[egress]` table, and no transport but `agent_dispatch` would otherwise get
+/// no row, leaving `plugins.entries.<key>.dispatch_agents` unaddressable and the
+/// permission permanently ungrantable.
+///
+/// Pinned by
+/// `a_network_permission_alone_earns_a_row_so_the_operator_can_grant_reach`
+/// and `an_agent_dispatch_permission_alone_earns_an_instance_row`.
 #[must_use]
 pub fn manifest_owns_instance_state(manifest: &PluginManifest) -> bool {
     manifest.config_schema.is_some()
         || !manifest.egress.hosts.is_empty()
         || manifest_has_governed_transport(manifest)
+        || manifest
+            .permissions
+            .contains(&PluginPermission::AgentDispatch)
 }
 
 /// Whether `manifest` requests a transport the plugin egress authority
@@ -1288,6 +1303,58 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// The third grant path: a tool that asks only for `agent_dispatch`.
+    ///
+    /// Its reach is not a host or a socket but the per-instance
+    /// `dispatch_agents` list on the instance row, which the operator authors
+    /// there. Without a row that list has nowhere to live and no dotted path to
+    /// resolve, so an `agent_dispatch`-only tool owes a row exactly as a
+    /// network-only tool does.
+    #[test]
+    fn an_agent_dispatch_permission_alone_earns_an_instance_row() {
+        let manifest: PluginManifest = serde_json::from_value(json!({
+            "name": "waker-tool",
+            "version": "1.0.0",
+            "capabilities": ["tool"],
+            "permissions": ["agent_dispatch"],
+        }))
+        .expect("fixture manifest");
+        assert!(
+            super::manifest_owns_instance_state(&manifest),
+            "agent_dispatch alone is host-owned state the operator grants on"
+        );
+
+        let rows = super::instance_rows(&zeroclaw_config::schema::Config::default(), &manifest)
+            .expect("rows must derive");
+        assert_eq!(
+            rows.len(),
+            1,
+            "an agent_dispatch-only tool owes exactly its default tool row: {rows:?}"
+        );
+        assert_eq!(rows[0].capability, zeroclaw_plugins::PluginCapability::Tool);
+        assert_eq!(rows[0].binding, "waker-tool");
+    }
+
+    /// A package asking only for permissions that own no host state still owes
+    /// no row, so the `agent_dispatch` arm cannot be satisfied by a blanket
+    /// "any permission" rule.
+    #[test]
+    fn other_permissions_alone_still_earn_no_row() {
+        for permission in ["file_read", "file_write", "memory_read", "memory_write"] {
+            let manifest: PluginManifest = serde_json::from_value(json!({
+                "name": "inert-tool",
+                "version": "1.0.0",
+                "capabilities": ["tool"],
+                "permissions": [permission],
+            }))
+            .expect("fixture manifest");
+            assert!(
+                !super::manifest_owns_instance_state(&manifest),
+                "{permission} alone owns no host state"
+            );
+        }
     }
 
     /// The placeholder is a plain word, which every shell passes literally,

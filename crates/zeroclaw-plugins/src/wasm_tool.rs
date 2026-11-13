@@ -26,6 +26,11 @@ pub struct WasmTool {
     /// service rather than a resolved allowlist so an operator's config edit
     /// applies on the next request without rebuilding the tool.
     egress: Option<crate::egress::EgressHostService>,
+    /// The host-owned alias of the agent whose turn runs this tool, when one
+    /// does. Forwarded to each store the tool builds so the guest's `dispatch`
+    /// import cannot misattribute a wake to an agent that never asked for it.
+    /// `None` is the metadata/verification case: no turn, no caller.
+    caller_alias: Option<String>,
 }
 
 impl Attributable for WasmTool {
@@ -68,6 +73,7 @@ impl WasmTool {
             services,
             limits,
             egress: None,
+            caller_alias: None,
         })
     }
 
@@ -78,6 +84,18 @@ impl WasmTool {
     #[must_use]
     pub fn with_egress_policy(mut self, egress: Option<crate::egress::EgressHostService>) -> Self {
         self.egress = egress;
+        self
+    }
+
+    /// Attach the host-owned alias of the agent whose turn runs this tool.
+    ///
+    /// Without one, a `dispatch` call from the guest reports no caller, which
+    /// the runtime treats as "no agent turn behind this call". Omission is
+    /// therefore safe: it never widens attribution, it only declines to claim
+    /// one.
+    #[must_use]
+    pub fn with_caller_alias(mut self, alias: impl Into<String>) -> Self {
+        self.caller_alias = Some(alias.into());
         self
     }
 
@@ -122,6 +140,7 @@ impl WasmTool {
             services,
             limits,
             egress,
+            caller_alias: None,
         })
     }
 }
@@ -165,13 +184,16 @@ impl Tool for WasmTool {
         let args_json = serde_json::to_vec(&args)?;
         self.services.resolve_config(&self.scope)?;
         // The authority handle travels to the fresh store; the *decision* is not
-        // read here. It is read inside the hooks, per request.
-        let mut plugin = runtime::create_plugin_with_egress(
+        // read here. It is read inside the hooks, per request. The caller alias
+        // travels the same way: it is the host's attribution for this turn, not
+        // a value the guest can substitute.
+        let mut plugin = runtime::create_plugin_with_egress_and_caller(
             &self.component,
             &self.scope,
             &self.services,
             self.limits,
             self.egress.clone(),
+            self.caller_alias.clone(),
         )
         .await?;
         runtime::call_execute(&mut plugin, &args_json).await
@@ -217,6 +239,31 @@ mod tests {
         assert_eq!(tool.scope.id().package(), "fixture");
         assert_eq!(tool.scope.id().capability(), PluginCapability::Tool);
         assert_eq!(tool.scope.id().binding(), "redaction-primary");
+    }
+
+    #[test]
+    fn caller_alias_is_opt_in_and_never_guest_supplied() {
+        let tool = WasmTool::new(
+            "waker".to_string(),
+            "wakes agents".to_string(),
+            serde_json::json!({}),
+            component(),
+            tool_scope(),
+            crate::services::test_host_services(),
+            crate::component::test_limits(1_000),
+        )
+        .expect("tool scope matches adapter");
+        assert!(
+            tool.caller_alias.is_none(),
+            "an adapter built without an agent turn claims no caller"
+        );
+
+        let tool = tool.with_caller_alias("redaction-primary");
+        assert_eq!(
+            tool.caller_alias.as_deref(),
+            Some("redaction-primary"),
+            "the host-owned alias travels to every store the tool builds"
+        );
     }
 
     #[test]

@@ -42,6 +42,7 @@ fn base_linker(imports: crate::component::OptionalImports) -> Result<Linker<Plug
     options.plugins_wit_v0(true);
     options.plugins_wit_v0_sockets(imports.sockets);
     options.plugins_wit_v0_websocket(imports.websocket);
+    options.plugins_wit_v0_dispatch(imports.dispatch);
     wt(
         ToolPlugin::add_to_linker::<_, wasmtime::component::HasSelf<_>>(
             &mut linker,
@@ -103,12 +104,35 @@ pub async fn create_plugin_with_egress(
     limits: crate::component::PluginLimits,
     egress: Option<crate::egress::EgressHostService>,
 ) -> Result<Plugin> {
+    create_plugin_with_egress_and_caller(component, scope, services, limits, egress, None).await
+}
+
+/// [`create_plugin_with_egress`], plus the host-owned caller alias for this
+/// store.
+///
+/// The alias is the identity the tool's `dispatch` import reports as the agent
+/// whose turn is running it. It is threaded from the host rather than read from
+/// the guest's arguments, because a plugin that could name its own caller could
+/// attribute a wake to an agent that never asked for it.
+///
+/// `caller_alias: None` is the case of a host path with no agent turn behind
+/// it: the metadata probe at registration, and any load-time verification.
+/// Those stores dispatch no wake, so the absence is a fact, not a gap.
+pub async fn create_plugin_with_egress_and_caller(
+    component: &AdmittedComponent,
+    scope: &PluginInstanceScope,
+    services: &PluginHostServices,
+    limits: crate::component::PluginLimits,
+    egress: Option<crate::egress::EgressHostService>,
+    caller_alias: Option<String>,
+) -> Result<Plugin> {
     scope.require_capability(PluginCapability::Tool)?;
     let component = load_component(component)?;
     let mut store = crate::component::new_store(
         PluginStoreSpec::new(scope.clone(), services.clone(), limits)
             .with_granted_http()
-            .with_egress_policy(egress),
+            .with_egress_policy(egress)
+            .with_caller_alias(caller_alias),
     );
     let imports = crate::component::OptionalImports::for_store(store.data());
     let linker = tool_linker(imports)?;
