@@ -6030,18 +6030,20 @@ mod tests {
 
     #[test]
     fn handle_initialize_default_model_reflects_configured_provider() {
-        use zeroclaw_config::schema::{ModelProviderConfig, OllamaModelProviderConfig};
         let mut config = Config::default();
-        config.providers.models.ollama.insert(
-            "default".to_string(),
-            OllamaModelProviderConfig {
-                base: ModelProviderConfig {
-                    model: Some("llama3.2".to_string()),
-                    ..Default::default()
-                },
-                ..OllamaModelProviderConfig::default()
-            },
-        );
+        config.providers = toml::from_str(
+            r#"
+[connections."gateway.ollama"]
+kind = "custom"
+uri = "http://127.0.0.1:1/v1"
+
+[models."chat.ollama"]
+capability = "chat"
+provider = "gateway.ollama"
+model = "llama3.2"
+"#,
+        )
+        .expect("canonical model fixture parses");
         let server = AcpServer::new(config, AcpServerConfig::default());
         let result = server.handle_initialize(&serde_json::json!({})).unwrap();
         assert_eq!(result["_meta"]["zeroclaw"]["defaultModel"], "llama3.2");
@@ -6049,39 +6051,36 @@ mod tests {
 
     #[test]
     fn handle_initialize_default_model_prefers_default_session_agent() {
-        use zeroclaw_config::schema::{
-            ModelProviderConfig, OllamaModelProviderConfig, OpenAIModelProviderConfig,
-        };
         let mut config = Config::default();
         // The install-wide first configured model (the openai slot precedes
         // ollama in slot order) differs from the default agent's entry, so the
         // assertion proves the agent binding wins over the install-wide pick.
-        config.providers.models.openai.insert(
-            "install".to_string(),
-            OpenAIModelProviderConfig {
-                base: ModelProviderConfig {
-                    model: Some("install-wide-model".to_string()),
-                    ..Default::default()
-                },
-            },
-        );
-        config.providers.models.ollama.insert(
-            "secondary".to_string(),
-            OllamaModelProviderConfig {
-                base: ModelProviderConfig {
-                    model: Some("default-agent-model".to_string()),
-                    ..Default::default()
-                },
-                ..OllamaModelProviderConfig::default()
-            },
-        );
-        config.agents.insert(
-            "first".to_string(),
-            dispatchable_test_agent("openai.install"),
-        );
+        config.providers = toml::from_str(
+            r#"
+[connections."gateway.install"]
+kind = "custom"
+uri = "http://127.0.0.1:1/v1"
+[connections."gateway.secondary"]
+kind = "custom"
+uri = "http://127.0.0.1:2/v1"
+
+[models."chat.install"]
+capability = "chat"
+provider = "gateway.install"
+model = "install-wide-model"
+[models."chat.secondary"]
+capability = "chat"
+provider = "gateway.secondary"
+model = "default-agent-model"
+"#,
+        )
+        .expect("canonical model fixture parses");
+        config
+            .agents
+            .insert("first".to_string(), dispatchable_test_agent("chat.install"));
         config.agents.insert(
             "second".to_string(),
-            dispatchable_test_agent("ollama.secondary"),
+            dispatchable_test_agent("chat.secondary"),
         );
         config.acp.default_agent = Some("second".to_string());
 
