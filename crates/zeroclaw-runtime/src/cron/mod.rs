@@ -27,7 +27,10 @@ pub use store::{
 };
 pub(crate) use store::{finish_agent_claim, update_job_authorized};
 #[cfg(test)]
-pub(crate) use store::{force_release_failure_for_tests, notify_patch_writer_wait_for_test};
+pub(crate) use store::{
+    force_release_failure_for_tests, notify_patch_writer_wait_for_test,
+    reset_write_connection_count_for_tests, write_connection_count_for_tests,
+};
 pub use types::{
     CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
     deserialize_maybe_stringified,
@@ -118,34 +121,7 @@ pub(crate) fn add_shell_job_with_runtime(
     delivery: Option<DeliveryConfig>,
     approved: bool,
 ) -> Result<CronJob> {
-    add_shell_job_with_runtime_and_format(
-        config,
-        runtime,
-        security,
-        agent_alias,
-        name,
-        schedule,
-        command,
-        delivery,
-        approved,
-        CronShellOutputFormat::default(),
-    )
-}
-
-fn add_shell_job_with_runtime_and_format(
-    config: &Config,
-    runtime: &dyn RuntimeAdapter,
-    security: &SecurityPolicy,
-    agent_alias: &str,
-    name: Option<String>,
-    schedule: Schedule,
-    command: &str,
-    delivery: Option<DeliveryConfig>,
-    approved: bool,
-    shell_output_format: CronShellOutputFormat,
-) -> Result<CronJob> {
     validate_shell_command_with_security(runtime, security, command, approved)?;
-    validate_delivery_config(delivery.as_ref())?;
     store::add_shell_job_with_format(
         config,
         agent_alias,
@@ -153,7 +129,8 @@ fn add_shell_job_with_runtime_and_format(
         schedule,
         command,
         delivery,
-        shell_output_format,
+        CronShellOutputFormat::default(),
+        || Ok(()),
     )
 }
 
@@ -218,12 +195,8 @@ pub fn add_shell_job_with_approval_and_format(
     approved: bool,
     shell_output_format: CronShellOutputFormat,
 ) -> Result<CronJob> {
-    let security = SecurityPolicy::for_agent(config, agent_alias)?;
-    let runtime = crate::platform::create_runtime(&config.runtime)?;
-    add_shell_job_with_runtime_and_format(
+    add_shell_job_authorized(
         config,
-        runtime.as_ref(),
-        &security,
         agent_alias,
         name,
         schedule,
@@ -231,6 +204,33 @@ pub fn add_shell_job_with_approval_and_format(
         delivery,
         approved,
         shell_output_format,
+        || Ok(()),
+    )
+}
+
+/// Check the shell policy before opening storage and acquire the caller's
+/// authority after SQLite grants the writer. The guard spans the insert and commit.
+pub(crate) fn add_shell_job_authorized<G>(
+    config: &Config,
+    agent_alias: &str,
+    name: Option<String>,
+    schedule: Schedule,
+    command: &str,
+    delivery: Option<DeliveryConfig>,
+    approved: bool,
+    shell_output_format: CronShellOutputFormat,
+    authorize: impl FnOnce() -> Result<G>,
+) -> Result<CronJob> {
+    validate_shell_command(config, agent_alias, command, approved)?;
+    store::add_shell_job_with_format(
+        config,
+        agent_alias,
+        name,
+        schedule,
+        command,
+        delivery,
+        shell_output_format,
+        authorize,
     )
 }
 

@@ -2,7 +2,6 @@
 
 use crate::agent::agent::{Agent, TurnEvent};
 use crate::agent::dispatcher::ToolDispatcher;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -32,6 +31,21 @@ pub(crate) struct ModelProviderUpdate {
     pub config_generation: Arc<zeroclaw_config::schema::Config>,
     pub temperature: Option<Option<f64>>,
     pub multimodal_config: zeroclaw_config::schema::MultimodalConfig,
+}
+
+impl ModelProviderUpdate {
+    fn apply_to(self, agent: &mut Agent) {
+        agent.set_model_provider(self.model_provider);
+        agent.set_model_provider_name(self.model_provider_name);
+        agent.set_model_name(self.model_name);
+        agent.set_model_route_resolver(self.model_route_resolver);
+        agent.set_tool_dispatcher(self.tool_dispatcher);
+        agent.set_multimodal_config(self.multimodal_config);
+        agent.set_config_generation(self.config_generation);
+        if let Some(temperature) = self.temperature {
+            agent.set_temperature(temperature);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -80,15 +94,7 @@ pub enum SteerOutcome {
     NoActiveTurn,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct SessionOverrides {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model_provider: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f64>,
-}
+pub use zeroclaw_rpc_proto::types::SessionOverrides;
 
 /// An entry in the per-session upload index (content-addressed by SHA-256).
 #[derive(Clone, Debug)]
@@ -97,6 +103,30 @@ pub struct UploadEntry {
     pub marker: String,
     pub workspace_path: String,
     pub size_bytes: u64,
+}
+
+/// Canonical transport owner plus revocation for steering already queued by it.
+/// Dropping the binding revokes it on every removal and replacement path.
+#[derive(Default)]
+struct SessionOwnerBinding {
+    tui_id: Option<String>,
+    revoked: tokio_util::sync::CancellationToken,
+}
+
+impl SessionOwnerBinding {
+    fn rebind(&mut self, tui_id: Option<String>) {
+        if self.tui_id != tui_id {
+            self.revoked.cancel();
+            self.revoked = tokio_util::sync::CancellationToken::new();
+            self.tui_id = tui_id;
+        }
+    }
+}
+
+impl Drop for SessionOwnerBinding {
+    fn drop(&mut self) {
+        self.revoked.cancel();
+    }
 }
 
 pub struct RpcSession {
@@ -119,7 +149,7 @@ pub struct RpcSession {
     pub plan: Vec<PlanEntry>,
     pub chat_mode: crate::rpc::types::ChatMode,
     pub interaction_surface: Option<crate::agent::prompt::InteractionSurface>,
-    pub owner_tui_id: Option<String>,
+    owner_binding: SessionOwnerBinding,
     /// Monotonic generation counter stamped by `SessionStore::insert`.
     /// Provider-refresh callers capture this before building a provider box
     /// and pass it to `SessionStore::apply_model_provider` so stale work
@@ -237,7 +267,7 @@ impl RpcSession {
             plan: Vec::new(),
             chat_mode,
             interaction_surface: None,
-            owner_tui_id: None,
+            owner_binding: SessionOwnerBinding::default(),
             generation: 0,
             pending_generation: None,
             owner_principal_id: None,
@@ -255,8 +285,12 @@ impl RpcSession {
 
     /// Bind this session to a TUI owner.
     pub fn with_owner(mut self, tui_id: Option<String>) -> Self {
-        self.owner_tui_id = tui_id;
+        self.owner_binding.rebind(tui_id);
         self
+    }
+
+    pub fn owner_tui_id(&self) -> Option<&str> {
+        self.owner_binding.tui_id.as_deref()
     }
 
     pub fn with_interaction_surface(
@@ -345,7 +379,7 @@ pub struct SessionStore {
     /// replaces a session entry. Captured by provider-refresh callers so
     /// `apply_model_provider` can reject work from a stale instance.
     session_generation: std::sync::atomic::AtomicU64,
-    /// Test-only gate: when set, `set_overrides_gated` and
+    /// Test-only gate: when set, `configure_authorized` and
     /// `apply_model_provider` signal `entered` on entry, wait on
     /// `release`, then signal `done` on exit, letting a regression test
     /// atomically replace the session and wait for completion.
@@ -657,7 +691,7 @@ impl SessionStore {
         let mut sessions = self.sessions.lock().await;
         if let Some((generation, owner)) = expected_access
             && !sessions.get(&id).is_some_and(|current| {
-                current.generation == generation && current.owner_tui_id.as_deref() == owner
+                current.generation == generation && current.owner_tui_id() == owner
             })
         {
             return Err(failure("session changed during preparation"));
@@ -817,7 +851,7 @@ impl SessionStore {
         }
         if let Some((expected_generation, expected_owner)) = expected_access
             && (session.generation != expected_generation
-                || session.owner_tui_id.as_deref() != expected_owner)
+                || session.owner_tui_id() != expected_owner)
         {
             return Err(ResumeExistingError::StaleIncarnation);
         }
@@ -841,7 +875,7 @@ impl SessionStore {
         };
 
         if owner_tui_id.is_some() {
-            session.owner_tui_id = owner_tui_id;
+            session.owner_binding.rebind(owner_tui_id);
         }
         session.last_active = Instant::now();
         let message_count = session
@@ -872,17 +906,30 @@ impl SessionStore {
     }
 
     /// Read execution facts and its live channel map from the authorized incarnation,
-    /// without acquiring the Agent mutex held by its running turn.
+    /// without acquiring the Agent mutex held by its running turn. With
+    /// `expected_access`, the incarnation must also still be owned by that
+    /// transport; the returned token is cancelled once that ownership ends.
     pub(crate) async fn steering_binding_for_generation(
         &self,
         id: &str,
         generation: u64,
         owner: Option<&str>,
-    ) -> Option<(String, String, bool, crate::tools::PerToolChannelHandle)> {
+        expected_access: Option<(u64, Option<&str>)>,
+    ) -> Option<(
+        String,
+        String,
+        bool,
+        crate::tools::PerToolChannelHandle,
+        tokio_util::sync::CancellationToken,
+    )> {
         let sessions = self.sessions.lock().await;
-        let session = sessions
-            .get(id)
-            .filter(|s| s.generation == generation && s.owner_principal_id.as_deref() == owner)?;
+        let session = sessions.get(id).filter(|s| {
+            s.generation == generation
+                && s.owner_principal_id.as_deref() == owner
+                && expected_access.is_none_or(|(expected, tui)| {
+                    s.generation == expected && s.owner_tui_id() == tui
+                })
+        })?;
         Some((
             session.agent_alias.clone(),
             session.workspace_dir.clone(),
@@ -891,6 +938,7 @@ impl SessionStore {
                 .as_ref()
                 .is_some_and(|env| !env.is_empty()),
             Arc::clone(&session.reaction_channels),
+            session.owner_binding.revoked.clone(),
         ))
     }
 
@@ -1226,7 +1274,7 @@ impl SessionStore {
     fn signal_test_gate_done(&self, _done: ()) {}
 
     /// Install a test-only pause gate at the pre-commit boundary inside
-    /// `set_overrides_gated` and `apply_model_provider`. Returns
+    /// `configure_authorized` and `apply_model_provider`. Returns
     /// `(entered, release, done)`.
     #[cfg(test)]
     pub fn set_test_gated_op_pause(&self) -> GatedOpPause {
@@ -1398,54 +1446,58 @@ impl SessionStore {
         Some(overrides)
     }
 
-    /// Like `set_overrides`, but validates `generation` before mutating the
-    /// session entry or its agent. Returns `None` if the session is absent
-    /// *or* if it was replaced under the same ID — both cases mean the caller
-    /// captured a stale generation and the work must be discarded.
-    pub async fn set_overrides_gated(
+    /// Commit a prepared configure operation after the Agent and canonical
+    /// incarnation are locked. The caller's authority guard spans every
+    /// mutation; no await separates the override and provider publications.
+    /// Returns `None` if the session is absent or was replaced under the same
+    /// ID: the caller captured a stale generation and the work is discarded.
+    ///
+    /// `explicit_model_selection` is whether the request itself named a model
+    /// or provider; such a choice turns off automatic model routing.
+    pub(crate) async fn configure_authorized<G, E>(
         &self,
         id: &str,
         generation: u64,
-        patch: SessionOverrides,
-    ) -> Option<SessionOverrides> {
-        let explicit_model_selection = patch.model.is_some() || patch.model_provider.is_some();
+        merged: SessionOverrides,
+        explicit_model_selection: bool,
+        update: Option<ModelProviderUpdate>,
+        authorize: impl FnOnce(&RpcSession) -> Result<G, E>,
+    ) -> Result<Option<SessionOverrides>, E> {
         let done = self.wait_test_gate().await;
-        let merged = match self.preview_overrides(id, &patch).await {
-            Some(merged) => merged,
-            None => {
-                self.signal_test_gate_done(done);
-                return None;
-            }
-        };
-        let mut sessions = self.sessions.lock().await;
-        let session = match sessions.get_mut(id) {
-            Some(session) => session,
-            None => {
-                self.signal_test_gate_done(done);
-                return None;
-            }
-        };
-        if session.generation != generation {
-            self.signal_test_gate_done(done);
-            return None;
+        let result = async {
+            let Some(agent) = self.get_agent(id).await else {
+                return Ok(None);
+            };
+            // Agent -> session map matches the other live effect boundaries.
+            let mut guard = agent.lock().await;
+            self.with_session_effect(id, |session| {
+                let Some(session) = session else {
+                    return Ok(None);
+                };
+                if session.generation != generation || !Arc::ptr_eq(&agent, &session.agent) {
+                    return Ok(None);
+                }
+                let _authority = authorize(session)?;
+                session.overrides = merged.clone();
+                if let Some(model) = &merged.model {
+                    guard.set_model_name(model.clone());
+                }
+                if explicit_model_selection {
+                    guard.disable_automatic_model_routing();
+                }
+                if merged.temperature.is_some() {
+                    guard.set_temperature(merged.temperature);
+                }
+                if let Some(update) = update {
+                    update.apply_to(&mut guard);
+                }
+                Ok(Some(merged))
+            })
+            .await
         }
-        session.overrides = merged.clone();
-        // Apply to agent immediately.
-        let overrides = session.overrides.clone();
-        let agent = session.agent.clone();
-        drop(sessions);
-        let mut guard = agent.lock().await;
-        if let Some(ref m) = overrides.model {
-            guard.set_model_name(m.clone());
-        }
-        if explicit_model_selection {
-            guard.disable_automatic_model_routing();
-        }
-        if overrides.temperature.is_some() {
-            guard.set_temperature(overrides.temperature);
-        }
+        .await;
         self.signal_test_gate_done(done);
-        Some(overrides)
+        result
     }
 
     pub async fn preview_overrides(
@@ -1504,7 +1556,7 @@ impl SessionStore {
     /// set to `v` (which may be `None`, clearing a prior profile temperature).
     /// When `temperature` is `None`, the agent's temperature is left unchanged
     /// — used by `session/configure` where temperature is already committed
-    /// via `set_overrides_gated`.
+    /// via `configure_authorized`.
     ///
     /// `multimodal_config` must be the same `[multimodal]` policy snapshot the
     /// caller built the provider box from, so the agent-side preparation pass
@@ -1531,16 +1583,7 @@ impl SessionStore {
             }
         };
         let mut guard = agent.lock().await;
-        guard.set_model_provider(update.model_provider);
-        guard.set_model_provider_name(update.model_provider_name);
-        guard.set_model_name(update.model_name);
-        guard.set_model_route_resolver(update.model_route_resolver);
-        guard.set_tool_dispatcher(update.tool_dispatcher);
-        guard.set_multimodal_config(update.multimodal_config);
-        guard.set_config_generation(update.config_generation);
-        if let Some(t) = update.temperature {
-            guard.set_temperature(t);
-        }
+        update.apply_to(&mut guard);
         self.signal_test_gate_done(done);
         true
     }
@@ -1849,7 +1892,7 @@ impl SessionStore {
             .iter()
             .filter(|(key, s)| {
                 key.as_str() != except_id
-                    && s.owner_tui_id.as_deref() == Some(tui_id)
+                    && s.owner_tui_id() == Some(tui_id)
                     && &s.chat_mode == chat_mode
                     && !in_flight.contains(key.as_str())
             })
@@ -1877,7 +1920,9 @@ impl SessionStore {
     /// created by an anonymous connection), `Some(Some(id))` if owned by `id`.
     pub async fn session_owner_tui_id(&self, session_id: &str) -> Option<Option<String>> {
         let sessions = self.sessions.lock().await;
-        sessions.get(session_id).map(|s| s.owner_tui_id.clone())
+        sessions
+            .get(session_id)
+            .map(|s| s.owner_tui_id().map(str::to_owned))
     }
 
     /// Read the owning-principal stamp from a LIVE session. Same tri-state
@@ -1895,9 +1940,12 @@ impl SessionStore {
     /// successor.
     pub async fn session_access_snapshot(&self, session_id: &str) -> Option<(u64, Option<String>)> {
         let sessions = self.sessions.lock().await;
-        sessions
-            .get(session_id)
-            .map(|session| (session.generation, session.owner_tui_id.clone()))
+        sessions.get(session_id).map(|session| {
+            (
+                session.generation,
+                session.owner_tui_id().map(str::to_owned),
+            )
+        })
     }
 
     pub async fn list_ids(&self) -> Vec<String> {
@@ -1980,10 +2028,10 @@ impl SessionStore {
     }
 
     fn owned(id: &str, session: &RpcSession) -> Option<OwnedSession> {
-        session.owner_tui_id.as_ref().map(|owner| OwnedSession {
+        session.owner_tui_id().map(|owner| OwnedSession {
             id: id.to_string(),
             generation: session.generation,
-            owner_tui_id: owner.clone(),
+            owner_tui_id: owner.to_owned(),
             last_active: session.last_active,
         })
     }
@@ -1993,7 +2041,7 @@ impl SessionStore {
             .lock()
             .await
             .iter()
-            .filter(|(_, session)| session.owner_tui_id.as_deref() == Some(owner_tui_id))
+            .filter(|(_, session)| session.owner_tui_id() == Some(owner_tui_id))
             .map(|(id, _)| id.clone())
             .collect()
     }
@@ -2344,13 +2392,6 @@ impl SessionStore {
         self.signal_cancellation(id, CancelCause::OperatorAbort)
     }
 
-    /// [`Self::abort_session`] bound to the live session incarnation the
-    /// caller was authorized against: a turn belonging to any other
-    /// incarnation under the same id (a same-id successor) is left running.
-    pub fn abort_session_for_generation(&self, id: &str, session_generation: Option<u64>) -> bool {
-        self.signal_cancellation_for_generation(id, session_generation, CancelCause::OperatorAbort)
-    }
-
     /// Signal only the session incarnation observed by the caller.
     ///
     /// Holding the session map lock across the generation check and token
@@ -2441,8 +2482,7 @@ impl SessionStore {
         if current.map(|session| session.generation) != generation
             || expected_access.is_some_and(|(expected_generation, owner)| {
                 !current.is_some_and(|session| {
-                    session.generation == expected_generation
-                        && session.owner_tui_id.as_deref() == owner
+                    session.generation == expected_generation && session.owner_tui_id() == owner
                 })
             })
         {
@@ -2665,10 +2705,110 @@ impl SessionStore {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn transport_binding_revokes_on_transfer_and_drop_without_aba_revival() {
+        let mut binding = super::SessionOwnerBinding::default();
+        binding.rebind(Some("alice-tui".into()));
+        let original = binding.revoked.clone();
+        binding.rebind(Some("alice-tui".into()));
+        assert!(
+            !original.is_cancelled(),
+            "same-TUI reconnect preserves queued steering"
+        );
+        binding.rebind(Some("other-tui".into()));
+        assert!(original.is_cancelled());
+        binding.rebind(Some("alice-tui".into()));
+        assert!(
+            original.is_cancelled(),
+            "returning to the owner cannot revive old input"
+        );
+        let current = binding.revoked.clone();
+        assert!(!current.is_cancelled());
+        drop(binding);
+        assert!(
+            current.is_cancelled(),
+            "session removal/replacement revokes its binding"
+        );
+    }
+
     use super::*;
 
     fn make_store(max: usize) -> SessionStore {
         SessionStore::new(max, Arc::new(SessionActorQueue::new(4, 10, 60)))
+    }
+
+    #[tokio::test]
+    async fn operator_abort_authorizes_after_the_real_cancellation_lock() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for revoke in [true, false] {
+            let store = Arc::new(make_store(4));
+            store
+                .insert(
+                    "s".into(),
+                    RpcSession::new(
+                        make_agent(),
+                        "test",
+                        "/tmp",
+                        super::super::types::ChatMode::Chat,
+                    ),
+                )
+                .await
+                .unwrap();
+            let generation = store.get_generation("s").await.unwrap();
+            let token = tokio_util::sync::CancellationToken::new();
+            store.register_cancel_token_for_generation_for_test("s", generation, token.clone());
+            let allowed = Arc::new(AtomicBool::new(true));
+            let held = store.cancel_tokens.lock().unwrap();
+            let waiting_store = Arc::clone(&store);
+            let waiting_allowed = Arc::clone(&allowed);
+            let waiter = std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap()
+                    .block_on(waiting_store.signal_cancellation_authorized(
+                        "s",
+                        Some(generation),
+                        None,
+                        CancelCause::OperatorAbort,
+                        |_| {
+                            if waiting_allowed.load(Ordering::SeqCst) {
+                                Ok(())
+                            } else {
+                                Err("revoked")
+                            }
+                        },
+                    ))
+            });
+            // The waiter holds the map before trying cancel_tokens. Observing
+            // that lock proves it reached the actual cancellation boundary.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while store.sessions.try_lock().is_ok() && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            let reached = store.sessions.try_lock().is_err();
+            if revoke {
+                allowed.store(false, Ordering::SeqCst);
+            }
+            assert!(!token.is_cancelled());
+            drop(held);
+            let result = waiter.join().unwrap();
+            assert!(
+                reached,
+                "waiter acquired the incarnation lock before revocation"
+            );
+            if revoke {
+                assert_eq!(result, Err("revoked"));
+                assert!(!token.is_cancelled());
+                assert_eq!(store.take_cancel_cause("s"), None);
+            } else {
+                assert_eq!(result, Ok(Some(true)));
+                assert!(token.is_cancelled());
+                assert_eq!(
+                    store.take_cancel_cause("s"),
+                    Some(CancelCause::OperatorAbort)
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -3747,7 +3887,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_overrides_gated_rejects_stale_generation() {
+    async fn configure_authorized_rejects_stale_generation() {
         let store = make_store(4);
         store
             .insert(
@@ -3769,16 +3909,22 @@ mod tests {
 
         // Stale generation must be rejected — successor untouched.
         let result = store
-            .set_overrides_gated(
+            .configure_authorized(
                 "s",
                 captured_gen,
                 SessionOverrides {
                     model: Some("intruder".into()),
                     ..Default::default()
                 },
+                true,
+                None,
+                |_| Ok::<(), ()>(()),
             )
             .await;
-        assert!(result.is_none(), "stale generation must be rejected");
+        assert!(
+            matches!(result, Ok(None)),
+            "stale generation must be rejected"
+        );
 
         // Successor's overrides must remain default.
         let overrides = store.get_overrides("s").await.unwrap();
@@ -3790,7 +3936,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_overrides_gated_accepts_current_generation() {
+    async fn configure_authorized_accepts_current_generation() {
         let store = make_store(4);
         store
             .insert(
@@ -3802,7 +3948,7 @@ mod tests {
         let captured_gen = store.get_generation("s").await.unwrap();
 
         let result = store
-            .set_overrides_gated(
+            .configure_authorized(
                 "s",
                 captured_gen,
                 SessionOverrides {
@@ -3810,10 +3956,14 @@ mod tests {
                     temperature: Some(0.7),
                     ..Default::default()
                 },
+                true,
+                None,
+                |_| Ok::<(), ()>(()),
             )
             .await;
-        assert!(result.is_some(), "current generation must be accepted");
-        let overrides = result.unwrap();
+        let overrides = result
+            .expect("the commit is authorized")
+            .expect("current generation must be accepted");
         assert_eq!(overrides.model.as_deref(), Some("valid"));
         assert_eq!(overrides.temperature, Some(0.7));
     }
