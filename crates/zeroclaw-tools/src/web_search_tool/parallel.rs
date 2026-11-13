@@ -1,6 +1,6 @@
 use super::{
-    WebSearchTool, cap_result_content, http_search_failure, no_results_message, render_results,
-    results_header,
+    WebSearchTool, cap_provider_error, cap_result_content, http_search_failure, no_results_message,
+    render_results, results_header,
 };
 use crate::i18n::get_required_tool_string;
 use crate::mcp_client::McpServer;
@@ -44,7 +44,10 @@ impl WebSearchTool {
             })?
             .map_err(|err| match err.downcast_ref::<McpHttpStatus>() {
                 Some(status) => http_search_failure("parallel", status.0),
-                None => err,
+                // A JSON-RPC `error` reply carries server-controlled text that
+                // `McpServer::call_tool` formats unbounded, and this path
+                // returns before the rendering caps.
+                None => anyhow::Error::msg(cap_provider_error(&err.to_string())),
             })?;
         format_response(query, self.max_results, &result)
     }
@@ -113,6 +116,7 @@ fn format_response(query: &str, max_results: usize, result: &Value) -> anyhow::R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::web_search_tool::MAX_PROVIDER_ERROR_CHARS;
     use wiremock::{
         Mock, MockServer, Request, ResponseTemplate,
         matchers::{header, method},
@@ -161,6 +165,57 @@ mod tests {
             err.to_string()
                 .contains("search_status=unavailable, http=429")
         );
+    }
+
+    /// A JSON-RPC `error` reply carries server-controlled text that
+    /// `McpServer::call_tool` formats without a bound, and the fall-through
+    /// arm returns it before any rendering cap applies.
+    #[tokio::test]
+    async fn json_rpc_error_text_is_capped_before_it_reaches_the_model() {
+        let _guard = crate::test_support::RuntimeProxyStateGuard::acquire().await;
+        set_runtime_proxy_config(ProxyConfig::default());
+        let server = MockServer::start().await;
+        // Multibyte on purpose: the cap must count characters, not bytes.
+        let message = "é".repeat(200_000);
+        let reply = message.clone();
+        Mock::given(method("POST"))
+            .respond_with(move |request: &Request| {
+                let body: Value = request.body_json().unwrap();
+                let result = match body["method"].as_str().unwrap() {
+                    "initialize" => json!({"capabilities":{"tools":{}}}),
+                    "notifications/initialized" => return ResponseTemplate::new(202),
+                    "tools/list" => {
+                        json!({"tools":[{"name":"web_search","inputSchema":{"type":"object"}}]})
+                    }
+                    "tools/call" => {
+                        return ResponseTemplate::new(200).set_body_json(json!({
+                            "jsonrpc":"2.0","id":body["id"],
+                            "error":{"code":-32000,"message":reply}
+                        }));
+                    }
+                    other => panic!("unexpected MCP method {other}"),
+                };
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"jsonrpc":"2.0","id":body["id"],"result":result}))
+            })
+            .mount(&server)
+            .await;
+
+        let tool = WebSearchTool::new("parallel".into(), None, None, 1, 5);
+        let err = tool
+            .search_parallel(&format!("{}/mcp", server.uri()), "example")
+            .await
+            .expect_err("a JSON-RPC error reply must fail the search")
+            .to_string();
+
+        assert!(!err.contains(&message), "the whole server message leaked");
+        assert!(
+            err.chars().count() <= MAX_PROVIDER_ERROR_CHARS + 3,
+            "server error exceeded its budget: {} chars",
+            err.chars().count()
+        );
+        assert!(err.ends_with("..."), "truncation must stay visible: {err}");
+        assert!(!err.contains('\u{FFFD}'), "split a codepoint");
     }
 
     #[test]
