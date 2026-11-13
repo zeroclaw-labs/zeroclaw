@@ -99,32 +99,19 @@ fn config_toml_roundtrip_preserves_provider() {
     let parsed = zeroclaw::config::migration::migrate_to_current(&toml_str)
         .expect("TOML should round-trip through migration");
 
-    assert!(
-        parsed
-            .providers
-            .models
-            .find("deepseek", "default")
-            .is_some(),
-        "deepseek.default entry should survive round-trip"
-    );
+    let registry = parsed
+        .provider_registry()
+        .expect("canonical provider registry");
+    let resolved = registry
+        .resolve_chat(&"deepseek.default".into())
+        .expect("deepseek.default entry should survive round-trip");
     assert_eq!(
-        parsed
-            .providers
-            .models
-            .find("deepseek", "default")
-            .and_then(|e| e.model.as_deref()),
+        resolved.selection.model.upstream_model(),
         Some("deepseek-chat")
     );
-    assert!(
-        (parsed
-            .providers
-            .models
-            .find("deepseek", "default")
-            .and_then(|e| e.temperature)
-            .unwrap_or(0.7)
-            - 0.5)
-            .abs()
-            < f64::EPSILON
+    assert_eq!(
+        serde_json::to_value(&resolved.options).unwrap()["temperature"],
+        serde_json::json!(0.5)
     );
 }
 

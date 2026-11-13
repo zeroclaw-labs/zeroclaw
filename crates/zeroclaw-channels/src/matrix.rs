@@ -2970,9 +2970,7 @@ mod inbound {
     }
 }
 
-/// Registers every configured provider — legacy `[transcription]` and typed
-/// `[providers.transcription.<type>.<alias>]` alike — and binds
-/// `agent_provider`.
+/// Registers canonical ASR models and binds the owning agent's model reference.
 ///
 /// When the owning agent states no preference, a lone registered provider is
 /// bound so single-provider deployments keep working without an explicit
@@ -3006,26 +3004,6 @@ pub(crate) type TranscriptionResolver = Arc<
         + Send
         + Sync,
 >;
-
-/// Resolver over a legacy `[transcription]` section alone. Typed
-/// `[providers.transcription.<type>.<alias>]` entries are unreachable this way,
-/// so production always goes through the channel runtime's live-config
-/// resolver; this exists to drive the inbound tests from a bare section.
-#[cfg(test)]
-pub(crate) fn legacy_transcription_resolver(
-    transcription: zeroclaw_config::schema::TranscriptionConfig,
-) -> TranscriptionResolver {
-    let config = Arc::new(zeroclaw_config::schema::Config {
-        transcription,
-        ..Default::default()
-    });
-    Arc::new(move || {
-        if !config.transcription.enabled {
-            return None;
-        }
-        Some(build_transcription_manager(&config, ""))
-    })
-}
 
 // ─── outbound ──────────────────────────────────────────────────────────────
 mod outbound {
@@ -5554,6 +5532,41 @@ fn streaming_key(recipient: &str, message_id: &str) -> Result<streaming::DraftKe
 // ─── tests ─────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
+    fn add_asr_model(config: &mut zeroclaw_config::schema::Config, name: &str, uri: &str) {
+        config.providers.connections.insert(
+            name.into(),
+            serde_json::from_value(serde_json::json!({
+                "kind": "local_whisper",
+                "uri": uri,
+                "auth": {"mode": "api_key", "api_key": "test-token"},
+                "api": {"asr": {"max_audio_bytes": 10485760, "request_timeout_secs": 30}}
+            }))
+            .expect("canonical ASR connection"),
+        );
+        config.providers.models.insert_canonical_model(
+            name.into(),
+            serde_json::from_value(serde_json::json!({
+                "capability": "asr", "provider": name, "model": "whisper-1"
+            }))
+            .expect("canonical ASR model"),
+        );
+    }
+
+    fn asr_config(uri: &str) -> zeroclaw_config::schema::Config {
+        let mut config = zeroclaw_config::schema::Config::default();
+        add_asr_model(&mut config, "asr.local", uri);
+        config
+    }
+
+    fn transcription_resolver(
+        config: zeroclaw_config::schema::Config,
+    ) -> super::TranscriptionResolver {
+        std::sync::Arc::new(move || {
+            zeroclaw_providers::transcription::is_enabled(&config)
+                .then(|| super::build_transcription_manager(&config, ""))
+        })
+    }
+
     /// Regression: Matrix
     /// streams paragraphs via `update_draft` and does NOT implement the
     /// `flush_draft_turn` narration contract, so it must NOT opt into the
@@ -6457,40 +6470,14 @@ mod tests {
 
     mod transcription_provider_resolution {
         use super::super::build_transcription_manager;
-        use zeroclaw_config::schema::{
-            AliasedAgentConfig, Config, LocalWhisperConfig,
-            LocalWhisperTranscriptionProviderConfig, TranscriptionConfig,
-        };
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
 
-        fn local_whisper_config(url: &str) -> LocalWhisperConfig {
-            LocalWhisperConfig {
-                url: url.to_string(),
-                bearer_token: Some("test-token".to_string()),
-                max_audio_bytes: 10 * 1024 * 1024,
-                timeout_secs: 30,
-            }
-        }
-
-        fn with_transcription(transcription: TranscriptionConfig) -> Config {
-            Config {
-                transcription,
-                ..Config::default()
-            }
-        }
-
-        /// A typed `[providers.transcription.local_whisper.stoa]` entry plus the
-        /// owning agent's `transcription_provider`, and no legacy provider.
         fn typed_config() -> Config {
-            let mut config = with_transcription(TranscriptionConfig {
-                enabled: true,
-                ..TranscriptionConfig::default()
-            });
-            config.providers.transcription.local_whisper.insert(
-                "stoa".to_string(),
-                LocalWhisperTranscriptionProviderConfig {
-                    uri: "http://127.0.0.1:9999/v1/transcribe".to_string(),
-                    ..LocalWhisperTranscriptionProviderConfig::default()
-                },
+            let mut config = Config::default();
+            super::add_asr_model(
+                &mut config,
+                "local_whisper.stoa",
+                "http://127.0.0.1:9999/v1/transcribe",
             );
             config.agents.insert(
                 "local".to_string(),
@@ -6540,8 +6527,11 @@ mod tests {
             // Two providers register, so the sole-provider fallback cannot
             // fire; only the agent's explicit alias can bind here.
             let mut config = typed_config();
-            config.transcription.local_whisper =
-                Some(local_whisper_config("http://127.0.0.1:9998/v1/transcribe"));
+            super::add_asr_model(
+                &mut config,
+                "asr.backup",
+                "http://127.0.0.1:9998/v1/transcribe",
+            );
 
             let manager = build_transcription_manager(&config, "local_whisper.stoa").unwrap();
             assert!(
@@ -6563,16 +6553,12 @@ mod tests {
 
         #[tokio::test]
         async fn binds_alias_when_exactly_one_provider_is_configured() {
-            let config = with_transcription(TranscriptionConfig {
-                enabled: true,
-                local_whisper: Some(local_whisper_config("http://127.0.0.1:9999/v1/transcribe")),
-                ..TranscriptionConfig::default()
-            });
+            let config = super::asr_config("http://127.0.0.1:9999/v1/transcribe");
 
             let manager = build_transcription_manager(&config, "").unwrap();
             assert_eq!(
                 manager.available_providers(),
-                vec!["local_whisper"],
+                vec!["asr.local"],
                 "fixture must register exactly one provider"
             );
 
@@ -6593,12 +6579,12 @@ mod tests {
 
         #[tokio::test]
         async fn leaves_alias_unbound_when_multiple_providers_are_configured() {
-            let config = with_transcription(TranscriptionConfig {
-                enabled: true,
-                api_key: Some("test-groq-key".to_string()),
-                local_whisper: Some(local_whisper_config("http://127.0.0.1:9999/v1/transcribe")),
-                ..TranscriptionConfig::default()
-            });
+            let mut config = super::asr_config("http://127.0.0.1:9999/v1/transcribe");
+            super::add_asr_model(
+                &mut config,
+                "asr.backup",
+                "http://127.0.0.1:9998/v1/transcribe",
+            );
 
             let manager = build_transcription_manager(&config, "").unwrap();
             assert!(
@@ -6622,24 +6608,6 @@ mod tests {
     mod media_filename_resolution {
         use super::super::build_transcription_manager;
         use super::super::inbound::transcription_safe_filename;
-        use zeroclaw_config::schema::TranscriptionConfig;
-
-        fn local_whisper_config(url: &str) -> zeroclaw_config::schema::LocalWhisperConfig {
-            zeroclaw_config::schema::LocalWhisperConfig {
-                url: url.to_string(),
-                bearer_token: Some("test-token".to_string()),
-                max_audio_bytes: 10 * 1024 * 1024,
-                timeout_secs: 30,
-            }
-        }
-
-        fn config_with(transcription: TranscriptionConfig) -> zeroclaw_config::schema::Config {
-            zeroclaw_config::schema::Config {
-                transcription,
-                ..zeroclaw_config::schema::Config::default()
-            }
-        }
-
         #[test]
         fn unaccepted_extension_with_supported_mime_uses_mime_derived_name() {
             let resolved = transcription_safe_filename("recording.bin", Some("audio/ogg"));
@@ -6702,12 +6670,8 @@ mod tests {
 
         #[tokio::test]
         async fn caption_only_body_reaches_provider_dispatch_not_format_rejection() {
-            let config = TranscriptionConfig {
-                enabled: true,
-                local_whisper: Some(local_whisper_config("http://127.0.0.1:9999/v1/transcribe")),
-                ..TranscriptionConfig::default()
-            };
-            let manager = build_transcription_manager(&config_with(config), "").unwrap();
+            let config = super::asr_config("http://127.0.0.1:9999/v1/transcribe");
+            let manager = build_transcription_manager(&config, "").unwrap();
 
             let file_name = transcription_safe_filename("Voice message", Some("audio/ogg"));
 
@@ -6728,12 +6692,8 @@ mod tests {
 
         #[tokio::test]
         async fn unaccepted_extension_reaches_provider_dispatch_not_format_rejection() {
-            let config = TranscriptionConfig {
-                enabled: true,
-                local_whisper: Some(local_whisper_config("http://127.0.0.1:9999/v1/transcribe")),
-                ..TranscriptionConfig::default()
-            };
-            let manager = build_transcription_manager(&config_with(config), "").unwrap();
+            let config = super::asr_config("http://127.0.0.1:9999/v1/transcribe");
+            let manager = build_transcription_manager(&config, "").unwrap();
 
             let file_name = transcription_safe_filename("recording.bin", Some("audio/ogg"));
 
@@ -6767,15 +6727,8 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let config = TranscriptionConfig {
-                enabled: true,
-                local_whisper: Some(local_whisper_config(&format!(
-                    "{}/v1/transcribe",
-                    server.uri()
-                ))),
-                ..TranscriptionConfig::default()
-            };
-            let manager = build_transcription_manager(&config_with(config), "").unwrap();
+            let config = super::asr_config(&format!("{}/v1/transcribe", server.uri()));
+            let manager = build_transcription_manager(&config, "").unwrap();
 
             let file_name = transcription_safe_filename("recording.aac", Some("audio/aac"));
             assert_eq!(file_name, "recording.aac");
@@ -6804,15 +6757,8 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let config = TranscriptionConfig {
-                enabled: true,
-                local_whisper: Some(local_whisper_config(&format!(
-                    "{}/v1/transcribe",
-                    server.uri()
-                ))),
-                ..TranscriptionConfig::default()
-            };
-            let manager = build_transcription_manager(&config_with(config), "").unwrap();
+            let config = super::asr_config(&format!("{}/v1/transcribe", server.uri()));
+            let manager = build_transcription_manager(&config, "").unwrap();
 
             let file_name = transcription_safe_filename("Voice message", None);
             assert_eq!(file_name, "Voice message");
@@ -6844,15 +6790,8 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let config = TranscriptionConfig {
-                enabled: true,
-                local_whisper: Some(local_whisper_config(&format!(
-                    "{}/v1/transcribe",
-                    server.uri()
-                ))),
-                ..TranscriptionConfig::default()
-            };
-            let manager = build_transcription_manager(&config_with(config), "").unwrap();
+            let config = super::asr_config(&format!("{}/v1/transcribe", server.uri()));
+            let manager = build_transcription_manager(&config, "").unwrap();
 
             let file_name = transcription_safe_filename("Voice message", Some("audio/ogg"));
 
@@ -6888,7 +6827,7 @@ mod tests {
         use wiremock::matchers::{method, path, path_regex};
         use wiremock::{Mock, ResponseTemplate};
         use zeroclaw_api::channel::ChannelApprovalResponse;
-        use zeroclaw_config::schema::{MatrixConfig, TranscriptionConfig};
+        use zeroclaw_config::schema::MatrixConfig;
 
         use super::super::inbound::{HandlerCtx, register_event_handlers};
 
@@ -6974,18 +6913,7 @@ mod tests {
             tx: mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
         ) -> HandlerCtx {
             handler_ctx_with_resolver(
-                Some(super::super::legacy_transcription_resolver(
-                    TranscriptionConfig {
-                        enabled: true,
-                        local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
-                            url: stt_url.to_string(),
-                            bearer_token: Some("test-token".to_string()),
-                            max_audio_bytes: 10 * 1024 * 1024,
-                            timeout_secs: 30,
-                        }),
-                        ..TranscriptionConfig::default()
-                    },
-                )),
+                Some(super::transcription_resolver(super::asr_config(stt_url))),
                 workspace,
                 tx,
             )
@@ -7131,8 +7059,6 @@ mod tests {
         /// The decoy is what makes the assertion mean something.
         #[tokio::test]
         async fn configured_route_transcribes_via_the_agents_provider() {
-            use zeroclaw_config::schema::LocalWhisperTranscriptionProviderConfig;
-
             let wav = build_wav();
 
             let matrix = MatrixMockServer::new().await;
@@ -7184,19 +7110,15 @@ mod tests {
                     ..Default::default()
                 },
             );
-            config.providers.transcription.local_whisper.insert(
-                "wanted".to_string(),
-                LocalWhisperTranscriptionProviderConfig {
-                    uri: format!("{}/v1/transcribe", wanted.uri()),
-                    ..Default::default()
-                },
+            super::add_asr_model(
+                &mut config,
+                "local_whisper.wanted",
+                &format!("{}/v1/transcribe", wanted.uri()),
             );
-            config.providers.transcription.local_whisper.insert(
-                "decoy".to_string(),
-                LocalWhisperTranscriptionProviderConfig {
-                    uri: format!("{}/v1/transcribe", decoy.uri()),
-                    ..Default::default()
-                },
+            super::add_asr_model(
+                &mut config,
+                "local_whisper.decoy",
+                &format!("{}/v1/transcribe", decoy.uri()),
             );
 
             let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
@@ -11667,22 +11589,6 @@ mod tests {
     mod transcription_gate {
 
         use super::super::inbound::{MediaCategory, should_transcribe};
-        use super::super::legacy_transcription_resolver;
-        use zeroclaw_config::schema::TranscriptionConfig;
-
-        fn enabled_cfg() -> TranscriptionConfig {
-            // Construct via Default + struct update so we stay robust to
-            // future field additions on TranscriptionConfig.
-            TranscriptionConfig {
-                enabled: true,
-                ..TranscriptionConfig::default()
-            }
-        }
-
-        fn disabled_cfg() -> TranscriptionConfig {
-            TranscriptionConfig::default()
-        }
-
         #[test]
         fn voice_transcribes() {
             assert!(should_transcribe(&MediaCategory::Voice));
@@ -11704,21 +11610,15 @@ mod tests {
         fn resolver_yields_nothing_when_disabled() {
             // The enabled gate moved from `should_transcribe` onto the
             // resolver, which reads it from live config on every message.
-            let resolver = legacy_transcription_resolver(disabled_cfg());
+            let resolver = super::transcription_resolver(Default::default());
             assert!(resolver().is_none());
         }
 
         #[test]
         fn resolver_yields_a_manager_when_enabled() {
-            let resolver = legacy_transcription_resolver(TranscriptionConfig {
-                local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
-                    url: "http://127.0.0.1:9999/v1/transcribe".to_string(),
-                    bearer_token: None,
-                    max_audio_bytes: 10 * 1024 * 1024,
-                    timeout_secs: 30,
-                }),
-                ..enabled_cfg()
-            });
+            let resolver = super::transcription_resolver(super::asr_config(
+                "http://127.0.0.1:9999/v1/transcribe",
+            ));
             assert!(resolver().is_some_and(|manager| manager.is_ok()));
         }
     }

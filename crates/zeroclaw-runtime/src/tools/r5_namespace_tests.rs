@@ -785,14 +785,22 @@ async fn late_build(
             ..Default::default()
         },
     );
-    let provider = config
-        .providers
-        .models
-        .ensure("custom", "namespace")
-        .unwrap();
-    provider.api_key = Some("test-key".into());
-    provider.model = Some("test-model".into());
-    provider.uri = Some("http://127.0.0.1:9".into());
+    config.providers.connections.insert(
+        "custom.namespace".into(),
+        serde_json::from_value(serde_json::json!({
+            "kind": "custom",
+            "uri": "http://127.0.0.1:9",
+            "auth": {"mode": "api_key", "api_key": "test-key"}
+        }))
+        .unwrap(),
+    );
+    config.providers.models.insert_canonical_model(
+        "custom.namespace".into(),
+        serde_json::from_value(serde_json::json!({
+            "capability": "chat", "provider": "custom.namespace", "model": "test-model"
+        }))
+        .unwrap(),
+    );
     config
         .risk_profiles
         .insert("late-risk".into(), Default::default());
