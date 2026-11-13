@@ -93,6 +93,7 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "tool.composio",
     "tool.file_download",
     "tool.http_request",
+    "tool.mcp",
     "tool.pushover",
     "tool.web_search",
     "memory.embeddings",
@@ -6018,7 +6019,7 @@ fn mcp_required_by_transport() -> serde_json::Value {
 }
 
 /// Configuration for a single external MCP server.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[cfg_attr(
     feature = "schema-export",
@@ -6057,6 +6058,27 @@ pub struct McpServerConfig {
     #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub headers: HashMap<String, String>,
+    /// Enable OAuth (authorization-code + PKCE) for this server's HTTP/SSE
+    /// transport: discovery via RFC 9728/8414, dynamic public-client
+    /// registration via RFC 7591 when `oauth_client_id` is unset, and a
+    /// loopback browser callback. Mutually exclusive with a configured
+    /// `authorization` header. Access/refresh tokens are persisted in the
+    /// encrypted auth-profile store and never appear in this file. Ignored
+    /// by stdio (validated as an error).
+    #[serde(default)]
+    pub oauth: bool,
+    /// Pre-registered public client id for `oauth = true`. Public metadata
+    /// under RFC 8252/9728, not a secret; ZeroClaw never manages a client
+    /// secret. When unset, dynamic registration is used if the
+    /// authorization server advertises it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[credential_class = "public_value"]
+    pub oauth_client_id: Option<String>,
+    /// OAuth scopes to request with `oauth = true` (RFC 6749 scope-token
+    /// grammar each). Sent as one space-joined `scope` parameter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[credential_class = "public_value"]
+    pub oauth_scopes: Option<Vec<String>>,
     /// Optional per-call timeout in seconds (hard capped in validation).
     #[serde(default)]
     pub tool_timeout_secs: Option<u64>,
@@ -11837,6 +11859,12 @@ fn validate_mcp_config(config: &McpConfig) -> Result<()> {
                         "mcp.servers[{i}] with transport=stdio requires non-empty command"
                     );
                 }
+                if server.oauth || server.oauth_client_id.is_some() || server.oauth_scopes.is_some()
+                {
+                    anyhow::bail!(
+                        "mcp.servers[{i}] oauth settings require transport=http or transport=sse"
+                    );
+                }
             }
             McpTransport::Http | McpTransport::Sse => {
                 let url = server
@@ -11885,9 +11913,76 @@ fn validate_mcp_config(config: &McpConfig) -> Result<()> {
                         );
                     }
                 }
+
+                validate_mcp_oauth_fields(server, i)?;
             }
         }
     }
+    Ok(())
+}
+
+/// OAuth contract for one MCP server entry: opt-in, remote transports only,
+/// never alongside a configured `authorization` header (two bearer credentials
+/// would be ambiguous), and oauth sub-fields require `oauth = true`.
+fn validate_mcp_oauth_fields(server: &McpServerConfig, i: usize) -> Result<()> {
+    if server.oauth {
+        if server
+            .headers
+            .keys()
+            .any(|key| key.trim().eq_ignore_ascii_case("authorization"))
+        {
+            anyhow::bail!(
+                "mcp.servers[{i}] cannot combine oauth = true with a configured authorization header; remove the header or set oauth = false"
+            );
+        }
+    } else if server.oauth_client_id.is_some() || server.oauth_scopes.is_some() {
+        anyhow::bail!("mcp.servers[{i}].oauth_client_id and oauth_scopes require oauth = true");
+    }
+
+    if let Some(client_id) = server.oauth_client_id.as_deref() {
+        if client_id.trim().is_empty() {
+            validation_bail!(
+                RequiredFieldEmpty,
+                format!("mcp.servers[{i}].oauth_client_id"),
+                "mcp.servers[{i}].oauth_client_id must not be empty when set"
+            );
+        }
+        // Deliberately stricter than RFC 6749's *VSCHAR client-id (Appendix
+        // A.1, which technically permits spaces, '"', and '\\'): control
+        // characters and whitespace in a client id would be percent-encoded
+        // into the authorization URL and rejected by real ASes anyway, so
+        // ZeroClaw requires the RFC 6749 scope-token alphabet
+        // ( %x21 / %x23-5B / %x5D-7E ) fail-closed at config validation.
+        if !client_id
+            .bytes()
+            .all(|b| matches!(b, 0x21 | 0x23..=0x5B | 0x5D..=0x7E))
+        {
+            anyhow::bail!(
+                "mcp.servers[{i}].oauth_client_id contains characters outside the accepted client-id alphabet (printable ASCII except space, \", and '\\')"
+            );
+        }
+    }
+
+    if let Some(scopes) = server.oauth_scopes.as_ref() {
+        if scopes.is_empty() {
+            anyhow::bail!("mcp.servers[{i}].oauth_scopes must not be empty when set");
+        }
+        for scope in scopes {
+            // RFC 6749 section 3.3: scope-token = 1*( %x21 / %x23-5B / %x5D-7E ).
+            // Rejects empty tokens and embedded whitespace, which would corrupt
+            // the single space-joined `scope` parameter.
+            let valid = !scope.is_empty()
+                && scope
+                    .bytes()
+                    .all(|b| matches!(b, 0x21 | 0x23..=0x5B | 0x5D..=0x7E));
+            if !valid {
+                anyhow::bail!(
+                    "mcp.servers[{i}].oauth_scopes contains an invalid scope token (RFC 6749 scope-token grammar required, no whitespace): {scope:?}"
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -44783,6 +44878,206 @@ high_entropy_tokens = false
         };
         let err = validate_mcp_config(&cfg).expect_err("invalid url should fail");
         assert!(err.to_string().contains("valid URL"), "got: {err}");
+    }
+
+    #[test]
+    async fn validate_mcp_config_accepts_oauth_server() {
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![McpServerConfig {
+                oauth: true,
+                oauth_scopes: Some(vec!["openid".to_string(), "profile".to_string()]),
+                ..http_server("svc", "https://mcp.example.com/mcp")
+            }],
+            ..Default::default()
+        };
+        validate_mcp_config(&cfg).expect("oauth http server should validate");
+    }
+
+    #[test]
+    async fn validate_mcp_config_rejects_oauth_with_authorization_header() {
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![McpServerConfig {
+                oauth: true,
+                headers: HashMap::from([(
+                    "Authorization".to_string(),
+                    "Bearer static".to_string(),
+                )]),
+                ..http_server("svc", "https://mcp.example.com/mcp")
+            }],
+            ..Default::default()
+        };
+        let err = validate_mcp_config(&cfg).expect_err("two bearer credentials should fail");
+        assert!(
+            err.to_string().contains("authorization header"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_mcp_config_rejects_oauth_with_lowercase_authorization_header() {
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![McpServerConfig {
+                oauth: true,
+                headers: HashMap::from([("authorization".to_string(), "x".to_string())]),
+                ..http_server("svc", "https://mcp.example.com/mcp")
+            }],
+            ..Default::default()
+        };
+        let err = validate_mcp_config(&cfg).expect_err("case-insensitive clash should fail");
+        assert!(
+            err.to_string().contains("authorization header"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_mcp_config_rejects_oauth_on_stdio() {
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![McpServerConfig {
+                name: "svc".to_string(),
+                transport: McpTransport::Stdio,
+                command: "server".to_string(),
+                oauth: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let err = validate_mcp_config(&cfg).expect_err("oauth on stdio should fail");
+        assert!(
+            err.to_string().contains("require transport=http"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_mcp_config_rejects_oauth_fields_without_oauth_enabled() {
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![McpServerConfig {
+                oauth_client_id: Some("client-123".to_string()),
+                ..http_server("svc", "https://mcp.example.com/mcp")
+            }],
+            ..Default::default()
+        };
+        let err = validate_mcp_config(&cfg).expect_err("client id without oauth should fail");
+        assert!(
+            err.to_string().contains("require oauth = true"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_mcp_config_rejects_empty_oauth_client_id() {
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![McpServerConfig {
+                oauth: true,
+                oauth_client_id: Some("  ".to_string()),
+                ..http_server("svc", "https://mcp.example.com/mcp")
+            }],
+            ..Default::default()
+        };
+        let err = validate_mcp_config(&cfg).expect_err("empty client id should fail");
+        assert!(
+            err.to_string()
+                .contains("oauth_client_id must not be empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_mcp_config_rejects_non_grammatical_oauth_client_id() {
+        for client_id in ["client 123", "client\u{7}", "cli\"ent"] {
+            let cfg = McpConfig {
+                enabled: true,
+                servers: vec![McpServerConfig {
+                    oauth: true,
+                    oauth_client_id: Some(client_id.to_string()),
+                    ..http_server("svc", "https://mcp.example.com/mcp")
+                }],
+                ..Default::default()
+            };
+            let err = match validate_mcp_config(&cfg) {
+                Ok(()) => panic!("client id {client_id:?} must be rejected"),
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string().contains("accepted client-id alphabet"),
+                "got: {err}"
+            );
+        }
+        // RFC 6749-legal ids (including the URL-ish and base64-ish shapes ASes
+        // actually issue) must keep validating.
+        for client_id in [
+            "a",
+            "client-123",
+            "client_123",
+            "a.b~c-d",
+            "c1/2+3=4",
+            "cli/ent",
+        ] {
+            let cfg = McpConfig {
+                enabled: true,
+                servers: vec![McpServerConfig {
+                    oauth: true,
+                    oauth_client_id: Some(client_id.to_string()),
+                    ..http_server("svc", "https://mcp.example.com/mcp")
+                }],
+                ..Default::default()
+            };
+            if let Err(err) = validate_mcp_config(&cfg) {
+                panic!("client id {client_id:?} must validate: {err}");
+            }
+        }
+    }
+
+    #[test]
+    async fn validate_mcp_config_rejects_malformed_oauth_scopes() {
+        for scopes in [
+            vec![],
+            vec!["has space".to_string()],
+            vec!["has\"quote".to_string()],
+            vec!["has\\backslash".to_string()],
+            vec!["".to_string()],
+        ] {
+            let cfg = McpConfig {
+                enabled: true,
+                servers: vec![McpServerConfig {
+                    oauth: true,
+                    oauth_scopes: Some(scopes.clone()),
+                    ..http_server("svc", "https://mcp.example.com/mcp")
+                }],
+                ..Default::default()
+            };
+            let err = validate_mcp_config(&cfg).expect_err("malformed scopes should fail");
+            assert!(err.to_string().contains("scope"), "got: {err}");
+        }
+    }
+
+    #[test]
+    async fn validate_mcp_config_accepts_rfc6749_scope_grammar() {
+        // Printable ASCII except '"' and '\\' is the RFC 6749 scope-token
+        // alphabet (%x21 / %x23-5B / %x5D-7E: backtick and '~' are inside it);
+        // URL-shaped scopes must keep validating.
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![McpServerConfig {
+                oauth: true,
+                oauth_scopes: Some(vec![
+                    "openid".to_string(),
+                    "offline_access".to_string(),
+                    "https://mcp.example.com/mcp".to_string(),
+                    "read:items!*()-./_[]`~".to_string(),
+                ]),
+                ..http_server("svc", "https://mcp.example.com/mcp")
+            }],
+            ..Default::default()
+        };
+        validate_mcp_config(&cfg).expect("RFC 6749 scope tokens should validate");
     }
 
     #[test]

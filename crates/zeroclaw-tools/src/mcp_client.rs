@@ -1679,6 +1679,9 @@ mod tests {
             transport: McpTransport::Stdio,
             url: None,
             headers: std::collections::HashMap::default(),
+            oauth: false,
+            oauth_client_id: None,
+            oauth_scopes: None,
             tls_ca_cert_path: None,
             max_response_bytes: None,
         };
@@ -1701,6 +1704,9 @@ mod tests {
             transport: McpTransport::Stdio,
             url: None,
             headers: std::collections::HashMap::default(),
+            oauth: false,
+            oauth_client_id: None,
+            oauth_scopes: None,
             tls_ca_cert_path: None,
             max_response_bytes: None,
         }];
@@ -2681,6 +2687,9 @@ done
             transport: McpTransport::Stdio,
             url: None,
             headers: std::collections::HashMap::default(),
+            oauth: false,
+            oauth_client_id: None,
+            oauth_scopes: None,
             tls_ca_cert_path: None,
             max_response_bytes: None,
         };

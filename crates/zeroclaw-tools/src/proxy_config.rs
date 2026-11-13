@@ -231,7 +231,8 @@ impl ProxyConfigTool {
                 "supported_selectors": ProxyConfig::supported_service_selectors(),
                 "dns_pinned_tool_constraints": {
                     "tool.http_request": "Cannot be proxied: selecting this key makes http_request fail closed so its validated DNS answer remains pinned.",
-                    "tool.web_fetch": "Cannot be proxied and has no exact service key; selecting tool.* makes the standard web_fetch request fail closed."
+                    "tool.web_fetch": "Cannot be proxied and has no exact service key; selecting tool.* makes the standard web_fetch request fail closed.",
+                    "tool.mcp": "MCP OAuth cannot be proxied: selecting this key makes the OAuth metadata, registration, and token requests fail closed so their pinned DNS answers remain authoritative."
                 },
                 "usage_example": {
                     "action": "set",
