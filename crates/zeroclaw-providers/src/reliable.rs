@@ -945,6 +945,10 @@ fn is_non_retryable_rate_limit(err: &anyhow::Error) -> bool {
         "package not active",
         "purchase package",
         "model not available for your plan",
+        // Exhausted-plan error types whose message text reads like a
+        // transient rate limit (e.g. OpenCode's "Rate limit exceeded").
+        "freeusagelimiterror",
+        "usage_limit_reached",
     ];
 
     if business_hints.iter().any(|hint| lower.contains(hint)) {
@@ -8835,6 +8839,40 @@ mod tests {
         );
     }
 
+    /// OpenCode Zen's exhausted free-quota response, as reported in #10779.
+    const OPENCODE_FREE_USAGE_LIMIT_429: &str = "OpenCode Zen API error (429 Too Many Requests): {\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Error from provider (Console): Rate limit exceeded. Please try again later.\"}}";
+
+    #[test]
+    fn non_retryable_rate_limit_detects_opencode_free_usage_limit() {
+        let err = anyhow::Error::msg(OPENCODE_FREE_USAGE_LIMIT_429);
+        assert!(
+            is_non_retryable_rate_limit(&err),
+            "OpenCode free-quota 429 should skip retries"
+        );
+    }
+
+    #[test]
+    fn non_retryable_rate_limit_detects_usage_limit_reached() {
+        let err = anyhow::Error::msg(
+            "API error (429 Too Many Requests): {\"error\":{\"type\":\"usage_limit_reached\",\"message\":\"The usage limit has been reached\"}}",
+        );
+        assert!(
+            is_non_retryable_rate_limit(&err),
+            "usage_limit_reached 429 should skip retries"
+        );
+    }
+
+    #[test]
+    fn non_retryable_rate_limit_ignores_quota_type_outside_429() {
+        let err = anyhow::Error::msg(
+            "API error (400 Bad Request): {\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"bad request\"}}",
+        );
+        assert!(
+            !is_non_retryable_rate_limit(&err),
+            "quota type strings only apply to rate-limit responses"
+        );
+    }
+
     #[test]
     fn non_retryable_rate_limit_does_not_flag_generic_429() {
         let err = anyhow::Error::msg("429 Too Many Requests: rate limit exceeded");
@@ -9287,6 +9325,39 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "must not retry non-retryable 429 business errors"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_retryable_rate_limit_skips_retries_for_opencode_free_usage_limit() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(MockModelProvider {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: usize::MAX,
+                    response: "never",
+                    error: OPENCODE_FREE_USAGE_LIMIT_429,
+                }),
+            )],
+            2,
+            1,
+        );
+
+        let err = model_provider
+            .simple_chat("hello", "test", Some(0.0))
+            .await
+            .expect_err("exhausted free quota should fail quickly without retrying");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "must not retry an exhausted free-usage quota"
+        );
+        assert!(
+            err.to_string().contains("rate_limited_non_retryable"),
+            "failure events must record rate_limited_non_retryable: {err}"
         );
     }
 
