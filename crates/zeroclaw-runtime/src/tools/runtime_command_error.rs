@@ -1,5 +1,56 @@
 use zeroclaw_config::platform::docker::DockerWorkspaceMountError;
 
+pub(super) fn memory_watchdog_support_error(
+    memory_mb: u64,
+    runtime: &str,
+    sandbox: &str,
+) -> Option<String> {
+    if memory_mb == 0 {
+        return None;
+    }
+    if !cfg!(any(target_os = "linux", target_os = "macos", windows))
+        || runtime != "native"
+        || sandbox == "docker"
+    {
+        return Some(crate::i18n::get_required_cli_string(
+            "tool-shell-memory-unsupported",
+        ));
+    }
+    None
+}
+
+pub(super) fn format_memory_wait_error(
+    error: &super::subprocess_memory::MemoryWaitError,
+) -> String {
+    use super::subprocess_memory::MemoryWaitError;
+    match error {
+        MemoryWaitError::Exceeded {
+            limit_mb,
+            rss_bytes,
+        } => {
+            let limit = limit_mb.to_string();
+            let rss = rss_bytes.div_ceil(1024 * 1024).to_string();
+            crate::i18n::get_required_cli_string_with_args(
+                "tool-shell-memory-exceeded",
+                &[("limit", limit.as_str()), ("rss", rss.as_str())],
+            )
+        }
+        MemoryWaitError::Unavailable { diagnostic } => {
+            crate::i18n::get_required_cli_string_with_args(
+                "tool-shell-memory-unavailable",
+                &[("error", diagnostic.as_str())],
+            )
+        }
+        MemoryWaitError::Io(error) => {
+            let message = error.to_string();
+            crate::i18n::get_required_cli_string_with_args(
+                "tool-runtime-command-wait-failed",
+                &[("error", message.as_str())],
+            )
+        }
+    }
+}
+
 pub(super) fn format_runtime_command_error(error: &anyhow::Error) -> String {
     if let Some(error) = error.downcast_ref::<DockerWorkspaceMountError>() {
         let (key, path, cause) = match error {

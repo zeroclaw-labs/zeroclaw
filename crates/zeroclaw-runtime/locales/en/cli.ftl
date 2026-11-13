@@ -1659,6 +1659,7 @@ sop-rpc-policy-unavailable = The parked SOP policy is unavailable: {$reason}.
 
 # ── Runtime command construction — shell and skill shell tools ──
 tool-runtime-command-build-failed = Failed to build runtime command: {$error}
+tool-runtime-command-wait-failed = Failed to wait for runtime command: {$error}
 tool-runtime-command-docker-workspace-path = Failed to build runtime command: Failed to canonicalize Docker workspace path {$path}: {$cause}
 tool-runtime-command-docker-allowed-root = Failed to build runtime command: Failed to canonicalize Docker workspace root {$path}: {$cause}
 
@@ -1751,6 +1752,9 @@ rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop 
 rpc-cron-agent-principal-required = Agent cron jobs do not carry principal restrictions; only administrators may modify or trigger them.
 cron-rpc-requested-agent-forbidden = The principal is not entitled to the requested agent.
 
+tool-shell-memory-unsupported = The shell memory watchdog requires a native Linux, macOS, or Windows command without a Docker sandbox. Use the container runtime's memory limit for containers.
+tool-shell-memory-exceeded = Command exceeded its { $limit } MiB resident-memory threshold (observed { $rss } MiB) and was stopped.
+tool-shell-memory-unavailable = Command stopped because resident-memory monitoring failed: { $error }
 skill-http-request-timeout = HTTP request timed out
 sop-store-busy = SOP storage is busy or unavailable; retry the request.
 sop-store-nonblocking-unavailable = SOP storage cannot provide immediate access; this request was refused.
