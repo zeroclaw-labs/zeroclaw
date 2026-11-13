@@ -101,3 +101,8 @@ When `supports_streaming()` is false, callers use the provider's non-streaming c
 - `crates/zeroclaw-providers/src/anthropic.rs`: Anthropic streaming
 - `crates/zeroclaw-providers/src/ollama.rs`: Ollama streaming
 - `crates/zeroclaw-channels/src/orchestrator/mod.rs`: channel-side stream consumption
+
+A compatible Chat Completions endpoint may close after a complete `data: [DONE]`
+sentinel without its final newline. That exact marker still completes the stream
+and preserves previously received content and usage. An incomplete sentinel or
+unparsed trailing JSON does not establish completion.
