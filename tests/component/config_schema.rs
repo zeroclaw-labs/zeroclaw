@@ -87,10 +87,8 @@ fn config_out_of_range_temperature_fails() {
 api_key = "sk-test"
 temperature = 99.0
 "#;
-    let config: Config = toml::from_str(toml_str).expect("parses");
-    // Out-of-range temperature is stored but caught by validate().
-    assert_eq!(model_temperature(&config), Some(99.0));
-    let err = config.validate().expect_err("temperature 99.0 should fail");
+    let err = toml::from_str::<Config>(toml_str)
+        .expect_err("temperature 99.0 must fail configuration admission");
     assert!(
         err.to_string().contains("temperature"),
         "expected temperature validation error, got: {err}"
@@ -104,9 +102,8 @@ fn config_negative_temperature_fails() {
 api_key = "sk-test"
 temperature = -0.5
 "#;
-    let config: Config = toml::from_str(toml_str).expect("parses");
-    assert_eq!(model_temperature(&config), Some(-0.5));
-    let err = config.validate().expect_err("temperature -0.5 should fail");
+    let err = toml::from_str::<Config>(toml_str)
+        .expect_err("temperature -0.5 must fail configuration admission");
     assert!(
         err.to_string().contains("temperature"),
         "expected temperature validation error, got: {err}"
