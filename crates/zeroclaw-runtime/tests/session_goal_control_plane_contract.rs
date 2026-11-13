@@ -64,7 +64,7 @@ fn session_goal_task(task_id: &str, session_id: &str) -> TaskRecord {
         originator_chain: Vec::new(),
         delivered: false,
         idem_key: None,
-        principal_id: Some("matrix:@operator:example.test".into()),
+        principal_id: Some("@operator:example.test".into()),
         session_id: Some(session_id.into()),
         execution_epoch: 0,
         started_at: "2026-08-30T00:00:00Z".into(),
@@ -1805,7 +1805,7 @@ async fn boot_recovery_fails_corrupt_session_goal_without_extension() {
                  id, kind, agent, status, owner_pid, owner_boot_id, principal_id,
                  session_id, execution_epoch, started_at
              ) VALUES ('corrupt-replace', 'goal', 'main', 'running', 999999, 'boot-old',
-                       'matrix:@operator:example.test', 'session-replace', 1, 'now')",
+                       '@operator:example.test', 'session-replace', 1, 'now')",
             [],
         )
         .expect("insert corrupt replacement fixture");

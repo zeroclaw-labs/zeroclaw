@@ -140,8 +140,13 @@ impl GoalSessionKey {
 /// hook-mutable generic channel field and `tui_id` is never durable identity.
 #[derive(Clone, PartialEq, Eq)]
 pub enum GoalIngressPrincipal {
-    Matrix { raw_mxid: String },
-    ZeroCode { tui_id: String },
+    /// The authenticated Matrix user ID, stored verbatim without a surface prefix.
+    Matrix {
+        raw_mxid: String,
+    },
+    ZeroCode {
+        tui_id: String,
+    },
 }
 
 impl fmt::Debug for GoalIngressPrincipal {
