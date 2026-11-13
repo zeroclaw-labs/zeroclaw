@@ -552,16 +552,6 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
         } => {
             require_configured_agent(config, &agent_alias)?;
             let delivery_requested = delivery.any_set();
-            if expression.is_none()
-                && tz.is_none()
-                && command.is_none()
-                && name.is_none()
-                && allowed_tools.is_empty()
-                && uses_memory.is_none()
-                && !delivery_requested
-            {
-                bail!("{}", get_required_cli_string("cli-cron-update-no-field"));
-            }
 
             let existing = if expression.is_some()
                 || tz.is_some()
@@ -633,10 +623,23 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                 ..CronJobPatch::default()
             };
 
-            let job = update_shell_job_with_approval(config, &agent_alias, &id, patch, false)?;
+            // `--agent` is the operator's reassignment: it becomes the job's
+            // owner. Naming the current owner leaves ownership untouched, so
+            // same-owner edits of declarative jobs still work.
+            let job = update_shell_job_with_approval_reassigning(
+                config,
+                &agent_alias,
+                &id,
+                patch,
+                false,
+            )?;
             println!(
                 "{}",
                 get_required_cli_string_with_args("cli-cron-updated", &[("id", &job.id)])
+            );
+            println!(
+                "{}",
+                get_required_cli_string_with_args("cli-cron-agent", &[("v", &job.agent_alias)])
             );
             println!(
                 "{}",
@@ -721,6 +724,103 @@ mod tests {
             },
         );
         config
+    }
+
+    fn add_second_agent(config: &mut Config, alias: &str) {
+        config.agents.insert(
+            alias.to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: "openrouter.test-agent".into(),
+                risk_profile: "test-agent".into(),
+                runtime_profile: "test-agent".into(),
+                ..Default::default()
+            },
+        );
+    }
+
+    fn cli_update(id: &str, agent: &str, name: Option<&str>) -> crate::CronCommands {
+        crate::CronCommands::Update {
+            id: id.to_string(),
+            agent_alias: agent.to_string(),
+            expression: None,
+            tz: None,
+            command: None,
+            name: name.map(str::to_string),
+            allowed_tools: vec![],
+            uses_memory: None,
+            delivery: crate::CronDeliveryArgs::default(),
+        }
+    }
+
+    /// Seed a declarative shell job owned by `test-agent` through the real
+    /// config sync path.
+    fn seed_declarative_job(config: &mut Config, id: &str) {
+        config
+            .agents
+            .get_mut("test-agent")
+            .unwrap()
+            .cron_jobs
+            .push(id.to_string());
+        let decls = std::collections::HashMap::from([(
+            id.to_string(),
+            zeroclaw_config::schema::CronJobDecl {
+                name: Some("decl".into()),
+                job_type: "shell".into(),
+                schedule: zeroclaw_config::schema::CronScheduleDecl::Cron {
+                    expr: "0 2 * * *".into(),
+                    tz: None,
+                },
+                command: Some("echo backup".into()),
+                ..Default::default()
+            },
+        )]);
+        sync_declarative_jobs(config, &decls).unwrap();
+        assert_eq!(get_job(config, id).unwrap().source, "declarative");
+    }
+
+    #[test]
+    fn cli_update_agent_reassigns_imperative_job() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        add_second_agent(&mut config, "secretary");
+        let job = add_job(&config, "test-agent", "*/5 * * * *", "echo ok").unwrap();
+
+        handle_command(cli_update(&job.id, "secretary", None), &config).unwrap();
+        assert_eq!(get_job(&config, &job.id).unwrap().agent_alias, "secretary");
+    }
+
+    #[test]
+    fn cli_update_same_owner_edits_declarative_job() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        seed_declarative_job(&mut config, "nightly-backup");
+
+        handle_command(
+            cli_update("nightly-backup", "test-agent", Some("renamed")),
+            &config,
+        )
+        .unwrap();
+        let stored = get_job(&config, "nightly-backup").unwrap();
+        assert_eq!(stored.agent_alias, "test-agent");
+        assert_eq!(stored.name.as_deref(), Some("renamed"));
+    }
+
+    #[test]
+    fn cli_update_rejects_declarative_owner_transfer() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        seed_declarative_job(&mut config, "nightly-backup");
+        add_second_agent(&mut config, "secretary");
+
+        let err = handle_command(
+            cli_update("nightly-backup", "secretary", Some("renamed")),
+            &config,
+        )
+        .expect_err("declarative owner is config-owned");
+        assert!(err.to_string().contains("cron_jobs"), "{err}");
+        let stored = get_job(&config, "nightly-backup").unwrap();
+        assert_eq!(stored.agent_alias, "test-agent");
+        assert_eq!(stored.name.as_deref(), Some("decl"));
     }
 
     #[test]

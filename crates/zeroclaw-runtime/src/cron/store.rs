@@ -790,6 +790,36 @@ pub(crate) fn update_job_authorized<G>(
     patch: CronJobPatch,
     authorize: impl FnOnce(&CronJob) -> Result<G>,
 ) -> Result<CronJob> {
+    update_job_authorized_with_owner(config, job_id, owner, patch, None, authorize)
+}
+
+/// Operator-only: apply `patch` and make `new_owner` the job's owning agent.
+///
+/// Ownership is deliberately not a `CronJobPatch` field: that struct is
+/// deserialized straight from model-supplied `cron_update` arguments, and an
+/// agent must not be able to move its job into another agent's execution
+/// context. Only operator entry points (the CLI) reach this function.
+///
+/// Requesting the job's current owner is a no-op for ownership, so same-owner
+/// edits of declarative jobs keep working; an actual transfer of a
+/// declarative job is rejected because `[agents.<alias>].cron_jobs` owns it.
+pub fn update_job_reassigning_owner(
+    config: &Config,
+    job_id: &str,
+    patch: CronJobPatch,
+    new_owner: &str,
+) -> Result<CronJob> {
+    update_job_authorized_with_owner(config, job_id, None, patch, Some(new_owner), |_| Ok(()))
+}
+
+fn update_job_authorized_with_owner<G>(
+    config: &Config,
+    job_id: &str,
+    owner: Option<&str>,
+    patch: CronJobPatch,
+    new_owner: Option<&str>,
+    authorize: impl FnOnce(&CronJob) -> Result<G>,
+) -> Result<CronJob> {
     // Start from the raw DB row, not the config-resolved `get_job()` view:
     // for a declarative job, `shell_output_format` isn't DB-owned, so an
     // unrelated patch (e.g. toggling `enabled`) must not re-persist the
@@ -888,6 +918,36 @@ pub(crate) fn update_job_authorized<G>(
             job.shell_output_format = shell_output_format;
         }
 
+        // Only an explicit, different owner is written. The read above and the
+        // UPDATE below share one IMMEDIATE transaction, and an unrelated patch
+        // binds NULL here so `COALESCE` keeps whatever owner the row has.
+        let mut reassigned_owner: Option<String> = None;
+        if let Some(requested) = new_owner {
+            let requested = requested.trim();
+            if requested.is_empty() {
+                anyhow::bail!(
+                    "{}",
+                    crate::i18n::get_required_cli_string_with_args(
+                        "cli-cron-owner-empty",
+                        &[("id", job_id)]
+                    )
+                );
+            }
+            if requested != job.agent_alias {
+                if job.source == "declarative" {
+                    anyhow::bail!(
+                        "{}",
+                        crate::i18n::get_required_cli_string_with_args(
+                            "cli-cron-owner-declarative",
+                            &[("id", job_id)]
+                        )
+                    );
+                }
+                job.agent_alias = requested.to_string();
+                reassigned_owner = Some(job.agent_alias.clone());
+            }
+        }
+
         if schedule_changed {
             job.next_run = next_run_for_schedule(&job.schedule, Utc::now())?;
         }
@@ -904,8 +964,9 @@ pub(crate) fn update_job_authorized<G>(
                 "UPDATE cron_jobs
                  SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
                      session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
-                     allowed_tools = ?12, next_run = ?13, uses_memory = ?14
-                 WHERE id = ?15 AND (?16 IS NULL OR agent_alias = ?16)",
+                     allowed_tools = ?12, next_run = ?13, uses_memory = ?14,
+                     agent_alias = COALESCE(?15, agent_alias)
+                 WHERE id = ?16 AND (?17 IS NULL OR agent_alias = ?17)",
                 params![
                     job.expression,
                     job.command,
@@ -921,6 +982,7 @@ pub(crate) fn update_job_authorized<G>(
                     encode_allowed_tools(job.allowed_tools.as_ref())?,
                     job.next_run.to_rfc3339(),
                     if job.uses_memory { 1 } else { 0 },
+                    reassigned_owner,
                     job.id,
                     owner,
                 ],
@@ -930,8 +992,9 @@ pub(crate) fn update_job_authorized<G>(
                 "UPDATE cron_jobs
                  SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
                      session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
-                     allowed_tools = ?12, next_run = ?13, uses_memory = ?14, shell_output_format = ?15
-                 WHERE id = ?16 AND (?17 IS NULL OR agent_alias = ?17)",
+                     allowed_tools = ?12, next_run = ?13, uses_memory = ?14, shell_output_format = ?15,
+                     agent_alias = COALESCE(?16, agent_alias)
+                 WHERE id = ?17 AND (?18 IS NULL OR agent_alias = ?18)",
                 params![
                     job.expression,
                     job.command,
@@ -951,6 +1014,7 @@ pub(crate) fn update_job_authorized<G>(
                         CronShellOutputFormat::Wrapped => "wrapped",
                         CronShellOutputFormat::Raw => "raw",
                     },
+                    reassigned_owner,
                     job.id,
                     owner,
                 ],
@@ -5784,6 +5848,170 @@ mod tests {
         assert_eq!(
             get_job(&config, &job.id).unwrap().allowed_tools,
             Some(vec!["shell".into()])
+        );
+    }
+
+    #[test]
+    fn update_job_reassigning_owner_persists_new_owner() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let job = add_agent_job(
+            &config,
+            "test-agent",
+            Some("weekly".into()),
+            Schedule::Every { every_ms: 60_000 },
+            "do the weekly thing",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(job.agent_alias, "test-agent");
+
+        let updated = update_job_reassigning_owner(
+            &config,
+            &job.id,
+            CronJobPatch {
+                name: Some("weekly-moved".into()),
+                ..CronJobPatch::default()
+            },
+            "secretary",
+        )
+        .unwrap();
+
+        assert_eq!(updated.agent_alias, "secretary");
+        let stored = get_job(&config, &job.id).unwrap();
+        assert_eq!(stored.agent_alias, "secretary");
+        assert_eq!(stored.name.as_deref(), Some("weekly-moved"));
+    }
+
+    #[test]
+    fn update_job_reassigning_owner_rejects_empty_alias() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "test-agent", "*/15 * * * *", "echo run").unwrap();
+
+        let err = update_job_reassigning_owner(&config, &job.id, CronJobPatch::default(), "  ")
+            .expect_err("empty owner must be rejected");
+        assert!(err.to_string().contains(&job.id), "{err}");
+        assert_eq!(get_job(&config, &job.id).unwrap().agent_alias, "test-agent");
+    }
+
+    /// An unrelated patch must never write an owner. It binds NULL for the
+    /// owner column, so a row whose owner changed after the caller loaded
+    /// its own copy keeps the newer owner. Driven deterministically by
+    /// renaming the owner directly in the database between the caller's
+    /// read (`get_job`) and its patch.
+    #[test]
+    fn unrelated_patch_keeps_current_owner() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "test-agent", "*/15 * * * *", "echo run").unwrap();
+        let stale = get_job(&config, &job.id).unwrap();
+        assert_eq!(stale.agent_alias, "test-agent");
+
+        with_initialized_connection(&config, |conn| {
+            conn.execute(
+                "UPDATE cron_jobs SET agent_alias = 'renamed-agent' WHERE id = ?1",
+                params![job.id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let updated = update_job(
+            &config,
+            &stale.id,
+            CronJobPatch {
+                enabled: Some(false),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.agent_alias, "renamed-agent");
+        let stored = get_job(&config, &job.id).unwrap();
+        assert_eq!(stored.agent_alias, "renamed-agent");
+        assert!(!stored.enabled);
+    }
+
+    fn seed_declarative_agent_job(config: &Config, id: &str) {
+        let now = Utc::now();
+        with_initialized_connection(config, |conn| {
+            conn.execute(
+                "INSERT INTO cron_jobs (
+                    id, expression, command, schedule, job_type, prompt, name,
+                    session_target, model, enabled, delivery, delete_after_run,
+                    allowed_tools, source, uses_memory, agent_alias, created_at, next_run
+                 ) VALUES (?1, ?2, '', ?3, 'agent', 'prompt', 'decl', 'isolated', NULL, 1, ?4, 0, NULL,
+                           'declarative', 1, 'test-agent', ?5, ?6)",
+                params![
+                    id,
+                    "0 6 * * 1",
+                    serde_json::to_string(&Schedule::Cron {
+                        expr: "0 6 * * 1".into(),
+                        tz: None,
+                    })?,
+                    serde_json::to_string(&DeliveryConfig::default())?,
+                    now.to_rfc3339(),
+                    (now + ChronoDuration::days(1)).to_rfc3339(),
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn update_job_reassigning_owner_rejects_declarative_transfer() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        seed_declarative_agent_job(&config, "decl-job");
+
+        let err = update_job_reassigning_owner(
+            &config,
+            "decl-job",
+            CronJobPatch {
+                name: Some("renamed".into()),
+                ..CronJobPatch::default()
+            },
+            "secretary",
+        )
+        .expect_err("declarative owner must stay config-owned");
+        // Config keys and the id are untranslated in every locale.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("decl-job") && msg.contains("cron_jobs"),
+            "unexpected error: {msg}"
+        );
+        let stored = get_job(&config, "decl-job").unwrap();
+        assert_eq!(stored.agent_alias, "test-agent");
+        assert_eq!(stored.name.as_deref(), Some("decl"));
+    }
+
+    #[test]
+    fn update_job_reassigning_owner_allows_same_owner_declarative_edit() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        seed_declarative_agent_job(&config, "decl-job");
+
+        let updated = update_job_reassigning_owner(
+            &config,
+            "decl-job",
+            CronJobPatch {
+                name: Some("renamed".into()),
+                ..CronJobPatch::default()
+            },
+            "test-agent",
+        )
+        .unwrap();
+        assert_eq!(updated.agent_alias, "test-agent");
+        assert_eq!(
+            get_job(&config, "decl-job").unwrap().name.as_deref(),
+            Some("renamed")
         );
     }
 
