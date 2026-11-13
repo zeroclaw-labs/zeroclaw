@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 /// match ACP (`in_progress`).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub enum PlanStatus {
     #[default]
     Pending,
@@ -18,6 +19,7 @@ pub enum PlanStatus {
 /// so normalization to a concrete value happens at parse time here.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub enum PlanPriority {
     High,
     #[default]
@@ -28,6 +30,7 @@ pub enum PlanPriority {
 /// A single plan entry. ACP-shaped (`content`/`priority`/`status`) plus
 /// the optional ZeroClaw `active_form` extension.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct PlanEntry {
     pub content: String,
     #[serde(default)]
