@@ -18319,6 +18319,15 @@ pub struct MatrixConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub interrupt_on_new_message: bool,
+    /// Whether edited messages (Matrix `m.replace` replacement events) are
+    /// processed as inbound messages. When `false` (default), replacement
+    /// events are dropped, so editing a message does not start a second
+    /// agent turn carrying the pre-edit fallback body. When `true`, the
+    /// corrected body from `m.new_content` flows through the ordinary
+    /// inbound pipeline and the delivered message is marked `edited`.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub edited_messages: bool,
     /// Streaming mode for progressive response delivery.
     /// `"off"` (default): single final message. `"partial"`: edit-in-place draft.
     /// `"single_message"`: progress draft plus separate final message.
@@ -37422,6 +37431,7 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
         let mc = MatrixConfig {
             enabled: true,
             homeserver: "https://matrix.org".into(),
+            edited_messages: false,
             access_token: Some("syt_token_abc".into()),
             user_id: Some("@bot:matrix.org".into()),
             device_id: Some("DEVICE123".into()),
@@ -37462,6 +37472,7 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
         let mc = MatrixConfig {
             enabled: true,
             homeserver: "https://synapse.local:8448".into(),
+            edited_messages: false,
             access_token: Some("tok".into()),
             user_id: None,
             device_id: None,
@@ -37648,6 +37659,7 @@ allowed_users = ["@u:matrix.org"]
                 MatrixConfig {
                     enabled: true,
                     homeserver: "https://m.org".into(),
+                    edited_messages: false,
                     access_token: Some("tok".into()),
                     user_id: None,
                     device_id: None,
@@ -48098,6 +48110,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let mx = MatrixConfig {
             enabled: true,
             homeserver: "https://m.org".into(),
+            edited_messages: false,
             access_token: Some("tok".into()),
             user_id: None,
             device_id: None,
@@ -48137,6 +48150,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let mx = MatrixConfig {
             enabled: true,
             homeserver: "https://m.org".into(),
+            edited_messages: false,
             access_token: None,
             user_id: None,
             device_id: None,
@@ -48181,6 +48195,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let mut mx = MatrixConfig {
             enabled: true,
             homeserver: "https://m.org".into(),
+            edited_messages: false,
             access_token: Some("old".into()),
             user_id: None,
             device_id: None,
@@ -48214,6 +48229,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let mut mx = MatrixConfig {
             enabled: true,
             homeserver: "https://m.org".into(),
+            edited_messages: false,
             access_token: Some("tok".into()),
             user_id: None,
             device_id: None,
@@ -48258,6 +48274,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             MatrixConfig {
                 enabled: true,
                 homeserver: "https://m.org".into(),
+                edited_messages: false,
                 access_token: Some("mx-tok".into()),
                 user_id: None,
                 device_id: None,
@@ -48301,6 +48318,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             MatrixConfig {
                 enabled: true,
                 homeserver: "https://m.org".into(),
+                edited_messages: false,
                 access_token: Some("old".into()),
                 user_id: None,
                 device_id: None,
@@ -48349,6 +48367,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             MatrixConfig {
                 enabled: true,
                 homeserver: "https://m.org".into(),
+                edited_messages: false,
                 access_token: Some("old".into()),
                 user_id: None,
                 device_id: None,
@@ -48465,6 +48484,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let mut mx = MatrixConfig {
             enabled: true,
             homeserver: "https://m.org".into(),
+            edited_messages: false,
             access_token: Some("plaintext-token".into()),
             user_id: None,
             device_id: None,
@@ -48509,6 +48529,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let mut mx = MatrixConfig {
             enabled: true,
             homeserver: "https://m.org".into(),
+            edited_messages: false,
             access_token: Some("plaintext-token".into()),
             user_id: None,
             device_id: None,
@@ -48549,6 +48570,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let mut mx = MatrixConfig {
             enabled: true,
             homeserver: "https://m.org".into(),
+            edited_messages: false,
             access_token: Some("plaintext-token".into()),
             user_id: None,
             device_id: None,
@@ -48584,6 +48606,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         MatrixConfig {
             enabled: true,
             homeserver: "https://m.org".into(),
+            edited_messages: false,
             access_token: Some("tok".into()),
             user_id: Some("@bot:m.org".into()),
             device_id: None,
