@@ -9056,6 +9056,8 @@ pub struct HttpRequestConfig {
 #[serde(deny_unknown_fields)]
 pub struct ScopedHttpCredential {
     pub origin: String,
+    #[serde(default)]
+    pub source: ScopedCredentialSource,
     pub auth: ScopedHttpAuth,
 }
 
@@ -9079,6 +9081,133 @@ pub enum ScopedApiKeyHeader {
     #[default]
     Bearer,
     XApiKey,
+}
+
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopedCredentialSource {
+    #[default]
+    Local,
+    OpenBao,
+    OnePassword,
+    Azure,
+    Aws,
+    Google,
+}
+
+impl ScopedCredentialSource {
+    /// Fixed read-only commands. All resource identifiers are passed as
+    /// arguments, and CLI authentication belongs to the host operator.
+    pub fn command(self, reference: &str) -> Option<(&'static str, Vec<String>)> {
+        let valid = |s: &str| {
+            !s.is_empty()
+                && !s.starts_with('-')
+                && s.len() <= 512
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_-/.:+=@".contains(&b))
+        };
+        if !valid(reference) {
+            return None;
+        }
+        let parts = reference.split('/').collect::<Vec<_>>();
+        let (program, args) = match (self, parts.as_slice()) {
+            (Self::OnePassword, _) => {
+                let fields = reference
+                    .strip_prefix("op://")?
+                    .split('/')
+                    .collect::<Vec<_>>();
+                if fields.len() != 3 || !fields.iter().all(|field| valid(field)) {
+                    return None;
+                }
+                ("op", vec!["read".into(), reference.into()])
+            }
+            (Self::OpenBao, [mount, path @ .., field])
+                if !path.is_empty()
+                    && parts.iter().all(|p| valid(p) && !matches!(*p, "." | "..")) =>
+            {
+                (
+                    "bao",
+                    vec![
+                        "kv".into(),
+                        "get".into(),
+                        format!("-mount={mount}"),
+                        format!("-field={field}"),
+                        path.join("/"),
+                    ],
+                )
+            }
+            (Self::Azure, [vault, name]) if parts.iter().all(|p| valid(p)) => (
+                "az",
+                vec![
+                    "keyvault".into(),
+                    "secret".into(),
+                    "show".into(),
+                    format!("--vault-name={vault}"),
+                    format!("--name={name}"),
+                    "--query=value".into(),
+                    "--output=tsv".into(),
+                    "--only-show-errors".into(),
+                ],
+            ),
+            (Self::Aws, [region, id @ ..]) if !id.is_empty() && parts.iter().all(|p| valid(p)) => (
+                "aws",
+                vec![
+                    "secretsmanager".into(),
+                    "get-secret-value".into(),
+                    format!("--region={region}"),
+                    format!("--secret-id={}", id.join("/")),
+                    "--query=SecretString".into(),
+                    "--output=json".into(),
+                    "--no-cli-pager".into(),
+                    "--no-cli-auto-prompt".into(),
+                ],
+            ),
+            (Self::Google, [project, secret, version]) if parts.iter().all(|p| valid(p)) => (
+                "gcloud",
+                vec![
+                    "secrets".into(),
+                    "versions".into(),
+                    "access".into(),
+                    (*version).into(),
+                    format!("--project={project}"),
+                    format!("--secret={secret}"),
+                    "--out-file=-".into(),
+                    "--quiet".into(),
+                ],
+            ),
+            _ => return None,
+        };
+        Some((program, args))
+    }
+}
+
+#[cfg(test)]
+mod scoped_credential_source_tests {
+    use super::ScopedCredentialSource as Source;
+
+    #[test]
+    fn external_reference_formats_use_fixed_read_commands() {
+        for (source, reference, program) in [
+            (Source::OnePassword, "op://vault/item/field", "op"),
+            (Source::OpenBao, "secret/team/service/password", "bao"),
+            (Source::Azure, "vault/secret", "az"),
+            (Source::Aws, "us-east-1/team/service", "aws"),
+            (Source::Google, "project/secret/latest", "gcloud"),
+        ] {
+            let (actual, args) = source.command(reference).unwrap();
+            assert_eq!(actual, program);
+            assert!(!args.is_empty());
+            assert!(source.command("--help").is_none());
+            assert!(source.command("invalid reference").is_none());
+        }
+        assert!(Source::OpenBao.command("secret/../password").is_none());
+        assert!(
+            Source::OnePassword
+                .command("op://vault//password")
+                .is_none()
+        );
+        assert!(Source::Local.command("value").is_none());
+    }
 }
 
 impl ScopedHttpCredential {

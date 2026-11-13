@@ -1383,7 +1383,7 @@ pub async fn list_http_credentials(
                 rows.push((
                     name,
                     serde_json::json!({
-                        "name": name, "origin": record.origin, "kind": kind
+                        "name": name, "origin": record.origin, "kind": kind, "source": record.source
                     }),
                 ));
             }
@@ -1406,7 +1406,7 @@ pub async fn mutate_http_credential(
     credential_no_store(
         async {
             use zeroclaw_config::{
-                schema::{ScopedHttpAuth, ScopedHttpCredential},
+                schema::{ScopedCredentialSource, ScopedHttpAuth, ScopedHttpCredential},
                 secrets::SecretStore,
             };
             let Ok(guard) = state.begin_config_commit().await else {
@@ -1453,10 +1453,14 @@ pub async fn mutate_http_credential(
                         && !value.chars().any(char::is_control)
                         && reject_masked_secret_value("", true, value).is_ok()
                 };
+                let valid_secret = |value: &str| match credential.source {
+                    ScopedCredentialSource::Local => valid(value),
+                    source => source.command(value).is_some(),
+                };
                 let valid_auth = match &credential.auth {
-                    ScopedHttpAuth::ApiKey { value, .. } => valid(value) && value.is_ascii(),
+                    ScopedHttpAuth::ApiKey { value, .. } => valid_secret(value) && value.is_ascii(),
                     ScopedHttpAuth::UserPassword { username, password } => {
-                        valid(username) && !username.contains(':') && valid(password)
+                        valid(username) && !username.contains(':') && valid_secret(password)
                     }
                 };
                 if !valid_auth {

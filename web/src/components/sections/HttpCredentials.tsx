@@ -1,14 +1,24 @@
 import { type FormEvent, useEffect, useState } from "react";
 import { Button } from "@/components/ui";
-import { changeHttpCredential, listHttpCredentials, type HttpCredentialKind, type HttpCredentialRow } from "@/lib/api";
+import { changeHttpCredential, listHttpCredentials, type HttpCredentialKind, type HttpCredentialRow, type HttpCredentialSource } from "@/lib/api";
 import { t } from "@/lib/i18n";
 
 type Catalog = Awaited<ReturnType<typeof listHttpCredentials>>;
+
+const sources = {
+  local: "",
+  open_bao: "secret/team/service/password",
+  one_password: "op://Vault/Item/password",
+  azure: "vault-name/secret-name",
+  aws: "us-east-1/team/service-token",
+  google: "project-id/secret-name/latest",
+} satisfies Record<HttpCredentialSource, string>;
 
 export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) {
   const [catalog, setCatalog] = useState<Catalog>();
   const [editing, setEditing] = useState<HttpCredentialRow | "new" | null>(null);
   const [removing, setRemoving] = useState<HttpCredentialRow | null>(null);
+  const [source, setSource] = useState<HttpCredentialSource>("local");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
 
@@ -49,7 +59,7 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
       : { kind, username: String(data.get("username")), password: secret } as const;
     form.reset();
     setEditing(null);
-    void update({ name, operation: editing === "new" ? "create" : "replace", credential: { origin, auth } });
+    void update({ name, operation: editing === "new" ? "create" : "replace", credential: { origin, source, auth } });
   }
 
   const rows = catalog?.credentials.filter((row) => row.kind === kind) ?? [];
@@ -65,9 +75,9 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
       {rows.map((row) => (
         <div key={row.name} className="space-y-2 rounded-md border p-3">
           <p className="break-all font-medium">{row.name}</p>
-          <p className="break-all text-sm">{row.origin} · {t("plugin_tls.configured")}</p>
+          <p className="break-all text-sm">{row.origin} · {t(`http_credentials.source_${row.source}`)}</p>
           <div className="flex flex-wrap gap-2">
-            <Button size="sm" disabled={disabled} onClick={() => { setRemoving(null); setEditing(row); }}>
+            <Button size="sm" disabled={disabled} onClick={() => { setRemoving(null); setSource(row.source); setEditing(row); }}>
               {t("plugin_tls.replace")}
             </Button>
             <Button size="sm" variant="ghost" disabled={disabled} onClick={() => { setEditing(null); setRemoving(row); }}>
@@ -76,7 +86,7 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
           </div>
         </div>
       ))}
-      <Button disabled={disabled} onClick={() => { setRemoving(null); setEditing("new"); }}>
+      <Button disabled={disabled} onClick={() => { setRemoving(null); setSource("local"); setEditing("new"); }}>
         {t("http_credentials.add")}
       </Button>
       {editing && (
@@ -88,6 +98,18 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
           <label className="block space-y-1">
             <span>{t("http_credentials.origin")}</span>
             <input className={inputClass} name="origin" type="url" required placeholder="https://api.example.com" defaultValue={editing === "new" ? "" : editing.origin} />
+          </label>
+          <label className="block space-y-1">
+            <span>{t("http_credentials.source")}</span>
+            <select className={inputClass} value={source} onChange={(event) => {
+              if (event.currentTarget.value in sources) {
+                setSource(event.currentTarget.value as HttpCredentialSource);
+              }
+            }}>
+              {(Object.keys(sources) as HttpCredentialSource[]).map((key) => (
+                <option key={key} value={key}>{t(`http_credentials.source_${key}`)}</option>
+              ))}
+            </select>
           </label>
           {kind === "api_key" && (
             <label className="block space-y-1">
@@ -105,8 +127,8 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
             </label>
           )}
           <label className="block space-y-1">
-            <span>{t(kind === "api_key" ? "http_credentials.token" : "http_credentials.password")}</span>
-            <input className={inputClass} name="secret" type="password" autoComplete="new-password" required />
+            <span>{t(source === "local" ? (kind === "api_key" ? "http_credentials.token" : "http_credentials.password") : "http_credentials.reference")}</span>
+            <input key={source} className={inputClass} name="secret" type={source === "local" ? "password" : "text"} placeholder={sources[source] || undefined} autoComplete="new-password" required />
           </label>
           <div className="flex flex-wrap gap-2">
             <Button type="submit" disabled={disabled}>{t(editing === "new" ? "http_credentials.add" : "plugin_tls.replace")}</Button>

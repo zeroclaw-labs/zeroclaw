@@ -163,6 +163,24 @@ operator enters the token in the editor, and the tool adds it to the request.
 A username and password credential uses the same reference flow for a
 service that accepts HTTP Basic. Browser form logins are outside this flow.
 
+The credential editor offers local encryption and the following external reference
+formats. They apply to the API token or Basic password. The Basic username is
+entered in the editor.
+
+| Source | Reference | Service prerequisite |
+| --- | --- | --- |
+| OpenBao | `mount/path/field` | Authenticated `bao` CLI and configured server |
+| 1Password | `op://vault/item/field` | Authenticated `op` CLI |
+| Azure Key Vault | `vault/secret` | Authenticated `az` CLI |
+| AWS Secrets Manager | `region/secret-id` | Authenticated AWS CLI v2 and a string secret |
+| Google Cloud Secret Manager | `project/secret/version` | Authenticated `gcloud` CLI |
+
+Install the required CLI in the service environment and grant its service identity
+read access to the specific secret. The external value is fetched per authorized
+HTTP call and is never saved to the ZeroClaw configuration. The alias and reference
+are stored in the encrypted local record. Rotate external values at their source.
+Deleting an alias removes the ZeroClaw binding.
+
 ### AnySearch provider
 
 AnySearch is an explicit, opt-in backend for `web_search_tool`:

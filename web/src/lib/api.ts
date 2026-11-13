@@ -1383,7 +1383,8 @@ export interface MapKeyResponse {
 }
 
 export type HttpCredentialKind = "user_password" | "api_key";
-export type HttpCredentialRow = { name: string; origin: string; kind: HttpCredentialKind };
+export type HttpCredentialSource = "local" | "open_bao" | "one_password" | "azure" | "aws" | "google";
+export type HttpCredentialRow = { name: string; origin: string; kind: HttpCredentialKind; source: HttpCredentialSource };
 type HttpCredentialAuth =
   | { kind: "user_password"; username: string; password: string }
   | { kind: "api_key"; value: string; header: "bearer" | "x_api_key" };
@@ -1397,7 +1398,7 @@ export function listHttpCredentials() {
 }
 
 export function changeHttpCredential(mutation:
-  | { name: string; operation: "create" | "replace"; credential: { origin: string; auth: HttpCredentialAuth } }
+  | { name: string; operation: "create" | "replace"; credential: { origin: string; source: HttpCredentialSource; auth: HttpCredentialAuth } }
   | { name: string; operation: "delete" }
 ) {
   return apiFetch<void>(httpCredentialsPath, { method: "POST", body: JSON.stringify(mutation) });

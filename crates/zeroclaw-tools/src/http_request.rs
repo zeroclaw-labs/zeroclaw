@@ -350,7 +350,75 @@ impl HttpRequestTool {
         }
     }
 
-    fn apply_scoped_credential(
+    async fn resolve_scoped_value(
+        source: zeroclaw_config::schema::ScopedCredentialSource,
+        value: String,
+    ) -> anyhow::Result<String> {
+        use std::process::Stdio;
+        use tokio::io::AsyncReadExt;
+        use zeroclaw_config::schema::ScopedCredentialSource;
+
+        if matches!(source, ScopedCredentialSource::Local) {
+            return Ok(value);
+        }
+        let (program, args) = source
+            .command(&value)
+            .ok_or_else(|| anyhow::Error::msg("Invalid external credential reference"))?;
+        let failed = |_| anyhow::Error::msg("External credential lookup failed");
+        let mut child = tokio::process::Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(failed)?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::Error::msg("External credential lookup failed"))?;
+        let mut output = Vec::new();
+        let status = tokio::time::timeout(Duration::from_secs(15), async {
+            stdout.take(65_537).read_to_end(&mut output).await?;
+            if output.len() > 65_536 {
+                return Err(std::io::Error::other(
+                    "External credential output exceeds limit",
+                ));
+            }
+            child.wait().await
+        })
+        .await
+        .map_err(|_| anyhow::Error::msg("External credential lookup timed out"))?
+        .map_err(failed)?;
+        anyhow::ensure!(status.success(), "External credential lookup failed");
+        let value = if matches!(source, ScopedCredentialSource::Aws) {
+            serde_json::from_slice::<String>(&output).ok()
+        } else {
+            String::from_utf8(output).ok().map(|value| {
+                if matches!(
+                    source,
+                    ScopedCredentialSource::Google | ScopedCredentialSource::OpenBao
+                ) {
+                    value
+                } else {
+                    value
+                        .strip_suffix("\r\n")
+                        .or_else(|| value.strip_suffix('\n'))
+                        .unwrap_or(&value)
+                        .to_owned()
+                }
+            })
+        };
+        value
+            .filter(|value| {
+                !value.trim().is_empty()
+                    && value.len() <= 4096
+                    && !value.chars().any(char::is_control)
+            })
+            .ok_or_else(|| anyhow::Error::msg("Invalid external credential value"))
+    }
+
+    async fn apply_scoped_credential(
         &self,
         headers: &mut HeaderMap,
         name: &str,
@@ -391,17 +459,21 @@ impl HttpRequestTool {
             anyhow::bail!("Scoped HTTP credential does not allow this HTTPS origin");
         }
         let (name, authorization, mut sensitive) = match credential.auth {
-            ScopedHttpAuth::ApiKey { value, header } => match header {
-                ScopedApiKeyHeader::Bearer => {
-                    (AUTHORIZATION, format!("Bearer {value}"), vec![value])
+            ScopedHttpAuth::ApiKey { value, header } => {
+                let value = Self::resolve_scoped_value(credential.source, value).await?;
+                match header {
+                    ScopedApiKeyHeader::Bearer => {
+                        (AUTHORIZATION, format!("Bearer {value}"), vec![value])
+                    }
+                    ScopedApiKeyHeader::XApiKey => (
+                        HeaderName::from_static("x-api-key"),
+                        value.clone(),
+                        vec![value],
+                    ),
                 }
-                ScopedApiKeyHeader::XApiKey => (
-                    HeaderName::from_static("x-api-key"),
-                    value.clone(),
-                    vec![value],
-                ),
-            },
+            }
             ScopedHttpAuth::UserPassword { username, password } => {
+                let password = Self::resolve_scoped_value(credential.source, password).await?;
                 let pair = format!("{username}:{password}");
                 let encoded = base64::engine::general_purpose::STANDARD.encode(&pair);
                 (
@@ -766,7 +838,10 @@ impl Tool for HttpRequestTool {
             (Some(_), Some(_)) => Err(anyhow::Error::msg(
                 "Choose credential or auth_secret, not both",
             )),
-            (Some(name), None) => self.apply_scoped_credential(&mut request_headers, name, &target),
+            (Some(name), None) => {
+                self.apply_scoped_credential(&mut request_headers, name, &target)
+                    .await
+            }
             (None, _) => self
                 .apply_auth_secret(&mut request_headers, auth_secret)
                 .map(|()| Vec::new()),
@@ -1204,8 +1279,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn scoped_credential_cannot_cross_https_origins() {
+    #[tokio::test]
+    async fn scoped_credential_cannot_cross_https_origins() {
         use zeroclaw_config::schema::{ScopedApiKeyHeader, ScopedHttpAuth, ScopedHttpCredential};
 
         let dir = tempfile::tempdir().unwrap();
@@ -1223,6 +1298,7 @@ mod tests {
             dir.path(),
             ScopedHttpCredential {
                 origin: "https://example.com".into(),
+                source: Default::default(),
                 auth: ScopedHttpAuth::ApiKey {
                     value: "fixture-key".into(),
                     header: ScopedApiKeyHeader::XApiKey,
@@ -1242,6 +1318,7 @@ mod tests {
             };
             assert!(
                 tool.apply_scoped_credential(&mut headers, "TEST", &target)
+                    .await
                     .is_err()
             );
             assert!(headers.is_empty());
@@ -1253,6 +1330,7 @@ mod tests {
         };
         assert!(
             tool.apply_scoped_credential(&mut headers, "TEST", &target)
+                .await
                 .is_ok()
         );
         assert_eq!(headers["x-api-key"], "fixture-key");
