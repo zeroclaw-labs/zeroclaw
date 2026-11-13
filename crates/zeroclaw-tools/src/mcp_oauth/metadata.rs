@@ -15,8 +15,8 @@ use serde::Deserialize;
 use super::policy::{MAX_METADATA_BYTES, ensure_oauth_url, origin_key};
 use super::resource::CanonicalResource;
 
-/// RFC 9728 protected-resource metadata (subset ZeroClaw consumes; unknown
-/// members are ignored per the RFC).
+/// RFC 9728 protected-resource metadata: the subset ZeroClaw consumes;
+/// unknown members are ignored.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProtectedResourceMetadata {
     #[serde(default)]
@@ -50,6 +50,10 @@ pub struct AuthorizationServerMetadata {
     pub token_endpoint_auth_methods_supported: Option<Vec<String>>,
     #[serde(default)]
     pub scopes_supported: Option<Vec<String>>,
+    /// RFC 9207 §2.2: when true, the AS includes `iss` on the redirect back,
+    /// and the client MUST act on it.
+    #[serde(default)]
+    pub authorization_response_iss_parameter_supported: Option<bool>,
 }
 
 /// An authorization server whose metadata validated against the flow's
@@ -63,6 +67,10 @@ pub struct ValidatedAs {
     /// Present only when advertised; DCR is still optional per configuration.
     pub registration_endpoint: Option<Url>,
     pub scopes_supported: Option<Vec<String>>,
+    /// RFC 9207: the AS advertises `iss` on the authorization response, so
+    /// the callback flow MUST refuse a response that omits it (and bind the
+    /// value to this issuer).
+    pub require_iss: bool,
 }
 
 /// GET one JSON document: no redirects (client posture), success status,
@@ -298,6 +306,9 @@ pub fn validate_auth_server(document: serde_json::Value, issuer: &Url) -> Result
         token_endpoint,
         registration_endpoint,
         scopes_supported: metadata.scopes_supported,
+        require_iss: metadata
+            .authorization_response_iss_parameter_supported
+            .unwrap_or(false),
     })
 }
 

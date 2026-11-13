@@ -34,6 +34,9 @@ nanohtml2text = "0.2"
 parking_lot = "0.12"
 probe-rs = { version = "0.32", optional = true }
 regex = "1.10"
+# `mcp_oauth/pkce.rs` flow secrets only (CSPRNG verifier/state); the crate's
+# other randomness consumers keep their existing sources.
+rand = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "__rustls-ring", "multipart", "stream"] }
 # Response-body decompression is done in `http_decode` for `web_fetch` and
 # `http_request` only — NOT via reqwest's gzip/brotli/deflate features, which

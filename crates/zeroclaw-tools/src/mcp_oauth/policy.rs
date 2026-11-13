@@ -6,7 +6,7 @@
 //! endpoints. Defaults are closed:
 //!
 //! - `https` everywhere; plain `http` only for the exact loopback hosts
-//!   (127.0.0.1, localhost, [::1]) so local mock servers and stdio-style dev
+//!   (127.0.0.1, localhost, `[::1]`) so local mock servers and stdio-style dev
 //!   setups still work without opening the internet to cleartext;
 //! - no userinfo, no fragment, host required;
 //! - DNS answers are validated and pinned before connect, so a first lookup
