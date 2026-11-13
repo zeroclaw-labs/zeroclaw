@@ -23268,18 +23268,24 @@ temperature = 0.3
 
     #[tokio::test]
     async fn resolve_classifier_route_returns_alias_temperature() {
-        // Build a config where `openai.my-classifier` has `temperature = 0.0`.
-        let mut cfg = zeroclaw_config::schema::Config::default();
-        cfg.providers.models.openai.insert(
-            "my-classifier".to_string(),
-            zeroclaw_config::schema::OpenAIModelProviderConfig {
-                base: zeroclaw_config::schema::ModelProviderConfig {
-                    model: Some("gpt-4o-mini".to_string()),
-                    temperature: Some(0.0),
-                    ..Default::default()
-                },
-            },
-        );
+        // Build a config where `chat.my-classifier` has `temperature = 0.0`.
+        let cfg = zeroclaw_config::schema::Config {
+            providers: toml::from_str(
+                r#"
+[connections."gateway.classifier"]
+kind = "custom"
+uri = "http://127.0.0.1:1/v1"
+
+[models."chat.my-classifier"]
+capability = "chat"
+provider = "gateway.classifier"
+model = "gpt-4o-mini"
+options = { temperature = 0.0 }
+"#,
+            )
+            .expect("canonical classifier fixture parses"),
+            ..Default::default()
+        };
 
         let base_ctx = (*router_test_ctx()).clone();
         let ctx = Arc::new(ChannelRuntimeContext {
@@ -23290,7 +23296,7 @@ temperature = 0.3
             ..base_ctx
         });
 
-        let alias_ref = zeroclaw_config::providers::ModelProviderRef::from("openai.my-classifier");
+        let alias_ref = zeroclaw_config::providers::ModelProviderRef::from("chat.my-classifier");
         let result = resolve_classifier_route(
             ctx.as_ref(),
             &alias_ref,
@@ -23309,7 +23315,6 @@ temperature = 0.3
     #[tokio::test]
     async fn classifier_without_temperature_does_not_inherit_main_agent_sampling() {
         use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
-        use zeroclaw_config::schema::ModelEntryConfig;
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -23318,23 +23323,26 @@ temperature = 0.3
             })))
             .mount(&server)
             .await;
-        let mut config = Config::default();
-        let profile = config
-            .providers
-            .models
-            .ensure("custom", "classifier")
-            .unwrap();
-        profile.uri = Some(server.uri());
-        profile.models.insert(
-            "chosen".into(),
-            ModelEntryConfig {
-                id: Some("classifier-id".into()),
-                ..Default::default()
-            },
-        );
+        let config = Config {
+            providers: toml::from_str(&format!(
+                r#"
+[connections."gateway.classifier"]
+kind = "custom"
+uri = "{}"
+
+[models."chat.classifier"]
+capability = "chat"
+provider = "gateway.classifier"
+model = "classifier-id"
+"#,
+                server.uri()
+            ))
+            .expect("canonical classifier fixture parses"),
+            ..Default::default()
+        };
         let channel = Arc::new(RecordingChannel::default());
         let agent = zeroclaw_config::schema::AliasedAgentConfig {
-            classifier_provider: "custom.classifier.chosen".into(),
+            classifier_provider: "chat.classifier".into(),
             precheck: zeroclaw_config::scattered_types::ChannelPrecheckConfig {
                 enabled: true,
                 ..Default::default()
@@ -33792,20 +33800,26 @@ options = {{ native_tools = true, temperature = 0.1 }}
         let main_provider: Arc<dyn ModelProvider> = main_provider_impl.clone();
         let classifier_provider_impl = Arc::new(PrecheckProbeModelProvider::default());
         let classifier_provider: Arc<dyn ModelProvider> = classifier_provider_impl.clone();
-        let mut prompt_config = zeroclaw_config::schema::Config::default();
-        prompt_config.providers.models.openai.insert(
-            "my-classifier".to_string(),
-            zeroclaw_config::schema::OpenAIModelProviderConfig {
-                base: zeroclaw_config::schema::ModelProviderConfig {
-                    model: Some("fast-intent".to_string()),
-                    temperature: Some(0.0),
-                    ..Default::default()
-                },
-            },
-        );
+        let prompt_config = zeroclaw_config::schema::Config {
+            providers: toml::from_str(
+                r#"
+[connections."gateway.classifier"]
+kind = "custom"
+uri = "http://127.0.0.1:1/v1"
+
+[models."chat.my-classifier"]
+capability = "chat"
+provider = "gateway.classifier"
+model = "fast-intent"
+options = { temperature = 0.0 }
+"#,
+            )
+            .expect("canonical classifier fixture parses"),
+            ..Default::default()
+        };
         let agent_cfg = zeroclaw_config::schema::AliasedAgentConfig {
             classifier_provider: zeroclaw_config::providers::ModelProviderRef::from(
-                "openai.my-classifier",
+                "chat.my-classifier",
             ),
             ..Default::default()
         };
@@ -33822,7 +33836,7 @@ options = {{ native_tools = true, temperature = 0.1 }}
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(
-                provider_cache_key("openai.my-classifier", "fast-intent", 0),
+                provider_cache_key("chat.my-classifier", "fast-intent", 0),
                 classifier_provider,
             );
 
@@ -42955,9 +42969,9 @@ options = {{ native_tools = true, temperature = 0.1 }}
     fn channel_route_switch_re_resolves_context_limits() {
         use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
 
-        let mut cfg = Config::default();
-        cfg.providers = toml::from_str(
-            r#"
+        let mut cfg = Config {
+            providers: toml::from_str(
+                r#"
 [connections."gateway.route"]
 kind = "custom"
 uri = "http://127.0.0.1:1/v1"
@@ -42974,8 +42988,10 @@ provider = "gateway.route"
 model = "small-model"
 metadata = { context_window = 8000 }
 "#,
-        )
-        .expect("canonical route context fixture parses");
+            )
+            .expect("canonical route context fixture parses"),
+            ..Default::default()
+        };
         cfg.runtime_profiles.insert(
             "ratio".to_string(),
             RuntimeProfileConfig {
