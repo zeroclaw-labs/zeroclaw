@@ -157,10 +157,11 @@ pub fn add_shell_job(
         command,
         delivery,
         CronShellOutputFormat::default(),
+        || Ok(()),
     )
 }
 
-pub fn add_shell_job_with_format(
+pub(super) fn add_shell_job_with_format<G>(
     config: &Config,
     agent_alias: &str,
     name: Option<String>,
@@ -168,10 +169,11 @@ pub fn add_shell_job_with_format(
     command: &str,
     delivery: Option<DeliveryConfig>,
     shell_output_format: CronShellOutputFormat,
+    authorize: impl FnOnce() -> Result<G>,
 ) -> Result<CronJob> {
     let now = Utc::now();
-    validate_schedule(&schedule, now)?;
     validate_delivery_config(delivery.as_ref())?;
+    validate_schedule(&schedule, now)?;
     let next_run = next_run_for_schedule(&schedule, now)?;
     let id = Uuid::new_v4().to_string();
     let expression = schedule_cron_expression(&schedule).unwrap_or_default();
@@ -190,7 +192,9 @@ pub fn add_shell_job_with_format(
     };
 
     with_initialized_connection(config, |conn| {
-        conn.execute(
+        let tx = begin_immediate(conn, "shell job insert")?;
+        let _authority = authorize()?;
+        tx.execute(
             "INSERT INTO cron_jobs (
                 id, expression, command, schedule, job_type, prompt, name, session_target, model,
                 enabled, delivery, delete_after_run, agent_alias, created_at, next_run, shell_output_format
@@ -210,7 +214,7 @@ pub fn add_shell_job_with_format(
             ],
         )
         .context("Failed to insert cron shell job")?;
-        Ok(())
+        tx.commit().context("Failed to commit cron shell job")
     })?;
 
     get_job(config, &id)

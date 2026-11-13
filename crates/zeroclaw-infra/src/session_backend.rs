@@ -108,6 +108,35 @@ pub trait SessionBackend: Send + Sync {
     /// Append a single message to a session.
     fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()>;
 
+    /// Append under the storage mutation boundary, resolving its current owner
+    /// there. Retain authorization through commit and the synchronous live-cache
+    /// effect. Unsupported stores fail closed; `committed` must not reenter storage.
+    fn append_authorized(
+        &self,
+        _session_key: &str,
+        _message: &ChatMessage,
+        _authorize: &SessionEffectAuthorization<'_>,
+        _committed: &mut dyn FnMut(),
+    ) -> std::io::Result<usize> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "guarded session append unsupported",
+        ))
+    }
+
+    /// Rename an existing row under its mutation lock and current owner lease.
+    fn set_session_name_authorized(
+        &self,
+        _session_key: &str,
+        _name: &str,
+        _authorize: &SessionEffectAuthorization<'_>,
+    ) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "guarded session rename unsupported",
+        ))
+    }
+
     /// Remove the last message from a session. Returns `true` if a message was removed.
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool>;
 
