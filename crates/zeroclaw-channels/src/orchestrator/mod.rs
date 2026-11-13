@@ -42953,27 +42953,29 @@ options = {{ native_tools = true, temperature = 0.1 }}
 
     #[test]
     fn channel_route_switch_re_resolves_context_limits() {
-        use zeroclaw_config::schema::{
-            AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig,
-            RuntimeProfileConfig,
-        };
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
 
         let mut cfg = Config::default();
-        for (alias, model, context_window) in [
-            ("large", "large-model", 200_000),
-            ("small", "small-model", 8_000),
-        ] {
-            cfg.providers.models.custom.insert(
-                alias.to_string(),
-                CustomModelProviderConfig {
-                    base: ModelProviderConfig {
-                        model: Some(model.to_string()),
-                        context_window: Some(context_window),
-                        ..ModelProviderConfig::default()
-                    },
-                },
-            );
-        }
+        cfg.providers = toml::from_str(
+            r#"
+[connections."gateway.route"]
+kind = "custom"
+uri = "http://127.0.0.1:1/v1"
+
+[models."chat.large"]
+capability = "chat"
+provider = "gateway.route"
+model = "large-model"
+metadata = { context_window = 200000 }
+
+[models."chat.small"]
+capability = "chat"
+provider = "gateway.route"
+model = "small-model"
+metadata = { context_window = 8000 }
+"#,
+        )
+        .expect("canonical route context fixture parses");
         cfg.runtime_profiles.insert(
             "ratio".to_string(),
             RuntimeProfileConfig {
@@ -42985,7 +42987,7 @@ options = {{ native_tools = true, temperature = 0.1 }}
             "router".to_string(),
             AliasedAgentConfig {
                 enabled: true,
-                model_provider: zeroclaw_config::providers::ModelProviderRef::new("custom.large"),
+                model_provider: zeroclaw_config::providers::ModelProviderRef::new("chat.large"),
                 runtime_profile: "ratio".into(),
                 ..AliasedAgentConfig::default()
             },
@@ -42995,7 +42997,7 @@ options = {{ native_tools = true, temperature = 0.1 }}
             &cfg,
             "router",
             &ChannelRouteSelection {
-                model_provider: "custom.large".to_string(),
+                model_provider: "chat.large".to_string(),
                 model: "large-model".to_string(),
                 automatic: true,
             },
@@ -43005,7 +43007,7 @@ options = {{ native_tools = true, temperature = 0.1 }}
             &cfg,
             "router",
             &ChannelRouteSelection {
-                model_provider: "custom.small".to_string(),
+                model_provider: "chat.small".to_string(),
                 model: "small-model".to_string(),
                 automatic: true,
             },
