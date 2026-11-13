@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   catalogCapabilities,
   catalogDescription,
+  catalogIdentity,
   matchesCatalogFilter,
 } from "./pluginCatalog.ts";
 
@@ -20,8 +21,16 @@ const packageWithBothSources = {
     description: "Registry calendar",
     capabilities: ["channel", "skill"],
     install_source: "calendar@0.2.0",
+    registry_id: null,
   },
 };
+
+test("same-name publishers retain distinct catalog row identities", () => {
+  const a = { ...packageWithBothSources, available: { ...packageWithBothSources.available, registry_id: "origin-a" } };
+  const b = { ...packageWithBothSources, available: { ...packageWithBothSources.available, registry_id: "origin-b" } };
+  assert.notEqual(catalogIdentity(a), catalogIdentity(b));
+  assert.equal(catalogIdentity(a), catalogIdentity({ ...a }));
+});
 
 test("catalog capabilities stay with the version that declares them", () => {
   assert.deepEqual(

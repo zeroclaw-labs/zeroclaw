@@ -42,7 +42,8 @@ pub struct AvailablePluginPackage {
 /// One package in the request-time catalog.
 ///
 /// Installed and registry records remain separate because their versions and
-/// metadata can legitimately differ. Package name is the only merged identity.
+/// metadata can legitimately differ. Available publishers retain separate rows;
+/// installed metadata has package-name identity, not recorded publisher provenance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct PluginCatalogEntry {
@@ -87,7 +88,7 @@ pub struct PluginsResponse {
     pub wasm_plugins_available: bool,
     /// Canonical configured plugin directory, before path expansion.
     pub plugins_dir: String,
-    /// One row per package name across installed and cached-registry sources.
+    /// One row per available publisher/package, plus installed-only packages.
     pub plugins: Vec<PluginCatalogEntry>,
     /// Source failures, kept distinct from a valid empty catalog.
     pub issues: Vec<PluginCatalogIssue>,
@@ -182,8 +183,8 @@ pub async fn list_plugins(State(state): State<AppState>, headers: HeaderMap) -> 
 }
 
 #[cfg(not(feature = "plugins-wasm"))]
-fn build_response(plugins_enabled: bool, plugins_dir: String) -> PluginsResponse {
-    PluginsResponse {
+fn build_response(plugins_enabled: bool, plugins_dir: String) -> OriginPluginsResponse {
+    OriginPluginsResponse {
         plugins_enabled,
         wasm_plugins_available: false,
         plugins_dir,
@@ -200,8 +201,8 @@ fn build_response(
     signature_mode: String,
     trusted_publisher_keys: Vec<String>,
     data_dir: std::path::PathBuf,
-) -> PluginsResponse {
-    use zeroclaw_plugins::catalog::package_catalog;
+) -> OriginPluginsResponse {
+    use zeroclaw_plugins::catalog::origin_package_catalog as package_catalog;
 
     let mut issues = Vec::new();
     let installed = match plugin_path.try_exists() {
@@ -252,8 +253,8 @@ fn build_response(
         }
     };
 
-    let registry = match zeroclaw_plugins::registry::read_cached_registry_index(&data_dir) {
-        Ok(index) => index,
+    let registry = match zeroclaw_plugins::registry::read_cached_registry_collection(&data_dir) {
+        Ok(index) => index.filter(zeroclaw_plugins::registry::cache_matches_environment),
         Err(error) => {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -275,10 +276,10 @@ fn build_response(
 
     let plugins = package_catalog(&installed, registry.as_ref())
         .into_iter()
-        .map(PluginCatalogEntry::from)
+        .map(OriginPluginCatalogEntry::from)
         .collect();
 
-    PluginsResponse {
+    OriginPluginsResponse {
         plugins_enabled,
         wasm_plugins_available: true,
         plugins_dir,
@@ -467,6 +468,26 @@ mod tests {
 
     #[cfg(feature = "plugins-wasm")]
     #[test]
+    fn publisher_identity_is_distinct_without_exposing_source_urls() {
+        let catalog: zeroclaw_plugins::registry::RegistryCollection = serde_json::from_value(serde_json::json!({"registries":[
+            {"registry_url":"https://a.invalid/index?credential=private-a","plugins":[{"name":"calendar","version":"1","url":"https://download.invalid/p.zip"}]},
+            {"registry_url":"https://a.invalid/index?credential=private-b","plugins":[{"name":"calendar","version":"1","url":"https://download.invalid/p.zip"}]}
+        ]})).unwrap();
+        let rows: Vec<_> = zeroclaw_plugins::catalog::origin_package_catalog(&[], Some(&catalog))
+            .into_iter()
+            .map(OriginPluginCatalogEntry::from)
+            .collect();
+        assert_ne!(
+            rows[0].available.as_ref().unwrap().registry_id,
+            rows[1].available.as_ref().unwrap().registry_id
+        );
+        let json = serde_json::to_string(&rows).unwrap();
+        assert!(!json.contains("private"));
+        assert!(!json.contains("https://"));
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
     fn registry_credentials_are_not_projected_into_the_response() {
         use zeroclaw_plugins::registry::{
             PluginRegistryEntry, PluginRegistryIndex, write_cached_registry_index,
@@ -505,5 +526,52 @@ mod tests {
         assert!(!json.contains("token=private"));
         assert!(!json.contains("registry_url"));
         assert!(!json.contains("url"));
+    }
+}
+
+/// Additive endpoint DTOs keep existing publicly constructible metadata intact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct OriginAvailablePluginPackage {
+    #[serde(flatten)]
+    pub metadata: AvailablePluginPackage,
+    pub registry_id: Option<String>,
+}
+impl std::ops::Deref for OriginAvailablePluginPackage {
+    type Target = AvailablePluginPackage;
+    fn deref(&self) -> &Self::Target {
+        &self.metadata
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct OriginPluginCatalogEntry {
+    pub name: String,
+    pub installed: Option<InstalledPluginPackage>,
+    pub available: Option<OriginAvailablePluginPackage>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct OriginPluginsResponse {
+    pub plugins_enabled: bool,
+    pub wasm_plugins_available: bool,
+    pub plugins_dir: String,
+    pub plugins: Vec<OriginPluginCatalogEntry>,
+    pub issues: Vec<PluginCatalogIssue>,
+}
+#[cfg(feature = "plugins-wasm")]
+impl From<zeroclaw_plugins::catalog::OriginCatalogEntry<'_>> for OriginPluginCatalogEntry {
+    fn from(row: zeroclaw_plugins::catalog::OriginCatalogEntry<'_>) -> Self {
+        use sha2::{Digest, Sha256};
+        Self {
+            name: row.name().to_string(),
+            installed: row.installed().map(InstalledPluginPackage::from),
+            available: row.available().map(|entry| OriginAvailablePluginPackage {
+                metadata: AvailablePluginPackage::from(entry),
+                registry_id: row
+                    .origin
+                    .map(|origin| format!("{:x}", Sha256::digest(origin.as_bytes()))),
+            }),
+        }
     }
 }

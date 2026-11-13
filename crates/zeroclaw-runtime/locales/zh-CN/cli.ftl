@@ -1383,3 +1383,6 @@ tool-git-operations-error-docker-runtime-write-unsupported = Git 写入命令在
 
 turn-context-window-exceeded-error = 本次请求超过所选模型的上下文容量。请减少请求内容或启用的工具，或选择上下文容量更大的模型。
 cron-agent-job-failed = 定时任务未能完成，请重试或联系管理员查看日志。
+
+cli-plugin-registry-command-unavailable = 这些值无法在 cmd.exe 和 PowerShell 中都按原样传递，因此无法提供可直接复制执行的安装命令。注册表条目仍然可用；请使用结构化安装，或根据所用的 shell 自行为参数添加引号。
+cli-quickstart-plugins-load-check-command-unavailable = 未安装 {$name}：它无法在此主机上加载：{$error}。这些值无法在 cmd.exe 和 PowerShell 中都按原样传递，因此无法提供可直接复制执行的重试命令。未生成安装命令。

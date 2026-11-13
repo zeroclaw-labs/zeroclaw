@@ -1379,3 +1379,6 @@ channel-approval-opt-allow-always = 常に許可
 channel-approval-opt-reject = 拒否
 channel-approval-opt-reject-with-edit = 編集して拒否
 tool-git-operations-error-docker-runtime-write-unsupported = Git の書き込みコマンドは Docker ランタイムでは利用できません。コンテナ内に閉じ込めることができないためです。
+
+cli-plugin-registry-command-unavailable = これらの値を cmd.exe と PowerShell の両方でそのまま渡すことができないため、コピーして実行できるインストールコマンドは利用できません。レジストリエントリは引き続き利用できます。構造化されたインストールを使用するか、使用するシェルに合わせて引数を引用符で囲んでください。
+cli-quickstart-plugins-load-check-command-unavailable = {$name} はインストールされませんでした: このホストで読み込めません: {$error}。これらの値を cmd.exe と PowerShell の両方でそのまま渡すことができないため、コピーして実行できる再試行コマンドは利用できません。インストールコマンドは生成されませんでした。

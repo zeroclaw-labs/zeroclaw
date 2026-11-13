@@ -211,6 +211,162 @@ fn run_plugin(config_dir: &Path, args: &[&str]) -> Output {
     .expect("the zeroclaw process must not panic")
 }
 
+/// Set registry configuration on the child only, not this test process.
+fn run_plugin_with_registries(config_dir: &Path, selection: &str, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_zeroclaw"))
+        .env("ZEROCLAW_CONFIG_DIR", config_dir)
+        .env("ZEROCLAW_PLUGIN_REGISTRY_URL", selection)
+        .env("RUST_LOG", "off")
+        .arg("plugin")
+        .args(args)
+        .output()
+        .expect("run plugin with selected registries")
+}
+
+#[tokio::test]
+async fn multi_registry_update_requires_explicit_origin_after_original_publisher_removes_package() {
+    let a = MockServer::start().await;
+    let b = MockServer::start().await;
+    let component = std::fs::read(fixture()).unwrap();
+    serve_registry(
+        &a,
+        "1.0.0",
+        package_archive(&manifest("1.0.0", ""), &component),
+        1,
+    )
+    .await;
+    serve_registry(
+        &b,
+        "2.0.0",
+        package_archive(&manifest("2.0.0", ""), &component),
+        0,
+    )
+    .await;
+    let config_dir = config_dir_with_installed_fixture();
+    std::fs::remove_dir_all(config_dir.path().join("plugins").join(PACKAGE)).unwrap();
+    let a_url = format!("{}/registry.json", a.uri());
+    let b_url = format!("{}/registry.json", b.uri());
+    let install = run_plugin(
+        config_dir.path(),
+        &["install", PACKAGE, "--registry", &a_url],
+    );
+    assert!(install.status.success(), "{}", combined(&install));
+    a.verify().await;
+    a.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/registry.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"plugins":[]})))
+        .mount(&a)
+        .await;
+    let before = installed_manifest(config_dir.path());
+    let selection = serde_json::to_string(&[&a_url, &b_url]).unwrap();
+    for args in [vec!["update", PACKAGE], vec!["update", "--all"]] {
+        let output = run_plugin_with_registries(config_dir.path(), &selection, &args);
+        assert!(!output.status.success(), "{}", combined(&output));
+        assert!(combined(&output).contains("--registry"));
+        assert_eq!(installed_manifest(config_dir.path()), before);
+    }
+    assert!(
+        b.received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| request.url.path() == "/registry.json")
+    );
+    b.verify().await;
+}
+
+#[tokio::test]
+async fn approval_from_environment_selected_origin_pins_that_origin_in_the_real_cli_command() {
+    let a = MockServer::start().await;
+    let archive = package_archive(
+        &manifest("2.0.0", "permissions = [\"state_read\"]\n"),
+        &std::fs::read(fixture()).unwrap(),
+    );
+    serve_registry(&a, "2.0.0", archive, 1).await;
+    let config_dir = config_dir_with_installed_fixture();
+    let origin = format!("{}/registry.json", a.uri());
+    let output = run_plugin_with_registries(config_dir.path(), &origin, &["update", PACKAGE]);
+    let text = combined(&output);
+    assert!(!output.status.success(), "{text}");
+    let command = text
+        .lines()
+        .find(|line| line.contains("plugin update") && line.contains("--allow"))
+        .expect("approval command");
+    assert!(
+        command.contains("--registry") && command.contains(&origin),
+        "{command}"
+    );
+    assert!(command.contains(&format!("{PACKAGE}@2.0.0")), "{command}");
+    assert!(installed_manifest(config_dir.path()).contains("version = \"1.0.0\""));
+    a.verify().await;
+    a.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/registry.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"plugins":[]})))
+        .mount(&a)
+        .await;
+    let b = MockServer::start().await;
+    serve_registry(
+        &b,
+        "2.0.0",
+        b"must not download another publisher".to_vec(),
+        0,
+    )
+    .await;
+    let selected =
+        serde_json::to_string(&[origin.clone(), format!("{}/registry.json", b.uri())]).unwrap();
+    // Replay the reviewed command's pinned identity/origin/authority through
+    // real dispatch after A disappears and B becomes the sole listing.
+    let replay = run_plugin_with_registries(
+        config_dir.path(),
+        &selected,
+        &[
+            "update",
+            &format!("{PACKAGE}@2.0.0"),
+            "--registry",
+            &origin,
+            "--allow-token",
+            "permission:state_read",
+        ],
+    );
+    assert!(!replay.status.success(), "{}", combined(&replay));
+    assert!(b.received_requests().await.unwrap().is_empty());
+    assert!(installed_manifest(config_dir.path()).contains("version = \"1.0.0\""));
+}
+
+#[tokio::test]
+async fn successful_union_search_shows_distinct_private_origin_labels_not_credentials() {
+    let server = MockServer::start().await;
+    serve_registry(&server, "2.0.0", b"not downloaded".to_vec(), 0).await;
+    let config_dir = config_dir_with_installed_fixture();
+    let first = format!("{}/registry.json?token=secret-a#private-a", server.uri()).replacen(
+        "http://",
+        "http://alice:password-a@",
+        1,
+    );
+    let second = format!("{}/registry.json?token=secret-b#private-b", server.uri()).replacen(
+        "http://",
+        "http://alice:password-b@",
+        1,
+    );
+    let selection = serde_json::to_string(&[&first, &second]).unwrap();
+    let output = run_plugin_with_registries(config_dir.path(), &selection, &["search", PACKAGE]);
+    let text = combined(&output);
+    assert!(output.status.success(), "{text}");
+    for origin in [&first, &second] {
+        assert!(
+            text.contains(&zeroclaw_plugins::registry::registry_origin_label(origin)),
+            "{text}"
+        );
+    }
+    for secret in ["alice", "password", "token=", "secret-", "private-"] {
+        assert!(!text.contains(secret), "{text}");
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    server.verify().await;
+}
+
 fn combined(out: &Output) -> String {
     format!(
         "{}{}",

@@ -1384,3 +1384,6 @@ channel-approval-opt-allow-always = Toujours autoriser
 channel-approval-opt-reject = Rejeter
 channel-approval-opt-reject-with-edit = Rejeter avec modification
 tool-git-operations-error-docker-runtime-write-unsupported = Les commandes d’écriture Git ne sont pas disponibles avec l’environnement d’exécution Docker, car elles ne peuvent pas être confinées à son conteneur.
+
+cli-plugin-registry-command-unavailable = Aucune commande d'installation prête à copier n'est disponible, car ces valeurs ne peuvent pas être transmises littéralement à la fois dans cmd.exe et dans PowerShell. L'entrée du registre reste disponible ; utilisez l'installation structurée ou mettez vous-même les arguments entre guillemets pour un interpréteur connu.
+cli-quickstart-plugins-load-check-command-unavailable = {$name} n'a pas été installé : il ne se charge pas sur cet hôte : {$error}. Aucune commande de nouvelle tentative prête à copier n'est disponible, car ces valeurs ne peuvent pas être transmises littéralement à la fois dans cmd.exe et dans PowerShell. Aucune commande d'installation n'a été générée.

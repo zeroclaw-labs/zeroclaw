@@ -1068,6 +1068,10 @@ cli-plugin-catalog-available = {"  "}○ {$name} v{$version} — available in ca
 cli-plugin-catalog-cache-failed = warning: could not read cached plugin registry: {$error}
 cli-plugin-search-none = No plugins matching '{$query}'.
 cli-plugin-search-results = Plugins matching '{$query}' ({$count}):
+cli-plugin-registry-origin = { $name } [{ $origin }]
+cli-plugin-registry-command = Install: { $command }
+cli-plugin-registry-selection-conflict = Select only one registry for each plugin name.
+cli-plugin-registry-ambiguous = Plugin { $name } is listed by multiple registries; select one with --registry <url>.
 cli-plugin-search-result =   {$name} v{$version} — {$description}
 cli-plugin-no-description = (no description)
 cli-plugin-install-resolving = Resolving '{$source}' from plugin registry...
@@ -1764,3 +1768,6 @@ turn-repeated-success-advisory = The same tool call returned the same successful
 turn-repeated-failure-recovery = The same tool call failed with the same result repeatedly. Change the approach or explain the blocker. One further identical retry is available before this turn stops.
 turn-repeated-failure-exhausted = The recovery retry failed with the same result, so this turn has stopped. Completed tool results have been preserved. You can retry in a new turn.
 turn-repeated-failure-retry-skipped = Skipped an additional identical call in this recovery batch. Only one recovery retry is available.
+
+cli-plugin-registry-command-unavailable = A copy-ready install command is unavailable because these values cannot be passed literally in both cmd.exe and PowerShell. The registry entry remains available; use structured installation or quote arguments yourself for a known shell.
+cli-quickstart-plugins-load-check-command-unavailable = {$name} was not installed: it does not load against this host: {$error}. A copy-ready retry command is unavailable because these values cannot be passed literally in both cmd.exe and PowerShell. No install command was generated.

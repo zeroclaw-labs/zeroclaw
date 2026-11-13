@@ -6409,7 +6409,7 @@ enum UpdateFrom<'a> {
     /// The registry index, fetched once for the whole command, and the
     /// `--registry` URL the operator passed, if any.
     Registry {
-        index: &'a zeroclaw::plugins::registry::PluginRegistryIndex,
+        index: &'a zeroclaw::plugins::registry::RegistryCollection,
         registry: Option<&'a str>,
     },
     /// A local package directory, as an absolute path.
@@ -6602,7 +6602,7 @@ async fn run_plugin_update(
         let from = if let Some(dir) = &local {
             UpdateFrom::Local(dir)
         } else {
-            let registry_url = plugin_registry::registry_url(registry.as_deref());
+            let registry_url = plugin_registry::registry_url(registry.as_deref())?;
             println!(
                 "{}",
                 t(
@@ -6611,9 +6611,8 @@ async fn run_plugin_update(
                 )
             );
             fetched = plugin_registry::fetch_registry_index(&registry_url).await?;
-            zeroclaw::plugins::registry::write_cached_registry_index(
+            zeroclaw::plugins::registry::write_cached_registry_collection(
                 &config.data_dir,
-                &registry_url,
                 &fetched,
             )?;
             UpdateFrom::Registry {
@@ -6911,7 +6910,17 @@ async fn update_one_plugin(
                 name: name.to_string(),
                 version: pin.map(str::to_string),
             };
-            let Ok(entry) = zeroclaw::plugins::registry::resolve_entry(index, &spec) else {
+            // Installed metadata does not establish a registry publisher.
+            // Never infer one from whichever origin happens to list the name today.
+            if registry.is_none_or(|url| url.trim().is_empty()) && index.registries.len() > 1 {
+                return failed(ta(
+                    "cli-plugin-registry-ambiguous",
+                    &[("name", name)],
+                    "Select a registry with --registry <url>",
+                ));
+            }
+            let Ok(entry) = zeroclaw::plugins::registry::resolve_registry_entry(index, &spec)
+            else {
                 if policy.all {
                     return PluginUpdateOutcome::NotListed;
                 }
@@ -6928,15 +6937,15 @@ async fn update_one_plugin(
                     version: installed.version.clone(),
                 };
             }
-            downloaded = match plugin_registry::download_registry_entry(entry).await {
+            downloaded = match plugin_registry::download_registry_entry(entry.entry).await {
                 Ok(downloaded) => downloaded,
                 Err(error) => return failed(format!("{error:#}")),
             };
             (
                 downloaded.plugin_dir().to_path_buf(),
                 UpdateSource::Registry {
-                    version: Some(&entry.version),
-                    registry,
+                    version: Some(&entry.entry.version),
+                    registry: Some(entry.origin),
                 },
             )
         }
@@ -13888,11 +13897,10 @@ Add pricing to the active provider profile or supply a catalog entry."
                 Ok(())
             }
             PluginCommands::Search { query, registry } => {
-                let registry_url = plugin_registry::registry_url(registry.as_deref());
+                let registry_url = plugin_registry::registry_url(registry.as_deref())?;
                 let index = plugin_registry::fetch_registry_index(&registry_url).await?;
-                zeroclaw::plugins::registry::write_cached_registry_index(
+                zeroclaw::plugins::registry::write_cached_registry_collection(
                     &config.data_dir,
-                    &registry_url,
                     &index,
                 )?;
                 let matches = plugin_registry::search_entries(&index, &query);
@@ -13928,7 +13936,10 @@ Add pricing to the active provider profile or supply a catalog entry."
                             ta(
                                 "cli-plugin-search-result",
                                 &[
-                                    ("name", &plugin.name),
+                                    (
+                                        "name",
+                                        &ta("cli-plugin-registry-origin", &[("name", &plugin.name), ("origin", &zeroclaw::plugins::registry::registry_origin_label(plugin.origin))], "Plugin registry origin")
+                                    ),
                                     ("version", &plugin.version),
                                     ("description", description),
                                 ],
@@ -13987,7 +13998,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                     ))
                     .await?
                 } else {
-                    let registry_url = plugin_registry::registry_url(registry.as_deref());
+                    let registry_url = plugin_registry::registry_url(registry.as_deref())?;
                     println!(
                         "{}",
                         ta(
@@ -27906,19 +27917,21 @@ hosts = ["api.example.com", "api2.example.com"]
     fn unfetchable_index(
         name: &str,
         version: &str,
-    ) -> zeroclaw::plugins::registry::PluginRegistryIndex {
-        zeroclaw::plugins::registry::PluginRegistryIndex {
-            plugins: vec![zeroclaw::plugins::registry::PluginRegistryEntry {
-                name: name.to_string(),
-                version: version.to_string(),
-                description: None,
-                author: None,
-                capabilities: Vec::new(),
-                url: "http://127.0.0.1:9/never-downloaded.zip".to_string(),
-                sha256: None,
-            }],
-            registry_url: None,
-        }
+    ) -> zeroclaw::plugins::registry::RegistryCollection {
+        zeroclaw::plugins::registry::RegistryCollection::from(
+            zeroclaw::plugins::registry::PluginRegistryIndex {
+                plugins: vec![zeroclaw::plugins::registry::PluginRegistryEntry {
+                    name: name.to_string(),
+                    version: version.to_string(),
+                    description: None,
+                    author: None,
+                    capabilities: Vec::new(),
+                    url: "http://127.0.0.1:9/never-downloaded.zip".to_string(),
+                    sha256: None,
+                }],
+                registry_url: None,
+            },
+        )
     }
 
     #[cfg(feature = "plugins-wasm")]
@@ -28040,6 +28053,62 @@ hosts = ["api.example.com", "api2.example.com"]
             Some("version = \"1.0.0\"")
         );
         assert!(config.plugins.entries.is_empty());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn registry_update_rejects_cross_origin_names_even_with_a_unique_pinned_version() {
+        let plugins = tempfile::tempdir().unwrap();
+        let mut host = host_with_installed_tool(plugins.path(), "weather");
+        let config_dir = tempfile::tempdir().unwrap();
+        let mut config = config_in_dir(config_dir.path());
+        let mut a = unfetchable_index("weather", "1.0.0");
+        a.registries[0].registry_url = Some("https://a.invalid/index".to_string());
+        let mut b = unfetchable_index("weather", "2.0.0");
+        b.registries[0].registry_url = Some("https://b.invalid/index".to_string());
+        a.registries.extend(b.registries);
+        for all in [false, true] {
+            let policy = update_policy(
+                UpdateFrom::Registry {
+                    index: &a,
+                    registry: None,
+                },
+                &[],
+                all,
+            );
+            let outcome = Box::pin(update_one_plugin(
+                &mut host,
+                &mut config,
+                "weather",
+                Some("1.0.0"),
+                &policy,
+            ))
+            .await;
+            assert!(
+                matches!(outcome, PluginUpdateOutcome::Failed { ref error, .. } if error.contains("--registry")),
+                "{outcome:?}"
+            );
+        }
+        assert_eq!(host.get_plugin("weather").unwrap().version, "1.0.0");
+        // An explicitly selected single-origin view retains the old current-version path.
+        a.registries.truncate(1);
+        let policy = update_policy(
+            UpdateFrom::Registry {
+                index: &a,
+                registry: Some("https://a.invalid/index"),
+            },
+            &[],
+            false,
+        );
+        let outcome = Box::pin(update_one_plugin(
+            &mut host,
+            &mut config,
+            "weather",
+            None,
+            &policy,
+        ))
+        .await;
+        assert!(matches!(outcome, PluginUpdateOutcome::UpToDate { .. }));
     }
 
     /// The version the registry selects being the installed one is up to date,

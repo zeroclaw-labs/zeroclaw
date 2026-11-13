@@ -6,14 +6,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tempfile::TempDir;
 use zeroclaw::plugins::PluginManifest;
-pub(crate) use zeroclaw::plugins::registry::search_entries;
+pub(crate) use zeroclaw::plugins::registry::search_registry_entries as search_entries;
 use zeroclaw::plugins::registry::{
-    PluginRegistryEntry, PluginRegistryIndex, parse_plugin_spec, resolve_entry,
-    write_cached_registry_index,
+    PluginRegistryEntry, PluginRegistryIndex, RegistryCollection, parse_plugin_spec,
+    resolve_registry_entry, write_cached_registry_collection,
 };
 
-pub(crate) const DEFAULT_REGISTRY_URL: &str =
-    "https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw-plugins/main/registry.json";
+pub(crate) use zeroclaw::plugins::registry::DEFAULT_REGISTRY_URL;
 pub(crate) const MAX_PLUGIN_ZIP_BYTES: usize = 50 * 1024 * 1024;
 pub(crate) const MAX_PLUGIN_EXTRACTED_BYTES: u64 = 50 * 1024 * 1024;
 const REGISTRY_URL_ENV: &str = "ZEROCLAW_PLUGIN_REGISTRY_URL";
@@ -48,13 +47,39 @@ impl DownloadedPlugin {
     }
 }
 
-pub(crate) fn registry_url(override_url: Option<&str>) -> String {
-    override_url
+pub(crate) fn registry_url(override_url: Option<&str>) -> Result<String> {
+    select_registry_url(
+        override_url,
+        std::env::var(REGISTRY_URL_ENV).ok().as_deref(),
+    )
+}
+
+fn select_registry_url(override_url: Option<&str>, environment: Option<&str>) -> Result<String> {
+    let value = override_url
         .filter(|url| !url.trim().is_empty())
         .map(ToOwned::to_owned)
-        .or_else(|| std::env::var(REGISTRY_URL_ENV).ok())
+        .or_else(|| environment.map(ToOwned::to_owned))
         .filter(|url| !url.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_REGISTRY_URL.to_string())
+        .unwrap_or_else(|| DEFAULT_REGISTRY_URL.to_string());
+    // Explicit overrides must be exactly one URL, regardless of the environment.
+    if override_url.is_some_and(|s| !s.trim().is_empty()) && value.trim_start().starts_with('[') {
+        bail!("--registry expects one HTTP(S) URL");
+    }
+    validate_registry_sources(&value)?;
+    Ok(value)
+}
+
+fn validate_registry_sources(value: &str) -> Result<Vec<String>> {
+    let sources = zeroclaw::plugins::registry::registry_sources(value)?;
+    // Validate every URL before the first network request.
+    for source in &sources {
+        let url = reqwest::Url::parse(source)
+            .with_context(|| format!("invalid plugin registry URL {source}"))?;
+        if url.host_str().is_none() || !matches!(url.scheme(), "http" | "https") {
+            bail!("plugin registry must be an HTTP(S) URL: {source}");
+        }
+    }
+    Ok(sources)
 }
 
 pub(crate) fn is_local_plugin_source(source: &str) -> bool {
@@ -70,7 +95,7 @@ pub(crate) fn looks_like_url(source: &str) -> bool {
     source.contains("://")
 }
 
-pub(crate) async fn fetch_registry_index(registry_url: &str) -> Result<PluginRegistryIndex> {
+pub(crate) async fn fetch_registry_index(registry_url: &str) -> Result<RegistryCollection> {
     RegistryClient::new(RegistryTimeouts::default())?
         .fetch_index(registry_url)
         .await
@@ -81,13 +106,9 @@ pub(crate) async fn download_registry_plugin(
     source: &str,
     cache_data_dir: Option<&Path>,
 ) -> Result<DownloadedPlugin> {
-    let index = fetch_registry_index(registry_url).await?;
-    if let Some(data_dir) = cache_data_dir {
-        write_cached_registry_index(data_dir, registry_url, &index)?;
-    }
-    let spec = parse_plugin_spec(source)?;
-    let entry = resolve_entry(&index, &spec)?;
-    download_registry_entry(entry).await
+    RegistryClient::new(RegistryTimeouts::default())?
+        .download_plugin(registry_url, source, cache_data_dir)
+        .await
 }
 
 /// Download one resolved registry entry and unpack it for admission.
@@ -165,8 +186,40 @@ impl RegistryClient {
         Ok(Self { http, timeouts })
     }
 
-    pub(crate) async fn fetch_index(&self, registry_url: &str) -> Result<PluginRegistryIndex> {
-        let response = self
+    async fn download_plugin(
+        &self,
+        registry_url: &str,
+        source: &str,
+        cache_data_dir: Option<&Path>,
+    ) -> Result<DownloadedPlugin> {
+        let index = self.fetch_index(registry_url).await?;
+        if let Some(data_dir) = cache_data_dir {
+            write_cached_registry_collection(data_dir, &index)?;
+        }
+        let spec = parse_plugin_spec(source)?;
+        let entry = resolve_registry_entry(&index, &spec)?;
+        self.download_entry(entry.entry).await
+    }
+
+    pub(crate) async fn fetch_index(&self, registry_url: &str) -> Result<RegistryCollection> {
+        let sources = validate_registry_sources(registry_url)?;
+        let mut combined = RegistryCollection {
+            registries: Vec::new(),
+        };
+        // At most eight sequential requests, each with the existing whole-index deadline.
+        // Publish/cache nothing until the complete configured set succeeds.
+        for source in sources {
+            let index = self.fetch_single_index(&source).await.map_err(|error| {
+                let message = format!("fetching plugin registry {source}: {error}");
+                error.context(message)
+            })?;
+            combined.registries.push(index);
+        }
+        Ok(combined)
+    }
+
+    async fn fetch_single_index(&self, registry_url: &str) -> Result<PluginRegistryIndex> {
+        let mut response = self
             .http
             .get(registry_url)
             .timeout(self.timeouts.index)
@@ -180,10 +233,28 @@ impl RegistryClient {
             }
             bail!("plugin registry returned HTTP {status} for {registry_url}");
         }
-        response
-            .json::<PluginRegistryIndex>()
+        const MAX_INDEX_BYTES: usize = 4 * 1024 * 1024;
+        if response
+            .content_length()
+            .is_some_and(|len| len > MAX_INDEX_BYTES as u64)
+        {
+            bail!("plugin registry index exceeds maximum size of {MAX_INDEX_BYTES} bytes");
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .context("parsing plugin registry JSON")
+            .context("reading plugin registry index")?
+        {
+            if bytes.len().saturating_add(chunk.len()) > MAX_INDEX_BYTES {
+                bail!("plugin registry index exceeds maximum size of {MAX_INDEX_BYTES} bytes");
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let mut index: PluginRegistryIndex =
+            serde_json::from_slice(&bytes).context("parsing plugin registry JSON")?;
+        index.registry_url = Some(registry_url.to_string());
+        Ok(index)
     }
 
     pub(crate) async fn download_entry(
@@ -442,6 +513,255 @@ version = "0.1.0"
 capabilities = ["tool"]
 "#;
 
+    #[test]
+    fn registry_selection_preserves_legacy_and_explicit_override_precedence() {
+        assert_eq!(
+            select_registry_url(None, None).unwrap(),
+            DEFAULT_REGISTRY_URL
+        );
+        assert_eq!(
+            select_registry_url(None, Some("  ")).unwrap(),
+            DEFAULT_REGISTRY_URL
+        );
+        let custom = "https://example.invalid/personal.json";
+        assert_eq!(select_registry_url(None, Some(custom)).unwrap(), custom);
+        assert_eq!(
+            select_registry_url(Some(custom), Some("[broken")).unwrap(),
+            custom
+        );
+        assert_eq!(
+            select_registry_url(Some(custom), Some(r#"["https://other.invalid/index"]"#)).unwrap(),
+            custom
+        );
+        assert!(select_registry_url(Some(r#"["https://other.invalid/index"]"#), None).is_err());
+        let values = r#"["https://a.invalid/a,b.json","https://b.invalid/index","https://a.invalid/a,b.json"]"#;
+        assert_eq!(
+            validate_registry_sources(values).unwrap(),
+            ["https://a.invalid/a,b.json", "https://b.invalid/index"]
+        );
+        for invalid in [
+            "[]",
+            "[1]",
+            "[broken",
+            r#"["https://a.invalid/index",""]"#,
+            r#"["https://a.invalid/index","file:///index"]"#,
+            r#"["http://"]"#,
+        ] {
+            assert!(
+                select_registry_url(None, Some(invalid)).is_err(),
+                "{invalid}"
+            );
+        }
+        let too_many: Vec<_> = (0..9)
+            .map(|n| format!("https://r{n}.invalid/index"))
+            .collect();
+        assert!(validate_registry_sources(&serde_json::to_string(&too_many).unwrap()).is_err());
+    }
+
+    async fn serve_named_index(server: &MockServer, version: &str) -> String {
+        let mut entry = sample_entry(server, None);
+        entry.version = version.to_string();
+
+        Mock::given(method("GET"))
+            .and(path("/registry.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "registry_url": "https://spoof.invalid/registry.json", "plugins": [entry]
+            })))
+            .mount(server)
+            .await;
+        format!("{}/registry.json", server.uri())
+    }
+
+    #[tokio::test]
+    async fn combined_search_retains_actual_origins_and_pinned_install_is_still_ambiguous() {
+        let a = MockServer::start().await;
+        let b = MockServer::start().await;
+        let a_url = serve_named_index(&a, "0.1.0").await;
+        let b_url = serve_named_index(&b, "0.2.0").await;
+        for server in [&a, &b] {
+            Mock::given(method("GET"))
+                .and(path(SAMPLE_ARCHIVE_PATH))
+                .respond_with(ResponseTemplate::new(500))
+                .expect(0)
+                .mount(server)
+                .await;
+        }
+        let selected = serde_json::to_string(&[&a_url, &b_url]).unwrap();
+        let index = fetch_registry_index(&selected).await.unwrap();
+        let matches = search_entries(&index, "sample");
+        assert_eq!(matches.len(), 2);
+        assert_eq!(Some(matches[0].origin), Some(a_url.as_str()));
+        assert_eq!(Some(matches[1].origin), Some(b_url.as_str()));
+        for source in ["sample", "sample@0.1.0", "sample@0.2.0"] {
+            let error = download_registry_plugin(&selected, source, None)
+                .await
+                .err()
+                .expect("ambiguous");
+            assert!(error.to_string().contains("--registry"));
+        }
+        a.verify().await;
+        b.verify().await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_union_keeps_the_previous_cache_and_never_fetches_archives() {
+        let a = MockServer::start().await;
+        let b = MockServer::start().await;
+        let a_url = serve_named_index(&a, "0.1.0").await;
+        let b_url = format!("{}/registry.json", b.uri());
+        let dir = tempfile::tempdir().unwrap();
+        let old = fetch_registry_index(&a_url).await.unwrap();
+        write_cached_registry_collection(dir.path(), &old).unwrap();
+        let cache = zeroclaw::plugins::registry::registry_cache_path(dir.path());
+        let previous = std::fs::read(&cache).unwrap();
+        for server in [&a, &b] {
+            Mock::given(method("GET"))
+                .and(path(SAMPLE_ARCHIVE_PATH))
+                .respond_with(ResponseTemplate::new(500))
+                .expect(0)
+                .mount(server)
+                .await;
+        }
+        for response in [
+            ResponseTemplate::new(503),
+            ResponseTemplate::new(200).set_body_string("{ malformed"),
+        ] {
+            b.reset().await;
+            Mock::given(method("GET"))
+                .and(path("/registry.json"))
+                .respond_with(response)
+                .mount(&b)
+                .await;
+            let selected = serde_json::to_string(&[&a_url, &b_url]).unwrap();
+            let error = download_registry_plugin(&selected, "sample", Some(dir.path()))
+                .await
+                .err()
+                .expect("failed index");
+            assert!(format!("{error:#}").contains(&b_url));
+            assert_eq!(std::fs::read(&cache).unwrap(), previous);
+            assert!(
+                b.received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|r| r.url.path() == "/registry.json")
+            );
+        }
+        a.verify().await;
+    }
+
+    #[tokio::test]
+    async fn explicit_registry_download_selects_only_the_requested_publisher() {
+        let a = MockServer::start().await;
+        let b = MockServer::start().await;
+        let a_url = serve_named_index(&a, "0.1.0").await;
+        let b_url = serve_named_index(&b, "0.2.0").await;
+        let configured = serde_json::to_string(&[&a_url, &b_url]).unwrap();
+        let selected = select_registry_url(Some(&a_url), Some(&configured)).unwrap();
+        serve_sample_archive(
+            &a,
+            ResponseTemplate::new(200).set_body_bytes(sample_archive()),
+        )
+        .await;
+        let downloaded = download_registry_plugin(&selected, "sample", None)
+            .await
+            .unwrap();
+        assert_eq!(downloaded.manifest().version, "0.1.0");
+        assert!(b.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_stalled_second_index_keeps_cache_and_requests_no_archive() {
+        let a = MockServer::start().await;
+        let b = MockServer::start().await;
+        let a_url = serve_named_index(&a, "0.1.0").await;
+        let b_url = format!("{}/registry.json", b.uri());
+        Mock::given(method("GET"))
+            .and(path("/registry.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"plugins":[]}))
+                    .set_delay(STALLED_RESPONSE_DELAY),
+            )
+            .expect(1)
+            .mount(&b)
+            .await;
+        for server in [&a, &b] {
+            Mock::given(method("GET"))
+                .and(path(SAMPLE_ARCHIVE_PATH))
+                .respond_with(ResponseTemplate::new(500))
+                .expect(0)
+                .mount(server)
+                .await;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let previous_index = fetch_registry_index(&a_url).await.unwrap();
+        write_cached_registry_collection(dir.path(), &previous_index).unwrap();
+        let path = zeroclaw::plugins::registry::registry_cache_path(dir.path());
+        let previous = std::fs::read(&path).unwrap();
+        let client = RegistryClient::new(RegistryTimeouts {
+            index: TEST_TIMEOUT,
+            ..RegistryTimeouts::default()
+        })
+        .unwrap();
+        let selected = serde_json::to_string(&[a_url, b_url.clone()]).unwrap();
+        let error = client
+            .download_plugin(&selected, "sample", Some(dir.path()))
+            .await
+            .err()
+            .expect("timeout");
+        assert!(is_timeout(&error));
+        assert!(format!("{error:#}").contains(&b_url));
+        assert_eq!(std::fs::read(path).unwrap(), previous);
+        a.verify().await;
+        b.verify().await;
+    }
+
+    #[tokio::test]
+    async fn oversized_index_is_rejected_before_json_or_archive_processing() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/registry.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(vec![b' '; 4 * 1024 * 1024 + 1]),
+            )
+            .mount(&server)
+            .await;
+        let error = fetch_registry_index(&format!("{}/registry.json", server.uri()))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("maximum size"));
+    }
+
+    #[tokio::test]
+    async fn mixed_case_http_source_passes_real_preflight_fetch_and_keeps_exact_origin() {
+        let server = MockServer::start().await;
+        let lower = serve_named_index(&server, "0.1.0").await;
+        let mixed = lower.replacen("http:", "hTtP:", 1);
+        assert_eq!(select_registry_url(None, Some(&mixed)).unwrap(), mixed);
+        let catalog = fetch_registry_index(&mixed).await.unwrap();
+        assert_eq!(catalog.sources(), vec![mixed.clone()]);
+        assert_eq!(search_entries(&catalog, "sample")[0].origin, mixed);
+        assert!(
+            serde_json::to_value(&catalog.registries[0].plugins[0])
+                .unwrap()
+                .get("registry_url")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_second_source_is_rejected_before_any_http() {
+        let server = MockServer::start().await;
+        let selected = serde_json::to_string(&[
+            format!("{}/registry.json", server.uri()),
+            "http://".to_string(),
+        ])
+        .unwrap();
+        assert!(fetch_registry_index(&selected).await.is_err());
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
     struct CountingChunks {
         chunks: Vec<Vec<u8>>,
         next: usize,
@@ -609,9 +929,9 @@ capabilities = ["tool"]
             .await
             .unwrap();
 
-        assert_eq!(index.plugins.len(), 1);
-        assert_eq!(index.plugins[0].name, "sample");
-        assert_eq!(index.plugins[0].version, "0.1.0");
+        assert_eq!(index.entries().len(), 1);
+        assert_eq!(index.entries()[0].name, "sample");
+        assert_eq!(index.entries()[0].version, "0.1.0");
     }
 
     #[tokio::test]

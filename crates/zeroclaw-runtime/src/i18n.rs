@@ -1250,7 +1250,7 @@ mod tests {
         /// the substrings the rendered value must contain.
         type QuickstartPluginCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
 
-        let cases: [QuickstartPluginCase<'_>; 46] = [
+        let cases: [QuickstartPluginCase<'_>; 48] = [
             // Any failure to fetch the registry index is printed as it reads.
             (
                 "cli-quickstart-plugins-registry-unavailable",
@@ -1300,6 +1300,15 @@ mod tests {
                 "cli-quickstart-plugins-unverified-prompt",
                 &[("name", "weather-tool")],
                 &["weather-tool"],
+            ),
+            ("cli-plugin-registry-command-unavailable", &[], &[]),
+            (
+                "cli-quickstart-plugins-load-check-command-unavailable",
+                &[
+                    ("name", "weather-tool"),
+                    ("error", "failed to load WASM component"),
+                ],
+                &["weather-tool", "failed to load WASM component"],
             ),
             // Quickstart has no `--no-verify`; a package that does not load
             // names the install command that accepts it anyway, addressed to
@@ -1706,6 +1715,7 @@ mod tests {
             .filter(|id| {
                 *id == "cli-quickstart-row-plugins"
                     || *id == "cli-plugin-egress-withheld"
+                    || *id == "cli-plugin-registry-command-unavailable"
                     || id.starts_with("cli-quickstart-plugins-")
             })
             .collect();

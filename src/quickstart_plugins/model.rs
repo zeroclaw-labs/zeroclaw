@@ -185,6 +185,7 @@ pub(crate) struct PluginChoice {
     pub(crate) state: ChoiceState,
     /// The entry an unpinned `plugin install` would resolve, when listed.
     pub(crate) registry_entry: Option<PluginRegistryEntry>,
+    pub(crate) registry_origin: Option<String>,
 }
 
 impl PluginChoice {
@@ -243,7 +244,23 @@ pub(crate) fn plugin_choices(catalog: &[PluginCatalogEntry<'_>]) -> Vec<PluginCh
                 description,
                 state,
                 registry_entry: available.cloned(),
+                registry_origin: None,
             })
+        })
+        .collect()
+}
+
+pub(crate) fn origin_plugin_choices(
+    catalog: &[zeroclaw::plugins::catalog::OriginCatalogEntry<'_>],
+) -> Vec<PluginChoice> {
+    catalog
+        .iter()
+        .flat_map(|row| {
+            let mut choices = plugin_choices(std::slice::from_ref(&row.metadata));
+            for choice in &mut choices {
+                choice.registry_origin = row.origin.map(str::to_string);
+            }
+            choices
         })
         .collect()
 }

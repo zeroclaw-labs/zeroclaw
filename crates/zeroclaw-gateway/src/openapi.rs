@@ -111,11 +111,14 @@ pub fn build_spec() -> serde_json::Value {
             "StatusResponse": response_schema_value::<StatusResponse>(),
             "InstalledPluginPackage": schema_value::<crate::api_plugins::InstalledPluginPackage>(),
             "AvailablePluginPackage": schema_value::<crate::api_plugins::AvailablePluginPackage>(),
+            "OriginAvailablePluginPackage": schema_value::<crate::api_plugins::OriginAvailablePluginPackage>(),
+            "OriginPluginCatalogEntry": schema_value::<crate::api_plugins::OriginPluginCatalogEntry>(),
+            "OriginPluginsResponse": schema_value::<crate::api_plugins::OriginPluginsResponse>(),
             "PluginCatalogEntry": schema_value::<crate::api_plugins::PluginCatalogEntry>(),
             "PluginCatalogIssueSource": schema_value::<crate::api_plugins::PluginCatalogIssueSource>(),
             "PluginCatalogIssueCode": schema_value::<crate::api_plugins::PluginCatalogIssueCode>(),
             "PluginCatalogIssue": schema_value::<crate::api_plugins::PluginCatalogIssue>(),
-            "PluginsResponse": schema_value::<crate::api_plugins::PluginsResponse>(),
+            "PluginsResponse": schema_value::<crate::api_plugins::OriginPluginsResponse>(),
         },
         "securitySchemes": {
             "bearerAuth": {

@@ -170,6 +170,66 @@ an optional `sha256` digest of the zip. The digest is optional only for
 step of `zeroclaw quickstart` refuses an entry without one, so publish a digest
 for every entry.
 
+### Multiple registry origins
+
+The environment variable accepts either its existing single HTTP(S) URL or a
+JSON array of URLs (not a comma-separated string):
+
+For example, configure a personal registry alongside the public index:
+
+```sh
+export ZEROCLAW_PLUGIN_REGISTRY_URL='["https://plugins.example.org/registry.json","https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw-plugins/main/registry.json"]'
+zeroclaw plugin search calendar
+```
+
+A nonblank `--registry <url>` always selects exactly that one registry, even
+when the environment variable is malformed. Unset or blank input retains the
+public default; a custom URL or list replaces it. The public registry is not
+implicitly appended to custom sources. Lists must contain one to eight unique
+HTTP(S) URLs. Exact duplicates are removed in configuration order, and commas
+inside URLs remain part of the URL. Every source is validated before HTTP.
+
+All indexes must succeed before search results or the canonical local cache
+are published. A failed, malformed or timed-out source reports its URL, leaves
+the previous cache intact, and prevents archive downloads. Each index is capped
+at 4 MiB and uses the existing request deadlines; at most eight indexes are
+fetched sequentially. An unpopulated public index still reports the existing
+public-registry error, including when explicitly listed alongside a custom one.
+
+Search, the offline CLI catalog, install suggestions and Quickstart retain the
+fetching source, never a publisher's self-declared `registry_url`. The same
+name can appear from several origins. CLI install requires `--registry <url>`
+when a name has multiple publishers, even if a pinned version occurs in only
+one origin. Updates from any multi-origin selection always require an explicit
+`--registry <url>`: installed metadata does not establish the previous registry
+publisher, and a removed listing must not silently switch publishers. Within
+one origin the existing last-listed version rule remains. Quickstart shows
+credential-safe opaque origin IDs and retains the selected
+publisher's archive; it refuses selecting two publishers of one package name.
+The installed-package directory still permits only one installed package per name.
+
+The existing `plugin-registry/registry.json` cache remains canonical. Legacy
+single-index files retain their wrapper URL as the authoritative origin. New
+union caches contain a collection of per-origin legacy indexes, including empty
+ones, without changing public entry fields or duplicating provenance on entries.
+Legacy single-index helpers refuse a union rather than flattening publishers.
+Publication uses an owner-only same-directory staged file and rename; restrictive
+existing Unix cache permissions are not widened. Offline
+consumers reject a cache from a different explicitly configured environment
+source set. Without an environment selection they retain the last deliberately
+refreshed cache, including a previous `--registry` search. Suggested commands
+include each entry's explicit origin rather than passing a JSON array as a URL,
+quoted at the host-aware POSIX/Windows/PowerShell command-rendering boundary.
+A copy-ready Windows install recipe is unavailable if any argument cannot be
+passed literally in both cmd.exe and PowerShell, such as a percent-encoded URL
+or a config path containing a literal percent sign. This does not invalidate
+registry metadata or disable structured installation.
+Successful search and Quickstart labels never print URL userinfo, query or
+fragment bytes; distinct raw URLs retain distinct opaque IDs. This does not
+claim redaction of existing error or executable-command surfaces.
+The authenticated catalog API distinguishes publishers with opaque registry
+IDs instead of exposing custom URLs that might contain credentials.
+
 ### Package names and Cargo features
 
 Operators install, inspect, and configure a package by its registry `name`.
