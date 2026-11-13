@@ -963,6 +963,35 @@ fn is_non_retryable_rate_limit(err: &anyhow::Error) -> bool {
     false
 }
 
+/// Try to extract the time until a quota resets (in milliseconds) from an
+/// error body that states it. OpenAI Codex's `usage_limit_reached` 429 carries
+/// `"resets_in_seconds": <n>` (and `"resets_at": <unix seconds>`) for a rolling
+/// window that lasts hours; this is distinct from Retry-After, which asks for
+/// a short wait before retrying the same request.
+fn parse_stated_reset_ms(err: &anyhow::Error) -> Option<u64> {
+    let msg = err.to_string();
+    let number_after = |key: &str| -> Option<u64> {
+        let start = msg.find(key)? + key.len();
+        let rest =
+            msg[start..].trim_start_matches(|c: char| c == '"' || c == ':' || c.is_whitespace());
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse::<u64>().ok()
+    };
+    let ms = if let Some(secs) = number_after("\"resets_in_seconds\"") {
+        secs.saturating_mul(1000)
+    } else {
+        let resets_at = number_after("\"resets_at\"")?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        resets_at.saturating_sub(now).saturating_mul(1000)
+    };
+    // A reset that is already due says nothing about how long to wait, so
+    // leave the choice to Retry-After or the default cooldown.
+    (ms > 0).then_some(ms)
+}
+
 /// Try to extract a Retry-After value (in milliseconds) from an error message.
 /// Looks for patterns like `Retry-After: 5` or `retry_after: 2.5` in the error string.
 fn parse_retry_after_ms(err: &anyhow::Error) -> Option<u64> {
@@ -2214,6 +2243,11 @@ impl ReliableModelProvider {
     /// Default cooldown after a retryable 429 when Retry-After is absent.
     const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(10);
 
+    /// Upper bound on a cooldown taken from a quota's stated reset time.
+    /// Long enough for a rolling five-hour subscription window, short
+    /// enough that a wrong or stale value cannot sideline a provider for days.
+    const STATED_RESET_COOLDOWN_CAP: Duration = Duration::from_secs(6 * 60 * 60);
+
     /// Minimum wait between attempts after an overload when no Retry-After
     /// is parsed. Overload sheds typically outlast one round trip.
     const OVERLOAD_BACKOFF_FLOOR_MS: u64 = 2_000;
@@ -2368,8 +2402,11 @@ impl ReliableModelProvider {
     }
 
     fn set_rate_limit_cooldown(&self, cooldown_key: &str, err: &anyhow::Error) -> Duration {
-        let cooldown = parse_retry_after_ms(err)
-            .map(|ms| Duration::from_millis(ms.min(60_000)))
+        // A quota that says when it resets is out until then: re-trying it on
+        // every call before that only adds a refused round trip and latency.
+        let cooldown = parse_stated_reset_ms(err)
+            .map(|ms| Duration::from_millis(ms).min(Self::STATED_RESET_COOLDOWN_CAP))
+            .or_else(|| parse_retry_after_ms(err).map(|ms| Duration::from_millis(ms.min(60_000))))
             .unwrap_or(Self::RATE_LIMIT_COOLDOWN);
 
         let mut cooldowns = self
@@ -2744,6 +2781,15 @@ impl ModelProvider for ReliableModelProvider {
                                 if has_typed_non_retryable_marker(&e) {
                                     terminal_provider_keys.insert(entry.cooldown_key.clone());
                                 }
+                                // A quota refusal that states its reset time
+                                // keeps the provider out until then, not only
+                                // for this call.
+                                if rate_limited
+                                    && self.model_providers.len() > 1
+                                    && parse_stated_reset_ms(&e).is_some()
+                                {
+                                    self.cool_down_rate_limited_provider(entry, served_model, &e);
+                                }
                                 final_cause = Some(e);
                                 final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
@@ -3057,6 +3103,15 @@ impl ModelProvider for ReliableModelProvider {
                                 );
                                 if has_typed_non_retryable_marker(&e) {
                                     terminal_provider_keys.insert(entry.cooldown_key.clone());
+                                }
+                                // A quota refusal that states its reset time
+                                // keeps the provider out until then, not only
+                                // for this call.
+                                if rate_limited
+                                    && self.model_providers.len() > 1
+                                    && parse_stated_reset_ms(&e).is_some()
+                                {
+                                    self.cool_down_rate_limited_provider(entry, served_model, &e);
                                 }
                                 final_cause = Some(e);
                                 final_cause_provider = Some(entry.candidate_name().to_string());
@@ -3507,6 +3562,15 @@ impl ModelProvider for ReliableModelProvider {
                                 if has_typed_non_retryable_marker(&e) {
                                     terminal_provider_keys.insert(entry.cooldown_key.clone());
                                 }
+                                // A quota refusal that states its reset time
+                                // keeps the provider out until then, not only
+                                // for this call.
+                                if rate_limited
+                                    && self.model_providers.len() > 1
+                                    && parse_stated_reset_ms(&e).is_some()
+                                {
+                                    self.cool_down_rate_limited_provider(entry, served_model, &e);
+                                }
                                 final_cause = Some(e);
                                 final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
@@ -3883,6 +3947,15 @@ impl ModelProvider for ReliableModelProvider {
                                 );
                                 if has_typed_non_retryable_marker(&e) {
                                     terminal_provider_keys.insert(entry.cooldown_key.clone());
+                                }
+                                // A quota refusal that states its reset time
+                                // keeps the provider out until then, not only
+                                // for this call.
+                                if rate_limited
+                                    && self.model_providers.len() > 1
+                                    && parse_stated_reset_ms(&e).is_some()
+                                {
+                                    self.cool_down_rate_limited_provider(entry, served_model, &e);
                                 }
                                 final_cause = Some(e);
                                 final_cause_provider = Some(entry.candidate_name().to_string());
@@ -9315,6 +9388,157 @@ mod tests {
             !model_provider.provider_cooldown_active("primary"),
             "zero-length cooldown should expire and be removed on read"
         );
+    }
+
+    /// The 429 body OpenAI Codex returns when a subscription seat's rolling
+    /// window is used up, as the shared `api_error` renders it.
+    const CODEX_USAGE_LIMIT_429: &str = "OpenAI Codex API error (429 Too Many Requests): {\"error\":{\"type\":\"usage_limit_reached\",\"message\":\"The usage limit has been reached\",\"plan_type\":\"team\",\"limit_window_minutes\":300,\"resets_in_seconds\":7144}}";
+
+    #[test]
+    fn stated_reset_is_read_from_the_quota_body() {
+        let codex = anyhow::Error::msg(CODEX_USAGE_LIMIT_429);
+        assert_eq!(parse_stated_reset_ms(&codex), Some(7_144_000));
+
+        let in_ten_minutes = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 600;
+        let at = anyhow::Error::msg(format!(
+            "429 Too Many Requests: {{\"error\":{{\"resets_at\":{in_ten_minutes}}}}}"
+        ));
+        let ms = parse_stated_reset_ms(&at).unwrap();
+        assert!((595_000..=600_000).contains(&ms), "{ms}");
+
+        let plain = anyhow::Error::msg("429 Too Many Requests, Retry-After: 30");
+        assert_eq!(parse_stated_reset_ms(&plain), None);
+
+        let due_now = anyhow::Error::msg("429: {\"resets_in_seconds\":0}");
+        assert_eq!(parse_stated_reset_ms(&due_now), None);
+        let in_the_past = anyhow::Error::msg("429: {\"resets_at\":1000}");
+        assert_eq!(parse_stated_reset_ms(&in_the_past), None);
+    }
+
+    #[test]
+    fn a_stated_reset_sets_a_long_bounded_cooldown() {
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(MockModelProvider {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    fail_until_attempt: 0,
+                    response: "ok",
+                    error: "boom",
+                }),
+            )],
+            0,
+            1,
+        );
+
+        let codex = anyhow::Error::msg(CODEX_USAGE_LIMIT_429);
+        assert_eq!(
+            model_provider.set_rate_limit_cooldown("primary", &codex),
+            Duration::from_secs(7144)
+        );
+
+        let days = anyhow::Error::msg("429: {\"resets_in_seconds\":999999}");
+        assert_eq!(
+            model_provider.set_rate_limit_cooldown("primary", &days),
+            ReliableModelProvider::STATED_RESET_COOLDOWN_CAP
+        );
+
+        // A reset already in the past leaves Retry-After in charge.
+        let stale = anyhow::Error::msg("429: {\"resets_at\":1000}, Retry-After: 30");
+        assert_eq!(
+            model_provider.set_rate_limit_cooldown("primary", &stale),
+            Duration::from_secs(30)
+        );
+
+        // Retry-After keeps its own, shorter cap.
+        let retry_after = anyhow::Error::msg("429 Too Many Requests, Retry-After: 600");
+        assert_eq!(
+            model_provider.set_rate_limit_cooldown("primary", &retry_after),
+            Duration::from_secs(60)
+        );
+    }
+
+    /// Two calls through a primary that keeps refusing with `error` and a
+    /// working fallback; returns how often the primary was tried.
+    async fn primary_calls_over_two_turns(error: &'static str) -> (usize, bool) {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&primary_calls),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error,
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: 0,
+                        response: "from fallback",
+                        error: "fallback down",
+                    }),
+                ),
+            ],
+            2,
+            1,
+        );
+        for _ in 0..2 {
+            let reply = model_provider
+                .simple_chat("hello", "test", Some(0.0))
+                .await
+                .unwrap();
+            assert_eq!(reply, "from fallback");
+        }
+        (
+            primary_calls.load(Ordering::SeqCst),
+            model_provider.provider_cooldown_active("primary"),
+        )
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_seat_is_skipped_until_its_stated_reset() {
+        // Retryable classification (the type string alone): the cooldown now
+        // lasts until the stated reset instead of ten seconds, so the second
+        // turn goes straight to the fallback.
+        let (calls, cooling) = primary_calls_over_two_turns(CODEX_USAGE_LIMIT_429).await;
+        assert_eq!(
+            calls, 1,
+            "the second turn must not re-try the exhausted seat"
+        );
+        assert!(cooling);
+    }
+
+    #[tokio::test]
+    async fn a_business_quota_refusal_with_a_stated_reset_is_skipped_until_then() {
+        // Non-retryable classification (business-quota wording): it already
+        // moved on at once; with a stated reset it now also stays out.
+        let (calls, cooling) = primary_calls_over_two_turns(
+            "API error (429 Too Many Requests): {\"error\":{\"type\":\"insufficient_quota\",\"resets_in_seconds\":600}}",
+        )
+        .await;
+        assert_eq!(calls, 1);
+        assert!(cooling);
+    }
+
+    #[tokio::test]
+    async fn a_business_quota_refusal_without_a_reset_is_still_tried_each_turn() {
+        // Unchanged: no stated reset, no cooldown; one attempt per turn.
+        let (calls, cooling) = primary_calls_over_two_turns(
+            "API error (429 Too Many Requests): {\"error\":{\"type\":\"insufficient_quota\"}}",
+        )
+        .await;
+        assert_eq!(calls, 2);
+        assert!(!cooling);
     }
 
     #[tokio::test]
