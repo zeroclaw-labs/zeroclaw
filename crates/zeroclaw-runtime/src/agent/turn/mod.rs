@@ -2974,7 +2974,7 @@ async fn run_tool_call_loop_impl<'a>(
             }
             Err(e) => {
                 let settlement_error =
-                    crate::agent::cost::settle_provider_attempts(&attempts, None)
+                    crate::agent::cost::settle_interrupted_provider_attempts(&attempts)
                         .await
                         .err();
                 // This iteration's attempts never reach an accepted response
@@ -11404,6 +11404,194 @@ mod tool_lifecycle_abandonment_tests {
         tools: Vec<Box<dyn crate::tools::Tool>>,
     ) -> crate::tools::scoped::ScopedToolRegistry {
         crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools)
+    }
+
+    #[derive(Default)]
+    struct ObservedTurnSettlement {
+        settlements: Mutex<Vec<zeroclaw_goal::accounting::GoalOperationSettlement>>,
+        releases: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl zeroclaw_goal::accounting::GoalOperationAccounting for ObservedTurnSettlement {
+        async fn admit(
+            &self,
+            _: zeroclaw_goal::accounting::GoalOperationRequest,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn settle(
+            &self,
+            settlement: zeroclaw_goal::accounting::GoalOperationSettlement,
+        ) -> anyhow::Result<()> {
+            self.settlements.lock().unwrap().push(settlement);
+            Ok(())
+        }
+
+        async fn release_unstarted(&self) -> anyhow::Result<()> {
+            self.releases
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn pricing_complete(&self) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    struct CancelDuringDispatchProvider {
+        token: CancellationToken,
+        streaming: bool,
+        constructed: Arc<std::sync::atomic::AtomicBool>,
+        polled: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for CancelDuringDispatchProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "cancel-during-dispatch"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for CancelDuringDispatchProvider {
+        fn supports_streaming(&self) -> bool {
+            self.streaming
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            self.streaming
+        }
+
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            unreachable!("the fixture uses structured chat")
+        }
+
+        async fn chat(
+            &self,
+            _: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.constructed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.token.cancel();
+            std::future::pending().await
+        }
+
+        fn stream_chat(
+            &self,
+            _: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+            _: zeroclaw_api::model_provider::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_api::model_provider::StreamResult<zeroclaw_api::model_provider::StreamEvent>,
+        > {
+            self.constructed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.token.cancel();
+            let polled = Arc::clone(&self.polled);
+            Box::pin(futures_util::stream::poll_fn(move |_| {
+                polled.store(true, std::sync::atomic::Ordering::SeqCst);
+                std::task::Poll::Pending
+            }))
+        }
+    }
+
+    async fn run_cancelled_goal_turn(streaming: bool) -> (bool, bool, Arc<ObservedTurnSettlement>) {
+        use std::sync::atomic::Ordering;
+
+        let token = CancellationToken::new();
+        let constructed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let provider = CancelDuringDispatchProvider {
+            token: token.clone(),
+            streaming,
+            constructed: Arc::clone(&constructed),
+            polled: Arc::clone(&polled),
+        };
+        let accounting = Arc::new(ObservedTurnSettlement::default());
+        let registry = registry_with(Vec::new());
+        let observer = NoopObserver;
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let mut history = vec![ChatMessage::user("hi")];
+        let (tx, _rx) = tokio::sync::mpsc::channel(128);
+        let error = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+            .scope(
+                Some(accounting.clone()),
+                run_scripted_loop_with_events(
+                    &provider,
+                    &registry,
+                    &observer,
+                    None,
+                    &pacing,
+                    "interrupted-dispatch",
+                    false,
+                    Some(token),
+                    &mut history,
+                    100_000,
+                    None,
+                    streaming.then_some(tx),
+                ),
+            )
+            .await
+            .expect_err("the provider cancels the turn");
+        assert!(is_tool_loop_cancelled(&error), "{error:#}");
+        (
+            constructed.load(Ordering::SeqCst),
+            polled.load(Ordering::SeqCst),
+            accounting,
+        )
+    }
+
+    fn assert_unknown_settlement(accounting: &ObservedTurnSettlement) {
+        use std::sync::atomic::Ordering;
+
+        let settlements = accounting.settlements.lock().unwrap();
+        assert_eq!(settlements.len(), 1);
+        assert_eq!(
+            settlements[0].accounting_state,
+            crate::control_plane::GoalAccountingState::OutcomeUnknown
+        );
+        assert!(settlements[0].events.is_empty());
+        assert_eq!(accounting.releases.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn goal_turn_unpolled_stream_constructor_settles_unknown() {
+        // A stream constructor can start provider work before its first poll.
+        for _ in 0..128 {
+            let (constructed, polled, accounting) = run_cancelled_goal_turn(true).await;
+            assert!(constructed, "the stream constructor must run");
+            if !polled {
+                assert_unknown_settlement(&accounting);
+                return;
+            }
+        }
+        panic!("no cancellation won before the stream's first poll");
+    }
+
+    #[tokio::test]
+    async fn goal_turn_interrupted_non_streaming_dispatch_settles_unknown() {
+        let (constructed, _, accounting) = run_cancelled_goal_turn(false).await;
+        assert!(constructed, "the non-streaming provider must be entered");
+        assert_unknown_settlement(&accounting);
     }
 
     struct FailingTurnSettlement;

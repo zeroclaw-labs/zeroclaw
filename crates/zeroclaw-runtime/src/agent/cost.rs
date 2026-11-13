@@ -686,9 +686,10 @@ pub(crate) fn with_visible_context(error: anyhow::Error, context: &str) -> anyho
     error.context(VisibleErrorContext(format!("{context}: {detail}")))
 }
 
-/// An interrupted dispatch with no reported leaves has an unknown outcome,
-/// rather than a known missing usage report. Known leaves follow normal
-/// settlement and retain their reported lower bounds.
+/// A dispatch entered without a recorded physical leaf has an unknown outcome:
+/// a streaming constructor may send a request before its stream is polled.
+/// It is never reported as missing usage or released. Known leaves follow
+/// normal settlement and retain their reported lower bounds.
 pub(crate) async fn settle_interrupted_provider_attempts(
     attempts: &[zeroclaw_providers::dispatch::AccountedAttempt],
 ) -> anyhow::Result<()> {
