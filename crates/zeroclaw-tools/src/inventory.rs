@@ -84,6 +84,9 @@ impl BuiltinToolCompilation {
                     OptInTool::CodexCli => cfg!(feature = "tool-codex-cli"),
                     OptInTool::GeminiCli => cfg!(feature = "tool-gemini-cli"),
                     OptInTool::OpenCodeCli => cfg!(feature = "tool-opencode-cli"),
+                    // Web search has no owner feature beyond its own: `compiled()`
+                    // already carries `tools-external`.
+                    OptInTool::WebSearch => true,
                 };
                 owner_compiled && tool.compiled()
             }

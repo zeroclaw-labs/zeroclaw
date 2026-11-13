@@ -4768,7 +4768,11 @@ mod tests {
     async fn patch_enabling_an_opt_in_tool_follows_whether_the_build_carries_it() {
         use zeroclaw_config::opt_in_tools::OptInTool;
         let tmp = tempfile::tempdir().unwrap();
-        let config = temp_config(&tmp);
+        let mut config = temp_config(&tmp);
+        // `[web_search]` defaults to enabled and reports its own
+        // tool_compiled_out line in lean builds; this test counts the
+        // microsoft365 warning only.
+        config.web_search.enabled = false;
         config.save().await.unwrap();
         let state = test_state(config);
         let (status, json) = response_json(

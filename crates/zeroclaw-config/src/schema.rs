@@ -24098,6 +24098,24 @@ impl Config {
                 format!("{section}.enabled"),
             ));
         }
+        // Web search defaults to enabled, so unlike the sections above its
+        // absence in a lean build is the norm, not a config written for a
+        // fuller build — report it the same way rather than dropping it
+        // silently. It stands outside `OptInTool::ALL` because the inventory
+        // files `web_search_tool` under `External`; see the variant's note.
+        let web_search = crate::opt_in_tools::OptInTool::WebSearch;
+        if !web_search.compiled() && web_search.enabled_in(self) {
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                crate::validation_warnings::TOOL_COMPILED_OUT,
+                format!(
+                    "[web_search] is enabled, but this build was compiled without the \
+                     `tools-external` feature, so the tool is unavailable and its settings \
+                     are not checked. Use a build that includes `tools-external` (the \
+                     `tools-compat` bundle), or disable the section."
+                ),
+                "web_search.enabled".to_string(),
+            ));
+        }
     }
 
     fn collect_codex_cli_extra_arg_warnings(
@@ -40470,8 +40488,13 @@ runtime_profile = "default"
     )))]
     #[test]
     async fn a_lean_build_validates_enabled_sections_for_tools_it_lacks() {
+        let mut quiet = Config::default();
+        // `[web_search]` defaults to enabled and reports compiled out in a
+        // build without `tools-external`; this assertion is about the
+        // sections enabled below, so keep the default noise out.
+        quiet.web_search.enabled = false;
         assert!(
-            !Config::default()
+            !quiet
                 .collect_warnings()
                 .iter()
                 .any(|warning| warning.code == crate::validation_warnings::TOOL_COMPILED_OUT),
@@ -40479,6 +40502,7 @@ runtime_profile = "default"
         );
 
         let mut config = Config::default();
+        config.web_search.enabled = false;
         config.microsoft365.enabled = true;
         config.project_intel.enabled = true;
         config.project_intel.templates_dir = Some("/nonexistent/zeroclaw-templates".into());
@@ -40515,6 +40539,10 @@ runtime_profile = "default"
     async fn google_workspace_allowlist_is_checked_only_where_the_tool_is_compiled() {
         use crate::opt_in_tools::OptInTool;
         let mut config = Config::default();
+        // `[web_search]` defaults to enabled and stands outside this test's
+        // focus; it reports compiled out in any build without
+        // `tools-external`, which the assertion below is not about.
+        config.web_search.enabled = false;
         config.google_workspace.enabled = true;
         config.google_workspace.allowed_services = vec!["drive".into()];
         config.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
@@ -40546,6 +40574,28 @@ runtime_profile = "default"
         }
     }
 
+    /// `web_search` defaults to enabled, so a build without `tools-external`
+    /// must say the tool is compiled out instead of silently dropping it;
+    /// a build that carries the feature reports nothing.
+    #[test]
+    async fn web_search_section_reports_compiled_out_without_tools_external() {
+        use crate::opt_in_tools::OptInTool;
+        let mut config = Config::default();
+        config.web_search.enabled = true;
+
+        let compiled_out: Vec<String> = config
+            .collect_warnings()
+            .into_iter()
+            .filter(|warning| warning.code == crate::validation_warnings::TOOL_COMPILED_OUT)
+            .map(|warning| warning.path)
+            .collect();
+        if OptInTool::WebSearch.compiled() {
+            assert!(compiled_out.is_empty(), "{compiled_out:?}");
+        } else {
+            assert_eq!(compiled_out, ["web_search.enabled"]);
+        }
+    }
+
     /// The counterpart in a build that carries the tools: their settings are
     /// still checked, and nothing is reported as compiled out.
     #[cfg(all(
@@ -40568,6 +40618,10 @@ runtime_profile = "default"
         ];
         for (field, enable) in cases {
             let mut config = Config::default();
+            // `[web_search]` defaults to enabled and stands outside this
+            // test's focus; in a build without `tools-external` it would
+            // report compiled out and trip the assertion below.
+            config.web_search.enabled = false;
             enable(&mut config);
             let err = config
                 .validate()
@@ -54029,6 +54083,9 @@ group_policy = "all"
 
     fn suppress_semantic_memory_warning(config: &mut Config) {
         config.memory.search_mode = SearchMode::Bm25;
+        // Default-on `[web_search]` reports TOOL_COMPILED_OUT in builds
+        // without `tools-external`; these tests count unrelated warnings.
+        config.web_search.enabled = false;
     }
 
     #[test]
