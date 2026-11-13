@@ -5614,9 +5614,7 @@ mod tests {
         use wiremock::matchers::{body_partial_json, method, path, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
         use zeroclaw_api::channel::{Channel, SendMessage};
-        use zeroclaw_config::schema::{
-            AliasedAgentConfig, Config, MatrixConfig, OpenAITtsProviderConfig, TtsProviderConfig,
-        };
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, MatrixConfig};
 
         use super::super::MatrixChannel;
 
@@ -5722,21 +5720,27 @@ mod tests {
         fn config_with_tts(uri: String) -> Config {
             let mut config = Config::default();
             config.tts.enabled = true;
-            config.providers.tts.openai.insert(
-                "local".to_string(),
-                OpenAITtsProviderConfig {
-                    base: TtsProviderConfig {
-                        api_key: Some("test-key".to_string()),
-                        uri: Some(uri),
-                        response_format: Some("opus".to_string()),
-                        ..TtsProviderConfig::default()
-                    },
-                },
+            config.providers.connections.insert(
+                "speech.local".into(),
+                serde_json::from_value(serde_json::json!({
+                    "kind": "openai",
+                    "uri": uri.strip_suffix("/audio/speech").expect("OpenAI speech endpoint"),
+                    "auth": {"mode": "api_key", "api_key": "test-key"}
+                }))
+                .expect("canonical speech connection"),
+            );
+            config.providers.models.insert_canonical_model(
+                "speech.local".into(),
+                serde_json::from_value(serde_json::json!({
+                    "capability": "tts", "provider": "speech.local", "model": "tts-1",
+                    "options": {"response_format": "opus"}
+                }))
+                .expect("canonical speech model"),
             );
             config.agents.insert(
                 "default".to_string(),
                 AliasedAgentConfig {
-                    tts_provider: "openai.local".into(),
+                    tts_provider: "speech.local".into(),
                     ..AliasedAgentConfig::default()
                 },
             );

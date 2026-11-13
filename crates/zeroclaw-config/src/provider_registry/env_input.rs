@@ -182,8 +182,30 @@ pub(crate) fn remap_after_promotion(source: &Config, candidate: &mut Config) -> 
 
 pub(crate) fn set(config: &mut Config, path: &str, value: &str, restore: bool) -> Result<()> {
     let mut document = serde_json::to_value(&config.providers)?;
-    set_document(&mut document, path, value, restore)?;
-    config.providers = serde_json::from_value(document)?;
+    if restore {
+        restore_document(&mut document, path, value)?;
+        config.providers = serde_json::from_value(document)?;
+        return Ok(());
+    }
+    // Let the real schema select the type. String fields must preserve values
+    // such as numeric model IDs and JSON-looking credentials verbatim.
+    let literal = if value.is_empty() {
+        Value::Null
+    } else {
+        Value::String(value.to_owned())
+    };
+    set_document(&mut document, path, literal.clone(), None)?;
+    let candidate = serde_json::from_value(document.clone());
+    config.providers = match candidate {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            let parsed = serde_json::from_str::<Value>(value)
+                .map_err(|_| anyhow::Error::msg(error.to_string()))?;
+            ensure!(!parsed.is_null() && parsed != literal, "{error}");
+            set_document(&mut document, path, parsed, None)?;
+            serde_json::from_value(document)?
+        }
+    };
     Ok(())
 }
 
@@ -196,13 +218,23 @@ pub(crate) fn restore(
         .iter()
         .filter(|(path, _)| path.starts_with("/providers/"))
     {
-        set_document(&mut document, path, value, true)?;
+        restore_document(&mut document, path, value)?;
     }
     config.providers = serde_json::from_value(document)?;
     Ok(())
 }
 
-fn set_document(document: &mut Value, path: &str, value: &str, restore: bool) -> Result<()> {
+fn restore_document(document: &mut Value, path: &str, value: &str) -> Result<()> {
+    let saved: Value = serde_json::from_str(value)?;
+    set_document(document, path, saved["value"].clone(), Some(&saved))
+}
+
+fn set_document(
+    document: &mut Value,
+    path: &str,
+    value: Value,
+    saved: Option<&Value>,
+) -> Result<()> {
     let pointer = path
         .strip_prefix("/providers/")
         .ok_or_else(|| anyhow::Error::msg("invalid registry override path"))?;
@@ -233,16 +265,6 @@ fn set_document(document: &mut Value, path: &str, value: &str, restore: bool) ->
     let leaf = parts
         .last()
         .ok_or_else(|| anyhow::Error::msg("missing registry override field"))?;
-    let saved: Option<Value> = restore.then(|| serde_json::from_str(value)).transpose()?;
-    let value = if let Some(saved) = &saved {
-        saved["value"].clone()
-    } else if value.is_empty() {
-        Value::Null
-    } else if value == "null" {
-        Value::String(value.to_owned())
-    } else {
-        serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_owned()))
-    };
     let map = node
         .as_object_mut()
         .ok_or_else(|| anyhow::Error::msg("registry override parent must be a table"))?;
@@ -335,6 +357,38 @@ mod tests {
         assert_eq!(
             value["connections"]["gateway.Prod"]["uri"],
             "https://updated.invalid/v1"
+        );
+    }
+
+    #[test]
+    fn string_fields_preserve_json_looking_environment_values() {
+        let mut config = fixture();
+        for tail in [
+            "providers__connections__gateway.Prod__auth__api_key",
+            "providers__models__chat.Fast.v2__model",
+        ] {
+            let path = path(&config, tail).unwrap();
+            let saved = snapshot(&config, &path).unwrap();
+            for value in ["123", "false", "null", "[1,2]", "\"quoted\""] {
+                set(&mut config, &path, value, false).unwrap();
+                let document = serde_json::to_value(&config.providers).unwrap();
+                assert_eq!(
+                    document.pointer(path.strip_prefix("/providers").unwrap()),
+                    Some(&Value::String(value.into()))
+                );
+            }
+            set(&mut config, &path, &saved, true).unwrap();
+        }
+        let path = path(
+            &config,
+            "providers__models__chat.Fast.v2__options__temperature",
+        )
+        .unwrap();
+        set(&mut config, &path, "0.25", false).unwrap();
+        let document = serde_json::to_value(&config.providers).unwrap();
+        assert_eq!(
+            document["models"]["chat.Fast.v2"]["options"]["temperature"],
+            serde_json::json!(0.25)
         );
     }
 

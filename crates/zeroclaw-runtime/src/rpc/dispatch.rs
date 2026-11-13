@@ -45148,68 +45148,46 @@ model = "before"
     }
 
     #[tokio::test]
-    async fn rpc_model_edit_updates_effective_nested_id_and_keeps_inherited_model_editable() {
+    async fn rpc_model_edit_updates_canonical_model_definition() {
+        use zeroclaw_config::provider_registry::editor;
+
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = make_model_refresh_test_config(&tmp);
-        config
-            .providers
-            .models
-            .ensure("openai", "test-provider")
-            .unwrap()
-            .models
-            .insert(
-                "default".into(),
-                zeroclaw_config::schema::ModelEntryConfig {
-                    id: Some("nested-before".into()),
-                    ..Default::default()
-                },
-            );
+        config.providers = toml::from_str(
+            r#"
+[connections."gateway.test"]
+kind = "custom"
+uri = "http://127.0.0.1:1/v1"
+auth = { mode = "api_key", api_key = "test-key" }
+[models."chat.test"]
+capability = "chat"
+provider = "gateway.test"
+model = "before"
+options = { temperature = 0.2 }
+"#,
+        )
+        .unwrap();
+        config.agents.get_mut("test-agent").unwrap().model_provider = "chat.test".into();
+        let expected = editor::snapshot(&config).unwrap();
+        let mut registry = expected.clone();
+        registry["models"]["chat.test"]["model"] = json!("after");
         let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "before"
+        );
         dispatcher
-            .handle_config_set(&json!({
-                "prop": "providers.models.openai.test-provider.model", "value": "nested-after"
-            }))
+            .handle_config_registry_set(&json!({"expected": expected, "registry": registry}))
             .await
-            .unwrap();
-        let saved = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
-        let reloaded: Config = toml::from_str(&saved).unwrap();
+            .expect("canonical model edit must rebuild the active session");
         assert_eq!(
-            reloaded
-                .resolve_model_selection("openai.test-provider")
-                .unwrap()
-                .model_id
-                .as_deref(),
-            Some("nested-after")
+            model_name_for_session(&dispatcher, &session_id).await,
+            "after"
         );
         assert_eq!(
-            reloaded
-                .providers
-                .models
-                .find("openai", "test-provider")
-                .unwrap()
-                .model
-                .as_deref(),
-            Some("old-model")
-        );
-        let mut inherited = reloaded;
-        inherited
-            .providers
-            .models
-            .ensure("openai", "test-provider")
-            .unwrap()
-            .models
-            .get_mut("default")
-            .unwrap()
-            .id = None;
-        let path = "providers.models.openai.test-provider.model";
-        RpcDispatcher::stage_config_set(&mut inherited, path, &json!("inherited-after")).unwrap();
-        assert_eq!(
-            inherited
-                .resolve_model_selection("openai.test-provider")
-                .unwrap()
-                .model_id
-                .as_deref(),
-            Some("inherited-after")
+            temperature_for_session(&dispatcher, &session_id).await,
+            Some(0.2)
         );
     }
 

@@ -124,7 +124,7 @@ fn project_provider_tables(
             connection["auth"] = serde_json::json!({"mode":"api_key","api_key":api_key});
         }
         if let Some(command) = base.binary_path.as_deref()
-            && matches!(family, "edge" | "piper")
+            && family == "edge"
         {
             connection["api"] = serde_json::json!({"tts":{"command":command}});
         }
@@ -1188,6 +1188,45 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tts_binary_path_is_projected_only_for_command_based_connections() {
+        let config: Config = toml::from_str(
+            r#"
+            schema_version = 3
+            [providers.tts.piper.local]
+            binary_path = "/unused/piper"
+            uri = "http://127.0.0.1:5000"
+            model = "en_US-lessac-medium"
+            voice = "speaker"
+            [providers.tts.edge.local]
+            binary_path = "/custom/edge-tts"
+        "#,
+        )
+        .unwrap();
+        let registry = serde_json::to_value(config.provider_registry().unwrap()).unwrap();
+        assert!(
+            registry["connections"]["legacy.tts.piper.local"]
+                .get("api")
+                .is_none()
+        );
+        assert_eq!(
+            registry["connections"]["legacy.tts.piper.local"]["uri"],
+            "http://127.0.0.1:5000"
+        );
+        assert_eq!(
+            registry["models"]["piper.local"]["model"],
+            "en_US-lessac-medium"
+        );
+        assert_eq!(
+            registry["models"]["piper.local"]["options"]["voice"],
+            "speaker"
+        );
+        assert_eq!(
+            registry["connections"]["legacy.tts.edge.local"]["api"]["tts"]["command"],
+            "/custom/edge-tts"
+        );
+    }
 
     #[test]
     fn persisted_decision_migration_matches_configuration_admission() {

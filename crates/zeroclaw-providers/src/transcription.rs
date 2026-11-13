@@ -2666,9 +2666,8 @@ mod tests {
         .err()
         .unwrap();
         assert!(
-            err.to_string()
-                .contains("no transcription provider registered"),
-            "expected 'no transcription provider registered' from manager safety net, got: {err}"
+            err.to_string().contains("no ASR model is available"),
+            "expected no available ASR model from manager safety net, got: {err}"
         );
     }
 
