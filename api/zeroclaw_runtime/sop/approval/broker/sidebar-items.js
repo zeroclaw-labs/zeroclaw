@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["ApprovalNoticeKind","BrokerOutcome"],"struct":["ApprovalBroker","GateNotice","NoopRouteAdapter"],"trait":["ApprovalRouteAdapter"]};

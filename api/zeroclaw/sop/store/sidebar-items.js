@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["SOP_STORE_VERSION"],"enum":["ProposalKind","ProposalStatus","StoreError"],"fn":["build_run_store"],"mod":["model","sqlite"],"struct":["ClaimToken","InMemoryRunStore","PersistedRun","ProposalRecord","RetentionPolicy","SopEventRecord","SqliteRunStore"],"trait":["SopRunStore"]};

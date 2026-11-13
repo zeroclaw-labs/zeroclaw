@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["TurnError","TurnOutcome"],"fn":["execute_turn","execute_turn_prepared"],"struct":["TurnAttribution","TurnRefusal"],"type":["TurnAdmission"]};

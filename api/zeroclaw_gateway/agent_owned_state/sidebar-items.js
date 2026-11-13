@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["archive_agent_workspace","cascade_owned_state","cascade_rename_agent","live_acp_session_count","plan_agent_delete","plan_agent_delete_with_acp_count"],"struct":["AgentDeletePreflight","OwnedStateReport","RenameStateReport","WorkspaceArchiveReport"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["WireError","WireOp"],"fn":["apply_wire"],"struct":["WireEdit"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["BuiltinCommandId","CommandExecution","CommandSurface"],"fn":["builtin_commands","command_by_name","commands_for_surface","normalize_command_name","parse_command_token","usage_for_surface"],"struct":["CommandSpec","ParsedCommandToken"]};

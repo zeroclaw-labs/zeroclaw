@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["ApprovalRouteIssue"],"fn":["parse_approval_route","unresolvable_approval_routes"],"struct":["ChannelRouteAdapter"]};

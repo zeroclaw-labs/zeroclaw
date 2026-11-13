@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["NodeType","Relation"],"struct":["GraphStats","KnowledgeEdge","KnowledgeGraph","KnowledgeNode","SearchResult"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["SOP_CONTROL_TOOLS"],"fn":["active_headless_step_scope","resolve_active_step_scope","with_active_headless_step_scope","with_inherited_headless_step_scope"],"struct":["ActiveStepScope","HeadlessStepScope"],"type":["ActiveScopeHandle"]};

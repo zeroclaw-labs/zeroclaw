@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["DashboardCaller","SessionRejection"],"fn":["layer"],"struct":["DashboardAuth","DashboardLayer","DashboardSessions","SessionAuth"]};

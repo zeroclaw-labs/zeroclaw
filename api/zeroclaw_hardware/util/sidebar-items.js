@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["is_serial_path_allowed","serial_open_baud","serial_path_allowlist_hint","should_open_serial_nonexclusive"]};

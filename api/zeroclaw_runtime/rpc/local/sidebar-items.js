@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["LocalRpcCallError"],"fn":["call_local","run_local_listener","run_local_listener_with_factory","run_local_listener_with_limits","socket_path"],"struct":["LocalListenerLimits","LocalTransport"]};

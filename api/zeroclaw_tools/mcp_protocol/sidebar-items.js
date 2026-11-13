@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["INTERNAL_ERROR","INVALID_PARAMS","INVALID_REQUEST","JSONRPC_VERSION","MCP_PROTOCOL_VERSION","METHOD_NOT_FOUND","PARSE_ERROR"],"struct":["JsonRpcError","JsonRpcRequest","JsonRpcResponse","McpToolDef","McpToolsListResult"]};

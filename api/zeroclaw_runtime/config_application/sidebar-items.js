@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["ConfigApplicationOutcome","ConfigApplicationReason","ConfigApplicationTarget"],"struct":["ConfigApplicationRecord","ConfigApplicationStatus","PublishedConfigRevision"]};

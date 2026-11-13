@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MAX_FALLBACK_DEPTH"],"enum":["TranscriptionProviderEntry"],"struct":["ChannelRef","ModelCostRatesByProvider","ModelProviderRef","ModelProviders","Providers","RiskProfileRef","RuntimeProfileRef","TranscriptionCostRatesByProvider","TranscriptionProviderRef","TranscriptionProviders","TtsCostRatesByProvider","TtsProviderRef","TtsProviders"]};

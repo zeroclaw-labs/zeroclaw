@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["Scope","ThreatKind"],"fn":["scan"],"struct":["Finding"]};

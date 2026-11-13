@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["RPC_PROTOCOL_VERSION"],"enum":["Method","MethodAuthz","RpcAccessPolicy"],"mod":["notification"],"struct":["RpcDispatcher"],"trait":["MethodAuthzExt"],"type":["LocalRpcSessionChannelFactory"]};

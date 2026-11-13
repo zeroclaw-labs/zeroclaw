@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["bump_component_restart","daemon_started_at","mark_component_error","mark_component_ok","mark_component_starting","snapshot","snapshot_json"],"struct":["ComponentHealth","HealthSnapshot"]};

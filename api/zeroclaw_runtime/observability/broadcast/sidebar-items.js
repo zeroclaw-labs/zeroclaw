@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["EVENT_CHANNEL_CAPACITY","EVENT_HISTORY_CAPACITY"],"fn":["history_events","is_public_event"],"struct":["BroadcastObserver","EventBuffer","EventBus"]};

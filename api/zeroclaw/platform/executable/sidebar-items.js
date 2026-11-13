@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["resolve_executable","resolve_executable_with_path"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["NAMES"],"fn":["subschema_for_named"]};
