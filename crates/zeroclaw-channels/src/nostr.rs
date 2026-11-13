@@ -13,6 +13,23 @@ enum NostrProtocol {
     Nip17,
 }
 
+/// Same pool as Telegram's receipt acks.
+const NOSTR_ACK_REACTIONS: &[&str] = &["⚡️", "👌", "👀", "🔥", "👍"];
+
+fn random_nostr_ack_reaction() -> &'static str {
+    NOSTR_ACK_REACTIONS[usize::from(rand::random::<u16>()) % NOSTR_ACK_REACTIONS.len()]
+}
+
+fn warn_ack_reaction_failed(error: &str) {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({"error": error})),
+        "Failed to send NIP-17 ack reaction"
+    );
+}
+
 /// Nostr channel supporting NIP-04 (legacy) and NIP-17 (gift-wrapped) private messages.
 /// Replies use the same protocol the sender used. Unsolicited sends default to NIP-17.
 pub struct NostrChannel {
@@ -26,6 +43,7 @@ pub struct NostrChannel {
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     /// Tracks last-seen protocol per sender pubkey so replies match.
     sender_protocols: Arc<RwLock<HashMap<PublicKey, NostrProtocol>>>,
+    ack_reactions: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
 impl NostrChannel {
@@ -56,7 +74,57 @@ impl NostrChannel {
             alias: alias.into(),
             peer_resolver,
             sender_protocols: Arc::new(RwLock::new(HashMap::new())),
+            ack_reactions: Arc::new(|| false),
         })
+    }
+
+    pub fn with_ack_reactions(mut self, enabled: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
+        self.ack_reactions = enabled;
+        self
+    }
+
+    /// `None` unless acks are on and the rumor is a NIP-17 chat message
+    /// (kind 14 text, kind 15 file).
+    async fn ack_reaction_wrap(&self, rumor: &UnsignedEvent) -> Result<Option<Event>> {
+        if !(self.ack_reactions)() || !matches!(rumor.kind.as_u16(), 14 | 15) {
+            return Ok(None);
+        }
+        // The sender controls the rumor JSON, including any `id` field.
+        let mut rumor = rumor.clone();
+        rumor.id = None;
+        let reaction = EventBuilder::reaction(
+            ReactionTarget {
+                event_id: rumor.id(),
+                public_key: rumor.pubkey,
+                coordinate: None,
+                kind: Some(rumor.kind),
+                relay_hint: None,
+            },
+            random_nostr_ack_reaction(),
+        )
+        .build(self.public_key);
+        let signer = self.client.signer().await?;
+        Ok(Some(
+            EventBuilder::gift_wrap(&signer, &rumor.pubkey, reaction, []).await?,
+        ))
+    }
+
+    /// Only the gift-wrap path calls this: a reaction to a NIP-04 DM would be public.
+    async fn send_ack_reaction_nonblocking(&self, rumor: &UnsignedEvent) {
+        let wrap = match self.ack_reaction_wrap(rumor).await {
+            Ok(Some(wrap)) => wrap,
+            Ok(None) => return,
+            Err(e) => {
+                warn_ack_reaction_failed(&e.to_string());
+                return;
+            }
+        };
+        let client = self.client.clone();
+        zeroclaw_spawn::spawn!(async move {
+            if let Err(e) = client.send_event(&wrap).await {
+                warn_ack_reaction_failed(&e.to_string());
+            }
+        });
     }
 
     /// Return the alias under `[channels.nostr.<alias>]` that this
@@ -285,6 +353,7 @@ impl Channel for NostrChannel {
                                         .write()
                                         .await
                                         .insert(sender, NostrProtocol::Nip17);
+                                    self.send_ack_reaction_nonblocking(&rumor).await;
                                     Some((
                                         event.id.to_hex(),
                                         sender.to_hex(),
@@ -548,6 +617,131 @@ mod tests {
         let map = ch.sender_protocols.read().await;
         let pk = Keys::generate().public_key();
         assert_eq!(map.get(&pk), None);
+    }
+
+    async fn test_channel(ack: bool) -> NostrChannel {
+        let keys = Keys::generate();
+        NostrChannel::new(
+            &keys.secret_key().to_secret_hex(),
+            vec![],
+            "nostr_test_alias",
+            Arc::new(Vec::new),
+        )
+        .await
+        .unwrap()
+        .with_ack_reactions(Arc::new(move || ack))
+    }
+
+    /// The reaction as the sender's client sees it after unwrapping.
+    async fn ack_seen_by_sender(
+        ch: &NostrChannel,
+        sender: &Keys,
+        rumor: &UnsignedEvent,
+    ) -> Option<UnsignedEvent> {
+        let wrap = ch.ack_reaction_wrap(rumor).await.unwrap()?;
+        assert_eq!(wrap.kind, Kind::GiftWrap);
+        assert_eq!(wrap.tags.public_keys().next(), Some(&sender.public_key()));
+        let unwrapped = UnwrappedGift::from_gift_wrap(sender, &wrap).await.unwrap();
+        assert_eq!(unwrapped.sender, ch.public_key);
+        Some(unwrapped.rumor)
+    }
+
+    #[tokio::test]
+    async fn ack_reaction_is_one_pool_emoji_gift_wrapped_to_sender() {
+        let ch = test_channel(true).await;
+        let sender = Keys::generate();
+        let mut dm =
+            EventBuilder::private_msg_rumor(ch.public_key, "hi").build(sender.public_key());
+
+        let reaction = ack_seen_by_sender(&ch, &sender, &dm).await.unwrap();
+        assert_eq!(reaction.kind, Kind::Reaction);
+        assert_eq!(reaction.pubkey, ch.public_key);
+        assert!(NOSTR_ACK_REACTIONS.contains(&reaction.content.as_str()));
+        assert_eq!(reaction.tags.event_ids().next(), Some(&dm.id()));
+        assert_eq!(
+            reaction.tags.public_keys().next(),
+            Some(&sender.public_key())
+        );
+        let k = reaction
+            .tags
+            .iter()
+            .find(|t| t.kind() == TagKind::k())
+            .and_then(|t| t.content());
+        assert_eq!(k, Some("14"));
+    }
+
+    #[tokio::test]
+    async fn ack_reaction_ignores_sender_supplied_rumor_id() {
+        let ch = test_channel(true).await;
+        let sender = Keys::generate();
+        let mut dm =
+            EventBuilder::private_msg_rumor(ch.public_key, "hi").build(sender.public_key());
+        let real_id = dm.id();
+        let mut spoofed = dm.clone();
+        spoofed.id = Some(EventId::all_zeros());
+
+        let reaction = ack_seen_by_sender(&ch, &sender, &spoofed).await.unwrap();
+        assert_eq!(reaction.tags.event_ids().next(), Some(&real_id));
+    }
+
+    #[tokio::test]
+    async fn no_ack_reaction_for_non_chat_rumors_or_when_disabled() {
+        let sender = Keys::generate();
+        let on = test_channel(true).await;
+        let reaction = EventBuilder::new(Kind::Reaction, "+").build(sender.public_key());
+        assert!(ack_seen_by_sender(&on, &sender, &reaction).await.is_none());
+
+        let off = NostrChannel::new(
+            &Keys::generate().secret_key().to_secret_hex(),
+            vec![],
+            "nostr_test_alias",
+            Arc::new(Vec::new),
+        )
+        .await
+        .unwrap();
+        let dm = EventBuilder::private_msg_rumor(off.public_key, "hi").build(sender.public_key());
+        assert!(ack_seen_by_sender(&off, &sender, &dm).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn ack_setting_is_read_per_message() {
+        let enabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ch = NostrChannel::new(
+            &Keys::generate().secret_key().to_secret_hex(),
+            vec![],
+            "nostr_test_alias",
+            Arc::new(Vec::new),
+        )
+        .await
+        .unwrap()
+        .with_ack_reactions({
+            let enabled = Arc::clone(&enabled);
+            Arc::new(move || enabled.load(std::sync::atomic::Ordering::SeqCst))
+        });
+        let sender = Keys::generate();
+        let dm = EventBuilder::private_msg_rumor(ch.public_key, "hi").build(sender.public_key());
+
+        assert!(ack_seen_by_sender(&ch, &sender, &dm).await.is_none());
+        enabled.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(ack_seen_by_sender(&ch, &sender, &dm).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn orchestrator_reactions_do_not_reach_nostr() {
+        // NIP-04 DMs and the orchestrator's ✅/⚠️ lifecycle both go through
+        // `add_reaction`, which must stay a no-op that sends nothing.
+        let ch = test_channel(true).await;
+        let sender = Keys::generate().public_key().to_hex();
+        ch.add_reaction(&sender, "any-message-id", "\u{2705}")
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn random_nostr_ack_reaction_is_from_pool() {
+        for _ in 0..128 {
+            assert!(NOSTR_ACK_REACTIONS.contains(&random_nostr_ack_reaction()));
+        }
     }
 
     #[tokio::test]
