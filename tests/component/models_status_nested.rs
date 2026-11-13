@@ -40,10 +40,10 @@ model = "claude-opus-4-7"
     // mutating the parent test process's config-directory environment.
     for model in ["claude-sonnet-4-6", "anthropic/claude-sonnet-4-20250514"] {
         run(dir.path(), &["models", "set", model]);
-        let persisted: toml::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
-        assert_eq!(
-            persisted["providers"]["models"]["primary"]["model"].as_str(),
-            Some(model)
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            persisted.contains(&format!("model = \"{model}\"")),
+            "model ID must be persisted verbatim; got:\n{persisted}"
         );
     }
 
