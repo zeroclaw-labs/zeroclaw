@@ -242,6 +242,12 @@ mod tests {
     }
 
     #[test]
+    fn object_array_accepts_empty_array() {
+        let s = coerce_for_set_prop(&serde_json::json!([]), Some(PropKind::ObjectArray)).unwrap();
+        assert_eq!(s, "[]");
+    }
+
+    #[test]
     fn bool_field_rejects_non_bool_string() {
         let err = coerce_for_set_prop(
             &serde_json::Value::String("yes".into()),

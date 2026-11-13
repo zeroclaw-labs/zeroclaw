@@ -225,6 +225,9 @@ jobs:
               --features plugins-wasm-cranelift \
               --lib 2>&1 | tee "$plugin_lib_log"
             plugin_lib_status=${PIPESTATUS[0]}
+            # The two runtime filters below only scope the step: the
+            # receipt-bound late_tool_search tests ignore themselves without
+            # the fixture receipt that only the Linux plugin job prepares.
             cargo nextest run --locked --no-fail-fast \
               -p zeroclaw-runtime \
               --features plugins-wasm-cranelift \
