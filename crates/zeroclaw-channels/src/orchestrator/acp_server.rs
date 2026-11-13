@@ -6030,9 +6030,9 @@ mod tests {
 
     #[test]
     fn handle_initialize_default_model_reflects_configured_provider() {
-        let mut config = Config::default();
-        config.providers = toml::from_str(
-            r#"
+        let config = Config {
+            providers: toml::from_str(
+                r#"
 [connections."gateway.ollama"]
 kind = "custom"
 uri = "http://127.0.0.1:1/v1"
@@ -6042,8 +6042,10 @@ capability = "chat"
 provider = "gateway.ollama"
 model = "llama3.2"
 "#,
-        )
-        .expect("canonical model fixture parses");
+            )
+            .expect("canonical model fixture parses"),
+            ..Default::default()
+        };
         let server = AcpServer::new(config, AcpServerConfig::default());
         let result = server.handle_initialize(&serde_json::json!({})).unwrap();
         assert_eq!(result["_meta"]["zeroclaw"]["defaultModel"], "llama3.2");
@@ -6051,12 +6053,12 @@ model = "llama3.2"
 
     #[test]
     fn handle_initialize_default_model_prefers_default_session_agent() {
-        let mut config = Config::default();
-        // The install-wide first configured model (the openai slot precedes
-        // ollama in slot order) differs from the default agent's entry, so the
-        // assertion proves the agent binding wins over the install-wide pick.
-        config.providers = toml::from_str(
-            r#"
+        let mut config = Config {
+            // The install-wide first configured model (the openai slot precedes
+            // ollama in slot order) differs from the default agent's entry, so the
+            // assertion proves the agent binding wins over the install-wide pick.
+            providers: toml::from_str(
+                r#"
 [connections."gateway.install"]
 kind = "custom"
 uri = "http://127.0.0.1:1/v1"
@@ -6073,8 +6075,10 @@ capability = "chat"
 provider = "gateway.secondary"
 model = "default-agent-model"
 "#,
-        )
-        .expect("canonical model fixture parses");
+            )
+            .expect("canonical model fixture parses"),
+            ..Default::default()
+        };
         config
             .agents
             .insert("first".to_string(), dispatchable_test_agent("chat.install"));
