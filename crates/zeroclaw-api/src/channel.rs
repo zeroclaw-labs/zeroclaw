@@ -1491,8 +1491,12 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
 
     /// Whether this channel can answer free-form (no-choices) `ask_user`
     /// questions via the standard `send` + `listen` flow. Channels that only
-    /// handle structured choices return `false` so callers fail fast with a
-    /// useful error instead of timing out on `listen`.
+    /// handle structured choices return `false`: callers then fail fast with a
+    /// useful error on a free-form question instead of timing out on `listen`,
+    /// and treat `Ok(None)` from [`Self::request_choice`] as the prompt being
+    /// closed without a choice rather than as a cue to fall back. Such a
+    /// channel must therefore return `Err` from `request_choice` when it cannot
+    /// show a choice prompt at all.
     fn supports_free_form_ask(&self) -> bool {
         true
     }

@@ -91,6 +91,19 @@ impl Channel for WsApprovalChannel {
         false
     }
 
+    /// The web dashboard has no choice prompt yet, so nothing is ever drawn
+    /// for a choice question. The trait default `Ok(None)` would read
+    /// to `ask_user` as the user dismissing a question they never saw, so
+    /// refuse instead and let the caller fail fast.
+    async fn request_choice(
+        &self,
+        _question: &str,
+        _choices: &[String],
+        _timeout: Duration,
+    ) -> anyhow::Result<Option<String>> {
+        anyhow::bail!("the web dashboard cannot show choice questions yet")
+    }
+
     /// Delegates to [`Self::request_approval_attributed`] and drops the
     /// provenance, so the prompt/timeout logic lives in exactly one place.
     async fn request_approval(
@@ -170,6 +183,74 @@ mod tests {
             "WsApprovalChannel must refuse free-form ask_user; \
              its send() is a no-op and listen() drops immediately"
         );
+    }
+
+    /// A dashboard chat has no choice prompt, so a choice question must fail
+    /// rather than come back as `Ok(None)`, which `ask_user` reports as the
+    /// user dismissing it. Nothing may be sent to the client either.
+    #[tokio::test]
+    async fn ws_approval_channel_refuses_choice_questions() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let pending = new_pending_approvals();
+        let channel = WsApprovalChannel::new(tx, Arc::clone(&pending), Duration::from_secs(30));
+
+        let err = channel
+            .request_choice(
+                "Pick one",
+                &["Yes".to_string(), "No".to_string()],
+                Duration::from_secs(30),
+            )
+            .await
+            .expect_err("the dashboard cannot show a choice question");
+        assert!(
+            err.to_string().contains("cannot show choice questions"),
+            "unexpected error: {err}"
+        );
+        assert!(rx.try_recv().is_err(), "nothing may reach the client");
+        assert!(pending.lock().is_empty());
+    }
+
+    /// End to end through the real tool: `ask_user` with choices on the `wss`
+    /// back-channel is a failure, never a `DISMISSED` success.
+    #[tokio::test]
+    async fn ask_user_with_choices_on_the_dashboard_fails_instead_of_reporting_a_dismissal() {
+        use zeroclaw_api::tool::Tool;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let channel: Arc<dyn Channel> = Arc::new(WsApprovalChannel::new(
+            tx,
+            new_pending_approvals(),
+            Duration::from_secs(30),
+        ));
+        let channels = Arc::new(parking_lot::RwLock::new(HashMap::from([(
+            "wss".to_string(),
+            channel,
+        )])));
+        let tool = zeroclaw_tools::ask_user::AskUserTool::new(
+            Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+            channels,
+        );
+
+        let result = tool
+            .execute(serde_json::json!({
+                "question": "Pick one",
+                "choices": ["Yes", "No"],
+                "timeout_secs": 30
+            }))
+            .await
+            .expect("ask_user reports channel errors in its result");
+
+        assert!(!result.success, "a question nobody saw is not answered");
+        let error = result.error.expect("the failure carries an error");
+        assert!(
+            error.contains("the web dashboard cannot show choice questions yet"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !result.output.to_string().contains("DISMISSED"),
+            "must not tell the agent the user dismissed it"
+        );
+        assert!(rx.try_recv().is_err(), "nothing may reach the client");
     }
 
     fn approval_request() -> ChannelApprovalRequest {
