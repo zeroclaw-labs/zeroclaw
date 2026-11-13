@@ -1165,6 +1165,18 @@ impl TranscriptionManager {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_test_provider(
+        mut self,
+        alias: &str,
+        provider: Box<dyn TranscriptionProvider>,
+    ) -> Self {
+        self.transcription_providers
+            .insert(alias.to_string(), provider);
+        self.agent_transcription_provider = alias.to_string();
+        self
+    }
+
     /// Build a `TranscriptionManager` from a `TranscriptionConfig`. The
     /// resolved agent alias starts empty; orchestrators that wire the
     /// manager to a specific agent should call

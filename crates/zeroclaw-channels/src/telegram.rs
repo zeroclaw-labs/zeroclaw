@@ -39,6 +39,8 @@ const POLL_HEALTH_STALE_AFTER: Duration = Duration::from_secs(90);
 /// notice is abandoned, not retried.
 const VOICE_DROP_NOTICE_TIMEOUT: Duration = Duration::from_secs(10);
 
+const VOICE_REPLY_PREP_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Ceiling on one `remove_reaction` clear. The clear runs while the
 /// orchestrator still holds the conversation permit, and
 /// `build_channel_proxy_client` sets no request timeout, so this bounds both
@@ -1136,6 +1138,8 @@ pub struct TelegramChannel {
     transcription: Option<zeroclaw_config::schema::TranscriptionConfig>,
     transcription_manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
     voice_transcriptions: Mutex<std::collections::HashMap<String, String>>,
+    voice_file_paths: Mutex<std::collections::HashMap<String, String>>,
+    voice_reply_prep_timeout: Duration,
     workspace_dir: Option<std::path::PathBuf>,
     ack_reactions: bool,
     tts_manager: Option<Arc<super::tts::TtsManager>>,
@@ -2784,6 +2788,8 @@ impl TelegramChannel {
             transcription: None,
             transcription_manager: None,
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
+            voice_file_paths: Mutex::new(std::collections::HashMap::new()),
+            voice_reply_prep_timeout: Duration::from_secs(30),
             workspace_dir: None,
             ack_reactions: true,
             tts_manager: None,
@@ -2804,6 +2810,15 @@ impl TelegramChannel {
         }
     }
 
+    /// Shrink the replied-to voice/audio preparation bound so a
+    /// stalled-preparation test does not wait out the production ceiling.
+    /// Test-only: the ceiling protects the listener, it is not
+    /// operator-tunable.
+    #[cfg(test)]
+    fn with_voice_reply_prep_timeout(mut self, timeout: Duration) -> Self {
+        self.voice_reply_prep_timeout = timeout;
+        self
+    }
     /// Shrink the transient-retry backoff so a retry-budget test does not
     /// wait out the production delay. Test-only: the backoff is not
     /// operator-tunable.
@@ -6069,15 +6084,23 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .get("chat")
                 .and_then(|c| c.get("id"))
                 .and_then(serde_json::Value::as_i64);
-            if let (Some(mid), Some(cid)) = (reply_mid, chat_id) {
-                self.voice_transcriptions
-                    .lock()
-                    .get(&format!("{cid}:{mid}"))
-                    .map(|t| format!("[Voice] {t}"))
-                    .unwrap_or_else(|| "[Voice message]".to_string())
+            let body = if let (Some(mid), Some(cid)) = (reply_mid, chat_id) {
+                let key = format!("{cid}:{mid}");
+                if let Some(text) = self.voice_transcriptions.lock().get(&key) {
+                    format!("[Voice] {text}")
+                } else if let Some(path) = self.voice_file_paths.lock().get(&key) {
+                    let file_name = std::path::Path::new(path)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("audio.ogg");
+                    format!("[Document: {file_name}] {path}")
+                } else {
+                    "[Voice message]".to_string()
+                }
             } else {
                 "[Voice message]".to_string()
-            }
+            };
+            body
         } else if reply.get("photo").is_some() {
             "[Photo]".to_string()
         } else if reply.get("document").is_some() {
@@ -6098,6 +6121,213 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .join("\n");
 
         Some(format!("> @{reply_sender}:\n{quoted_lines}"))
+    }
+
+    /// Whether an inbound parser would admit `message` under the mention-only
+    /// gate. Reply-voice preparation consults this before fetching a quoted
+    /// recording: an admission decision broader than the parsers spends a
+    /// download (and possibly a transcription) on an update that is dropped
+    /// afterwards.
+    ///
+    /// The decision mirrors the parser branches exactly:
+    /// - the text parser sees messages with `text` and admits addressed ones,
+    ///   plus unaddressed text under passive group context;
+    /// - the media parsers (`check_media_mention_gate`) see photo/document
+    ///   and voice/audio messages and admit only a caption that mentions the
+    ///   bot or answers it directly — a captionless reply to the bot admits
+    ///   nothing, and no passive fallback exists there;
+    /// - anything neither parser can see admits nothing.
+    ///
+    /// Call only under `mention_only` in a group chat, the condition both
+    /// parser gates key on.
+    fn reply_prep_parser_admission(&self, message: &serde_json::Value) -> bool {
+        if let Some(text) = message.get("text").and_then(serde_json::Value::as_str) {
+            let bot_username_guard = self.bot_username.lock();
+            let Some(bot_username) = bot_username_guard.as_ref() else {
+                // Without the bot's username the text parser drops every
+                // group message in a mention_only chat.
+                return false;
+            };
+            if Self::contains_bot_mention(text, bot_username) {
+                return true;
+            }
+            drop(bot_username_guard);
+            if let Some(bot_id) = *self.bot_id.lock()
+                && Self::is_reply_to_bot(message, bot_id)
+            {
+                return true;
+            }
+            return Self::should_record_passive_group_context(
+                self.passive_group_context,
+                true,
+                false,
+            );
+        }
+        if Self::parse_attachment_metadata(message).is_none()
+            && Self::parse_voice_metadata(message).is_none()
+        {
+            return false;
+        }
+        let caption = message.get("caption").and_then(serde_json::Value::as_str);
+        self.check_media_mention_gate(message, caption).is_some()
+    }
+
+    /// Pre-download a replied-to voice/audio message so `extract_reply_context`
+    /// can reference it even when the original message was dropped by the
+    /// mention-only gate. If built-in transcription is enabled, the audio is
+    /// also transcribed and cached; otherwise only the local file path is kept
+    /// so the agent can call `transcriber__transcribe_audio` itself.
+    async fn prepopulate_voice_reply_context(&self, update: &serde_json::Value) {
+        let Some(message) = update.get("message") else {
+            return;
+        };
+        let Some(reply) = message.get("reply_to_message") else {
+            return;
+        };
+        if reply.get("voice").is_none() && reply.get("audio").is_none() {
+            return;
+        }
+
+        // Authorize with the same identity set the parsers use: the display
+        // fallback "unknown" from `extract_sender_info` is not a real
+        // identity and must not match an allowlisted username.
+        let identities = Self::authorization_identities(message);
+        if !self.is_any_user_allowed(identities.iter().map(String::as_str)) {
+            return;
+        }
+
+        // Admit only updates the inbound parsers themselves would process.
+        // Passive group context admits text observations only; media replies
+        // must clear the media gate (a mention or a captioned reply to the
+        // bot), so no download or transcription is spent on an update every
+        // parser drops.
+        if self.mention_only
+            && Self::is_group_message(message)
+            && !self.reply_prep_parser_admission(message)
+        {
+            return;
+        }
+
+        let reply_mid = match reply.get("message_id").and_then(serde_json::Value::as_i64) {
+            Some(m) => m,
+            None => return,
+        };
+        let chat_id = match message
+            .get("chat")
+            .and_then(|c| c.get("id"))
+            .and_then(serde_json::Value::as_i64)
+        {
+            Some(c) => c,
+            None => return,
+        };
+        let key = format!("{chat_id}:{reply_mid}");
+        {
+            let paths = self.voice_file_paths.lock();
+            let texts = self.voice_transcriptions.lock();
+            if paths.contains_key(&key) || texts.contains_key(&key) {
+                return;
+            }
+        }
+
+        let workspace = match self.workspace_dir.as_ref() {
+            Some(w) => w,
+            None => return,
+        };
+        let save_dir = workspace.join("telegram_files");
+        if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
+            Self::log_reply_prep_failure("create_dir", &e);
+            return;
+        }
+
+        let (file_id, duration) = match Self::parse_voice_metadata(reply) {
+            Some(v) => v,
+            None => return,
+        };
+
+        let tg_file_path = match self.get_file_path(&file_id).await {
+            Ok(p) => p,
+            Err(e) => {
+                Self::log_reply_prep_failure("get_file_path", &e);
+                return;
+            }
+        };
+
+        let audio_data = match self.download_file(&tg_file_path).await {
+            Ok(d) => d,
+            Err(e) => {
+                Self::log_reply_prep_failure("download", &e);
+                return;
+            }
+        };
+
+        let local_filename = if reply.get("voice").is_some() {
+            let ext = tg_file_path.rsplit('.').next().unwrap_or("ogg");
+            format!("voice_{chat_id}_{reply_mid}.{ext}")
+        } else {
+            let ext = tg_file_path.rsplit('.').next().unwrap_or("mp3");
+            format!("audio_{chat_id}_{reply_mid}.{ext}")
+        };
+        let local_path = save_dir.join(&local_filename);
+        if let Err(e) = tokio::fs::write(&local_path, &audio_data).await {
+            Self::log_reply_prep_failure("write_file", &e);
+            return;
+        }
+        let path_str = local_path.to_string_lossy().into_owned();
+
+        // Cache the saved path before awaiting transcription. The prep future
+        // runs under a deadline in `process_update`; if transcription exceeds
+        // the remaining budget the future is dropped, and without this entry
+        // every later reply would re-download and re-transcribe the same
+        // recording. On transcription success the path entry is removed so
+        // the transcript remains the single cached artifact.
+        {
+            let mut cache = self.voice_file_paths.lock();
+            if cache.len() >= 100 {
+                cache.clear();
+            }
+            cache.insert(key.clone(), path_str);
+        }
+
+        // Prefer built-in transcription when configured.
+        if let (Some(config), Some(manager)) = (
+            self.transcription.as_ref(),
+            self.transcription_manager.as_deref(),
+        ) && duration <= config.max_duration_secs
+        {
+            let file_name = tg_file_path
+                .rsplit('/')
+                .next()
+                .unwrap_or("voice.ogg")
+                .to_string();
+            if let Ok(text) = manager.transcribe(&audio_data, &file_name).await
+                && !text.trim().is_empty()
+            {
+                self.voice_file_paths.lock().remove(&key);
+                let mut cache = self.voice_transcriptions.lock();
+                if cache.len() >= 100 {
+                    cache.clear();
+                }
+                cache.insert(key, text);
+            }
+        }
+    }
+
+    /// Best-effort preparation is silent by design for senders, but the
+    /// operator needs a sanitized reason when quoted reply context is missing:
+    /// a reply that arrives with only `[Voice message]` and no path or text is
+    /// otherwise indistinguishable from a bug. English log with a stable
+    /// `stage` attribute, per the logging contract.
+    fn log_reply_prep_failure(stage: &str, error: &impl std::fmt::Display) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "stage": stage,
+                    "error": zeroclaw_runtime::security::scrub(&format!("{error}")),
+                })),
+            "Failed to prepare replied-to voice/audio context; reply will carry no quoted media"
+        );
     }
 
     /// Forum-topic thread id for history keying and reply routing, if this
@@ -7605,6 +7835,30 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             );
             *transient_retry = None;
             return UpdateOutcome::Advanced;
+        }
+
+        // Download and cache the replied-to voice/audio file before
+        // parsing, so reply context can reference it even when the
+        // original message was dropped by the mention-only gate. The
+        // attempt is deadline-bounded so a stalled prep cannot
+        // head-of-line block later updates; on expiry the update
+        // simply proceeds without the quoted media.
+        if tokio::time::timeout(
+            self.voice_reply_prep_timeout,
+            self.prepopulate_voice_reply_context(update),
+        )
+        .await
+        .is_err()
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "timeout_secs": self.voice_reply_prep_timeout.as_secs_f64(),
+                    })),
+                "Timed out preparing replied-to voice/audio context; continuing without it"
+            );
         }
 
         let disposition = if let Some(m) = self.parse_update_message(update) {
@@ -19043,6 +19297,526 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────
     // extract_reply_context tests
     // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn extract_reply_context_voice_with_cached_file_path() {
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "t".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        );
+        // Pre-populate the local-path cache (no transcription available).
+        let path = "/workspace/telegram_files/voice_100_42.ogg";
+        ch.voice_file_paths
+            .lock()
+            .insert("100:42".to_string(), path.to_string());
+        let msg = serde_json::json!({
+            "chat": { "id": 100 },
+            "reply_to_message": {
+                "message_id": 42,
+                "from": { "username": "bob" },
+                "voice": { "file_id": "abc", "duration": 5 }
+            }
+        });
+        let ctx = ch.extract_reply_context(&msg).unwrap();
+        assert_eq!(
+            ctx,
+            format!("> @bob:\n> [Document: voice_100_42.ogg] {path}")
+        );
+    }
+
+    #[tokio::test]
+    async fn prepopulate_skips_reply_the_mention_gate_would_drop() {
+        use wiremock::MockServer;
+
+        // mention_only group, no @mention, passive context off: every parser
+        // drops this update, so the quoted recording must not be fetched or
+        // transcribed at all.
+        let mock_server = MockServer::start().await;
+        let ch = TelegramChannel::new(
+            "t".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true,
+        )
+        .with_mock_api_base(mock_server.uri());
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 20,
+                "text": "lol",
+                "from": { "id": 1, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "supergroup" },
+                "reply_to_message": {
+                    "message_id": 42,
+                    "from": { "username": "bob" },
+                    "voice": { "file_id": "abc", "duration": 5 }
+                }
+            }
+        });
+
+        ch.prepopulate_voice_reply_context(&update).await;
+        assert!(
+            mock_server.received_requests().await.unwrap().is_empty(),
+            "a reply the gate drops must not touch the network"
+        );
+        assert!(ch.voice_file_paths.lock().is_empty());
+        assert!(ch.voice_transcriptions.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepopulate_fetches_reply_context_when_addressed() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // An @mention in the reply text admits the update, so the quoted
+        // recording is fetched and cached for reply context.
+        let workspace = tempfile::tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "voice/file_1.ogg" }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/voice/file_1\.ogg$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 64]))
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "t".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true,
+        )
+        .with_mock_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 21,
+                "text": "@mybot что сказал?",
+                "from": { "id": 1, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "supergroup" },
+                "reply_to_message": {
+                    "message_id": 42,
+                    "from": { "username": "bob" },
+                    "voice": { "file_id": "abc", "duration": 5 }
+                }
+            }
+        });
+
+        ch.prepopulate_voice_reply_context(&update).await;
+        assert!(
+            ch.voice_file_paths.lock().contains_key("-100200300:42"),
+            "addressed reply should cache the quoted recording path"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepopulate_fetches_reply_context_for_passive_text_reply() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Passive group context admits an unaddressed text observation, so a
+        // reply without a mention still gets its quoted recording cached.
+        let workspace = tempfile::tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "voice/file_1.ogg" }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/voice/file_1\.ogg$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 64]))
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "t".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true,
+        )
+        .with_mock_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf())
+        .with_passive_group_context(true);
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 22,
+                "text": "что думаешь?",
+                "from": { "id": 1, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "supergroup" },
+                "reply_to_message": {
+                    "message_id": 42,
+                    "from": { "username": "bob" },
+                    "voice": { "file_id": "abc", "duration": 5 }
+                }
+            }
+        });
+
+        ch.prepopulate_voice_reply_context(&update).await;
+        assert!(
+            ch.voice_file_paths.lock().contains_key("-100200300:42"),
+            "passive text reply should cache the quoted recording path"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepopulate_skips_rejected_media_reply_even_with_passive_context() {
+        use wiremock::MockServer;
+
+        // mention_only group with passive group context on: an unmentioned
+        // captioned photo reply is still dropped by every media parser (the
+        // media gate has no passive fallback), so the quoted recording must
+        // not be fetched or transcribed.
+        let workspace = tempfile::tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+        let ch = TelegramChannel::new(
+            "t".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true,
+        )
+        .with_mock_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf())
+        .with_passive_group_context(true);
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 23,
+                "photo": [{ "file_id": "p1", "file_size": 10 }],
+                "caption": "look at this",
+                "from": { "id": 1, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "supergroup" },
+                "reply_to_message": {
+                    "message_id": 42,
+                    "from": { "username": "bob" },
+                    "voice": { "file_id": "abc", "duration": 5 }
+                }
+            }
+        });
+
+        ch.prepopulate_voice_reply_context(&update).await;
+        assert!(
+            mock_server.received_requests().await.unwrap().is_empty(),
+            "a media reply the gate drops must not touch the network"
+        );
+        assert!(ch.voice_file_paths.lock().is_empty());
+        assert!(ch.voice_transcriptions.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepopulate_skips_captionless_media_reply_to_bot() {
+        use wiremock::MockServer;
+
+        // A captionless photo that answers the bot's message directly is not
+        // admitted by the media parsers (their reply-to-bot bypass still
+        // requires a caption), so preparation must not treat reply-to-bot as
+        // enough on its own.
+        let workspace = tempfile::tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+        let ch = TelegramChannel::new(
+            "t".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true,
+        )
+        .with_mock_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+        {
+            let mut cache = ch.bot_id.lock();
+            *cache = Some(7);
+        }
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 24,
+                "photo": [{ "file_id": "p1", "file_size": 10 }],
+                "from": { "id": 1, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "supergroup" },
+                "reply_to_message": {
+                    "message_id": 42,
+                    "from": { "id": 7, "username": "mybot" },
+                    "voice": { "file_id": "abc", "duration": 5 }
+                }
+            }
+        });
+
+        ch.prepopulate_voice_reply_context(&update).await;
+        assert!(
+            mock_server.received_requests().await.unwrap().is_empty(),
+            "a captionless media reply must not touch the network"
+        );
+        assert!(ch.voice_file_paths.lock().is_empty());
+        assert!(ch.voice_transcriptions.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepopulate_rejects_display_fallback_identity() {
+        use wiremock::MockServer;
+
+        // A sender without a username used to be authorized through the
+        // "unknown" display fallback, so an allowlisted "unknown" admitted
+        // any username-less sender. Only real identities count: the numeric
+        // id 777 is not allowed, so nothing may be fetched.
+        let workspace = tempfile::tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+        let ch = TelegramChannel::new(
+            "t".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["unknown".into()]),
+            true,
+        )
+        .with_mock_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 25,
+                "text": "@mybot привет",
+                "from": { "id": 777 },
+                "chat": { "id": -100_200_300, "type": "supergroup" },
+                "reply_to_message": {
+                    "message_id": 42,
+                    "from": { "username": "bob" },
+                    "voice": { "file_id": "abc", "duration": 5 }
+                }
+            }
+        });
+
+        ch.prepopulate_voice_reply_context(&update).await;
+        assert!(
+            mock_server.received_requests().await.unwrap().is_empty(),
+            "a sender known only by a fabricated identity must not touch the network"
+        );
+        assert!(ch.voice_file_paths.lock().is_empty());
+        assert!(ch.voice_transcriptions.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn process_update_recovers_when_reply_prep_stalls() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A stalled getFile must not head-of-line block the listener: the
+        // preparation hits its deadline, and the addressed text message is
+        // still parsed and dispatched.
+        let workspace = tempfile::tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(30))
+                    .set_body_json(serde_json::json!({
+                        "ok": true,
+                        "result": { "file_path": "voice/file_1.ogg" }
+                    })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "t".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true,
+        )
+        .with_mock_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf())
+        .with_voice_reply_prep_timeout(Duration::from_millis(250));
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+        let update = serde_json::json!({
+            "update_id": 7,
+            "message": {
+                "message_id": 22,
+                "text": "@mybot привет",
+                "from": { "id": 1, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "supergroup" },
+                "reply_to_message": {
+                    "message_id": 42,
+                    "from": { "username": "bob" },
+                    "voice": { "file_id": "abc", "duration": 5 }
+                }
+            }
+        });
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut transient_retry = None;
+        let outcome = ch.process_update(&update, &tx, &mut transient_retry).await;
+        assert!(matches!(outcome, UpdateOutcome::Advanced));
+        let msg = rx
+            .recv()
+            .await
+            .expect("addressed message must dispatch even when prep stalls");
+        assert!(
+            msg.content.contains("привет"),
+            "message should carry the sender text, got: {}",
+            msg.content
+        );
+        assert!(
+            ch.voice_file_paths.lock().is_empty(),
+            "stalled prep must not leave a partial cache entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_update_keeps_saved_audio_path_when_transcription_stalls() {
+        use super::super::transcription::{TranscriptionManager, TranscriptionProvider};
+        use async_trait::async_trait;
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        struct StallingTranscriptionProvider;
+
+        #[async_trait]
+        impl TranscriptionProvider for StallingTranscriptionProvider {
+            fn name(&self) -> &str {
+                "stall"
+            }
+
+            async fn transcribe(
+                &self,
+                _audio_data: &[u8],
+                _file_name: &str,
+            ) -> anyhow::Result<String> {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                Ok("late transcript".to_string())
+            }
+        }
+
+        impl ::zeroclaw_api::attribution::Attributable for StallingTranscriptionProvider {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Transcription(
+                        ::zeroclaw_api::attribution::TranscriptionProviderKind::Groq,
+                    ),
+                )
+            }
+
+            fn alias(&self) -> &str {
+                "stall"
+            }
+        }
+
+        // getFile and the file download answer immediately; only the
+        // transcription exceeds the prep deadline. The saved file must stay
+        // cached so later replies quote its path instead of re-downloading
+        // and re-transcribing the same recording.
+        let workspace = tempfile::tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "voice/file_1.ogg" }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/voice/file_1\.ogg$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 64]))
+            .mount(&mock_server)
+            .await;
+
+        let tc = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            max_duration_secs: 300,
+            ..Default::default()
+        };
+        let manager = TranscriptionManager::empty()
+            .with_test_provider("stall", Box::new(StallingTranscriptionProvider));
+
+        let ch = TelegramChannel::new(
+            "t".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true,
+        )
+        .with_transcription_manager(tc, Some(Arc::new(manager)))
+        .with_mock_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf())
+        .with_voice_reply_prep_timeout(Duration::from_millis(250));
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+        let update = serde_json::json!({
+            "update_id": 8,
+            "message": {
+                "message_id": 23,
+                "text": "@mybot привет",
+                "from": { "id": 1, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "supergroup" },
+                "reply_to_message": {
+                    "message_id": 42,
+                    "from": { "username": "bob" },
+                    "voice": { "file_id": "abc", "duration": 5 }
+                }
+            }
+        });
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut transient_retry = None;
+        let outcome = ch.process_update(&update, &tx, &mut transient_retry).await;
+        assert!(matches!(outcome, UpdateOutcome::Advanced));
+        let msg = rx
+            .recv()
+            .await
+            .expect("addressed message must dispatch even when transcription stalls");
+        assert!(
+            msg.content.contains("привет"),
+            "message should carry the sender text, got: {}",
+            msg.content
+        );
+        let saved = ch
+            .voice_file_paths
+            .lock()
+            .get("-100200300:42")
+            .expect("saved audio path must survive a transcription-timeout drop")
+            .clone();
+        assert!(
+            saved.ends_with("voice_-100200300_42.ogg"),
+            "cached path should point at the saved recording, got: {saved}"
+        );
+        assert!(
+            ch.voice_transcriptions.lock().is_empty(),
+            "no transcript may be cached when transcription never finished"
+        );
+    }
 
     #[test]
     fn extract_reply_context_text_message() {
