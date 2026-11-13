@@ -11348,3 +11348,120 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
     }
 }
+
+/// Regression: a cached client's pooled connection must not be
+/// driven by another runtime. With `test-disable-http-idle-pool`, each request
+/// opens its connection on the runtime that sends it, so B succeeds even when
+/// A ends mid-flight.
+#[cfg(test)]
+mod cross_runtime_pool_regression {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    fn serve(delay: Duration) -> String {
+        use axum::{Json, Router, routing::post};
+        let (tx, rx) = std::sync::mpsc::channel();
+        let hits = Arc::new(AtomicUsize::new(0));
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let app = Router::new().route(
+                    "/v1/messages",
+                    post(move |Json(_b): Json<serde_json::Value>| {
+                        let hits = hits.clone();
+                        async move {
+                            if hits.fetch_add(1, Ordering::SeqCst) > 0 {
+                                tokio::time::sleep(delay).await;
+                            }
+                            Json(serde_json::json!({
+                                "content": [{"type": "text", "text": "ok"}],
+                                "usage": {"input_tokens": 1, "output_tokens": 1},
+                                "stop_reason": "end_turn",
+                                "model": "probe-model"
+                            }))
+                        }
+                    }),
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                tx.send(format!("http://{}", listener.local_addr().unwrap()))
+                    .unwrap();
+                axum::serve(listener, app).await.unwrap();
+            });
+        });
+        rx.recv().unwrap()
+    }
+
+    fn provider(url: &str, timeout_secs: u64) -> AnthropicModelProvider {
+        AnthropicModelProvider::builder("probe")
+            .credential(Some("test-key"))
+            .base_url(url)
+            .timeout_secs(timeout_secs)
+            .build()
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    fn runtime_a(
+        url: String,
+        timeout_secs: u64,
+    ) -> (
+        tokio::sync::oneshot::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let rt_a = rt();
+            rt_a.block_on(async move {
+                provider(&url, timeout_secs)
+                    .chat_with_system(None, "a", "probe-model", None)
+                    .await
+                    .expect("runtime A's request");
+                ready_tx.send(()).unwrap();
+                let _ = stop_rx.await;
+            });
+            drop(rt_a);
+        });
+        ready_rx.recv().unwrap();
+        (stop_tx, handle)
+    }
+
+    fn request_from_b_while_a_ends(
+        url: &str,
+        timeout_secs_b: u64,
+        stop_a: tokio::sync::oneshot::Sender<()>,
+        end_a_after: Duration,
+    ) -> anyhow::Result<String> {
+        let rt_b = rt();
+        rt_b.block_on(async move {
+            let p = provider(url, timeout_secs_b);
+            let req = p.chat_with_system(None, "b", "probe-model", None);
+            tokio::pin!(req);
+            tokio::select! {
+                r = &mut req => return r,
+                () = tokio::time::sleep(end_a_after) => {}
+            }
+            let _ = stop_a.send(());
+            req.await
+        })
+    }
+
+    #[test]
+    fn cached_client_survives_sibling_runtime_ending_mid_request() {
+        let url = serve(Duration::from_millis(500));
+        let (stop_a, a) = runtime_a(url.clone(), 4242);
+        let r = request_from_b_while_a_ends(&url, 4242, stop_a, Duration::from_millis(150));
+        a.join().unwrap();
+        r.expect("idle pooling is off in tests, so B keeps its own connection");
+    }
+}

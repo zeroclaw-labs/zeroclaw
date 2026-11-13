@@ -11994,6 +11994,23 @@ fn runtime_proxy_current_generation() -> u64 {
     }
 }
 
+fn maybe_disable_http_idle_pool(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    // Test builds share one cached Client across many short-lived tokio
+    // runtimes. Keep-alive reuse then lets request B ride a connection whose
+    // driver task lives on runtime A; when A ends mid-flight, hyper reports
+    // "dispatch task is gone". Disabling idle pooling forces each request to
+    // open its connection on the runtime that sends it. Production keeps the
+    // default pool.
+    #[cfg(feature = "test-disable-http-idle-pool")]
+    {
+        builder.pool_max_idle_per_host(0)
+    }
+    #[cfg(not(feature = "test-disable-http-idle-pool"))]
+    {
+        builder
+    }
+}
+
 fn runtime_proxy_client_cache() -> &'static RwLock<HashMap<String, RuntimeProxyCachedClient>> {
     RUNTIME_PROXY_CLIENT_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
@@ -12120,7 +12137,9 @@ pub fn build_runtime_proxy_client(service_key: &str) -> reqwest::Client {
     }
 
     let (generation, config) = runtime_proxy_config_snapshot();
-    let builder = config.apply_to_reqwest_builder(reqwest::Client::builder(), service_key);
+    let builder = maybe_disable_http_idle_pool(
+        config.apply_to_reqwest_builder(reqwest::Client::builder(), service_key),
+    );
     let client = builder.build().unwrap_or_else(|error| {
         ::zeroclaw_log::record!(
             WARN,
@@ -12152,7 +12171,8 @@ pub fn build_runtime_proxy_client_with_timeouts(
     let builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs));
-    let builder = config.apply_to_reqwest_builder(builder, service_key);
+    let builder =
+        maybe_disable_http_idle_pool(config.apply_to_reqwest_builder(builder, service_key));
     let client = builder.build().unwrap_or_else(|error| {
         ::zeroclaw_log::record!(
             WARN,
@@ -12188,7 +12208,8 @@ pub fn build_runtime_proxy_client_with_read_timeout(
     let builder = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
         .read_timeout(std::time::Duration::from_secs(read_timeout_secs));
-    let builder = config.apply_to_reqwest_builder(builder, service_key);
+    let builder =
+        maybe_disable_http_idle_pool(config.apply_to_reqwest_builder(builder, service_key));
     let client = builder.build().unwrap_or_else(|error| {
         ::zeroclaw_log::record!(
             WARN,
@@ -12282,7 +12303,11 @@ fn build_explicit_proxy_client(
     if let Some(ct) = connect_timeout_secs {
         builder = builder.connect_timeout(std::time::Duration::from_secs(ct));
     }
-    builder = apply_explicit_proxy_to_builder(builder, service_key, proxy_url);
+    builder = maybe_disable_http_idle_pool(apply_explicit_proxy_to_builder(
+        builder,
+        service_key,
+        proxy_url,
+    ));
     let client = builder.build().unwrap_or_else(|error| {
         ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"service_key": service_key, "proxy_url": proxy_url, "error": format!("{}", error)})), "Failed to build channel proxy client: ");
         reqwest::Client::new()

@@ -179,7 +179,7 @@ wiremock = "0.6"
 zeroclaw-tools = { workspace = true, features = ["test-helpers"] }
 # Test-only config fault injection for the config/set post-rename sync
 # regression. Same pattern as zeroclaw-tools above.
-zeroclaw-config = { workspace = true, features = ["test-helpers"] }
+zeroclaw-config = { workspace = true, features = ["test-helpers", "test-disable-http-idle-pool"] }
 
 # Channel features (forwarded to zeroclaw-channels)
 
