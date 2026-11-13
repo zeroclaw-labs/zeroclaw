@@ -26502,26 +26502,31 @@ impl Config {
             // The wake allowlist gates which agents this plugin instance may
             // wake, so a malformed alias is a hard error rather than a line
             // silently dropped at dispatch time.
-            let dispatch_path = format!("plugins.entries.{}.dispatch_agents", entry.name);
-            for target in &entry.dispatch_agents {
-                let trimmed = target.trim();
-                if trimmed.is_empty() {
-                    validation_bail!(
-                        InvalidFormat,
-                        dispatch_path.clone(),
-                        "{dispatch_path} must not contain an empty agent alias"
-                    );
-                }
-                let canonical = trimmed.len() <= 64
-                    && trimmed
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'));
-                if trimmed != "*" && !canonical {
-                    validation_bail!(
-                        InvalidFormat,
-                        dispatch_path.clone(),
-                        "{dispatch_path} lists {target:?}, which is neither '*' nor a 1-64 byte agent alias of letters, digits, '-' or '_'"
-                    );
+            if !entry.dispatch_agents.is_empty() {
+                let dispatch_path = format!("plugins.entries.{}.dispatch_agents", entry.name);
+                for target in &entry.dispatch_agents {
+                    // Padding is rejected rather than trimmed so the alias that
+                    // is stored is exactly the alias that is matched at
+                    // dispatch time, matching `egress_hosts` / `net_guard`
+                    // strictness.
+                    if target.trim().is_empty() {
+                        validation_bail!(
+                            InvalidFormat,
+                            dispatch_path.clone(),
+                            "{dispatch_path} lists {target:?}, which must be a 1-64 byte agent alias of letters, digits, '-' or '_' without leading or trailing whitespace"
+                        );
+                    }
+                    let canonical = target.len() <= 64
+                        && target
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'));
+                    if target != "*" && !canonical {
+                        validation_bail!(
+                            InvalidFormat,
+                            dispatch_path.clone(),
+                            "{dispatch_path} lists {target:?}, which is neither '*' nor a 1-64 byte agent alias of letters, digits, '-' or '_'"
+                        );
+                    }
                 }
             }
             if entry.dispatch_rate_per_min == Some(0) {
@@ -33610,7 +33615,7 @@ custom_ca_secret = "corp_ca"
 
     #[test]
     async fn plugin_entry_rejects_empty_dispatch_agent_or_zero_rate() {
-        for bad in ["  ", "alpha.beta", "bad target"] {
+        for bad in ["  ", "alpha.beta", "bad target", " alpha ", &"a".repeat(65)] {
             let mut config = Config::default();
             let mut entry = plugin_entry_with_egress(&[], &[]);
             entry.dispatch_agents = vec![bad.to_string()];
@@ -33622,6 +33627,12 @@ custom_ca_secret = "corp_ca"
             assert!(
                 text.contains("dispatch_agents"),
                 "error must name the offending path for {bad:?}; got: {text}"
+            );
+            let structured = crate::api_error::ConfigApiError::from_validation(err);
+            assert_eq!(
+                structured.code,
+                crate::api_error::ConfigApiCode::InvalidFormat,
+                "padded or oversized alias must classify as InvalidFormat for {bad:?}"
             );
         }
 
