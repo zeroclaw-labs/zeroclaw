@@ -358,6 +358,54 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_native_carrier_preserves_metadata_and_updated_text() {
+        let original = serde_json::json!({
+            "tool_call_id": "call-1",
+            "name": "file_read",
+            "content": "原文🦀 [IMAGE:quoted.png]\n",
+            "attachments": [{"kind": "image", "target": "old.png"}],
+            "extension": {"trace": [1, 2], "enabled": true},
+        });
+        let content = original.to_string();
+        let mut parts = classify("tool", &content).unwrap();
+        parts.text.push_str("\nAttachment omitted.");
+
+        // Replacement and removal both occur in normalization/degradation.
+        for (attachments, expected_attachments) in [
+            (
+                vec![image("new.png")],
+                serde_json::json!([{"kind": "image", "target": "new.png"}]),
+            ),
+            (vec![], serde_json::json!([])),
+        ] {
+            let rebuilt = rebuild_carrier("tool", &content, &parts, &attachments);
+            let actual: serde_json::Value = serde_json::from_str(&rebuilt).unwrap();
+            let mut expected = original.clone();
+            expected["content"] = serde_json::json!(parts.text);
+            expected["attachments"] = expected_attachments;
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn rebuild_prompt_carrier_keeps_marker_looking_body_verbatim() {
+        let body = "原文🦀\n[Tool attachments: 1]\n[IMAGE:quoted.png]\n\n";
+        let content = render_prompt_tool_carrier(body, &[image("old.png")]);
+        let mut parts = classify("user", &content).unwrap();
+        parts.text.push_str("Attachment omitted.\n");
+
+        for attachments in [vec![image("new.png")], vec![]] {
+            let rebuilt = rebuild_carrier("user", &content, &parts, &attachments);
+            let header = if attachments.is_empty() {
+                "[Tool results]\n[Tool attachments: 0]\n"
+            } else {
+                "[Tool results]\n[Tool attachments: 1]\n[IMAGE:new.png]\n"
+            };
+            assert_eq!(rebuilt, format!("{header}{body}Attachment omitted.\n"));
+        }
+    }
+
+    #[test]
     fn native_carrier_reads_attachments_and_verbatim_text() {
         let content = native_carrier(
             "File: /tmp/shot.png\nbody text",
