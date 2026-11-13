@@ -21,7 +21,7 @@ import {
 import { t } from '@/lib/i18n';
 import { loadConfigSearchItems, type ConfigSearchItem } from '@/lib/configSearch';
 import { useAuth } from '@/hooks/useAuth';
-import { navAccessFor, pathAccess } from '@/lib/navAccess';
+import { navAccessFor, pathAccess, type NavAccess } from '@/lib/navAccess';
 
 // Navigation destinations mirror the Sidebar's grouped nav. They're
 // re-declared locally (rather than imported from Sidebar) to keep the palette
@@ -56,7 +56,7 @@ type ResultKind = 'page' | 'section' | 'entry';
 // A unified, keyboard-navigable result row. Nav destinations and config items
 // are normalized into this single shape so the filter / selection / render
 // pipeline treats them identically.
-interface PaletteItem {
+export interface PaletteItem {
   kind: ResultKind;
   /** Navigated to on select. */
   to: string;
@@ -103,6 +103,25 @@ function toPaletteItem(c: ConfigSearchItem): PaletteItem {
     searchExtra: c.url,
     icon: KIND_ICON[kind],
   };
+}
+
+/**
+ * Every searchable item `access` lets the caller open: the pages first, then
+ * the config sections and entries. Both go through `pathAccess`. Config results
+ * load once and stay cached, so ones loaded while the account could read config
+ * drop out as soon as its session says it no longer can.
+ */
+export function paletteItemsFor(access: NavAccess, configItems: ConfigSearchItem[]): PaletteItem[] {
+  const allowed = (to: string) => pathAccess(to, access) === 'allowed';
+  const pages: PaletteItem[] = DESTINATIONS.filter((d) => allowed(d.to)).map((d) => ({
+    kind: 'page',
+    to: d.to,
+    label: t(d.labelKey),
+    sublabel: t(d.groupKey),
+    searchExtra: d.to,
+    icon: d.icon,
+  }));
+  return [...pages, ...configItems.map(toPaletteItem).filter((item) => allowed(item.to))];
 }
 
 // Substring (case-insensitive) match across label + sublabel + path. Returns a
@@ -175,19 +194,10 @@ export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
 
   // All searchable items in one flat list: static pages first, then config
   // sections, then config entries (toPaletteItem assigns the bucket/icon).
-  const allItems = useMemo<PaletteItem[]>(() => {
-    const access = navAccessFor(session);
-    const destinations = DESTINATIONS.filter((d) => pathAccess(d.to, access) === 'allowed');
-    const pages: PaletteItem[] = destinations.map((d) => ({
-      kind: 'page',
-      to: d.to,
-      label: t(d.labelKey),
-      sublabel: t(d.groupKey),
-      searchExtra: d.to,
-      icon: d.icon,
-    }));
-    return [...pages, ...configItems.map(toPaletteItem)];
-  }, [configItems, session]);
+  const allItems = useMemo<PaletteItem[]>(
+    () => paletteItemsFor(navAccessFor(session), configItems),
+    [configItems, session],
+  );
 
   // Filter + sort + bucket + cap. The flat `results` list (header rows
   // interleaved) is what we render; `items` (no headers) is the keyboard-

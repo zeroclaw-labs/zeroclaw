@@ -146,8 +146,9 @@ The listener binds `127.0.0.1` only, one random port, single request lifetime.
 4. **Browser token delivery: delegated.** Resolution chosen here: the gateway
    callback renders a one-time, self-contained page that hands the token to
    `window.opener` via `postMessage` with the gateway's own origin as the
-   target, plus a manual copy fallback on the same page. No cookies and no new
-   session model: the dashboard keeps authenticating per request with the
+   target, plus a manual copy fallback on the same page. A short-lived
+   per-flow cookie now binds the callback to the initiating browser (#12050);
+   it grants no API access and introduces no authenticated session model: the dashboard keeps authenticating per request with the
    `Authorization` header and `X-ZeroClaw-Auth-Provider`, exactly the
    route-layer contract already reviewed. This is the most reversible choice
    (a later cookie-session design deprecates one page, not an auth model).
