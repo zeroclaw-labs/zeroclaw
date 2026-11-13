@@ -27,6 +27,17 @@ pub struct SpawnSubagentTool {
     /// any spawn work happens. Set by the agent loop from
     /// `AgentRunOverrides.is_subagent` at registry construction time.
     is_subagent_caller: bool,
+    /// Tool names the child run may be offered, published by whoever built
+    /// this instance for a delegated target.
+    ///
+    /// `None` is a top-level caller: there is no ceiling to carry, and the
+    /// child is assembled from its own configuration as before. `Some` is a
+    /// bounded target, and the cell is filled once the caller's registry has
+    /// actually been sealed - which happens after this tool is constructed,
+    /// hence the late handle rather than a value. A `Some` that is still
+    /// empty when the tool runs is a wiring failure, and refusing is the only
+    /// safe reading: an unpublished ceiling is not an absent one.
+    caller_ceiling: Option<Arc<std::sync::OnceLock<Vec<String>>>>,
     /// The capabilities and principal the parent turn was built from. When
     /// bound, the child runs through them, so it uses the parent's provider,
     /// memory and supplied tools and resolves for the same principal. Empty
@@ -56,10 +67,28 @@ impl SpawnSubagentTool {
             parent_alias: parent_alias.into(),
             security,
             is_subagent_caller: false,
+            caller_ceiling: None,
             capabilities: Arc::new(std::sync::OnceLock::new()),
             execution_capability: None,
             session_memory: None,
         }
+    }
+
+    /// Bind the ceiling a delegated child must stay within.
+    #[must_use]
+    pub fn with_caller_ceiling(
+        mut self,
+        ceiling: Option<Arc<std::sync::OnceLock<Vec<String>>>>,
+    ) -> Self {
+        self.caller_ceiling = ceiling;
+        self
+    }
+
+    /// The ceiling this instance was built with, for tests that pin which
+    /// registry handed it over.
+    #[cfg(test)]
+    pub(crate) fn caller_ceiling_for_test(&self) -> Option<&Arc<std::sync::OnceLock<Vec<String>>>> {
+        self.caller_ceiling.as_ref()
     }
 
     /// Share the session memory route of the registry this tool is assembled
@@ -178,6 +207,11 @@ tokio::task_local! {
 
 #[async_trait]
 impl Tool for SpawnSubagentTool {
+    #[cfg(test)]
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
     fn requires_unrestricted_principal(&self) -> bool {
         true
     }
@@ -351,6 +385,28 @@ impl Tool for SpawnSubagentTool {
                 .await;
         }
 
+        // Carry the ceiling into the child's own assembly. `agent::run`
+        // threads this into `ScopedAssembly::caller_allowed`, which only ever
+        // narrows and reaches the built-in filter, the MCP access policy and
+        // the post-assembly registrations alike. Without it the child is
+        // rebuilt from the target's own profile and recovers whatever the
+        // delegation was supposed to have taken away.
+        let allowed_tools = match self.caller_ceiling.as_ref() {
+            None => None,
+            Some(cell) => match cell.get() {
+                Some(names) => Some(names.clone()),
+                None => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(crate::i18n::get_required_cli_string(
+                            "bounded-ceiling-spawn-unpublished",
+                        )),
+                    });
+                }
+            },
+        };
+
         // A bound parent passes its capabilities and principal to the child,
         // so the child cannot reach a provider or memory store the parent's
         // sources would not have returned.
@@ -375,7 +431,7 @@ impl Tool for SpawnSubagentTool {
                             vec![],
                             false,
                             Some(session_path),
-                            None,
+                            allowed_tools,
                             zeroclaw_api::ingress::TurnOrigin::SubTurn,
                             run_overrides,
                         )
@@ -392,7 +448,7 @@ impl Tool for SpawnSubagentTool {
                             vec![],
                             false,
                             Some(session_path),
-                            None,
+                            allowed_tools,
                             zeroclaw_api::ingress::TurnOrigin::SubTurn,
                             run_overrides,
                         )

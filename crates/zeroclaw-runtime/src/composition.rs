@@ -350,6 +350,16 @@ pub struct NativeRecipeInputs<'a> {
     pub execution_capability: Option<crate::live_config_authority::AgentExecutionCapability>,
     /// A read view of ACP sessions, for entry points that serve ACP.
     pub acp_sessions: Option<crate::tools::AcpSessionReadView>,
+    /// The caller's tool ceiling for this build, when the entry point runs
+    /// under one, or `None` for a root entry point with no caller. The
+    /// scheduler, SOP and relay tools persist or launch work that outlives the
+    /// turn, so they need the ceiling's value and not only the filtered list.
+    /// Crate-private: only the runtime's own entry points set it. A recipe
+    /// that forwards `inputs` to [`defaults::native_compat_registry`] carries it
+    /// without seeing it; a recipe in another crate cannot read it, so one that
+    /// builds the scheduler, SOP or relay tools itself builds them without a
+    /// ceiling.
+    pub(crate) caller_ceiling: Option<crate::tools::caller_ceiling::CallerCeiling>,
 }
 
 /// A native compatibility recipe: builds the native registry for one eager
