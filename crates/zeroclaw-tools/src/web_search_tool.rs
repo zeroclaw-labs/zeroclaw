@@ -1974,7 +1974,7 @@ fn cap_provider_error(message: &str) -> String {
 }
 
 /// Header line for a rendered result list. Shared so the echoed query is
-/// bounded — and the wording stays identical — across all nine providers.
+/// bounded — and the wording stays identical — across all ten providers.
 fn results_header(query: &str, provider: &str) -> String {
     format!(
         "Search results for: {} (via {provider})",
@@ -1984,7 +1984,7 @@ fn results_header(query: &str, provider: &str) -> String {
 
 /// The reply every provider returns when a search matched nothing.
 ///
-/// One shared function rather than nine copies: this path returns before
+/// One shared function rather than ten copies: this path returns before
 /// [`render_results`], so it is the only place the echoed query is bounded at
 /// all, and a per-provider copy would be a per-provider chance to forget.
 fn no_results_message(query: &str) -> String {
@@ -1995,7 +1995,7 @@ fn no_results_message(query: &str) -> String {
 /// [`MAX_TOTAL_OUTPUT_CHARS`].
 ///
 /// Trimming happens at whole-result granularity so the model never receives a
-/// result cut off mid-field. Shared by all nine provider parsers — the cap must
+/// result cut off mid-field. Shared by all ten provider parsers — the cap must
 /// not depend on which provider answered.
 fn render_results(header: String, blocks: Vec<Vec<String>>) -> String {
     let mut out = header;
