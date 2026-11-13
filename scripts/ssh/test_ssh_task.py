@@ -61,6 +61,27 @@ class TaskTransportTests(unittest.TestCase):
                 delimiter = argv.index('--')
                 self.assertEqual(argv[delimiter + 1:], ['alias', *command])
 
+    def test_scoped_signer_is_retired_before_master_is_leased(self):
+        signer = object()
+        with patch.object(module, 'start_scoped_agent', return_value=signer) as start, \
+             patch.object(module, 'stop_agent') as stop:
+            first = self.pool.acquire('scoped', [], 'host-a', ('local', 'dummy'))
+            stop.assert_called_once_with(signer, self.pool.entries['scoped']['agent_path'])
+            self.assertEqual(self.pool.acquire('scoped', [], 'host-a', ('local', 'dummy')), first)
+            self.assertEqual(len(FakeMaster.starts), 1)
+            start.assert_called_once()
+            self.pool.close()
+            stop.assert_called_once()
+
+    def test_failed_scoped_authentication_retires_signer(self):
+        FakeMaster.fail = True
+        with patch.object(module, 'start_scoped_agent', return_value=object()), \
+             patch.object(module, 'stop_agent') as stop:
+            with self.assertRaisesRegex(RuntimeError, 'connection failed'):
+                self.pool.acquire('scoped', [], 'host-a', ('local', 'dummy'))
+            self.pool.close()
+            stop.assert_called_once()
+
     def test_one_master_per_host_even_with_overlapping_commands(self):
         first = self.pool.acquire('same', [], 'host-a')
         self.assertEqual(self.pool.acquire('same', [], 'host-a'), first)

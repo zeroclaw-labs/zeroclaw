@@ -210,19 +210,23 @@ class Pool:
                     return process, agent
                 entry = dict(key=key, process=None, agent_path=agent_path, future=self.spawner.submit(spawn), path=path,
                              host=host, log=log, active=0, last=self.clock(), failed=False,
-                             ready=threading.Event(), stop_lock=threading.Lock())
+                             ready=threading.Event(), stop_lock=threading.Lock(), agent_lock=threading.Lock())
                 self.entries[key] = entry
         # Only callers of this key wait for its setup. Other destinations and
         # task shutdown never wait behind its network connection deadline.
         if owner:
             try:
-                process, _ = entry['future'].result()
+                process, agent = entry['future'].result()
                 entry['process'] = process
                 deadline = time.monotonic() + 15
                 while not pathlib.Path(entry['path']).exists() and process.poll() is None:
                     if self.closed or time.monotonic() > deadline:
                         break
                     time.sleep(0.05)
+                # OpenSSH creates its multiplex listener after authentication.
+                # Remove signing capability before making the connection available.
+                if agent is not None:
+                    self.retire_agent(entry, agent)
                 with self.lock:
                     entry['last'] = self.clock()
                     entry['failed'] = (self.closed or not pathlib.Path(entry['path']).exists()
@@ -261,6 +265,13 @@ class Pool:
                 entry['last'] = self.clock()
 
     @staticmethod
+    def retire_agent(entry, agent):
+        with entry['agent_lock']:
+            if not entry.get('agent_retired'):
+                stop_agent(agent, entry['agent_path'])
+                entry['agent_retired'] = True
+
+    @staticmethod
     def stop(entry):
         with entry['stop_lock']:
             try:
@@ -275,7 +286,7 @@ class Pool:
                     process.kill()
                     process.wait(timeout=3)
             if agent:
-                stop_agent(agent, entry['agent_path'])
+                Pool.retire_agent(entry, agent)
             entry['log'].close()
             pathlib.Path(entry['path']).unlink(missing_ok=True)
 
