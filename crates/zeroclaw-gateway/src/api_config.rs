@@ -1387,7 +1387,7 @@ pub async fn list_http_credentials(
                     }),
                 ));
             }
-            rows.sort_by(|(left, _), (right, _)| left.cmp(right));
+            rows.sort_by_key(|(name, _)| *name);
             Json(serde_json::json!({
                 "encryption_enabled": config.secrets.encrypt,
                 "credentials": rows.into_iter().map(|(_, row)| row).collect::<Vec<_>>()
