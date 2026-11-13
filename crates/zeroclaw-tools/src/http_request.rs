@@ -391,6 +391,15 @@ impl HttpRequestTool {
         .map_err(|_| anyhow::Error::msg("External credential lookup timed out"))?
         .map_err(failed)?;
         anyhow::ensure!(status.success(), "External credential lookup failed");
+        Self::decode_scoped_value(source, output)
+    }
+
+    fn decode_scoped_value(
+        source: zeroclaw_config::schema::ScopedCredentialSource,
+        output: Vec<u8>,
+    ) -> anyhow::Result<String> {
+        use zeroclaw_config::schema::ScopedCredentialSource;
+
         let value = if matches!(source, ScopedCredentialSource::Aws) {
             serde_json::from_slice::<String>(&output).ok()
         } else {
@@ -1277,6 +1286,33 @@ mod tests {
             properties.contains_key("auth_secret"),
             "http_request schema must expose auth_secret"
         );
+    }
+
+    #[test]
+    fn scoped_external_cli_outputs_match_documented_formats() {
+        use zeroclaw_config::schema::ScopedCredentialSource as Source;
+
+        for (source, output, expected) in [
+            (Source::OnePassword, &b"fixture-op\n"[..], "fixture-op"),
+            (Source::Azure, &b"fixture-azure\r\n"[..], "fixture-azure"),
+            (Source::Aws, &b"\"fixture-aws\"\n"[..], "fixture-aws"),
+            (Source::Google, &b"fixture-google"[..], "fixture-google"),
+            (Source::OpenBao, &b"fixture-bao"[..], "fixture-bao"),
+        ] {
+            assert_eq!(
+                HttpRequestTool::decode_scoped_value(source, output.to_vec()).unwrap(),
+                expected
+            );
+        }
+        for (source, output) in [
+            (Source::Aws, &b"null"[..]),
+            (Source::Aws, &b"{}"[..]),
+            (Source::Google, &b"multiple\nlines"[..]),
+            (Source::Azure, &b"\r\n"[..]),
+            (Source::OnePassword, &b"\xff"[..]),
+        ] {
+            assert!(HttpRequestTool::decode_scoped_value(source, output.to_vec()).is_err());
+        }
     }
 
     #[tokio::test]
