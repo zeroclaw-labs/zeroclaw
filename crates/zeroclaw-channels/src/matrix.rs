@@ -5733,7 +5733,7 @@ mod tests {
                 "speech.local".into(),
                 serde_json::from_value(serde_json::json!({
                     "capability": "tts", "provider": "speech.local", "model": "tts-1",
-                    "options": {"response_format": "opus"}
+                    "options": {"format": "opus"}
                 }))
                 .expect("canonical speech model"),
             );

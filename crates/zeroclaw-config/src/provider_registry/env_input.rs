@@ -194,18 +194,36 @@ pub(crate) fn set(config: &mut Config, path: &str, value: &str, restore: bool) -
     } else {
         Value::String(value.to_owned())
     };
-    set_document(&mut document, path, literal.clone(), None)?;
+    // JSON-valued options need their structured representation. A typed string
+    // field rejects numbers/objects here, then accepts the unchanged literal
+    // below. Keep strings (including quoted credentials) and the clear
+    // sentinel verbatim instead of treating them as JSON string syntax.
+    let parsed = serde_json::from_str::<Value>(value)
+        .ok()
+        .filter(|value| !value.is_null() && !value.is_string())
+        .unwrap_or_else(|| literal.clone());
+    set_document(&mut document, path, parsed.clone(), None)?;
     let candidate = serde_json::from_value(document.clone());
-    config.providers = match candidate {
+    let candidate: crate::providers::Providers = match candidate {
         Ok(candidate) => candidate,
         Err(error) => {
-            let parsed = serde_json::from_str::<Value>(value)
-                .map_err(|_| anyhow::Error::msg(error.to_string()))?;
-            ensure!(!parsed.is_null() && parsed != literal, "{error}");
-            set_document(&mut document, path, parsed, None)?;
+            ensure!(parsed != literal, "{error}");
+            set_document(&mut document, path, literal, None)?;
             serde_json::from_value(document)?
         }
     };
+    // Config files report unknown options at startup. Environment overrides
+    // must fail atomically if their target disappears during typed decoding.
+    if !value.is_empty() {
+        let pointer = path
+            .strip_prefix("/providers")
+            .ok_or_else(|| anyhow::Error::msg("invalid registry override path"))?;
+        ensure!(
+            serde_json::to_value(&candidate)?.pointer(pointer).is_some(),
+            "unknown registry override field"
+        );
+    }
+    config.providers = candidate;
     Ok(())
 }
 
@@ -245,7 +263,13 @@ fn set_document(
     ensure!(parts.len() >= 2, "override must target a registry leaf");
     let mut node = &mut *document;
     for (index, part) in parts[..parts.len() - 1].iter().enumerate() {
-        if index < 2 {
+        if index == 0 && matches!(part.as_str(), "fallback" | "model_presets") {
+            node = node
+                .as_object_mut()
+                .ok_or_else(|| anyhow::Error::msg("registry must be a table"))?
+                .entry(part.clone())
+                .or_insert_with(|| serde_json::json!({}));
+        } else if index < 2 {
             node = node
                 .get_mut(part)
                 .ok_or_else(|| anyhow::Error::msg("registry override target does not exist"))?;
@@ -253,13 +277,14 @@ fn set_document(
             let map = node
                 .as_object_mut()
                 .ok_or_else(|| anyhow::Error::msg("registry override parent must be a table"))?;
-            node = map.entry(part.clone()).or_insert_with(|| {
-                if part == "auth" {
+            node = map.entry(part.clone()).or_insert(Value::Null);
+            if node.is_null() {
+                *node = if part == "auth" {
                     serde_json::json!({"mode":"api_key"})
                 } else {
                     serde_json::json!({})
-                }
-            });
+                };
+            }
         }
     }
     let leaf = parts
@@ -353,7 +378,7 @@ mod tests {
         set(&mut config, &uri_path, "https://updated.invalid/v1", false).unwrap();
         set(&mut config, &key_path, &saved, true).unwrap();
         let value = serde_json::to_value(&config.providers).unwrap();
-        assert!(value["connections"]["gateway.Prod"].get("auth").is_none());
+        assert!(value["connections"]["gateway.Prod"]["auth"].is_null());
         assert_eq!(
             value["connections"]["gateway.Prod"]["uri"],
             "https://updated.invalid/v1"
@@ -390,6 +415,32 @@ mod tests {
             document["models"]["chat.Fast.v2"]["options"]["temperature"],
             serde_json::json!(0.25)
         );
+    }
+
+    #[test]
+    fn json_options_preserve_structured_environment_values() {
+        let mut config = fixture();
+        for field in ["chat_template_kwargs", "provider_extra"] {
+            let path = path(
+                &config,
+                &format!("providers__models__chat.Fast.v2__options__{field}"),
+            )
+            .unwrap();
+            let saved = snapshot(&config, &path).unwrap();
+            set(
+                &mut config,
+                &path,
+                r#"{"enable_thinking":false,"limit":123}"#,
+                false,
+            )
+            .unwrap();
+            let value = serde_json::to_value(&config.providers).unwrap();
+            assert_eq!(
+                value["models"]["chat.Fast.v2"]["options"][field],
+                serde_json::json!({"enable_thinking":false,"limit":123})
+            );
+            set(&mut config, &path, &saved, true).unwrap();
+        }
     }
 
     #[test]
