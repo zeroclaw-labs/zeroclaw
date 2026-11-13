@@ -27547,13 +27547,8 @@ fn restore_onepassword_references_for_save(
             continue;
         }
         if path.starts_with("/providers/") {
-            crate::provider_registry::env_input::set(
-                config_to_save,
-                path,
-                &serde_json::to_string(value)?,
-                false,
-            )
-            .context("restore provider external secret reference before save")?;
+            crate::provider_registry::env_input::set(config_to_save, path, value, false)
+                .context("restore provider external secret reference before save")?;
             continue;
         }
         if let Err(err) = config_to_save.set_prop(path, value) {
@@ -52302,9 +52297,11 @@ allowed_users = []
             .insert("default".to_string(), RiskProfileConfig::default());
 
         // Anthropic model provider (mandatory for the agent).
-        config.providers.models.anthropic.insert(
-            "default".to_string(),
-            AnthropicModelProviderConfig::default(),
+        crate::migration::bind_test_route_model(
+            &mut config,
+            "anthropic.default",
+            "test-model",
+            None,
         );
 
         // A configured Telegram channel the agent can reference. Just
@@ -54855,10 +54852,7 @@ group_policy = "all"
 
     fn delegate_roster_config() -> Config {
         let mut cfg = Config::default();
-        cfg.providers.models.ollama.insert(
-            "default".to_string(),
-            crate::schema::OllamaModelProviderConfig::default(),
-        );
+        crate::migration::bind_test_route_model(&mut cfg, "ollama.default", "test-model", None);
         cfg.risk_profiles
             .insert("shared".to_string(), RiskProfileConfig::default());
         cfg.risk_profiles

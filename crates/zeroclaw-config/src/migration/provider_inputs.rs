@@ -244,6 +244,9 @@ fn providers_for_input(config: &Config) -> Result<crate::providers::Providers> {
                     continue;
                 };
                 let auth = object.entry("auth").or_insert_with(|| json!({}));
+                if auth.is_null() {
+                    *auth = json!({});
+                }
                 let Some(auth) = auth.as_object_mut() else {
                     continue;
                 };
@@ -1011,7 +1014,13 @@ pub(crate) fn migrate_document(mut document: toml::Value) -> Result<toml::Value>
     let normalized: Config = toml::Value::Table(input)
         .try_into()
         .context("normalize provider configuration input")?;
-    document["providers"] = toml::Value::try_from(&normalized.providers)?;
+    document
+        .as_table_mut()
+        .context("configuration document must be a table")?
+        .insert(
+            "providers".into(),
+            toml::Value::try_from(&normalized.providers)?,
+        );
     if let Some(table) = document.as_table_mut() {
         table.remove("decision_models");
     }

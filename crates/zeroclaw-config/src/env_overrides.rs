@@ -516,6 +516,7 @@ mod tests {
             r#"
 [providers.models.grok_cli.work]
 model = "base-model"
+working_directory = "/fixture/workspace"
 max_acp_stdout_bytes = 1048576
 [providers.models.grok_cli.work.models."fast.v2"]
 id = "nested-model"

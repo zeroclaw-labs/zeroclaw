@@ -117,11 +117,6 @@ pub(crate) fn remap_after_promotion(source: &Config, candidate: &mut Config) -> 
                     out,
                 );
             }
-        } else if original.is_null() && admitted.is_object() {
-            for (key, value) in admitted.as_object().into_iter().flatten() {
-                let path = format!("{path}/{}", key.replace('~', "~0").replace('/', "~1"));
-                differences(&Value::Null, value, &path, out);
-            }
         } else {
             out.push(path.to_owned());
         }
