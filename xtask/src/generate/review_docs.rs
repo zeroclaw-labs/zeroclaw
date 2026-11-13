@@ -141,7 +141,7 @@ fn buckets(values: &[&str]) -> String {
 
 fn render_skill(policy: &ReviewCiPolicy, current: &str) -> anyhow::Result<String> {
     let fetch = format!(
-        "- **What to fetch** (PR metadata, comments, inline threads, formal reviews,\n  diff, RFCs, current merge state, base drift against `{}`, and required\n  checks) — run all fetches in a single parallel batch",
+        "- **What to fetch** (PR metadata, comments, inline threads, formal reviews,\n  diff, RFCs, current merge state, base drift against `{}`, and required\n  checks) — batch independent fetches between the revision guards",
         policy.base_branch
     );
     let freshness = format!(
@@ -218,11 +218,11 @@ fn render_protocol_fetch(policy: &ReviewCiPolicy) -> String {
    and base drift rules below, never an author's description of the state.
 
    On a re-review, a verified refreshed head means this `headRefOid` differs
-   from the previously reviewed head recorded in `tmp/handoff.md` or the
-   `commit_id` of the reviewer's own prior review from step 4, and the reviewer
-   has confirmed that the new revision contains the requested refresh. On a
-   first review or without a prior reviewed head, do not infer a rerun from
-   author prose; use the normal pending-CI rules."#,
+   from the `commit_id` of the reviewer's own prior review fetched in step 4,
+   and the reviewer has confirmed that the new revision contains the requested
+   refresh. A local draft or handoff file does not establish a posted review.
+   On a first review or without a verified prior reviewed head, do not infer a
+   rerun from author prose; use the normal pending-CI rules."#,
         base_branch = policy.base_branch,
         minimum_gh_version = minimum_gh_version,
         minimum_gh_major = policy.minimum_gh_major,

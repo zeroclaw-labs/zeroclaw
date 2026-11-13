@@ -81,7 +81,11 @@ REVIEW_DECISION=$(gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw \
 
 - `APPROVED` or `""` → proceed
 - `REVIEW_REQUIRED` → warn the user that no required review has been received, and ask if they want to proceed anyway
-- `CHANGES_REQUESTED` → stop: "PR #$NUMBER has a changes-requested review outstanding. The reviewer must approve or dismiss their review before this can merge."
+- `CHANGES_REQUESTED` → stop: "PR #$NUMBER has a changes-requested review outstanding. Ordinary findings need reconciliation; an integration hold requires deliberate maintainer dismissal."
+
+Before accepting any aggregate review decision, apply **Integration decisions** in `docs/book/src/contributing/pr-review-protocol.md` to the current head and live review/dismissal history. A later generic approval or removal of the integration does not clear a posted integration hold. Stop if the required approval or dismissal cannot be verified; do not dismiss the hold or substitute an approval during merge preparation.
+
+Complete **Final administrative review** in `docs/book/src/maintainers/pr-workflow.md` before preparing the merge packet. This covers templates, public-artifact checks, label hygiene, milestone placement, and queue/tracker handling formerly carried by the substantive review skill. The future merge workflow will invoke `pr-template-review`; until it exists, perform that checklist directly, preserving the existing authorization boundaries for public changes.
 
 ### Step 1a: Enforce Labels, Milestone, and Release-Line Placement
 
@@ -331,6 +335,8 @@ Do not infer consent from silence, prior approval of the commit message, or any 
 ### Step 5: Execute
 
 Only after explicit confirmation in Step 4:
+
+Re-read and re-evaluate the current integration inventory, exact approval records, and review/dismissal history under **Integration decisions** in the review protocol. If a relied-on approval changed or became unverifiable, a new integration needs a decision, or any posted hold lacks deliberate maintainer dismissal, stop and rebuild the confirmation packet from Step 1. A matching head and an aggregate `APPROVED` state do not replace this check; decision records can change without a commit.
 
 Immediately before merge, reread the current PR body and closing references and rerun Step 1a's complete release-line classification from the refreshed body, every closing issue, labels, milestone, and any deeper public evidence it triggers. Set `$CURRENT_RELEASE_LINE_DISPOSITION` from that recomputation; merely fetching the sources is not sufficient. Stop if the recomputed disposition is absent or ambiguous. The no-signal fast path must satisfy its complete predicate again. If `$RELEASE_EVIDENCE_STATE` names a PR-body, closing-issue, linked-tracker, or comment fact, reread that source and compare the exact placement fact as well. Also reread the current head, `do-not-merge`, `status:blocked`, and `release-gate` labels and milestone, and save the current sorted closing-issue number set as `$CURRENT_RELEASE_CLOSING_ISSUES`. If the guard state, derived disposition, closing-issue set, or any relied-upon fact changed or became ambiguous, stop without merging, restart at Step 1, and build a new confirmation packet. Unrelated body or issue wording that leaves the release disposition and relied-upon facts unchanged does not invalidate the packet. This is a bounded last-moment consistency check, not an atomic lock: `--match-head-commit` protects the source head but does not detect concurrent metadata or evidence changes after the read.
 

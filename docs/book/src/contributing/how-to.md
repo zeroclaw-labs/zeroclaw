@@ -29,6 +29,8 @@ The key checkpoints:
 - **Review routing**: make the scope, linked issues, validation, and risk/rollback context clear enough that reviewers can choose the right review path quickly.
 - **Review**: maintainers review. Findings use the PR review taxonomy: 🔴 blocking, 🟡 warning, 🔵 suggestion, 🟢 praise, and ✅ resolved. Address blockers; warnings should get a response; suggestions are optional.
 
+Substantive review checks the linked issue, code quality, security, integrations, and downstream effects. The proposed workflow in [RFC #11876](https://github.com/zeroclaw-labs/zeroclaw/issues/11876) requires a linked issue and explicit maintainer approval for new external integrations; see the [review protocol](./pr-review-protocol.md) for scope, prior approval, and persistent integration holds. Labels, milestones, template compliance, and queue bookkeeping belong to [final administrative review](../maintainers/pr-workflow.md#final-administrative-review) before merge, so code approval alone does not establish merge readiness.
+
 ## Code style
 
 - `cargo fmt` clean (checked in CI)
