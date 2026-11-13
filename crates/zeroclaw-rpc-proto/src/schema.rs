@@ -57,7 +57,7 @@ catalog! {
     ConfigReloadResult, ConfigListParams, ConfigListResult, ConfigDeleteParams, ConfigDeleteResult,
     ConfigMapKeysParams, ConfigMapKeysResult, ConfigResolveAliasSourceParams,
     ConfigResolveAliasSourceResult, ConfigMapKeyCreateParams, ConfigMapKeyCreateResult,
-    ConfigMapKeyDeleteParams, ConfigMapKeyDeleteResult, ConfigMapKeyRenameParams,
+    ConfigMapKeyDeleteParams, OwnedStateReport, ConfigMapKeyDeleteResult, ConfigMapKeyRenameParams,
     ConfigMapKeyRenameResult, ConfigTemplateEntry, ConfigTemplatesResult,
     // Config publication and application
     PublishedConfigRevision, ConfigApplicationTarget, ConfigApplicationOutcome,

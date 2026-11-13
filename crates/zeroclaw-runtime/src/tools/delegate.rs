@@ -37,6 +37,9 @@ use zeroclaw_log::Instrument as _;
 use zeroclaw_memory::Memory;
 use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
 
+/// Registered name of the identity-scoped knowledge tool.
+const KNOWLEDGE_TOOL_NAME: &str = "knowledge";
+
 fn current_tool_loop_session_key() -> Option<String> {
     TOOL_LOOP_SESSION_KEY.try_with(Clone::clone).ok().flatten()
 }
@@ -1756,6 +1759,28 @@ impl DelegateTool {
                 &[("agent_name", agent_name)],
             )),
         }
+    }
+
+    /// The knowledge tool bound to the target agent's identity. Like the
+    /// memory tools, a bounded delegate's knowledge captures and reads belong
+    /// to the agent it runs as, never to the delegating parent.
+    fn knowledge_tool_for_target(
+        &self,
+        config: Option<&Config>,
+        agent_name: &str,
+    ) -> anyhow::Result<Arc<dyn Tool>> {
+        let config = config.or(self.root_config.as_deref()).ok_or_else(|| {
+            anyhow::Error::msg("knowledge for a delegate target requires a config snapshot")
+        })?;
+        let graph = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &config.knowledge.resolved_db_path(),
+            config.knowledge.max_nodes,
+        )?;
+        let scope =
+            crate::tools::knowledge_scope_for_agent(config, self.live_config.as_ref(), agent_name);
+        Ok(Arc::new(
+            zeroclaw_tools::knowledge_tool::KnowledgeTool::new(Arc::new(graph), scope),
+        ))
     }
 
     #[cfg(test)]
@@ -5415,6 +5440,35 @@ impl DelegateTool {
                 } else {
                     None
                 };
+                // The knowledge tool is identity-scoped like memory: a bounded
+                // delegate captures and reads as its target agent, never as the
+                // delegating parent. Rebinding it constructs a native tool, which
+                // a supplied-only registry forbids, so that case refuses.
+                let inherits_knowledge = inherited
+                    .iter()
+                    .any(|(tool, origin)| origin.is_none() && tool.name() == KNOWLEDGE_TOOL_NAME);
+                if inherits_knowledge
+                    && construction == crate::composition::RegistryConstruction::SuppliedOnly
+                {
+                    return Ok(Self::bounded_tools_refusal(agent_name));
+                }
+                let target_knowledge = if inherits_knowledge {
+                    match self.knowledge_tool_for_target(target_config, agent_name) {
+                        Ok(tool) => Some(tool),
+                        Err(e) => {
+                            return Ok(ToolResult {
+                                success: false,
+                                output: ToolOutput::default(),
+                                error: Some(crate::i18n::get_required_cli_string_with_args(
+                                    "delegate-knowledge-init-failed",
+                                    &[("agent", agent_name), ("error", &format!("{e:#}"))],
+                                )),
+                            });
+                        }
+                    }
+                } else {
+                    None
+                };
                 let target_memory_tools = target_memory.as_ref().map(|memory| {
                     self.memory_tools_for_target(
                         &memory_kinds,
@@ -5429,6 +5483,11 @@ impl DelegateTool {
                             .as_ref()
                             .and_then(|(tools, _)| tools.get(&origin.kind))
                         else {
+                            return Ok(Self::bounded_tools_refusal(agent_name));
+                        };
+                        Arc::clone(replacement)
+                    } else if tool.name() == KNOWLEDGE_TOOL_NAME {
+                        let Some(replacement) = target_knowledge.as_ref() else {
                             return Ok(Self::bounded_tools_refusal(agent_name));
                         };
                         Arc::clone(replacement)
@@ -9524,6 +9583,31 @@ mod tests {
         assert_eq!(*fixture.memory.seen.lock(), vec!["caller"]);
     }
 
+    /// A supplied-only registry cannot construct a target-scoped knowledge
+    /// tool, and the caller's instance must not reach another agent, so a
+    /// bounded delegation that would inherit it refuses.
+    #[tokio::test]
+    async fn bounded_supplied_mode_refuses_to_pass_the_callers_knowledge_tool() {
+        use zeroclaw_memory::knowledge_graph::{KnowledgeGraph, KnowledgeScope};
+
+        let fixture = origin_fixture(false, false, false, false, "knowledge").await;
+        let graph = KnowledgeGraph::new(&fixture._tmp.path().join("knowledge.db"), 100).unwrap();
+        let caller_knowledge: Arc<dyn Tool> = Arc::new(crate::tools::KnowledgeTool::new(
+            Arc::new(graph),
+            KnowledgeScope::for_agent("caller", Vec::<String>::new()),
+        ));
+        fixture
+            .delegate
+            .parent_tools
+            .tools
+            .write()
+            .insert(0, caller_knowledge);
+
+        let result = dispatch_origin(&fixture).await;
+        assert!(!result.success, "{result:?}");
+        assert_eq!(result.error, DelegateTool::bounded_tools_refusal("a").error);
+    }
+
     async fn scoped_origin_parent(
         fixture: &OriginFixture,
         exclude_memory: bool,
@@ -11993,6 +12077,181 @@ mod tests {
         assert!(result.success, "agentic delegate failed: {result:?}");
         assert!(result.output.contains("memory workflow done"));
         assert_stored_for_target_only(&fixture, "sync-key").await;
+    }
+
+    struct KnowledgeCaptureThenFinalModelProvider;
+
+    #[async_trait]
+    impl ModelProvider for KnowledgeCaptureThenFinalModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            if request.messages.iter().any(|m| m.role == "tool") {
+                return Ok(ChatResponse {
+                    text: Some("knowledge workflow done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                });
+            }
+            Ok(ChatResponse {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_capture".to_string(),
+                    name: "knowledge".to_string(),
+                    arguments: serde_json::json!({
+                        "action": "capture",
+                        "node_type": "pattern",
+                        "title": "delegated capture",
+                        "content": "captured while running as the target"
+                    })
+                    .to_string(),
+                    extra_content: None,
+                }],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for KnowledgeCaptureThenFinalModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "KnowledgeCaptureThenFinalModelProvider"
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_agentic_rebinds_knowledge_tool_to_target_agent_scope() {
+        // Like memory, the knowledge tool is identity-scoped. A bounded child
+        // inherits the parent's registry, so the parent's caller-scoped
+        // instance must be replaced: a capture made while running as the
+        // target belongs to the target, never to the delegating caller.
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_memory::knowledge_graph::{KnowledgeGraph, KnowledgeScope};
+
+        let tmp = TempDir::new().unwrap();
+        let graph_path = tmp.path().join("knowledge.db");
+        let mut root_config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        root_config.knowledge.enabled = true;
+        root_config.knowledge.db_path = graph_path.to_string_lossy().into_owned();
+        let model_provider_config = ModelProviderConfig {
+            model: Some("delegate-test-model".to_string()),
+            api_key: Some("delegate-test-key".to_string()),
+            ..ModelProviderConfig::default()
+        };
+        root_config.providers.models.custom.insert(
+            "local".to_string(),
+            CustomModelProviderConfig {
+                base: model_provider_config.clone(),
+            },
+        );
+        let mut risk_profile = RiskProfileConfig {
+            delegation_policy: DelegationPolicy {
+                mode: DelegationMode::Allow,
+            },
+            allowed_tools: vec!["knowledge".to_string()],
+            ..RiskProfileConfig::default()
+        };
+        risk_profile.auto_approve.push("knowledge".to_string());
+        root_config
+            .risk_profiles
+            .insert("agentic_test".to_string(), risk_profile);
+        root_config.runtime_profiles.insert(
+            "agentic_test".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 5,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        let agent = AliasedAgentConfig {
+            model_provider: "custom.local".into(),
+            risk_profile: "agentic_test".into(),
+            runtime_profile: "agentic_test".into(),
+            ..AliasedAgentConfig::default()
+        };
+        root_config
+            .agents
+            .insert("caller".to_string(), agent.clone());
+        root_config
+            .agents
+            .insert("target".to_string(), agent.clone());
+        let root_config = Arc::new(root_config);
+        let caller_security = Arc::new(SecurityPolicy::for_agent(&root_config, "caller").unwrap());
+        let caller_knowledge: Arc<dyn Tool> = Arc::new(crate::tools::KnowledgeTool::new(
+            Arc::new(KnowledgeGraph::new(&graph_path, 100).unwrap()),
+            KnowledgeScope::for_agent("caller", Vec::<String>::new()),
+        ));
+        let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
+            HashMap::new();
+        providers_models
+            .entry("custom".to_string())
+            .or_default()
+            .insert("local".to_string(), model_provider_config);
+        let tool = DelegateTool::new(
+            root_config.agents.clone(),
+            None,
+            Arc::clone(&caller_security),
+        )
+        .with_root_config(Arc::clone(&root_config))
+        .with_workspace_dir(tmp.path().join("workspace"))
+        .with_parent_tools(Arc::new(RwLock::new(vec![caller_knowledge])))
+        .with_providers_models(providers_models)
+        .with_risk_profiles(root_config.risk_profiles.clone())
+        .with_runtime_profiles(root_config.runtime_profiles.clone())
+        .with_caller_alias("caller");
+
+        let result = tool
+            .execute_agentic(
+                "target",
+                &agent,
+                "custom",
+                "delegate-test-model",
+                &KnowledgeCaptureThenFinalModelProvider,
+                "capture what you learned",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "agentic delegate failed: {result:?}");
+        assert!(result.output.contains("knowledge workflow done"));
+        let graph = KnowledgeGraph::new(&graph_path, 100).unwrap();
+        assert_eq!(
+            graph.count_owner("target").unwrap(),
+            1,
+            "the delegated capture must belong to the target agent"
+        );
+        assert_eq!(
+            graph.count_owner("caller").unwrap(),
+            0,
+            "a bounded delegate must not write as the delegating caller"
+        );
     }
 
     #[tokio::test]
