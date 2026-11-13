@@ -1,3 +1,4 @@
+import HttpCredentials from "@/components/sections/HttpCredentials";
 import PluginTlsCredentials from "../components/sections/PluginTlsCredentials";
 // Schema-driven config editor (#6175). Curated section explorer
 // but lands on a per-section overview: pick a section in the sidebar, see
@@ -246,6 +247,16 @@ export default function Config() {
               key: "plugin-tls-credentials",
               label: t("plugin_tls.title"),
               render: () => <PluginTlsCredentials />,
+            },
+            {
+              key: "user-password-credentials",
+              label: t("http_credentials.user_password"),
+              render: () => <HttpCredentials key="user_password" kind="user_password" />,
+            },
+            {
+              key: "api-key-credentials",
+              label: t("http_credentials.api_key"),
+              render: () => <HttpCredentials key="api_key" kind="api_key" />,
             },
           ]}
         />

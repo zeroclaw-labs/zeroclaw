@@ -9043,6 +9043,59 @@ pub struct HttpRequestConfig {
     #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub secrets: HashMap<String, String>,
+    /// Encrypted, origin-bound HTTP credentials managed by the operator.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub scoped_credentials: HashMap<String, String>,
+}
+
+/// The plaintext record exists only inside the operator endpoint and HTTP tool.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopedHttpCredential {
+    pub origin: String,
+    pub auth: ScopedHttpAuth,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ScopedHttpAuth {
+    ApiKey {
+        value: String,
+        #[serde(default)]
+        header: ScopedApiKeyHeader,
+    },
+    UserPassword {
+        username: String,
+        password: String,
+    },
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopedApiKeyHeader {
+    #[default]
+    Bearer,
+    XApiKey,
+}
+
+impl ScopedHttpCredential {
+    pub fn https_origin(raw: &str) -> Option<String> {
+        let url = url::Url::parse(raw).ok()?;
+        if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+            return None;
+        }
+        Some(url.origin().ascii_serialization())
+    }
+
+    pub fn valid_name(name: &str) -> bool {
+        (1..=64).contains(&name.len())
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    }
 }
 
 impl Default for HttpRequestConfig {
@@ -9055,6 +9108,7 @@ impl Default for HttpRequestConfig {
             allow_private_hosts: false,
             allowed_private_hosts: vec![],
             secrets: HashMap::new(),
+            scoped_credentials: HashMap::new(),
         }
     }
 }

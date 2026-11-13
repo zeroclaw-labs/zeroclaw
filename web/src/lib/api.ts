@@ -1382,6 +1382,27 @@ export interface MapKeyResponse {
   created: boolean;
 }
 
+export type HttpCredentialKind = "user_password" | "api_key";
+export type HttpCredentialRow = { name: string; origin: string; kind: HttpCredentialKind };
+type HttpCredentialAuth =
+  | { kind: "user_password"; username: string; password: string }
+  | { kind: "api_key"; value: string; header: "bearer" | "x_api_key" };
+
+const httpCredentialsPath = "/api/config/http-credentials";
+
+export function listHttpCredentials() {
+  return apiFetch<{ encryption_enabled: boolean; credentials: HttpCredentialRow[] }>(
+    httpCredentialsPath,
+  );
+}
+
+export function changeHttpCredential(mutation:
+  | { name: string; operation: "create" | "replace"; credential: { origin: string; auth: HttpCredentialAuth } }
+  | { name: string; operation: "delete" }
+) {
+  return apiFetch<void>(httpCredentialsPath, { method: "POST", body: JSON.stringify(mutation) });
+}
+
 export interface PluginTlsCredential {
   instance: string;
   property: string;
