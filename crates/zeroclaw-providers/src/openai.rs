@@ -1820,6 +1820,10 @@ mod tool_round_policy_tests {
         policy: Option<ToolRoundPolicy>,
         tool_shape: u8,
     ) -> serde_json::Value {
+        // The proxy tests point the process-wide runtime proxy at a throwaway
+        // server for the OpenAI services; a client built while one of them
+        // runs would send this fixture's request there instead.
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
         let captured = Arc::new(Mutex::new(None));
         let capture = Arc::clone(&captured);
         let path = match wire {
