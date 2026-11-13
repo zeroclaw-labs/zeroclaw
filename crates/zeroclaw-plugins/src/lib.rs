@@ -8,6 +8,8 @@ pub mod component;
 #[cfg(feature = "plugins-wasmtime")]
 mod component_config;
 #[cfg(feature = "plugins-wasmtime")]
+mod component_limits;
+#[cfg(feature = "plugins-wasmtime")]
 mod component_logging;
 #[cfg(feature = "plugins-wasmtime")]
 mod component_secrets;
