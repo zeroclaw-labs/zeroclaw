@@ -1503,8 +1503,7 @@ provider = "gateway"
         let zeroclaw_config::provider_registry::ModelDefinition::Chat(model) = cfg
             .providers
             .models
-            .canonical_models
-            .get_mut("anthropic.default")
+            .canonical_model_mut(&"anthropic.default".into())
             .unwrap()
         else {
             panic!("fixture must contain a chat model");

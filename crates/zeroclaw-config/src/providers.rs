@@ -336,6 +336,15 @@ impl ModelProviders {
         self.canonical_models.get(model_ref)
     }
 
+    /// Mutable exact-key lookup for callers editing an admitted canonical
+    /// model in their owned configuration candidate.
+    pub fn canonical_model_mut(
+        &mut self,
+        model_ref: &ModelRef,
+    ) -> Option<&mut ModelDefinition<serde_json::Value>> {
+        self.canonical_models.get_mut(model_ref)
+    }
+
     /// Insert an exact model key into a caller-owned configuration candidate.
     /// Validate the candidate with `Providers::canonical_registry` before
     /// publishing or persisting it; connection-dependent options resolve there.
