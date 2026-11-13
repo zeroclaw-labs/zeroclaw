@@ -1,6 +1,6 @@
 use super::{
     WebSearchTool, cap_provider_error, cap_result_content, http_search_failure, no_results_message,
-    render_results, results_header,
+    render_results, results_header, transport_search_failure,
 };
 use crate::i18n::get_required_tool_string;
 use crate::mcp_client::McpServer;
@@ -27,7 +27,19 @@ impl WebSearchTool {
             try_apply_runtime_proxy_to_builder(reqwest::Client::builder(), "tool.web_search")?;
         let transport = HttpTransport::with_builder(&config, builder)?;
         let call = async {
-            let server = McpServer::connect_with_transport(config, Arc::new(transport)).await?;
+            let server = McpServer::connect_with_transport(config, Arc::new(transport))
+                .await
+                .map_err(|err| match err.downcast_ref::<reqwest::Error>() {
+                    Some(transport) => {
+                        let stage = if transport.is_body() || transport.is_decode() {
+                            "response"
+                        } else {
+                            "request"
+                        };
+                        transport_search_failure("parallel", stage, transport)
+                    }
+                    None => err,
+                })?;
             server
                 .call_tool(
                     "web_search",
@@ -44,9 +56,6 @@ impl WebSearchTool {
             })?
             .map_err(|err| match err.downcast_ref::<McpHttpStatus>() {
                 Some(status) => http_search_failure("parallel", status.0),
-                // A JSON-RPC `error` reply carries server-controlled text that
-                // `McpServer::call_tool` formats unbounded, and this path
-                // returns before the rendering caps.
                 None => anyhow::Error::msg(cap_provider_error(&err.to_string())),
             })?;
         format_response(query, self.max_results, &result)
@@ -124,7 +133,7 @@ mod tests {
     use zeroclaw_config::schema::{ProxyConfig, ProxyScope, set_runtime_proxy_config};
 
     #[tokio::test]
-    async fn search_uses_service_proxy_and_reports_http_errors() {
+    async fn search_uses_service_proxy_and_classifies_failures() {
         let _guard = crate::test_support::RuntimeProxyStateGuard::acquire().await;
         let proxy = MockServer::start().await;
         set_runtime_proxy_config(ProxyConfig {
@@ -135,8 +144,14 @@ mod tests {
             no_proxy: vec!["localhost".into(), "127.0.0.1".into(), "::1".into()],
             ..Default::default()
         });
+        let redirects = MockServer::start().await;
+        let redirect_url = redirects.uri();
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(307).insert_header("location", "/mcp"))
+            .mount(&redirects)
+            .await;
         Mock::given(method("POST")).and(header("user-agent", "ZeroClaw"))
-            .respond_with(|request: &Request| {
+            .respond_with(move |request: &Request| {
                 let body: Value = request.body_json().unwrap();
                 let result = match body["method"].as_str().unwrap() {
                     "initialize" => json!({"capabilities":{"tools":{}}}),
@@ -149,13 +164,16 @@ mod tests {
                         if args["objective"] == "limited" {
                             return ResponseTemplate::new(429);
                         }
+                        if args["objective"] == "interrupted" {
+                            return ResponseTemplate::new(307).insert_header("location", redirect_url.as_str());
+                        }
                         let hit = json!({"results":[{"url":"https://example.org","excerpts":["passage"]}]});
                         json!({"content":[{"type":"text","text":hit.to_string()}]})
                     }
                     other => panic!("unexpected MCP method {other}"),
                 };
                 ResponseTemplate::new(200).set_body_json(json!({"jsonrpc":"2.0","id":body["id"],"result":result}))
-            }).expect(8).mount(&proxy).await;
+            }).mount(&proxy).await;
         let tool = WebSearchTool::new("parallel".into(), None, None, 1, 5);
         let endpoint = "http://search.invalid/mcp";
         let output = tool.search_parallel(endpoint, "example").await.unwrap();
@@ -164,6 +182,39 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("search_status=unavailable, http=429")
+        );
+
+        assert_eq!(proxy.received_requests().await.unwrap().len(), 8);
+        let err = tool
+            .search_parallel(&redirects.uri(), "example")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("search_status=unavailable, transport=redirect, stage=request"),
+            "{err}"
+        );
+        let err = tool
+            .search_parallel(endpoint, "interrupted")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("outcome unknown and request was not replayed"),
+            "{err}"
+        );
+
+        let tool = WebSearchTool::new("parallel".into(), None, None, 1, 1);
+        let stalled = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/mcp", stalled.local_addr().unwrap());
+        let err = tool
+            .search_parallel(&endpoint, "example")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("search_status=unavailable, transport=timeout"),
+            "{err}"
         );
     }
 
