@@ -258,6 +258,11 @@ export default function Config() {
               label: t("http_credentials.api_key"),
               render: () => <HttpCredentials key="api_key" kind="api_key" />,
             },
+            {
+              key: "ssh-key-credentials",
+              label: t("http_credentials.ssh_keys"),
+              render: () => <HttpCredentials key="ssh_key" kind="ssh_key" />,
+            },
           ]}
         />
       );

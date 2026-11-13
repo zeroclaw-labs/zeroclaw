@@ -1379,11 +1379,16 @@ pub async fn list_http_credentials(
                 let kind = match record.auth {
                     ScopedHttpAuth::ApiKey { .. } => "api_key",
                     ScopedHttpAuth::UserPassword { .. } => "user_password",
+                    ScopedHttpAuth::SshKey { .. } => "ssh_key",
+                };
+                let destinations = match &record.auth {
+                    ScopedHttpAuth::SshKey { destinations, .. } => Some(destinations),
+                    _ => None,
                 };
                 rows.push((
                     name,
                     serde_json::json!({
-                        "name": name, "origin": record.origin, "kind": kind, "source": record.source
+                        "name": name, "origin": record.origin, "kind": kind, "source": record.source, "destinations": destinations
                     }),
                 ));
             }
@@ -1440,13 +1445,20 @@ pub async fn mutate_http_credential(
                 _ => return StatusCode::CONFLICT.into_response(),
             };
             if let Some(mut credential) = mutation.credential {
-                let Some(origin) = ScopedHttpCredential::https_origin(&credential.origin) else {
-                    return StatusCode::BAD_REQUEST.into_response();
-                };
-                if credential.origin.trim_end_matches('/') != origin {
-                    return StatusCode::BAD_REQUEST.into_response();
+                if matches!(&credential.auth, ScopedHttpAuth::SshKey { .. }) {
+                    if !credential.origin.is_empty() {
+                        return StatusCode::BAD_REQUEST.into_response();
+                    }
+                } else {
+                    let Some(origin) = ScopedHttpCredential::https_origin(&credential.origin)
+                    else {
+                        return StatusCode::BAD_REQUEST.into_response();
+                    };
+                    if credential.origin.trim_end_matches('/') != origin {
+                        return StatusCode::BAD_REQUEST.into_response();
+                    }
+                    credential.origin = origin;
                 }
-                credential.origin = origin;
                 let valid = |value: &str| {
                     !value.trim().is_empty()
                         && value.len() <= 4096
@@ -1461,6 +1473,24 @@ pub async fn mutate_http_credential(
                     ScopedHttpAuth::ApiKey { value, .. } => valid_secret(value) && value.is_ascii(),
                     ScopedHttpAuth::UserPassword { username, password } => {
                         valid(username) && !username.contains(':') && valid_secret(password)
+                    }
+                    ScopedHttpAuth::SshKey {
+                        private_key,
+                        destinations,
+                    } => {
+                        let key = private_key.trim();
+                        let valid_key = match credential.source {
+                            ScopedCredentialSource::Local => {
+                                key.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----")
+                                    && key.ends_with("-----END OPENSSH PRIVATE KEY-----")
+                            }
+                            source => source.command(key).is_some(),
+                        };
+                        valid_key
+                            && destinations.len() <= 32
+                            && destinations
+                                .iter()
+                                .all(|destination| destination.is_valid())
                     }
                 };
                 if !valid_auth {

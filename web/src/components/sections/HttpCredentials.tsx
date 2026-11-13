@@ -62,9 +62,16 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
     const form = event.currentTarget;
     const data = new FormData(form);
     const name = editing === "new" ? String(data.get("name")) : editing.name;
-    const origin = String(data.get("origin"));
+    const origin = kind === "ssh_key" ? "" : String(data.get("origin"));
     const secret = String(data.get("secret"));
-    const auth = kind === "api_key"
+    const destinations = String(data.get("destinations") ?? "").split("\n")
+      .map(line => line.trim()).filter(Boolean).map(line => {
+        const match = /^([^@]+)@(?:\[([0-9a-f:.]+)\]|([^:]+))(?::(\d+))?$/i.exec(line);
+        return { username: match?.[1] ?? "", host: match?.[2] ?? match?.[3] ?? "", port: Number(match?.[4] ?? 22) };
+      });
+    const auth = kind === "ssh_key"
+      ? { kind, private_key: secret.trim(), destinations } as const
+      : kind === "api_key"
       ? { kind, value: secret, header } as const
       : { kind, username: String(data.get("username")), password: secret } as const;
     form.reset();
@@ -77,7 +84,7 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
   const inputClass = "block w-full rounded-md border border-border bg-background px-3 py-2";
   return (
     <section className="space-y-4">
-      <p className="text-sm">{t("http_credentials.hint")}</p>
+      <p className="text-sm">{t(kind === "ssh_key" ? "http_credentials.ssh_pending" : "http_credentials.hint")}</p>
       {message && <p role="status">{message}</p>}
       {!catalog && !message && <p>{t("plugin_tls.loading")}</p>}
       {catalog && !catalog.encryption_enabled && <p>{t("plugin_tls.encryption")}</p>}
@@ -85,7 +92,10 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
       {rows.map((row) => (
         <div key={row.name} className="space-y-2 rounded-md border p-3">
           <p className="break-all font-medium">{row.name}</p>
-          <p className="break-all text-sm">{row.origin} · {t(`http_credentials.source_${row.source}`)}</p>
+          <p className="break-all text-sm">{row.origin && `${row.origin} · `}{t(`http_credentials.source_${row.source}`)}</p>
+          {row.destinations?.map((destination) => (
+            <p key={JSON.stringify(destination)} className="text-sm">{destination.username}@{destination.host}:{destination.port}</p>
+          ))}
           <div className="flex flex-wrap gap-2">
             <Button size="sm" disabled={disabled} onClick={() => { setRemoving(null); setHeader("bearer"); setSource(row.source); setEditing(row); }}>
               {t("plugin_tls.replace")}
@@ -105,10 +115,19 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
             <span>{t("http_credentials.name")}</span>
             <input className={inputClass} name="name" required maxLength={64} pattern={"[A-Za-z0-9_\\-]+"} readOnly={editing !== "new"} defaultValue={editing === "new" ? "" : editing.name} />
           </label>
+          {kind === "ssh_key" ? (
+            <label className="block space-y-1">
+              <span>{t("http_credentials.ssh_destinations")}</span>
+              <textarea className={inputClass} name="destinations" placeholder="operator@server.example.com:22"
+                defaultValue={editing === "new" ? "" : editing.destinations?.map(d => `${d.username}@${d.host.includes(":") ? `[${d.host}]` : d.host}:${d.port}`).join("\n")}
+              />
+            </label>
+          ) : (
           <label className="block space-y-1">
             <span>{t("http_credentials.origin")}</span>
             <input className={inputClass} name="origin" type="url" required placeholder="https://api.example.com" defaultValue={editing === "new" ? "" : editing.origin} />
           </label>
+          )}
           <div className="space-y-1">
             <label htmlFor="credential-source">{t("http_credentials.source")}</label>
             <Select id="credential-source" value={source}
@@ -148,8 +167,12 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
             </label>
           )}
           <label className="block space-y-1">
-            <span>{t(source === "local" ? (kind === "api_key" ? "http_credentials.token" : "http_credentials.password") : "http_credentials.reference")}</span>
-            <input key={source} className={inputClass} name="secret" type={source === "local" ? "password" : "text"} placeholder={sources[source] || undefined} autoComplete="new-password" required />
+            <span>{t(source !== "local" ? "http_credentials.reference" : kind === "ssh_key" ? "http_credentials.ssh_private_key" : kind === "api_key" ? "http_credentials.token" : "http_credentials.password")}</span>
+            {kind === "ssh_key" && source === "local" ? (
+              <textarea key={source} className={inputClass} name="secret" required spellCheck={false} autoComplete="off" />
+            ) : (
+              <input key={source} className={inputClass} name="secret" type={source === "local" ? "password" : "text"} placeholder={sources[source] || undefined} autoComplete="new-password" required />
+            )}
           </label>
           <div className="flex flex-wrap gap-2">
             <Button type="submit" disabled={disabled}>{t(editing === "new" ? "http_credentials.add" : "plugin_tls.replace")}</Button>

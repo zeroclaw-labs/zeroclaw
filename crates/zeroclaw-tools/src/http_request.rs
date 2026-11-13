@@ -491,6 +491,9 @@ impl HttpRequestTool {
                     vec![pair, encoded, password, username],
                 )
             }
+            ScopedHttpAuth::SshKey { .. } => {
+                anyhow::bail!("SSH keys cannot authenticate HTTP requests")
+            }
         };
         let mut header = HeaderValue::from_str(&authorization)
             .map_err(|_| anyhow::Error::msg("Invalid stored HTTP credential"))?;

@@ -9073,6 +9073,35 @@ pub enum ScopedHttpAuth {
         username: String,
         password: String,
     },
+    SshKey {
+        private_key: String,
+        destinations: Vec<SshCredentialDestination>,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SshCredentialDestination {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+}
+
+impl SshCredentialDestination {
+    pub fn is_valid(&self) -> bool {
+        let identifier = |value: &str, extra: &[u8]| {
+            !value.is_empty()
+                && !value.starts_with('-')
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || extra.contains(&byte))
+        };
+        self.port != 0
+            && self.host.len() <= 253
+            && self.username.len() <= 64
+            && identifier(&self.host, b".-:")
+            && identifier(&self.username, b"_-")
+    }
 }
 
 #[derive(Default, Serialize, Deserialize)]
