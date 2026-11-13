@@ -729,6 +729,15 @@ impl CronDeliveryArgs {
 pub enum CronCommands {
     /// List all scheduled tasks
     List,
+    /// Show recent cron run history
+    Runs {
+        /// Filter by job ID (shows runs for all jobs when omitted)
+        #[arg(long)]
+        job: Option<String>,
+        /// Maximum number of runs to show (1-50, default 10)
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..=50))]
+        limit: u64,
+    },
     /// Add a new scheduled task
     // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
