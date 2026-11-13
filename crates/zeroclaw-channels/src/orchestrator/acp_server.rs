@@ -7014,14 +7014,20 @@ options = { extract_text_tool_calls = true }
         );
 
         let mut reloaded = live.snapshot();
-        reloaded
-            .providers
-            .models
-            .anthropic
-            .get_mut("default")
-            .unwrap()
-            .base
-            .model = Some("reloaded-model".to_string());
+        zeroclaw_config::provider_registry::editor::update(&mut reloaded, |registry| {
+            let model = registry
+                .models
+                .get_mut(&zeroclaw_config::provider_registry::ModelRef::from(
+                    "chat.test",
+                ))
+                .expect("canonical ACP test model exists");
+            let zeroclaw_config::provider_registry::ModelDefinition::Chat(model) = model else {
+                anyhow::bail!("canonical ACP test model must be chat");
+            };
+            model.model = Some("reloaded-model".to_string());
+            Ok(())
+        })
+        .expect("reloaded canonical model must be editable");
         live.publish(live.next_revision().unwrap(), reloaded)
             .unwrap();
 
