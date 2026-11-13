@@ -1171,6 +1171,17 @@ async fn start_without_budget_flags_or_defaults_returns_budget_required() {
     }
 }
 
+#[test]
+fn goal_budget_value_has_one_type_across_public_paths() {
+    let configured = ConfigGoalBudgetLimits {
+        token_limit: Some(10),
+        cost_limit_usd: Some(2.5),
+    };
+    let command: zeroclaw_commands::goal::GoalBudgetLimits = configured;
+    let shared: zeroclaw_api::goal::GoalBudgetLimits = command;
+    assert_eq!(shared, configured);
+}
+
 #[tokio::test]
 async fn explicit_command_budgets_start_without_configured_defaults() {
     use zeroclaw_commands::goal::{GoalBudgetLimits, GoalBudgetSelection};
@@ -2536,46 +2547,42 @@ async fn matrix_goal_control_requires_the_exact_raw_principal_after_key_normaliz
         )
         .await
         .unwrap();
-    assert!(matches!(
-        controller
-            .submit(&host_settings(&config), &first_start)
-            .await
-            .unwrap(),
-        GoalResponse::Started(_)
-    ));
+    let GoalResponse::Started(started) = controller
+        .submit(&host_settings(&config), &first_start)
+        .await
+        .unwrap()
+    else {
+        panic!("owner should be able to start the Goal");
+    };
 
-    let colliding_status = host
-        .submit(
-            &host_settings(&config),
-            colliding_ingress.clone(),
-            recording_driver(&colliding_ingress),
-            GoalCommand::Status,
-        )
-        .await
-        .unwrap();
-    assert!(matches!(
-        controller
-            .submit(&host_settings(&config), &colliding_status)
+    for command in [
+        GoalCommand::Status,
+        GoalCommand::Budget,
+        GoalCommand::SetBudget(zeroclaw_commands::goal::GoalBudgetSelection::Unlimited),
+        GoalCommand::Pause { immediate: false },
+        GoalCommand::Pause { immediate: true },
+        GoalCommand::Resume {
+            response: Some("a response from another principal".into()),
+        },
+        GoalCommand::Cancel,
+    ] {
+        let submission = host
+            .submit(
+                &host_settings(&config),
+                colliding_ingress.clone(),
+                recording_driver(&colliding_ingress),
+                command,
+            )
             .await
-            .unwrap(),
-        GoalResponse::NoCurrentGoal
-    ));
-    let colliding_cancel = host
-        .submit(
-            &host_settings(&config),
-            colliding_ingress.clone(),
-            recording_driver(&colliding_ingress),
-            GoalCommand::Cancel,
-        )
-        .await
-        .unwrap();
-    assert!(matches!(
-        controller
-            .submit(&host_settings(&config), &colliding_cancel)
-            .await
-            .unwrap(),
-        GoalResponse::NoCurrentGoal
-    ));
+            .unwrap();
+        assert_eq!(
+            controller
+                .submit(&host_settings(&config), &submission)
+                .await
+                .unwrap(),
+            GoalResponse::SessionUnavailable
+        );
+    }
     let colliding_start = host
         .submit(
             &host_settings(&config),
@@ -2593,8 +2600,25 @@ async fn matrix_goal_control_requires_the_exact_raw_principal_after_key_normaliz
             .submit(&host_settings(&config), &colliding_start)
             .await
             .unwrap(),
-        GoalResponse::NoCurrentGoal
+        GoalResponse::SessionUnavailable
     ));
+
+    let first_status = host
+        .submit(
+            &host_settings(&config),
+            first_ingress.clone(),
+            recording_driver(&first_ingress),
+            GoalCommand::Status,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        controller
+            .submit(&host_settings(&config), &first_status)
+            .await
+            .unwrap(),
+        GoalResponse::Status(started)
+    );
 
     let first_cancel = host
         .submit(
@@ -2630,7 +2654,7 @@ async fn matrix_goal_control_requires_the_exact_raw_principal_after_key_normaliz
             .submit(&host_settings(&config), &colliding_terminal_replacement)
             .await
             .unwrap(),
-        GoalResponse::NoCurrentGoal
+        GoalResponse::SessionUnavailable
     ));
 
     let first_terminal_status = host

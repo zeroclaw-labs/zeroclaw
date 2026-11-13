@@ -6,6 +6,7 @@ pub mod attribution;
 pub mod channel;
 pub mod conversation_binding;
 pub mod elicitation;
+pub mod goal;
 pub mod grants;
 pub mod hook;
 pub mod ingress;

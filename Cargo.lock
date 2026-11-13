@@ -14038,6 +14038,7 @@ name = "zeroclaw-commands"
 version = "0.9.0"
 dependencies = [
  "serde",
+ "zeroclaw-api",
 ]
 
 [[package]]
