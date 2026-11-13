@@ -110,7 +110,7 @@ struct Session {
     last_active: Instant,
     /// Agent alias (e.g. `"clamps"`) for attributable span logs.
     agent_alias: String,
-    /// Model-provider ref (e.g. `"anthropic.default"`) for attributable span logs.
+    /// Model-provider ref (e.g. `"chat.test"`) for attributable span logs.
     model_provider: String,
     /// Model identifier (e.g. `"claude-sonnet-4-6"`) for attributable span logs.
     model: String,
@@ -4514,7 +4514,7 @@ mod tests {
         // When a client passes cwd = '.' (resolved to the install root), the
         // session must still use the per-agent workspace — not the daemon cwd.
         let cwd = tempfile::tempdir().unwrap();
-        // A fully-wired config (valid `anthropic.default` provider + `test-agent`)
+        // A fully-wired config (valid `chat.test` provider + `test-agent`)
         // so agent construction succeeds. A failing construction would emit the
         // shared "ACP session/new failed" log line and race the attribution test
         // that matches events by message text alone.
@@ -5218,10 +5218,8 @@ mod tests {
     fn two_agent_config(cwd: &std::path::Path) -> Config {
         let mut cfg = make_test_config(cwd);
         for alias in ["agent-alpha", "agent-beta"] {
-            cfg.agents.insert(
-                alias.to_string(),
-                dispatchable_test_agent("anthropic.default"),
-            );
+            cfg.agents
+                .insert(alias.to_string(), dispatchable_test_agent("chat.test"));
         }
         cfg
     }
@@ -5445,7 +5443,7 @@ mod tests {
         config.agents.clear();
         config.agents.insert(
             "agent-beta".to_string(),
-            dispatchable_test_agent("anthropic.default"),
+            dispatchable_test_agent("chat.test"),
         );
         // Missing config default is skipped; sole configured agent applies.
         // Connection default stays out of the restore chain.
@@ -5489,7 +5487,7 @@ mod tests {
         let mut config = two_agent_config(cwd.path());
         config.agents.insert(
             "agent-gamma".to_string(),
-            dispatchable_test_agent("anthropic.default"),
+            dispatchable_test_agent("chat.test"),
         );
         config.agents.get_mut("agent-alpha").unwrap().enabled = false;
         config.acp.default_agent = Some("agent-beta".to_string());
@@ -6945,16 +6943,20 @@ mod tests {
             data_dir: cwd.to_path_buf(),
             ..Default::default()
         };
-        cfg.providers.models.anthropic.insert(
-            "default".to_string(),
-            zeroclaw_config::schema::AnthropicModelProviderConfig {
-                base: zeroclaw_config::schema::ModelProviderConfig {
-                    model: Some("claude-haiku-4-5".to_string()),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        );
+        cfg.providers = toml::from_str(
+            r#"
+[connections."gateway.test"]
+kind = "custom"
+uri = "http://127.0.0.1:1/v1"
+auth = { mode = "api_key", api_key = "test-key" }
+
+[models."chat.test"]
+capability = "chat"
+provider = "gateway.test"
+model = "claude-haiku-4-5"
+"#,
+        )
+        .expect("canonical ACP test provider config parses");
         cfg.risk_profiles.insert(
             "default".to_string(),
             zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -6965,7 +6967,7 @@ mod tests {
         );
         cfg.agents.insert(
             "test-agent".to_string(),
-            dispatchable_test_agent("anthropic.default"),
+            dispatchable_test_agent("chat.test"),
         );
         cfg
     }
@@ -10527,7 +10529,7 @@ options = { extract_text_tool_calls = true }
         cfg.agents.insert(
             "finance".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
-                model_provider: "anthropic.default".into(),
+                model_provider: "chat.test".into(),
                 risk_profile: "default".into(),
                 runtime_profile: "default".into(),
                 mcp_bundles: vec!["b1".into()],
