@@ -1284,19 +1284,20 @@ mod tests {
             zeroclaw_config::migration::CURRENT_SCHEMA_VERSION
         );
 
-        let provider = cfg
-            .providers
-            .models
-            .ollama
-            .get("default")
-            .expect("Ollama default provider must exist");
-        assert_eq!(provider.base.model.as_deref(), Some("llama3.2"));
+        let registry = cfg.provider_registry().expect("canonical registry");
+        let model = registry
+            .resolve_chat(&"ollama.default".into())
+            .expect("Ollama default model must exist");
+        assert_eq!(model.upstream_model(), Some("llama3.2"));
         assert_eq!(
-            provider.base.uri.as_deref(),
+            model.selection.connection.uri(),
             Some("http://host.docker.internal:11434")
         );
-        assert_eq!(provider.base.api_key, None);
-        assert_eq!(provider.base.temperature, Some(0.7));
+        assert_eq!(model.selection.connection.api_key(), None);
+        assert_eq!(
+            model.options.temperature,
+            Some(zeroclaw_config::provider_registry::Override::Set(0.7))
+        );
 
         let agent = cfg.agents.get("default").expect("default agent must exist");
         assert!(agent.enabled);
@@ -1451,8 +1452,16 @@ mod tests {
         assert!(resp.needs_quickstart);
         assert_eq!(resp.reason, "fresh_install");
 
-        cfg.create_map_key("providers.models.anthropic", "default")
-            .unwrap();
+        cfg.providers = toml::from_str(
+            r#"
+[connections.gateway]
+kind = "anthropic"
+[models."anthropic.default"]
+capability = "chat"
+provider = "gateway"
+"#,
+        )
+        .unwrap();
         let resp = derive_section_status(&cfg);
         assert!(
             resp.needs_quickstart,
@@ -1491,8 +1500,16 @@ mod tests {
                 .any(|m| m == "Choose a model for model provider `anthropic.default`.")
         );
 
-        cfg.set_prop("providers.models.anthropic.default.model", "claude-sonnet")
-            .unwrap();
+        let zeroclaw_config::provider_registry::ModelDefinition::Chat(model) = cfg
+            .providers
+            .models
+            .canonical_models
+            .get_mut("anthropic.default")
+            .unwrap()
+        else {
+            panic!("fixture must contain a chat model");
+        };
+        model.model = Some("claude-sonnet".into());
         let resp = derive_section_status(&cfg);
         assert!(
             resp.needs_quickstart,
@@ -1504,8 +1521,13 @@ mod tests {
                 .any(|m| m == "Set credential/auth for model provider `anthropic.default`.")
         );
 
-        cfg.set_prop("providers.models.anthropic.default.api_key", "sk-test")
-            .unwrap();
+        cfg.providers.connections.insert(
+            "gateway".into(),
+            serde_json::from_value(serde_json::json!({
+                "kind": "anthropic", "auth": {"mode": "api_key", "api_key": "sk-test"}
+            }))
+            .unwrap(),
+        );
         let resp = derive_section_status(&cfg);
         assert!(!resp.needs_quickstart);
         assert_eq!(resp.reason, "has_dispatchable_agent");
@@ -1695,9 +1717,11 @@ model = "upstream-model"
         )
         .unwrap();
         assert!(any_usable_model_provider(&cfg));
-        // The typed-family picker only links to legacy aliases. Its badge
-        // must not imply that a canonical model is editable through that path.
-        assert!(provider_type_badge(&cfg, "custom", false).is_none());
+        assert_eq!(
+            provider_type_badge(&cfg, "custom", false).as_deref(),
+            Some("configured"),
+            "the provider picker derives readiness from canonical models"
+        );
         assert!(
             !quickstart_missing_requirements(&cfg)
                 .iter()

@@ -181,7 +181,7 @@ mod tests {
                 "uri": "https://embedding.example.test/v1",
             });
             if let Some(key) = connection_key {
-                connection["auth"] = serde_json::json!({"api_key": key});
+                connection["auth"] = serde_json::json!({"mode": "api_key", "api_key": key});
             }
             let registry: ProviderRegistry = serde_json::from_value(serde_json::json!({
                 "connections": {"embedding.prod": connection},

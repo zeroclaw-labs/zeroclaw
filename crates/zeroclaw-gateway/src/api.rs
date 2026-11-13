@@ -2493,6 +2493,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn test_state(config: zeroclaw_config::schema::Config) -> AppState {
+        let config = zeroclaw_config::migration::admit_test_input(&config);
         let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
         AppState {
             config: state_authority.live_handle(),

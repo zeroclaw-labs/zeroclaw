@@ -117,10 +117,18 @@ fn project_provider_tables(
         }
         let provider_id = ProviderId::from(format!("legacy.tts.{family}.{alias}"));
         let mut connection = serde_json::json!({"kind": family});
-        if let Some(uri) = base.uri.as_deref() {
+        let template: registry::ProviderConnection =
+            serde_json::from_value(json!({"kind": family})).map_err(|error| {
+                registry::RegistryError::new(["providers", "tts", family, alias], error.to_string())
+            })?;
+        if let Some(uri) = base.uri.as_deref()
+            && template.accepts_connection_field("uri")
+        {
             connection["uri"] = serde_json::Value::String(uri.to_owned());
         }
-        if let Some(api_key) = base.api_key.as_deref() {
+        if let Some(api_key) = base.api_key.as_deref()
+            && template.accepts_connection_field("auth")
+        {
             connection["auth"] = serde_json::json!({"mode":"api_key","api_key":api_key});
         }
         if let Some(command) = base.binary_path.as_deref()
@@ -297,12 +305,7 @@ fn providers_for_input(config: &Config) -> Result<crate::providers::Providers> {
         "local_whisper",
     ] {
         let input = if family == "groq" {
-            if config
-                .transcription
-                .api_key
-                .as_deref()
-                .is_none_or(|key| key.trim().is_empty())
-            {
+            if !has_legacy_groq_input(config) {
                 continue;
             }
             json!({"api_key": config.transcription.api_key, "uri": config.transcription.api_url,
@@ -903,6 +906,16 @@ pub(crate) fn normalize_definitions(config: &mut Config) -> Result<()> {
     Ok(())
 }
 
+fn has_legacy_groq_input(config: &Config) -> bool {
+    let input = &config.transcription;
+    let defaults = crate::schema::TranscriptionConfig::default();
+    input.api_key.is_some()
+        || input.api_url != defaults.api_url
+        || input.model != defaults.model
+        || input.language.is_some()
+        || input.initial_prompt.is_some()
+}
+
 fn has_legacy_input(config: &Config) -> bool {
     !config.decision_models.is_empty()
         || config.memory.embedding_api_key.is_some()
@@ -926,7 +939,7 @@ fn has_legacy_input(config: &Config) -> bool {
             .iter_entries()
             .next()
             .is_some()
-        || config.transcription.api_key.is_some()
+        || has_legacy_groq_input(config)
         || config.transcription.openai.is_some()
         || config.transcription.deepgram.is_some()
         || config.transcription.assemblyai.is_some()
@@ -958,6 +971,10 @@ pub(crate) fn document_needs_migration(document: &toml::Value) -> bool {
         })
         || [
             "api_key",
+            "api_url",
+            "model",
+            "language",
+            "initial_prompt",
             "openai",
             "deepgram",
             "assemblyai",
@@ -1214,10 +1231,9 @@ mod tests {
         )
         .unwrap();
         let registry = serde_json::to_value(config.provider_registry().unwrap()).unwrap();
-        assert!(
-            registry["connections"]["legacy.tts.piper.local"]
-                .get("api")
-                .is_none()
+        assert_eq!(
+            registry["connections"]["legacy.tts.piper.local"]["api"],
+            serde_json::json!({})
         );
         assert_eq!(
             registry["connections"]["legacy.tts.piper.local"]["uri"],

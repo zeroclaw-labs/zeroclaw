@@ -6038,14 +6038,14 @@ mod tests {
 
     #[test]
     fn build_model_requires_a_model() {
-        // No configured entry and no override → cannot resolve a model name.
+        // An unconfigured reference fails at the canonical registry boundary.
         let config = Config::default();
         let err = match build_model(&config, "tester", "anthropic.default", None) {
             Ok(_) => panic!("missing model must error"),
             Err(e) => e,
         };
         assert!(
-            err.to_string().contains("no `model` configured"),
+            err.to_string().contains("unknown model reference"),
             "got: {err}"
         );
     }

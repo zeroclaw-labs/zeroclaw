@@ -6000,6 +6000,14 @@ fn default_transcription_model() -> String {
     "whisper-large-v3-turbo".into()
 }
 
+fn is_default_transcription_api_url(value: &str) -> bool {
+    value == default_transcription_api_url()
+}
+
+fn is_default_transcription_model(value: &str) -> bool {
+    value == default_transcription_model()
+}
+
 fn default_transcription_max_duration_secs() -> u64 {
     120
 }
@@ -6038,10 +6046,16 @@ pub struct TranscriptionConfig {
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_key: Option<String>,
     /// Whisper API endpoint URL (Groq transcription provider).
-    #[serde(default = "default_transcription_api_url")]
+    #[serde(
+        default = "default_transcription_api_url",
+        skip_serializing_if = "is_default_transcription_api_url"
+    )]
     pub api_url: String,
     /// Whisper model name (Groq transcription provider).
-    #[serde(default = "default_transcription_model")]
+    #[serde(
+        default = "default_transcription_model",
+        skip_serializing_if = "is_default_transcription_model"
+    )]
     pub model: String,
     /// Optional language hint (ISO-639-1, e.g. "en", "ru") for Groq transcription provider.
     #[serde(default)]
@@ -30430,32 +30444,17 @@ mod tests {
 
     #[::core::prelude::v1::test]
     fn context_limits_follow_selected_provider_alias_and_model() {
-        use std::collections::HashMap;
-
-        use super::{
-            AliasedAgentConfig, Config, CustomModelProviderConfig, ModelEntryConfig,
-            ModelProviderConfig, RuntimeProfileConfig,
-        };
-
-        let mut providers = HashMap::new();
-        for (alias, model, context_window) in [
-            ("large", "large-model", 200_000),
-            ("small", "small-model", 8_000),
-        ] {
-            providers.insert(
-                alias.to_string(),
-                CustomModelProviderConfig {
-                    base: ModelProviderConfig {
-                        model: Some(model.to_string()),
-                        context_window: Some(context_window),
-                        ..ModelProviderConfig::default()
-                    },
-                },
-            );
-        }
-
         let mut cfg = Config::default();
-        cfg.providers.models.custom = providers;
+        cfg.providers = serde_json::from_value(serde_json::json!({
+            "connections": {"gateway": {"kind": "custom", "uri": "https://example.invalid/v1"}},
+            "models": {
+                "custom.large": {"capability": "chat", "provider": "gateway", "model": "large-model", "metadata": {"context_window": 200_000}},
+                "custom.small": {"capability": "chat", "provider": "gateway", "model": "small-model", "metadata": {"context_window": 8_000}},
+                "custom.backup": {"capability": "chat", "provider": "gateway", "metadata": {"context_window": 8_000}},
+                "custom.multi": {"capability": "chat", "provider": "gateway", "model": "legacy-model", "metadata": {"context_window": 100_000}},
+                "custom.multi.fast": {"capability": "chat", "provider": "gateway", "model": "nested-fast-model", "metadata": {"context_window": 16_000}}
+            }
+        })).unwrap();
         cfg.runtime_profiles.insert(
             "ratio".to_string(),
             RuntimeProfileConfig {
@@ -30497,38 +30496,11 @@ mod tests {
         // serve the model requested from the primary while retaining its own
         // endpoint metadata. Its capacity still belongs to that accepted
         // alias and must not degrade to the compatibility fallback.
-        cfg.providers.models.custom.insert(
-            "backup".to_string(),
-            CustomModelProviderConfig {
-                base: ModelProviderConfig {
-                    context_window: Some(8_000),
-                    ..ModelProviderConfig::default()
-                },
-            },
-        );
         let unpinned_fallback =
             cfg.resolved_context_limits_for_route("coder", "custom.backup", "large-model");
         assert_eq!(unpinned_fallback.model_context_window, 8_000);
         assert_eq!(unpinned_fallback.context_token_budget, 7_200);
 
-        cfg.providers.models.custom.insert(
-            "multi".to_string(),
-            CustomModelProviderConfig {
-                base: ModelProviderConfig {
-                    model: Some("legacy-model".to_string()),
-                    context_window: Some(100_000),
-                    models: HashMap::from([(
-                        "fast".to_string(),
-                        ModelEntryConfig {
-                            id: Some("nested-fast-model".to_string()),
-                            context_window: Some(16_000),
-                            ..ModelEntryConfig::default()
-                        },
-                    )]),
-                    ..ModelProviderConfig::default()
-                },
-            },
-        );
         cfg.agents.get_mut("coder").unwrap().model_provider = "custom.multi.fast".into();
 
         let nested = cfg.resolved_context_limits_for_route(
@@ -30539,11 +30511,6 @@ mod tests {
         assert_eq!(nested.model_context_window, 16_000);
         assert_eq!(nested.context_token_budget, 14_400);
 
-        // Runtime attribution normalizes provider names to two segments. The
-        // actual served model must still resolve the unique nested capacity.
-        let normalized =
-            cfg.resolved_context_limits_for_route("coder", "custom.multi", "nested-fast-model");
-        assert_eq!(normalized, nested);
         assert_eq!(cfg.effective_model_context_window("coder"), 16_000);
         assert_eq!(
             cfg.model_provider_context_window_opt("custom.multi.fast", "nested-fast-model"),
@@ -30551,8 +30518,8 @@ mod tests {
         );
         assert_eq!(
             cfg.model_provider_context_window_opt("custom.multi", "nested-fast-model"),
-            Some(16_000),
-            "wire attribution normalizes the provider ref but must retain nested capacity"
+            None,
+            "a different exact model reference must not borrow another model's capacity"
         );
     }
 
@@ -30562,11 +30529,10 @@ mod tests {
     #[::core::prelude::v1::test]
     fn configured_context_window_reports_unset_distinctly_from_the_fallback() {
         let mut cfg = super::Config::default();
-        cfg.providers
-            .models
-            .ensure("ollama", "local")
-            .expect("known model provider type")
-            .model = Some("qwen3".to_string());
+        cfg.providers = serde_json::from_value(serde_json::json!({
+            "connections": {"local": {"kind": "ollama"}},
+            "models": {"ollama.local": {"capability": "chat", "provider": "local", "model": "qwen3"}}
+        })).unwrap();
         cfg.agents.insert(
             "coder".to_string(),
             super::AliasedAgentConfig {
@@ -30586,11 +30552,16 @@ mod tests {
 
         // Explicitly configuring the same numeric value remains distinguishable
         // from the fallback.
-        cfg.providers
+        let crate::provider_registry::ModelDefinition::Chat(model) = cfg
+            .providers
             .models
-            .ensure("ollama", "local")
-            .expect("known model provider type")
-            .context_window = Some(super::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK);
+            .canonical_models
+            .get_mut(&crate::provider_registry::ModelRef::from("ollama.local"))
+            .unwrap()
+        else {
+            panic!("fixture model must be chat");
+        };
+        model.metadata.context_window = Some(super::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK);
         assert_eq!(
             cfg.configured_model_context_window("coder"),
             Some(super::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK)
@@ -35379,7 +35350,14 @@ auto_save = true
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed = parse_test_config(&toml_str);
 
-        assert_eq!(parsed.providers.models.len(), config.providers.models.len());
+        assert_eq!(
+            parsed.provider_registry().unwrap().models.len(),
+            crate::migration::admit_test_input(&config)
+                .provider_registry()
+                .unwrap()
+                .models
+                .len()
+        );
         assert_eq!(parsed.observability.backend, ObservabilityBackend::Log);
         assert_eq!(
             parsed.observability.log_persistence,
@@ -36853,20 +36831,17 @@ default_temperature = 0.7
             config_path: dir.join("config.toml"),
             ..Default::default()
         };
-        config.providers.models.anthropic.insert(
-            "default".to_string(),
-            AnthropicModelProviderConfig {
-                base: ModelProviderConfig {
-                    api_key: Some("root-credential".into()),
-                    extra_headers: HashMap::from([(
-                        "Authorization".to_string(),
-                        "Bearer provider-header-credential".to_string(),
-                    )]),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        );
+        config.providers = serde_json::from_value(serde_json::json!({
+            "connections": {"primary": {
+                "kind": "openai",
+                "auth": {"mode": "api_key", "api_key": "root-credential"},
+                "extra_headers": {"Authorization": "Bearer provider-header-credential"}
+            }},
+            "models": {"chat.primary": {
+                "capability": "chat", "provider": "primary", "model": "gpt-test"
+            }}
+        }))
+        .unwrap();
         // ModelProvider fields are now resolved directly — no cache needed.
         config.composio.api_key = Some("composio-credential".into());
         config.browser.computer_use.api_key = Some("browser-credential".into());
@@ -37012,13 +36987,13 @@ default_temperature = 0.7
         let root_encrypted = stored
             .providers
             .connections
-            .get("legacy.anthropic.default")
+            .get("primary")
             .and_then(|connection| connection.api_key())
             .unwrap();
         assert!(crate::secrets::SecretStore::is_encrypted(root_encrypted));
         assert_eq!(store.decrypt(root_encrypted).unwrap(), "root-credential");
 
-        let provider_header = stored.providers.connections["legacy.anthropic.default"]
+        let provider_header = stored.providers.connections["primary"]
             .extra_headers()
             .unwrap()
             .get("Authorization")
@@ -39232,8 +39207,7 @@ model = "primary-model"
             config
         };
         let assert_error_path = |config: Config, expected: &str| {
-            let error = config
-                .validate()
+            let error = validate_provider_input_fixture(&config)
                 .expect_err("malformed nested model entry must fail validation")
                 .to_string();
             assert!(
@@ -39242,9 +39216,10 @@ model = "primary-model"
             );
         };
 
-        assert_error_path(
-            config_with(ModelEntryConfig::default(), None),
-            "models.fast.id",
+        assert!(
+            validate_provider_input_fixture(&config_with(ModelEntryConfig::default(), None))
+                .is_ok(),
+            "an unpinned model may receive its upstream ID from an invocation override"
         );
         assert_error_path(
             config_with(
@@ -39254,7 +39229,7 @@ model = "primary-model"
                 },
                 Some("profile-model"),
             ),
-            "models.fast.id",
+            "model",
         );
         assert_error_path(
             config_with(
@@ -39265,7 +39240,7 @@ model = "primary-model"
                 },
                 None,
             ),
-            "models.fast.temperature",
+            "temperature",
         );
         assert_error_path(
             config_with(
@@ -39276,7 +39251,7 @@ model = "primary-model"
                 },
                 None,
             ),
-            "models.fast.context_window",
+            "context_window",
         );
 
         let inherited = config_with(
@@ -39289,9 +39264,9 @@ model = "primary-model"
             Some("profile-model"),
         );
         assert!(
-            inherited.validate().is_ok(),
+            validate_provider_input_fixture(&inherited).is_ok(),
             "an omitted nested id inherits the profile model: {:?}",
-            inherited.validate().err()
+            validate_provider_input_fixture(&inherited).err()
         );
     }
 
@@ -39332,16 +39307,15 @@ model = "primary-model"
             .await
             .unwrap();
         let parsed = parse_test_config(&saved);
-        assert!(
-            (parsed
-                .providers
-                .models
-                .find("anthropic", "default")
-                .and_then(|e| e.temperature)
-                .unwrap_or(0.7)
-                - 0.5)
-                .abs()
-                < f64::EPSILON
+        assert_eq!(
+            parsed
+                .provider_registry()
+                .unwrap()
+                .resolve_chat(&"anthropic.default".into())
+                .unwrap()
+                .options
+                .temperature,
+            Some(crate::provider_registry::Override::Set(0.5))
         );
 
         // SAFETY: test-only, single-threaded test runner.
@@ -39453,9 +39427,8 @@ model = "primary-model"
 
         let error =
             validate_provider_input_fixture(&config).expect_err("expected validation to fail");
-        assert!(error.to_string().contains(
-            "providers.models.ollama.default.model uses ':cloud', but uri is local or unset"
-        ));
+        assert!(error.to_string().contains(":cloud"), "{error:#}");
+        assert!(error.to_string().contains("uri"), "{error:#}");
     }
 
     #[test]
@@ -40193,10 +40166,11 @@ default_model = "legacy-model"
         assert_eq!(config.config_path, legacy_config_path);
         assert_eq!(
             config
-                .providers
-                .models
-                .find("openrouter", "default")
-                .and_then(|e| e.model.as_deref()),
+                .provider_registry()
+                .unwrap()
+                .resolve_chat(&"openrouter.default".into())
+                .unwrap()
+                .upstream_model(),
             Some("legacy-model")
         );
 
@@ -40313,10 +40287,11 @@ default_model = "persisted-profile"
         assert_eq!(config.config_path, config_path);
         assert_eq!(
             config
-                .providers
-                .models
-                .find("openrouter", "default")
-                .and_then(|e| e.model.as_deref()),
+                .provider_registry()
+                .unwrap()
+                .resolve_chat(&"openrouter.default".into())
+                .unwrap()
+                .upstream_model(),
             Some("persisted-profile")
         );
         assert!(logs.contains("Config loaded"), "{logs}");
@@ -42878,7 +42853,7 @@ group_policy = "disabled"
     }
 
     /// A dynamic secret map (`#[secret] HashMap<String, String>`, e.g.
-    /// `extra_headers`) treats its whole non-empty suffix as ONE opaque
+    /// `http_request.secrets`) treats its whole non-empty suffix as ONE opaque
     /// key — `set_prop` stores the literal `"X-Foo.bar"`. The dirty
     /// writer must not re-split that key at dots into `X-Foo` → `bar`,
     /// or `write_or_delete_leaf` finds nothing, takes the delete branch,
@@ -42891,8 +42866,7 @@ group_policy = "disabled"
 
         let seed = format!(
             "schema_version = {}\n\n\
-             [providers.models.openai.fresh]\n\
-             model = \"gpt-4o\"\n",
+             [http_request.secrets]\n",
             crate::migration::CURRENT_SCHEMA_VERSION
         );
         std::fs::write(&config_path, &seed).unwrap();
@@ -42902,21 +42876,16 @@ group_policy = "disabled"
             ..Default::default()
         };
         config.secrets.encrypt = false;
-        config
-            .create_map_key("providers.models.openai", "fresh")
-            .expect("seed the alias");
 
-        let path = "providers.models.openai.fresh.extra_headers.X-Foo.bar";
+        let path = "http_request.secrets.X-Foo.bar";
         config
             .set_prop_persistent(path, "header-value")
             .expect("a dotted dynamic secret-map key must be insertable");
         assert_eq!(
             config
-                .providers
-                .models
-                .openai
-                .get("fresh")
-                .and_then(|p| p.base.extra_headers.get("X-Foo.bar"))
+                .http_request
+                .secrets
+                .get("X-Foo.bar")
                 .map(String::as_str),
             Some("header-value"),
             "precondition: set_prop stores ONE literal HashMap key"
@@ -42929,11 +42898,9 @@ group_policy = "disabled"
             .unwrap_or_else(|e| panic!("rewritten config must reparse: {e}\n---\n{written}"));
         assert_eq!(
             reloaded
-                .providers
-                .models
-                .openai
-                .get("fresh")
-                .and_then(|p| p.base.extra_headers.get("X-Foo.bar"))
+                .http_request
+                .secrets
+                .get("X-Foo.bar")
                 .map(String::as_str),
             Some("header-value"),
             "a dotted dynamic secret-map key must round-trip through disk as the \
@@ -42951,9 +42918,7 @@ group_policy = "disabled"
 
         let seed = format!(
             "schema_version = {}\n\n\
-             [providers.models.openai.fresh]\n\
-             model = \"gpt-4o\"\n\n\
-             [providers.models.openai.fresh.extra_headers]\n\
+             [http_request.secrets]\n\
              \"X-Foo.bar\" = \"header-value\"\n",
             crate::migration::CURRENT_SCHEMA_VERSION
         );
@@ -42963,25 +42928,12 @@ group_policy = "disabled"
         config.config_path = config_path.clone();
         config.secrets.encrypt = false;
         assert!(
-            config
-                .providers
-                .models
-                .openai
-                .get("fresh")
-                .is_some_and(|p| p.base.extra_headers.contains_key("X-Foo.bar")),
+            config.http_request.secrets.contains_key("X-Foo.bar"),
             "precondition: seeded dotted header key must load"
         );
 
-        config
-            .providers
-            .models
-            .openai
-            .get_mut("fresh")
-            .unwrap()
-            .base
-            .extra_headers
-            .remove("X-Foo.bar");
-        config.mark_dirty("providers.models.openai.fresh.extra_headers.X-Foo.bar");
+        config.http_request.secrets.remove("X-Foo.bar");
+        config.mark_dirty("http_request.secrets.X-Foo.bar");
         config.save_dirty().await.expect("save_dirty must succeed");
 
         let written = std::fs::read_to_string(&config_path).unwrap();
@@ -43844,10 +43796,11 @@ group_policy = "disabled"
     }
 
     #[test]
-    async fn collect_warnings_flags_wire_api_on_fixed_protocol_family() {
+    async fn collect_warnings_preserves_explicit_compatible_wire_api() {
         let mut config = Config::default();
         suppress_semantic_memory_warning(&mut config);
-        // mistral has a fixed wire protocol and ignores wire_api.
+        // Canonical compatible connections pass the selected wire API into
+        // runtime construction, including families that once ignored it.
         config
             .providers
             .models
@@ -43862,15 +43815,15 @@ group_policy = "disabled"
             .unwrap()
             .wire_api = Some(WireApi::Responses);
 
-        let warnings = crate::migration::admit_test_input(&config).collect_warnings();
-        assert_eq!(warnings.len(), 1, "exactly the mistral entry should warn");
-        let w = &warnings[0];
-        assert_eq!(w.code, "wire_api_not_supported_for_family");
-        assert_eq!(w.path, "providers.models.mistral.primary.wire_api");
-        assert!(
-            !warnings.iter().any(|w| w.path.contains("custom.vllm")),
-            "custom honors wire_api and must not warn",
-        );
+        let config = crate::migration::admit_test_input(&config);
+        assert!(config.collect_warnings().is_empty());
+        let registry = config.provider_registry().unwrap();
+        for reference in ["mistral.primary", "custom.vllm"] {
+            assert_eq!(
+                registry.resolve_chat(&reference.into()).unwrap().wire_api,
+                Some(WireApi::Responses)
+            );
+        }
     }
 
     // The certificate issuance and renewal trail is written through this
@@ -45603,7 +45556,7 @@ channel = "notion"
         let control =
             toml::Value::try_from(crate::migration::migrate_to_current(flat).unwrap()).unwrap();
         assert_eq!(
-            control["providers"]["models"]["openai"]["default"]["extra_headers"]["X-Trace"]
+            control["providers"]["connections"]["legacy.openai.default"]["extra_headers"]["X-Trace"]
                 .as_str(),
             Some("keep")
         );
@@ -45626,7 +45579,7 @@ channel = "notion"
             )
             .unwrap();
             assert_eq!(
-                stated["providers"]["models"]["openai"][alias]["model"].as_str(),
+                stated["providers"]["models"][format!("openai.{alias}")]["model"].as_str(),
                 Some("keep-model"),
                 "{alias}"
             );
@@ -46085,12 +46038,13 @@ channel = "notion"
             .await;
             let loaded = crate::migration::migrate_to_current(&raw).unwrap();
             assert_eq!(
-                loaded.transcription.api_key.as_deref(),
+                loaded.providers.connections["legacy.asr.section.groq"].api_key(),
                 Some("groq-key-global")
             );
             let alias = toml::Value::try_from(&loaded).unwrap();
             assert_eq!(
-                alias["providers"]["transcription"]["groq"]["default"]["api_key"].as_str(),
+                alias["providers"]["connections"]["legacy.asr.groq.default"]["auth"]["api_key"]
+                    .as_str(),
                 Some("groq-key-alias")
             );
         }
@@ -47060,7 +47014,9 @@ channel = "notion"
                     case.spellings[0], case.spellings[1], case.read_at
                 );
                 let single = format!("schema_version = {version}\n\n{}", case.single);
-                match crate::migration::migrate_to_current(&single) {
+                // This checks the historical spelling adapter. Canonical
+                // admission relocates provider fields after that adapter.
+                match crate::migration::migrated_provider_input_fixture(&single) {
                     Ok(config) if typed_at(&config, &case.read_at).as_ref() == Some(value) => {}
                     Ok(config) => {
                         failures.push(format!(
@@ -51383,6 +51339,10 @@ allowed_users = []
         );
 
         for field in &fields {
+            // Each edit is an independent transaction. Config admission may
+            // retire initialized historical input tables, so one edit must
+            // not change the starting surface for the next field's check.
+            let mut config = config.clone();
             // get_prop must not panic or error
             let get_result = config.get_prop(&field.name);
             assert!(
@@ -53224,7 +53184,7 @@ allowed_users = []
         assert!(
             msg.contains("classifier_provider")
                 && msg.contains("does-not-exist")
-                && msg.contains("providers.models.custom.does-not-exist is not configured"),
+                && msg.contains("does not resolve to a configured model"),
             "expected DanglingReference error mentioning field + alias + section, got: {msg}"
         );
     }
@@ -53252,7 +53212,8 @@ allowed_users = []
         let msg = format!("{:#}", cfg.validate().expect_err("missing alias must fail"));
         assert!(
             msg.contains("summary_provider")
-                && msg.contains("providers.models.custom.does-not-exist is not configured"),
+                && msg.contains("custom.does-not-exist")
+                && msg.contains("does not resolve to a configured model"),
             "expected DanglingReference for agent summary_provider, got: {msg}"
         );
     }
@@ -53286,7 +53247,8 @@ allowed_users = []
         );
         assert!(
             msg.contains("runtime_profiles.fast.context_compression.summary_provider")
-                && msg.contains("providers.models.custom.nope is not configured"),
+                && msg.contains("custom.nope")
+                && msg.contains("does not resolve to a configured model"),
             "expected DanglingReference for profile summary_provider, got: {msg}"
         );
     }
@@ -54599,7 +54561,8 @@ group_policy = "all"
             dimensions: Some(1536),
             api_key: None,
         });
-        validate_provider_input_fixture(&config).expect("hint route should validate");
+        crate::migration::normalize_test_input(&mut config);
+        config.validate().expect("hint route should validate");
 
         assert!(
             warnings_with_code(&config, SEMANTIC_MEMORY_WARNING).is_empty(),
@@ -54804,7 +54767,7 @@ group_policy = "all"
         assert_eq!(warnings[0].code, "empty_server_fallback_model");
         assert_eq!(
             warnings[0].path,
-            "providers.models.anthropic.primary.server_fallback_models[0]"
+            "providers.models.anthropic.primary.extra.server_fallback_models[0]"
         );
     }
 

@@ -1,10 +1,15 @@
 schema_version = 4
 
 # Ollama runs on the host. This is an endpoint, not a bearer credential.
-[providers.models.ollama.default]
-model = "llama3.2"
+[providers.connections.ollama]
+kind = "ollama"
 uri = "http://host.docker.internal:11434"
-temperature = 0.7
+
+[providers.models."ollama.default"]
+capability = "chat"
+provider = "ollama"
+model = "llama3.2"
+options = { temperature = 0.7 }
 
 [agents.default]
 enabled = true

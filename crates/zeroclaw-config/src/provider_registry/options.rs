@@ -298,7 +298,7 @@ options = { extract_text_tool_calls = true }
             .unwrap();
         provider.kind = Some("groq".to_owned());
         assert_eq!(
-            config.model_text_extraction("openai.proxy.prod"),
+            crate::migration::admit_test_input(&config).model_text_extraction("openai.proxy.prod"),
             TextExtraction {
                 reasoning: true,
                 tool_calls: true
@@ -317,14 +317,15 @@ options = { extract_text_tool_calls = true }
             },
         );
         assert_eq!(
-            config.model_text_extraction("openai.proxy.prod"),
+            crate::migration::admit_test_input(&config).model_text_extraction("openai.proxy.prod"),
             TextExtraction {
                 reasoning: true,
                 tool_calls: false
             }
         );
         assert_eq!(
-            config.model_text_extraction("openai.proxy.prod.native.model"),
+            crate::migration::admit_test_input(&config)
+                .model_text_extraction("openai.proxy.prod.native.model"),
             TextExtraction {
                 reasoning: true,
                 tool_calls: false

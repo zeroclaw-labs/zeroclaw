@@ -347,10 +347,8 @@ agentic_timeout_secs = 300
 timeout_secs = 120
 
 [[embedding_routes]]
-dimensions = 1536
 hint = "default"
-model = "text-embedding-3-small"
-model_provider = "openai.default"
+model_provider = "embedding.route.default"
 
 [gateway]
 allow_public_bind = false
@@ -650,7 +648,113 @@ include_jira_data = false
 report_output_dir = "~/.zeroclaw/project-reports"
 risk_sensitivity = "medium"
 
+[providers.connections."legacy.anthropic.agent_complex_agent"]
+capabilities = ["chat"]
+kind = "anthropic"
+
+[providers.connections."legacy.anthropic.agent_complex_agent".api.chat]
+request_timeout_secs = 180
+wire_api = "chat_completions"
+
+[providers.connections."legacy.anthropic.agent_complex_agent".auth]
+api_key = "sk-ant-complex"
+mode = "api_key"
+
+[providers.connections."legacy.anthropic.custom"]
+capabilities = ["chat"]
+kind = "anthropic"
+uri = "https://api.z.ai/api/anthropic"
+
+[providers.connections."legacy.anthropic.custom".api.chat]
+wire_api = "chat_completions"
+
+[providers.connections."legacy.anthropic.custom".auth]
+mode = "api_key"
+
+[providers.connections."legacy.anthropic.default"]
+capabilities = ["chat"]
+kind = "anthropic"
+uri = "https://api.anthropic.com"
+
+[providers.connections."legacy.anthropic.default".api.chat]
+wire_api = "chat_completions"
+
+[providers.connections."legacy.anthropic.default".auth]
+mode = "api_key"
+
+[providers.connections."legacy.azure.default"]
+capabilities = ["chat"]
+kind = "azure"
+
+[providers.connections."legacy.azure.default".api.chat]
+wire_api = "chat_completions"
+
+[providers.connections."legacy.azure.default".auth]
+mode = "api_key"
+
+[providers.connections."legacy.azure.default".extra]
+api_version = "2024-08-01-preview"
+resource = "my-resource"
+
+[providers.connections."legacy.ollama.default"]
+capabilities = [
+    "chat",
+    "decision",
+]
+kind = "ollama"
+uri = "http://127.0.0.1:11434"
+
+[providers.connections."legacy.ollama.default".api.chat]
+wire_api = "chat_completions"
+
+[providers.connections."legacy.ollama.default".auth]
+mode = "api_key"
+
+[providers.connections."legacy.ollama.default".extra_headers]
+
+[providers.connections."legacy.openai.agent_simple_agent"]
+capabilities = [
+    "chat",
+    "embedding",
+    "tts",
+    "asr",
+    "decision",
+]
+kind = "openai"
+
+[providers.connections."legacy.openai.agent_simple_agent".api.chat]
+wire_api = "chat_completions"
+
+[providers.connections."legacy.openai.agent_simple_agent".auth]
+mode = "api_key"
+
+[providers.connections."legacy.openai.agent_simple_agent".extra_headers]
+
+[providers.connections."legacy.openai.default"]
+capabilities = [
+    "chat",
+    "embedding",
+    "tts",
+    "asr",
+    "decision",
+]
+kind = "openai"
+uri = "https://api.openai.com/v1/chat/completions"
+
+[providers.connections."legacy.openai.default".api.chat]
+request_timeout_secs = 90
+wire_api = "chat_completions"
+
+[providers.connections."legacy.openai.default".auth]
+api_key = "sk-v1-test-global"
+mode = "api_key"
+
+[providers.connections."legacy.openai.default".extra_headers]
+HTTP-Referer = "https://zeroclaw.test"
+X-Title = "zeroclaw-v1-fixture"
+
 [providers.connections."route.deep"]
+capabilities = ["chat"]
 kind = "anthropic"
 uri = "https://api.anthropic.com"
 
@@ -661,6 +765,13 @@ wire_api = "chat_completions"
 mode = "api_key"
 
 [providers.connections."route.fast"]
+capabilities = [
+    "chat",
+    "embedding",
+    "tts",
+    "asr",
+    "decision",
+]
 kind = "openai"
 uri = "https://api.openai.com/v1/chat/completions"
 
@@ -676,49 +787,74 @@ mode = "api_key"
 HTTP-Referer = "https://zeroclaw.test"
 X-Title = "zeroclaw-v1-fixture"
 
-[providers.models.anthropic.agent_complex_agent]
-api_key = "sk-ant-complex"
+[providers.models."anthropic.agent_complex_agent"]
+capability = "chat"
 model = "claude-sonnet-4-5"
+provider = "legacy.anthropic.agent_complex_agent"
+
+[providers.models."anthropic.agent_complex_agent".metadata]
+
+[providers.models."anthropic.agent_complex_agent".options]
 temperature = 0.3
-timeout_secs = 180
 
-[providers.models.anthropic.custom]
+[providers.models."anthropic.custom"]
+capability = "chat"
+provider = "legacy.anthropic.custom"
+
+[providers.models."anthropic.custom".metadata]
+
+[providers.models."anthropic.custom".options]
 max_tokens = 8192
-name = "anthropic-custom"
-uri = "https://api.z.ai/api/anthropic"
 
-[providers.models.anthropic.default]
-name = "anthropic"
-uri = "https://api.anthropic.com"
+[providers.models."anthropic.default"]
+capability = "chat"
+provider = "legacy.anthropic.default"
 
-[providers.models.azure.default]
-azure_openai_api_version = "2024-08-01-preview"
-azure_openai_deployment = "gpt-4o"
-azure_openai_resource = "my-resource"
-name = "openai"
-requires_openai_auth = true
+[providers.models."anthropic.default".metadata]
 
-[providers.models.ollama.default]
+[providers.models."azure.default"]
+capability = "chat"
+provider = "legacy.azure.default"
+
+[providers.models."azure.default".extra]
+deployment = "gpt-4o"
+
+[providers.models."azure.default".metadata]
+
+[providers.models."embedding.route.default"]
+capability = "embedding"
+model = "text-embedding-3-small"
+provider = "legacy.openai.default"
+
+[providers.models."embedding.route.default".metadata]
+dimensions = 1536
+
+[providers.models."ollama.default"]
+capability = "chat"
+provider = "legacy.ollama.default"
+
+[providers.models."ollama.default".metadata]
+
+[providers.models."ollama.default".options]
 merge_system_into_user = true
-name = "ollama"
-uri = "http://127.0.0.1:11434"
 
-[providers.models.openai.agent_simple_agent]
+[providers.models."openai.agent_simple_agent"]
+capability = "chat"
 model = "gpt-4o-mini"
+provider = "legacy.openai.agent_simple_agent"
 
-[providers.models.openai.default]
-api_key = "sk-v1-test-global"
+[providers.models."openai.agent_simple_agent".metadata]
+
+[providers.models."openai.default"]
+capability = "chat"
+model = "gpt-4o-mini"
+provider = "legacy.openai.default"
+
+[providers.models."openai.default".metadata]
+
+[providers.models."openai.default".options]
 max_tokens = 4096
-model = "gpt-4o-mini"
-name = "openai"
 temperature = 0.5
-timeout_secs = 90
-uri = "https://api.openai.com/v1/chat/completions"
-wire_api = "chat_completions"
-
-[providers.models.openai.default.extra_headers]
-HTTP-Referer = "https://zeroclaw.test"
-X-Title = "zeroclaw-v1-fixture"
 
 [providers.models."route.deep"]
 capability = "chat"
@@ -726,8 +862,6 @@ model = "claude-sonnet-4-6"
 provider = "route.deep"
 
 [providers.models."route.deep".metadata]
-
-[providers.models."route.deep".options]
 
 [providers.models."route.fast"]
 capability = "chat"

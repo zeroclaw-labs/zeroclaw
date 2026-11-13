@@ -1872,7 +1872,8 @@ mod tests {
             .unwrap(),
             ..Config::default()
         };
-        for profile in ["google.prod", "chat.google.prod", "old.alias"] {
+        let config = zeroclaw_config::migration::admit_test_input(&config);
+        for profile in ["google.prod", "chat.google.prod", "gemini.old.alias"] {
             assert_eq!(
                 GeminiFlow::client_credentials(&config, profile).unwrap(),
                 ("fixture-client".into(), "fixture-secret".into())

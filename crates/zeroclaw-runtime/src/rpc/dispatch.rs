@@ -38866,10 +38866,11 @@ mod tests {
         let config_dispatcher = Arc::clone(&dispatcher);
         let config_set = zeroclaw_spawn::spawn!(async move {
             config_dispatcher
-                .handle_config_set(&json!({
-                    "prop": "providers.models.openai.test-provider.model",
-                    "value": "committed-model"
-                }))
+                .handle_config_registry_set(&registry_edit_params(
+                    &config_dispatcher,
+                    &["models", "openai.test-provider", "model"],
+                    json!("committed-model"),
+                ))
                 .await
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -41784,19 +41785,22 @@ mod tests {
     async fn config_set_writes_real_secret_through_set_prop() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dispatcher = make_config_set_test_dispatcher(make_secret_test_config(&tmp));
-        let params = json!({
-            "prop": "providers.models.anthropic.default.api_key",
-            "value": "sk-real-test-key"
-        });
-        let res = dispatcher.handle_config_set(&params).await;
+        let params = registry_edit_params(
+            &dispatcher,
+            &["connections", "legacy.anthropic.default", "auth", "api_key"],
+            json!("sk-real-test-key"),
+        );
+        let res = dispatcher.handle_config_registry_set(&params).await;
         assert!(res.is_ok(), "config/set must accept a real secret: {res:?}");
         let cfg = dispatcher.ctx.config.read().clone();
-        let stored = cfg
-            .providers
-            .models
-            .anthropic
-            .get("default")
-            .and_then(|e| e.base.api_key.clone());
+        let stored = cfg.provider_registry().ok().and_then(|registry| {
+            let model = registry.resolve_chat(&"anthropic.default".into()).ok()?;
+            registry
+                .connections
+                .get(model.selection.model.provider())
+                .and_then(|connection| connection.api_key())
+                .map(str::to_owned)
+        });
         assert_eq!(
             stored.as_deref(),
             Some("sk-real-test-key"),
@@ -41805,89 +41809,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn config_set_persists_dotted_dynamic_secret_keys_for_existing_and_fresh_aliases() {
+    async fn registry_edit_persists_dotted_headers_for_existing_and_new_connections() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config_path = tmp.path().join("config.toml");
         let mut cfg = make_secret_test_config(&tmp);
         cfg.secrets.encrypt = false;
-        cfg.create_map_key("providers.models.openai", "existing")
-            .expect("create the existing provider alias");
-        cfg.providers
-            .models
-            .openai
-            .get_mut("existing")
-            .expect("existing provider alias must be present")
-            .base
-            .model = Some("gpt-4o".to_string());
         cfg.save().await.expect("seed the on-disk config");
         let dispatcher = make_config_set_test_dispatcher(cfg);
 
-        let existing = dispatcher
-            .handle_config_set(&json!({
-                "prop": "providers.models.openai.existing.extra_headers.X-Trace.level",
-                "value": "existing-value"
-            }))
-            .await;
-        assert!(
-            existing.is_ok(),
-            "config/set must accept a dotted key on an existing alias: {existing:?}"
-        );
+        dispatcher
+            .handle_config_registry_set(&registry_edit_params(
+                &dispatcher,
+                &[
+                    "connections",
+                    "legacy.anthropic.default",
+                    "extra_headers",
+                    "X-Trace.level",
+                ],
+                json!("existing-value"),
+            ))
+            .await
+            .expect("edit an exact header key on an existing connection");
+        dispatcher
+            .handle_config_registry_set(&registry_edit_params(
+                &dispatcher,
+                &["connections", "fresh"],
+                json!({"kind": "openai", "extra_headers": {"X-Trace.level": "fresh-value"}}),
+            ))
+            .await
+            .expect("create a connection with an exact header key");
 
         let disk = std::fs::read_to_string(&config_path).unwrap();
-        let reloaded: zeroclaw_config::schema::Config = toml::from_str(&disk).unwrap_or_else(|e| {
-            panic!("config must reload after existing-alias write: {e}\n{disk}")
-        });
-        assert_eq!(
-            reloaded
-                .providers
-                .models
-                .openai
-                .get("existing")
-                .and_then(|provider| provider.base.extra_headers.get("X-Trace.level"))
-                .map(String::as_str),
-            Some("existing-value"),
-            "RPC success must mean the literal dotted key survived save/reload"
-        );
-
-        let fresh = dispatcher
-            .handle_config_set(&json!({
-                "prop": "providers.models.openai.fresh.extra_headers.X-Trace.level",
-                "value": "fresh-value"
-            }))
-            .await;
-        assert!(
-            fresh.is_ok(),
-            "config/set must materialize an alias for a first dotted dynamic-map write: {fresh:?}"
-        );
-        assert_eq!(
-            dispatcher
-                .ctx
-                .config
-                .read()
-                .providers
-                .models
-                .openai
-                .get("fresh")
-                .and_then(|provider| provider.base.extra_headers.get("X-Trace.level"))
-                .map(String::as_str),
-            Some("fresh-value"),
-            "new alias and dotted key must be published to live config"
-        );
-
-        let disk = std::fs::read_to_string(&config_path).unwrap();
-        let reloaded: zeroclaw_config::schema::Config = toml::from_str(&disk)
-            .unwrap_or_else(|e| panic!("config must reload after fresh-alias write: {e}\n{disk}"));
-        assert_eq!(
-            reloaded
-                .providers
-                .models
-                .openai
-                .get("fresh")
-                .and_then(|provider| provider.base.extra_headers.get("X-Trace.level"))
-                .map(String::as_str),
-            Some("fresh-value"),
-            "fresh alias dotted key must survive the RPC save/reload boundary"
-        );
+        let reloaded: Config = toml::from_str(&disk).unwrap();
+        for config in [&*dispatcher.ctx.config.read(), &reloaded] {
+            for (connection, expected) in [
+                ("legacy.anthropic.default", "existing-value"),
+                ("fresh", "fresh-value"),
+            ] {
+                assert_eq!(
+                    config.providers.connections[connection]
+                        .extra_headers()
+                        .and_then(|headers| headers.get("X-Trace.level"))
+                        .map(String::as_str),
+                    Some(expected),
+                    "literal dotted header survives publication and reload"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -42085,10 +42053,11 @@ mod tests {
         let config_path = tmp.path().join("config.toml");
         zeroclaw_config::schema::arm_post_replace_sync_failure_for_test(&config_path);
         let res = dispatcher
-            .handle_config_set(&json!({
-                "prop": "providers.models.anthropic.default.api_key",
-                "value": "sk-post-rename-sync-key"
-            }))
+            .handle_config_registry_set(&registry_edit_params(
+                &dispatcher,
+                &["connections", "legacy.anthropic.default", "auth", "api_key"],
+                json!("sk-post-rename-sync-key"),
+            ))
             .await;
         assert!(
             res.is_ok(),
@@ -42103,11 +42072,16 @@ mod tests {
             .ctx
             .config
             .read()
-            .providers
-            .models
-            .anthropic
-            .get("default")
-            .and_then(|e| e.base.api_key.clone());
+            .provider_registry()
+            .ok()
+            .and_then(|registry| {
+                let model = registry.resolve_chat(&"anthropic.default".into()).ok()?;
+                registry
+                    .connections
+                    .get(model.selection.model.provider())
+                    .and_then(|connection| connection.api_key())
+                    .map(str::to_owned)
+            });
         assert_eq!(
             live.as_deref(),
             Some("sk-post-rename-sync-key"),
@@ -42146,7 +42120,7 @@ mod tests {
             ..Default::default()
         };
         cfg.create_map_key("providers.models.openai", "default")
-            .expect("create openai.default");
+            .unwrap();
         // Memory embeddings resolve from openai.default.
         cfg.memory.embedding_provider = "openai.default".into();
         cfg.memory.embedding_model = "text-embedding-3-small".into();
@@ -42208,7 +42182,7 @@ mod tests {
             ..Default::default()
         };
         cfg.create_map_key("providers.models.openai", "default")
-            .expect("create openai.default");
+            .unwrap();
         cfg.set_prop_persistent("providers.models.openai.default.uri", &mock_a.uri())
             .expect("set initial uri");
         cfg.set_prop_persistent("providers.models.openai.default.api_key", "key-a")
@@ -42281,7 +42255,7 @@ mod tests {
             ..Default::default()
         };
         cfg.create_map_key("providers.models.openai", "default")
-            .expect("create openai.default");
+            .unwrap();
         cfg.memory.embedding_provider = "openai.default".into();
         cfg.memory.embedding_model = "text-embedding-3-small".into();
         cfg.memory.embedding_dimensions = 1536;
@@ -42330,10 +42304,11 @@ mod tests {
 
         // Full RPC path: this schedules the live-agent memory refresh.
         let res = dispatcher
-            .handle_config_set(&json!({
-                "prop": "providers.models.openai.default.api_key",
-                "value": "sk-rotated"
-            }))
+            .handle_config_registry_set(&registry_edit_params(
+                &dispatcher,
+                &["connections", "legacy.openai.default", "auth", "api_key"],
+                json!("sk-rotated"),
+            ))
             .await;
         assert!(res.is_ok(), "config/set must succeed: {res:?}");
 
@@ -42543,20 +42518,11 @@ mod tests {
     async fn config_set_non_secret_field_still_uses_set_prop() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dispatcher = make_config_set_test_dispatcher(make_secret_test_config(&tmp));
-        let params = json!({
-            "prop": "providers.models.anthropic.default.model",
-            "value": "claude-sonnet-4-5"
-        });
+        let params = json!({"prop": "gateway.host", "value": "localhost"});
         let res = dispatcher.handle_config_set(&params).await;
         assert!(res.is_ok(), "non-secret set must succeed: {res:?}");
         let cfg = dispatcher.ctx.config.read().clone();
-        let stored = cfg
-            .providers
-            .models
-            .anthropic
-            .get("default")
-            .and_then(|e| e.base.model.clone());
-        assert_eq!(stored.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(cfg.gateway.host, "localhost");
     }
 
     #[tokio::test]
@@ -42656,7 +42622,6 @@ mod tests {
 
         let workspace_dir = tmp.path().join("workspace");
         std::fs::create_dir_all(&workspace_dir).unwrap();
-
         let mut config = Config {
             config_path: tmp.path().join("config.toml"),
             data_dir: tmp.path().join("data"),
@@ -42671,7 +42636,6 @@ mod tests {
         provider.uri = Some("http://127.0.0.1:1".into());
         provider.model = Some("old-model".into());
         provider.temperature = Some(0.2);
-
         config.agents = HashMap::from([(
             "test-agent".to_string(),
             AliasedAgentConfig {
@@ -42760,6 +42724,19 @@ mod tests {
             .expect("in-turn model switch must succeed");
     }
 
+    fn registry_edit_params(dispatcher: &RpcDispatcher, path: &[&str], value: Value) -> Value {
+        use zeroclaw_config::provider_registry::editor;
+
+        let expected = editor::snapshot(&dispatcher.ctx.config.read()).expect("registry snapshot");
+        let mut registry = expected.clone();
+        let mut field = &mut registry;
+        for key in path {
+            field = &mut field[*key];
+        }
+        *field = value;
+        json!({"expected": expected, "registry": registry})
+    }
+
     #[tokio::test]
     async fn config_set_refreshes_bare_and_url_bindings_with_inherited_models() {
         for reference in ["openai", "custom:http://127.0.0.1:2/v1"] {
@@ -42786,10 +42763,11 @@ mod tests {
                 );
 
                 dispatcher
-                    .handle_config_set(&json!({
-                        "prop": "providers.models.openai.test-provider.model",
-                        "value": "updated-inherited-model"
-                    }))
+                    .handle_config_registry_set(&registry_edit_params(
+                        &dispatcher,
+                        &["models", "openai.test-provider", "model"],
+                        json!("updated-inherited-model"),
+                    ))
                     .await
                     .expect("editing inherited model defaults must refresh bare/URL bindings");
                 assert_eq!(
@@ -42835,10 +42813,11 @@ mod tests {
         .await;
 
         dispatcher
-            .handle_config_set(&json!({
-                "prop": "providers.models.openai.test-provider.temperature",
-                "value": 0.4
-            }))
+            .handle_config_registry_set(&registry_edit_params(
+                &dispatcher,
+                &["models", "openai.test-provider", "options", "temperature"],
+                json!(0.4),
+            ))
             .await
             .expect("editing the original provider must succeed");
         assert_eq!(
@@ -42852,10 +42831,11 @@ mod tests {
         );
 
         dispatcher
-            .handle_config_set(&json!({
-                "prop": "providers.models.openai.tool_provider.model",
-                "value": "tool-model-v2"
-            }))
+            .handle_config_registry_set(&registry_edit_params(
+                &dispatcher,
+                &["models", "openai.tool_provider", "model"],
+                json!("tool-model-v2"),
+            ))
             .await
             .expect("editing the active provider must rebuild the selected binding");
         assert_eq!(
@@ -42864,10 +42844,11 @@ mod tests {
             "the model resolved by the tool must keep inheriting its selected config"
         );
         dispatcher
-            .handle_config_set(&json!({
-                "prop": "providers.models.openai.tool_provider.temperature",
-                "value": 0.7
-            }))
+            .handle_config_registry_set(&registry_edit_params(
+                &dispatcher,
+                &["models", "openai.tool_provider", "options", "temperature"],
+                json!(0.7),
+            ))
             .await
             .expect("subsequent active-provider edits must still refresh the binding");
         assert_eq!(
@@ -42900,12 +42881,13 @@ mod tests {
         .await;
 
         dispatcher
-            .handle_config_set(&json!({
-                "prop": "providers.models.openai.tool_provider.model",
-                "value": "tool-model-v2"
-            }))
+            .handle_config_registry_set(&registry_edit_params(
+                &dispatcher,
+                &["models", "openai.tool_provider", "model"],
+                json!("tool-model-v2"),
+            ))
             .await
-            .expect("editing the active provider must preserve an explicit model override");
+            .expect("editing the active model preserves an explicit override");
         assert_eq!(
             model_name_for_session(&dispatcher, &session_id).await,
             "explicit-tool-model"
@@ -43019,10 +43001,11 @@ mod tests {
             "openai.tool_renamed"
         );
         dispatcher
-            .handle_config_set(&json!({
-                "prop": "providers.models.openai.tool_renamed.model",
-                "value": "renamed-model"
-            }))
+            .handle_config_registry_set(&registry_edit_params(
+                &dispatcher,
+                &["models", "openai.tool_renamed", "model"],
+                json!("renamed-model"),
+            ))
             .await
             .expect("the renamed active selection must keep inheriting config edits");
         assert_eq!(
@@ -43199,9 +43182,11 @@ mod tests {
         let writer = Arc::clone(&dispatcher);
         let task = zeroclaw_spawn::spawn!(async move {
             writer
-                .handle_config_set(&json!({
-                    "prop": "providers.models.openai.test-provider.model", "value": "new-model"
-                }))
+                .handle_config_registry_set(&registry_edit_params(
+                    &writer,
+                    &["models", "openai.test-provider", "model"],
+                    json!("new-model"),
+                ))
                 .await
         });
         tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
@@ -43290,9 +43275,11 @@ mod tests {
         // A subsequent write to the same path replaces its ledger records.
         // Its receipt must not be attributable to the earlier request.
         let newer = dispatcher
-            .handle_config_set(&json!({
-                "prop": "providers.models.openai.test-provider.model", "value": "newer-model"
-            }))
+            .handle_config_registry_set(&registry_edit_params(
+                &dispatcher,
+                &["models", "openai.test-provider", "model"],
+                json!("newer-model"),
+            ))
             .await
             .unwrap();
         let latest = dispatcher.handle_config_status().await.unwrap();
@@ -43893,10 +43880,16 @@ model = "before"
         // live refresh; the rebuild must keep the session's three-segment
         // selection instead of collapsing to the profile default entry.
         let res = dispatcher
-            .handle_config_set(&json!({
-                "prop": "providers.models.openai.test-provider.models.fast.temperature",
-                "value": 0.5
-            }))
+            .handle_config_registry_set(&registry_edit_params(
+                &dispatcher,
+                &[
+                    "models",
+                    "openai.test-provider.fast",
+                    "options",
+                    "temperature",
+                ],
+                json!(0.5),
+            ))
             .await;
         assert!(
             res.is_ok(),
@@ -44038,10 +44031,11 @@ model = "before"
         let config_wait = config_waiting.notified();
         let config_set = zeroclaw_spawn::spawn!(async move {
             config_dispatcher
-                .handle_config_set(&json!({
-                    "prop": "providers.models.openai.test-provider.model",
-                    "value": "new-model"
-                }))
+                .handle_config_registry_set(&registry_edit_params(
+                    &config_dispatcher,
+                    &["models", "openai.test-provider", "model"],
+                    json!("new-model"),
+                ))
                 .await
         });
         let mut config_set = Box::pin(config_set);
@@ -44195,10 +44189,11 @@ model = "before"
         let config_dispatcher = Arc::clone(&dispatcher);
         let config_set = zeroclaw_spawn::spawn!(async move {
             config_dispatcher
-                .handle_config_set(&json!({
-                    "prop": "providers.models.openai.edited.model",
-                    "value": "new-model"
-                }))
+                .handle_config_registry_set(&registry_edit_params(
+                    &config_dispatcher,
+                    &["models", "openai.edited", "model"],
+                    json!("new-model"),
+                ))
                 .await
         });
         let mut config_set = Box::pin(config_set);
@@ -44630,10 +44625,11 @@ model = "before"
         );
 
         let res = dispatcher
-            .handle_config_set(&json!({
-                "prop": "providers.models.openai.test-provider.model",
-                "value": "new-model"
-            }))
+            .handle_config_registry_set(&registry_edit_params(
+                &dispatcher,
+                &["models", "openai.test-provider", "model"],
+                json!("new-model"),
+            ))
             .await;
         assert!(res.is_ok(), "config/set must succeed: {res:?}");
         assert_eq!(
@@ -44713,22 +44709,18 @@ model = "before"
         );
 
         let res = dispatcher
-            .handle_config_set(&json!({
-                "prop": "providers.models.openai.test-provider.model",
-                "value": ""
-            }))
+            .handle_config_registry_set(&registry_edit_params(
+                &dispatcher,
+                &["models", "openai.test-provider", "model"],
+                json!(""),
+            ))
             .await;
         assert!(
             res.is_err(),
             "config/set must surface a provider rebuild failure: {res:?}"
         );
         let cfg = dispatcher.ctx.config.read().clone();
-        let stored = cfg
-            .providers
-            .models
-            .openai
-            .get("test-provider")
-            .and_then(|e| e.base.model.clone());
+        let stored = cfg.resolve_model_id("openai.test-provider");
         assert_eq!(
             stored.as_deref(),
             Some("old-model"),
@@ -45089,9 +45081,14 @@ model = "before"
             }))
             .await
             .unwrap();
-        dispatcher.handle_config_set(&json!({
-            "prop": "providers.models.openai.test-provider.models.default.id", "value": "new-default"
-        })).await.unwrap();
+        dispatcher
+            .handle_config_registry_set(&registry_edit_params(
+                &dispatcher,
+                &["models", "openai.test-provider.default", "model"],
+                json!("new-default"),
+            ))
+            .await
+            .unwrap();
         assert_eq!(
             model_name_for_session(&dispatcher, &session_id).await,
             "new-default"
@@ -45575,10 +45572,11 @@ options = { temperature = 0.2 }
         );
 
         let res = dispatcher
-            .handle_config_set(&json!({
-                "prop": "providers.models.openai.test-provider.temperature",
-                "value": 0.4
-            }))
+            .handle_config_registry_set(&registry_edit_params(
+                &dispatcher,
+                &["models", "openai.test-provider", "options", "temperature"],
+                json!(0.4),
+            ))
             .await;
         assert!(res.is_ok(), "config/set must succeed: {res:?}");
 
@@ -45605,10 +45603,11 @@ options = { temperature = 0.2 }
         assert_eq!(merged.temperature, Some(0.6));
 
         let res = dispatcher
-            .handle_config_set(&json!({
-                "prop": "providers.models.openai.test-provider.model",
-                "value": "new-model"
-            }))
+            .handle_config_registry_set(&registry_edit_params(
+                &dispatcher,
+                &["models", "openai.test-provider", "model"],
+                json!("new-model"),
+            ))
             .await;
         assert!(res.is_ok(), "config/set must succeed: {res:?}");
 
@@ -45631,9 +45630,11 @@ options = { temperature = 0.2 }
         );
 
         let res = dispatcher
-            .handle_config_delete(&json!({
-                "prop": "providers.models.openai.test-provider.temperature",
-            }))
+            .handle_config_registry_set(&registry_edit_params(
+                &dispatcher,
+                &["models", "openai.test-provider", "options", "temperature"],
+                Value::Null,
+            ))
             .await;
         let res = res.expect("config/delete must succeed");
         let status = dispatcher.handle_config_status().await.unwrap();
@@ -46299,7 +46300,7 @@ options = { temperature = 0.2 }
         }
         config
             .create_map_key("providers.models.anthropic", "default")
-            .expect("create anthropic.default");
+            .unwrap();
         let port_before = config.gateway.port;
         let (mut dispatcher, mut rx) = authenticated_roster_dispatcher(&tmp, config, 4242).await;
         let disk_before = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
@@ -47877,9 +47878,9 @@ options = { temperature = 0.2 }
             ..Default::default()
         };
         cfg.create_map_key("providers.models.anthropic", "default")
-            .expect("create anthropic.default");
+            .unwrap();
         cfg.create_map_key("providers.models.openai", "default")
-            .expect("create openai.default");
+            .unwrap();
         cfg
     }
 
@@ -47890,13 +47891,13 @@ options = { temperature = 0.2 }
                 .models
                 .anthropic
                 .get("default")
-                .and_then(|e| e.base.model.clone()),
+                .and_then(|entry| entry.base.model.clone()),
             "openai" => config
                 .providers
                 .models
                 .openai
                 .get("default")
-                .and_then(|e| e.base.model.clone()),
+                .and_then(|entry| entry.base.model.clone()),
             other => panic!("unexpected provider {other}"),
         }
     }
@@ -51144,10 +51145,11 @@ options = { temperature = 0.2 }
         let config_set_dispatcher = Arc::clone(&dispatcher);
         let config_set = zeroclaw_spawn::spawn!(async move {
             config_set_dispatcher
-                .handle_config_set(&json!({
-                    "prop": "providers.models.openai.test-provider.model",
-                    "value": "refreshed-model"
-                }))
+                .handle_config_registry_set(&registry_edit_params(
+                    &config_set_dispatcher,
+                    &["models", "openai.test-provider", "model"],
+                    json!("refreshed-model"),
+                ))
                 .await
         });
 
@@ -51255,10 +51257,11 @@ options = { temperature = 0.2 }
         let config_set_dispatcher = Arc::clone(&dispatcher);
         let config_set = zeroclaw_spawn::spawn!(async move {
             config_set_dispatcher
-                .handle_config_set(&json!({
-                    "prop": "providers.models.openai.test-provider.model",
-                    "value": "refreshed-model"
-                }))
+                .handle_config_registry_set(&registry_edit_params(
+                    &config_set_dispatcher,
+                    &["models", "openai.test-provider", "model"],
+                    json!("refreshed-model"),
+                ))
                 .await
         });
 
@@ -51382,11 +51385,25 @@ options = { temperature = 0.2 }
 
             let commit_dispatcher = Arc::clone(&dispatcher);
             let commit = zeroclaw_spawn::spawn!(async move {
+                let path = match field {
+                    "model" => vec!["models", "openai.test-provider", "model"],
+                    "temperature" => {
+                        vec!["models", "openai.test-provider", "options", "temperature"]
+                    }
+                    "context_window" => vec![
+                        "models",
+                        "openai.test-provider",
+                        "metadata",
+                        "context_window",
+                    ],
+                    _ => panic!("unexpected model fixture field"),
+                };
                 commit_dispatcher
-                    .handle_config_set(&json!({
-                        "prop": format!("providers.models.openai.test-provider.{field}"),
-                        "value": value,
-                    }))
+                    .handle_config_registry_set(&registry_edit_params(
+                        &commit_dispatcher,
+                        &path,
+                        value,
+                    ))
                     .await
             });
             tokio::time::timeout(
@@ -51520,10 +51537,11 @@ options = { temperature = 0.2 }
         let config_set_dispatcher = Arc::clone(&dispatcher);
         let config_set = zeroclaw_spawn::spawn!(async move {
             config_set_dispatcher
-                .handle_config_set(&json!({
-                    "prop": "providers.models.openai.test-provider.model",
-                    "value": "refreshed-model"
-                }))
+                .handle_config_registry_set(&registry_edit_params(
+                    &config_set_dispatcher,
+                    &["models", "openai.test-provider", "model"],
+                    json!("refreshed-model"),
+                ))
                 .await
         });
 
@@ -51650,10 +51668,11 @@ options = { temperature = 0.2 }
         let config_set_dispatcher = Arc::clone(&dispatcher);
         let config_set = zeroclaw_spawn::spawn!(async move {
             config_set_dispatcher
-                .handle_config_set(&json!({
-                    "prop": "providers.models.openai.test-provider.model",
-                    "value": "refreshed-model"
-                }))
+                .handle_config_registry_set(&registry_edit_params(
+                    &config_set_dispatcher,
+                    &["models", "openai.test-provider", "model"],
+                    json!("refreshed-model"),
+                ))
                 .await
         });
         commit_pause.arrived.notified().await;
@@ -51757,10 +51776,11 @@ options = { temperature = 0.2 }
         let config_set_dispatcher = Arc::clone(&dispatcher);
         let config_set = zeroclaw_spawn::spawn!(async move {
             config_set_dispatcher
-                .handle_config_set(&json!({
-                    "prop": "providers.models.openai.test-provider.temperature",
-                    "value": 0.7
-                }))
+                .handle_config_registry_set(&registry_edit_params(
+                    &config_set_dispatcher,
+                    &["models", "openai.test-provider", "options", "temperature"],
+                    json!(0.7),
+                ))
                 .await
         });
 
@@ -51852,10 +51872,11 @@ options = { temperature = 0.2 }
         let config_set_dispatcher = Arc::clone(&dispatcher);
         let config_set = zeroclaw_spawn::spawn!(async move {
             config_set_dispatcher
-                .handle_config_set(&json!({
-                    "prop": "providers.models.openai.test-provider.model",
-                    "value": "refreshed-model"
-                }))
+                .handle_config_registry_set(&registry_edit_params(
+                    &config_set_dispatcher,
+                    &["models", "openai.test-provider", "model"],
+                    json!("refreshed-model"),
+                ))
                 .await
         });
 

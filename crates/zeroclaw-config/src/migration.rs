@@ -1682,6 +1682,9 @@ pub fn generate(target_version: u32, opts: &GenerateOptions<'_>) -> Result<Strin
     };
 
     let mut value = value;
+    if target_version == CURRENT_SCHEMA_VERSION {
+        value = provider_inputs::migrate_document(value)?;
+    }
     // Generation creates a new installation, even when the requested schema
     // is historical. Write its full default selection so the document states
     // it and `config migrate` has nothing to normalize.
@@ -4879,7 +4882,7 @@ model = "grok-model"
 [multimodal]
 vision_model_provider = "xai"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("xai.default"),
@@ -5470,7 +5473,7 @@ model = "vision-model"
 vision_model_provider = "{raw_source}"
 "#
             );
-            let cfg = migrate_to_current(&raw)
+            let cfg = migrated_provider_input_fixture(&raw)
                 .unwrap_or_else(|e| panic!("legacy variant {raw_source} must migrate: {e}"));
             assert_eq!(
                 cfg.multimodal.vision_model_provider.as_deref(),
@@ -7595,11 +7598,8 @@ model_provider = "gemini.work"
         assert!(differ.is_empty(), "the V1 reading differs at {differ:?}");
     }
 
-    /// The current `[transcription]` still reads V2's Groq settings and
-    /// per-family STT tables, spelled as V2 spelled them, so the V1 reading
-    /// leaves them where they are, with every value: no move to a
-    /// `[providers.transcription]` alias whose fields differ (`uri` for
-    /// `url`, no endpoint for Groq).
+    /// V1 transcription input is projected to the canonical ASR model
+    /// registry while retaining every supported setting.
     #[test]
     fn the_v1_reading_keeps_the_shared_transcription_settings_in_place() {
         let file: toml::Table = toml::from_str(
@@ -7617,16 +7617,15 @@ model_provider = "gemini.work"
         );
         let (as_v1, typed_v1) = stated_reading(&file, 1);
         for (path, kept) in [
-            ("transcription.api_url", "https://stt.example.invalid/v1"),
-            ("transcription.model", "whisper-keep"),
-            ("transcription.openai.model", "whisper-1"),
-            ("transcription.google.language_code", "de-DE"),
+            (r#"providers.models."asr.groq".model"#, "whisper-keep"),
+            (r#"providers.models."asr.openai".model"#, "whisper-1"),
+            (r#"providers.models."asr.google".options.language"#, "de-DE"),
             (
-                "transcription.local_whisper.url",
+                r#"providers.connections."legacy.asr.section.local_whisper".uri"#,
                 "http://127.0.0.1:8001/v1/transcribe",
             ),
             (
-                "transcription.local_whisper.bearer_token",
+                r#"providers.connections."legacy.asr.section.local_whisper".auth.api_key"#,
                 "KEEP-LOCAL-TOKEN",
             ),
         ] {
@@ -7637,14 +7636,11 @@ model_provider = "gemini.work"
             );
         }
         assert_eq!(
-            value_at(&typed_v1, "transcription.local_whisper.timeout_secs")
+            value_at(&typed_v1, r#"providers.connections."legacy.asr.section.local_whisper".api.asr.request_timeout_secs"#)
                 .and_then(toml::Value::as_integer),
             Some(17)
         );
-        assert!(
-            value_at(&as_v1, "providers.transcription").is_none(),
-            "nothing moves under `[providers.transcription]`: {as_v1:#?}"
-        );
+        assert!(value_at(&as_v1, "providers.models").is_some());
         assert!(readings_differ(&file).is_empty());
     }
 

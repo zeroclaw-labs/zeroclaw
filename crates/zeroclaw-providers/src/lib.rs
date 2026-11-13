@@ -941,6 +941,8 @@ pub fn provider_runtime_options_for_agent(
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
 ) -> ModelProviderRuntimeOptions {
+    let admitted = zeroclaw_config::migration::admit_test_input(config);
+    let config = &admitted;
     let base = provider_runtime_options_for_bare_family(config);
     let Some(agent) = config.agent(agent_alias) else {
         return base;
@@ -959,6 +961,8 @@ pub fn provider_runtime_options_for_alias(
     family: &str,
     alias: &str,
 ) -> ModelProviderRuntimeOptions {
+    let admitted = zeroclaw_config::migration::admit_test_input(config);
+    let config = &admitted;
     let reference = format!("{family}.{alias}");
     let Ok(registry) = config.provider_registry() else {
         return provider_runtime_options_for_bare_family(config);
@@ -984,6 +988,8 @@ pub fn options_for_provider_ref(
     name: &str,
     fallback: &ModelProviderRuntimeOptions,
 ) -> ModelProviderRuntimeOptions {
+    let admitted = zeroclaw_config::migration::admit_test_input(config);
+    let config = &admitted;
     if let Ok(registry) = config.chat_registry_for_input(None, name)
         && let Ok(selected) = registry.resolve_chat(&name.trim().into())
     {
@@ -2885,7 +2891,9 @@ mod tests {
             reasoning_effort_passthrough: true,
             ..Default::default()
         };
-        let resolved = options_for_provider_ref(&Config::default(), "llamacpp", &fallback);
+        let mut config = Config::default();
+        config.runtime.reasoning_effort = Some("high".into());
+        let resolved = options_for_provider_ref(&config, "llamacpp", &fallback);
         assert!(
             !resolved.reasoning_effort_passthrough,
             "bare family ref must drop the fallback alias's passthrough opt-in"
@@ -3143,7 +3151,7 @@ mod tests {
             "openai",
             "primary",
         );
-        assert_eq!(options.provider_kind.as_deref(), Some("openai-compatible"));
+        assert_eq!(options.provider_kind.as_deref(), Some("custom"));
         assert_eq!(
             options.provider_api_url.as_deref(),
             Some("http://primary.example/v1")
@@ -3597,7 +3605,7 @@ mod tests {
 
         let route_options = options_for_provider_ref(&config, "openrouter", &inherited);
 
-        assert_eq!(route_options.provider_kind, None);
+        assert_eq!(route_options.provider_kind.as_deref(), Some("openrouter"));
         assert_eq!(route_options.provider_api_url, None);
         // A bare route clears the inherited alias-only state back to the type
         // default (currently `relocate`), so assert against the default rather
@@ -3638,7 +3646,7 @@ mod tests {
             &options,
         );
 
-        assert_eq!(route_options.provider_kind, None);
+        assert_eq!(route_options.provider_kind.as_deref(), Some("openrouter"));
         assert_eq!(route_options.provider_api_url, None);
     }
 
@@ -3677,7 +3685,7 @@ mod tests {
             "openai",
             "primary",
         );
-        assert_eq!(options.provider_kind.as_deref(), Some("openai-compatible"));
+        assert_eq!(options.provider_kind.as_deref(), Some("custom"));
 
         let provider = {
             let mut routed_config = zeroclaw_config::migration::admit_test_input(&config);
@@ -4109,13 +4117,10 @@ mod tests {
         let via_ref = model::build_raw_provider(&config, url, Default::default())
             .map(|resolved| resolved.provider)
             .expect("ref factory builds custom URL");
-        let via_legacy = create_model_provider(url, None, &Default::default())
-            .expect("legacy factory builds custom URL");
         assert_eq!(
             via_ref.alias(),
-            via_legacy.alias(),
-            "custom:<url> with a dotted host must build identically to the legacy \
-             factory (not be mis-split into a bogus family/alias)"
+            url,
+            "a dotted URL retains its exact selection reference for attribution"
         );
     }
 

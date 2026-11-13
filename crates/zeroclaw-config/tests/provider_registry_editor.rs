@@ -34,6 +34,9 @@ model = "model-two"
         ..Config::default()
     };
     config
+        .risk_profiles
+        .insert("default".into(), Default::default());
+    config
         .providers
         .models
         .ensure("openai", "legacy.prod")
@@ -213,7 +216,7 @@ fn registry_save_does_not_bypass_explicitly_disabled_embeddings() {
         },
     )
     .unwrap_err();
-    assert!(error.to_string().contains("capability"), "{error}");
+    assert!(format!("{error:#}").contains("capability"), "{error:#}");
     assert_eq!(snapshot(&config).unwrap(), expected);
 }
 
@@ -447,10 +450,14 @@ fn legacy_chat_and_speech_names_are_normalized_before_editor_promotion() {
         .unwrap(),
         ..Config::default()
     };
+    config
+        .risk_profiles
+        .insert("default".into(), Default::default());
     config.agents.insert(
         "agent".into(),
         AliasedAgentConfig {
             model_provider: "openai.default".into(),
+            risk_profile: "default".into(),
             tts_provider: "openai.default".into(),
             transcription_provider: "openai.default".into(),
             ..Default::default()
@@ -678,6 +685,7 @@ fn exact_model_rename_rewrites_consumers_and_fallback_without_prefix_matching() 
         "consumer".into(),
         AliasedAgentConfig {
             model_provider: "chat.fast.us".into(),
+            risk_profile: "default".into(),
             classifier_provider: "chat.fast.us".into(),
             summary_provider: "chat.fast.us".into(),
             ..Default::default()
@@ -762,9 +770,13 @@ fn preset_rename_updates_api_and_model_bindings() {
 #[test]
 fn registry_rename_refuses_environment_owned_consumer_bindings_atomically() {
     let mut config = admit(config());
-    config
-        .agents
-        .insert("test-agent".into(), Default::default());
+    config.agents.insert(
+        "test-agent".into(),
+        zeroclaw_config::schema::AliasedAgentConfig {
+            risk_profile: "default".into(),
+            ..Default::default()
+        },
+    );
     config.agents.get_mut("test-agent").unwrap().model_provider = "chat.fast.us".into();
     config
         .env_overridden_paths

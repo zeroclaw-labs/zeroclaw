@@ -3560,6 +3560,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 crate::dashboard_session::test_support::add_sign_in(&mut config, issuer);
             }
             adjust(&mut config);
+            zeroclaw_config::migration::normalize_test_input(&mut config);
 
             let backend = zeroclaw_infra::make_session_backend(&workspace, "sqlite")
                 .expect("sqlite session backend");

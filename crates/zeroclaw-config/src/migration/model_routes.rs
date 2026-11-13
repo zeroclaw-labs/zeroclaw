@@ -227,7 +227,7 @@ pub(super) fn legacy_model(
     if !extra.is_empty() {
         connection["extra"] = extra.into();
     }
-    if raw.get("requires_openai_auth").and_then(Value::as_bool) == Some(true) {
+    if kind == "openai" && raw.get("requires_openai_auth").and_then(Value::as_bool) == Some(true) {
         connection["auth"] = json!({"mode":"codex"});
     } else if (kind == "qwen"
         && raw
@@ -248,13 +248,18 @@ pub(super) fn legacy_model(
                     .and_then(Value::as_str)
                     .is_some_and(|value| !value.trim().is_empty())
             }))
-        || raw
+        || (matches!(kind, "qwen" | "minimax" | "gemini") && raw
             .get("auth_mode")
             .and_then(Value::as_str)
-            .is_some_and(|mode| matches!(mode, "o_auth" | "oauth"))
+            .is_some_and(|mode| matches!(mode, "o_auth" | "oauth")))
     {
         let mut auth = json!({"mode":"oauth"});
         for &(old, new) in LEGACY_OAUTH_FIELDS {
+            if (kind == "gemini" && new == "refresh_token")
+                || (kind != "gemini" && new == "client_secret")
+            {
+                continue;
+            }
             if let Some(value) = raw.get(old).filter(|value| !value.is_null()) {
                 auth[new] = value.clone();
             }

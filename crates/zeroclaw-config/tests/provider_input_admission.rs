@@ -131,6 +131,46 @@ oauth_client_secret="test-secret"
 }
 
 #[test]
+fn transcription_settings_without_credentials_are_promoted_and_stay_canonical() {
+    let config = migration::migrate_to_current(
+        r#"schema_version = 3
+[transcription]
+enabled = true
+api_url = "https://speech.example.invalid/v1/transcriptions"
+model = "custom-whisper"
+language = "de"
+"#,
+    )
+    .unwrap();
+    let registry = config.provider_registry().unwrap();
+    let model = registry.resolve_asr(&"asr.groq".into()).unwrap();
+    assert_eq!(
+        model.selection.model.upstream_model(),
+        Some("custom-whisper")
+    );
+    assert_eq!(
+        model.options.language,
+        Some(zeroclaw_config::provider_registry::Override::Set(
+            "de".into()
+        ))
+    );
+    assert_eq!(
+        model.selection.connection.uri(),
+        Some("https://speech.example.invalid/v1/transcriptions")
+    );
+
+    let serialized = toml::to_string(&config).unwrap();
+    let document: toml::Value = toml::from_str(&serialized).unwrap();
+    assert!(document["transcription"].get("api_url").is_none());
+    assert!(document["transcription"].get("model").is_none());
+    let reloaded = migration::migrate_to_current(&serialized).unwrap();
+    assert_eq!(
+        serde_json::to_value(reloaded.provider_registry().unwrap()).unwrap(),
+        serde_json::to_value(registry).unwrap()
+    );
+}
+
+#[test]
 fn registry_getter_never_projects_manually_injected_retired_tables() {
     let mut config = Config::default();
     config

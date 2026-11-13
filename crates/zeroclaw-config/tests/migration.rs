@@ -881,17 +881,15 @@ fn t14b2_per_agent_timeout_secs_folds_onto_model_provider_entry() {
         .agents
         .get("complex_agent")
         .expect("agents.complex_agent present");
-    let (provider_type, provider_alias) = agent
-        .model_provider
-        .split_once('.')
-        .expect("agents.complex_agent.model_provider is <type>.<alias>");
-    let entry = cfg
-        .providers
-        .models
-        .find(provider_type, provider_alias)
-        .expect("model_providers entry exists for complex_agent's brain");
+    let registry = cfg.provider_registry().unwrap();
+    let entry = registry
+        .resolve_chat(&agent.model_provider.as_str().into())
+        .expect("the agent's canonical chat model exists");
     assert_eq!(
-        entry.timeout_secs,
+        entry
+            .request_timeout_secs
+            .and_then(|value| value.into_option())
+            .map(std::num::NonZeroU64::get),
         Some(180),
         "V2 agent timeout_secs must land on the agent's model_provider, not runtime_profile"
     );
@@ -1007,16 +1005,16 @@ fn agent_synthesized_into_runtime_profiles_default() {
 #[test]
 fn cost_prices_dropped_not_folded() {
     let cfg = v3_config();
-    let anth = cfg
-        .providers
-        .models
-        .find("anthropic", "default")
-        .expect("anthropic.default exists");
+    let registry = cfg.provider_registry().unwrap();
+    let anth = registry.models.get("anthropic.default").unwrap();
+    let zeroclaw_config::provider_registry::ModelDefinition::Chat(anth) = anth else {
+        panic!("fixture must contain a chat model");
+    };
     assert!(
-        anth.pricing.is_empty(),
+        anth.metadata.pricing.is_none(),
         "V2 cost.prices entries must be dropped on migration; \
          got pricing entries on anthropic.default: {:?}",
-        anth.pricing.keys().collect::<Vec<_>>()
+        anth.metadata.pricing
     );
 
     // The migrated config also must not carry [cost.prices.*] anywhere.
@@ -1624,12 +1622,15 @@ model_provider = "openai.default"
         .iter()
         .find(|r| r.hint == "semantic")
         .expect("semantic route");
-    assert_eq!(
-        semantic.model_provider, "openai.default",
-        "bare V2 `provider = openai` must be promoted to dotted V3 `openai.default`"
-    );
-    assert_eq!(semantic.model, "text-embedding-3-small");
-    assert_eq!(semantic.dimensions, Some(1536));
+    let registry = cfg.provider_registry().unwrap();
+    let model = registry
+        .resolve_embedding(&semantic.model_provider.as_str().into())
+        .unwrap();
+    assert_eq!(model.model, "text-embedding-3-small");
+    assert_eq!(model.dimensions, Some(1536));
+    assert_eq!(model.selection.connection.kind(), "openai");
+    assert!(semantic.model.is_empty());
+    assert!(semantic.dimensions.is_none());
 }
 
 #[test]

@@ -290,8 +290,21 @@ fn set_document(
         .split('/')
         .map(|part| part.replace("~1", "/").replace("~0", "~"))
         .collect();
-    ensure!(parts.len() >= 2, "override must target a registry leaf");
     let mut node = &mut *document;
+    if parts.len() == 1 {
+        // Promotion can create an entire previously absent collection. Only
+        // snapshot restoration may remove it; env edits still target leaves.
+        ensure!(saved.is_some(), "override must target a registry leaf");
+        let map = node
+            .as_object_mut()
+            .ok_or_else(|| anyhow::Error::msg("registry must be a table"))?;
+        if value.is_null() {
+            map.remove(&parts[0]);
+        } else {
+            map.insert(parts[0].clone(), value);
+        }
+        return Ok(());
+    }
     for (index, part) in parts[..parts.len() - 1].iter().enumerate() {
         if index == 0 && matches!(part.as_str(), "fallback" | "model_presets") {
             node = node

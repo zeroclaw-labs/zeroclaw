@@ -2269,6 +2269,7 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let mut config = config(&idp.uri(), &model.uri(), root.path());
             tweak(&mut config);
+            zeroclaw_config::migration::normalize_test_input(&mut config);
             let (start_gate, end_gate) = (HookGate::new(), HookGate::new());
             let (generation, connector, core, store, core_auth) =
                 core_generation(&config, (&start_gate, &end_gate));
