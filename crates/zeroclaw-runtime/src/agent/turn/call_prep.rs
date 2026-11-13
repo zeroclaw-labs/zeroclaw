@@ -612,6 +612,7 @@ mod tests {
             parent_agent_alias: None,
             serving_provider_name: None,
             serving_model: None,
+            channel_thread_ts: None,
         }
     }
 

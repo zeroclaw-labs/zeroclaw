@@ -7061,6 +7061,7 @@ mod tests {
                         arguments_summary: "demo args".to_string(),
                         raw_arguments: None,
                         position: None,
+                        thread_ts: None,
                     },
                 )
                 .await

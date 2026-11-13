@@ -124,6 +124,11 @@ pub struct IngressContext {
     /// fail-closed to absent).
     #[serde(default)]
     pub internal_principal: Option<InternalPrincipal>,
+    /// Platform thread of the inbound message (its `ChannelMessage.thread_ts`),
+    /// so prompts the turn sends back to its origin stay in that thread.
+    /// `None` outside a thread and for internal turns.
+    #[serde(default)]
+    pub thread_ts: Option<String>,
 }
 
 impl IngressContext {
@@ -136,6 +141,7 @@ impl IngressContext {
             trust: TrustClass::Trusted,
             origin,
             internal_principal: None,
+            thread_ts: None,
         }
     }
 

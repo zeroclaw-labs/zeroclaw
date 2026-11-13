@@ -775,6 +775,7 @@ mod payload_capture_tests {
             turn_id: "trace-req-test",
             serving_provider_name: None,
             serving_model: None,
+            channel_thread_ts: None,
         }
     }
 
@@ -1255,6 +1256,7 @@ mod streaming_fallback_tests {
             parent_agent_alias: None,
             serving_provider_name: None,
             serving_model: None,
+            channel_thread_ts: None,
         }
     }
     struct RejectedImageThenPendingProvider {
@@ -1940,6 +1942,7 @@ mod streaming_fallback_tests {
             parent_agent_alias: None,
             serving_provider_name: None,
             serving_model: None,
+            channel_thread_ts: None,
         };
 
         let outcome = TOOL_LOOP_TURN_USAGE
@@ -2056,6 +2059,7 @@ mod streaming_fallback_tests {
             parent_agent_alias: None,
             serving_provider_name: None,
             serving_model: None,
+            channel_thread_ts: None,
         };
 
         let outcome = call_provider(
@@ -2119,6 +2123,7 @@ mod streaming_fallback_tests {
             parent_agent_alias: None,
             serving_provider_name: None,
             serving_model: None,
+            channel_thread_ts: None,
         };
 
         let error = call_provider(
@@ -2263,6 +2268,7 @@ mod streaming_fallback_tests {
                 parent_agent_alias: None,
                 serving_provider_name: None,
                 serving_model: None,
+                channel_thread_ts: None,
             };
 
             let outcome = call_provider(
@@ -2483,6 +2489,7 @@ mod streaming_fallback_tests {
             parent_agent_alias: None,
             serving_provider_name: None,
             serving_model: None,
+            channel_thread_ts: None,
         };
 
         let (outcome, notice) = zeroclaw_providers::scope_safeguard_fallback(async {
@@ -2596,6 +2603,7 @@ mod streaming_fallback_tests {
             parent_agent_alias: None,
             serving_provider_name: None,
             serving_model: None,
+            channel_thread_ts: None,
         };
 
         let error = call_provider(
@@ -2675,6 +2683,7 @@ mod streaming_fallback_tests {
             parent_agent_alias: None,
             serving_provider_name: None,
             serving_model: None,
+            channel_thread_ts: None,
         };
 
         let outcome = call_provider(
@@ -2755,6 +2764,7 @@ mod streaming_fallback_tests {
             parent_agent_alias: None,
             serving_provider_name: None,
             serving_model: None,
+            channel_thread_ts: None,
         };
 
         let outcome = call_provider(
@@ -3546,6 +3556,7 @@ mod streaming_fallback_tests {
             parent_agent_alias: None,
             serving_provider_name: None,
             serving_model: None,
+            channel_thread_ts: None,
         };
 
         let outcome = TOOL_LOOP_TURN_USAGE
@@ -3660,6 +3671,7 @@ mod streaming_fallback_tests {
             parent_agent_alias: None,
             serving_provider_name: None,
             serving_model: None,
+            channel_thread_ts: None,
         };
 
         let outcome = TOOL_LOOP_TURN_USAGE
@@ -3927,6 +3939,7 @@ mod streaming_fallback_tests {
             parent_agent_alias: None,
             serving_provider_name: None,
             serving_model: None,
+            channel_thread_ts: None,
         };
 
         let outcome = TOOL_LOOP_TURN_USAGE
@@ -4012,6 +4025,7 @@ mod streaming_fallback_tests {
             parent_agent_alias: None,
             serving_provider_name: None,
             serving_model: None,
+            channel_thread_ts: None,
         };
 
         let outcome = TOOL_LOOP_TURN_USAGE
