@@ -9356,7 +9356,10 @@ pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Search provider: "duckduckgo" (free), "brave" (requires API key), "tavily" (requires API key), "searxng" (self-hosted), "jina" (requires API key), "bocha" (requires API key), "anysearch" (optional API key; anonymous requests use a lower quota), "serply" (Google web results, requires API key), or "keenable" (works without a key; a key only lifts rate limits, <https://keenable.ai>)
+    /// Search provider. Defaults to "parallel" (keyless, rate-limited Unified MCP).
+    /// "duckduckgo" is free and "searxng" is self-hosted. "anysearch" and
+    /// "keenable" (<https://keenable.ai>) accept optional keys for higher limits.
+    /// "brave", "tavily", "jina", "bocha", and "serply" (Google web results) require API keys.
     #[serde(default = "default_web_search_provider")]
     pub search_provider: String,
     /// Brave Search API key (required if search_provider is "brave")
@@ -9412,8 +9415,10 @@ pub struct WebSearchConfig {
     pub timeout_secs: u64,
 }
 
+pub const DEFAULT_WEB_SEARCH_PROVIDER: &str = "parallel";
+
 fn default_web_search_provider() -> String {
-    "duckduckgo".into()
+    DEFAULT_WEB_SEARCH_PROVIDER.into()
 }
 
 fn default_web_search_max_results() -> usize {
@@ -55048,10 +55053,13 @@ model_provider = \"ollama.default\"
     }
 
     #[test]
-    async fn empty_table_round_trips_to_web_search_config_default() {
-        let from_empty: WebSearchConfig = toml::from_str("").unwrap();
-        let default = WebSearchConfig::default();
-        assert_eq!(from_empty.enabled, default.enabled);
+    async fn web_search_defaults_to_parallel_when_the_provider_is_omitted() {
+        assert_eq!(Config::default().web_search.search_provider, "parallel");
+        for input in ["", "[web_search]", "[web_search]\nmax_results = 2"] {
+            let cfg: Config = toml::from_str(input).unwrap();
+            assert!(cfg.web_search.enabled);
+            assert_eq!(cfg.web_search.search_provider, "parallel");
+        }
     }
 
     #[test]

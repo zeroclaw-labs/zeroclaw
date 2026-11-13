@@ -1,3 +1,5 @@
+mod parallel;
+
 use super::web_search_provider_routing::{
     SearchStatus, WebSearchProviderRoute, resolve_web_search_provider,
 };
@@ -190,12 +192,6 @@ impl SerplyConfigParseFailure {
 }
 
 /// Web search tool for searching the internet.
-/// Supports multiple model_providers: DuckDuckGo (free), Brave (requires API key),
-/// Tavily (requires API key), SearXNG (self-hosted, requires instance URL),
-/// Jina AI (requires API key), Bocha AI (requires API key, Chinese-friendly),
-/// AnySearch (optional API key; anonymous access has a lower quota),
-/// Serply (Google web results, requires API key), and Keenable (keyless public
-/// endpoint; an optional API key lifts rate limits).
 ///
 /// API keys are resolved lazily at execution time: if the boot-time key
 /// is missing or still encrypted, the tool re-reads `config.toml`, decrypts the
@@ -1978,7 +1974,7 @@ fn cap_provider_error(message: &str) -> String {
 }
 
 /// Header line for a rendered result list. Shared so the echoed query is
-/// bounded — and the wording stays identical — across all nine providers.
+/// bounded — and the wording stays identical — across all ten providers.
 fn results_header(query: &str, provider: &str) -> String {
     format!(
         "Search results for: {} (via {provider})",
@@ -1988,7 +1984,7 @@ fn results_header(query: &str, provider: &str) -> String {
 
 /// The reply every provider returns when a search matched nothing.
 ///
-/// One shared function rather than nine copies: this path returns before
+/// One shared function rather than ten copies: this path returns before
 /// [`render_results`], so it is the only place the echoed query is bounded at
 /// all, and a per-provider copy would be a per-provider chance to forget.
 fn no_results_message(query: &str) -> String {
@@ -1999,7 +1995,7 @@ fn no_results_message(query: &str) -> String {
 /// [`MAX_TOTAL_OUTPUT_CHARS`].
 ///
 /// Trimming happens at whole-result granularity so the model never receives a
-/// result cut off mid-field. Shared by all nine provider parsers — the cap must
+/// result cut off mid-field. Shared by all ten provider parsers — the cap must
 /// not depend on which provider answered.
 fn render_results(header: String, blocks: Vec<Vec<String>>) -> String {
     let mut out = header;
@@ -2038,11 +2034,6 @@ fn render_results(header: String, blocks: Vec<Vec<String>>) -> String {
 }
 
 // ── DuckDuckGo scrape hygiene ────────────────────────────────────────────────
-//
-// The default provider scrapes `html.duckduckgo.com`, and DuckDuckGo blocks
-// machines that look automated — which is why this module ships block
-// detection at all. Two cheap signals are worth removing: a single fixed
-// User-Agent, and a burst of back-to-back requests with no human-scale gap.
 
 /// Realistic desktop browser User-Agents, rotated per request. A single fixed
 /// UA is a trivially stable fingerprint across every ZeroClaw install.
@@ -2410,6 +2401,7 @@ impl Tool for WebSearchTool {
             WebSearchProviderRoute::Bocha => self.search_bocha(query).await?,
             WebSearchProviderRoute::AnySearch => self.search_anysearch(query).await?,
             WebSearchProviderRoute::Serply => self.search_serply(query).await?,
+            WebSearchProviderRoute::Parallel => self.search_parallel(parallel::URL, query).await?,
             WebSearchProviderRoute::Keenable => self.search_keenable(query).await?,
         };
 

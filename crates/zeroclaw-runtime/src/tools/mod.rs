@@ -2946,14 +2946,8 @@ fn all_tools_with_runtime_on_thread(
         }
     }
 
-    // Web search requires explicit selection and provider configuration
     #[cfg(feature = "tools-external")]
     if root_config.web_search.enabled && select_tool!("web_search_tool") {
-        // Rate-limited like every other outbound-network tool (see web_fetch
-        // and http_request above): without the wrapper an agent loop could
-        // issue unbounded searches against the configured provider — and
-        // against the default DuckDuckGo scrape path, which gets the machine
-        // blocked.
         register_tool!(
             "web_search_tool",
             Arc::new(RateLimitedTool::new(
@@ -5931,18 +5925,18 @@ permissions = ["http_client"]
         );
     }
 
-    /// `web_search_tool` must be registered behind `RateLimitedTool` like
-    /// every other outbound-network tool. It was the lone exception, which let
-    /// an agent loop issue unbounded searches — and unbounded scrapes against
-    /// the default DuckDuckGo path.
-    ///
-    /// The probe uses an exhausted action budget plus the SearXNG provider
-    /// with no instance URL configured, so the two outcomes are distinguishable
-    /// without any network call:
-    ///   * wrapped   → `Ok(success: false)` carrying the rate-limit error,
-    ///                 because the wrapper short-circuits before the inner tool
-    ///   * unwrapped → `Err("SearXNG instance URL not configured…")` from the
-    ///                 inner tool's own config resolution
+    #[test]
+    #[cfg(feature = "tools-external")]
+    fn web_search_tool_is_absent_when_selected_but_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = test_config(&tmp);
+        cfg.tools.optional = vec!["web_search_tool".into()];
+        cfg.web_search.enabled = false;
+
+        let names = registry_names(&tmp, &cfg, false);
+        assert!(!names.iter().any(|name| name == "web_search_tool"));
+    }
+
     #[tokio::test]
     #[cfg(feature = "tools-external")]
     async fn web_search_tool_is_registered_behind_the_rate_limiter() {
@@ -5968,6 +5962,7 @@ permissions = ["http_client"]
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
 
         let mut cfg = test_config(&tmp);
+        cfg.tools.optional = vec!["web_search_tool".into()];
         cfg.web_search.enabled = true;
         // Resolves locally and fails without touching the network.
         cfg.web_search.search_provider = "searxng".to_string();
@@ -7915,7 +7910,7 @@ permissions = ["http_client"]
         assert!(!names.contains(&"read_skill"));
     }
 
-    fn registry_names(tmp: &TempDir, is_subagent_caller: bool) -> Vec<String> {
+    fn registry_names(tmp: &TempDir, cfg: &Config, is_subagent_caller: bool) -> Vec<String> {
         let security = Arc::new(SecurityPolicy::default());
         let mem_cfg = MemoryConfig {
             backend: "markdown".into(),
@@ -7923,8 +7918,6 @@ permissions = ["http_client"]
         };
         let mem: Arc<dyn Memory> =
             Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
-        let cfg = test_config(tmp);
-
         all_tools(
             Arc::new(cfg.clone()),
             &security,
@@ -7939,7 +7932,7 @@ permissions = ["http_client"]
             tmp.path(),
             &HashMap::new(),
             None,
-            &cfg,
+            cfg,
             None,
             is_subagent_caller,
             None,
@@ -7954,12 +7947,13 @@ permissions = ["http_client"]
     #[test]
     fn model_switch_present_for_top_level_absent_for_subagent() {
         let tmp = TempDir::new().unwrap();
-        let top = registry_names(&tmp, false);
+        let cfg = test_config(&tmp);
+        let top = registry_names(&tmp, &cfg, false);
         assert!(
             top.iter().any(|n| n == ModelSwitchTool::NAME),
             "top-level agent must keep model_switch"
         );
-        let subagent = registry_names(&tmp, true);
+        let subagent = registry_names(&tmp, &cfg, true);
         assert!(
             !subagent.iter().any(|n| n == ModelSwitchTool::NAME),
             "subagent must not be able to switch the inherited model"

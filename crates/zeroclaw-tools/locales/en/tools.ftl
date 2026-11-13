@@ -251,6 +251,8 @@ tool-web-search-tool-error-anysearch-config-parse = Failed to parse config file 
 tool-web-search-tool-error-anysearch-config-parse-line = , line { $line }
 tool-web-search-tool-error-anysearch-config-read = Failed to read config file { $path } for AnySearch API key: { $error }
 tool-web-search-tool-error-anysearch-response-too-large = AnySearch response exceeds the { $limit } byte size limit
+tool-web-search-tool-error-parallel-invalid-response = Parallel returned invalid web search results.
+tool-web-search-tool-error-parallel-timeout = Parallel web search timed out (search_status=unavailable, transport=timeout).
 tool-web-search-tool-error-anysearch-invalid-response = Invalid AnySearch API response
 tool-web-search-tool-error-anysearch-api = AnySearch returned error (code { $code }): { $message }
 tool-web-search-tool-anysearch-no-title = No title

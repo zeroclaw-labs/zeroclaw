@@ -1530,6 +1530,13 @@ pub fn generate(target_version: u32, opts: &GenerateOptions<'_>) -> Result<Strin
     };
 
     let mut value = value;
+    if target_version >= 4 {
+        let provider = value
+            .get_mut("web_search")
+            .and_then(|search| search.get_mut("search_provider"))
+            .context("generated config lacks web_search.search_provider")?;
+        *provider = crate::schema::DEFAULT_WEB_SEARCH_PROVIDER.into();
+    }
     // Generation creates a new installation, even when the requested schema
     // is historical. Write its full default selection so the document states
     // it and `config migrate` has nothing to normalize.
