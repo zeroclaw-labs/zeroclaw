@@ -50087,7 +50087,6 @@ This is an example JSON object for profile settings."#;
     async fn configured_discord_transcription_dispatches_to_routed_agent_provider() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
-        use zeroclaw_config::schema::LocalWhisperTranscriptionProviderConfig;
 
         let media_server = MockServer::start().await;
         let whisper_server = MockServer::start().await;
@@ -50117,7 +50116,33 @@ This is an example JSON object for profile settings."#;
             .mount(&decoy_server)
             .await;
 
-        let mut config = Config::default();
+        let mut config = Config {
+            providers: toml::from_str(&format!(
+                r#"
+[connections."asr.routed"]
+kind = "local_whisper"
+uri = "{}/v1/transcribe"
+
+[connections."asr.decoy"]
+kind = "local_whisper"
+uri = "{}/v1/transcribe"
+
+[models."asr.routed"]
+capability = "asr"
+provider = "asr.routed"
+model = "routed"
+
+[models."asr.decoy"]
+capability = "asr"
+provider = "asr.decoy"
+model = "decoy"
+"#,
+                whisper_server.uri(),
+                decoy_server.uri()
+            ))
+            .expect("canonical ASR fixture parses"),
+            ..Default::default()
+        };
         config.transcription.enabled = true;
         config.channels.discord.insert(
             "community".to_string(),
@@ -50132,21 +50157,7 @@ This is an example JSON object for profile settings."#;
             zeroclaw_config::schema::AliasedAgentConfig {
                 enabled: true,
                 channels: vec!["discord.community".into()],
-                transcription_provider: "local_whisper.routed".into(),
-                ..Default::default()
-            },
-        );
-        config.providers.transcription.local_whisper.insert(
-            "routed".to_string(),
-            LocalWhisperTranscriptionProviderConfig {
-                uri: format!("{}/v1/transcribe", whisper_server.uri()),
-                ..Default::default()
-            },
-        );
-        config.providers.transcription.local_whisper.insert(
-            "decoy".to_string(),
-            LocalWhisperTranscriptionProviderConfig {
-                uri: format!("{}/v1/transcribe", decoy_server.uri()),
+                transcription_provider: "asr.routed".into(),
                 ..Default::default()
             },
         );
