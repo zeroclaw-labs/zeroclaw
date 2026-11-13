@@ -1089,6 +1089,11 @@ pub struct TtsManager {
     max_text_length: usize,
 }
 
+#[cfg(feature = "channel-telegram")]
+pub(crate) mod speech;
+#[cfg(feature = "channel-telegram")]
+pub(crate) use speech::SpeechJob;
+
 impl TtsManager {
     pub fn from_config(config: &Config) -> Result<Self> {
         Self::from_config_for_agent(config, None)
@@ -1270,6 +1275,14 @@ impl TtsManager {
             return None;
         }
         self.tts_providers.get(alias).map(|p| p.output_format())
+    }
+
+    /// Encode ordered provider-format audio blobs into a single OGG/Opus
+    /// container suitable for a Telegram voice note.
+    #[cfg(feature = "channel-telegram")]
+    pub(crate) async fn concat_parts_to_opus(&self, parts: &[Vec<u8>]) -> Result<Vec<u8>> {
+        let format = self.agent_output_format().unwrap_or("wav").to_string();
+        speech::concat_parts_to_opus(parts, &format).await
     }
 }
 

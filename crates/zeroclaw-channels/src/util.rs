@@ -1,3 +1,34 @@
+/// Preview cleanup is optional and bounded. It must not turn a dropped final
+/// into an error that the orchestrator could retry through another modality.
+pub(crate) async fn cancel_draft_best_effort(
+    channel: &dyn zeroclaw_api::channel::Channel,
+    recipient: &str,
+    message_id: &str,
+) {
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        channel.cancel_draft(recipient, message_id),
+    )
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            ::zeroclaw_log::record!(WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&error.to_string())})),
+                "Draft preview cleanup failed"
+            );
+        }
+        Err(_) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "Draft preview cleanup timed out"
+            );
+        }
+    }
+}
+
 #[cfg(any(
     test,
     feature = "channel-discord",
