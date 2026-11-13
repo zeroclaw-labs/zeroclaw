@@ -272,6 +272,7 @@ mod tests {
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: 120,
+                cost_override_operators: Vec::new(),
                 excluded_tools: vec![],
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,

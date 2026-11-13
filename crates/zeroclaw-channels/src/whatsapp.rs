@@ -9,7 +9,7 @@ use zeroclaw_api::channel::{
 };
 
 struct PendingApproval {
-    sender: oneshot::Sender<ChannelApprovalResponse>,
+    sender: oneshot::Sender<zeroclaw_api::channel::AttributedApprovalResponse>,
     alias: String,
     destination: String,
 }
@@ -28,7 +28,7 @@ pub async fn register_pending_approval_for_test(
     token: &str,
     alias: &str,
     destination: &str,
-) -> oneshot::Receiver<ChannelApprovalResponse> {
+) -> oneshot::Receiver<zeroclaw_api::channel::AttributedApprovalResponse> {
     use std::collections::hash_map::Entry;
 
     let (sender, receiver) = oneshot::channel();
@@ -177,7 +177,7 @@ where
             // Nothing awaits between here and the disarm, so there is no
             // cancellation window to cover.
             guard.disarm();
-            zeroclaw_api::channel::AttributedApprovalResponse::operator(response)
+            response
         }
         Ok(Err(_)) => {
             remove_pending_and_disarm(&token, &mut guard).await;
@@ -330,7 +330,10 @@ impl WhatsAppChannel {
             return false;
         };
         drop(approvals);
-        let _ = pending.sender.send(response);
+        let _ = pending.sender.send(
+            zeroclaw_api::channel::AttributedApprovalResponse::operator(response)
+                .with_user(Some(responder)),
+        );
         true
     }
 
@@ -3100,7 +3103,9 @@ mod tests {
     const TEST_APPROVAL_ALIAS: &str = "whatsapp_test_alias";
     const TEST_APPROVAL_DESTINATION: &str = "+1234567890";
 
-    fn test_pending_approval(sender: oneshot::Sender<ChannelApprovalResponse>) -> PendingApproval {
+    fn test_pending_approval(
+        sender: oneshot::Sender<zeroclaw_api::channel::AttributedApprovalResponse>,
+    ) -> PendingApproval {
         PendingApproval {
             sender,
             alias: TEST_APPROVAL_ALIAS.to_string(),
@@ -3133,7 +3138,7 @@ mod tests {
         token: &str,
     ) -> (
         PendingApprovalGuard,
-        oneshot::Receiver<ChannelApprovalResponse>,
+        oneshot::Receiver<zeroclaw_api::channel::AttributedApprovalResponse>,
     ) {
         let (tx, rx) = oneshot::channel();
         PENDING_APPROVALS
@@ -3299,7 +3304,11 @@ mod tests {
             .await
             .remove(token)
             .expect("the lifecycle must register before a reply can resolve it");
-        let _ = pending.sender.send(ChannelApprovalResponse::Approve);
+        let _ = pending
+            .sender
+            .send(zeroclaw_api::channel::AttributedApprovalResponse::operator(
+                ChannelApprovalResponse::Approve,
+            ));
 
         let attributed = task
             .await
@@ -3348,7 +3357,11 @@ mod tests {
         // The reply handler takes the sender out and resolves the request. The
         // success arm touches no lock, so the lifecycle still completes here.
         let pending = map.remove(token).expect("registered");
-        let _ = pending.sender.send(ChannelApprovalResponse::Approve);
+        let _ = pending
+            .sender
+            .send(zeroclaw_api::channel::AttributedApprovalResponse::operator(
+                ChannelApprovalResponse::Approve,
+            ));
         let _ = task.await.expect("task").expect("lifecycle");
 
         // A later request reuses the same six-character token.
@@ -3437,7 +3450,7 @@ mod tests {
             Arc::new(|| vec!["+1234567890".into()]),
         );
 
-        let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
+        let (tx, _rx) = oneshot::channel::<zeroclaw_api::channel::AttributedApprovalResponse>();
         {
             let mut map = PENDING_APPROVALS.lock().await;
             map.insert("test_share_tok".to_string(), test_pending_approval(tx));

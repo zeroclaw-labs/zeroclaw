@@ -4067,10 +4067,11 @@ impl SlackChannel {
         if let Some((token, response, responder, channel)) =
             Self::try_parse_approval_block_action(envelope)
         {
-            crate::util::resolve_pending_approval(
+            crate::util::resolve_pending_approval_attributed_with_tool(
                 &self.pending_approvals,
                 &token,
-                response,
+                zeroclaw_api::channel::AttributedApprovalResponse::operator(response)
+                    .with_user(Some(responder.to_string())),
                 self.is_user_allowed(&responder),
                 &channel,
             )
@@ -4587,14 +4588,16 @@ impl SlackChannel {
                 if !sender_is_bot
                     && let Some((token, response)) =
                         crate::util::parse_approval_reply(&normalized_text)
-                    && crate::util::resolve_pending_approval(
+                    && crate::util::resolve_pending_approval_attributed_with_tool(
                         &self.pending_approvals,
                         &token,
-                        response,
+                        zeroclaw_api::channel::AttributedApprovalResponse::operator(response)
+                            .with_user(Some(user.to_string())),
                         self.is_user_allowed(user),
                         &channel_id,
                     )
                     .await
+                    .0
                     .suppresses_message()
                 {
                     continue;
@@ -5181,6 +5184,13 @@ fn build_socket_mode_approval_body(
     let btn_always = i18n::get_required_cli_string("channel-approval-btn-always");
     // Two pending cards from one turn are otherwise identical until tapped.
     let position_line = crate::util::approval_position_line(position);
+    let mut buttons = vec![
+        serde_json::json!({ "type": "button", "text": { "type": "plain_text", "text": btn_approve }, "action_id": format!("approval_{token}_approve"), "style": "primary" }),
+        serde_json::json!({ "type": "button", "text": { "type": "plain_text", "text": btn_deny }, "action_id": format!("approval_{token}_deny"), "style": "danger" }),
+    ];
+    if tool_name != zeroclaw_api::channel::COST_LIMIT_OVERRIDE_APPROVAL {
+        buttons.push(serde_json::json!({ "type": "button", "text": { "type": "plain_text", "text": btn_always }, "action_id": format!("approval_{token}_always") }));
+    }
     serde_json::json!({
         "channel": recipient,
         "text": format!("{heading} [{token}]\n{position_line}{tool_label}: {tool_name}\n{args_label}: {arguments_summary}"),
@@ -5192,11 +5202,7 @@ fn build_socket_mode_approval_body(
             }
         }, {
             "type": "actions",
-            "elements": [
-                { "type": "button", "text": { "type": "plain_text", "text": btn_approve }, "action_id": format!("approval_{token}_approve"), "style": "primary" },
-                { "type": "button", "text": { "type": "plain_text", "text": btn_deny }, "action_id": format!("approval_{token}_deny"), "style": "danger" },
-                { "type": "button", "text": { "type": "plain_text", "text": btn_always }, "action_id": format!("approval_{token}_always") },
-            ]
+            "elements": buttons
         }]
     })
 }
@@ -6034,14 +6040,18 @@ impl Channel for SlackChannel {
                         if !sender_is_bot
                             && let Some((token, response)) =
                                 crate::util::parse_approval_reply(&normalized_text)
-                            && crate::util::resolve_pending_approval(
+                            && crate::util::resolve_pending_approval_attributed_with_tool(
                                 &self.pending_approvals,
                                 &token,
-                                response,
+                                zeroclaw_api::channel::AttributedApprovalResponse::operator(
+                                    response,
+                                )
+                                .with_user(Some(user.to_string())),
                                 self.is_user_allowed(user),
                                 &channel_id,
                             )
                             .await
+                            .0
                             .suppresses_message()
                         {
                             continue;
@@ -6153,14 +6163,16 @@ impl Channel for SlackChannel {
                     if !sender_is_bot
                         && let Some((token, response)) =
                             crate::util::parse_approval_reply(&normalized_text)
-                        && crate::util::resolve_pending_approval(
+                        && crate::util::resolve_pending_approval_attributed_with_tool(
                             &self.pending_approvals,
                             &token,
-                            response,
+                            zeroclaw_api::channel::AttributedApprovalResponse::operator(response)
+                                .with_user(Some(user.to_string())),
                             self.is_user_allowed(user),
                             &thread_channel_id,
                         )
                         .await
+                        .0
                         .suppresses_message()
                     {
                         continue;
@@ -6301,7 +6313,7 @@ impl Channel for SlackChannel {
             match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
                 Ok(Ok(resp)) => {
                     guard.disarm();
-                    zeroclaw_api::channel::AttributedApprovalResponse::operator(resp)
+                    resp
                 }
                 Ok(Err(_)) => {
                     guard.remove().await;
@@ -6325,6 +6337,21 @@ impl Channel for SlackChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cost_override_socket_card_has_no_always_button() {
+        let body = super::build_socket_mode_approval_body(
+            "chat",
+            "ab12cd",
+            zeroclaw_api::channel::COST_LIMIT_OVERRIDE_APPROVAL,
+            "limit reached",
+            None,
+        );
+        let buttons = body["blocks"][1]["elements"].as_array().unwrap();
+        assert_eq!(buttons.len(), 2);
+        assert_eq!(buttons[0]["action_id"], "approval_ab12cd_approve");
+        assert_eq!(buttons[1]["action_id"], "approval_ab12cd_deny");
+    }
 
     #[test]
     fn split_text_into_chunks_safe_on_multibyte_utf8() {
@@ -9545,7 +9572,10 @@ mod tests {
             .await,
             crate::util::PendingApprovalResolution::Resolved,
         );
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::AlwaysApprove);
+        assert_eq!(
+            rx.await.unwrap().response,
+            ChannelApprovalResponse::AlwaysApprove
+        );
 
         let (approve_tx, approve_rx) = oneshot::channel();
         ch.pending_approvals.lock().await.insert(
@@ -9567,7 +9597,10 @@ mod tests {
             .await,
             crate::util::PendingApprovalResolution::Resolved,
         );
-        assert_eq!(approve_rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(
+            approve_rx.await.unwrap().response,
+            ChannelApprovalResponse::Approve
+        );
     }
 
     #[tokio::test]
@@ -9644,7 +9677,8 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(6), approved_rx)
                 .await
                 .expect("polling ingress should resolve the authorized approval")
-                .expect("approval manager sender should stay open"),
+                .expect("approval manager sender should stay open")
+                .response,
             ChannelApprovalResponse::Approve
         );
         assert!(
@@ -10093,7 +10127,10 @@ mod tests {
             );
         }
 
-        assert_eq!(approved_rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(
+            approved_rx.await.unwrap().response,
+            ChannelApprovalResponse::Approve
+        );
         assert!(
             tokio::time::timeout(Duration::from_millis(50), inbound_rx.recv())
                 .await
