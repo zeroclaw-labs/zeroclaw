@@ -697,6 +697,10 @@ struct LagReattach {
     /// `zc-queue-dispatch-failed` notice after the reload that consumes this
     /// carrier clears the info bar. `None` when the response was `Ok`.
     prompt_error: Option<String>,
+    /// The turn took an accepted steer and its terminal frame said it ended
+    /// early, so the `zc-steer-ended-early` warning that frame set must be
+    /// re-applied after the terminal reload clears the info bar.
+    steer_ended_early: bool,
 }
 
 /// Which resync notice a reloaded transcript opens with. Decided in
@@ -891,6 +895,48 @@ fn token_source_fluent_key(source: &str) -> String {
 
 fn should_retry_on_entry(phase: &ChatPhase) -> bool {
     matches!(phase, ChatPhase::Error(_) | ChatPhase::PickAgent { .. })
+}
+
+/// What a `session/steer` call tells the client about delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SteerOutcome {
+    /// The daemon took the message into the running turn.
+    Accepted,
+    /// The daemon answered and did not take it (refusal or an error reply,
+    /// including an older daemon without the method). Safe to queue.
+    Refused,
+    /// No daemon answer: a timeout, or the connection dropped while the
+    /// request was out. The daemon may still have taken it.
+    Unknown,
+}
+
+impl SteerOutcome {
+    /// `transport_down` is whether the connection was lost by the time the
+    /// reply resolved. Only an error reply the daemon itself sent counts as a
+    /// refusal; client-side failures (closed transport, dropped request,
+    /// undecodable reply) leave delivery unknown so the text is never queued
+    /// for a second run.
+    fn from_reply(
+        reply: anyhow::Result<crate::client::SessionSteerResult>,
+        transport_down: bool,
+    ) -> Self {
+        match reply {
+            Ok(result) if result.accepted => Self::Accepted,
+            Ok(_) => Self::Refused,
+            Err(_) if transport_down => Self::Unknown,
+            Err(error) => match error.downcast_ref::<crate::jsonrpc::JsonRpcError>() {
+                // The client synthesizes INTERNAL_ERROR for a closed or
+                // dropped transport; the daemon's steer refusals use
+                // specific codes.
+                Some(rpc_error)
+                    if rpc_error.code != crate::jsonrpc::error_codes::INTERNAL_ERROR =>
+                {
+                    Self::Refused
+                }
+                _ => Self::Unknown,
+            },
+        }
+    }
 }
 
 impl Chat {
@@ -2944,6 +2990,7 @@ impl Chat {
                     generation,
                     carried: None,
                     prompt_error,
+                    steer_ended_early: false,
                 });
             }
             settled = true;
@@ -3206,6 +3253,8 @@ impl Chat {
                         } else {
                             None
                         };
+                        let steer_ended_early =
+                            terminal_followup && lag.as_ref().is_some_and(|l| l.steer_ended_early);
                         let prompt_error = lag.and_then(|l| l.prompt_error);
                         let notice = if terminal_followup {
                             ResyncNotice::TurnFinished
@@ -3222,6 +3271,7 @@ impl Chat {
                             notice,
                             carried,
                             prompt_error,
+                            steer_ended_early,
                         );
                         state.message_count = snapshot.message_count;
                         if let Some(plan) = snapshot.plan {
@@ -4521,6 +4571,47 @@ impl Chat {
                     state.clear_info_notice();
                     state.resume_queue();
                     let prompt = text.unwrap_or_default();
+                    // While a turn runs, a text-only message with nothing
+                    // queued ahead of it goes into that turn instead of
+                    // waiting for it to end. Anything the daemon does not
+                    // take (turn just ended, steering full, older daemon)
+                    // falls back to the queue unchanged.
+                    if state.can_steer_running_turn(&prompt, &attachments) {
+                        let session_id = state.session_id.clone();
+                        let reply = self.rpc.session_steer(&session_id, &prompt).await;
+                        let transport_down = matches!(
+                            self.rpc.connection_state(),
+                            crate::client::ConnectionState::Disconnected { .. }
+                        );
+                        let outcome = SteerOutcome::from_reply(reply, transport_down);
+                        let steered = outcome == SteerOutcome::Accepted;
+                        if let ChatPhase::Active(ref mut state) = self.phase
+                            && state.session_id == session_id
+                        {
+                            if steered {
+                                state.push_steered_user_message(prompt);
+                                return false;
+                            }
+                            if outcome == SteerOutcome::Unknown {
+                                // The daemon may have taken it; queueing would
+                                // risk sending it twice. Hand it back instead.
+                                state.input_bar.insert_text(&prompt);
+                                state.set_info_notice(crate::i18n::t("zc-steer-unconfirmed"));
+                                return false;
+                            }
+                            let enq = state.enqueue_message(prompt, attachments);
+                            self.after_enqueue(enq);
+                            return false;
+                        }
+                        // Unreachable while the blocking await holds `&mut self`.
+                        // The async key-action follow-up must restore or flag
+                        // non-accepted text here without sending it to a different
+                        // session's queue.
+                        if !steered {
+                            let _ = cleanup_attachment_temps(&attachments);
+                        }
+                        return false;
+                    }
                     let enq = state.enqueue_message(prompt, attachments);
                     self.after_enqueue(enq);
                     return false;
@@ -10108,6 +10199,9 @@ pub struct ChatState {
     /// Used by `commit_turn` to decide whether `full_text` is a fallback
     /// (no streaming happened) or a duplicate (streaming already committed).
     turn_had_streaming_text: bool,
+    /// The daemon accepted steering for this turn, but has not confirmed
+    /// consumption. Owned here so an early terminal outcome can warn the user.
+    turn_took_accepted_steer: bool,
     /// Agent-message entry committed by prompt-response fallback while its
     /// terminal notification may still be in flight. Continuation chunks for
     /// the same local generation extend this entry instead of creating a
@@ -10270,6 +10364,7 @@ impl ChatState {
             turn_generation: 0,
             optimistic_user_message: None,
             turn_had_streaming_text: false,
+            turn_took_accepted_steer: false,
             prompt_settled_stream_entry: None,
             turn_had_tool_calls: false,
             turn_status: TurnStatus::Idle,
@@ -12139,6 +12234,7 @@ impl ChatState {
                         self.commit_turn(content, true);
                     }
                     TurnEndOutcome::Cancelled | TurnEndOutcome::Failed => {
+                        let took_accepted_steer = self.turn_took_accepted_steer;
                         if outcome == TurnEndOutcome::Failed {
                             self.last_error = Some(classify_turn_failure(&content));
                         }
@@ -12146,6 +12242,9 @@ impl ChatState {
                             .push(ChatEntry::SystemMessage(Arc::<str>::from(content.as_str())));
                         self.mark_dirty_append();
                         self.commit_turn(String::new(), false);
+                        if took_accepted_steer {
+                            self.set_info_notice(crate::i18n::t("zc-steer-ended-early"));
+                        }
                     }
                 }
             }
@@ -12186,6 +12285,7 @@ impl ChatState {
             self.mark_dirty_append();
         }
         self.turn_had_streaming_text = false;
+        self.turn_took_accepted_steer = false;
         self.turn_had_tool_calls = false;
         // A terminal notification resolves the earlier uncertainty, but the
         // queued backlog still waits for the user's deliberate resume.
@@ -12211,7 +12311,7 @@ impl ChatState {
             self.freeze_prompt_settled_stream();
         }
         // Preserve per-turn provenance for a delayed terminal notification;
-        // the next turn resets both flags when its user message is committed.
+        // the next turn resets it when its user message is committed.
         self.mark_dirty_append();
         self.settle_turn_lifecycle(false, pause_reason);
     }
@@ -12302,6 +12402,7 @@ impl ChatState {
         self.optimistic_user_message =
             Some((self.turn_generation, entry_index, prior_message_count));
         self.turn_had_streaming_text = false;
+        self.turn_took_accepted_steer = false;
         self.turn_had_tool_calls = false;
         // Start a fresh status + animation anchor. We're `Working` until the
         // first chunk (thought / message / tool-call) tells us otherwise.
@@ -12399,6 +12500,45 @@ impl ChatState {
 
     fn next_dispatch_index(&self) -> Option<usize> {
         self.message_queue.next_dispatch_index(self.turn_in_flight)
+    }
+
+    /// Whether a message submitted now can be steered into the running turn
+    /// (`session/steer`) instead of queued behind it. Text only (the method
+    /// carries no attachments), and only with an empty queue: steering past
+    /// earlier queued messages would reorder what the user sent.
+    pub(crate) fn can_steer_running_turn(
+        &self,
+        text: &str,
+        attachments: &[PendingAttachment],
+    ) -> bool {
+        self.turn_in_flight
+            && !matches!(self.turn_status, TurnStatus::Cancelling)
+            && self.pending_approval().is_none()
+            && attachments.is_empty()
+            && !text.trim().is_empty()
+            && self.message_queue.is_empty()
+    }
+
+    /// Record a message the daemon accepted into the running turn. Unlike
+    /// [`Self::push_user_message`] this starts no turn: the generation,
+    /// in-flight flag and error state belong to the turn being steered. Text
+    /// streamed so far is committed first so the message sits where it was
+    /// sent. Acceptance does not confirm that the daemon consumed the text.
+    pub(crate) fn push_steered_user_message(&mut self, text: String) {
+        self.turn_took_accepted_steer = true;
+        self.flush_streaming_thought();
+        if self.flush_streaming_text() {
+            self.turn_had_streaming_text = true;
+        }
+        if self.first_message.is_none() && !text.trim().is_empty() {
+            self.first_message = Some(text.clone());
+        }
+        self.entries.push(ChatEntry::UserMessage {
+            text: Some(Arc::<str>::from(text)),
+            attachments: vec![],
+        });
+        self.mark_dirty_append();
+        self.message_count = self.message_count.saturating_add(1);
     }
 
     pub fn take_next_dispatchable(&mut self) -> Option<QueuedMessage> {
@@ -12726,6 +12866,7 @@ impl ChatState {
         self.turn_in_flight = false;
         self.optimistic_user_message = None;
         self.turn_had_streaming_text = false;
+        self.turn_took_accepted_steer = false;
         self.turn_had_tool_calls = false;
         self.turn_status = TurnStatus::Idle;
         self.cancel_started_at = None;
@@ -12757,6 +12898,7 @@ impl ChatState {
             generation: self.turn_generation,
             carried: None,
             prompt_error: None,
+            steer_ended_early: false,
         });
         self.mark_dirty_append();
     }
@@ -12777,12 +12919,14 @@ impl ChatState {
             } => Some((*outcome, content.clone())),
             _ => None,
         };
+        let took_accepted_steer = self.turn_took_accepted_steer;
         self.apply_update(update);
         if let Some((outcome, content)) = terminal
             && outcome != crate::client::TurnEndOutcome::Completed
             && let Some(lag) = self.lag_reattach.as_mut()
         {
             lag.carried = Some((outcome, Arc::<str>::from(content.as_str())));
+            lag.steer_ended_early = took_accepted_steer;
         }
     }
 
@@ -12806,6 +12950,7 @@ impl ChatState {
         notice: ResyncNotice,
         carried: Option<(crate::client::TurnEndOutcome, Arc<str>)>,
         prompt_error: Option<String>,
+        steer_ended_early: bool,
     ) {
         self.entries.clear();
         self.first_message = None;
@@ -12846,6 +12991,12 @@ impl ChatState {
                 }
                 crate::client::TurnEndOutcome::Completed => {}
             }
+        }
+        // The steer warning the carried terminal frame raised: the info bar
+        // was cleared above, so raise it again. Set before the prompt error
+        // so the order matches the live path (frame first, then response).
+        if steer_ended_early {
+            self.set_info_notice(crate::i18n::t("zc-steer-ended-early"));
         }
         // The prompt-response error recorded on the carrier by
         // `drain_prompt_completions`: this reload's own notices cleared the
@@ -12982,6 +13133,7 @@ impl ChatState {
         self.turn_in_flight = false;
         self.message_count = 0;
         self.turn_generation = self.turn_generation.wrapping_add(1);
+        self.turn_took_accepted_steer = false;
         self.prompt_settled_stream_entry = None;
         self.turn_status = TurnStatus::Idle;
         self.cancel_started_at = None;
@@ -18228,6 +18380,260 @@ mod tests {
     }
 
     #[test]
+    fn steering_is_offered_only_for_a_plain_message_into_a_running_turn() {
+        let mut s = state();
+        assert!(
+            !s.can_steer_running_turn("hi", &[]),
+            "idle: an ordinary prompt, not a steer"
+        );
+        s.push_user_message(Some("first".into()), Vec::new());
+        assert!(s.can_steer_running_turn("follow-up", &[]));
+        assert!(!s.can_steer_running_turn("   ", &[]), "blank text");
+        let attachment = PendingAttachment {
+            path: std::path::PathBuf::from("/nonexistent/a.txt"),
+            mime_type: "text/plain".to_string(),
+            filename: "a.txt".to_string(),
+            size_bytes: 1,
+            source: crate::attachment::AttachmentSource::File,
+        };
+        assert!(
+            !s.can_steer_running_turn("with file", std::slice::from_ref(&attachment)),
+            "session/steer carries no attachments"
+        );
+        s.enqueue_message("queued earlier".into(), Vec::new())
+            .unwrap();
+        assert!(
+            !s.can_steer_running_turn("later", &[]),
+            "steering past a queued message would reorder what the user sent"
+        );
+        s.message_queue.clear();
+        s.enter_cancelling();
+        assert!(
+            !s.can_steer_running_turn("too late", &[]),
+            "a cancelling turn will not read it"
+        );
+    }
+
+    #[test]
+    fn a_steered_message_joins_the_running_turn_without_starting_one() {
+        let mut s = state();
+        s.push_user_message(Some("first".into()), Vec::new());
+        let generation = s.turn_generation;
+        s.apply_update(SessionUpdate::AgentMessageChunk {
+            session_id: "sess-1".to_string(),
+            text: "partial answer".to_string(),
+        });
+        let count_before = s.message_count;
+
+        s.push_steered_user_message("actually, also do X".into());
+
+        assert!(s.turn_in_flight, "the steered turn is still running");
+        assert_eq!(
+            s.turn_generation, generation,
+            "a steer must not start a new client turn generation"
+        );
+        assert_eq!(s.message_count, count_before + 1);
+        let tail: Vec<String> = s
+            .entries
+            .iter()
+            .rev()
+            .take(2)
+            .map(|entry| match entry {
+                ChatEntry::AgentMessage(text) => format!("agent:{text}"),
+                ChatEntry::UserMessage { text, .. } => {
+                    format!("user:{}", text.as_deref().unwrap_or(""))
+                }
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            tail,
+            vec![
+                "user:actually, also do X".to_string(),
+                "agent:partial answer".to_string(),
+            ],
+            "text streamed before the steer is committed above it"
+        );
+        assert!(s.streaming_text.is_empty());
+
+        // The turn's own completion still settles it.
+        s.apply_update(turn_complete("sess-1", TurnEndOutcome::Completed, "done"));
+        assert!(!s.turn_in_flight);
+    }
+
+    #[test]
+    fn an_accepted_steer_then_cancelled_turn_shows_delivery_notice() {
+        let mut s = state();
+        s.push_user_message(Some("first".into()), Vec::new());
+        s.push_steered_user_message("also X".into());
+
+        s.apply_update(turn_complete(
+            "sess-1",
+            TurnEndOutcome::Cancelled,
+            "[interrupted by user]",
+        ));
+
+        assert!(!s.turn_in_flight);
+        assert!(!s.turn_took_accepted_steer);
+        assert_eq!(
+            s.info_message.as_ref().map(|notice| notice.text.as_str()),
+            Some(crate::i18n::t("zc-steer-ended-early").as_str()),
+        );
+        assert_eq!(s.queue_len(), 0, "uncertain delivery must not resend");
+    }
+
+    #[test]
+    fn an_accepted_steer_then_failed_turn_shows_delivery_notice() {
+        let mut s = state();
+        s.push_user_message(Some("first".into()), Vec::new());
+        s.push_steered_user_message("also X".into());
+
+        s.apply_update(turn_complete(
+            "sess-1",
+            TurnEndOutcome::Failed,
+            "Provider request failed",
+        ));
+
+        assert!(!s.turn_in_flight);
+        assert!(!s.turn_took_accepted_steer);
+        assert!(s.last_error.is_some());
+        assert_eq!(
+            s.info_message.as_ref().map(|notice| notice.text.as_str()),
+            Some(crate::i18n::t("zc-steer-ended-early").as_str()),
+        );
+    }
+
+    #[test]
+    fn an_accepted_steer_then_completed_turn_has_no_delivery_notice() {
+        let mut s = state();
+        s.push_user_message(Some("first".into()), Vec::new());
+        s.push_steered_user_message("also X".into());
+
+        s.apply_update(turn_complete("sess-1", TurnEndOutcome::Completed, "done"));
+
+        assert!(!s.turn_in_flight);
+        assert!(!s.turn_took_accepted_steer);
+        assert!(s.info_message.is_none());
+    }
+
+    #[test]
+    fn a_turn_after_cancelled_steering_starts_without_delivery_uncertainty() {
+        let mut s = state();
+        s.push_user_message(Some("first".into()), Vec::new());
+        s.push_steered_user_message("also X".into());
+        s.apply_update(turn_complete(
+            "sess-1",
+            TurnEndOutcome::Cancelled,
+            "[interrupted by user]",
+        ));
+        assert!(s.info_message.is_some());
+
+        // Submit clears the previous notice before dispatching a fresh turn.
+        s.clear_info_notice();
+        s.push_user_message(Some("next".into()), Vec::new());
+        assert!(!s.turn_took_accepted_steer);
+        s.apply_update(turn_complete(
+            "sess-1",
+            TurnEndOutcome::Cancelled,
+            "[interrupted by user]",
+        ));
+        assert!(s.info_message.is_none(), "no steer belongs to this turn");
+    }
+
+    #[test]
+    fn a_steer_on_the_last_output_does_not_repeat_the_answer_at_completion() {
+        let mut s = state();
+        s.push_user_message(Some("first".into()), Vec::new());
+        s.apply_update(SessionUpdate::AgentMessageChunk {
+            session_id: "sess-1".to_string(),
+            text: "the answer".to_string(),
+        });
+        s.push_steered_user_message("also X".into());
+        // No further chunk: the turn ends with its final text.
+        s.apply_update(turn_complete(
+            "sess-1",
+            TurnEndOutcome::Completed,
+            "the answer",
+        ));
+        let answers = s
+            .entries
+            .iter()
+            .filter(
+                |entry| matches!(entry, ChatEntry::AgentMessage(text) if &**text == "the answer"),
+            )
+            .count();
+        assert_eq!(answers, 1, "streamed text must not be appended again");
+    }
+
+    #[test]
+    fn a_steer_timeout_is_not_treated_as_a_refusal() {
+        let timeout = anyhow::Error::new(crate::client::DaemonRpcTimeout {
+            method: "session/steer".to_string(),
+            timeout: std::time::Duration::from_secs(5),
+        });
+        assert_eq!(
+            SteerOutcome::from_reply(Err(timeout), false),
+            SteerOutcome::Unknown
+        );
+        let refusal = anyhow::Error::new(crate::jsonrpc::JsonRpcError {
+            code: crate::jsonrpc::error_codes::METHOD_NOT_FOUND,
+            message: "Unknown method".to_string(),
+            data: None,
+        });
+        assert_eq!(
+            SteerOutcome::from_reply(Err(refusal), false),
+            SteerOutcome::Refused
+        );
+    }
+
+    #[test]
+    fn a_steer_lost_to_a_dropped_connection_is_not_treated_as_a_refusal() {
+        // What `fail_pending` hands a request that was in flight when the
+        // transport closed, wrapped the way `RpcClient::call` wraps it.
+        let closed = || {
+            let error = crate::jsonrpc::JsonRpcError {
+                code: crate::jsonrpc::error_codes::INTERNAL_ERROR,
+                message: "Connection closed: eof".to_string(),
+                data: None,
+            };
+            let message = format!("RPC session/steer: {} ({})", error.message, error.code);
+            anyhow::Error::new(error).context(message)
+        };
+        assert_eq!(
+            SteerOutcome::from_reply(Err(closed()), true),
+            SteerOutcome::Unknown
+        );
+        // Even if the state already flipped back, the synthesized code alone
+        // keeps it unknown.
+        assert_eq!(
+            SteerOutcome::from_reply(Err(closed()), false),
+            SteerOutcome::Unknown
+        );
+        // A real daemon refusal that arrives as the link drops is still not
+        // safe to queue: the connection loss wins.
+        let busy = anyhow::Error::new(crate::jsonrpc::JsonRpcError {
+            code: crate::jsonrpc::error_codes::METHOD_NOT_FOUND,
+            message: "Unknown method".to_string(),
+            data: None,
+        });
+        assert_eq!(
+            SteerOutcome::from_reply(Err(busy), true),
+            SteerOutcome::Unknown
+        );
+        // A daemon refusal wrapped by `RpcClient::call` still reads as one.
+        let wrapped = anyhow::Error::new(crate::jsonrpc::JsonRpcError {
+            code: crate::jsonrpc::error_codes::METHOD_NOT_FOUND,
+            message: "Unknown method".to_string(),
+            data: None,
+        })
+        .context("RPC session/steer: Unknown method (-32601)");
+        assert_eq!(
+            SteerOutcome::from_reply(Err(wrapped), false),
+            SteerOutcome::Refused
+        );
+    }
+
+    #[test]
     fn last_error_follows_turn_completion_outcomes() {
         let mut s = state();
         s.turn_in_flight = true;
@@ -18403,6 +18809,7 @@ mod tests {
             ResyncNotice::Idle,
             None,
             None,
+            false,
         );
         assert_eq!(failed.last_error, Some(SessionError::TurnFailed));
         assert_eq!(failed.sidebar_status(), SidebarStatus::Errored);
@@ -18415,6 +18822,7 @@ mod tests {
             ResyncNotice::Idle,
             None,
             None,
+            false,
         );
         assert_eq!(unreconciled.last_error, None);
         assert_eq!(unreconciled.sidebar_status(), SidebarStatus::Ready);
@@ -19412,6 +19820,108 @@ mod tests {
             writer_rx.try_recv().is_err(),
             "a session-lost turn must not dispatch a new prompt before re-attaching"
         );
+    }
+
+    /// A kept-running turn that took an accepted steer and then ends early:
+    /// the steer delivery warning its terminal frame raised must survive the
+    /// terminal reload, which otherwise clears the info bar.
+    #[tokio::test]
+    async fn lag_reattach_keeps_steer_warning_across_terminal_reload() {
+        let (tx, mut writer_rx) = mpsc::channel::<String>(32);
+        let outbound = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(outbound.clone()));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut running = state_for("sess-1", "myagent");
+        running.push_user_message(Some("kept running".to_string()), Vec::new());
+        running.push_steered_user_message("also X".into());
+        chat.phase = ChatPhase::Active(Box::new(running));
+        chat.session_order = vec!["sess-1".to_string()];
+
+        for _ in 0..65 {
+            chat.rpc
+                .push_notification_for_test("session/update", serde_json::Value::Null);
+        }
+        chat.drain_notifications();
+        for _ in 0..2 {
+            let frame = next_rpc_request(&mut writer_rx, "resync reloads the session").await;
+            match frame.get("method").and_then(serde_json::Value::as_str) {
+                Some(method::SESSION_STATE) => respond_ok(
+                    &outbound,
+                    &frame,
+                    serde_json::json!({ "session_id": "sess-1", "state": "running", "turn_id": "9" }),
+                ),
+                Some(method::SESSION_MESSAGES) => respond_ok(
+                    &outbound,
+                    &frame,
+                    serde_json::json!({
+                        "messages": [{ "role": "user", "content": "kept running" }],
+                        "total": 1
+                    }),
+                ),
+                other => panic!("unexpected resync frame: {other:?}"),
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while chat.session_resync_rx.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first resync should finish");
+        chat.tick_transport_events();
+
+        chat.rpc.push_notification_for_test(
+            "session/update",
+            serde_json::json!({
+                "type": "turn_complete",
+                "session_id": "sess-1",
+                "outcome": "cancelled",
+                "content": "[interrupted by user]",
+                "client_turn_generation": 1,
+            }),
+        );
+        chat.tick_transport_events();
+
+        let idle = next_rpc_request(&mut writer_rx, "terminal frame triggers reload").await;
+        assert_eq!(idle["method"], method::SESSION_STATE);
+        respond_ok(
+            &outbound,
+            &idle,
+            serde_json::json!({ "session_id": "sess-1", "state": "idle" }),
+        );
+        let reconciled =
+            next_rpc_request(&mut writer_rx, "terminal reload fetches the transcript").await;
+        assert_eq!(reconciled["method"], method::SESSION_MESSAGES);
+        respond_ok(
+            &outbound,
+            &reconciled,
+            serde_json::json!({
+                "messages": [{ "role": "user", "content": "kept running" }]
+            }),
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while chat.session_resync_rx.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal reload should finish");
+        chat.tick_transport_events();
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("session remains active after the terminal reload");
+        };
+        assert!(state.lag_reattach.is_none());
+        assert!(!state.turn_in_flight);
+        assert_eq!(
+            state
+                .info_message
+                .as_ref()
+                .map(|notice| notice.text.as_str()),
+            Some(crate::i18n::t("zc-steer-ended-early").as_str()),
+            "the steer warning must outlive the terminal reload"
+        );
+        assert_eq!(state.queue_len(), 0, "uncertain delivery must not resend");
     }
 
     /// A kept-running turn that completes cleanly: the intercepted terminal
@@ -33673,6 +34183,151 @@ mod tests {
             );
             assert!(!state.in_browse_mode());
         }
+    }
+
+    /// Enter while a turn runs sends `session/steer`. Accepted: the message
+    /// is in the transcript and nothing is queued. Refused (no active turn on
+    /// the daemon, or a daemon without the method): it lands in the queue as
+    /// before, so nothing typed is lost.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn submit_during_a_running_turn_steers_and_falls_back_to_the_queue() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+
+        for (reply, expect_steered) in [
+            (
+                Some(serde_json::json!({"session_id": "sess-1", "accepted": true})),
+                true,
+            ),
+            (None, false),
+        ] {
+            let (tx, mut rx) = mpsc::channel::<String>(16);
+            let rpc = Arc::new(RpcOutbound::new(tx));
+            let client = Arc::new(RpcClient::with_rpc(rpc.clone()));
+            let mut chat = Chat::new(client, PaneKind::Acp);
+            let mut active = state();
+            active.push_user_message(Some("first".into()), Vec::new());
+            active.input_bar.insert_text("also do X");
+            chat.phase = ChatPhase::Active(Box::new(active));
+            let mut term: crate::config_manager::Term = ratatui::Terminal::with_options(
+                crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+                ratatui::TerminalOptions {
+                    viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 100, 30)),
+                },
+            )
+            .unwrap();
+
+            let responder = {
+                let rpc = rpc.clone();
+                let reply = reply.clone();
+                tokio::spawn(async move {
+                    // Bounded: if Submit never sends (steering not attempted),
+                    // fail here instead of hanging the whole test binary.
+                    let line = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                        .await
+                        .expect("Enter during a running turn must send session/steer")
+                        .expect("submit must send a request");
+                    let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    assert_eq!(req["method"], "session/steer");
+                    assert_eq!(req["params"]["content"], "also do X");
+                    let id = req["id"].as_str().unwrap().to_string();
+                    match reply {
+                        Some(result) => rpc.dispatch_response(&id, Some(result), None),
+                        None => rpc.dispatch_response(
+                            &id,
+                            None,
+                            Some(crate::jsonrpc::JsonRpcError {
+                                code: -32001,
+                                message: "No active turn for this session".to_string(),
+                                data: None,
+                            }),
+                        ),
+                    }
+                    rx
+                })
+            };
+            chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut term)
+                .await;
+            let mut rx = tokio::time::timeout(std::time::Duration::from_secs(5), responder)
+                .await
+                .expect("responder must finish")
+                .expect(
+                    "responder must not panic: Enter during a running turn must send session/steer",
+                );
+
+            let state = active_state(&mut chat);
+            let last_user = state.entries.iter().rev().find_map(|entry| match entry {
+                ChatEntry::UserMessage { text, .. } => text.as_deref().map(str::to_owned),
+                _ => None,
+            });
+            if expect_steered {
+                assert_eq!(last_user.as_deref(), Some("also do X"));
+                assert_eq!(state.queue_len(), 0, "a steered message is not queued");
+            } else {
+                assert_eq!(
+                    last_user.as_deref(),
+                    Some("first"),
+                    "a refused steer must not appear as sent"
+                );
+                assert_eq!(
+                    state.queue_len(),
+                    1,
+                    "a refused steer falls back to the queue"
+                );
+            }
+            assert!(state.turn_in_flight);
+            assert!(
+                rx.try_recv().is_err(),
+                "no session/prompt while the turn is still running"
+            );
+        }
+    }
+
+    /// A steer that times out may still have reached the turn, so it is not
+    /// queued (that could send it twice); the text goes back to the input.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_steer_returns_the_text_to_the_input_instead_of_queueing() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(rpc.clone()));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        let mut active = state();
+        active.push_user_message(Some("first".into()), Vec::new());
+        active.input_bar.insert_text("also do X");
+        chat.phase = ChatPhase::Active(Box::new(active));
+        let mut term: crate::config_manager::Term = ratatui::Terminal::with_options(
+            crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 100, 30)),
+            },
+        )
+        .unwrap();
+
+        // Never answers: the client's request timeout decides.
+        chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut term)
+            .await;
+        let line = rx.try_recv().expect("Enter must send session/steer");
+        assert!(line.contains("session/steer"));
+
+        let state = active_state(&mut chat);
+        assert_eq!(
+            state.queue_len(),
+            0,
+            "an unconfirmed steer must not be queued"
+        );
+        assert_eq!(state.input_bar.input(), "also do X");
+        assert!(rx.try_recv().is_err(), "no session/prompt either");
     }
 
     // Keymap overrides are process-global; retain the existing test lock across
