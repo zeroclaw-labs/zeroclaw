@@ -237,6 +237,14 @@ mod tests {
     }
 
     #[test]
+    fn resolves_parallel() {
+        assert_eq!(
+            resolve_web_search_provider("parallel").route,
+            WebSearchProviderRoute::Parallel
+        );
+    }
+
+    #[test]
     fn resolve_unknown_provider_falls_back_to_default() {
         let resolved = resolve_web_search_provider("bing");
         assert_eq!(resolved.route, WebSearchProviderRoute::DuckDuckGo);

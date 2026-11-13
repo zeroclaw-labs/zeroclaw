@@ -1,57 +1,53 @@
-use super::{cap_result_content, no_results_message, render_results, results_header};
+use super::{
+    WebSearchTool, cap_result_content, http_search_failure, no_results_message, render_results,
+    results_header,
+};
 use crate::i18n::get_required_tool_string;
 use crate::mcp_client::McpServer;
+use crate::mcp_transport::{HttpTransport, McpHttpStatus};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::time::Duration;
-use zeroclaw_config::schema::{McpServerConfig, McpTransport};
+use std::{sync::Arc, time::Duration};
+use zeroclaw_config::schema::{McpServerConfig, McpTransport, try_apply_runtime_proxy_to_builder};
 
-pub(super) async fn search(
-    query: &str,
-    max_results: usize,
-    timeout_secs: u64,
-) -> anyhow::Result<String> {
-    search_at(
-        "https://mcp.parallel.ai/mcp?tools=web_search",
-        query,
-        max_results,
-        timeout_secs,
-    )
-    .await
-}
+pub(super) const URL: &str = "https://mcp.parallel.ai/mcp?tools=web_search";
 
-async fn search_at(
-    url: &str,
-    query: &str,
-    max_results: usize,
-    timeout_secs: u64,
-) -> anyhow::Result<String> {
-    let config = McpServerConfig {
-        name: "parallel".into(),
-        transport: McpTransport::Http,
-        url: Some(url.into()),
-        headers: [("User-Agent".into(), "ZeroClaw".into())].into(),
-        max_response_bytes: Some(1024 * 1024),
-        tool_timeout_secs: Some(timeout_secs),
-        ..Default::default()
-    };
-    // Bound the entire search, including the MCP handshake and discovery.
-    let result = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
-        let server = McpServer::connect(config).await?;
-        server
-            .call_tool(
-                "web_search",
-                json!({"objective": query, "search_queries": [query]}),
-            )
+impl WebSearchTool {
+    pub(super) async fn search_parallel(&self, url: &str, query: &str) -> anyhow::Result<String> {
+        let config = McpServerConfig {
+            name: "parallel".into(),
+            transport: McpTransport::Http,
+            url: Some(url.into()),
+            headers: [("User-Agent".into(), "ZeroClaw".into())].into(),
+            max_response_bytes: Some(1024 * 1024),
+            tool_timeout_secs: Some(self.timeout_secs),
+            ..Default::default()
+        };
+        let builder =
+            try_apply_runtime_proxy_to_builder(reqwest::Client::builder(), "tool.web_search")?;
+        let transport = HttpTransport::with_builder(&config, builder)?;
+        let call = async {
+            let server = McpServer::connect_with_transport(config, Arc::new(transport)).await?;
+            server
+                .call_tool(
+                    "web_search",
+                    json!({"objective": query, "search_queries": [query]}),
+                )
+                .await
+        };
+        let result = tokio::time::timeout(Duration::from_secs(self.timeout_secs), call)
             .await
-    })
-    .await
-    .map_err(|_| {
-        anyhow::anyhow!(get_required_tool_string(
-            "tool-web-search-tool-error-parallel-timeout"
-        ))
-    })??;
-    format_response(query, max_results, result)
+            .map_err(|_| {
+                anyhow::Error::msg(get_required_tool_string(
+                    "tool-web-search-tool-error-parallel-timeout",
+                ))
+            })?
+            .map_err(|err| match err.downcast_ref::<McpHttpStatus>() {
+                Some(status) => http_search_failure("parallel", status.0),
+                None => err,
+            })?;
+        format_response(query, self.max_results, &result)
+    }
 }
 
 #[derive(Deserialize)]
@@ -66,16 +62,14 @@ struct SearchResult {
     excerpts: Vec<String>,
 }
 
-fn format_response(query: &str, max_results: usize, mut result: Value) -> anyhow::Result<String> {
+fn format_response(query: &str, max_results: usize, result: &Value) -> anyhow::Result<String> {
     let invalid = || {
-        anyhow::anyhow!(get_required_tool_string(
-            "tool-web-search-tool-error-parallel-invalid-response"
+        anyhow::Error::msg(get_required_tool_string(
+            "tool-web-search-tool-error-parallel-invalid-response",
         ))
     };
-    let response: SearchResponse = match result.get_mut("structuredContent") {
-        Some(payload) if !payload.is_null() => {
-            serde_json::from_value(payload.take()).map_err(|_| invalid())?
-        }
+    let response: SearchResponse = match result.get("structuredContent") {
+        Some(payload) if !payload.is_null() => SearchResponse::deserialize(payload),
         _ => {
             let blocks = result["content"].as_array().ok_or_else(invalid)?;
             let text = blocks
@@ -84,9 +78,10 @@ fn format_response(query: &str, max_results: usize, mut result: Value) -> anyhow
                 .filter_map(|b| b["text"].as_str())
                 .collect::<Vec<_>>()
                 .join("\n");
-            serde_json::from_str(&text).map_err(|_| invalid())?
+            serde_json::from_str(&text)
         }
-    };
+    }
+    .map_err(|_| invalid())?;
     if response.results.is_empty() {
         return Ok(no_results_message(query));
     }
@@ -119,71 +114,53 @@ fn format_response(query: &str, max_results: usize, mut result: Value) -> anyhow
 mod tests {
     use super::*;
     use wiremock::{
-        Mock, MockServer, ResponseTemplate,
-        matchers::{body_partial_json, header, method},
+        Mock, MockServer, Request, ResponseTemplate,
+        matchers::{header, method},
     };
+    use zeroclaw_config::schema::{ProxyConfig, ProxyScope, set_runtime_proxy_config};
 
     #[tokio::test]
-    #[ignore = "calls the public Parallel MCP endpoint"]
-    async fn live_search_via_configured_provider() {
-        use super::super::WebSearchTool;
-        use zeroclaw_api::tool::Tool;
-        use zeroclaw_config::schema::WebSearchConfig;
-
-        let config: WebSearchConfig = toml::from_str(r#"search_provider = "parallel""#).unwrap();
-        let tool = WebSearchTool::new(
-            config.search_provider,
-            None,
-            None,
-            config.max_results,
-            config.timeout_secs,
-        );
-        let result = tool
-            .execute(json!({"query": "Rust standard library Vec documentation"}))
-            .await
-            .unwrap();
+    async fn search_uses_service_proxy_and_reports_http_errors() {
+        let _guard = crate::test_support::RuntimeProxyStateGuard::acquire().await;
+        let proxy = MockServer::start().await;
+        set_runtime_proxy_config(ProxyConfig {
+            enabled: true,
+            scope: ProxyScope::Services,
+            services: vec!["tool.web_search".into()],
+            all_proxy: Some(proxy.uri()),
+            no_proxy: vec!["localhost".into(), "127.0.0.1".into(), "::1".into()],
+            ..Default::default()
+        });
+        Mock::given(method("POST")).and(header("user-agent", "ZeroClaw"))
+            .respond_with(|request: &Request| {
+                let body: Value = request.body_json().unwrap();
+                let result = match body["method"].as_str().unwrap() {
+                    "initialize" => json!({"capabilities":{"tools":{}}}),
+                    "notifications/initialized" => return ResponseTemplate::new(202),
+                    "tools/list" => json!({"tools":[{"name":"web_search", "inputSchema":{"type":"object"}}]}),
+                    "tools/call" => {
+                        assert_eq!(body["params"]["name"], "web_search");
+                        let args = &body["params"]["arguments"];
+                        assert_eq!(args["search_queries"], json!([args["objective"]]));
+                        if args["objective"] == "limited" {
+                            return ResponseTemplate::new(429);
+                        }
+                        let hit = json!({"results":[{"url":"https://example.org","excerpts":["passage"]}]});
+                        json!({"content":[{"type":"text","text":hit.to_string()}]})
+                    }
+                    other => panic!("unexpected MCP method {other}"),
+                };
+                ResponseTemplate::new(200).set_body_json(json!({"jsonrpc":"2.0","id":body["id"],"result":result}))
+            }).expect(8).mount(&proxy).await;
+        let tool = WebSearchTool::new("parallel".into(), None, None, 1, 5);
+        let endpoint = "http://search.invalid/mcp";
+        let output = tool.search_parallel(endpoint, "example").await.unwrap();
+        assert!(output.contains("passage"));
+        let err = tool.search_parallel(endpoint, "limited").await.unwrap_err();
         assert!(
-            result.success
-                && result.output.contains("(via Parallel)")
-                && result.output.contains("https://")
+            err.to_string()
+                .contains("search_status=unavailable, http=429")
         );
-    }
-
-    #[tokio::test]
-    async fn sends_only_search_with_the_project_header() {
-        let mock = MockServer::start().await;
-        for (request, response) in [
-            (
-                json!({"method":"initialize"}),
-                json!({"id":1,"result":{"capabilities":{"tools":{}}}}),
-            ),
-            (json!({"method":"notifications/initialized"}), Value::Null),
-            (
-                json!({"method":"tools/list"}),
-                json!({"id":2,"result":{"tools":[{"name":"web_search","inputSchema":{"type":"object"}}]}}),
-            ),
-            (
-                json!({"method":"tools/call","params":{"name":"web_search","arguments":{"objective":"query","search_queries":["query"]}}}),
-                json!({"id":3,"result":{"content":[{"type":"text","text":json!({"results":[{"url":"https://example.org","excerpts":["passage"]}]}).to_string()}]}}),
-            ),
-        ] {
-            let reply = if response.is_null() {
-                ResponseTemplate::new(202)
-            } else {
-                let mut response = response;
-                response["jsonrpc"] = json!("2.0");
-                ResponseTemplate::new(200).set_body_json(response)
-            };
-            Mock::given(method("POST"))
-                .and(header("user-agent", "ZeroClaw"))
-                .and(body_partial_json(request))
-                .respond_with(reply)
-                .expect(1)
-                .mount(&mock)
-                .await;
-        }
-        let output = search_at(&mock.uri(), "query", 1, 5).await.unwrap();
-        assert!(output.contains("(via Parallel)") && output.contains("passage"));
     }
 
     #[test]
@@ -192,14 +169,14 @@ mod tests {
             {"url":"https://example.org/first","title":"First","excerpts":["one","two"]},
             {"url":"https://example.org/second","excerpts":[]}
         ]}});
-        let output = format_response("q", 1, hits).unwrap();
+        let output = format_response("q", 1, &hits).unwrap();
         assert!(
             output.contains("First") && output.contains("one\ntwo") && !output.contains("second")
         );
         assert_eq!(
-            format_response("q", 1, json!({"structuredContent":{"results":[]}})).unwrap(),
+            format_response("q", 1, &json!({"structuredContent":{"results":[]}})).unwrap(),
             no_results_message("q")
         );
-        assert!(format_response("q", 1, json!({"content":[]})).is_err());
+        assert!(format_response("q", 1, &json!({"content":[]})).is_err());
     }
 }
