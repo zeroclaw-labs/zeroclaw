@@ -14856,6 +14856,95 @@ target = "memory_recall"
         (tool, target)
     }
 
+    /// Runs a real independent delegation the way a caller's Agent turn does:
+    /// through tool dispatch, inside the caller's scoped prompt variants.
+    /// Returns the request body the target's provider received.
+    async fn independent_child_request_under_caller_scope(native: bool, cap: usize) -> String {
+        let temp = TempDir::new().unwrap();
+        let (server, requests) = start_final_text_chat_server("target done").await;
+        let mut config = (*bounded_subdelegation_fixture(
+            &temp,
+            &server.uri,
+            &[("caller", &[]), ("target", &[])],
+            &["caller"],
+            3,
+            true,
+            false,
+        ))
+        .clone();
+        config.agents.get_mut("caller").unwrap().delegates = vec![DelegateTargetConfig {
+            agent: "target".to_string(),
+            mode: DelegateExecutionMode::Independent,
+        }];
+        config
+            .providers
+            .models
+            .custom
+            .get_mut("local")
+            .unwrap()
+            .base
+            .native_tools = Some(native);
+        let workspace = config.agent_workspace_dir("target");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("IDENTITY.md"), "TARGET_IDENTITY").unwrap();
+        let config = Arc::new(config);
+        let tool = bounded_subdelegation_tool(&config).with_runtime(Arc::new(DelegateTestRuntime));
+        let registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(tool)]);
+        let caller_prompt = "## Interaction Context\n\nCALLER_IDENTITY\n\n## Tools\n\n\
+                             CALLER_TOOLS\n\n## Safety\n\nrules";
+        let prompts = Arc::new(crate::agent::turn::ToolProtocolPrompts::with_max_chars(
+            caller_prompt.to_string(),
+            caller_prompt.to_string(),
+            cap,
+        ));
+        let meta = crate::agent::turn::TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: Some("caller"),
+            turn_id: "test-turn-id",
+            channel_name: "test",
+        };
+
+        let outcome = crate::agent::turn::scope_tool_protocol_prompts(
+            prompts,
+            crate::agent::tool_execution::execute_one_tool(
+                DelegateTool::NAME,
+                serde_json::json!({"agent": "target", "prompt": "who are you"}),
+                None,
+                crate::agent::tool_execution::ToolDispatchContext {
+                    tools_registry: &registry,
+                    activated_tools: None,
+                    excluded_tools: &[],
+                    model_switch_callback: None,
+                },
+                &meta,
+                &NoopObserver,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.success, "delegation failed: {}", outcome.output);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "expected one target request");
+        requests[0].clone()
+    }
+
+    #[tokio::test]
+    async fn independent_delegate_request_carries_target_prompt_under_caller_scope() {
+        for (native, cap) in [(true, 64_000), (true, 0), (false, 64_000), (false, 0)] {
+            let body = independent_child_request_under_caller_scope(native, cap).await;
+            let case = format!("native={native} cap={cap}");
+            assert!(body.contains("TARGET_IDENTITY"), "{case}: {body}");
+            for leaked in ["CALLER_IDENTITY", "CALLER_TOOLS", "## Interaction Context"] {
+                assert!(!body.contains(leaked), "{case} leaked {leaked}: {body}");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn independent_delegate_uses_target_native_thinking_and_restores_parent_scope() {
         let target_thinking = ThinkingConfig {
