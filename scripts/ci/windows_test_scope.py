@@ -42,6 +42,7 @@ PLUGIN_HOST_EXACT_PATHS = {
     "scripts/ci/windows_test_scope.py",
     "scripts/ci/windows_test_scope.test.sh",
     "tests/plugin_channel_runtime_e2e.rs",
+    "tests/support/plugin_channel_fixture.rs",
 }
 PLUGIN_HOST_SCRIPT_PREFIX = "scripts/ci/plugin_backend_change_filter"
 PLUGIN_HOST_CONTROL_PREFIXES = (

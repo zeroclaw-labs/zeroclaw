@@ -219,6 +219,11 @@ pub struct RpcContext {
     /// of letting them run detached under superseded configuration.
     pub sop_driver_handles: Option<crate::sop::SopDriverHandles>,
     pub sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
+    /// The generation's plugin webhook ingress, the same instance the
+    /// gateway's `/plugin/{path}` route and the channel supervisor use.
+    /// `None` when the embedder wired none: `plugin-webhook/dispatch` then
+    /// answers `unavailable` and `plugin-webhook/routes` lists nothing.
+    pub plugin_webhooks: Option<Arc<zeroclaw_infra::plugin_webhook::PluginWebhookIngress>>,
 
     /// Lifecycle hook runner. `None` when hooks are disabled in config.
     pub hooks: Option<Arc<crate::hooks::HookRunner>>,
@@ -300,6 +305,7 @@ impl RpcContext {
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
+            plugin_webhooks: None,
             sop_engine: None,
             sop_driver_handles: None,
             sop_audit: None,
@@ -344,6 +350,7 @@ impl RpcContext {
             sop_engine: None,
             sop_driver_handles: None,
             sop_audit: None,
+            plugin_webhooks: None,
             hooks: None,
             #[cfg(test)]
             config_commit_pause: None,
@@ -376,6 +383,7 @@ impl RpcContext {
             sop_engine: None,
             sop_driver_handles: None,
             sop_audit: None,
+            plugin_webhooks: None,
             hooks: None,
             #[cfg(test)]
             config_commit_pause: None,
@@ -417,6 +425,7 @@ impl RpcContext {
             sop_engine: None,
             sop_driver_handles: None,
             sop_audit: None,
+            plugin_webhooks: None,
             hooks: None,
             #[cfg(test)]
             config_commit_pause: None,
@@ -499,6 +508,7 @@ impl RpcContext {
             sop_engine: None,
             sop_driver_handles: None,
             sop_audit: None,
+            plugin_webhooks: None,
             hooks: None,
             #[cfg(test)]
             config_commit_pause: None,
@@ -535,6 +545,7 @@ impl RpcContext {
             sop_engine: Some(sop_engine),
             sop_driver_handles: Some(crate::sop::SopDriverHandles::default()),
             sop_audit: None,
+            plugin_webhooks: None,
             hooks: None,
             #[cfg(test)]
             config_commit_pause: None,
@@ -577,6 +588,7 @@ impl RpcContext {
             sop_engine: Some(sop_engine),
             sop_driver_handles,
             sop_audit: Some(sop_audit),
+            plugin_webhooks: None,
             hooks: None,
             config_commit_pause: None,
             cert_audit: None,
@@ -612,6 +624,7 @@ impl RpcContext {
             sop_engine: None,
             sop_driver_handles: None,
             sop_audit: None,
+            plugin_webhooks: None,
             hooks: None,
             #[cfg(test)]
             config_commit_pause: None,
@@ -648,6 +661,7 @@ impl RpcContext {
             sop_engine: None,
             sop_driver_handles: None,
             sop_audit: None,
+            plugin_webhooks: None,
             hooks: None,
             #[cfg(test)]
             config_commit_pause: None,
@@ -685,6 +699,7 @@ impl RpcContext {
             sop_engine: None,
             sop_driver_handles: None,
             sop_audit: None,
+            plugin_webhooks: None,
             hooks: None,
             #[cfg(test)]
             config_commit_pause: None,
@@ -722,6 +737,7 @@ impl RpcContext {
             sop_engine: None,
             sop_driver_handles: None,
             sop_audit: None,
+            plugin_webhooks: None,
             hooks: None,
             #[cfg(test)]
             config_commit_pause: None,

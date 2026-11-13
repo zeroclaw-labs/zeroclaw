@@ -1006,6 +1006,7 @@ const V3_ONLY_DESTINATIONS: &[&[&str]] = &[
 /// `v3_agent_fields_are_the_current_agent_fields`.
 const V3_AGENT_FIELDS: &[&str] = &[
     "a2a",
+    "accept_injected_webhooks",
     "acp_enable_mcp",
     "channels",
     "classifier_provider",

@@ -114,6 +114,11 @@ pub enum Method {
     // TUI
     TuiList,
 
+    // Plugin webhooks
+    PluginWebhookDispatch,
+    PluginWebhookCancel,
+    PluginWebhookRoutes,
+
     // Files
     FileAttach,
     FileUploadBegin,
@@ -245,6 +250,10 @@ impl Method {
         (Method::SubscriptionCancel, "subscription/cancel"),
         // TUI
         (Method::TuiList, "tui/list"),
+        // Plugin webhooks
+        (Method::PluginWebhookDispatch, "plugin-webhook/dispatch"),
+        (Method::PluginWebhookCancel, "plugin-webhook/cancel"),
+        (Method::PluginWebhookRoutes, "plugin-webhook/routes"),
         // Files
         (Method::FileAttach, "file/attach"),
         (Method::FileUploadBegin, "file/upload/begin"),
@@ -427,6 +436,15 @@ impl Method {
                 Typed("SubscriptionCancelResult"),
             ),
             M::TuiList => (None, Typed("TuiListResult")),
+            M::PluginWebhookDispatch => (
+                Typed("PluginWebhookDispatchParams"),
+                Typed("PluginWebhookDispatchResult"),
+            ),
+            M::PluginWebhookCancel => (
+                Typed("PluginWebhookCancelParams"),
+                Typed("PluginWebhookCancelResult"),
+            ),
+            M::PluginWebhookRoutes => (None, Typed("PluginWebhookRoutesResult")),
             M::FileAttach => (Typed("FileAttachParams"), Typed("FileAttachResult")),
             M::FileUploadBegin => (
                 Typed("FileUploadBeginParams"),
@@ -556,6 +574,18 @@ mod tests {
         for (method, wire) in Method::ALL {
             assert_eq!(Method::from_wire(wire), Some(*method), "{wire}");
             assert_eq!(method.wire_name(), *wire);
+        }
+    }
+
+    #[test]
+    fn plugin_webhook_methods_have_their_wire_names() {
+        for (method, wire) in [
+            (Method::PluginWebhookDispatch, "plugin-webhook/dispatch"),
+            (Method::PluginWebhookCancel, "plugin-webhook/cancel"),
+            (Method::PluginWebhookRoutes, "plugin-webhook/routes"),
+        ] {
+            assert_eq!(method.wire_name(), wire);
+            assert_eq!(Method::from_wire(wire), Some(method));
         }
     }
 

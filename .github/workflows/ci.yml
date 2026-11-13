@@ -1395,10 +1395,20 @@ jobs:
             exit 1
           fi
       # Guards required plugin webhook ingress coverage from issue #11003; see the bespoke gate registry in README.md.
+      # Two-process proof for the standalone gateway: the real `zeroclaw
+      # daemon` owns the plugin route and the real `zeroclaw gateway start`
+      # forwards `/plugin/{path}` to it over the local RPC socket, including a
+      # daemon killed mid-request, restarted, and reloaded. It reuses the
+      # plain `zeroclaw` binary the step above builds. Unix only.
+      - name: Run plugin webhook IPC e2e
+        if: steps.changed.outputs.run == 'true' && matrix.suite == 'runtime'
+        run: cargo test --locked --features plugins-wasm-cranelift --test plugin_webhook_ipc_e2e
+      # Guards required plugin webhook ingress coverage from issue #11003; see the bespoke gate registry in README.md.
       # The gateway's `/plugin/{path}` ingress only compiles under its
       # `plugins-wasm` feature, so the default-feature Test job never runs its
-      # tests. The filter is a module path: it selects every test in the
-      # handler's `plugin_webhook::tests`, not one test name.
+      # tests. The filter is a module path: it selects every test under the
+      # handler's and the forwarder's `plugin_webhook` modules, not one test
+      # name.
       - name: Run gateway plugin webhook tests
         if: steps.changed.outputs.run == 'true' && matrix.suite == 'gateway'
         run: cargo test --locked -p zeroclaw-gateway --features plugins-wasm --lib plugin_webhook

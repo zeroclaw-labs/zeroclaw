@@ -556,6 +556,10 @@ hmac = "0.12"
 parking_lot = "0.12"
 regex = "1.10"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
+# The plugin webhook IPC e2e dials the daemon socket to wait for published
+# routes and to reload the daemon.
+zeroclaw-rpc-client = { workspace = true }
+zeroclaw-rpc-proto = { workspace = true }
 
 [[test]]
 name = "component"
@@ -601,6 +605,14 @@ path = "tests/channel_egress_e2e.rs"
 [[test]]
 name = "channel_websocket_e2e"
 path = "tests/channel_websocket_e2e.rs"
+
+# Two-process proof that the standalone gateway forwards channel-plugin
+# webhooks to a running daemon over the local RPC socket. Unix only; needs
+# `plugins-wasm-cranelift`, the default `agent-runtime` and `gateway`
+# features, and the wasm32-wasip2 target.
+[[test]]
+name = "plugin_webhook_ipc_e2e"
+path = "tests/plugin_webhook_ipc_e2e.rs"
 
 [[bench]]
 name = "agent_benchmarks"
