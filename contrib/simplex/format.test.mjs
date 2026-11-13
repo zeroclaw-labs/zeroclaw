@@ -34,6 +34,39 @@ test('links keep their destination visible and do not execute HTML', () => {
     'Documentation (https://example.test/a_b) and diagram (https://example.test/image.png)');
 });
 
+test('simple math arrows become readable Unicode within prose and emphasis', () => {
+  assert.equal(text(String.raw`**Plan $\rightarrow$ Dispatch $\to$ Review $\Rightarrow$ Refine**`),
+    '*Plan → Dispatch → Review ⇒ Refine*');
+  assert.equal(text(String.raw`$a \leftrightarrow b$; $$\Leftarrow$$; \(\mapsto\); \[\downarrow\]`),
+    'a ↔ b; ⇐; ↦; ↓');
+  assert.equal(text(String.raw`$\leftarrow$ $\Leftrightarrow$ $\uparrow$`), '← ⇔ ↑');
+});
+
+test('math conversion preserves code, destinations, escapes, currency and unsupported TeX', () => {
+  for (const source of [
+    '`$\\rightarrow$`',
+    '```tex\n$\\rightarrow$\n```\n',
+    String.raw`$\frac{a}{b} \rightarrow c$`,
+    String.raw`\(\unknown\)`,
+    String.raw`$x_1 \rightarrow y^2$`,
+    String.raw`$\rightarrowtail$`,
+    String.raw`\$\rightarrow\$`,
+    '$5 and $10',
+    'https://example.test/$to$/file',
+  ]) assert.equal(text(source), source);
+  assert.equal(text(String.raw`[Docs](https://example.test/$\rightarrow$)`),
+    String.raw`Docs (https://example.test/$\rightarrow$)`);
+});
+
+test('mixed headings retain one readable bold span and rules use a text separator', () => {
+  assert.equal(text('### Updating `PROFILE.md` (now)\n\n---\n\nReady.'),
+    '*Updating PROFILE.md (now)*\n\n────────\n\nReady.');
+  assert.equal(text('### Update [`PROFILE.md`](https://example.test/profile)\n'),
+    '*Update PROFILE.md* (https://example.test/profile)\n');
+  assert.equal(text('***\n'), '────────\n');
+  assert.equal(text('    ---\n'), '    ---\n');
+});
+
 test('large Unicode replies close formatting in each bounded message without losing content', () => {
   const content = 'Words 😀 and text '.repeat(2500).trim();
   const messages = simplexTextMessages(`**${content}**`);

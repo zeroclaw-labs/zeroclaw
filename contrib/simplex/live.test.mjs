@@ -52,6 +52,16 @@ test('completed tool narration is committed once and a later phase owns a new bu
   assert.deepEqual([...items.values()],[{text:'Checking now.',live:false},{text:'The final answer.',live:false}]);
   assert.equal(commands.filter(c=>c.startsWith('/_send ')).length,2);
 });
+test('live edits and finalization use the same compatible text conversion',async()=>{
+  const {live,items}=fixture();
+  const source='### Update `PROFILE.md`\n\n**Plan $\\rightarrow$ Dispatch**\n\n---\n';
+  const expected='*Update PROFILE.md*\n\n*Plan → Dispatch*\n\n────────\n';
+  await live.start('draft','17','Processing…');
+  await live.update('draft','17',source);
+  assert.deepEqual(items.get(1),{text:expected,live:true});
+  await live.finish('draft','17',source);
+  assert.deepEqual(items.get(1),{text:expected,live:false});
+});
 test('cancellation removes empty placeholders and preserves interrupted partial text',async()=>{
   for(const partial of ['', 'A partial response']) {
     const {live,items}=fixture();await live.start('draft','17','Processing…');

@@ -61,6 +61,19 @@ try {
  assert.notEqual(final.meta.itemLive,true);
  assert.equal(b.events.flatMap(e=>e.type==='newChatItems'?e.chatItems??[]:[])
   .filter(i=>i.chatItem?.meta?.itemId===physicalId).length,1,'edits must retain the physical message');
+ const compatible='### Update `PROFILE.md`\n\n**Plan $\\rightarrow$ Dispatch**\n\n---\n';
+ const rendered='*Update PROFILE.md*\n\n*Plan → Dispatch*\n\n────────\n';
+ await live.start('fixture-compatible',aid,'Processing…');
+ await live.update('fixture-compatible',aid,compatible);
+ await until(()=>b.events.filter(e=>e.type==='chatItemUpdated')
+  .map(e=>e.chatItem?.chatItem ?? e.chatItem).find(i=>i?.meta?.itemLive===true
+   && i.content?.msgContent?.text===rendered),'compatible_preview_timeout');
+ await live.finish('fixture-compatible',aid,compatible);
+ const compatibleFinal=await until(()=>b.events.filter(e=>e.type==='chatItemUpdated')
+  .map(e=>e.chatItem?.chatItem ?? e.chatItem).find(i=>i?.meta?.itemLive!==true
+   && i.content?.msgContent?.text===rendered),'compatible_final_timeout');
+ assert.ok(compatibleFinal.formattedText?.some(s=>s.format?.type==='bold' && s.text==='Update PROFILE.md'));
+ assert.ok(compatibleFinal.formattedText?.some(s=>s.format?.type==='bold' && s.text==='Plan → Dispatch'));
  await live.start('fixture-cancel',aid,'Thinking…');
  await live.cancel('fixture-cancel',aid,'[Interrupted]');
  const result=spawnSync('ffmpeg',['-v','error','-f','lavfi','-i','anullsrc=r=16000:cl=mono','-t','0.4','-c:a','aac','-movflags','frag_keyframe+empty_moov','-f','mp4','pipe:1']);assert.equal(result.status,0);

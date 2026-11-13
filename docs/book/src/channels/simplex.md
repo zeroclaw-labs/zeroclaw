@@ -247,8 +247,13 @@ strikethrough becomes `~text~`. Headings become bold lines; lists and tables use
 readable text layouts. Links retain a visible destination. SimpleX cannot nest
 styles, so nested emphasis is flattened. Intraword emphasis becomes plain text
 to preserve identifiers and words. Inline and fenced code, escaped source and
-raw HTML are passed through verbatim; this does not add a full code-block or
-HTML renderer to SimpleX.
+raw HTML are passed through verbatim outside headings; inline code in headings
+keeps its content within one bold heading instead of nesting incompatible styles.
+Horizontal rules become a Unicode text separator. Simple delimited TeX arrow
+expressions (for example, `$\rightarrow$`, `$\to$`, or `\(\Rightarrow\)`)
+become Unicode arrows. Unknown commands and structured math stay as source text;
+code contents and link destinations are not converted. This does not add a full
+code-block, HTML, or math renderer to SimpleX.
 
 The helper uses a pinned Markdown lexer and never evaluates HTML or fetches
 linked resources. Text is split at the existing 12,000-character limit without

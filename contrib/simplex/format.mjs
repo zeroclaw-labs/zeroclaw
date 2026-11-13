@@ -1,32 +1,63 @@
 // Markdown remains canonical in the native conversation. This derived view is
 // used only when handing approved outbound text to the SimpleX CLI.
-import {Lexer} from 'marked';
+import {Marked} from 'marked';
 
 const MESSAGE_CHARS = 12000;
 
-function pieces(tokens, inherited = '') {
+// A small, lossless fallback for common arrow notation, not a TeX renderer.
+// Recognize math before Markdown interprets its backslashes; unknown commands
+// and structured expressions remain source text. Code and link targets never
+// enter this inline tokenizer.
+const arrows = new Map(Object.entries({
+  to: '→', rightarrow: '→', leftarrow: '←', leftrightarrow: '↔',
+  Rightarrow: '⇒', Leftarrow: '⇐', Leftrightarrow: '⇔',
+  uparrow: '↑', downarrow: '↓', mapsto: '↦',
+}));
+const lexer = new Marked({gfm: true, extensions: [{
+  name: 'simplexMath', level: 'inline',
+  start: source => source.search(/\$|\\[([]/),
+  tokenizer(source) {
+    const match = /^(?:\$\$([^$\n]+)\$\$|\$([^$\n]+)\$|\\\(([^\n]*?)\\\)|\\\[([^\n]*?)\\\])/.exec(source);
+    if (!match) return;
+    const body = match.slice(1).find(value => value !== undefined);
+    if (!/\\[a-zA-Z]+/.test(body)) return;
+    const text = body.replace(/\\([a-zA-Z]+)/g, (raw, name) => arrows.get(name) ?? raw);
+    const literal = /[\\${}^_]/.test(text);
+    return {type: 'simplexMath', raw: match[0], text: literal ? match[0] : text.trim(), literal};
+  },
+}]});
+
+function pieces(tokens, inherited = '', heading = false) {
   const result = [];
   const add = (text, mark = inherited, literal = false) => result.push({text, mark, literal});
   for (const token of tokens) {
     switch (token.type) {
-      case 'strong': result.push(...pieces(token.tokens, '*')); break;
-      case 'em': result.push(...pieces(token.tokens, inherited || '_')); break;
-      case 'del': result.push(...pieces(token.tokens, inherited || '~')); break;
+      case 'strong': result.push(...pieces(token.tokens, '*', heading)); break;
+      case 'em': result.push(...pieces(token.tokens, inherited || '_', heading)); break;
+      case 'del': result.push(...pieces(token.tokens, inherited || '~', heading)); break;
       // The target cannot nest formatting or represent arbitrary fenced code.
       // Keep code and HTML source verbatim instead of rewriting their contents.
-      case 'code': case 'codespan': case 'html': add(token.raw, '', true); break;
+      case 'codespan':
+        // SimpleX cannot nest a snippet inside bold. Keep the filename/content
+        // within one heading span rather than inserting spaces around it.
+        if (heading) add(token.text);
+        else add(token.raw, '', true);
+        break;
+      case 'code': case 'html': add(token.raw, '', true); break;
+      case 'simplexMath': add(token.text, token.literal ? '' : inherited, token.literal); break;
+      case 'hr': add('────────' + token.raw.match(/\n*$/)[0], ''); break;
       case 'heading':
-        result.push(...pieces(token.tokens, '*'));
+        result.push(...pieces(token.tokens, '*', true));
         add(token.raw.match(/\n*$/)[0], ''); break;
       case 'paragraph':
         result.push(...pieces(token.tokens, inherited));
         add(token.raw.match(/\n*$/)[0], ''); break;
       case 'text':
-        if (token.tokens) result.push(...pieces(token.tokens, inherited));
+        if (token.tokens) result.push(...pieces(token.tokens, inherited, heading));
         else add(token.raw);
         break;
       case 'link': case 'image': {
-        const label = token.tokens ? pieces(token.tokens, inherited) : [{text: token.text, mark: inherited}];
+        const label = token.tokens ? pieces(token.tokens, inherited, heading) : [{text: token.text, mark: inherited}];
         result.push(...label);
         if (label.map(part => part.text).join('') !== token.href) add(` (${token.href})`, '');
         break;
@@ -66,7 +97,7 @@ function pieces(tokens, inherited = '') {
 
 function render(markdown, maxChars) {
   const parts = [];
-  for (const part of pieces(Lexer.lex(markdown, {gfm: true}))) {
+  for (const part of pieces(lexer.lexer(markdown))) {
     const previous = parts.at(-1);
     if (previous && previous.mark === part.mark && previous.literal === part.literal) previous.text += part.text;
     else parts.push({...part});
@@ -116,6 +147,7 @@ function render(markdown, maxChars) {
   flush();
   return messages;
 }
+
 
 // SimpleX limits encoded messages, not Unicode characters. Keep the normal
 // chunk size when it fits; re-render with a proven per-character byte bound
