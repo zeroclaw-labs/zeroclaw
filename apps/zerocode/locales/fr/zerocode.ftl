@@ -627,7 +627,6 @@ zc-config-footer-action-back-to-files = retour aux fichiers
 zc-config-footer-action-back-to-skills = retour aux compétences
 zc-config-footer-action-help = aide
 zc-config-footer-action-new-line = nouvelle ligne
-zc-config-field-edit-hint = { $keys } → appuyez pour modifier
 zc-doctor-log-path = log : { $path }
 
 zc-oidc-enroll-visit = Pour vous connecter, ouvrez { $uri } et saisissez le code { $code }
@@ -712,4 +711,14 @@ zc-config-section-cron-help = Tâches planifiées associant une planification à
 zc-config-section-tunnel-help = Exposez éventuellement la passerelle via Cloudflare ou ngrok, ou gardez-la uniquement en local.
 zc-config-section-onboard-state-help = État du cycle de vie du démarrage rapide et registre hérité de complétion par section.
 
+# Config field details use schema-owned descriptions and values.
+zc-config-footer-action-field-details = détails du champ
+zc-config-field-path = Chemin : { $path }
+zc-config-field-current-value = Valeur actuelle :
+zc-config-field-unset = <non défini>
+zc-config-field-secret-set = Défini (masqué)
+zc-config-field-value-unavailable = Indisponible
+zc-config-field-environment-override = Une variable d'environnement remplace la valeur configurée.
+zc-config-field-precheck-timeout-secs-label = Délai de la vérification préalable (secondes)
+zc-config-field-max-cost-per-day-cents-label = Coût maximal par jour (centimes)
 zc-chat-tool-question = question
