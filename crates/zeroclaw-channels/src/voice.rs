@@ -137,10 +137,7 @@ impl VoicePipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeroclaw_config::schema::{
-        AliasedAgentConfig, EdgeTtsProviderConfig, GroqTranscriptionProviderConfig,
-        TranscriptionConfig, TranscriptionProviderConfig, TtsProviderConfig,
-    };
+    use zeroclaw_config::schema::{AliasedAgentConfig, TranscriptionConfig};
 
     fn config_with_edge_tts() -> Config {
         let mut config = Config::default();
@@ -152,15 +149,10 @@ mod tests {
                 ..AliasedAgentConfig::default()
             },
         );
-        config.providers.tts.edge.insert(
-            "default".to_string(),
-            EdgeTtsProviderConfig {
-                base: TtsProviderConfig {
-                    binary_path: Some("edge-tts".to_string()),
-                    ..TtsProviderConfig::default()
-                },
-            },
-        );
+        config.providers = serde_json::from_value(serde_json::json!({
+            "connections": {"speech.edge": {"kind": "edge", "api": {"tts": {"command": "edge-tts"}}}},
+            "models": {"edge.default": {"capability": "tts", "provider": "speech.edge"}}
+        })).unwrap();
         config
     }
 
@@ -172,16 +164,10 @@ mod tests {
             },
             ..Config::default()
         };
-        config.providers.transcription.groq.insert(
-            "default".to_string(),
-            GroqTranscriptionProviderConfig {
-                base: TranscriptionProviderConfig {
-                    api_key: Some("test-groq-key".to_string()),
-                    ..TranscriptionProviderConfig::default()
-                },
-                ..GroqTranscriptionProviderConfig::default()
-            },
-        );
+        config.providers = serde_json::from_value(serde_json::json!({
+            "connections": {"speech.groq": {"kind": "groq", "auth": {"mode": "api_key", "api_key": "test-groq-key"}}},
+            "models": {"groq.default": {"capability": "asr", "provider": "speech.groq", "model": "whisper-large-v3"}}
+        })).unwrap();
         config.agents.insert(
             "default".to_string(),
             AliasedAgentConfig {
@@ -235,7 +221,21 @@ mod tests {
         let mut config = config_with_groq_stt();
         let tts_config = config_with_edge_tts();
         config.tts = tts_config.tts;
-        config.providers.tts = tts_config.providers.tts;
+        config
+            .providers
+            .connections
+            .extend(tts_config.providers.connections);
+        for reference in tts_config.providers.models.canonical_model_refs() {
+            config.providers.models.insert_canonical_model(
+                reference.clone(),
+                tts_config
+                    .providers
+                    .models
+                    .canonical_model(reference)
+                    .unwrap()
+                    .clone(),
+            );
+        }
         config.agents.get_mut("default").unwrap().tts_provider = "edge.default".into();
 
         let pipeline = VoicePipeline::from_config(&config).unwrap();

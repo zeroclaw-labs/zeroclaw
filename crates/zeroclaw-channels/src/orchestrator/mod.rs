@@ -4695,12 +4695,8 @@ fn load_cached_model_preview(
     agent_workspace_dir: &Path,
     provider_name: &str,
 ) -> Vec<String> {
-    // Canonicalize undotted names so lookup matches the cache key.
-    let canonical = if provider_name.contains('.') {
-        provider_name.to_string()
-    } else {
-        format!("{provider_name}.default")
-    };
+    // The refresh writer stores the exact model key, including undotted keys.
+    let canonical = provider_name.trim();
 
     // Check the shared cache location first (written by `zeroclaw models refresh`),
     // then fall back to the agent workspace for backward compatibility.
@@ -20750,8 +20746,8 @@ pub(crate) mod tests {
         // `zeroclaw-runtime::doctor::persist_model_cache` writer (what
         // `zeroclaw models refresh` calls), then this crate's actual
         // `load_cached_model_preview` reader (what `/model` calls) — for an
-        // undotted provider ref (canonicalized to `openrouter.default` on both
-        // sides) and a custom, non-default agent workspace.
+        // undotted model key (preserved verbatim on both sides) and a custom,
+        // non-default agent workspace.
         let data_root = TempDir::new().unwrap();
         let custom_agent_workspace = TempDir::new().unwrap();
 
@@ -22451,9 +22447,7 @@ temperature = 0.3
 
     #[tokio::test]
     async fn startup_rejects_retired_publication_and_starts_no_listeners_on_setup_failure() {
-        use zeroclaw_config::schema::{
-            AliasedAgentConfig, CustomModelProviderConfig, ModelProviderConfig,
-        };
+        use zeroclaw_config::schema::AliasedAgentConfig;
         use zeroclaw_runtime::LiveConfigAuthority;
 
         let _serial = STARTUP_REGISTRY_TEST_LOCK.lock().await;
@@ -22467,16 +22461,10 @@ temperature = 0.3
         };
         config.memory.backend = "none".into();
         config.channels.session_persistence = false;
-        config.providers.models.custom.insert(
-            "startup".into(),
-            CustomModelProviderConfig {
-                base: ModelProviderConfig {
-                    uri: Some("http://127.0.0.1:1/v1".into()),
-                    model: Some("startup-model".into()),
-                    ..Default::default()
-                },
-            },
-        );
+        config.providers = serde_json::from_value(serde_json::json!({
+            "connections": {"gateway.startup": {"kind": "custom", "uri": "http://127.0.0.1:1/v1"}},
+            "models": {"chat.startup": {"capability": "chat", "provider": "gateway.startup", "model": "startup-model"}}
+        })).unwrap();
         config
             .risk_profiles
             .insert("default".into(), Default::default());
@@ -22487,7 +22475,7 @@ temperature = 0.3
             "first".into(),
             AliasedAgentConfig {
                 enabled: true,
-                model_provider: "custom.startup".into(),
+                model_provider: "chat.startup".into(),
                 risk_profile: "default".into(),
                 runtime_profile: "default".into(),
                 ..Default::default()
@@ -24010,13 +23998,11 @@ temperature = 0.1
     }
 
     #[tokio::test]
-    async fn resilient_channel_provider_pins_selected_nested_model_over_legacy_model() {
+    async fn resilient_channel_provider_pins_selected_model_over_call_argument() {
         use axum::{Json, Router, extract::State, routing::post};
         use serde_json::{Value, json};
         use std::sync::Mutex as StdMutex;
-        use zeroclaw_config::schema::{
-            Config, ModelEntryConfig, ModelProviderConfig, OpenAIModelProviderConfig, WireApi,
-        };
+        use zeroclaw_config::schema::Config;
         use zeroclaw_providers::ChatRequest;
 
         type Capture = Arc<StdMutex<Option<Value>>>;
@@ -24048,30 +24034,26 @@ temperature = 0.1
                 .expect("serve mock model endpoint");
         });
 
-        let mut config = Config::default();
-        config.providers.models.openai.insert(
-            "channel".to_string(),
-            OpenAIModelProviderConfig {
-                base: ModelProviderConfig {
-                    model: Some("legacy-channel-model".to_string()),
-                    api_key: Some("sk-test".to_string()),
-                    uri: Some(format!("http://{address}/v1")),
-                    wire_api: Some(WireApi::ChatCompletions),
-                    models: HashMap::from([(
-                        "fast".to_string(),
-                        ModelEntryConfig {
-                            id: Some("nested-channel-model".to_string()),
-                            ..Default::default()
-                        },
-                    )]),
-                    ..Default::default()
-                },
-            },
-        );
+        let config = Config {
+            providers: serde_json::from_value(json!({
+                "connections": {"gateway.channel": {
+                    "kind": "openai",
+                    "uri": format!("http://{address}/v1"),
+                    "auth": {"mode": "api_key", "api_key": "sk-test"},
+                    "api": {"chat": {"wire_api": "chat_completions"}}
+                }},
+                "models": {"chat.channel.fast": {
+                    "capability": "chat", "provider": "gateway.channel",
+                    "model": "selected-channel-model"
+                }}
+            }))
+            .unwrap(),
+            ..Config::default()
+        };
         let provider = create_resilient_model_provider_nonblocking(
             Arc::new(config.clone()),
-            "openai.channel.fast",
-            "nested-channel-model",
+            "chat.channel.fast",
+            "selected-channel-model",
         )
         .await
         .expect("channel provider should construct");
@@ -24083,7 +24065,7 @@ temperature = 0.1
                     tools: None,
                     thinking: None,
                 },
-                "nested-channel-model",
+                "different-call-model",
                 None,
             )
             .await
@@ -24096,7 +24078,7 @@ temperature = 0.1
             .expect("mock endpoint was called");
         assert_eq!(
             body.get("model").and_then(Value::as_str),
-            Some("nested-channel-model")
+            Some("selected-channel-model")
         );
         server.abort();
     }
@@ -33212,11 +33194,10 @@ options = {{ native_tools = true, temperature = 0.1 }}
         );
 
         let mut prompt_config = zeroclaw_config::schema::Config::default();
-        prompt_config
-            .providers
-            .models
-            .ensure("openrouter", "default")
-            .expect("openrouter slot must exist");
+        prompt_config.providers = serde_json::from_value(serde_json::json!({
+            "connections": {"gateway.router": {"kind": "openrouter"}},
+            "models": {"openrouter.default": {"capability": "chat", "provider": "gateway.router", "model": "default-model"}}
+        })).unwrap();
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
@@ -43392,12 +43373,12 @@ metadata = { context_window = 8000 }
                     effort_routing_channel_context(tmp.path(), true);
                 let mut ctx = Arc::try_unwrap(ctx).ok().unwrap();
                 let mut config = ctx.prompt_config.as_ref().clone();
-                config
-                    .providers
-                    .models
-                    .ensure("openrouter", "default")
-                    .unwrap()
-                    .model = Some("switched-model".into());
+                zeroclaw_config::migration::bind_test_route_model(
+                    &mut config,
+                    "openrouter.default",
+                    "switched-model",
+                    None,
+                );
                 let config = Arc::new(config);
                 ctx.prompt_config = Arc::clone(&config);
                 ctx.tools_registry = Arc::new(
@@ -45074,10 +45055,16 @@ metadata = { context_window = 8000 }
             "claude-sonnet-4-5",
             None,
         );
-        ctx.model_routes = Arc::new(vec![zeroclaw_config::schema::ModelRouteConfig {
+        ctx.live_config =
+            zeroclaw_config::live::LiveConfig::new((*ctx.prompt_config).clone()).handle();
+        let route = zeroclaw_config::schema::ModelRouteConfig {
             hint: "fast".into(),
             model_ref: "anthropic.work".into(),
-        }]);
+        };
+        Arc::make_mut(&mut ctx.prompt_config).model_routes = vec![route.clone()];
+        ctx.live_config =
+            zeroclaw_config::live::LiveConfig::new((*ctx.prompt_config).clone()).handle();
+        ctx.model_routes = Arc::new(vec![route]);
         let msg = zeroclaw_api::channel::ChannelMessage {
             id: "message-7".into(),
             sender: "test_user".into(),
@@ -45136,10 +45123,16 @@ metadata = { context_window = 8000 }
             "claude-sonnet-4-5",
             None,
         );
-        ctx.model_routes = Arc::new(vec![zeroclaw_config::schema::ModelRouteConfig {
+        ctx.live_config =
+            zeroclaw_config::live::LiveConfig::new((*ctx.prompt_config).clone()).handle();
+        let route = zeroclaw_config::schema::ModelRouteConfig {
             hint: "fast".into(),
             model_ref: "anthropic.work".into(),
-        }]);
+        };
+        Arc::make_mut(&mut ctx.prompt_config).model_routes = vec![route.clone()];
+        ctx.live_config =
+            zeroclaw_config::live::LiveConfig::new((*ctx.prompt_config).clone()).handle();
+        ctx.model_routes = Arc::new(vec![route]);
         let msg = zeroclaw_api::channel::ChannelMessage {
             id: "message-8".into(),
             sender: "test_user".into(),
@@ -45193,10 +45186,16 @@ metadata = { context_window = 8000 }
             "fast-model",
             None,
         );
-        ctx.model_routes = Arc::new(vec![zeroclaw_config::schema::ModelRouteConfig {
+        ctx.live_config =
+            zeroclaw_config::live::LiveConfig::new((*ctx.prompt_config).clone()).handle();
+        let route = zeroclaw_config::schema::ModelRouteConfig {
             hint: "fast".into(),
             model_ref: "openrouter.default".into(),
-        }]);
+        };
+        Arc::make_mut(&mut ctx.prompt_config).model_routes = vec![route.clone()];
+        ctx.live_config =
+            zeroclaw_config::live::LiveConfig::new((*ctx.prompt_config).clone()).handle();
+        ctx.model_routes = Arc::new(vec![route]);
         let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
         ctx.model_provider = provider_impl.clone();
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
@@ -45297,10 +45296,14 @@ metadata = { context_window = 8000 }
             "claude-sonnet-4-5",
             None,
         );
-        ctx.model_routes = Arc::new(vec![zeroclaw_config::schema::ModelRouteConfig {
+        let route = zeroclaw_config::schema::ModelRouteConfig {
             hint: "fast".into(),
             model_ref: "anthropic.work".into(),
-        }]);
+        };
+        Arc::make_mut(&mut ctx.prompt_config).model_routes = vec![route.clone()];
+        ctx.live_config =
+            zeroclaw_config::live::LiveConfig::new((*ctx.prompt_config).clone()).handle();
+        ctx.model_routes = Arc::new(vec![route]);
         let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
         ctx.model_provider = provider_impl.clone();
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
@@ -45423,10 +45426,14 @@ metadata = { context_window = 8000 }
             "claude-sonnet-4-5",
             None,
         );
-        ctx.model_routes = Arc::new(vec![zeroclaw_config::schema::ModelRouteConfig {
+        let route = zeroclaw_config::schema::ModelRouteConfig {
             hint: "fast".into(),
             model_ref: "anthropic.work".into(),
-        }]);
+        };
+        Arc::make_mut(&mut ctx.prompt_config).model_routes = vec![route.clone()];
+        ctx.live_config =
+            zeroclaw_config::live::LiveConfig::new((*ctx.prompt_config).clone()).handle();
+        ctx.model_routes = Arc::new(vec![route]);
         let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
         ctx.model_provider = provider_impl.clone();
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
@@ -46026,25 +46033,16 @@ metadata = { context_window = 8000 }
                 ..Default::default()
             },
         );
-        picker_config.providers.models.openai.insert(
-            "primary".into(),
-            zeroclaw_config::schema::OpenAIModelProviderConfig {
-                base: zeroclaw_config::schema::ModelProviderConfig {
-                    model: Some("gpt-current".into()),
-                    ..Default::default()
-                },
+        picker_config.providers = serde_json::from_value(serde_json::json!({
+            "connections": {
+                "gateway.primary": {"kind": "openai"},
+                "gateway.work": {"kind": "anthropic"}
             },
-        );
-        picker_config.providers.models.anthropic.insert(
-            "work".into(),
-            zeroclaw_config::schema::AnthropicModelProviderConfig {
-                base: zeroclaw_config::schema::ModelProviderConfig {
-                    model: Some("claude-sonnet-4-5".into()),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        );
+            "models": {
+                "openai.primary": {"capability": "chat", "provider": "gateway.primary", "model": "gpt-current"},
+                "anthropic.work": {"capability": "chat", "provider": "gateway.work", "model": "claude-sonnet-4-5"}
+            }
+        })).unwrap();
         picker_config.agents.insert(
             "assistant".into(),
             zeroclaw_config::schema::AliasedAgentConfig {
@@ -46173,10 +46171,14 @@ metadata = { context_window = 8000 }
             "claude-sonnet-4-5",
             None,
         );
-        ctx.model_routes = Arc::new(vec![zeroclaw_config::schema::ModelRouteConfig {
+        let route = zeroclaw_config::schema::ModelRouteConfig {
             hint: "fast".into(),
             model_ref: "anthropic.work".into(),
-        }]);
+        };
+        Arc::make_mut(&mut ctx.prompt_config).model_routes = vec![route.clone()];
+        ctx.live_config =
+            zeroclaw_config::live::LiveConfig::new((*ctx.prompt_config).clone()).handle();
+        ctx.model_routes = Arc::new(vec![route]);
         let mut original_sender_message = queued.clone();
         original_sender_message.sender = "original_user".into();
         let original_key = conversation_history_key(&original_sender_message);
@@ -46623,21 +46625,26 @@ metadata = { context_window = 8000 }
 
     #[test]
     fn resolve_models_command_resolves_bare_family_to_configured_alias() {
-        let mut config = zeroclaw_config::schema::Config::default();
-        {
-            let base = config
-                .providers
-                .models
-                .ensure("openrouter", "default")
-                .expect("openrouter slot must exist");
-            base.api_key = Some("sk-configured".into());
-            base.uri = Some("https://router.example/v1".into());
-            base.model = Some("some-model".into());
-        }
+        let config = zeroclaw_config::schema::Config {
+            providers: toml::from_str(
+                r#"
+[connections."gateway.default"]
+kind = "openrouter"
+capabilities = ["chat"]
+
+[models."chat.default"]
+capability = "chat"
+provider = "gateway.default"
+model = "some-model"
+"#,
+            )
+            .unwrap(),
+            ..Default::default()
+        };
 
         match resolve_models_command(&config, "openrouter") {
-            ModelsCommandResolution::Resolved(r) => assert_eq!(r, "openrouter.default"),
-            other => panic!("expected Resolved(openrouter.default), got {other:?}"),
+            ModelsCommandResolution::Resolved(r) => assert_eq!(r, "chat.default"),
+            other => panic!("expected Resolved(chat.default), got {other:?}"),
         }
     }
 
@@ -46652,27 +46659,32 @@ metadata = { context_window = 8000 }
 
     #[test]
     fn resolve_models_command_flags_ambiguous_family() {
-        let mut config = zeroclaw_config::schema::Config::default();
-        config
-            .providers
-            .models
-            .ensure("openrouter", "default")
-            .unwrap();
-        config
-            .providers
-            .models
-            .ensure("openrouter", "secondary")
-            .unwrap();
+        let config = zeroclaw_config::schema::Config {
+            providers: toml::from_str(
+                r#"
+[connections."gateway.default"]
+kind = "openrouter"
+capabilities = ["chat"]
+[models."chat.default"]
+capability = "chat"
+provider = "gateway.default"
+model = "default-model"
+[models."chat.secondary"]
+capability = "chat"
+provider = "gateway.default"
+model = "secondary-model"
+"#,
+            )
+            .unwrap(),
+            ..Default::default()
+        };
 
         match resolve_models_command(&config, "openrouter") {
             ModelsCommandResolution::Ambiguous { family, aliases } => {
                 assert_eq!(family, "openrouter");
                 assert_eq!(
                     aliases,
-                    vec![
-                        "openrouter.default".to_string(),
-                        "openrouter.secondary".to_string()
-                    ]
+                    vec!["chat.default".to_string(), "chat.secondary".to_string()]
                 );
             }
             other => panic!("expected Ambiguous, got {other:?}"),
@@ -46681,19 +46693,32 @@ metadata = { context_window = 8000 }
 
     #[test]
     fn resolve_models_command_preserves_and_validates_nested_selection() {
-        let mut config = Config::default();
-        for alias in ["gw", "gw.v2"] {
-            let profile = config.providers.models.ensure("custom", alias).unwrap();
-            for model in ["default", "fast.v1"] {
-                profile.models.insert(
-                    model.into(),
-                    zeroclaw_config::schema::ModelEntryConfig {
-                        id: Some(model.into()),
-                        ..Default::default()
-                    },
-                );
-            }
-        }
+        let config = Config {
+            providers: toml::from_str(
+                r#"
+[connections."gateway.gw"]
+kind = "custom"
+capabilities = ["chat"]
+[connections."gateway.gw.v2"]
+kind = "custom"
+capabilities = ["chat"]
+[models."custom.gw.fast.v1"]
+capability = "chat"
+provider = "gateway.gw"
+model = "fast.v1"
+[models."custom.gw.v2"]
+capability = "chat"
+provider = "gateway.gw.v2"
+model = "v2"
+[models."custom.gw.v2.fast.v1"]
+capability = "chat"
+provider = "gateway.gw.v2"
+model = "fast.v1"
+"#,
+            )
+            .unwrap(),
+            ..Default::default()
+        };
         for reference in ["custom.gw.fast.v1", "custom.gw.v2", "custom.gw.v2.fast.v1"] {
             match resolve_models_command(&config, reference) {
                 ModelsCommandResolution::Resolved(actual) => assert_eq!(actual, reference),
@@ -46708,15 +46733,24 @@ metadata = { context_window = 8000 }
 
     #[test]
     fn resolve_models_command_accepts_existing_dotted_ref() {
-        let mut config = zeroclaw_config::schema::Config::default();
-        config
-            .providers
-            .models
-            .ensure("openrouter", "default")
-            .unwrap();
+        let config = Config {
+            providers: toml::from_str(
+                r#"
+[connections."gateway.default"]
+kind = "openrouter"
+capabilities = ["chat"]
+[models."chat.default"]
+capability = "chat"
+provider = "gateway.default"
+model = "default-model"
+"#,
+            )
+            .unwrap(),
+            ..Default::default()
+        };
 
-        match resolve_models_command(&config, "openrouter.default") {
-            ModelsCommandResolution::Resolved(r) => assert_eq!(r, "openrouter.default"),
+        match resolve_models_command(&config, "chat.default") {
+            ModelsCommandResolution::Resolved(r) => assert_eq!(r, "chat.default"),
             other => panic!("expected Resolved, got {other:?}"),
         }
         match resolve_models_command(&config, "openrouter.missing") {
@@ -46736,31 +46770,48 @@ metadata = { context_window = 8000 }
 
     #[test]
     fn runtime_model_switch_resolves_bare_family_to_configured_alias() {
-        let mut config = zeroclaw_config::schema::Config::default();
-        config
-            .providers
-            .models
-            .ensure("openrouter", "default")
-            .unwrap();
+        let config = Config {
+            providers: toml::from_str(
+                r#"
+[connections."gateway.default"]
+kind = "openrouter"
+capabilities = ["chat"]
+[models."chat.default"]
+capability = "chat"
+provider = "gateway.default"
+model = "default-model"
+"#,
+            )
+            .unwrap(),
+            ..Default::default()
+        };
 
         let resolved = resolve_provider_ref_for_runtime_switch(&config, "openrouter").unwrap();
 
-        assert_eq!(resolved, "openrouter.default");
+        assert_eq!(resolved, "chat.default");
     }
 
     #[test]
     fn runtime_model_switch_rejects_ambiguous_bare_family() {
-        let mut config = zeroclaw_config::schema::Config::default();
-        config
-            .providers
-            .models
-            .ensure("openrouter", "default")
-            .unwrap();
-        config
-            .providers
-            .models
-            .ensure("openrouter", "secondary")
-            .unwrap();
+        let config = Config {
+            providers: toml::from_str(
+                r#"
+[connections."gateway.default"]
+kind = "openrouter"
+capabilities = ["chat"]
+[models."chat.default"]
+capability = "chat"
+provider = "gateway.default"
+model = "default-model"
+[models."chat.secondary"]
+capability = "chat"
+provider = "gateway.default"
+model = "secondary-model"
+"#,
+            )
+            .unwrap(),
+            ..Default::default()
+        };
 
         let err = resolve_provider_ref_for_runtime_switch(&config, "openrouter")
             .expect_err("ambiguous model switch provider should reject");

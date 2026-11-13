@@ -11972,9 +11972,7 @@ mod tests {
     async fn finalize_multi_message_suppress_voice_skips_tts_but_delivers_text() {
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
-        use zeroclaw_config::schema::{
-            AliasedAgentConfig, Config, OpenAITtsProviderConfig, TtsProviderConfig,
-        };
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
 
         let mock_server = MockServer::start().await;
         // Catch-all for every POST: Bot API (sendMessage/sendVoice) and the
@@ -12000,17 +11998,10 @@ mod tests {
                 ..AliasedAgentConfig::default()
             },
         );
-        config.providers.tts.openai.insert(
-            "default".to_string(),
-            OpenAITtsProviderConfig {
-                base: TtsProviderConfig {
-                    api_key: Some("k".to_string()),
-                    uri: Some(format!("{}/v1/audio/speech", mock_server.uri())),
-                    voice: Some("alloy".to_string()),
-                    ..TtsProviderConfig::default()
-                },
-            },
-        );
+        config.providers = serde_json::from_value(serde_json::json!({
+            "connections": {"speech.openai": {"kind": "openai", "uri": format!("{}/v1", mock_server.uri()), "auth": {"mode": "api_key", "api_key": "k"}}},
+            "models": {"openai.default": {"capability": "tts", "provider": "speech.openai", "model": "tts-1", "options": {"voice": "alloy"}}}
+        })).unwrap();
 
         // Recipient "123" is voice-capable, so a non-suppressed finalize WOULD
         // queue TTS — that is what makes the suppress assertion meaningful.
@@ -12094,9 +12085,7 @@ mod tests {
     async fn multi_message_voice_only_peer_gets_voice_without_narration_or_final_text() {
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
-        use zeroclaw_config::schema::{
-            AliasedAgentConfig, Config, OpenAITtsProviderConfig, TtsProviderConfig,
-        };
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
 
         let mock_server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -12118,17 +12107,10 @@ mod tests {
                 ..AliasedAgentConfig::default()
             },
         );
-        config.providers.tts.openai.insert(
-            "default".to_string(),
-            OpenAITtsProviderConfig {
-                base: TtsProviderConfig {
-                    api_key: Some("k".to_string()),
-                    uri: Some(format!("{}/v1/audio/speech", mock_server.uri())),
-                    voice: Some("alloy".to_string()),
-                    ..TtsProviderConfig::default()
-                },
-            },
-        );
+        config.providers = serde_json::from_value(serde_json::json!({
+            "connections": {"speech.openai": {"kind": "openai", "uri": format!("{}/v1", mock_server.uri()), "auth": {"mode": "api_key", "api_key": "k"}}},
+            "models": {"openai.default": {"capability": "tts", "provider": "speech.openai", "model": "tts-1", "options": {"voice": "alloy"}}}
+        })).unwrap();
 
         // "123" is a voice-only peer.
         let ch = multi_message_test_channel("telegram_test_alias", 0)
@@ -19374,13 +19356,24 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let tc = zeroclaw_config::schema::TranscriptionConfig {
-            enabled: true,
-            api_key: Some("test_key".to_string()),
-            api_url: format!("{}/transcribe", mock_server.uri()),
-            max_duration_secs: 120,
+        let mut canonical = zeroclaw_config::schema::Config {
+            providers: serde_json::from_value(serde_json::json!({
+                "connections": {"speech.test": {"kind": "local_whisper", "uri": format!("{}/transcribe", mock_server.uri())}},
+                "models": {"asr.test": {"capability": "asr", "provider": "speech.test", "model": "whisper-1"}}
+            })).unwrap(),
             ..Default::default()
         };
+        canonical.transcription.enabled = true;
+        canonical.agents.insert(
+            "telegram-agent".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                transcription_provider: "asr.test".into(),
+                ..Default::default()
+            },
+        );
+        let manager =
+            zeroclaw_providers::transcription::build_transcription_manager(&canonical, "asr.test")
+                .unwrap();
         let mention_only = false;
         let ch = TelegramChannel::new(
             "token".into(),
@@ -19389,7 +19382,7 @@ mod tests {
             mention_only,
         )
         .with_mock_api_base(mock_server.uri())
-        .with_transcription(tc);
+        .with_transcription_manager(Default::default(), Some(Arc::new(manager)));
         let update = serde_json::json!({
             "message": {
                 "message_id": 4,
