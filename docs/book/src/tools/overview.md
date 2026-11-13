@@ -163,7 +163,6 @@ operator enters the token in the editor, and the tool adds it to the request.
 A username and password credential uses the same reference flow for a
 service that accepts HTTP Basic. Browser form logins are outside this flow.
 
-
 ### AnySearch provider
 
 AnySearch is an explicit, opt-in backend for `web_search_tool`:
