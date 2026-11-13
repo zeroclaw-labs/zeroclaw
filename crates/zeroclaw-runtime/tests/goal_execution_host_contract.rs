@@ -1614,6 +1614,8 @@ enum ScriptedFault {
     VerifierOutcomeUnknown,
     CorruptGoalAfterParent,
     CorruptGoalAfterVerifier,
+    CorruptTaskAfterAppend,
+    CorruptTaskAfterContinue,
 }
 
 struct ExecutionScript {
@@ -1700,6 +1702,18 @@ impl ScriptedLease {
         assert_eq!(
             conn.execute(
                 "UPDATE goal_tasks SET blockers_json = 'not-json' WHERE task_id = ?1",
+                rusqlite::params![scope.task_id()],
+            )?,
+            1
+        );
+        Ok(())
+    }
+
+    fn corrupt_task_record(&self, scope: &GoalExecutionScope) -> anyhow::Result<()> {
+        let conn = rusqlite::Connection::open(&self.control_db)?;
+        assert_eq!(
+            conn.execute(
+                "UPDATE tasks SET depth = 'corrupt' WHERE id = ?1",
                 rusqlite::params![scope.task_id()],
             )?,
             1
@@ -1845,6 +1859,7 @@ impl GoalSessionExecutionLease for ScriptedLease {
                 anyhow::bail!("fixture verifier interrupted");
             }
             Some(ScriptedFault::CorruptGoalAfterVerifier) => self.corrupt_goal_record(scope)?,
+            Some(ScriptedFault::CorruptTaskAfterContinue) => self.corrupt_task_record(scope)?,
             _ => {}
         }
         Ok(GoalVerifierResult {
@@ -1873,6 +1888,9 @@ impl GoalSessionExecutionLease for ScriptedLease {
         ));
         if matches!(fault, Some(ScriptedFault::PauseDuringAppend)) {
             self.pause(scope).await;
+        }
+        if matches!(fault, Some(ScriptedFault::CorruptTaskAfterAppend)) {
+            self.corrupt_task_record(scope)?;
         }
         Ok(())
     }
@@ -2116,6 +2134,30 @@ impl EngineFixture {
             .map(|message| (message.role, message.content))
             .collect()
     }
+
+    fn raw_status_and_reason(&self) -> (String, Option<String>) {
+        rusqlite::Connection::open(&self.driver.control_db)
+            .unwrap()
+            .query_row(
+                "SELECT status, error FROM tasks WHERE id = ?1",
+                rusqlite::params![self.scope.task_id()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    fn reject_status_write(&self, status: &str) {
+        assert!(matches!(status, "completed" | "paused"));
+        let sql = format!(
+            "CREATE TRIGGER reject_fixture_status BEFORE UPDATE OF status ON tasks \
+             WHEN NEW.status = '{status}' BEGIN \
+             SELECT RAISE(ABORT, 'fixture status write failed'); END"
+        );
+        rusqlite::Connection::open(&self.driver.control_db)
+            .unwrap()
+            .execute_batch(&sql)
+            .unwrap();
+    }
 }
 
 const SCRIPTED_COMPLETE: &str =
@@ -2146,6 +2188,128 @@ async fn engine_persists_a_verified_candidate_before_completing() {
         fixture.history(),
         vec![("assistant".into(), "final answer".into())]
     );
+}
+
+#[tokio::test]
+async fn engine_task_read_failure_after_append_fails_the_epoch() {
+    let mut fixture = EngineFixture::new(
+        &["answer"],
+        &[],
+        Some(ScriptedFault::CorruptTaskAfterAppend),
+    )
+    .await;
+    let error = fixture.run().await.unwrap_err();
+    assert!(format!("{error:#}").contains("failed to read Goal lifecycle after an operation"));
+    assert_eq!(
+        fixture.steps(),
+        vec![
+            ScriptedStep::Parent(Vec::new()),
+            ScriptedStep::Append(
+                "answer".into(),
+                TaskStatus::Running,
+                fixture.scope.execution_epoch()
+            ),
+        ]
+    );
+    assert_eq!(
+        fixture.raw_status_and_reason(),
+        ("failed".into(), Some("lifecycle_persistence_failed".into()))
+    );
+    assert_eq!(
+        fixture.reason().await.as_deref(),
+        Some("lifecycle_persistence_failed")
+    );
+}
+
+#[tokio::test]
+async fn engine_task_read_failure_after_continue_fails_before_another_parent() {
+    let feedback = r#"{"decision":"continue","reason":"work remains","blockers":[]}"#;
+    let mut fixture = EngineFixture::new(
+        &["answer"],
+        &[feedback],
+        Some(ScriptedFault::CorruptTaskAfterContinue),
+    )
+    .await;
+    let error = fixture.run().await.unwrap_err();
+    assert!(format!("{error:#}").contains("failed to read Goal lifecycle after an operation"));
+    assert_eq!(
+        fixture.steps(),
+        vec![
+            ScriptedStep::Parent(Vec::new()),
+            ScriptedStep::Append(
+                "answer".into(),
+                TaskStatus::Running,
+                fixture.scope.execution_epoch()
+            ),
+            ScriptedStep::Verifier("answer".into()),
+        ]
+    );
+    assert_eq!(
+        fixture.raw_status_and_reason(),
+        ("failed".into(), Some("lifecycle_persistence_failed".into()))
+    );
+    assert_eq!(
+        fixture.reason().await.as_deref(),
+        Some("lifecycle_persistence_failed")
+    );
+}
+
+#[tokio::test]
+async fn engine_completion_write_failure_fails_the_epoch() {
+    let mut fixture = EngineFixture::new(&["answer"], &[SCRIPTED_COMPLETE], None).await;
+    fixture.reject_status_write("completed");
+    let error = fixture.run().await.unwrap_err();
+    let rendered = format!("{error:#}");
+    assert!(rendered.contains("failed to record Goal completion"));
+    assert!(rendered.contains("fixture status write failed"));
+    assert_eq!(fixture.task().await.status, TaskStatus::Failed);
+    assert_eq!(
+        fixture.reason().await.as_deref(),
+        Some("lifecycle_persistence_failed")
+    );
+}
+
+#[tokio::test]
+async fn engine_verifier_pause_write_failure_fails_the_epoch() {
+    let blocked = r#"{"decision":"blocked","reason":"choice required","blockers":[{"kind":"needs_user_input","message":"Choose one"}]}"#;
+    let mut fixture = EngineFixture::new(&["Choose one"], &[blocked], None).await;
+    fixture.reject_status_write("paused");
+    let error = fixture.run().await.unwrap_err();
+    let rendered = format!("{error:#}");
+    assert!(rendered.contains("failed to record Goal verifier pause"));
+    assert!(rendered.contains("fixture status write failed"));
+    assert_eq!(fixture.task().await.status, TaskStatus::Failed);
+    assert_eq!(
+        fixture.reason().await.as_deref(),
+        Some("lifecycle_persistence_failed")
+    );
+}
+
+#[tokio::test]
+async fn engine_blocked_verifier_does_not_replace_winning_operator_pause() {
+    let blocked = r#"{"decision":"blocked","reason":"choice required","blockers":[{"kind":"needs_user_input","message":"Choose one"}]}"#;
+    let mut fixture = EngineFixture::new(
+        &["Choose one"],
+        &[blocked],
+        Some(ScriptedFault::PauseDuringVerifier),
+    )
+    .await;
+    let error = fixture.run().await.unwrap_err();
+    let rendered = format!("{error:#}");
+    assert!(rendered.contains("Goal verifier pause lost its execution fence"));
+    assert!(rendered.contains("Goal failure lost its execution fence"));
+    assert_eq!(fixture.task().await.status, TaskStatus::Paused);
+    assert_eq!(
+        fixture
+            .store
+            .get_goal_task(fixture.scope.task_id())
+            .await
+            .unwrap()
+            .unwrap()
+            .pause_reason,
+        Some(GoalPauseReason::OperatorPaused)
+    );
+    assert!(fixture.reason().await.is_none());
 }
 
 #[tokio::test]

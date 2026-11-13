@@ -27,6 +27,7 @@ use super::{
 const MAX_VERIFIER_REASON_CHARS: usize = 2_000;
 const MAX_VERIFIER_BLOCKERS: usize = 16;
 const MAX_VERIFIER_BLOCKER_MESSAGE_CHARS: usize = 2_000;
+const LIFECYCLE_PERSISTENCE_FAILED: &str = "lifecycle_persistence_failed";
 /// Maximum UTF-8 bytes accepted before parsing a verifier response.
 const MAX_VERIFIER_RESPONSE_BYTES: usize = 1_048_576;
 /// Maximum compact-JSON bytes retained for one blocker payload.
@@ -98,6 +99,9 @@ impl GoalExecutionEngine {
     /// acquisition or its config refusal, resume-response append, and history
     /// access—make no durable lifecycle change. The owning caller must settle
     /// the exact execution epoch when such an error follows a transition.
+    /// After the first parent operation, errors either record a guarded Failed
+    /// disposition or leave a competing transition intact. The original error
+    /// is retained; restart reconciliation owns an epoch the store cannot write.
     pub async fn run(
         &self,
         settings: &GoalHostSettings<'_>,
@@ -152,12 +156,8 @@ impl GoalExecutionEngine {
             .flatten()
             .context("Goal operation accountant is not scoped")?;
         let mut working_history = lease.canonical_history()?;
+        self.exact_running_task(scope).await?;
         loop {
-            // The driver may return from a previously admitted parent call
-            // after a pause, cancellation, or replacement fenced this epoch.
-            // That call is allowed to settle its already-incurred usage, but
-            // its result must never admit a new parent or verifier operation.
-            self.exact_running_task(scope).await?;
             let candidate = match lease
                 .run_parent_turn(
                     scope,
@@ -202,7 +202,7 @@ impl GoalExecutionEngine {
             // A lifecycle transition can race with the parent call above.
             // Recheck the exact durable task and epoch before the verifier so
             // a drained parent result cannot start a second model operation.
-            self.exact_running_task(scope).await?;
+            self.require_running_after_operation(scope).await?;
 
             let verifier = match lease
                 .run_verifier(
@@ -240,6 +240,7 @@ impl GoalExecutionEngine {
                 Ok(VerifierDecision::Continue { reason }) => {
                     working_history.push(ChatMessage::assistant(candidate));
                     working_history.push(goal_verifier_feedback_message(&reason));
+                    self.require_running_after_operation(scope).await?;
                 }
                 Ok(VerifierDecision::Blocked { blockers }) => {
                     self.pause_verifier_blocked(scope, blockers).await?;
@@ -353,8 +354,15 @@ impl GoalExecutionEngine {
         let task = self
             .registry
             .current_goal_for_session(scope.session_id())
-            .await?
-            .context("Goal session no longer has a current task")?;
+            .await?;
+        Self::ensure_exact_running(scope, task)
+    }
+
+    fn ensure_exact_running(
+        scope: &GoalExecutionScope,
+        task: Option<TaskRecord>,
+    ) -> Result<TaskRecord> {
+        let task = task.context("Goal session no longer has a current task")?;
         ensure!(task.id == scope.task_id(), "Goal task identity is stale");
         ensure!(
             task.status == TaskStatus::Running,
@@ -367,8 +375,30 @@ impl GoalExecutionEngine {
         Ok(task)
     }
 
+    async fn require_running_after_operation(&self, scope: &GoalExecutionScope) -> Result<()> {
+        let task = match self
+            .registry
+            .current_goal_for_session(scope.session_id())
+            .await
+        {
+            Ok(task) => task,
+            Err(error) => {
+                return Err(self
+                    .fail_with(
+                        scope,
+                        LIFECYCLE_PERSISTENCE_FAILED,
+                        with_visible_context(
+                            error,
+                            "failed to read Goal lifecycle after an operation",
+                        ),
+                    )
+                    .await);
+            }
+        };
+        Self::ensure_exact_running(scope, task).map(|_| ())
+    }
+
     async fn complete(&self, scope: &GoalExecutionScope) -> Result<()> {
-        self.exact_running_task(scope).await?;
         match self
             .registry
             .finish_session_goal(
@@ -378,11 +408,20 @@ impl GoalExecutionEngine {
                 TaskStatus::Completed,
                 None,
             )
-            .await?
+            .await
         {
-            GoalTransitionResult::Applied => {}
-            GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
+            Ok(GoalTransitionResult::Applied) => {}
+            Ok(GoalTransitionResult::Stale | GoalTransitionResult::Missing) => {
                 bail!("Goal completion lost its execution fence")
+            }
+            Err(error) => {
+                return Err(self
+                    .fail_with(
+                        scope,
+                        LIFECYCLE_PERSISTENCE_FAILED,
+                        with_visible_context(error, "failed to record Goal completion"),
+                    )
+                    .await);
             }
         }
         Ok(())
@@ -406,12 +445,23 @@ impl GoalExecutionEngine {
                 scope.execution_epoch(),
                 pause,
             )
-            .await?
+            .await
         {
-            GoalTransitionResult::Applied => Ok(()),
-            GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
-                bail!("Goal verifier pause lost its execution fence")
-            }
+            Ok(GoalTransitionResult::Applied) => Ok(()),
+            Ok(GoalTransitionResult::Stale | GoalTransitionResult::Missing) => Err(self
+                .fail_with(
+                    scope,
+                    LIFECYCLE_PERSISTENCE_FAILED,
+                    anyhow::Error::msg("Goal verifier pause lost its execution fence"),
+                )
+                .await),
+            Err(error) => Err(self
+                .fail_with(
+                    scope,
+                    LIFECYCLE_PERSISTENCE_FAILED,
+                    with_visible_context(error, "failed to record Goal verifier pause"),
+                )
+                .await),
         }
     }
 
