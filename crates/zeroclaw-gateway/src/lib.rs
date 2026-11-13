@@ -3578,6 +3578,7 @@ struct GatewayChatDispatchCapture {
     message: String,
     session_id: Option<String>,
     agent_override: Option<String>,
+    is_messaging_channel_turn: bool,
 }
 
 #[cfg(test)]
@@ -3619,6 +3620,7 @@ fn record_gateway_chat_dispatch_for_test(
     message: &str,
     session_id: Option<&str>,
     agent_override: Option<&str>,
+    is_messaging_channel_turn: bool,
 ) {
     GATEWAY_CHAT_DISPATCH_CAPTURES
         .lock()
@@ -3627,6 +3629,7 @@ fn record_gateway_chat_dispatch_for_test(
             message: message.to_string(),
             session_id: session_id.map(ToString::to_string),
             agent_override: agent_override.map(ToString::to_string),
+            is_messaging_channel_turn,
         });
 }
 
@@ -3635,6 +3638,7 @@ pub(crate) async fn run_gateway_chat_with_tools(
     message: &str,
     session_id: Option<&str>,
     agent_override: Option<&str>,
+    is_messaging_channel_turn: bool,
 ) -> anyhow::Result<GatewayChatOutcome> {
     if let Some(err) = needs_quickstart_for(&state.model) {
         return Err(err);
@@ -3646,7 +3650,12 @@ pub(crate) async fn run_gateway_chat_with_tools(
     // doesn't go through the cost-tracking scope.
     #[cfg(test)]
     {
-        record_gateway_chat_dispatch_for_test(message, session_id, agent_override);
+        record_gateway_chat_dispatch_for_test(
+            message,
+            session_id,
+            agent_override,
+            is_messaging_channel_turn,
+        );
         let response = state
             .model_provider
             .chat_with_system(None, message, &state.model, state.temperature)
@@ -3709,6 +3718,7 @@ pub(crate) async fn run_gateway_chat_with_tools(
                     session_id,
                     zeroclaw_api::ingress::TurnOrigin::Interactive,
                     Some(execution_admission),
+                    is_messaging_channel_turn,
                 ),
             ),
         ))
@@ -4206,7 +4216,14 @@ async fn handle_webhook(
         .await;
     }
 
-    match run_gateway_chat_with_tools(&state, message, session_id.as_deref(), agent_override).await
+    match run_gateway_chat_with_tools(
+        &state,
+        message,
+        session_id.as_deref(),
+        agent_override,
+        false,
+    )
+    .await
     {
         Ok(GatewayChatOutcome { response, .. }) => {
             let duration = started_at.elapsed();
@@ -4680,7 +4697,7 @@ async fn dispatch_gateway_turn_streaming(
             .await;
         }
 
-        record_gateway_chat_dispatch_for_test(message, session_id, agent_override);
+        record_gateway_chat_dispatch_for_test(message, session_id, agent_override, false);
         let call =
             state
                 .model_provider
@@ -11016,6 +11033,89 @@ data: [DONE]\n\n";
         );
     }
 
+    #[cfg(feature = "a2a")]
+    #[tokio::test]
+    async fn a2a_dispatch_is_not_a_messaging_channel_turn() {
+        use axum::{body::Body, http::Request};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+        use zeroclaw_config::{multi_agent::AgentA2aConfig, schema::AliasedAgentConfig};
+
+        let _capture_guard = lock_gateway_chat_dispatch_capture_for_test().await;
+        let mut state = sse_test_state(Arc::new(MockModelProvider::default()));
+        let mut config = Config::default();
+        config.a2a.server.enabled = true;
+        config.agents.insert(
+            "surface-agent".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                a2a: AgentA2aConfig {
+                    published: true,
+                    exposed_skills: Vec::new(),
+                },
+                ..Default::default()
+            },
+        );
+        let authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
+        state.config = authority.live_handle();
+        state.agent_lifecycle = authority.agent_lifecycle();
+        state.config_authority = authority;
+        state.pairing = Arc::new(PairingGuard::new(true, &[], PairingCodePolicy::default()));
+        let code = state
+            .pairing
+            .generate_new_pairing_code(PairingCodePolicy::default())
+            .expect("pairing code");
+        let token = state
+            .pairing
+            .try_pair(&code, "surface-fixture")
+            .await
+            .expect("pairing request")
+            .expect("paired token");
+        let message = "a2a non-messaging surface";
+        let response = a2a::a2a_task_route()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/a2a/surface-agent")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header("A2A-Version", "1.0")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "SendMessage",
+                            "params": { "message": {
+                                "messageId": "surface-message", "role": "ROLE_USER",
+                                "parts": [{ "text": message }]
+                            }}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            result["result"]["task"]["status"]["state"],
+            "TASK_STATE_COMPLETED"
+        );
+        let captures = gateway_chat_dispatch_captures_for_test();
+        let capture = captures
+            .iter()
+            .find(|capture| capture.message == message)
+            .expect("authenticated A2A request must dispatch");
+        assert!(
+            !capture.is_messaging_channel_turn,
+            "A2A must remain a direct surface"
+        );
+        assert_eq!(capture.agent_override.as_deref(), Some("surface-agent"));
+    }
+
     #[tokio::test]
     async fn webhook_sse_streams_cumulative_token_then_done() {
         let _capture_guard = lock_gateway_chat_dispatch_capture_for_test().await;
@@ -11066,16 +11166,19 @@ data: [DONE]\n\n";
         assert!(
             captures
                 .iter()
-                .any(|capture| capture.message == "sse cumulative hello"),
+                .any(|capture| capture.message == "sse cumulative hello"
+                    && !capture.is_messaging_channel_turn),
             "streamed dispatch must record the same capture as the JSON path"
         );
     }
 
     #[tokio::test]
     async fn webhook_stream_true_without_sse_accept_keeps_json() {
+        let _capture_guard = lock_gateway_chat_dispatch_capture_for_test().await;
         let state = sse_test_state(Arc::new(MockModelProvider::default()));
+        let message = "generic webhook direct surface";
         let body = Ok(Json(WebhookBody {
-            message: "hello".into(),
+            message: message.into(),
             stream: true,
         }));
 
@@ -11093,6 +11196,15 @@ data: [DONE]\n\n";
         let payload = response.into_body().collect().await.unwrap().to_bytes();
         let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
         assert_eq!(parsed["response"], "ok");
+        let captures = gateway_chat_dispatch_captures_for_test();
+        let capture = captures
+            .iter()
+            .find(|capture| capture.message == message)
+            .expect("generic JSON webhook must dispatch");
+        assert!(
+            !capture.is_messaging_channel_turn,
+            "generic webhooks must remain a direct surface"
+        );
     }
 
     #[tokio::test]
@@ -13761,6 +13873,7 @@ data: [DONE]\n\n";
     #[cfg(feature = "channel-nextcloud")]
     #[tokio::test]
     async fn nextcloud_talk_webhook_returns_before_llm_call_completes() {
+        let _capture_guard = lock_gateway_chat_dispatch_capture_for_test().await;
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let provider_impl = Arc::new(SlowProvider {
             calls: AtomicUsize::new(0),
@@ -13784,7 +13897,7 @@ data: [DONE]\n\n";
             Arc::new(|| vec!["*".to_string()]),
         ));
 
-        let body = r#"{"type":"message","object":{"token":"room-token"},"actor":{"id":"user_a","name":"User A"},"message":{"actorType":"users","actorId":"user_a","message":"hello"}}"#;
+        let body = r#"{"type":"message","object":{"token":"room-token"},"actor":{"id":"user_a","name":"User A"},"message":{"actorType":"users","actorId":"user_a","message":"nextcloud messaging surface"}}"#;
         let signature = compute_nextcloud_signature_hex(secret, random, body);
 
         let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(Config::default());
@@ -13893,6 +14006,15 @@ data: [DONE]\n\n";
             .expect("spawned LLM call did not start within 2s")
             .expect("started_tx sender was dropped");
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+        let captures = gateway_chat_dispatch_captures_for_test();
+        let capture = captures
+            .iter()
+            .find(|capture| capture.message == "nextcloud messaging surface")
+            .expect("authenticated Nextcloud must dispatch before the provider completes");
+        assert!(
+            capture.is_messaging_channel_turn,
+            "fast-ack Nextcloud is a messaging turn"
+        );
     }
 
     // ══════════════════════════════════════════════════════════
@@ -15310,6 +15432,10 @@ data: [DONE]\n\n";
             .find(|capture| capture.message == message)
             .expect("Linq webhook should dispatch the inbound message");
         assert_eq!(capture.agent_override.as_deref(), Some("beta"));
+        assert!(
+            capture.is_messaging_channel_turn,
+            "authenticated Linq is a messaging turn"
+        );
         let session_id = capture
             .session_id
             .as_deref()
@@ -15740,10 +15866,12 @@ data: [DONE]\n\n";
         assert_eq!(
             gateway_chat_dispatch_captures_for_test()
                 .iter()
-                .filter(|capture| capture.message == ordinary_text)
+                .filter(
+                    |capture| capture.message == ordinary_text && capture.is_messaging_channel_turn
+                )
                 .count(),
             1,
-            "a non-approval message must still dispatch through the gateway"
+            "an authenticated WhatsApp non-approval message must dispatch as a messaging turn"
         );
     }
 
