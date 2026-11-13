@@ -77,6 +77,7 @@ import {
   secretMapEntryKey,
   secretMapKeyError,
 } from "./secretMap.logic";
+import { isOptionTypeHint, parseNumberDraft } from "./numberInput.logic";
 import { isLocalModelProviderName, primeModelProviderCatalog } from "../../lib/modelProviders";
 import EntityEnabledToggle from "../EntityEnabledToggle";
 
@@ -407,8 +408,8 @@ function parseInput(entry: ListResponseEntry, raw: string): unknown {
       }
     }
     case "number": {
-      const n = Number(raw);
-      return Number.isNaN(n) ? raw : n;
+      // Section Save and Save all parse here; optional clears must stay `null`.
+      return parseNumberDraft(entry.type_hint, raw);
     }
     default:
       return raw;
@@ -486,7 +487,7 @@ function isReferenceField(typeHint: string): boolean {
 // are excused by `treatAsOptional` at the call site, not here, so a genuinely
 // required ref like `model_provider` keeps its hint.)
 function isRequiredField(typeHint: string): boolean {
-  return !typeHint.replace(/\s+/g, "").startsWith("Option<");
+  return !isOptionTypeHint(typeHint);
 }
 
 // MCP server entries (`mcp.servers.<name>.<leaf>`) carry a transport-conditional

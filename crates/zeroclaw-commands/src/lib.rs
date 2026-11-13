@@ -1,5 +1,7 @@
 //! Shared built-in channel slash command catalogue.
 
+pub mod goal;
+
 use serde::Serialize;
 
 /// User-facing surface where a command can be advertised or accepted.
@@ -36,7 +38,7 @@ pub enum BuiltinCommandId {
     Config,
     /// Show or change model thinking/reasoning effort.
     Thinking,
-    /// Manage durable goal-mode work.
+    /// Goal command identity retained while admission is not yet wired.
     Goal,
 }
 
@@ -64,7 +66,7 @@ pub enum CommandExecution {
     ClientLocal,
     /// The channel/runtime command handler owns the command.
     RuntimeCommand,
-    /// The durable goal controller/admission path owns the command.
+    /// Goal admission ownership retained while admission is not yet wired.
     GoalAdmission,
 }
 
@@ -189,15 +191,6 @@ static BUILTIN_COMMANDS: &[CommandSpec] = &[
         description_key: "command-thinking-description",
         surfaces: CHANNEL_ONLY,
         execution: CommandExecution::RuntimeCommand,
-    },
-    CommandSpec {
-        id: BuiltinCommandId::Goal,
-        name: "goal",
-        aliases: &[],
-        usage: "/goal <start <objective>|objective <objective>|status|budget|pause|resume [reason]|cancel|help> ...",
-        description_key: "command-goal-description",
-        surfaces: CHANNEL_ONLY,
-        execution: CommandExecution::GoalAdmission,
     },
 ];
 
@@ -333,18 +326,13 @@ mod tests {
     }
 
     #[test]
-    fn goal_is_advertised_only_where_admission_is_implemented() {
-        assert!(parse_command_token("/goal", CommandSurface::Web).is_none());
-        assert!(parse_command_token("/goal", CommandSurface::Tui).is_none());
-        assert!(parse_command_token("/goal", CommandSurface::Channel).is_some());
-        let goal = command_by_name("/goal").expect("goal command should be registered");
-        assert!(
-            goal.usage.contains("start <objective>"),
-            "goal command usage must advertise the required start objective"
+    fn dormant_goal_parser_does_not_advertise_an_unwired_command() {
+        assert_eq!(BuiltinCommandId::Goal.as_str(), "goal");
+        assert_ne!(
+            CommandExecution::GoalAdmission,
+            CommandExecution::RuntimeCommand
         );
-        assert!(
-            goal.usage.contains("objective <objective>"),
-            "goal command usage must advertise objective amendment syntax"
-        );
+        assert!(parse_command_token("/goal", CommandSurface::Channel).is_none());
+        assert!(command_by_name("/goal").is_none());
     }
 }
