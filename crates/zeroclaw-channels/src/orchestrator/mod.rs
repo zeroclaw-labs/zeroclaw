@@ -20917,28 +20917,32 @@ pub(crate) mod tests {
                 ..Default::default()
             },
         );
-        config.providers.models.custom.insert(
-            "capacity".to_string(),
-            zeroclaw_config::schema::CustomModelProviderConfig {
-                base: zeroclaw_config::schema::ModelProviderConfig {
-                    model: Some("test-model".to_string()),
-                    context_window: Some(64),
-                    ..Default::default()
-                },
-            },
-        );
+        config.providers = toml::from_str(
+            r#"
+[connections."gateway.capacity"]
+kind = "custom"
+capabilities = ["chat"]
+
+[models."chat.capacity"]
+capability = "chat"
+provider = "gateway.capacity"
+model = "test-model"
+metadata = { context_window = 64 }
+"#,
+        )
+        .unwrap();
         let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
             channel_impl.clone(),
             provider.clone(),
             config,
             zeroclaw_config::schema::AliasedAgentConfig::default(),
-            "custom.capacity",
+            "chat.capacity",
             None,
         );
         ctx.provider_cache
             .lock()
             .unwrap()
-            .insert("custom.capacity".to_string(), provider.clone());
+            .insert("chat.capacity".to_string(), provider.clone());
         let msg = ChannelMessage {
             id: "matrix-capacity-error".to_string(),
             explicitly_addressed: true,
@@ -20965,7 +20969,7 @@ pub(crate) mod tests {
             ctx.provider_cache
                 .lock()
                 .unwrap()
-                .contains_key("custom.capacity")
+                .contains_key("chat.capacity")
         );
         assert!(!channel_impl.cancelled_drafts.lock().await.is_empty());
 
@@ -23914,20 +23918,31 @@ model = "classifier-id"
 schema_version = 4
 
 [agents.agent_a]
-model_provider = "openrouter.hot"
+model_provider = "chat.hot"
 
 [agents.agent_b]
-model_provider = "anthropic.default"
+model_provider = "chat.cold"
 
-[providers.models.openrouter.hot]
-model = "hot-model"
-api_key = "hot-key"
+[providers.connections."gateway.hot"]
+kind = "custom"
 uri = "https://hot.example.test/v1"
-temperature = 0.2
+auth = { mode = "api_key", api_key = "hot-key" }
 
-[providers.models.anthropic.default]
+[providers.connections."gateway.cold"]
+kind = "custom"
+uri = "https://cold.example.test/v1"
+auth = { mode = "api_key", api_key = "cold-key" }
+
+[providers.models."chat.hot"]
+capability = "chat"
+provider = "gateway.hot"
+model = "hot-model"
+options = { temperature = 0.2 }
+
+[providers.models."chat.cold"]
+capability = "chat"
+provider = "gateway.cold"
 model = "cold-model"
-api_key = "cold-key"
 "#,
         )
         .await
@@ -23937,7 +23952,7 @@ api_key = "cold-key"
             .await
             .unwrap();
 
-        assert_eq!(defaults.default_model_provider, "openrouter.hot");
+        assert_eq!(defaults.default_model_provider, "chat.hot");
         assert_eq!(defaults.model, "hot-model");
         let registry = config.provider_registry().unwrap();
         let selected = registry
