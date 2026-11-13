@@ -274,3 +274,18 @@ tool-a2a-cancel = Cancel an in-flight A2A task on a peer. Returns the updated Ta
 tool-a2a-cancel-desc-peer = Configured peer name hosting the task.
 tool-a2a-cancel-desc-task-id = The task id to cancel.
 tool-a2a-cancel-desc-agent = Optional agent alias or tenant that created the task (from a2a_send). Helps route the cancel to the correct interface when discovery is re-run (the cached route is used first).
+
+# Scoped HTTP credentials
+tool-http-credential-reference = Invalid external credential reference
+tool-http-credential-lookup = External credential lookup failed
+tool-http-credential-timeout = External credential lookup timed out
+tool-http-credential-value = Invalid external credential value
+tool-http-credential-store = Credential store unavailable
+tool-http-credential-missing = Scoped HTTP credential unavailable
+tool-http-credential-invalid = Invalid stored HTTP credential
+tool-http-credential-origin = Scoped HTTP credential does not allow this HTTPS origin
+tool-http-credential-kind = SSH keys cannot authenticate HTTP requests
+tool-http-credential-argument = 'credential' must be a string
+tool-http-credential-exclusive = Choose credential or auth_secret, not both
+tool-http-credential-host = A custom Host header is forbidden when using a scoped credential.
+tool-http-credential-alias = Credential alias must contain 1 to 64 ASCII letters, numbers, underscores, or hyphens.
