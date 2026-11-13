@@ -141,7 +141,7 @@ The following built-in capabilities are available when compiled and selected, wh
 | `glob_search` | List files matching a glob pattern within the workspace |
 | `content_search` | Search file contents by regex within the workspace (ripgrep with grep fallback) |
 | `http_request` | HTTP GET/POST/PUT/DELETE/PATCH/HEAD/OPTIONS to allowlisted domains |
-| `web_search_tool` | Web search. Provider is configurable: DuckDuckGo (default, no key), Brave, Tavily, SearXNG, Jina, Bocha, AnySearch, Serply, or Keenable (no key required; optional key lifts rate limits) |
+| `web_search_tool` | Web search. Provider is configurable: DuckDuckGo (default, no key), Brave, Tavily, SearXNG, Jina, Bocha, AnySearch, Serply, Keenable (no key required; optional key lifts rate limits), or Firecrawl |
 | `web_fetch` | Fetch a page and return clean plain text |
 | `browser` | Headless-browser automation. Opt-in: requires `[browser] automation_enabled = true`. See [Browser automation](./browser.md) |
 | `memory_recall` | Search long-term memory for relevant facts, preferences, or context |
@@ -166,6 +166,26 @@ ZeroClaw sends it only as a Bearer authorization header; without a key, no
 `Authorization` header is sent. Selecting this provider therefore sends search
 queries to a third-party service even in anonymous mode. It does not change the
 default provider and is not used as an automatic fallback.
+
+### Firecrawl provider
+
+Firecrawl is an explicit, opt-in backend for `web_search_tool`:
+
+```toml
+[web_search]
+search_provider = "firecrawl"
+firecrawl_api_key = "..."
+```
+
+Search queries, the configured result limit and a fixed `origin` identifier
+(`zeroclaw`) are sent to `https://api.firecrawl.dev/v2/search`. ZeroClaw sends
+the key only as a Bearer authorization header, and the request asks for web
+results only, so each result is a title, URL, and short description like the
+other providers. Use `web_fetch` to read a full page; its optional Firecrawl
+fallback is configured separately under `[web_fetch.firecrawl]` and uses its own
+key. Selecting this provider
+sends search queries to a third-party service. It does not change the default
+provider and is not used as an automatic fallback.
 
 Additional first-party built-ins, included in full but not in minimal:
 
