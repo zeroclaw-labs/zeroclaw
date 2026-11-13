@@ -155,6 +155,10 @@ token-bearing response to `<workspace>/state/costs.jsonl`, one JSON object
 per line. The ledger is read on startup so the dashboard's current-month
 per-agent rollup survives restarts.
 
+When actual provider-route attribution is available, a `CostRecord` can also
+carry `provider_ref`. Older rows may omit it and deserialize without it; the
+field does not change the ledger's existing ownership or pricing rules.
+
 Each `TokenUsage` record carries two pricing-provenance fields:
 
 - `unpriced_tokens`: the input, cached-input, or output token subset whose

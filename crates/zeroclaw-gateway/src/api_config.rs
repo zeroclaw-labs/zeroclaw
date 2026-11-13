@@ -358,8 +358,18 @@ fn lookup_prop_field(
 fn scoped_validate(
     working: &zeroclaw_config::schema::Config,
     baseline: &zeroclaw_config::schema::Config,
+    can_read_config: bool,
 ) -> Result<Vec<zeroclaw_config::validation_warnings::ValidationWarning>, ConfigApiError> {
-    let warnings = working.validate_edit_against(baseline)?;
+    let warnings = working.validate_edit_against(baseline).map_err(|error| {
+        if can_read_config {
+            error
+        } else {
+            ConfigApiError::new(
+                ConfigApiCode::ValidationFailed,
+                "Configuration validation failed; Config read access is required for details",
+            )
+        }
+    })?;
     for warning in &warnings {
         ::zeroclaw_log::record!(
             WARN,
@@ -374,6 +384,24 @@ fn scoped_validate(
         );
     }
     Ok(warnings)
+}
+
+/// Preserve the warning signal without disclosing unrelated configuration to
+/// a caller who is authorized to write but has no Config read grant.
+fn redact_write_only_warnings(
+    warnings: &mut Vec<zeroclaw_config::validation_warnings::ValidationWarning>,
+    can_read_config: bool,
+) {
+    if !can_read_config && !warnings.is_empty() {
+        warnings.clear();
+        warnings.push(
+            zeroclaw_config::validation_warnings::ValidationWarning::new(
+                "config_warning_details_hidden",
+                "Configuration warnings exist; Config read access is required for details",
+                "configuration",
+            ),
+        );
+    }
 }
 
 /// Map a config-commit admission/allocate failure (generation closing,
@@ -1069,16 +1097,9 @@ pub async fn handle_prop_put(
     }
 
     let before = state.config.read().clone();
-    let scoped_validation_warnings = match scoped_validate(&new_config, &before) {
-        Ok(ws) => ws,
-        Err(err) => return error_response(err),
-    };
-
-    let mut warnings = new_config.collect_warnings();
-    warnings.extend(scoped_validation_warnings);
     // The complete write set, classified against the configuration being
     // replaced: a PUT under a map key that did not exist is the creation
-    // it is. Authorized before the persist and the comment write below.
+    // it is. Authorize before validation can reveal unrelated config details.
     let authorization = match authorize_config_write(
         &principal,
         ConfigWriteSet::by_effect(
@@ -1091,6 +1112,15 @@ pub async fn handle_prop_put(
         Ok(authorization) => authorization,
         Err(denied) => return denied.into_response(),
     };
+    let scoped_validation_warnings =
+        match scoped_validate(&new_config, &before, authorization.can_read_config()) {
+            Ok(ws) => ws,
+            Err(err) => return error_response(err),
+        };
+
+    let mut warnings = new_config.collect_warnings();
+    warnings.extend(scoped_validation_warnings);
+    redact_write_only_warnings(&mut warnings, authorization.can_read_config());
     let agent_config_reservation =
         match zeroclaw_config::alias_refs::agent_alias_for_prop_path(&body.path)
             .map(|alias| state.agent_lifecycle.reserve_config_mutation(alias))
@@ -1159,15 +1189,9 @@ pub async fn handle_prop_delete(
     }
 
     let before = state.config.read().clone();
-    let scoped_validation_warnings = match scoped_validate(&new_config, &before) {
-        Ok(ws) => ws,
-        Err(err) => return error_response(err),
-    };
-
-    let mut warnings = new_config.collect_warnings();
-    warnings.extend(scoped_validation_warnings);
     // Clearing a scalar prop leaves the field declared, so the effect diff
     // alone would read as an update; the route's semantics are a removal.
+    // Authorize before validation can reveal unrelated config details.
     let authorization = match authorize_config_write(
         &principal,
         ConfigWriteSet::by_effect(
@@ -1181,6 +1205,15 @@ pub async fn handle_prop_delete(
         Ok(authorization) => authorization,
         Err(denied) => return denied.into_response(),
     };
+    let scoped_validation_warnings =
+        match scoped_validate(&new_config, &before, authorization.can_read_config()) {
+            Ok(ws) => ws,
+            Err(err) => return error_response(err),
+        };
+
+    let mut warnings = new_config.collect_warnings();
+    warnings.extend(scoped_validation_warnings);
+    redact_write_only_warnings(&mut warnings, authorization.can_read_config());
     let agent_config_reservation =
         match zeroclaw_config::alias_refs::agent_alias_for_prop_path(&q.path)
             .map(|alias| state.agent_lifecycle.reserve_config_mutation(alias))
@@ -2806,13 +2839,30 @@ pub async fn handle_patch(
         }
     }
 
+    let before = state.config.read().clone();
+    // The batch's complete write set: every member's path classified by
+    // effect against the configuration being replaced, `remove` pinned to
+    // the removal it is. Authorize the whole batch before validation can
+    // reveal unrelated config details.
+    let mut writes = ConfigWriteSet::by_effect(
+        &before,
+        &working,
+        working.dirty_paths.iter().map(String::as_str),
+    );
+    for op in ops.iter().filter(|op| op.op == "remove") {
+        writes = writes.with(json_pointer_to_dotted(&op.path), Verb::Delete);
+    }
+    let authorization = match authorize_config_write(&principal, writes, &_cfg_guard) {
+        Ok(authorization) => authorization,
+        Err(denied) => return denied.into_response(),
+    };
     // Per-PATCH validation is classified against the pre-edit baseline. See
     // `scoped_validate` for the contract.
-    let before = state.config.read().clone();
-    let scoped_validation_warnings = match scoped_validate(&working, &before) {
-        Ok(ws) => ws,
-        Err(err) => return error_response(err),
-    };
+    let scoped_validation_warnings =
+        match scoped_validate(&working, &before, authorization.can_read_config()) {
+            Ok(ws) => ws,
+            Err(err) => return error_response(err),
+        };
 
     // Collect (path, comment) pairs from any op that supplied a non-None
     // comment. Applied after save() so the comment-preserving sync_table
@@ -2829,22 +2879,7 @@ pub async fn handle_patch(
     // callers see it.
     let mut warnings = working.collect_warnings();
     warnings.extend(scoped_validation_warnings);
-    // The batch's complete write set: every member's path classified by
-    // effect against the configuration being replaced, `remove` pinned to
-    // the removal it is. One unauthorized member refuses the whole batch
-    // before anything is written.
-    let mut writes = ConfigWriteSet::by_effect(
-        &before,
-        &working,
-        working.dirty_paths.iter().map(String::as_str),
-    );
-    for op in ops.iter().filter(|op| op.op == "remove") {
-        writes = writes.with(json_pointer_to_dotted(&op.path), Verb::Delete);
-    }
-    let authorization = match authorize_config_write(&principal, writes, &_cfg_guard) {
-        Ok(authorization) => authorization,
-        Err(denied) => return denied.into_response(),
-    };
+    redact_write_only_warnings(&mut warnings, authorization.can_read_config());
     let mut agent_config_reservations = Vec::with_capacity(agent_aliases.len());
     for alias in agent_aliases {
         match state.agent_lifecycle.reserve_config_mutation(&alias) {
@@ -2931,11 +2966,8 @@ pub async fn handle_init(
     }
 
     let before = state.config.read().clone();
-    if let Err(err) = scoped_validate(&working, &before) {
-        return error_response(err);
-    }
     // Initialization brings whole sections into being; each is a creation
-    // in the write set.
+    // in the write set. Authorize before validation reveals config details.
     let writes = initialized.iter().fold(
         ConfigWriteSet::by_effect(
             &before,
@@ -2948,6 +2980,9 @@ pub async fn handle_init(
         Ok(authorization) => authorization,
         Err(denied) => return denied.into_response(),
     };
+    if let Err(err) = scoped_validate(&working, &before, authorization.can_read_config()) {
+        return error_response(err);
+    }
     if let Err(e) = persist_and_swap(&state, authorization, working, _cfg_guard).await {
         return e;
     }

@@ -481,6 +481,11 @@ impl fmt::Debug for GoalVerifierTurn {
 /// Surface-owned foreground execution bridge. It retains the live-session
 /// guard and one foreground slot for its lifetime, but has no lifecycle or
 /// ledger authority; the later executor owns both around these calls.
+///
+/// Parent and verifier calls run inside `GOAL_OPERATION_ACCOUNTING`. Tokio
+/// task-local values do not automatically follow spawned tasks: an implementor
+/// that spawns model work must carry and re-enter that accounting scope, and
+/// must not return before the work and its settlement finish.
 #[async_trait]
 pub trait GoalSessionExecutionLease: Send {
     /// Exact live session retained by this foreground lease.

@@ -127,6 +127,12 @@ Secret and initialization responses keep their documented shapes and do not
 include warnings. A pre-existing error retained during one of those writes is
 saved unchanged and reported only in the gateway log.
 
+The complete write set is authorized before this cross-field validation. A
+caller without `Config:Read` receives a generic validation failure instead of
+configuration details. On successful writes, any warnings are represented by
+one `config_warning_details_hidden` warning; callers with read access receive
+the full warnings. Secret and initialization responses still omit warnings.
+
 For lists addressed by a natural key, indexed validation diagnostics are matched
 to the edited entry when its identity can be resolved. An ambiguous or unknown
 identity is treated as related to the edit and rejected. Removing or reordering

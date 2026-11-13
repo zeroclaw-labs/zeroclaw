@@ -543,9 +543,15 @@ pub struct ConfigWriteAuthorization {
     /// wildcard selector.
     enforced: Option<ConfigWriteSet>,
     authority: Option<Arc<GatewayInboundAuth>>,
+    can_read_config: bool,
 }
 
 impl ConfigWriteAuthorization {
+    /// Whether this caller may receive diagnostics about other config paths.
+    pub(crate) fn can_read_config(&self) -> bool {
+        self.can_read_config
+    }
+
     /// Refuse when `dirty`, the paths about to be persisted, reaches
     /// beyond the authorized write set: the handler could not identify its
     /// complete write set up front, and a scoped principal is refused
@@ -587,10 +593,14 @@ impl ConfigWriteAuthorization {
     }
 }
 
-fn unenforced(authority: Option<Arc<GatewayInboundAuth>>) -> ConfigWriteAuthorization {
+fn unenforced(
+    authority: Option<Arc<GatewayInboundAuth>>,
+    can_read_config: bool,
+) -> ConfigWriteAuthorization {
     ConfigWriteAuthorization {
         enforced: None,
         authority,
+        can_read_config,
     }
 }
 
@@ -631,15 +641,15 @@ pub fn authorize_config_write(
     guard: &ConfigWriteGuard,
 ) -> Result<ConfigWriteAuthorization, WriteDenied> {
     let Some(axum::Extension(request)) = request else {
-        return Ok(unenforced(None));
+        return Ok(unenforced(None, true));
     };
     let authority = Some(Arc::clone(&request.authority));
     let Some(conn) = &request.principal else {
-        return Ok(unenforced(authority));
+        return Ok(unenforced(authority, true));
     };
     let grants = current_grants(request, conn, guard)?;
     if grants.admin {
-        return Ok(unenforced(authority));
+        return Ok(unenforced(authority, true));
     }
     for (path, verb) in &writes.writes {
         if !grants.permits(Resource::Config, *verb) {
@@ -657,6 +667,7 @@ pub fn authorize_config_write(
     Ok(ConfigWriteAuthorization {
         enforced: Some(writes),
         authority,
+        can_read_config: may_read_config(&grants),
     })
 }
 
@@ -670,15 +681,15 @@ pub fn authorize_whole_config_write(
     guard: &ConfigWriteGuard,
 ) -> Result<ConfigWriteAuthorization, WriteDenied> {
     let Some(axum::Extension(request)) = request else {
-        return Ok(unenforced(None));
+        return Ok(unenforced(None, true));
     };
     let authority = Some(Arc::clone(&request.authority));
     let Some(conn) = &request.principal else {
-        return Ok(unenforced(authority));
+        return Ok(unenforced(authority, true));
     };
     let grants = current_grants(request, conn, guard)?;
     if grants.admin {
-        return Ok(unenforced(authority));
+        return Ok(unenforced(authority, true));
     }
     for verb in verbs {
         if !grants.permits(Resource::Config, *verb) {
@@ -694,7 +705,7 @@ pub fn authorize_whole_config_write(
                 .to_owned(),
         ));
     }
-    Ok(unenforced(authority))
+    Ok(unenforced(authority, may_read_config(&grants)))
 }
 
 /// Route-layer middleware for the config/onboarding route group.
@@ -1298,6 +1309,196 @@ mod tests {
 
     fn put_model(alias: &str, model: &str) -> serde_json::Value {
         serde_json::json!({ "path": format!("agents.{alias}.workspace.path"), "value": model })
+    }
+
+    #[tokio::test]
+    async fn denied_config_writes_do_not_expose_cross_field_diagnostics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let idp = introspection_idp(&["ops"]).await;
+        // This principal may update a different Config path, but has no Read
+        // grant and cannot write the memory setting under test.
+        let mut config = editor_config(&tmp, &idp.uri(), &[Verb::Update], &["agents.public.*"]);
+        config.memory.backend = "sqlite".into();
+        config.memory.types.enabled = false;
+        config.memory.consolidation_extract_facts = false;
+        let mut private_agent = zeroclaw_config::schema::AliasedAgentConfig::default();
+        private_agent.memory.backend = zeroclaw_config::multi_agent::MemoryBackendKind::None;
+        config
+            .agents
+            .insert("private_fixture".into(), private_agent);
+        let router = router_for(config);
+
+        let put = serde_json::json!({ "path": "memory.types.enabled", "value": true });
+        let (status, body) = send(
+            &router,
+            "PUT",
+            "/api/config/prop",
+            OPERATOR.0,
+            OPERATOR.1,
+            Some(put.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.to_string().contains("private_fixture"), "{body}");
+
+        let patch = serde_json::json!([
+            { "op": "replace", "path": "/memory/types/enabled", "value": true }
+        ]);
+        for (method, path, input) in [
+            ("PUT", "/api/config/prop", put),
+            ("PATCH", "/api/config", patch),
+        ] {
+            let (status, body) = send(&router, method, path, SCOPED.0, SCOPED.1, Some(input)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method}: {body}");
+            assert!(
+                !body.to_string().contains("private_fixture"),
+                "{method}: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn denied_config_removals_do_not_expose_cross_field_diagnostics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let idp = introspection_idp(&["ops"]).await;
+        let mut config = editor_config(&tmp, &idp.uri(), &[Verb::Delete], &["agents.public.*"]);
+        config.memory.backend = "sqlite".into();
+        config.memory.types.enabled = true;
+        config.memory.consolidation_extract_facts = false;
+        let router = router_for(config);
+
+        let (status, body) = send(
+            &router,
+            "DELETE",
+            "/api/config/prop?path=memory.backend",
+            OPERATOR.0,
+            OPERATOR.1,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.to_string().contains("memory.types.enabled"), "{body}");
+
+        for (method, path, input) in [
+            ("DELETE", "/api/config/prop?path=memory.backend", None),
+            (
+                "PATCH",
+                "/api/config",
+                Some(serde_json::json!([{ "op": "remove", "path": "/memory/backend" }])),
+            ),
+        ] {
+            let (status, body) = send(&router, method, path, SCOPED.0, SCOPED.1, input).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method}: {body}");
+            assert!(
+                !body.to_string().contains("memory.types.enabled"),
+                "{method}: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn config_writer_without_read_does_not_receive_unrelated_warnings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reader_tmp = tempfile::tempdir().unwrap();
+        let idp = introspection_idp(&["ops"]).await;
+        let mut config = editor_config(&tmp, &idp.uri(), &[Verb::Update], &["agents.public.*"]);
+        config.memory.backend = "sqlite".into();
+        config.memory.types.enabled = true;
+        config.memory.consolidation_extract_facts = false;
+        for alias in ["private_one", "private_two"] {
+            let mut agent = zeroclaw_config::schema::AliasedAgentConfig::default();
+            agent.memory.backend = zeroclaw_config::multi_agent::MemoryBackendKind::None;
+            config.agents.insert(alias.into(), agent);
+        }
+        config.agents.insert(
+            "public".into(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        let mut reader_config = config.clone();
+        reader_config.config_path = reader_tmp.path().join("config.toml");
+        reader_config.data_dir = reader_tmp.path().join("data");
+        reader_config
+            .permission_profiles
+            .get_mut("config-reader")
+            .unwrap()
+            .grants
+            .insert(Resource::Config, vec![Verb::Read, Verb::Update]);
+        let router = router_for(config);
+        let reader_router = router_for(reader_config);
+
+        let (status, body) = send(
+            &router,
+            "PUT",
+            "/api/config/prop",
+            SCOPED.0,
+            SCOPED.1,
+            Some(put_model("public", "updated")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!body.to_string().contains("private_one"), "{body}");
+        assert!(!body.to_string().contains("private_two"), "{body}");
+        assert_eq!(body["warnings"][0]["code"], "config_warning_details_hidden");
+
+        let (status, body) = send(
+            &router,
+            "PATCH",
+            "/api/config",
+            SCOPED.0,
+            SCOPED.1,
+            Some(serde_json::json!([
+                { "op": "replace", "path": "/agents/public/workspace/path", "value": "patched" }
+            ])),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!body.to_string().contains("private_one"), "{body}");
+        assert!(!body.to_string().contains("private_two"), "{body}");
+        assert_eq!(body["warnings"][0]["code"], "config_warning_details_hidden");
+
+        // A scoped reader retains the full warnings after the same save.
+        let (status, body) = send(
+            &reader_router,
+            "PUT",
+            "/api/config/prop",
+            SCOPED.0,
+            SCOPED.1,
+            Some(put_model("public", "updated")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.to_string().contains("private_one"), "{body}");
+        assert!(body.to_string().contains("private_two"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn config_writer_without_read_receives_generic_validation_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let idp = introspection_idp(&["ops"]).await;
+        let mut config =
+            editor_config(&tmp, &idp.uri(), &[Verb::Update], &["memory.types.enabled"]);
+        config.memory.backend = "sqlite".into();
+        config.memory.types.enabled = false;
+        config.memory.consolidation_extract_facts = false;
+        let mut private_agent = zeroclaw_config::schema::AliasedAgentConfig::default();
+        private_agent.memory.backend = zeroclaw_config::multi_agent::MemoryBackendKind::None;
+        config
+            .agents
+            .insert("private_fixture".into(), private_agent);
+        let router = router_for(config);
+
+        let (status, body) = send(
+            &router,
+            "PUT",
+            "/api/config/prop",
+            SCOPED.0,
+            SCOPED.1,
+            Some(serde_json::json!({ "path": "memory.types.enabled", "value": true })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], "validation_failed", "{body}");
+        assert!(!body.to_string().contains("private_fixture"), "{body}");
     }
 
     #[tokio::test]
