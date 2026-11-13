@@ -247,8 +247,9 @@ pub(crate) async fn begin_goal_dispatch_if_scoped()
     }
 }
 
-/// Poll the dispatch once under its guard, then release it. The caller must
-/// not await other work between acquiring the guard and awaiting this future.
+/// Poll the dispatch once under its guard, then release it. Cancellation and
+/// timeout wrappers must remain outside this future: they can yield before
+/// polling their inner future and therefore are not the dispatch boundary.
 pub(crate) async fn release_after_first_poll<F: std::future::Future>(
     mut start: Option<zeroclaw_goal::task::GoalDispatchStart>,
     future: F,

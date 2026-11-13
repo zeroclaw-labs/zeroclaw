@@ -2857,7 +2857,8 @@ async fn run_tool_call_loop_impl<'a>(
         } else {
             None
         };
-        // Only synchronous work may occur before this future's first poll.
+        // The provider call retains the guard through dispatch entry, even if
+        // an outer cancellation select yields before polling its provider arm.
         let ProviderCallOutcome {
             chat_result,
             attempts,
@@ -2866,28 +2867,26 @@ async fn run_tool_call_loop_impl<'a>(
             streamed_protocol_suppressed,
             streamed_visible_text,
             image_recovery_succeeded,
-        } = crate::agent::cost::release_after_first_poll(
+        } = call_provider(
+            &ctx,
+            active_model_provider,
+            active_model_provider_name,
+            provider_request_model,
+            provider_dispatch_model,
+            zeroclaw_api::model_provider::ChatRequest {
+                messages: &provider_request_messages,
+                tools: request_tools,
+                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                    .try_with(Clone::clone)
+                    .ok()
+                    .flatten(),
+            },
+            image_recovery_messages.as_deref(),
+            should_consume_provider_stream,
+            policy,
+            iteration,
+            use_native_tools.then_some(iteration_tool_specs.tool_specs.as_slice()),
             dispatch_start,
-            call_provider(
-                &ctx,
-                active_model_provider,
-                active_model_provider_name,
-                provider_request_model,
-                provider_dispatch_model,
-                zeroclaw_api::model_provider::ChatRequest {
-                    messages: &provider_request_messages,
-                    tools: request_tools,
-                    thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                        .try_with(Clone::clone)
-                        .ok()
-                        .flatten(),
-                },
-                image_recovery_messages.as_deref(),
-                should_consume_provider_stream,
-                policy,
-                iteration,
-                use_native_tools.then_some(iteration_tool_specs.tool_specs.as_slice()),
-            ),
         )
         .await?;
         let accepted_request_messages = if image_recovery_succeeded {
