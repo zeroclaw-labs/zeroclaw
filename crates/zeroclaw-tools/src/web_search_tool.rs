@@ -2034,11 +2034,6 @@ fn render_results(header: String, blocks: Vec<Vec<String>>) -> String {
 }
 
 // ── DuckDuckGo scrape hygiene ────────────────────────────────────────────────
-//
-// The default provider scrapes `html.duckduckgo.com`, and DuckDuckGo blocks
-// machines that look automated — which is why this module ships block
-// detection at all. Two cheap signals are worth removing: a single fixed
-// User-Agent, and a burst of back-to-back requests with no human-scale gap.
 
 /// Realistic desktop browser User-Agents, rotated per request. A single fixed
 /// UA is a trivially stable fingerprint across every ZeroClaw install.

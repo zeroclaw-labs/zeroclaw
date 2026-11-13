@@ -40,6 +40,7 @@ fn migrate_v2(input: &str) -> toml::Value {
 #[test]
 fn chain_produces_valid_v3() {
     let cfg = v3_config();
+    assert_eq!(cfg.web_search.search_provider, "duckduckgo");
     assert_eq!(
         cfg.schema_version, CURRENT_SCHEMA_VERSION,
         "migrated config must carry current schema_version"
@@ -2132,6 +2133,12 @@ fn generate_every_version_migrates_and_validates() {
         let raw = generate(target, &GenerateOptions::default())
             .unwrap_or_else(|e| panic!("generate({target}) failed: {e:#}"));
         let parsed: toml::Value = toml::from_str(&raw).expect("generated config is TOML");
+        let (field, provider) = match target {
+            1 | 2 => ("provider", "duckduckgo"),
+            3 => ("search_provider", "duckduckgo"),
+            _ => ("search_provider", "parallel"),
+        };
+        assert_eq!(parsed["web_search"][field].as_str(), Some(provider));
         assert_eq!(
             parsed["tools"]["optional"],
             toml::Value::Array(vec![toml::Value::String("*".into())]),
@@ -3055,15 +3062,11 @@ fn v4_fixture_is_migration_idempotent() {
 }
 
 #[test]
-fn v1_to_v4_round_trip_matches_committed_fixture() {
-    // The fixture is the acceptance record of exactly what the chain produces
-    // from the V1 fixture, so compare the generated text byte for byte. (A
-    // loaded `Config` holds hash maps whose serialization order varies, so
-    // re-serialized configs are not comparable as strings.)
+fn generated_v4_matches_committed_fixture() {
     let generated = generate(4, &GenerateOptions::default()).expect("generate V4");
     assert!(
         generated == V4_FIXTURE,
-        "the V1 -> V4 chain drifted from fixtures/v4.toml; if intended, regenerate it with \
+        "generated V4 drifted from fixtures/v4.toml; if intended, regenerate it with \
          `zeroclaw config generate 4 > crates/zeroclaw-config/fixtures/v4.toml`"
     );
     let _: Config = toml::from_str(&generated).expect("generated V4 parses as Config");

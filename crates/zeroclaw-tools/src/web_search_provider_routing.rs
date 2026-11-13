@@ -1,3 +1,5 @@
+pub use zeroclaw_config::schema::DEFAULT_WEB_SEARCH_PROVIDER;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WebSearchProviderRoute {
     DuckDuckGo,
@@ -42,82 +44,40 @@ pub struct WebSearchProviderResolution {
     pub used_fallback: bool,
 }
 
-pub const DEFAULT_WEB_SEARCH_PROVIDER: &str = "duckduckgo";
-const BRAVE_PROVIDER: &str = "brave";
-const SEARXNG_PROVIDER: &str = "searxng";
-const TAVILY_PROVIDER: &str = "tavily";
-const JINA_PROVIDER: &str = "jina";
-const BOCHA_PROVIDER: &str = "bocha";
-const ANYSEARCH_PROVIDER: &str = "anysearch";
-const SERPLY_PROVIDER: &str = "serply";
-const KEENABLE_PROVIDER: &str = "keenable";
+fn named_provider(name: &str) -> Option<(WebSearchProviderRoute, &'static str)> {
+    use WebSearchProviderRoute as Route;
+
+    Some(match name {
+        "duckduckgo" | "ddg" | "duck-duck-go" | "duck_duck_go" => (Route::DuckDuckGo, "duckduckgo"),
+        "brave" | "brave-search" | "brave_search" => (Route::Brave, "brave"),
+        "searxng" | "searx" | "searx-ng" | "searx_ng" => (Route::SearXNG, "searxng"),
+        "tavily" | "tavily-search" | "tavily_search" => (Route::Tavily, "tavily"),
+        "jina" | "jina-ai" | "jina_ai" => (Route::Jina, "jina"),
+        "bocha" | "bochaai" | "bocha-ai" | "bocha_ai" | "bocha-search" | "bocha_search" => {
+            (Route::Bocha, "bocha")
+        }
+        "anysearch" | "any-search" | "any_search" => (Route::AnySearch, "anysearch"),
+        "serply" | "serply-search" | "serply_search" | "serply-io" | "serply_io" => {
+            (Route::Serply, "serply")
+        }
+        "keenable" | "keenable-search" | "keenable_search" => (Route::Keenable, "keenable"),
+        "parallel" => (Route::Parallel, "parallel"),
+        _ => return None,
+    })
+}
 
 pub fn resolve_web_search_provider(raw_model_provider: &str) -> WebSearchProviderResolution {
     let normalized = raw_model_provider.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "" | "default" | "duckduckgo" | "ddg" | "duck-duck-go" | "duck_duck_go" => {
-            WebSearchProviderResolution {
-                route: WebSearchProviderRoute::DuckDuckGo,
-                canonical_provider: DEFAULT_WEB_SEARCH_PROVIDER,
-                used_fallback: false,
-            }
-        }
-        "brave" | "brave-search" | "brave_search" => WebSearchProviderResolution {
-            route: WebSearchProviderRoute::Brave,
-            canonical_provider: BRAVE_PROVIDER,
-            used_fallback: false,
-        },
-        "searxng" | "searx" | "searx-ng" | "searx_ng" => WebSearchProviderResolution {
-            route: WebSearchProviderRoute::SearXNG,
-            canonical_provider: SEARXNG_PROVIDER,
-            used_fallback: false,
-        },
-        "tavily" | "tavily-search" | "tavily_search" => WebSearchProviderResolution {
-            route: WebSearchProviderRoute::Tavily,
-            canonical_provider: TAVILY_PROVIDER,
-            used_fallback: false,
-        },
-        "jina" | "jina-ai" | "jina_ai" => WebSearchProviderResolution {
-            route: WebSearchProviderRoute::Jina,
-            canonical_provider: JINA_PROVIDER,
-            used_fallback: false,
-        },
-        "bocha" | "bochaai" | "bocha-ai" | "bocha_ai" | "bocha-search" | "bocha_search" => {
-            WebSearchProviderResolution {
-                route: WebSearchProviderRoute::Bocha,
-                canonical_provider: BOCHA_PROVIDER,
-                used_fallback: false,
-            }
-        }
-        "anysearch" | "any-search" | "any_search" => WebSearchProviderResolution {
-            route: WebSearchProviderRoute::AnySearch,
-            canonical_provider: ANYSEARCH_PROVIDER,
-            used_fallback: false,
-        },
-        "serply" | "serply-search" | "serply_search" | "serply-io" | "serply_io" => {
-            WebSearchProviderResolution {
-                route: WebSearchProviderRoute::Serply,
-                canonical_provider: SERPLY_PROVIDER,
-                used_fallback: false,
-            }
-        }
-        "keenable" | "keenable-search" | "keenable_search" => WebSearchProviderResolution {
-            route: WebSearchProviderRoute::Keenable,
-            canonical_provider: KEENABLE_PROVIDER,
-            used_fallback: false,
-        },
-        "parallel" => WebSearchProviderResolution {
-            route: WebSearchProviderRoute::Parallel,
-            canonical_provider: "parallel",
-            used_fallback: false,
-        },
-        // Warns for unknown model_providers, falls back to default.
-        // Known non-default model_providers are matched above.
-        _ => WebSearchProviderResolution {
-            route: WebSearchProviderRoute::DuckDuckGo,
-            canonical_provider: DEFAULT_WEB_SEARCH_PROVIDER,
-            used_fallback: true,
-        },
+    let named = named_provider(&normalized);
+    let used_fallback = named.is_none() && !matches!(normalized.as_str(), "" | "default");
+    let (route, canonical_provider) = named.unwrap_or_else(|| {
+        named_provider(DEFAULT_WEB_SEARCH_PROVIDER)
+            .expect("the built-in default must name a provider")
+    });
+    WebSearchProviderResolution {
+        route,
+        canonical_provider,
+        used_fallback,
     }
 }
 
@@ -131,7 +91,7 @@ mod tests {
         for alias in ddg_aliases {
             let resolved = resolve_web_search_provider(alias);
             assert_eq!(resolved.route, WebSearchProviderRoute::DuckDuckGo);
-            assert_eq!(resolved.canonical_provider, DEFAULT_WEB_SEARCH_PROVIDER);
+            assert_eq!(resolved.canonical_provider, "duckduckgo");
             assert!(!resolved.used_fallback);
         }
     }
@@ -142,7 +102,7 @@ mod tests {
         for alias in brave_aliases {
             let resolved = resolve_web_search_provider(alias);
             assert_eq!(resolved.route, WebSearchProviderRoute::Brave);
-            assert_eq!(resolved.canonical_provider, BRAVE_PROVIDER);
+            assert_eq!(resolved.canonical_provider, "brave");
             assert!(!resolved.used_fallback);
         }
     }
@@ -153,7 +113,7 @@ mod tests {
         for alias in searxng_aliases {
             let resolved = resolve_web_search_provider(alias);
             assert_eq!(resolved.route, WebSearchProviderRoute::SearXNG);
-            assert_eq!(resolved.canonical_provider, SEARXNG_PROVIDER);
+            assert_eq!(resolved.canonical_provider, "searxng");
             assert!(!resolved.used_fallback);
         }
     }
@@ -164,7 +124,7 @@ mod tests {
         for alias in tavily_aliases {
             let resolved = resolve_web_search_provider(alias);
             assert_eq!(resolved.route, WebSearchProviderRoute::Tavily);
-            assert_eq!(resolved.canonical_provider, TAVILY_PROVIDER);
+            assert_eq!(resolved.canonical_provider, "tavily");
             assert!(!resolved.used_fallback);
         }
     }
@@ -175,7 +135,7 @@ mod tests {
         for alias in jina_aliases {
             let resolved = resolve_web_search_provider(alias);
             assert_eq!(resolved.route, WebSearchProviderRoute::Jina);
-            assert_eq!(resolved.canonical_provider, JINA_PROVIDER);
+            assert_eq!(resolved.canonical_provider, "jina");
             assert!(!resolved.used_fallback);
         }
     }
@@ -193,7 +153,7 @@ mod tests {
         for alias in bocha_aliases {
             let resolved = resolve_web_search_provider(alias);
             assert_eq!(resolved.route, WebSearchProviderRoute::Bocha);
-            assert_eq!(resolved.canonical_provider, BOCHA_PROVIDER);
+            assert_eq!(resolved.canonical_provider, "bocha");
             assert!(!resolved.used_fallback);
         }
     }
@@ -203,7 +163,7 @@ mod tests {
         for alias in ["anysearch", "any-search", "any_search"] {
             let resolved = resolve_web_search_provider(alias);
             assert_eq!(resolved.route, WebSearchProviderRoute::AnySearch);
-            assert_eq!(resolved.canonical_provider, ANYSEARCH_PROVIDER);
+            assert_eq!(resolved.canonical_provider, "anysearch");
             assert!(!resolved.used_fallback);
         }
     }
@@ -220,7 +180,7 @@ mod tests {
         for alias in serply_aliases {
             let resolved = resolve_web_search_provider(alias);
             assert_eq!(resolved.route, WebSearchProviderRoute::Serply);
-            assert_eq!(resolved.canonical_provider, SERPLY_PROVIDER);
+            assert_eq!(resolved.canonical_provider, "serply");
             assert!(!resolved.used_fallback);
         }
     }
@@ -231,41 +191,28 @@ mod tests {
         for alias in keenable_aliases {
             let resolved = resolve_web_search_provider(alias);
             assert_eq!(resolved.route, WebSearchProviderRoute::Keenable);
-            assert_eq!(resolved.canonical_provider, KEENABLE_PROVIDER);
+            assert_eq!(resolved.canonical_provider, "keenable");
             assert!(!resolved.used_fallback);
         }
     }
 
     #[test]
-    fn resolves_parallel() {
-        assert_eq!(
-            resolve_web_search_provider("parallel").route,
-            WebSearchProviderRoute::Parallel
-        );
+    fn default_and_explicit_parallel_route_without_fallback() {
+        for alias in ["", "   ", "default", "  DEFAULT ", "parallel"] {
+            let resolved = resolve_web_search_provider(alias);
+            assert_eq!(resolved.route, WebSearchProviderRoute::Parallel);
+            assert_eq!(resolved.canonical_provider, "parallel");
+            assert!(!resolved.used_fallback);
+        }
     }
 
     #[test]
-    fn resolve_unknown_provider_falls_back_to_default() {
-        let resolved = resolve_web_search_provider("bing");
-        assert_eq!(resolved.route, WebSearchProviderRoute::DuckDuckGo);
-        assert_eq!(resolved.canonical_provider, DEFAULT_WEB_SEARCH_PROVIDER);
-        assert!(resolved.used_fallback);
-
-        let resolved2 = resolve_web_search_provider("searxng-plus");
-        assert_eq!(resolved2.route, WebSearchProviderRoute::DuckDuckGo);
-        assert_eq!(resolved2.canonical_provider, DEFAULT_WEB_SEARCH_PROVIDER);
-        assert!(resolved2.used_fallback);
-    }
-
-    #[test]
-    fn empty_and_default_route_to_duckduckgo_without_fallback() {
-        for alias in ["", "default"] {
-            let r = resolve_web_search_provider(alias);
-            assert_eq!(r.route, WebSearchProviderRoute::DuckDuckGo);
-            assert_eq!(r.canonical_provider, DEFAULT_WEB_SEARCH_PROVIDER);
-            // An explicit empty / "default" is the configured default, not an
-            // unknown-provider fallback (so it must not set used_fallback).
-            assert!(!r.used_fallback);
+    fn unknown_provider_falls_back_to_parallel() {
+        for name in ["bing", "searxng-plus"] {
+            let resolved = resolve_web_search_provider(name);
+            assert_eq!(resolved.route, WebSearchProviderRoute::Parallel);
+            assert_eq!(resolved.canonical_provider, "parallel");
+            assert!(resolved.used_fallback);
         }
     }
 
