@@ -1609,6 +1609,11 @@ enum ScriptedFault {
     ParentAccountingFailure,
     VerifierAccountingFailure,
     SettleIncomplete,
+    ParentOutcomeUnknown,
+    PauseAfterParentOutcomeUnknown,
+    VerifierOutcomeUnknown,
+    CorruptGoalAfterParent,
+    CorruptGoalAfterVerifier,
 }
 
 struct ExecutionScript {
@@ -1623,6 +1628,7 @@ struct ScriptedDriver {
     store: Arc<SqliteTaskStore>,
     sessions: Arc<SqliteSessionBackend>,
     script: Arc<StdMutex<ExecutionScript>>,
+    control_db: PathBuf,
 }
 
 struct ScriptedLease {
@@ -1631,6 +1637,7 @@ struct ScriptedLease {
     sessions: Arc<SqliteSessionBackend>,
     script: Arc<StdMutex<ExecutionScript>>,
     scope: Option<GoalExecutionScope>,
+    control_db: PathBuf,
 }
 
 impl ScriptedLease {
@@ -1660,6 +1667,45 @@ impl ScriptedLease {
         ))
         .context("fixture turn context")
     }
+
+    async fn settle_unknown(&self, scope: &GoalExecutionScope) -> anyhow::Result<()> {
+        assert_eq!(
+            self.store
+                .admit_pending_operation(
+                    scope.task_id(),
+                    scope.session_id(),
+                    scope.execution_epoch(),
+                    "unknown-operation",
+                )
+                .await?,
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            self.store
+                .settle_pending_operation(
+                    scope.task_id(),
+                    scope.session_id(),
+                    scope.execution_epoch(),
+                    "unknown-operation",
+                    GoalAccountingState::OutcomeUnknown,
+                )
+                .await?,
+            GoalTransitionResult::Applied
+        );
+        Ok(())
+    }
+
+    fn corrupt_goal_record(&self, scope: &GoalExecutionScope) -> anyhow::Result<()> {
+        let conn = rusqlite::Connection::open(&self.control_db)?;
+        assert_eq!(
+            conn.execute(
+                "UPDATE goal_tasks SET blockers_json = 'not-json' WHERE task_id = ?1",
+                rusqlite::params![scope.task_id()],
+            )?,
+            1
+        );
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -1683,6 +1729,7 @@ impl GoalSessionDriver for ScriptedDriver {
             sessions: Arc::clone(&self.sessions),
             script: Arc::clone(&self.script),
             scope: None,
+            control_db: self.control_db.clone(),
         }))
     }
 }
@@ -1738,6 +1785,15 @@ impl GoalSessionExecutionLease for ScriptedLease {
             Some(ScriptedFault::ParentAccountingFailure) => {
                 return Err(Self::accounting_error());
             }
+            Some(
+                ScriptedFault::ParentOutcomeUnknown | ScriptedFault::PauseAfterParentOutcomeUnknown,
+            ) => {
+                self.settle_unknown(scope).await?;
+                if matches!(fault, Some(ScriptedFault::PauseAfterParentOutcomeUnknown)) {
+                    self.pause(scope).await;
+                }
+                anyhow::bail!("fixture parent interrupted");
+            }
             Some(ScriptedFault::SettleIncomplete) => {
                 assert_eq!(
                     self.store
@@ -1763,6 +1819,7 @@ impl GoalSessionExecutionLease for ScriptedLease {
                     GoalTransitionResult::Applied
                 );
             }
+            Some(ScriptedFault::CorruptGoalAfterParent) => self.corrupt_goal_record(scope)?,
             _ => {}
         }
         Ok(self.script.lock().unwrap().parents.pop_front().unwrap())
@@ -1783,6 +1840,11 @@ impl GoalSessionExecutionLease for ScriptedLease {
             Some(ScriptedFault::VerifierAccountingFailure) => {
                 return Err(Self::accounting_error());
             }
+            Some(ScriptedFault::VerifierOutcomeUnknown) => {
+                self.settle_unknown(scope).await?;
+                anyhow::bail!("fixture verifier interrupted");
+            }
+            Some(ScriptedFault::CorruptGoalAfterVerifier) => self.corrupt_goal_record(scope)?,
             _ => {}
         }
         Ok(GoalVerifierResult {
@@ -1842,6 +1904,65 @@ struct ScriptedAccountingFactory;
 impl GoalOperationAccountingFactory for ScriptedAccountingFactory {
     fn for_scope(&self, _scope: GoalExecutionScope) -> Arc<dyn GoalOperationAccounting> {
         Arc::new(ScriptedAccounting)
+    }
+}
+
+struct FailingPricingFactory {
+    fail_on_call: usize,
+    pause_before_failure: Option<Arc<SqliteTaskStore>>,
+}
+
+struct FailingPricing {
+    calls: AtomicUsize,
+    fail_on_call: usize,
+    pause_before_failure: Option<Arc<SqliteTaskStore>>,
+    scope: GoalExecutionScope,
+}
+
+#[async_trait]
+impl GoalOperationAccounting for FailingPricing {
+    async fn admit(&self, _request: GoalOperationRequest) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn settle(&self, _settlement: GoalOperationSettlement) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn release_unstarted(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn pricing_complete(&self) -> anyhow::Result<bool> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) + 1 == self.fail_on_call {
+            if let Some(store) = &self.pause_before_failure {
+                assert_eq!(
+                    store
+                        .pause_session_goal(
+                            self.scope.task_id(),
+                            self.scope.session_id(),
+                            self.scope.execution_epoch(),
+                            GoalPauseState {
+                                reason: GoalPauseReason::OperatorPaused,
+                                description: None,
+                                blockers: Vec::new()
+                            },
+                        )
+                        .await?,
+                    GoalTransitionResult::Applied
+                );
+            }
+            anyhow::bail!("fixture pricing ledger read failed");
+        }
+        Ok(true)
+    }
+}
+
+impl GoalOperationAccountingFactory for FailingPricingFactory {
+    fn for_scope(&self, scope: GoalExecutionScope) -> Arc<dyn GoalOperationAccounting> {
+        Arc::new(FailingPricing {
+            calls: AtomicUsize::new(0),
+            fail_on_call: self.fail_on_call,
+            pause_before_failure: self.pause_before_failure.clone(),
+            scope,
+        })
     }
 }
 
@@ -1924,6 +2045,7 @@ impl EngineFixture {
                 steps: Vec::new(),
                 fault,
             })),
+            control_db: directory.path().join("control/control_plane.db"),
         });
         let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
         let (_, request) = runtime
@@ -2313,6 +2435,216 @@ async fn engine_incomplete_accounting_names_the_durable_condition() {
         fixture.reason().await.as_deref(),
         Some("accounting_missing_or_invalid")
     );
+}
+
+async fn assert_pricing_read_failure_settles_epoch(fail_on_call: usize) {
+    let mut fixture = EngineFixture::new(&["answer"], &[SCRIPTED_COMPLETE], None).await;
+    assert_eq!(
+        fixture
+            .store
+            .update_session_goal_limits(
+                fixture.scope.task_id(),
+                fixture.scope.session_id(),
+                fixture.scope.execution_epoch(),
+                Some(100),
+                Some(1.0),
+            )
+            .await
+            .unwrap(),
+        GoalTransitionResult::Applied
+    );
+    let error = fixture
+        .runtime
+        .execution_engine(Arc::new(FailingPricingFactory {
+            fail_on_call,
+            pause_before_failure: None,
+        }))
+        .run(
+            &host_settings(&fixture.config),
+            fixture.request.take().unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("fixture pricing ledger read failed"));
+    assert!(
+        error
+            .to_string()
+            .contains("fixture pricing ledger read failed")
+    );
+    assert_eq!(fixture.task().await.status, TaskStatus::Failed);
+    assert_eq!(
+        fixture.reason().await.as_deref(),
+        Some("pricing_unavailable")
+    );
+    let steps = fixture.steps();
+    if fail_on_call == 1 {
+        assert_eq!(steps, vec![ScriptedStep::Parent(Vec::new())]);
+    } else {
+        assert!(matches!(steps.last(), Some(ScriptedStep::Verifier(_))));
+        assert_eq!(
+            fixture.history(),
+            vec![("assistant".into(), "answer".into())]
+        );
+    }
+}
+
+#[tokio::test]
+async fn engine_parent_pricing_read_failure_settles_epoch() {
+    assert_pricing_read_failure_settles_epoch(1).await;
+}
+
+#[tokio::test]
+async fn engine_verifier_pricing_read_failure_settles_epoch() {
+    assert_pricing_read_failure_settles_epoch(2).await;
+}
+
+#[tokio::test]
+async fn engine_pricing_read_failure_preserves_winning_pause() {
+    let mut fixture = EngineFixture::new(&["answer"], &[], None).await;
+    assert_eq!(
+        fixture
+            .store
+            .update_session_goal_limits(
+                fixture.scope.task_id(),
+                fixture.scope.session_id(),
+                fixture.scope.execution_epoch(),
+                Some(100),
+                Some(1.0),
+            )
+            .await
+            .unwrap(),
+        GoalTransitionResult::Applied
+    );
+    let error = fixture
+        .runtime
+        .execution_engine(Arc::new(FailingPricingFactory {
+            fail_on_call: 1,
+            pause_before_failure: Some(Arc::clone(&fixture.store)),
+        }))
+        .run(
+            &host_settings(&fixture.config),
+            fixture.request.take().unwrap(),
+        )
+        .await
+        .unwrap_err();
+    let rendered = format!("{error:#}");
+    assert!(rendered.contains("fixture pricing ledger read failed"));
+    assert!(rendered.contains("Goal failure lost its execution fence"));
+    assert!(
+        error
+            .to_string()
+            .contains("fixture pricing ledger read failed")
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("Goal failure lost its execution fence")
+    );
+    assert_eq!(
+        error
+            .to_string()
+            .matches("fixture pricing ledger read failed")
+            .count(),
+        1
+    );
+    assert_eq!(fixture.task().await.status, TaskStatus::Paused);
+}
+
+async fn assert_goal_record_read_failure_settles_epoch(fault: ScriptedFault) {
+    let mut fixture = EngineFixture::new(&["answer"], &[SCRIPTED_COMPLETE], Some(fault)).await;
+    let error = fixture.run().await.unwrap_err();
+    let rendered = format!("{error:#}");
+    assert!(rendered.contains("failed to read Goal accounting after an operation"));
+    assert!(rendered.contains("get goal task"));
+    assert!(error.to_string().contains("get goal task"));
+    assert_eq!(fixture.task().await.status, TaskStatus::Failed);
+    assert_eq!(
+        fixture.reason().await.as_deref(),
+        Some("accounting_missing_or_invalid")
+    );
+}
+
+#[tokio::test]
+async fn engine_parent_goal_record_read_failure_settles_epoch() {
+    assert_goal_record_read_failure_settles_epoch(ScriptedFault::CorruptGoalAfterParent).await;
+}
+
+#[tokio::test]
+async fn engine_verifier_goal_record_read_failure_settles_epoch() {
+    assert_goal_record_read_failure_settles_epoch(ScriptedFault::CorruptGoalAfterVerifier).await;
+}
+
+#[tokio::test]
+async fn engine_parent_unknown_outcome_preserves_error_and_accounting_reason() {
+    let mut fixture = EngineFixture::new(&[], &[], Some(ScriptedFault::ParentOutcomeUnknown)).await;
+    let error = fixture.run().await.unwrap_err();
+    let rendered = format!("{error:#}");
+    assert!(rendered.contains("fixture parent interrupted"));
+    assert!(rendered.contains("outcome of an earlier Goal model call is unknown"));
+    assert!(error.to_string().contains("fixture parent interrupted"));
+    assert!(
+        error
+            .to_string()
+            .contains("outcome of an earlier Goal model call is unknown")
+    );
+    assert_eq!(fixture.task().await.status, TaskStatus::Failed);
+    assert_eq!(
+        fixture.reason().await.as_deref(),
+        Some("accounting_missing_or_invalid")
+    );
+}
+
+#[tokio::test]
+async fn engine_verifier_unknown_outcome_preserves_error_and_accounting_reason() {
+    let mut fixture = EngineFixture::new(
+        &["answer"],
+        &[],
+        Some(ScriptedFault::VerifierOutcomeUnknown),
+    )
+    .await;
+    let error = fixture.run().await.unwrap_err();
+    let rendered = format!("{error:#}");
+    assert!(rendered.contains("fixture verifier interrupted"));
+    assert!(rendered.contains("outcome of an earlier Goal model call is unknown"));
+    assert!(error.to_string().contains("fixture verifier interrupted"));
+    assert_eq!(fixture.task().await.status, TaskStatus::Failed);
+    assert_eq!(
+        fixture.reason().await.as_deref(),
+        Some("accounting_missing_or_invalid")
+    );
+    assert_eq!(
+        fixture.history(),
+        vec![("assistant".into(), "answer".into())]
+    );
+}
+
+#[tokio::test]
+async fn engine_unknown_outcome_does_not_overwrite_winning_pause() {
+    let mut fixture = EngineFixture::new(
+        &[],
+        &[],
+        Some(ScriptedFault::PauseAfterParentOutcomeUnknown),
+    )
+    .await;
+    let error = fixture.run().await.unwrap_err();
+    let rendered = format!("{error:#}");
+    assert!(rendered.contains("fixture parent interrupted"));
+    assert!(rendered.contains("outcome of an earlier Goal model call is unknown"));
+    assert!(rendered.contains("Goal failure lost its execution fence"));
+    assert!(error.to_string().contains("fixture parent interrupted"));
+    assert!(
+        error
+            .to_string()
+            .contains("outcome of an earlier Goal model call is unknown")
+    );
+    assert_eq!(
+        error
+            .to_string()
+            .matches("fixture parent interrupted")
+            .count(),
+        1
+    );
+    assert_eq!(fixture.task().await.status, TaskStatus::Paused);
 }
 
 #[tokio::test]

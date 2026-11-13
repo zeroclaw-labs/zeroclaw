@@ -50,9 +50,30 @@ pub struct GoalExecutionEngine {
 
 // Context layers may wrap a failure, but only its type determines accounting classification.
 fn is_accounting_failure(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.is::<GoalAccountingFailure>())
+    error.downcast_ref::<GoalAccountingFailure>().is_some()
+        || error
+            .chain()
+            .any(|cause| cause.is::<GoalAccountingFailure>())
+}
+
+#[derive(Debug)]
+struct VisibleErrorContext(String);
+
+impl std::fmt::Display for VisibleErrorContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+fn with_visible_context(error: anyhow::Error, context: &str) -> anyhow::Error {
+    let detail = if error.downcast_ref::<VisibleErrorContext>().is_some()
+        || error.downcast_ref::<GoalAccountingFailure>().is_some()
+    {
+        error.to_string()
+    } else {
+        format!("{error:#}")
+    };
+    error.context(VisibleErrorContext(format!("{context}: {detail}")))
 }
 
 impl GoalExecutionEngine {
@@ -158,14 +179,14 @@ impl GoalExecutionEngine {
                     }
                 }
                 Err(error) => {
-                    let (reason, error) = if is_accounting_failure(&error) {
-                        ("accounting_missing_or_invalid", error)
-                    } else {
-                        (
+                    let (reason, error) = self
+                        .classify_operation_failure(
+                            scope,
+                            error,
                             "parent_operation_failed",
-                            error.context("Goal parent operation failed"),
+                            "Goal parent operation failed",
                         )
-                    };
+                        .await;
                     return Err(self.fail_with(scope, reason, error).await);
                 }
             };
@@ -199,14 +220,14 @@ impl GoalExecutionEngine {
                     response
                 }
                 Err(error) => {
-                    let (reason, error) = if is_accounting_failure(&error) {
-                        ("accounting_missing_or_invalid", error)
-                    } else {
-                        (
+                    let (reason, error) = self
+                        .classify_operation_failure(
+                            scope,
+                            error,
                             "verifier_operation_failed",
-                            error.context("Goal verifier operation failed"),
+                            "Goal verifier operation failed",
                         )
-                    };
+                        .await;
                     return Err(self.fail_with(scope, reason, error).await);
                 }
             };
@@ -239,11 +260,28 @@ impl GoalExecutionEngine {
         scope: &GoalExecutionScope,
         accountant: &dyn crate::accounting::GoalOperationAccounting,
     ) -> Result<()> {
-        let goal = self
-            .registry
-            .get_goal_task(scope.task_id())
-            .await?
-            .context("Goal extension disappeared while settling accounting")?;
+        let goal = match self.registry.get_goal_task(scope.task_id()).await {
+            Ok(Some(goal)) => goal,
+            Ok(None) => {
+                let error =
+                    anyhow::Error::msg("Goal extension disappeared while settling accounting");
+                return Err(self
+                    .fail_with(scope, "accounting_missing_or_invalid", error)
+                    .await);
+            }
+            Err(error) => {
+                return Err(self
+                    .fail_with(
+                        scope,
+                        "accounting_missing_or_invalid",
+                        with_visible_context(
+                            error,
+                            "failed to read Goal accounting after an operation",
+                        ),
+                    )
+                    .await);
+            }
+        };
         if goal.accounting_state != GoalAccountingState::Complete
             || goal.pending_call_id.is_some()
             || goal.pending_call_epoch.is_some()
@@ -256,13 +294,59 @@ impl GoalExecutionEngine {
                 .fail_with(scope, "accounting_missing_or_invalid", error)
                 .await);
         }
-        if goal.effective_cost_limit_usd.is_some() && !accountant.pricing_complete().await? {
-            let error = anyhow::Error::msg(
-                "Goal cost budget lacks complete pricing for actual provider usage",
-            );
+        if goal.effective_cost_limit_usd.is_some() {
+            let error = match accountant.pricing_complete().await {
+                Ok(true) => return Ok(()),
+                Ok(false) => anyhow::Error::msg(
+                    "Goal cost budget lacks complete pricing for actual provider usage",
+                ),
+                Err(error) => with_visible_context(
+                    error,
+                    "failed to check pricing for actual Goal provider usage",
+                ),
+            };
             return Err(self.fail_with(scope, "pricing_unavailable", error).await);
         }
         Ok(())
+    }
+
+    async fn classify_operation_failure(
+        &self,
+        scope: &GoalExecutionScope,
+        error: anyhow::Error,
+        operation_reason: &'static str,
+        operation_context: &'static str,
+    ) -> (&'static str, anyhow::Error) {
+        if is_accounting_failure(&error) {
+            return ("accounting_missing_or_invalid", error);
+        }
+        match self.registry.get_goal_task(scope.task_id()).await {
+            Ok(Some(goal))
+                if goal.accounting_state != GoalAccountingState::Complete
+                    || goal.pending_call_id.is_some()
+                    || goal.pending_call_epoch.is_some() =>
+            {
+                let accounting = GoalAccountingFailure::incomplete_for_operation(
+                    goal.accounting_state,
+                    goal.pending_call_id.is_some() || goal.pending_call_epoch.is_some(),
+                    &error,
+                );
+                ("accounting_missing_or_invalid", error.context(accounting))
+            }
+            Ok(_) => (
+                operation_reason,
+                with_visible_context(error, operation_context),
+            ),
+            Err(check_error) => (
+                operation_reason,
+                with_visible_context(
+                    error,
+                    &format!(
+                        "{operation_context}; Goal accounting could not be checked: {check_error:#}"
+                    ),
+                ),
+            ),
+        }
     }
 
     async fn exact_running_task(&self, scope: &GoalExecutionScope) -> Result<TaskRecord> {
@@ -340,7 +424,7 @@ impl GoalExecutionEngine {
     ) -> anyhow::Error {
         match self.fail(scope, reason).await {
             Ok(()) => error,
-            Err(transition_error) => error.context(format!("{transition_error:#}")),
+            Err(transition_error) => with_visible_context(error, &format!("{transition_error:#}")),
         }
     }
 
@@ -520,6 +604,27 @@ mod tests {
         assert!(!is_accounting_failure(&anyhow::Error::new(
             crate::accounting::GoalOperationFenced::NOT_RUNNING,
         )));
+    }
+
+    #[test]
+    fn accounting_failure_is_classified_through_standard_error_source() {
+        #[derive(Debug)]
+        struct Wrapper(GoalAccountingFailure);
+        impl std::fmt::Display for Wrapper {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("outer failure")
+            }
+        }
+        impl std::error::Error for Wrapper {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let error = anyhow::Error::new(Wrapper(GoalAccountingFailure::incomplete(
+            GoalAccountingState::OutcomeUnknown,
+            false,
+        )));
+        assert!(is_accounting_failure(&error));
     }
 
     #[test]

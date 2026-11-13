@@ -450,7 +450,7 @@ pub(crate) async fn finish_after_max_iterations(
             // The provider error stays the source; the stop rides alongside
             // it so the exit is typed without losing what actually failed.
             return Err(zeroclaw_api::turn_stop::tag(
-                e.context(exhaustion),
+                crate::agent::cost::with_visible_context(e, &exhaustion),
                 limit.stop(),
             ));
         }
@@ -1127,6 +1127,19 @@ mod graceful_summary_metering_tests {
         let chain = format!("{error:#}");
         assert!(chain.contains("fixture settlement failed"));
         assert!(chain.contains("model query cancelled"));
+        assert!(error.to_string().contains("fixture settlement failed"));
+        assert!(error.to_string().contains("model query cancelled"));
+        assert_eq!(
+            error
+                .to_string()
+                .matches("fixture settlement failed")
+                .count(),
+            1
+        );
+        assert_eq!(
+            error.to_string().matches("model query cancelled").count(),
+            1
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(accountant.settlements.lock().len(), 1);
         let mut usage_events = 0;
@@ -1135,6 +1148,40 @@ mod graceful_summary_metering_tests {
                 input_tokens: Some(80),
                 output_tokens: Some(5),
                 accepted: false,
+                ..
+            } = event
+            {
+                usage_events += 1;
+            }
+        }
+        assert_eq!(usage_events, 1);
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_success_with_settlement_failure_still_projects_usage() {
+        let provider = CountingUsageProvider {
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let accounting: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+            Arc::new(SummaryAccounting {
+                fail_settlement: true,
+                ..SummaryAccounting::default()
+            });
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
+        let error = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+            .scope(
+                Some(accounting),
+                run_controlled_summary(&provider, None, Some(&event_tx)),
+            )
+            .await
+            .expect_err("failed settlement must still fail the summary");
+        assert!(format!("{error:#}").contains("fixture settlement failed"));
+        let mut usage_events = 0;
+        while let Ok(event) = event_rx.try_recv() {
+            if let TurnEvent::Usage {
+                input_tokens: Some(100),
+                output_tokens: Some(20),
+                accepted: true,
                 ..
             } = event
             {

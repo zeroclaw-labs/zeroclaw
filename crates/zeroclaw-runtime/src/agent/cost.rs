@@ -629,6 +629,63 @@ pub(crate) async fn settle_provider_attempts(
     Ok(())
 }
 
+/// Preserve both failures while retaining the operation error as a source.
+#[derive(Debug)]
+pub(crate) struct OperationSettlementFailure {
+    operation: anyhow::Error,
+    settlement: anyhow::Error,
+}
+
+impl std::fmt::Display for OperationSettlementFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Goal usage settlement also failed: {:#}; original operation error: {:#}",
+            self.settlement, self.operation
+        )
+    }
+}
+
+impl std::error::Error for OperationSettlementFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.operation.as_ref())
+    }
+}
+
+/// Keep the provider failure as the source while reporting a separate
+/// settlement failure. The Goal owner inspects durable accounting state.
+pub(crate) fn with_settlement_failure(
+    operation_error: anyhow::Error,
+    settlement_error: anyhow::Error,
+) -> anyhow::Error {
+    anyhow::Error::new(OperationSettlementFailure {
+        operation: operation_error,
+        settlement: settlement_error,
+    })
+}
+
+/// Some representation paths display only the outer error, so include the
+/// original diagnostic there while retaining it as the typed source.
+#[derive(Debug)]
+struct VisibleErrorContext(String);
+
+impl std::fmt::Display for VisibleErrorContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+pub(crate) fn with_visible_context(error: anyhow::Error, context: &str) -> anyhow::Error {
+    let detail = if error.downcast_ref::<VisibleErrorContext>().is_some()
+        || error.downcast_ref::<OperationSettlementFailure>().is_some()
+    {
+        error.to_string()
+    } else {
+        format!("{error:#}")
+    };
+    error.context(VisibleErrorContext(format!("{context}: {detail}")))
+}
+
 /// An interrupted dispatch with no reported leaves has an unknown outcome,
 /// rather than a known missing usage report. Known leaves follow normal
 /// settlement and retain their reported lower bounds.

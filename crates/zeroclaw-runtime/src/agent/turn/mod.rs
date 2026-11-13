@@ -2973,27 +2973,34 @@ async fn run_tool_call_loop_impl<'a>(
                 )
             }
             Err(e) => {
-                crate::agent::cost::settle_provider_attempts(&attempts, None).await?;
+                let settlement_error =
+                    crate::agent::cost::settle_provider_attempts(&attempts, None)
+                        .await
+                        .err();
                 // This iteration's attempts never reach an accepted response
                 // (recovery continues with a fresh attempt vec, otherwise the
                 // turn fails) — project them now so the gateway ledger stays
                 // complete.
                 emit_rejected_attempt_usage(ctx.event_tx, &attempts).await;
                 record_llm_failure(&ctx, provider_request_model, llm_started_at, iteration, &e);
-                let recovered = try_recover_context_overflow(
-                    injected_memory_preamble,
-                    turn_state.history,
-                    &e,
-                    iteration,
-                    event_tx.as_ref(),
-                    on_delta.as_ref(),
-                    observer,
-                    ctx.context_limits,
-                    agent_alias,
-                    turn_id,
-                    &mut turn_state.crumb_present,
-                )
-                .await;
+                let recovered = if settlement_error.is_none() {
+                    try_recover_context_overflow(
+                        injected_memory_preamble,
+                        turn_state.history,
+                        &e,
+                        iteration,
+                        event_tx.as_ref(),
+                        on_delta.as_ref(),
+                        observer,
+                        ctx.context_limits,
+                        agent_alias,
+                        turn_id,
+                        &mut turn_state.crumb_present,
+                    )
+                    .await
+                } else {
+                    ContextRecovery::NotOverflow
+                };
                 if recovered.recovered() {
                     continue;
                 }
@@ -3023,6 +3030,12 @@ async fn run_tool_call_loop_impl<'a>(
                     ));
                     turn_state.push_dual(msg);
                 }
+                if let Some(settlement_error) = settlement_error {
+                    return Err(crate::agent::cost::with_settlement_failure(
+                        e,
+                        settlement_error,
+                    ));
+                }
                 return Err(if recovered == ContextRecovery::Unrecoverable {
                     zeroclaw_api::turn_stop::tag(
                         e,
@@ -3047,11 +3060,17 @@ async fn run_tool_call_loop_impl<'a>(
         // Any parser or stream-protocol guard finding rejects the transport
         // candidate, including a response that also carries native tool calls.
         if parse_issue_detected {
-            crate::agent::cost::settle_provider_attempts(&attempts, None).await?;
+            let settlement = crate::agent::cost::settle_provider_attempts(&attempts, None).await;
             // Same contract as the error branch: this iteration's attempts
             // are settled but never accepted — project them before retrying
             // with a fresh vec or returning the fallback.
             emit_rejected_attempt_usage(ctx.event_tx, &attempts).await;
+            settlement.map_err(|error| {
+                crate::agent::cost::with_visible_context(
+                    error,
+                    "provider response had malformed tool protocol",
+                )
+            })?;
             malformed_tool_protocol_retries += 1;
             ::zeroclaw_log::record!(
                 WARN,
@@ -3145,19 +3164,19 @@ async fn run_tool_call_loop_impl<'a>(
         // the complete immutable report to its accounting owner; ordinary
         // sessions retain the split settlement writer. Their non-ledger usage
         // projections stay identical.
-        if crate::agent::cost::goal_operation_accounting_is_scoped() {
+        let settlement = if crate::agent::cost::goal_operation_accounting_is_scoped() {
             crate::agent::cost::settle_provider_attempts(
                 &attempts,
                 Some(attempts.len().saturating_sub(1)),
             )
-            .await?;
+            .await
         } else {
             crate::agent::cost::settle_provider_attempts(
                 &attempts[..attempts.len().saturating_sub(1)],
                 None,
             )
-            .await?;
-        }
+            .await
+        };
         // Earlier physical leaves are rejected routing/retry work. The final
         // accepted response is projected by `record_accepted_chat_response`,
         // so only it carries accepted context-window fields.
@@ -3177,6 +3196,7 @@ async fn run_tool_call_loop_impl<'a>(
             accepted_route.as_ref(),
         )
         .await;
+        settlement?;
 
         // Backfill the final served route only after protocol classification
         // accepts the response.
@@ -11285,6 +11305,38 @@ mod tool_lifecycle_abandonment_tests {
         context_token_budget: usize,
         image_cache: Option<ToolLoopImageState<'_>>,
     ) -> anyhow::Result<String> {
+        run_scripted_loop_with_events(
+            provider,
+            tools_registry,
+            observer,
+            hooks,
+            pacing,
+            turn_id,
+            parallel_tools,
+            cancellation_token,
+            history,
+            context_token_budget,
+            image_cache,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_scripted_loop_with_events(
+        provider: &dyn ModelProvider,
+        tools_registry: &crate::tools::scoped::ScopedToolRegistry,
+        observer: &NoopObserver,
+        hooks: Option<&crate::hooks::HookRunner>,
+        pacing: &zeroclaw_config::schema::PacingConfig,
+        turn_id: &str,
+        parallel_tools: bool,
+        cancellation_token: Option<CancellationToken>,
+        history: &mut Vec<ChatMessage>,
+        context_token_budget: usize,
+        image_cache: Option<ToolLoopImageState<'_>>,
+        event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
+    ) -> anyhow::Result<String> {
         let mut crumb_present = false;
         let mut injected_preamble = None;
         run_tool_call_loop(ToolLoop {
@@ -11335,7 +11387,7 @@ mod tool_lifecycle_abandonment_tests {
             shared_budget: None,
             channel: None,
             collected_receipts: None,
-            event_tx: None,
+            event_tx,
             steering: None,
             new_messages_out: None,
             image_cache,
@@ -11352,6 +11404,198 @@ mod tool_lifecycle_abandonment_tests {
         tools: Vec<Box<dyn crate::tools::Tool>>,
     ) -> crate::tools::scoped::ScopedToolRegistry {
         crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools)
+    }
+
+    struct FailingTurnSettlement;
+
+    #[async_trait::async_trait]
+    impl zeroclaw_goal::accounting::GoalOperationAccounting for FailingTurnSettlement {
+        async fn admit(
+            &self,
+            _: zeroclaw_goal::accounting::GoalOperationRequest,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn settle(
+            &self,
+            _: zeroclaw_goal::accounting::GoalOperationSettlement,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("fixture turn settlement failed")
+        }
+        async fn release_unstarted(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn pricing_complete(&self) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    async fn run_with_failed_settlement(
+        provider: &dyn ModelProvider,
+    ) -> (anyhow::Error, Vec<TurnEvent>) {
+        let accounting: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+            Arc::new(FailingTurnSettlement);
+        let registry = registry_with(Vec::new());
+        let observer = NoopObserver;
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let mut history = vec![ChatMessage::user("hi")];
+        let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+        let error = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+            .scope(
+                Some(accounting),
+                run_scripted_loop_with_events(
+                    provider,
+                    &registry,
+                    &observer,
+                    None,
+                    &pacing,
+                    "settlement-test",
+                    false,
+                    None,
+                    &mut history,
+                    100_000,
+                    None,
+                    Some(tx),
+                ),
+            )
+            .await
+            .expect_err("settlement failure must fail the turn");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        (error, events)
+    }
+
+    #[tokio::test]
+    async fn turn_projects_accepted_usage_when_goal_settlement_fails() {
+        let provider = ScriptedProvider {
+            responses: Mutex::new(vec![ChatResponse {
+                text: Some("answer".into()),
+                tool_calls: Vec::new(),
+                usage: Some(zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(100),
+                    output_tokens: Some(20),
+                    cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                }),
+                reasoning_content: None,
+            }]),
+        };
+        let (error, events) = run_with_failed_settlement(&provider).await;
+        assert!(format!("{error:#}").contains("fixture turn settlement failed"));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    TurnEvent::Usage {
+                        input_tokens: Some(100),
+                        output_tokens: Some(20),
+                        accepted: true,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_preserves_malformed_response_usage_and_settlement_diagnostic() {
+        let provider = ScriptedProvider {
+            responses: Mutex::new(vec![ChatResponse {
+                text: Some(
+                    "<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}</tool_call>"
+                        .into(),
+                ),
+                tool_calls: Vec::new(),
+                usage: Some(zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(80),
+                    output_tokens: Some(5),
+                    cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                }),
+                reasoning_content: None,
+            }]),
+        };
+        let (error, events) = run_with_failed_settlement(&provider).await;
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("malformed tool protocol"));
+        assert!(diagnostic.contains("fixture turn settlement failed"));
+        assert_eq!(
+            diagnostic.matches("fixture turn settlement failed").count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    TurnEvent::Usage {
+                        input_tokens: Some(80),
+                        output_tokens: Some(5),
+                        accepted: false,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_preserves_rejected_usage_and_provider_error_when_goal_settlement_fails() {
+        let provider = zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "reliable",
+            vec![(
+                "primary".into(),
+                Box::new(ScriptedProvider {
+                    responses: Mutex::new(vec![ChatResponse {
+                        text: None,
+                        tool_calls: Vec::new(),
+                        usage: Some(zeroclaw_providers::traits::TokenUsage {
+                            input_tokens: Some(80),
+                            output_tokens: Some(5),
+                            cached_input_tokens: None,
+                            cache_creation_input_tokens: None,
+                        }),
+                        reasoning_content: None,
+                    }]),
+                }) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        );
+        let (error, events) = run_with_failed_settlement(&provider).await;
+        assert!(format!("{error:#}").contains("fixture turn settlement failed"));
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<zeroclaw_providers::ReliableRejectedCompletionUsage>())
+        );
+        let provider_error = error
+            .chain()
+            .find(|cause| cause.is::<zeroclaw_providers::ReliableRejectedCompletionUsage>())
+            .unwrap()
+            .to_string();
+        assert!(error.to_string().contains(&provider_error));
+        assert!(error.to_string().contains("fixture turn settlement failed"));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    TurnEvent::Usage {
+                        input_tokens: Some(80),
+                        output_tokens: Some(5),
+                        accepted: false,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
     }
 
     struct ImageRecoveryProvider {

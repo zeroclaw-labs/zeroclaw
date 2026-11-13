@@ -201,7 +201,12 @@ impl ResolvedModelAccess<'_> {
         if let Some(interruption) = control.current() {
             release_unstarted_goal_operation_if_scoped()
                 .await
-                .map_err(|error| error.context(format!("while handling {interruption}")))?;
+                .map_err(|error| {
+                    crate::agent::cost::with_visible_context(
+                        error,
+                        &format!("while handling {interruption}"),
+                    )
+                })?;
             return Err(interruption.into());
         }
         let dispatcher = ProviderDispatch::from_ref(self.model_provider);
@@ -234,11 +239,21 @@ impl ResolvedModelAccess<'_> {
                     extend_rejected_summaries(settled_out, attempts);
                     crate::agent::cost::settle_interrupted_provider_attempts(attempts)
                         .await
-                        .map_err(|error| error.context(format!("while handling {interruption}")))?;
+                        .map_err(|error| {
+                            crate::agent::cost::with_visible_context(
+                                error,
+                                &format!("while handling {interruption}"),
+                            )
+                        })?;
                 } else {
                     release_unstarted_goal_operation_if_scoped()
                         .await
-                        .map_err(|error| error.context(format!("while handling {interruption}")))?;
+                        .map_err(|error| {
+                            crate::agent::cost::with_visible_context(
+                                error,
+                                &format!("while handling {interruption}"),
+                            )
+                        })?;
                 }
                 return Err(interruption.into());
             }
@@ -264,11 +279,18 @@ impl ResolvedModelAccess<'_> {
                 // cause to every one-shot caller.
                 if response.is_semantically_empty_terminal() {
                     extend_rejected_summaries(settled_out, attempts);
-                    crate::agent::cost::settle_provider_attempts(attempts, None).await?;
-                    return Err(anyhow::Error::new(SemanticEmptyTerminalCompletion));
+                    let error = anyhow::Error::new(SemanticEmptyTerminalCompletion);
+                    return Err(
+                        match crate::agent::cost::settle_provider_attempts(attempts, None).await {
+                            Ok(()) => error,
+                            Err(settlement) => {
+                                crate::agent::cost::with_settlement_failure(error, settlement)
+                            }
+                        },
+                    );
                 }
                 zeroclaw_providers::dispatch::commit_accepted_provider_route(accepted_route);
-                if goal_scoped {
+                let settlement = if goal_scoped {
                     extend_rejected_summaries(
                         settled_out,
                         &attempts[..attempts.len().saturating_sub(1)],
@@ -277,7 +299,7 @@ impl ResolvedModelAccess<'_> {
                         attempts,
                         Some(attempts.len().saturating_sub(1)),
                     )
-                    .await?;
+                    .await
                 } else {
                     extend_rejected_summaries(
                         settled_out,
@@ -287,8 +309,8 @@ impl ResolvedModelAccess<'_> {
                         &attempts[..attempts.len().saturating_sub(1)],
                         None,
                     )
-                    .await?;
-                }
+                    .await
+                };
                 // Only a semantically valid result controls accepted context
                 // usage and successful response telemetry.
                 let accepted_cost_usd = if goal_scoped {
@@ -328,12 +350,19 @@ impl ResolvedModelAccess<'_> {
                     // after the final-summary event.
                     estimated_input_tokens: None,
                 });
+                settlement?;
                 Ok(response)
             }
             Err(error) => {
                 extend_rejected_summaries(settled_out, attempts);
-                crate::agent::cost::settle_provider_attempts(attempts, None).await?;
-                Err(error)
+                Err(
+                    match crate::agent::cost::settle_provider_attempts(attempts, None).await {
+                        Ok(()) => error,
+                        Err(settlement) => {
+                            crate::agent::cost::with_settlement_failure(error, settlement)
+                        }
+                    },
+                )
             }
         }
     }
@@ -761,6 +790,88 @@ mod run_model_query_tests {
     struct CapturedGoalSettlement(
         Arc<parking_lot::Mutex<Vec<zeroclaw_goal::accounting::GoalOperationSettlement>>>,
     );
+
+    struct FailingGoalSettlement;
+
+    #[async_trait]
+    impl zeroclaw_goal::accounting::GoalOperationAccounting for FailingGoalSettlement {
+        async fn admit(
+            &self,
+            _: zeroclaw_goal::accounting::GoalOperationRequest,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn settle(
+            &self,
+            _: zeroclaw_goal::accounting::GoalOperationSettlement,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("fixture settlement failed")
+        }
+        async fn release_unstarted(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn pricing_complete(&self) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    #[tokio::test]
+    async fn run_model_query_preserves_provider_error_and_usage_when_settlement_fails() {
+        let reliable = ReliableModelProvider::new(
+            "reliable",
+            vec![(
+                "primary".to_owned(),
+                Box::new(SemanticEmptyThenTextProvider {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    persist_empty: true,
+                }) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        );
+        let accounting: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+            Arc::new(FailingGoalSettlement);
+        let messages = [ChatMessage::user("hi")];
+        let mut summaries = Vec::new();
+        let error = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+            .scope(Some(accounting), async {
+                ResolvedModelAccess {
+                    model_provider: &reliable,
+                    provider_name: "reliable",
+                    model: "test-model",
+                    dispatch_model: "test-model",
+                    temperature: None,
+                }
+                .run_model_query(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    &mut summaries,
+                )
+                .await
+            })
+            .await
+            .expect_err("provider and settlement failures must be reported");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<ReliableRejectedCompletionUsage>())
+        );
+        assert!(format!("{error:#}").contains("fixture settlement failed"));
+        let provider_error = error
+            .chain()
+            .find(|cause| cause.is::<ReliableRejectedCompletionUsage>())
+            .unwrap()
+            .to_string();
+        assert!(error.to_string().contains(&provider_error));
+        assert!(error.to_string().contains("fixture settlement failed"));
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].input_tokens, Some(80));
+        assert_eq!(summaries[0].output_tokens, Some(5));
+        assert!(!summaries[0].accepted);
+    }
 
     #[async_trait]
     impl zeroclaw_goal::accounting::GoalOperationAccounting for CapturedGoalSettlement {

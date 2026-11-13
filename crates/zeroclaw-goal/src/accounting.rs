@@ -119,6 +119,18 @@ impl GoalAccountingFailure {
         };
         Self { message }
     }
+
+    pub(crate) fn incomplete_for_operation(
+        state: crate::task::GoalAccountingState,
+        pending: bool,
+        operation_error: &anyhow::Error,
+    ) -> Self {
+        let mut failure = Self::incomplete(state, pending);
+        failure
+            .message
+            .push_str(&format!("; original operation error: {operation_error:#}"));
+        failure
+    }
 }
 
 impl std::fmt::Display for GoalAccountingFailure {

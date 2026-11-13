@@ -78,6 +78,19 @@ impl std::fmt::Display for ToolLoopCancelled {
 impl std::error::Error for ToolLoopCancelled {}
 
 pub fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
+    // A cancellation can coexist with a separate accounting failure. Treating
+    // the combined error as cancellation-only would discard that failure at
+    // the Agent and RPC boundaries.
+    if err
+        .downcast_ref::<zeroclaw_goal::accounting::GoalAccountingFailure>()
+        .is_some()
+        || err.chain().any(|source| {
+            source.is::<crate::agent::cost::OperationSettlementFailure>()
+                || source.is::<zeroclaw_goal::accounting::GoalAccountingFailure>()
+        })
+    {
+        return false;
+    }
     err.chain().any(|source| source.is::<ToolLoopCancelled>())
 }
 
@@ -610,6 +623,35 @@ mod tests {
     fn is_tool_loop_cancelled_direct() {
         let err = anyhow::Error::new(ToolLoopCancelled);
         assert!(is_tool_loop_cancelled(&err));
+    }
+
+    #[test]
+    fn cancellation_with_accounting_failure_is_not_cancellation_only() {
+        let combined = crate::agent::cost::with_settlement_failure(
+            anyhow::Error::new(ToolLoopCancelled),
+            anyhow::Error::msg("fixture settlement failed"),
+        );
+        assert!(!is_tool_loop_cancelled(&combined));
+        assert!(
+            combined
+                .chain()
+                .any(|cause| cause.is::<ToolLoopCancelled>())
+        );
+        assert!(combined.to_string().contains("fixture settlement failed"));
+        assert!(combined.to_string().contains("tool loop cancelled"));
+
+        let incomplete = anyhow::Error::new(ToolLoopCancelled).context(
+            zeroclaw_goal::accounting::GoalAccountingFailure::incomplete(
+                zeroclaw_goal::task::GoalAccountingState::OutcomeUnknown,
+                false,
+            ),
+        );
+        assert!(!is_tool_loop_cancelled(&incomplete));
+        assert!(
+            incomplete
+                .chain()
+                .any(|cause| cause.is::<ToolLoopCancelled>())
+        );
     }
 
     #[test]

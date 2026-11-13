@@ -403,13 +403,17 @@ fn outcome_from_task_result(
                 crate::agent::terminal_completion_error_message(&error, None)
             {
                 return Err(TurnError::TerminalCompletion {
-                    diagnostic: error.to_string(),
+                    diagnostic: safe_turn_diagnostic(&error),
                     user_message,
                 });
             }
-            Err(TurnError::AgentError(error.to_string()))
+            Err(TurnError::AgentError(safe_turn_diagnostic(&error)))
         }
     }
+}
+
+fn safe_turn_diagnostic(error: &anyhow::Error) -> String {
+    crate::security::scrub(&crate::agent::loop_::scrub_credentials(&error.to_string()))
 }
 
 /// Why [`drain_until_done_or_cancelled`] returned. `ExplicitCancel` is an
@@ -1163,11 +1167,54 @@ mod tests {
             new_messages: Vec::new(),
         };
         let outcome = outcome_from_task_result(Err(err), String::new());
-        assert!(
-            matches!(outcome, Err(TurnError::AgentError(_))),
-            "a genuine agent failure must surface as an error, not a silent \
-             cancel"
+        let Err(TurnError::AgentError(message)) = outcome else {
+            panic!("a genuine agent failure must surface as an error, not a silent cancel");
+        };
+        assert_eq!(message, "provider exploded");
+    }
+
+    #[test]
+    fn cancellation_with_settlement_failure_is_visible_as_an_error() {
+        let error = crate::agent::cost::with_settlement_failure(
+            anyhow::Error::new(crate::agent::loop_::ToolLoopCancelled),
+            anyhow::Error::msg("fixture settlement failed"),
         );
+        let outcome = outcome_from_task_result(
+            Err(StreamedTurnError {
+                error,
+                committed_response: String::new(),
+                new_messages: Vec::new(),
+            }),
+            String::new(),
+        );
+        let Err(TurnError::AgentError(message)) = outcome else {
+            panic!("combined failure must not become a silent cancellation");
+        };
+        assert!(message.contains("tool loop cancelled"));
+        assert!(message.contains("fixture settlement failed"));
+    }
+
+    #[test]
+    fn combined_turn_error_redacts_credentials_at_rpc_boundary() {
+        let error = crate::agent::cost::with_settlement_failure(
+            anyhow::Error::msg("provider failed token=QWxhZGRpbjpvcGVuIHNlc2FtZQ=="),
+            anyhow::Error::msg("fixture settlement failed"),
+        );
+        let outcome = outcome_from_task_result(
+            Err(StreamedTurnError {
+                error,
+                committed_response: String::new(),
+                new_messages: Vec::new(),
+            }),
+            String::new(),
+        );
+        let Err(TurnError::AgentError(message)) = outcome else {
+            panic!("combined failure must remain an error");
+        };
+        assert!(message.contains("provider failed"));
+        assert!(message.contains("fixture settlement failed"));
+        assert!(message.contains("[REDACTED"));
+        assert!(!message.contains("IHNlc2FtZQ"));
     }
 
     #[test]
