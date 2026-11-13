@@ -9073,6 +9073,9 @@ pub enum ScopedHttpAuth {
         username: String,
         password: String,
     },
+    Totp {
+        seed: String,
+    },
     SshKey {
         private_key: String,
         destinations: Vec<SshCredentialDestination>,
@@ -9215,6 +9218,31 @@ mod scoped_credential_source_tests {
     use super::ScopedCredentialSource as Source;
 
     #[test]
+    fn password_destinations_allow_directory_protocols_without_embedded_credentials() {
+        use super::ScopedHttpCredential;
+
+        for value in [
+            "https://api.example.com",
+            "ldaps://directory.example.com:636",
+            "kerberos://EXAMPLE.COM",
+            "ad://example.com",
+        ] {
+            assert_eq!(
+                ScopedHttpCredential::password_service(value).as_deref(),
+                Some(value)
+            );
+        }
+        for value in [
+            "ldap://directory.example.com",
+            "ldaps://user:password@directory.example.com",
+            "ad://example.com/path",
+            "kerberos://EXAMPLE.COM?value=secret",
+        ] {
+            assert!(ScopedHttpCredential::password_service(value).is_none());
+        }
+    }
+
+    #[test]
     fn external_reference_formats_use_fixed_read_commands() {
         for (source, reference, program) in [
             (Source::OnePassword, "op://vault/item/field", "op"),
@@ -9246,6 +9274,24 @@ impl ScopedHttpCredential {
             return None;
         }
         Some(url.origin().ascii_serialization())
+    }
+
+    pub fn password_service(raw: &str) -> Option<String> {
+        if let Some(origin) = Self::https_origin(raw) {
+            return (raw.trim_end_matches('/') == origin).then_some(origin);
+        }
+        let url = url::Url::parse(raw).ok()?;
+        if !matches!(url.scheme(), "ldaps" | "kerberos" | "ad")
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || !matches!(url.path(), "" | "/")
+        {
+            return None;
+        }
+        Some(url.as_str().trim_end_matches('/').to_owned())
     }
 
     pub fn valid_name(name: &str) -> bool {

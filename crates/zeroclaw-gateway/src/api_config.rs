@@ -1380,6 +1380,7 @@ pub async fn list_http_credentials(
                     ScopedHttpAuth::ApiKey { .. } => "api_key",
                     ScopedHttpAuth::UserPassword { .. } => "user_password",
                     ScopedHttpAuth::SshKey { .. } => "ssh_key",
+                    ScopedHttpAuth::Totp { .. } => "totp",
                 };
                 let header = match &record.auth {
                     ScopedHttpAuth::ApiKey { header, .. } => Some(header),
@@ -1449,20 +1450,22 @@ pub async fn mutate_http_credential(
                 _ => return StatusCode::CONFLICT.into_response(),
             };
             if let Some(mut credential) = mutation.credential {
-                if matches!(&credential.auth, ScopedHttpAuth::SshKey { .. }) {
-                    if !credential.origin.is_empty() {
-                        return StatusCode::BAD_REQUEST.into_response();
+                let destination = match &credential.auth {
+                    ScopedHttpAuth::SshKey { .. } | ScopedHttpAuth::Totp { .. } => {
+                        credential.origin.is_empty().then(String::new)
                     }
-                } else {
-                    let Some(origin) = ScopedHttpCredential::https_origin(&credential.origin)
-                    else {
-                        return StatusCode::BAD_REQUEST.into_response();
-                    };
-                    if credential.origin.trim_end_matches('/') != origin {
-                        return StatusCode::BAD_REQUEST.into_response();
+                    ScopedHttpAuth::UserPassword { .. } => {
+                        ScopedHttpCredential::password_service(&credential.origin)
                     }
-                    credential.origin = origin;
-                }
+                    ScopedHttpAuth::ApiKey { .. } => {
+                        ScopedHttpCredential::https_origin(&credential.origin)
+                            .filter(|origin| credential.origin.trim_end_matches('/') == origin)
+                    }
+                };
+                let Some(destination) = destination else {
+                    return StatusCode::BAD_REQUEST.into_response();
+                };
+                credential.origin = destination;
                 let valid = |value: &str| {
                     !value.trim().is_empty()
                         && value.len() <= 4096
@@ -1476,8 +1479,21 @@ pub async fn mutate_http_credential(
                 let valid_auth = match &credential.auth {
                     ScopedHttpAuth::ApiKey { value, .. } => valid_secret(value) && value.is_ascii(),
                     ScopedHttpAuth::UserPassword { username, password } => {
-                        valid(username) && !username.contains(':') && valid_secret(password)
+                        valid(username)
+                            && (!credential.origin.starts_with("https://")
+                                || !username.contains(':'))
+                            && valid_secret(password)
                     }
+                    ScopedHttpAuth::Totp { seed } => match credential.source {
+                        ScopedCredentialSource::Local => {
+                            (16..=256).contains(&seed.len())
+                                && matches!(seed.len() % 8, 0 | 2 | 4 | 5 | 7)
+                                && seed
+                                    .bytes()
+                                    .all(|byte| matches!(byte, b'A'..=b'Z' | b'2'..=b'7'))
+                        }
+                        source => source.command(seed).is_some(),
+                    },
                     ScopedHttpAuth::SshKey {
                         private_key,
                         destinations,

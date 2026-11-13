@@ -62,14 +62,16 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
     const form = event.currentTarget;
     const data = new FormData(form);
     const name = editing === "new" ? String(data.get("name")) : editing.name;
-    const origin = kind === "ssh_key" ? "" : String(data.get("origin"));
+    const origin = kind === "ssh_key" || kind === "totp" ? "" : String(data.get("origin")).trim();
     const secret = String(data.get("secret"));
     const destinations = String(data.get("destinations") ?? "").split("\n")
       .map(line => line.trim()).filter(Boolean).map(line => {
         const match = /^([^@]+)@(?:\[([0-9a-f:.]+)\]|([^:]+))(?::(\d+))?$/i.exec(line);
         return { username: match?.[1] ?? "", host: match?.[2] ?? match?.[3] ?? "", port: Number(match?.[4] ?? 22) };
       });
-    const auth = kind === "ssh_key"
+    const auth = kind === "totp"
+      ? { kind, seed: source === "local" ? secret.replace(/[\s-]+/g, "").replace(/=+$/, "").toUpperCase() : secret.trim() } as const
+      : kind === "ssh_key"
       ? { kind, private_key: secret.trim(), destinations } as const
       : kind === "api_key"
       ? { kind, value: secret, header } as const
@@ -84,7 +86,7 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
   const inputClass = "block w-full rounded-md border border-border bg-background px-3 py-2";
   return (
     <section className="space-y-4">
-      <p className="text-sm">{t(kind === "ssh_key" ? "http_credentials.ssh_pending" : "http_credentials.hint")}</p>
+      <p className="text-sm">{t(kind === "ssh_key" ? "http_credentials.ssh_pending" : kind === "totp" ? "http_credentials.totp_hint" : kind === "user_password" ? "http_credentials.service_hint" : "http_credentials.hint")}</p>
       {message && <p role="status">{message}</p>}
       {!catalog && !message && <p>{t("plugin_tls.loading")}</p>}
       {catalog && !catalog.encryption_enabled && <p>{t("plugin_tls.encryption")}</p>}
@@ -122,10 +124,10 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
                 defaultValue={editing === "new" ? "" : editing.destinations?.map(d => `${d.username}@${d.host.includes(":") ? `[${d.host}]` : d.host}:${d.port}`).join("\n")}
               />
             </label>
-          ) : (
+          ) : kind !== "totp" && (
           <label className="block space-y-1">
-            <span>{t("http_credentials.origin")}</span>
-            <input className={inputClass} name="origin" type="url" required placeholder="https://api.example.com" defaultValue={editing === "new" ? "" : editing.origin} />
+            <span>{t(kind === "user_password" ? "http_credentials.service" : "http_credentials.origin")}</span>
+            <input className={inputClass} name="origin" type="url" required placeholder={kind === "user_password" ? "ldaps://directory.example.com:636" : "https://api.example.com"} defaultValue={editing === "new" ? "" : editing.origin} />
           </label>
           )}
           <div className="space-y-1">
@@ -167,7 +169,7 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
             </label>
           )}
           <label className="block space-y-1">
-            <span>{t(source !== "local" ? "http_credentials.reference" : kind === "ssh_key" ? "http_credentials.ssh_private_key" : kind === "api_key" ? "http_credentials.token" : "http_credentials.password")}</span>
+            <span>{t(source !== "local" ? "http_credentials.reference" : kind === "totp" ? "http_credentials.totp_seed" : kind === "ssh_key" ? "http_credentials.ssh_private_key" : kind === "api_key" ? "http_credentials.token" : "http_credentials.password")}</span>
             {kind === "ssh_key" && source === "local" ? (
               <textarea key={source} className={inputClass} name="secret" required spellCheck={false} autoComplete="off" />
             ) : (

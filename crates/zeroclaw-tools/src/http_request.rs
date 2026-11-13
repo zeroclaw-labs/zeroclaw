@@ -514,7 +514,7 @@ impl HttpRequestTool {
                     vec![pair, encoded, password, username],
                 )
             }
-            ScopedHttpAuth::SshKey { .. } => {
+            ScopedHttpAuth::SshKey { .. } | ScopedHttpAuth::Totp { .. } => {
                 return Err(anyhow::Error::msg(scoped_credential_message(
                     "tool-http-credential-kind",
                 )));

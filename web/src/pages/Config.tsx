@@ -263,6 +263,11 @@ export default function Config() {
               label: t("http_credentials.ssh_keys"),
               render: () => <HttpCredentials key="ssh_key" kind="ssh_key" />,
             },
+            {
+              key: "totp-credentials",
+              label: t("http_credentials.totp"),
+              render: () => <HttpCredentials key="totp" kind="totp" />,
+            },
           ]}
         />
       );

@@ -1382,11 +1382,12 @@ export interface MapKeyResponse {
   created: boolean;
 }
 
-export type HttpCredentialKind = "user_password" | "api_key" | "ssh_key";
+export type HttpCredentialKind = "user_password" | "api_key" | "ssh_key" | "totp";
 export type HttpCredentialSource = "local" | "open_bao" | "one_password" | "azure" | "aws" | "google";
 export type SshDestination = { host: string; port: number; username: string };
 export type HttpCredentialRow = { name: string; origin: string; kind: HttpCredentialKind; source: HttpCredentialSource; destinations?: SshDestination[] | null; header?: "bearer" | "x_api_key" | null };
 type HttpCredentialAuth =
+  | { kind: "totp"; seed: string }
   | { kind: "user_password"; username: string; password: string }
   | { kind: "ssh_key"; private_key: string; destinations: SshDestination[] }
   | { kind: "api_key"; value: string; header: "bearer" | "x_api_key" };
