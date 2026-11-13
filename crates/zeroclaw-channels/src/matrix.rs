@@ -2116,7 +2116,7 @@ mod inbound {
     use serde_json::Value as JsonValue;
     use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc};
 
-    use super::{allowlist, approval, context as ctx_mod, mention};
+    use super::{allowlist, approval, context as ctx_mod, inbound, mention};
     use zeroclaw_api::{channel::ChannelMessage, media::MediaAttachment};
     use zeroclaw_config::schema::MatrixConfig;
 
@@ -2290,6 +2290,36 @@ mod inbound {
         }
 
         let body = ctx_mod::body_for(&ev.content.msgtype);
+        // A replacement event (an edit of an earlier message) must be
+        // classified before anything consumes the body: the event's own
+        // `body` is the pre-edit fallback ("* old text"), so letting it
+        // through would start a duplicate turn. Disabled (default): edits
+        // are dropped entirely. Enabled: the corrected `m.new_content` body
+        // flows through the ordinary pipeline, marked `edited`.
+        let mut edited = false;
+        let body = match inbound::classify_replacement(&raw) {
+            Some(inbound::InboundEdit::Text { body, .. }) if ctx.config.edited_messages => {
+                edited = true;
+                body
+            }
+            Some(edit) => {
+                let reason = match edit {
+                    inbound::InboundEdit::Text { .. } => "edited_messages_disabled",
+                    inbound::InboundEdit::NonText => "non_text_edit",
+                };
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "reason": reason,
+                            "event_id": ev.event_id.to_string(),
+                        })),
+                    "matrix: drop replacement event"
+                );
+                return Ok(());
+            }
+            None => body,
+        };
         let sender = ev.sender.as_str();
         let room_id = room.room_id().as_str();
         let allowed_peers = (ctx.peer_resolver)();
@@ -2522,6 +2552,7 @@ mod inbound {
             attachments,
             subject: None,
             voice_origin,
+            edited,
             ..Default::default()
         };
 
@@ -2603,6 +2634,35 @@ mod inbound {
         let in_reply_to = relates.get("m.in_reply_to")?;
         let event_id = in_reply_to.get("event_id")?.as_str()?;
         event_id.parse().ok()
+    }
+
+    /// Classification of an inbound edit (Matrix `m.replace` replacement
+    /// event). A replacement arrives as its own `m.room.message` event whose
+    /// content carries `m.relates_to` with `rel_type = "m.replace"` and the
+    /// corrected content under `m.new_content`.
+    pub(super) enum InboundEdit {
+        /// Text edit: the original event id and the corrected body.
+        Text { original: String, body: String },
+        /// Replacement of a non-text message (media, poll, ...): the v1
+        /// inbound pipeline has no edit semantics for these.
+        NonText,
+    }
+
+    pub(super) fn classify_replacement(raw: &RawEvent) -> Option<InboundEdit> {
+        let v: JsonValue = serde_json::from_str(raw.get()).ok()?;
+        let relates = v.get("content")?.get("m.relates_to")?;
+        if relates.get("rel_type")?.as_str()? != "m.replace" {
+            return None;
+        }
+        let original = relates.get("event_id")?.as_str()?.to_string();
+        let new_content = v.get("content")?.get("m.new_content")?;
+        match new_content.get("msgtype")?.as_str()? {
+            "m.text" | "m.notice" => Some(InboundEdit::Text {
+                original,
+                body: new_content.get("body")?.as_str()?.to_string(),
+            }),
+            _ => Some(InboundEdit::NonText),
+        }
     }
 
     pub(super) fn is_voice_message(raw: &RawEvent) -> bool {
@@ -7800,6 +7860,129 @@ mod tests {
             assert!(approvals.contains_key("WRONG001"));
             assert!(approvals.contains_key("OTHER001"));
         }
+
+        fn test_ctx(
+            tx: mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+            config: MatrixConfig,
+        ) -> HandlerCtx {
+            HandlerCtx {
+                config: Arc::new(config),
+                alias: "test".to_string(),
+                peer_resolver: Arc::new(|| vec!["@operator:localhost".to_string()]),
+                transcription: None,
+                workspace_dir: None,
+                tx,
+                pending_approvals: Arc::new(TokioMutex::new(HashMap::new())),
+                threads_seen: Arc::new(TokioRwLock::new(HashSet::new())),
+                bot_user_id: user_id!("@bot:localhost").to_owned(),
+                bot_display_name: Arc::new(TokioRwLock::new(None)),
+                initial_sync_done: Arc::new(AtomicBool::new(true)),
+                undecryptable_seen: Arc::new(TokioMutex::new(HashSet::new())),
+            }
+        }
+
+        fn replacement_event(new_msgtype: &str, new_body: &str) -> serde_json::Value {
+            serde_json::json!({
+                "type": "m.room.message",
+                "event_id": "$edit1:localhost",
+                "sender": "@operator:localhost",
+                "origin_server_ts": 1_000_010u64,
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "* corrected text",
+                    "m.new_content": { "msgtype": new_msgtype, "body": new_body },
+                    "m.relates_to": { "rel_type": "m.replace", "event_id": "$orig:localhost" }
+                }
+            })
+        }
+
+        #[tokio::test]
+        async fn sync_ingress_drops_text_replacement_by_default() {
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            let (tx, mut inbound_rx) = mpsc::channel(4);
+            let ctx = test_ctx(
+                tx,
+                MatrixConfig {
+                    allowed_rooms: vec![test_room().to_string()],
+                    ..MatrixConfig::default()
+                },
+            );
+            let _guards = register_event_handlers(&client, &ctx);
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(
+                        &replacement_event("m.text", "corrected text"),
+                    )),
+                )
+                .await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), inbound_rx.recv())
+                    .await
+                    .is_err(),
+                "replacement events must not reach agent dispatch when edited_messages is off"
+            );
+        }
+
+        #[tokio::test]
+        async fn sync_ingress_delivers_text_replacement_body_when_enabled() {
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            let (tx, mut inbound_rx) = mpsc::channel(4);
+            let ctx = test_ctx(
+                tx,
+                MatrixConfig {
+                    allowed_rooms: vec![test_room().to_string()],
+                    edited_messages: true,
+                    ..MatrixConfig::default()
+                },
+            );
+            let _guards = register_event_handlers(&client, &ctx);
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(
+                        &replacement_event("m.text", "corrected text"),
+                    )),
+                )
+                .await;
+            let msg = recv_forwarded(&mut inbound_rx).await;
+            assert_eq!(msg.content, "corrected text");
+            assert!(msg.edited, "enabled edits must be marked for the runtime");
+        }
+
+        #[tokio::test]
+        async fn sync_ingress_drops_non_text_replacement_even_when_enabled() {
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            let (tx, mut inbound_rx) = mpsc::channel(4);
+            let ctx = test_ctx(
+                tx,
+                MatrixConfig {
+                    allowed_rooms: vec![test_room().to_string()],
+                    edited_messages: true,
+                    ..MatrixConfig::default()
+                },
+            );
+            let _guards = register_event_handlers(&client, &ctx);
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room())
+                        .add_timeline_event(timeline_raw(&replacement_event("m.image", "cat.jpg"))),
+                )
+                .await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), inbound_rx.recv())
+                    .await
+                    .is_err(),
+                "media edits must be dropped: v1 has no edit semantics for non-text content"
+            );
+        }
     }
 
     mod markers {
@@ -10473,6 +10656,7 @@ mod tests {
                 device_id: None,
                 allowed_rooms: vec![],
                 interrupt_on_new_message: false,
+                edited_messages: false,
                 stream_mode: Default::default(),
                 stream_tool_arguments: vec![],
                 draft_update_interval_ms: 1500,

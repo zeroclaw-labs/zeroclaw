@@ -92,6 +92,10 @@ rooms the bot answers in. Authorize senders with a [peer group](#who-can-talk-to
 
 {{#thread-context channel="Matrix" prop="reply_in_thread" path="channels.matrix.<alias>.reply_in_thread"}}
 
+### Edited messages
+
+Matrix delivers an edit as a new `m.replace` replacement event, not as a mutation of the original message. By default (`channels.matrix.<alias>.edited_messages = false`) ZeroClaw drops replacement events, so editing a message does **not** start a second agent turn carrying the pre-edit fallback body (`* old text`). Set `edited_messages = true` to process edits: the corrected body from `m.new_content` then flows through the ordinary inbound pipeline and the delivered message is marked `edited` for the runtime. Replacements of non-text messages (media, polls) are dropped in both modes — v1 has no edit semantics for non-text content.
+
 ## 3. Token path (alternative): obtaining `access_token` and `device_id`
 
 > [!IMPORTANT]
