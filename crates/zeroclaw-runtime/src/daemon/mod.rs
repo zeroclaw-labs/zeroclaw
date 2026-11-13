@@ -854,11 +854,6 @@ pub async fn run_with_authority(
             }
         };
 
-    // In-process RPC seam for the supervised gateway. Created before the
-    // gateway starts and bound once this generation's RPC context exists;
-    // the gateway's connect waits for that bind.
-    let inproc_connector = crate::rpc::inproc::InprocConnector::new(channels_cancel.child_token());
-
     if let Some(gateway_start) = registry.take_gateway_start() {
         gateway_required = true;
         let gateway_cfg = config.clone();
