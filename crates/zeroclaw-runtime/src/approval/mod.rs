@@ -86,6 +86,8 @@ pub struct ApprovalManager {
     auto_approve: HashSet<String>,
     /// Tools that always need approval, ignoring session allowlist.
     always_ask: HashSet<String>,
+    /// `always_ask` entries inherited from bounded delegation callers.
+    caller_always_ask: HashSet<String>,
     /// Autonomy level from config.
     autonomy_level: AutonomyLevel,
     /// When `true`, tools that would require interactive approval are
@@ -118,6 +120,7 @@ impl ApprovalManager {
         Self {
             auto_approve: risk_profile.auto_approve.iter().cloned().collect(),
             always_ask: normalized_always_ask(&risk_profile.always_ask),
+            caller_always_ask: HashSet::new(),
             autonomy_level: risk_profile.level,
             non_interactive: false,
             non_interactive_shell_requires_approval: false,
@@ -131,6 +134,7 @@ impl ApprovalManager {
         Self {
             auto_approve: risk_profile.auto_approve.iter().cloned().collect(),
             always_ask: normalized_always_ask(&risk_profile.always_ask),
+            caller_always_ask: HashSet::new(),
             autonomy_level: risk_profile.level,
             non_interactive: true,
             non_interactive_shell_requires_approval: false,
@@ -144,8 +148,12 @@ impl ApprovalManager {
     ///
     /// The target profile decides whether the child may invoke a tool, but it
     /// cannot grant command-specific approval to caller-owned command tools.
-    pub(crate) fn for_bounded_non_interactive(risk_profile: &RiskProfileConfig) -> Self {
+    pub(crate) fn for_bounded_non_interactive(
+        risk_profile: &RiskProfileConfig,
+        caller_always_ask: &[String],
+    ) -> Self {
         Self {
+            caller_always_ask: normalized_always_ask(caller_always_ask),
             propagate_runtime_command_approval: false,
             ..Self::for_non_interactive(risk_profile)
         }
@@ -155,6 +163,7 @@ impl ApprovalManager {
         Self {
             auto_approve: risk_profile.auto_approve.iter().cloned().collect(),
             always_ask: normalized_always_ask(&risk_profile.always_ask),
+            caller_always_ask: HashSet::new(),
             autonomy_level: risk_profile.level,
             non_interactive: true,
             non_interactive_shell_requires_approval: true,
@@ -178,6 +187,7 @@ impl ApprovalManager {
         Self {
             auto_approve: risk_profile.auto_approve.iter().cloned().collect(),
             always_ask: normalized_always_ask(&risk_profile.always_ask),
+            caller_always_ask: self.caller_always_ask.clone(),
             autonomy_level: risk_profile.level,
             non_interactive: self.non_interactive,
             non_interactive_shell_requires_approval: self.non_interactive_shell_requires_approval,
@@ -195,6 +205,7 @@ impl ApprovalManager {
         Self {
             auto_approve: self.auto_approve.clone(),
             always_ask: self.always_ask.clone(),
+            caller_always_ask: self.caller_always_ask.clone(),
             autonomy_level: self.autonomy_level,
             non_interactive: self.non_interactive,
             non_interactive_shell_requires_approval: self.non_interactive_shell_requires_approval,
@@ -225,9 +236,19 @@ impl ApprovalManager {
     /// The manager stores these as a set because enforcement is order-blind;
     /// prompts need a stable ordering instead.
     pub fn always_ask_tools(&self) -> Vec<String> {
-        let mut tools: Vec<String> = self.always_ask.iter().cloned().collect();
+        let mut tools: Vec<String> = self
+            .always_ask
+            .union(&self.caller_always_ask)
+            .cloned()
+            .collect();
         tools.sort();
         tools
+    }
+
+    fn always_asks(&self, tool_name: &str) -> bool {
+        [&self.always_ask, &self.caller_always_ask]
+            .iter()
+            .any(|set| set.contains("*") || set.contains(tool_name))
     }
 
     /// Check whether a tool call requires interactive approval.
@@ -244,7 +265,7 @@ impl ApprovalManager {
 
         // always_ask overrides everything, including Full autonomy — an operator
         // who explicitly lists a tool here wants a prompt regardless of level.
-        if self.always_ask.contains("*") || self.always_ask.contains(tool_name) {
+        if self.always_asks(tool_name) {
             return ApprovalRequirement::Prompt;
         }
 
@@ -284,8 +305,7 @@ impl ApprovalManager {
         self.non_interactive
             && self.non_interactive_shell_requires_approval
             && tool_name == "shell"
-            && !self.always_ask.contains("*")
-            && !self.always_ask.contains(tool_name)
+            && !self.always_asks(tool_name)
             && self.approval_requirement(tool_name) == ApprovalRequirement::Prompt
     }
 
@@ -787,7 +807,7 @@ mod tests {
         assert!(fresh.audit_log().is_empty());
         assert!(fresh.propagates_runtime_command_approval());
 
-        let bounded = ApprovalManager::for_bounded_non_interactive(&supervised_config());
+        let bounded = ApprovalManager::for_bounded_non_interactive(&supervised_config(), &[]);
         assert!(!bounded.for_new_turn().propagates_runtime_command_approval());
     }
 
@@ -1054,6 +1074,93 @@ mod tests {
             ApprovalRequirement::Prompt
         );
         assert_eq!(derived.always_ask_tools(), vec!["shell"]);
+    }
+
+    #[test]
+    fn bounded_caller_always_ask_overrides_target_approval() {
+        let full = RiskProfileConfig {
+            level: AutonomyLevel::Full,
+            ..RiskProfileConfig::default()
+        };
+        let auto = RiskProfileConfig {
+            auto_approve: vec!["file_write".into(), "file_read".into()],
+            ..RiskProfileConfig::default()
+        };
+        for (case, target) in [("full", &full), ("auto_approve", &auto)] {
+            let mgr =
+                ApprovalManager::for_bounded_non_interactive(target, &[" file_write ".into()]);
+            assert_eq!(
+                mgr.approval_requirement("file_write"),
+                ApprovalRequirement::Prompt,
+                "{case}: a caller always_ask entry must not be approved by the target"
+            );
+            assert_eq!(
+                mgr.approval_requirement("file_read"),
+                ApprovalRequirement::Approved,
+                "{case}: tools the caller did not list keep the target decision"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_caller_always_ask_wildcard_covers_every_tool() {
+        let full = RiskProfileConfig {
+            level: AutonomyLevel::Full,
+            ..RiskProfileConfig::default()
+        };
+        let mgr = ApprovalManager::for_bounded_non_interactive(&full, &["*".into()]);
+        assert!(mgr.needs_approval("file_read"));
+        assert!(mgr.needs_approval("shell"));
+    }
+
+    #[test]
+    fn bounded_caller_always_ask_overrides_non_interactive_shell_pass_through() {
+        let supervised = RiskProfileConfig::default();
+        let plain = ApprovalManager::for_bounded_non_interactive(&supervised, &[]);
+        assert_eq!(
+            plain.approval_requirement("shell"),
+            ApprovalRequirement::NotRequired
+        );
+        let listed = ApprovalManager::for_bounded_non_interactive(&supervised, &["shell".into()]);
+        assert_eq!(
+            listed.approval_requirement("shell"),
+            ApprovalRequirement::Prompt
+        );
+    }
+
+    #[test]
+    fn bounded_caller_always_ask_survives_derive_and_new_turn() {
+        let full = RiskProfileConfig {
+            level: AutonomyLevel::Full,
+            ..RiskProfileConfig::default()
+        };
+        let bounded = ApprovalManager::for_bounded_non_interactive(&full, &["file_write".into()]);
+        let derived = bounded.derive_for_risk_profile(&RiskProfileConfig {
+            auto_approve: vec!["*".into()],
+            ..RiskProfileConfig::default()
+        });
+        for (case, mgr) in [("derived", &derived), ("new_turn", &bounded.for_new_turn())] {
+            assert!(mgr.needs_approval("file_write"), "{case}");
+            assert_eq!(mgr.always_ask_tools(), vec!["file_write"], "{case}");
+        }
+    }
+
+    #[test]
+    fn caller_always_ask_is_empty_outside_bounded_children() {
+        let full = RiskProfileConfig {
+            level: AutonomyLevel::Full,
+            ..RiskProfileConfig::default()
+        };
+        assert!(
+            ApprovalManager::for_non_interactive(&full)
+                .always_ask_tools()
+                .is_empty()
+        );
+        assert!(
+            ApprovalManager::from_risk_profile(&full)
+                .always_ask_tools()
+                .is_empty()
+        );
     }
 
     #[test]
