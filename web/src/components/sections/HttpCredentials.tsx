@@ -1,5 +1,5 @@
 import { type FormEvent, useEffect, useState } from "react";
-import { Button } from "@/components/ui";
+import { Button, Select } from "@/components/ui";
 import { changeHttpCredential, listHttpCredentials, type HttpCredentialKind, type HttpCredentialRow, type HttpCredentialSource } from "@/lib/api";
 import { t } from "@/lib/i18n";
 
@@ -27,6 +27,7 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
   const [catalog, setCatalog] = useState<Catalog>();
   const [editing, setEditing] = useState<HttpCredentialRow | "new" | null>(null);
   const [removing, setRemoving] = useState<HttpCredentialRow | null>(null);
+  const [header, setHeader] = useState<"bearer" | "x_api_key">("bearer");
   const [source, setSource] = useState<HttpCredentialSource>("local");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
@@ -64,7 +65,7 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
     const origin = String(data.get("origin"));
     const secret = String(data.get("secret"));
     const auth = kind === "api_key"
-      ? { kind, value: secret, header: data.get("header") === "x_api_key" ? "x_api_key" : "bearer" } as const
+      ? { kind, value: secret, header } as const
       : { kind, username: String(data.get("username")), password: secret } as const;
     form.reset();
     setEditing(null);
@@ -86,7 +87,7 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
           <p className="break-all font-medium">{row.name}</p>
           <p className="break-all text-sm">{row.origin} · {t(`http_credentials.source_${row.source}`)}</p>
           <div className="flex flex-wrap gap-2">
-            <Button size="sm" disabled={disabled} onClick={() => { setRemoving(null); setSource(row.source); setEditing(row); }}>
+            <Button size="sm" disabled={disabled} onClick={() => { setRemoving(null); setHeader("bearer"); setSource(row.source); setEditing(row); }}>
               {t("plugin_tls.replace")}
             </Button>
             <Button size="sm" variant="ghost" disabled={disabled} onClick={() => { setEditing(null); setRemoving(row); }}>
@@ -95,7 +96,7 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
           </div>
         </div>
       ))}
-      <Button disabled={disabled} onClick={() => { setRemoving(null); setSource("local"); setEditing("new"); }}>
+      <Button disabled={disabled} onClick={() => { setRemoving(null); setHeader("bearer"); setSource("local"); setEditing("new"); }}>
         {t("http_credentials.add")}
       </Button>
       {editing && (
@@ -108,18 +109,14 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
             <span>{t("http_credentials.origin")}</span>
             <input className={inputClass} name="origin" type="url" required placeholder="https://api.example.com" defaultValue={editing === "new" ? "" : editing.origin} />
           </label>
-          <label className="block space-y-1">
-            <span>{t("http_credentials.source")}</span>
-            <select className={inputClass} value={source} onChange={(event) => {
-              if (event.currentTarget.value in sources) {
-                setSource(event.currentTarget.value as HttpCredentialSource);
-              }
-            }}>
-              {(Object.keys(sources) as HttpCredentialSource[]).map((key) => (
-                <option key={key} value={key}>{t(`http_credentials.source_${key}`)}</option>
-              ))}
-            </select>
-          </label>
+          <div className="space-y-1">
+            <label htmlFor="credential-source">{t("http_credentials.source")}</label>
+            <Select id="credential-source" value={source}
+              aria-label={t("http_credentials.source")}
+              onChange={(value) => setSource(value as HttpCredentialSource)}
+              options={Object.keys(sources).map((value) => ({ value, label: t(`http_credentials.source_${value}`) }))}
+            />
+          </div>
           <details className="space-y-2 rounded-md border p-3 text-sm">
             <summary className="cursor-pointer font-medium">{t("http_credentials.setup_help")}</summary>
             <p>{t("http_credentials.setup_host")}</p>
@@ -132,13 +129,17 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
             )}
           </details>
           {kind === "api_key" && (
-            <label className="block space-y-1">
-              <span>{t("http_credentials.header")}</span>
-              <select className={inputClass} name="header">
-                <option value="bearer">Authorization: Bearer</option>
-                <option value="x_api_key">X-API-Key</option>
-              </select>
-            </label>
+            <div className="space-y-1">
+              <label htmlFor="credential-header">{t("http_credentials.header")}</label>
+              <Select id="credential-header" value={header}
+                aria-label={t("http_credentials.header")}
+                onChange={(value) => setHeader(value === "x_api_key" ? "x_api_key" : "bearer")}
+                options={[
+                  { value: "bearer", label: "Authorization: Bearer" },
+                  { value: "x_api_key", label: "X-API-Key" },
+                ]}
+              />
+            </div>
           )}
           {kind === "user_password" && (
             <label className="block space-y-1">
