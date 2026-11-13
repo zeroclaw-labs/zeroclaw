@@ -13896,6 +13896,7 @@ dependencies = [
  "zeroclaw-tls",
  "zeroclaw-tool-call-parser",
  "zeroclaw-tools",
+ "zeroize",
  "zip",
 ]
 
@@ -14063,6 +14064,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "schemars 1.2.2",
+ "scrypt",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -14076,6 +14078,7 @@ dependencies = [
  "tokio-tungstenite 0.29.0",
  "toml 1.1.2+spec-1.1.0",
  "toml_edit 0.25.12+spec-1.1.0",
+ "unicode-normalization",
  "url",
  "uuid",
  "webpki-roots 1.0.10",
@@ -14085,6 +14088,7 @@ dependencies = [
  "zeroclaw-log",
  "zeroclaw-macros",
  "zeroclaw-spawn",
+ "zeroize",
 ]
 
 [[package]]

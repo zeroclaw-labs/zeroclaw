@@ -695,6 +695,7 @@ mod tests {
                 UserConfig {
                     principal_id: Some("shared".to_string()),
                     uid: Some(uid),
+                    password_hash: None,
                     permission_profiles: vec!["reader".to_string()],
                 },
             );
@@ -720,6 +721,7 @@ mod tests {
                 UserConfig {
                     principal_id: Some("dup".to_string()),
                     uid: Some(uid),
+                    password_hash: None,
                     permission_profiles: vec![],
                 },
             );
@@ -754,6 +756,7 @@ mod tests {
             UserConfig {
                 principal_id: Some("alice".to_string()),
                 uid: Some(1000),
+                password_hash: None,
                 permission_profiles: vec!["operator".to_string()],
             },
         );
@@ -842,6 +845,7 @@ mod tests {
                         UserConfig {
                             principal_id: Some("bob".into()),
                             uid: Some(1000),
+                            password_hash: None,
                             permission_profiles: vec!["operator".into()],
                         },
                     );
@@ -856,6 +860,7 @@ mod tests {
                         UserConfig {
                             principal_id: Some("alice".into()),
                             uid: Some(2000),
+                            password_hash: None,
                             permission_profiles: vec!["operator".into()],
                         },
                     );
@@ -1032,6 +1037,7 @@ mod tests {
             UserConfig {
                 principal_id: Some("alice".to_string()),
                 uid: Some(1000),
+                password_hash: None,
                 permission_profiles: vec!["operator".to_string()],
             },
         );

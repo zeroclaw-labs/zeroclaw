@@ -130,8 +130,17 @@ dotted form (`agents.researcher.model_provider`). Both are accepted; the
 server normalises.
 
 The CLI counterpart is `zeroclaw config patch <file-or-stdin>`, which applies
-the same op set against the local Config and returns the same structured
-response shape (`--json` for scripts).
+the same op set and returns the same structured response shape (`--json` for
+scripts). The op set goes through the running daemon when the patch touches
+the authorization sections (`[users]`, `[permission_profiles]`, `[oidc]`,
+`security.trust_daemon_uid`) and the daemon can take every write in it, and
+against the local Config otherwise. A patch bound for the daemon fails and
+saves nothing if it has a `test` op on an authorization path, because the
+CLI would check the `test` against the file, not the daemon's live
+configuration. Its `--json` envelope may also carry a `daemon` member
+saying whether the daemon applied the batch;
+[Authentication & principals](../security/authentication.md#when-authorization-edits-take-effect)
+lists the reason codes for a batch left pending reload.
 
 ## Secrets: write-only over HTTP
 

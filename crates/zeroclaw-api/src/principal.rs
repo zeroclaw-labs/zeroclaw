@@ -151,6 +151,9 @@ pub enum AuthMethod {
     /// The existing `PairingGuard` bearer token (continuity / operator
     /// bootstrap).
     Native,
+    /// A local roster password, checked against the entry's
+    /// `password_hash`.
+    Password,
 }
 
 impl AuthMethod {
@@ -165,6 +168,7 @@ impl AuthMethod {
             Self::SshKey => "ssh-key",
             Self::Peercred => "peercred",
             Self::Native => "native",
+            Self::Password => "password",
         }
     }
 }
@@ -662,6 +666,13 @@ mod tests {
     fn auth_method_serializes_snake_case() {
         let j = serde_json::to_string(&AuthMethod::SshKey).expect("serialize");
         assert_eq!(j, "\"ssh_key\"");
+    }
+
+    #[test]
+    fn password_method_label_matches_its_wire_name() {
+        assert_eq!(AuthMethod::Password.as_str(), "password");
+        let j = serde_json::to_string(&AuthMethod::Password).expect("serialize");
+        assert_eq!(j, "\"password\"");
     }
 
     #[test]
