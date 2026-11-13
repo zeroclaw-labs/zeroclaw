@@ -894,6 +894,12 @@ async fn run() -> anyhow::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let local_config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
+    // A missing file is created with defaults inside `ensure_and_load`. An
+    // existing file that cannot be read or parsed must not fall back: defaults
+    // have no saved remote connection, so the next step would talk to (or
+    // spawn) a local daemon instead of the operator's chosen target.
+    // InvalidSavedLogin is already fail-closed; other load errors must not
+    // start with empty defaults either.
     let loaded_config = match config::ensure_and_load(&local_config_dir) {
         Ok(cfg) => cfg,
         Err(e) if e.downcast_ref::<config::InvalidSavedLogin>().is_some() => {
@@ -901,8 +907,7 @@ async fn run() -> anyhow::Result<()> {
             return Err(e);
         }
         Err(e) => {
-            eprintln!("zerocode: config load failed ({e:#}); starting with defaults");
-            config::ZerocodeConfig::default()
+            return Err(anyhow::Error::msg(format!("config load failed ({e:#})")));
         }
     };
     let resolved_locale = loaded_config
