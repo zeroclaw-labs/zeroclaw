@@ -63,6 +63,7 @@ The stability-tier definitions and versioning policy live in [FND-001](../founda
 | `zeroclaw-infra` | Beta | |
 | `zeroclaw-buildinfo` | Experimental | Shared `build.rs` stamp: renders `git describe`, or `ZEROCLAW_BUILD_ID` when the checkout is absent, into `ZEROCLAW_VERSION` for the daemon and relay binaries; build-dependency only, no runtime API |
 | `zeroclaw-commands` | Experimental | Built-in command catalog and metadata |
+| `zeroclaw-goal` | Experimental | Transport-neutral Goal policy and execution contracts |
 | `zeroclaw-tool-call-parser` | Beta | Stable at v0.8.0 |
 | `zeroclaw-channels` | Experimental | Plugin migration at v1.0.0 |
 | `zeroclaw-tools` | Experimental | Plugin migration at v1.0.0 |

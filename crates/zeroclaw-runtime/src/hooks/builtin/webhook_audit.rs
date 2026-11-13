@@ -146,6 +146,12 @@ fn build_webhook_client(target: &ValidatedWebhookTarget) -> Result<reqwest::Clie
     } else {
         builder.resolve_to_addrs(target.destination.host(), target.destination.addresses())
     };
+    #[cfg(test)]
+    let builder = if tests::is_plain_http_fixture(target) {
+        builder.tls_built_in_native_certs(false)
+    } else {
+        builder
+    };
     builder
         .build()
         .map_err(|_| "failed to build webhook HTTP client".to_string())
@@ -456,6 +462,83 @@ impl HookHandler for WebhookAuditHook {
 mod tests {
     use super::*;
 
+    std::thread_local! {
+        static PLAIN_HTTP_FIXTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    struct PlainHttpFixture {
+        previous: bool,
+        _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+
+    impl PlainHttpFixture {
+        fn enter() -> Self {
+            Self {
+                previous: PLAIN_HTTP_FIXTURE.replace(true),
+                _thread_bound: std::marker::PhantomData,
+            }
+        }
+    }
+
+    impl Drop for PlainHttpFixture {
+        fn drop(&mut self) {
+            PLAIN_HTTP_FIXTURE.set(self.previous);
+        }
+    }
+
+    pub(super) fn is_plain_http_fixture(target: &ValidatedWebhookTarget) -> bool {
+        // Plain HTTP mocks do not need the native TLS trust store. Keep HTTPS
+        // and unscoped calls on the ordinary client-construction path.
+        PLAIN_HTTP_FIXTURE.get()
+            && target.url.scheme() == "http"
+            && !target.destination.addresses().is_empty()
+            && target
+                .destination
+                .addresses()
+                .iter()
+                .all(|address| address.ip().is_loopback())
+    }
+
+    #[tokio::test]
+    async fn http_fixture_native_roots_override_is_scoped_and_excludes_https() {
+        async fn literal_target(url: &str) -> ValidatedWebhookTarget {
+            validate_webhook_target_with_resolver(url, &[], |_, _| async {
+                Err("literal fixture must not require DNS".to_string())
+            })
+            .await
+            .expect("valid literal fixture")
+        }
+
+        let http = literal_target("http://127.0.0.1:12345/hook").await;
+        let https = literal_target("https://8.8.8.8/hook").await;
+        assert!(!is_plain_http_fixture(&http));
+        {
+            let _fixture = PlainHttpFixture::enter();
+            assert!(is_plain_http_fixture(&http));
+            assert!(!is_plain_http_fixture(&https));
+            {
+                let _nested = PlainHttpFixture::enter();
+                assert!(is_plain_http_fixture(&http));
+            }
+            assert!(is_plain_http_fixture(&http));
+            std::thread::scope(|scope| {
+                assert!(
+                    !scope
+                        .spawn(|| is_plain_http_fixture(&http))
+                        .join()
+                        .expect("fixture isolation thread")
+                );
+            });
+        }
+        assert!(!is_plain_http_fixture(&http));
+        let result = std::panic::catch_unwind(|| {
+            let _fixture = PlainHttpFixture::enter();
+            panic!("exercise fixture scope unwinding");
+        });
+        assert!(result.is_err());
+        assert!(!is_plain_http_fixture(&http));
+    }
+
     // ── Glob matching tests ──────────────────────────────────────
 
     #[test]
@@ -692,6 +775,7 @@ mod tests {
             .mount(&server)
             .await;
 
+        let _fixture = PlainHttpFixture::enter();
         let mut hook = make_hook(vec!["Bash"], true);
         hook.config.url = server.uri();
 
@@ -738,6 +822,7 @@ mod tests {
             .mount(&server)
             .await;
 
+        let _fixture = PlainHttpFixture::enter();
         let mut hook = make_hook(vec!["Bash"], true);
         hook.config.url = server.uri();
         let mut runner = crate::hooks::HookRunner::new();

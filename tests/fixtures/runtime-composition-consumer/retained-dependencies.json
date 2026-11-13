@@ -53,6 +53,10 @@
       "owner": "crates/zeroclaw-runtime/src/sop/mod.rs",
       "reason": "Existing SOP graph/state definitions owned by the SOP engine; no additional composition capability."
     },
+    "zeroclaw-goal": {
+      "owner": "crates/zeroclaw-runtime/src/control_plane/goal_task.rs",
+      "reason": "The control plane re-exports Goal task types and registry contracts, and its SQLite store implements that registry; Goal policy stays in zeroclaw-goal and this edge adds no concrete adapter selection."
+    },
     "zeroclaw-plugins": {
       "owner": "crates/zeroclaw-runtime/src/tools/mod.rs",
       "reason": "Existing optional runtime plugin adapter boundary and host lifetime; policy and reservations remain enforced by the registry. Optionality does not excuse concrete construction on a supplied-capability path."
