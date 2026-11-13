@@ -4682,19 +4682,7 @@ mod tests {
         let spawn_marker = cwd.path().join("mcp-server-was-spawned");
         let mut config = Config {
             data_dir: cwd.path().to_path_buf(),
-            providers: {
-                let mut p = zeroclaw_config::providers::Providers::default();
-                p.models.openrouter.insert(
-                    "default".to_string(),
-                    zeroclaw_config::schema::OpenRouterModelProviderConfig {
-                        base: zeroclaw_config::schema::ModelProviderConfig {
-                            model: Some("test-model".to_string()),
-                            ..Default::default()
-                        },
-                    },
-                );
-                p
-            },
+            providers: openrouter_test_providers(None),
             mcp: zeroclaw_config::schema::McpConfig {
                 enabled: true,
                 servers: vec![zeroclaw_config::schema::McpServerConfig {
@@ -4731,7 +4719,7 @@ mod tests {
                 exclude: Vec::new(),
             },
         );
-        let mut agent = dispatchable_test_agent("openrouter.default");
+        let mut agent = dispatchable_test_agent("chat.openrouter");
         agent.mcp_bundles = vec!["slow-bundle".to_string()];
         config.agents.insert("test-agent".to_string(), agent);
         let server = AcpServer::new(config, AcpServerConfig::default());
@@ -4768,20 +4756,7 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let mut config = Config {
             data_dir: cwd.path().to_path_buf(),
-            providers: {
-                let mut providers = zeroclaw_config::providers::Providers::default();
-                providers.models.openrouter.insert(
-                    "default".to_string(),
-                    zeroclaw_config::schema::OpenRouterModelProviderConfig {
-                        base: zeroclaw_config::schema::ModelProviderConfig {
-                            api_key: Some("sk-ant-zeroclaw_test_credential".to_string()),
-                            model: Some("test-model".to_string()),
-                            ..Default::default()
-                        },
-                    },
-                );
-                providers
-            },
+            providers: openrouter_test_providers(Some("sk-ant-zeroclaw_test_credential")),
             ..Default::default()
         };
         config.risk_profiles.insert(
@@ -4790,7 +4765,7 @@ mod tests {
         );
         config.agents.insert(
             "test-agent".to_string(),
-            dispatchable_test_agent("openrouter.default"),
+            dispatchable_test_agent("chat.openrouter"),
         );
         let server = AcpServer::new(config, AcpServerConfig::default());
 
@@ -4841,7 +4816,7 @@ mod tests {
         assert_eq!(event["event"]["outcome"], "failure");
         assert_eq!(event["zeroclaw"]["channel_type"], "acp");
         assert_eq!(event["zeroclaw"]["agent_alias"], "test-agent");
-        assert_eq!(event["zeroclaw"]["model_provider"], "openrouter.default");
+        assert_eq!(event["zeroclaw"]["model_provider"], "chat.openrouter");
         assert_eq!(event["zeroclaw"]["model"], "test-model");
         assert!(
             event["zeroclaw"]["session_key"]
@@ -5022,20 +4997,7 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let mut config = Config {
             data_dir: cwd.path().to_path_buf(),
-            providers: {
-                let mut p = zeroclaw_config::providers::Providers::default();
-                p.models.openrouter.insert(
-                    "default".to_string(),
-                    zeroclaw_config::schema::OpenRouterModelProviderConfig {
-                        base: zeroclaw_config::schema::ModelProviderConfig {
-                            api_key: Some("test-key".to_string()),
-                            model: Some("test-model".to_string()),
-                            ..Default::default()
-                        },
-                    },
-                );
-                p
-            },
+            providers: openrouter_test_providers(Some("test-key")),
             ..Default::default()
         };
         config.risk_profiles.insert(
@@ -5048,7 +5010,7 @@ mod tests {
         );
         config.agents.insert(
             "only-agent".to_string(),
-            dispatchable_test_agent("openrouter.default"),
+            dispatchable_test_agent("chat.openrouter"),
         );
         let server = AcpServer::new(config, AcpServerConfig::default());
 
@@ -5097,20 +5059,7 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let mut config = Config {
             data_dir: cwd.path().to_path_buf(),
-            providers: {
-                let mut p = zeroclaw_config::providers::Providers::default();
-                p.models.openrouter.insert(
-                    "default".to_string(),
-                    zeroclaw_config::schema::OpenRouterModelProviderConfig {
-                        base: zeroclaw_config::schema::ModelProviderConfig {
-                            api_key: Some("test-key".to_string()),
-                            model: Some("test-model".to_string()),
-                            ..Default::default()
-                        },
-                    },
-                );
-                p
-            },
+            providers: openrouter_test_providers(Some("test-key")),
             ..Default::default()
         };
         config.risk_profiles.insert(
@@ -5123,11 +5072,11 @@ mod tests {
         );
         config.agents.insert(
             "agent-alpha".to_string(),
-            dispatchable_test_agent("openrouter.default"),
+            dispatchable_test_agent("chat.openrouter"),
         );
         config.agents.insert(
             "agent-beta".to_string(),
-            dispatchable_test_agent("openrouter.default"),
+            dispatchable_test_agent("chat.openrouter"),
         );
         config.acp.default_agent = Some("agent-alpha".to_string());
         let server = AcpServer::new(config, AcpServerConfig::default());
@@ -5151,20 +5100,7 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let mut config = Config {
             data_dir: cwd.path().to_path_buf(),
-            providers: {
-                let mut p = zeroclaw_config::providers::Providers::default();
-                p.models.openrouter.insert(
-                    "default".to_string(),
-                    zeroclaw_config::schema::OpenRouterModelProviderConfig {
-                        base: zeroclaw_config::schema::ModelProviderConfig {
-                            api_key: Some("test-key".to_string()),
-                            model: Some("test-model".to_string()),
-                            ..Default::default()
-                        },
-                    },
-                );
-                p
-            },
+            providers: openrouter_test_providers(Some("test-key")),
             ..Default::default()
         };
         config.risk_profiles.insert(
@@ -5177,11 +5113,11 @@ mod tests {
         );
         config.agents.insert(
             "agent-alpha".to_string(),
-            dispatchable_test_agent("openrouter.default"),
+            dispatchable_test_agent("chat.openrouter"),
         );
         config.agents.insert(
             "agent-beta".to_string(),
-            dispatchable_test_agent("openrouter.default"),
+            dispatchable_test_agent("chat.openrouter"),
         );
         config.acp.default_agent = Some("agent-alpha".to_string());
         let server = AcpServer::new(config, AcpServerConfig::default());
@@ -6973,6 +6909,25 @@ model = "claude-haiku-4-5"
             dispatchable_test_agent("chat.test"),
         );
         cfg
+    }
+
+    fn openrouter_test_providers(api_key: Option<&str>) -> zeroclaw_config::providers::Providers {
+        let auth = api_key.map_or_else(String::new, |key| {
+            format!("auth = {{ mode = \"api_key\", api_key = \"{key}\" }}")
+        });
+        toml::from_str(&format!(
+            r#"
+[connections."gateway.openrouter"]
+kind = "openrouter"
+{auth}
+
+[models."chat.openrouter"]
+capability = "chat"
+provider = "gateway.openrouter"
+model = "test-model"
+"#
+        ))
+        .expect("canonical OpenRouter test provider config parses")
     }
 
     /// The carrier regression exercises prompt-guided tool extraction through
