@@ -355,26 +355,33 @@ mod tests {
 
     #[tokio::test]
     async fn codex_cli_resolves_relative_working_directory_under_workspace() {
+        const CHILD: &str = "ZEROCLAW_TEST_CODEX_WORKDIR_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let empty_path = tempfile::TempDir::new().expect("empty PATH dir");
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "codex_cli::tests::codex_cli_resolves_relative_working_directory_under_workspace",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("PATH", empty_path.path())
+                .output()
+                .expect("isolated working-directory test");
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+
         let workspace = tempfile::TempDir::new().expect("temp workspace");
-        let empty_path = tempfile::TempDir::new().expect("empty PATH dir");
         let relative_working_directory = "relative-workdir";
         std::fs::create_dir(workspace.path().join(relative_working_directory))
             .expect("relative working directory");
-
-        let previous_path = std::env::var_os("PATH");
-        // SAFETY: this test is intended to run with `--test-threads=1` and
-        // restores PATH before returning.
-        unsafe { std::env::set_var("PATH", empty_path.path()) };
-        let _path_guard = scopeguard::guard(previous_path, |previous_path| match previous_path {
-            Some(previous_path) => {
-                // SAFETY: restoring the process PATH captured before this test.
-                unsafe { std::env::set_var("PATH", previous_path) }
-            }
-            None => {
-                // SAFETY: restoring the process PATH captured before this test.
-                unsafe { std::env::remove_var("PATH") }
-            }
-        });
 
         let tool = CodexCliTool::new(
             test_security_with_workspace(AutonomyLevel::Full, workspace.path().to_path_buf()),
