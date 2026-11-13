@@ -43187,10 +43187,14 @@ metadata = { context_window = 8000 }
             "claude-sonnet",
             None,
         );
-        ctx.model_routes = Arc::new(vec![zeroclaw_config::schema::ModelRouteConfig {
+        let mut config = (*ctx.prompt_config).clone();
+        config.model_routes = vec![zeroclaw_config::schema::ModelRouteConfig {
             hint: "auto".into(),
             model_ref: "anthropic.work".into(),
-        }]);
+        }];
+        ctx.prompt_config = Arc::new(config.clone());
+        ctx.live_config = zeroclaw_config::live::LiveConfig::new(config.clone()).handle();
+        ctx.model_routes = Arc::new(config.model_routes.clone());
         let mut msg = scope_test_msg("alice", "chan", None);
         msg.content = "/model auto".into();
         let sender_key = conversation_history_key(&msg);
