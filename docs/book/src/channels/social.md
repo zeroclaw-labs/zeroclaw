@@ -52,7 +52,7 @@ worse than one it answers five seconds late.
 {{#peer-group nostr}}
 
 - **Auth:** raw private key (`nsec` bech32 or hex).
-- **Inbound:** kind-1 (text), kind-4 (DM, NIP-04), and kind-1059 (gift-wrap, NIP-17).
+- **Inbound:** kind-1 (text), kind-4 (DM, NIP-04), and kind-1059 (gift-wrap, NIP-17). A gift-wrapped NIP-25 reaction (kind-7 rumor), e.g. a user reacting to one of the agent's replies, is ignored rather than treated as a message.
 - **Outbound:** same kinds. Zap handling is experimental.
 - **Relays:** the agent connects to all listed relays; use 3–5 for reliability. If `relays` is omitted, ZeroClaw connects to a built-in set of popular public relays.
 
