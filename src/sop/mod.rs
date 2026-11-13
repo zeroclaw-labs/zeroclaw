@@ -179,11 +179,26 @@ pub fn handle_command(command: crate::SopCommands, config: &crate::config::Confi
                     &[("value", &sop.cooldown_secs.to_string())]
                 )
             );
+            let effective = (sop.max_concurrent as usize).min(config.sop.max_concurrent_total);
             println!(
                 "{}",
                 get_required_cli_string_with_args(
                     "cli-sop-max-concurrent",
                     &[("value", &sop.max_concurrent.to_string())]
+                )
+            );
+            println!(
+                "{}",
+                get_required_cli_string_with_args(
+                    "cli-sop-max-concurrent-total",
+                    &[("value", &config.sop.max_concurrent_total.to_string())]
+                )
+            );
+            println!(
+                "{}",
+                get_required_cli_string_with_args(
+                    "cli-sop-max-concurrent-effective",
+                    &[("value", &effective.to_string())]
                 )
             );
             println!(
