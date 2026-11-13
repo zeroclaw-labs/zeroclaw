@@ -366,25 +366,25 @@ impl HttpRequestTool {
         let path = self
             .config_path
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Credential store unavailable"))?;
+            .ok_or_else(|| anyhow::Error::msg("Credential store unavailable"))?;
         let contents = std::fs::read_to_string(path)
-            .map_err(|_| anyhow::anyhow!("Credential store unavailable"))?;
+            .map_err(|_| anyhow::Error::msg("Credential store unavailable"))?;
         let config: Config = toml::from_str(&contents)
-            .map_err(|_| anyhow::anyhow!("Credential store unavailable"))?;
+            .map_err(|_| anyhow::Error::msg("Credential store unavailable"))?;
         let stored = config
             .http_request
             .scoped_credentials
             .get(name)
             .filter(|value| config.secrets.encrypt && value.starts_with("enc2:"))
-            .ok_or_else(|| anyhow::anyhow!("Scoped HTTP credential unavailable"))?;
+            .ok_or_else(|| anyhow::Error::msg("Scoped HTTP credential unavailable"))?;
         let dir = path
             .parent()
-            .ok_or_else(|| anyhow::anyhow!("Credential store unavailable"))?;
+            .ok_or_else(|| anyhow::Error::msg("Credential store unavailable"))?;
         let plaintext = SecretStore::new(dir, true)
             .decrypt(stored)
-            .map_err(|_| anyhow::anyhow!("Credential store unavailable"))?;
+            .map_err(|_| anyhow::Error::msg("Credential store unavailable"))?;
         let credential: ScopedHttpCredential = serde_json::from_str(&plaintext)
-            .map_err(|_| anyhow::anyhow!("Invalid stored HTTP credential"))?;
+            .map_err(|_| anyhow::Error::msg("Invalid stored HTTP credential"))?;
         if ScopedHttpCredential::https_origin(&target.url).as_deref()
             != Some(credential.origin.as_str())
         {
@@ -412,7 +412,7 @@ impl HttpRequestTool {
             }
         };
         let mut header = HeaderValue::from_str(&authorization)
-            .map_err(|_| anyhow::anyhow!("Invalid stored HTTP credential"))?;
+            .map_err(|_| anyhow::Error::msg("Invalid stored HTTP credential"))?;
         header.set_sensitive(true);
         headers.insert(name, header);
         sensitive.insert(0, authorization);
@@ -758,13 +758,13 @@ impl Tool for HttpRequestTool {
             Some(value) => Some(
                 value
                     .as_str()
-                    .ok_or_else(|| anyhow::anyhow!("'credential' must be a string"))?,
+                    .ok_or_else(|| anyhow::Error::msg("'credential' must be a string"))?,
             ),
             None => None,
         };
         let credential_result = match (scoped, auth_secret) {
-            (Some(_), Some(_)) => Err(anyhow::anyhow!(
-                "Choose credential or auth_secret, not both"
+            (Some(_), Some(_)) => Err(anyhow::Error::msg(
+                "Choose credential or auth_secret, not both",
             )),
             (Some(name), None) => self.apply_scoped_credential(&mut request_headers, name, &target),
             (None, _) => self
