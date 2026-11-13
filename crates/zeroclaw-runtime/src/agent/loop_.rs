@@ -17279,7 +17279,9 @@ Let me check the result."#;
             .lock()
             .unwrap()
             .set_deferred_builtin_specs(vec![tools[1].spec()]);
-        let build = |excluded: &[String]| {
+        let native_provider =
+            ScriptedModelProvider::from_text_responses(vec!["ok"]).with_native_tool_support();
+        let build_with = |provider: &dyn ModelProvider, excluded: &[String]| {
             super::build_system_prompt_for_turn(
                 workspace.path(),
                 "test-model",
@@ -17289,7 +17291,7 @@ Let me check the result."#;
                 None,
                 None,
                 &RiskProfileConfig::default(),
-                &provider,
+                provider,
                 &tools,
                 excluded,
                 Some(&activated),
@@ -17304,6 +17306,8 @@ Let me check the result."#;
             )
             .unwrap()
         };
+        let build = |excluded: &[String]| build_with(&provider, excluded);
+        let native_initial = build_with(&native_provider, &[]);
         let initial = build(&[]);
         assert!(initial.contains("catalog_probe - "));
         assert!(!initial.contains("**catalog_probe**"));
@@ -17330,7 +17334,8 @@ Let me check the result."#;
             tools[1].description(),
             tools[1].parameters_schema()
         )));
-        assert!(!selected.contains("catalog_probe - "));
+        assert!(selected.contains("catalog_probe - "));
+        assert_eq!(build_with(&native_provider, &[]), native_initial);
     }
 
     #[test]
