@@ -6390,6 +6390,214 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn startup_agent_flags_open_target_chat_once_after_connect() {
+        use clap::Parser;
+
+        for flag in ["-a", "--agent"] {
+            let cli = crate::Cli::parse_from(["zerocode", flag, "startup-target"]);
+            let reconnect_state = cli.initial_reconnect_state();
+            let (tx, mut rx) = mpsc::channel::<String>(16);
+            let rpc_out = Arc::new(crate::jsonrpc::RpcOutbound::new(tx));
+            let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc_out)));
+            let mut chat = chat::Chat::new(rpc, chat::PaneKind::Chat);
+            let mut mode = Mode::Dashboard;
+
+            consume_pending_quickstart_chat(
+                &PostPollDispatchState::new(ConnectionState::Disconnected {
+                    reason: "startup fixture disconnect".to_string(),
+                }),
+                &reconnect_state,
+                &mut mode,
+                &mut chat,
+            )
+            .await;
+            assert_eq!(mode, Mode::Dashboard);
+            assert!(
+                rx.try_recv().is_err(),
+                "disconnected startup must not send RPC"
+            );
+
+            let state_for_start = Arc::clone(&reconnect_state);
+            let mut start = tokio::spawn(async move {
+                consume_pending_quickstart_chat(
+                    &PostPollDispatchState::new(ConnectionState::Connected),
+                    &state_for_start,
+                    &mut mode,
+                    &mut chat,
+                )
+                .await;
+                (mode, chat)
+            });
+            let request = tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::select! {
+                    request = rx.recv() => request.expect("startup RPC channel stays open"),
+                    finished = &mut start => {
+                        let (mode, _) = finished.expect("startup task completes");
+                        assert_eq!(mode, Mode::Chat, "parsed agent must reach Chat startup");
+                        panic!("startup completed without requesting the target session");
+                    }
+                }
+            })
+            .await
+            .expect("startup should request its selected session");
+            let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+            assert_eq!(request["method"], crate::client::method::SESSION_NEW);
+            assert_eq!(request["params"]["agent_alias"], "startup-target");
+            assert!(request["params"]["session_id"].is_null());
+            assert_eq!(request["params"]["keep_siblings"], true);
+            rpc_out.dispatch_response(
+                request["id"].as_str().unwrap(),
+                Some(serde_json::json!({
+                    "session_id": "startup-session",
+                    "workspace_dir": "/startup-workspace"
+                })),
+                None,
+            );
+
+            let request = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("session start resolves model identity")
+                .expect("RPC channel stays open");
+            let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+            assert_eq!(request["method"], crate::client::method::CONFIG_LIST);
+            rpc_out.dispatch_response(
+                request["id"].as_str().unwrap(),
+                Some(serde_json::json!([])),
+                None,
+            );
+            let (mut mode, mut chat) = tokio::time::timeout(Duration::from_secs(2), start)
+                .await
+                .expect("startup completes after the RPC responses")
+                .expect("startup task succeeds");
+            assert_eq!(mode, Mode::Chat);
+            assert_eq!(chat.current_session_id(), Some("startup-session"));
+            let sessions = chat.session_summaries();
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].agent_alias, "startup-target");
+            assert!(sessions[0].focused);
+            assert!(
+                reconnect_state
+                    .lock()
+                    .unwrap()
+                    .pending_quickstart_chat
+                    .is_none()
+            );
+
+            consume_pending_quickstart_chat(
+                &PostPollDispatchState::new(ConnectionState::Connected),
+                &reconnect_state,
+                &mut mode,
+                &mut chat,
+            )
+            .await;
+            assert!(
+                rx.try_recv().is_err(),
+                "a consumed startup must not reopen a session"
+            );
+            assert_eq!(chat.current_session_id(), Some("startup-session"));
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_without_agent_keeps_dashboard_and_sends_no_session_request() {
+        use clap::Parser;
+
+        let cli = crate::Cli::parse_from(["zerocode"]);
+        let reconnect_state = cli.initial_reconnect_state();
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc_out = Arc::new(crate::jsonrpc::RpcOutbound::new(tx));
+        let rpc = Arc::new(RpcClient::with_rpc(rpc_out));
+        let mut chat = chat::Chat::new(rpc, chat::PaneKind::Chat);
+        let mut mode = Mode::Dashboard;
+
+        consume_pending_quickstart_chat(
+            &PostPollDispatchState::new(ConnectionState::Connected),
+            &reconnect_state,
+            &mut mode,
+            &mut chat,
+        )
+        .await;
+
+        assert_eq!(mode, Mode::Dashboard);
+        assert_eq!(chat.current_session_id(), None);
+        assert!(chat.session_summaries().is_empty());
+        assert!(
+            reconnect_state
+                .lock()
+                .unwrap()
+                .pending_quickstart_chat
+                .is_none()
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "omitted alias must not initiate an RPC"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_agent_rpc_rejection_uses_existing_chat_error() {
+        use clap::Parser;
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let cli = crate::Cli::parse_from(["zerocode", "--agent", "unknown-startup-agent"]);
+        let reconnect_state = cli.initial_reconnect_state();
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc_out = Arc::new(crate::jsonrpc::RpcOutbound::new(tx));
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc_out)));
+        let mut chat = chat::Chat::new(rpc, chat::PaneKind::Chat);
+        let start = tokio::spawn(async move {
+            let mut mode = Mode::Dashboard;
+            consume_pending_quickstart_chat(
+                &PostPollDispatchState::new(ConnectionState::Connected),
+                &reconnect_state,
+                &mut mode,
+                &mut chat,
+            )
+            .await;
+            (mode, chat)
+        });
+        let request = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("startup should request the supplied alias")
+            .expect("RPC channel stays open");
+        let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+        assert_eq!(request["method"], crate::client::method::SESSION_NEW);
+        assert_eq!(request["params"]["agent_alias"], "unknown-startup-agent");
+        rpc_out.dispatch_response(
+            request["id"].as_str().unwrap(),
+            None,
+            Some(crate::jsonrpc::JsonRpcError {
+                code: crate::jsonrpc::error_codes::INTERNAL_ERROR,
+                message: "unknown-startup-agent".to_string(),
+                data: None,
+            }),
+        );
+        let (mode, mut chat) = tokio::time::timeout(Duration::from_secs(2), start)
+            .await
+            .expect("rejected startup should return")
+            .expect("startup task succeeds");
+        assert_eq!(mode, Mode::Chat);
+        assert_eq!(chat.current_session_id(), None);
+        assert!(
+            rx.try_recv().is_err(),
+            "rejection must not start another session"
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        terminal
+            .draw(|frame| chat.draw(frame, frame.area()))
+            .unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("unknown-startup-agent"));
+    }
+
     #[test]
     fn quickstart_chat_handoff_consumes_immediate_target() {
         let state = SharedReconnectState::default();
