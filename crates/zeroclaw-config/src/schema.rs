@@ -9931,6 +9931,13 @@ pub struct PluginEntryConfig {
     /// field, `*` is not accepted here.
     #[serde(default)]
     pub egress_allow_private: Vec<String>,
+    /// Agent aliases this plugin instance may wake via `dispatch.wake`.
+    /// Default empty (`[]` = deny all). `"*"` permits any enabled agent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dispatch_agents: Vec<String>,
+    /// Optional per-instance wake ceiling per minute (default 30 when `None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_rate_per_min: Option<u32>,
     /// Named TLS trust and optional client-certificate profiles a transport
     /// may select for a destination. A profile chooses certificates only: its
     /// `hosts` must each be granted by `egress_hosts`, and selecting it never
@@ -26492,6 +26499,40 @@ impl Config {
         // `zeroclaw_infra::net_guard`, including containment of the private
         // address carveout by the host grant.
         for entry in &self.plugins.entries {
+            // The wake allowlist gates which agents this plugin instance may
+            // wake, so a malformed alias is a hard error rather than a line
+            // silently dropped at dispatch time.
+            let dispatch_path = format!("plugins.entries.{}.dispatch_agents", entry.name);
+            for target in &entry.dispatch_agents {
+                let trimmed = target.trim();
+                if trimmed.is_empty() {
+                    validation_bail!(
+                        InvalidFormat,
+                        dispatch_path.clone(),
+                        "{dispatch_path} must not contain an empty agent alias"
+                    );
+                }
+                let canonical = trimmed.len() <= 64
+                    && trimmed
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'));
+                if trimmed != "*" && !canonical {
+                    validation_bail!(
+                        InvalidFormat,
+                        dispatch_path.clone(),
+                        "{dispatch_path} lists {target:?}, which is neither '*' nor a 1-64 byte agent alias of letters, digits, '-' or '_'"
+                    );
+                }
+            }
+            if entry.dispatch_rate_per_min == Some(0) {
+                let path = format!("plugins.entries.{}.dispatch_rate_per_min", entry.name);
+                validation_bail!(
+                    InvalidNumericRange,
+                    path,
+                    "{path} must be greater than 0; a zero ceiling denies every wake this plugin attempts"
+                );
+            }
+
             let hosts = {
                 let path = format!("plugins.entries.{}.egress_hosts", entry.name);
                 match zeroclaw_infra::net_guard::normalize_egress_patterns(
@@ -33285,6 +33326,7 @@ enabled = true
             egress_hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
             egress_allow_private: private.iter().map(|h| (*h).to_string()).collect(),
             tls_profiles: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -33563,6 +33605,58 @@ custom_ca_secret = "corp_ca"
             err.to_string()
                 .contains("plugins.limits.max_connections_per_instance"),
             "error must name the offending path; got: {err}"
+        );
+    }
+
+    #[test]
+    async fn plugin_entry_rejects_empty_dispatch_agent_or_zero_rate() {
+        for bad in ["  ", "alpha.beta", "bad target"] {
+            let mut config = Config::default();
+            let mut entry = plugin_entry_with_egress(&[], &[]);
+            entry.dispatch_agents = vec![bad.to_string()];
+            config.plugins.entries.push(entry);
+            let err = config
+                .validate()
+                .expect_err("a malformed dispatch agent must be rejected");
+            let text = err.to_string();
+            assert!(
+                text.contains("dispatch_agents"),
+                "error must name the offending path for {bad:?}; got: {text}"
+            );
+        }
+
+        let mut config = Config::default();
+        let mut entry = plugin_entry_with_egress(&[], &[]);
+        entry.dispatch_rate_per_min = Some(0);
+        config.plugins.entries.push(entry);
+        let err = config
+            .validate()
+            .expect_err("a zero dispatch rate must be rejected");
+        assert!(
+            err.to_string().contains("dispatch_rate_per_min"),
+            "error must name the offending path; got: {err}"
+        );
+    }
+
+    #[test]
+    async fn plugin_entry_accepts_wildcard_and_valid_dispatch_agents() {
+        let mut config = Config::default();
+        let mut entry = plugin_entry_with_egress(&[], &[]);
+        entry.dispatch_agents = vec!["*".to_string(), "alpha-1_b".to_string()];
+        entry.dispatch_rate_per_min = Some(15);
+        config.plugins.entries.push(entry);
+        config
+            .validate()
+            .expect("wildcard plus a canonical agent alias must validate");
+
+        let default = super::PluginEntryConfig::default();
+        assert!(
+            default.dispatch_agents.is_empty(),
+            "the default must wake no agents"
+        );
+        assert_eq!(
+            default.dispatch_rate_per_min, None,
+            "the default must defer to the host rate ceiling"
         );
     }
 

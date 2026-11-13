@@ -4720,6 +4720,7 @@ const = true
             egress_hosts: Vec::new(),
             egress_allow_private: Vec::new(),
             tls_profiles: Vec::new(),
+            ..Default::default()
         };
         let mut snapshot = Config::default();
         snapshot.plugins.entries = vec![
@@ -5060,6 +5061,7 @@ permissions = ["http_client"]
             egress_hosts: vec!["api.example.com".to_string()],
             egress_allow_private: Vec::new(),
             tls_profiles: Vec::new(),
+            ..Default::default()
         };
         let request = || {
             zeroclaw_plugins::egress::EgressRequest::new(
