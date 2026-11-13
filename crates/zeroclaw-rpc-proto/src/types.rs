@@ -837,10 +837,37 @@ rpc_type! {
 }
 
 rpc_type! {
+    /// What the owned-state cascade removed when a map-key delete retired an
+    /// agent. Plain counts and messages: the cascade itself runs in the
+    /// runtime, which re-exports this type from `agent_owned_state`.
+    #[derive(Default)]
+    pub struct OwnedStateReport {
+        pub memory_purged: usize,
+        pub knowledge_purged: usize,
+        #[serde(default)]
+        pub knowledge_foreign_edges_purged: usize,
+        pub cron_removed: usize,
+        pub acp_removed: usize,
+        pub sessions_cleared: usize,
+        pub control_plane_tasks_removed: usize,
+        pub archived_to: Option<String>,
+        /// Surfaced failures (export / purge / delete errors). Non-empty means
+        /// part of the cascade did NOT complete; those rows were not silently
+        /// treated as removed. The handler logs these; nothing is masked as
+        /// success.
+        pub warnings: Vec<String>,
+    }
+}
+
+rpc_type! {
     pub struct ConfigMapKeyDeleteResult {
         pub path: String,
         pub key: String,
         pub deleted: bool,
+        /// What the owned-state cascade removed, when the delete retired an
+        /// agent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub owned_state: Option<OwnedStateReport>,
         /// Exact publication committed by this request, when available.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub revision: Option<PublishedConfigRevision>,

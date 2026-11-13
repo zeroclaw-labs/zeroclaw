@@ -691,6 +691,17 @@
           "key": {
             "type": "string"
           },
+          "owned_state": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OwnedStateReport"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What the owned-state cascade removed, when the delete retired an\nagent."
+          },
           "path": {
             "type": "string"
           },
@@ -2521,6 +2532,70 @@
           "step",
           "col",
           "row"
+        ],
+        "type": "object"
+      },
+      "OwnedStateReport": {
+        "description": "What the owned-state cascade removed when a map-key delete retired an\nagent. Plain counts and messages: the cascade itself runs in the\nruntime, which re-exports this type from `agent_owned_state`.",
+        "properties": {
+          "acp_removed": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "archived_to": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "control_plane_tasks_removed": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "cron_removed": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "knowledge_foreign_edges_purged": {
+            "default": 0,
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "knowledge_purged": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "memory_purged": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sessions_cleared": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "warnings": {
+            "description": "Surfaced failures (export / purge / delete errors). Non-empty means\npart of the cascade did NOT complete; those rows were not silently\ntreated as removed. The handler logs these; nothing is masked as\nsuccess.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "memory_purged",
+          "knowledge_purged",
+          "cron_removed",
+          "acp_removed",
+          "sessions_cleared",
+          "control_plane_tasks_removed",
+          "warnings"
         ],
         "type": "object"
       },
