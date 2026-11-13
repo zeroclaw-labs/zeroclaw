@@ -29,6 +29,22 @@ pub struct QdrantMemory {
 }
 
 impl QdrantMemory {
+    fn timestamp_in_range(timestamp: &str, since: Option<&str>, until: Option<&str>) -> bool {
+        let instant = chrono::DateTime::parse_from_rfc3339(timestamp).ok();
+        let compare = |bound: &str| {
+            match (
+                instant.as_ref(),
+                chrono::DateTime::parse_from_rfc3339(bound),
+            ) {
+                (Some(instant), Ok(bound)) => instant.cmp(&bound),
+                // Keep the legacy comparison for non-RFC3339 values.
+                _ => timestamp.cmp(bound),
+            }
+        };
+        since.is_none_or(|bound| !compare(bound).is_lt())
+            && until.is_none_or(|bound| !compare(bound).is_gt())
+    }
+
     fn add_time_range_filter(
         must: &mut Vec<serde_json::Value>,
         since: Option<&str>,
@@ -312,9 +328,7 @@ impl QdrantMemory {
                     _ => continue,
                 };
                 let timestamp = payload.timestamp.clone();
-                if since.is_some_and(|value| timestamp.as_str() < value)
-                    || until.is_some_and(|value| timestamp.as_str() > value)
-                {
+                if !Self::timestamp_in_range(&timestamp, since, until) {
                     continue;
                 }
 
@@ -827,13 +841,7 @@ impl Memory for QdrantMemory {
             })
             .collect();
 
-        // Filter by time range if specified
-        if let Some(s) = since {
-            entries.retain(|e| e.timestamp.as_str() >= s);
-        }
-        if let Some(u) = until {
-            entries.retain(|e| e.timestamp.as_str() <= u);
-        }
+        entries.retain(|entry| Self::timestamp_in_range(&entry.timestamp, since, until));
 
         Ok(entries)
     }
@@ -1219,12 +1227,7 @@ impl Memory for QdrantMemory {
             })
             .collect();
 
-        if let Some(s) = since {
-            entries.retain(|e| e.timestamp.as_str() >= s);
-        }
-        if let Some(u) = until {
-            entries.retain(|e| e.timestamp.as_str() <= u);
-        }
+        entries.retain(|entry| Self::timestamp_in_range(&entry.timestamp, since, until));
         Ok(entries)
     }
 }
@@ -1304,6 +1307,129 @@ mod tests {
                 "agent_id": "alpha"
             }
         })
+    }
+
+    struct VectorEmbedding;
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for VectorEmbedding {
+        fn name(&self) -> &str {
+            "fixture"
+        }
+
+        fn dimensions(&self) -> usize {
+            2
+        }
+
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn time_bounded_recall_compares_rfc3339_instants() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let since = "2026-09-26T12:00:00+08:00";
+        let until = "2026-09-26T06:00:00Z";
+        let server = thread::spawn(move || {
+            for index in 0..6 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let request = read_http_request(&mut stream);
+                let body: serde_json::Value =
+                    serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+                let vector = index < 2;
+                assert!(request.starts_with(if vector {
+                    "POST /collections/mem/points/search "
+                } else {
+                    "POST /collections/mem/points/scroll "
+                }));
+                let must = body["filter"]["must"].as_array().unwrap();
+                assert!(
+                    must.iter()
+                        .any(|condition| condition["key"] == "session_id")
+                );
+                assert_eq!(
+                    must.iter().any(|condition| condition["key"] == "agent_id"),
+                    index % 2 == 1
+                );
+                if vector {
+                    assert_eq!(body["vector"], serde_json::json!([1.0, 0.0]));
+                    assert!(must.iter().any(|condition| condition
+                        == &serde_json::json!({
+                            "key": "timestamp", "range": {"gte": since, "lte": until}
+                        })));
+                }
+                let points: Vec<_> = [
+                    "2026-09-26T04:00:00.000+00:00",
+                    "2026-09-26T05:00:00.500000+00:00",
+                    "2026-09-26T06:00:00+00:00",
+                    "2026-09-26T03:59:59Z",
+                    "2026-09-26T06:00:00.001Z",
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(id, timestamp)| {
+                    let mut point = qdrant_fixture_point(id);
+                    point["payload"]["timestamp"] = timestamp.into();
+                    point["payload"]["session_id"] = "session".into();
+                    point["score"] = serde_json::json!(0.9);
+                    point
+                })
+                .collect();
+                let response = if vector {
+                    serde_json::json!({"result": points})
+                } else {
+                    serde_json::json!({"result": {"points": points, "next_page_offset": null}})
+                }
+                .to_string();
+                write!(stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response.len(), response).unwrap();
+            }
+        });
+
+        let mut results = Vec::new();
+        for mode in 0..3 {
+            let embedder: Arc<dyn EmbeddingProvider> = if mode == 0 {
+                Arc::new(VectorEmbedding)
+            } else {
+                Arc::new(EmptyVectorEmbedding)
+            };
+            let mem = QdrantMemory::new_lazy("test", &endpoint, "mem", None, embedder);
+            mem.initialized.set(()).unwrap();
+            let query = if mode == 1 { "" } else { "keyword" };
+            results.push(
+                Memory::recall(&mem, query, 10, Some("session"), Some(since), Some(until))
+                    .await
+                    .unwrap(),
+            );
+            results.push(
+                Memory::recall_for_agents(
+                    &mem,
+                    &["alpha"],
+                    query,
+                    10,
+                    Some("session"),
+                    Some(since),
+                    Some(until),
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        server.join().unwrap();
+        for (path, entries) in results.iter().enumerate() {
+            let ids: Vec<_> = entries.iter().map(|entry| entry.id.as_str()).collect();
+            assert_eq!(ids, ["0", "1", "2"], "recall path {path}");
+        }
     }
 
     #[tokio::test]
