@@ -10080,8 +10080,9 @@ impl RpcDispatcher {
     /// `config/set-many`: stage an ordered batch of `config/set` entries on
     /// one working copy and commit it with a single `save_and_publish_config`,
     /// so fields that are only valid together (a `[users.<name>]` entry's
-    /// `uid` and `permission_profiles`) can be authored without an invalid
-    /// intermediate state ever being checked, saved, or installed. Whatever
+    /// credential, `uid` or `password_hash`, and its `permission_profiles`)
+    /// can be authored without an invalid intermediate state ever being
+    /// checked, saved, or installed. Whatever
     /// commit-time checks `save_and_publish_config` performs run once, over the
     /// final state. An entry that fails to stage aborts the whole batch
     /// before anything is saved or swapped, and the error names its index.
@@ -16062,6 +16063,7 @@ mod tests {
             UserConfig {
                 principal_id: None,
                 uid: Some(uid),
+                password_hash: None,
                 permission_profiles: vec!["reader".into()],
             },
         );
@@ -16205,6 +16207,7 @@ mod tests {
             UserConfig {
                 principal_id: None,
                 uid: Some(4343),
+                password_hash: None,
                 permission_profiles: vec!["operator".into()],
             },
         );
@@ -16339,6 +16342,7 @@ mod tests {
                 UserConfig {
                     principal_id: None,
                     uid: Some(4343),
+                    password_hash: None,
                     permission_profiles: vec!["operator".into()],
                 },
             );
@@ -16666,6 +16670,7 @@ mod tests {
             UserConfig {
                 principal_id: None,
                 uid: Some(uid),
+                password_hash: None,
                 permission_profiles: vec!["cron-alpha".into()],
             },
         );
@@ -17841,6 +17846,7 @@ mod tests {
             UserConfig {
                 principal_id: None,
                 uid: Some(uid),
+                password_hash: None,
                 permission_profiles: vec!["session-scoped".into()],
             },
         );
@@ -19968,6 +19974,7 @@ mod tests {
                     zeroclaw_config::schema::UserConfig {
                         principal_id: None,
                         uid: Some(4343),
+                        password_hash: None,
                         permission_profiles: vec!["session-scoped".into()],
                     },
                 );
@@ -23102,6 +23109,7 @@ mod tests {
             UserConfig {
                 principal_id: None,
                 uid: Some(4242),
+                password_hash: None,
                 permission_profiles: vec!["narrow".into()],
             },
         );
@@ -23165,6 +23173,7 @@ mod tests {
             UserConfig {
                 principal_id: None,
                 uid: Some(4242),
+                password_hash: None,
                 permission_profiles: vec!["selector-only".into()],
             },
         );
@@ -23277,6 +23286,7 @@ mod tests {
             UserConfig {
                 principal_id: None,
                 uid: Some(4242),
+                password_hash: None,
                 permission_profiles: vec!["principal-test".into()],
             },
         );
@@ -24305,6 +24315,7 @@ mod tests {
                 UserConfig {
                     principal_id: None,
                     uid: Some(uid),
+                    password_hash: None,
                     permission_profiles: vec!["member".into()],
                 },
             );
@@ -26434,6 +26445,7 @@ mod tests {
             UserConfig {
                 principal_id: None,
                 uid: Some(4444),
+                password_hash: None,
                 permission_profiles: vec!["admin".into()],
             },
         );
@@ -26502,6 +26514,7 @@ mod tests {
             UserConfig {
                 principal_id: None,
                 uid: Some(4444),
+                password_hash: None,
                 permission_profiles: vec!["admin".into()],
             },
         );
@@ -26646,6 +26659,7 @@ mod tests {
             UserConfig {
                 principal_id: None,
                 uid: Some(4444),
+                password_hash: None,
                 permission_profiles: vec!["admin".into()],
             },
         );
@@ -27159,6 +27173,7 @@ mod tests {
             UserConfig {
                 principal_id: None,
                 uid: Some(4444),
+                password_hash: None,
                 permission_profiles: vec!["admin".into()],
             },
         );
@@ -29071,6 +29086,7 @@ mod tests {
                 UserConfig {
                     principal_id: None,
                     uid: Some(uid),
+                    password_hash: None,
                     permission_profiles: vec![name.into()],
                 },
             );
@@ -44695,6 +44711,7 @@ mod tests {
             UserConfig {
                 principal_id: None,
                 uid: Some(4242),
+                password_hash: None,
                 permission_profiles: vec!["admin".into()],
             },
         );
@@ -45161,6 +45178,7 @@ mod tests {
             UserConfig {
                 principal_id: None,
                 uid: Some(4242),
+                password_hash: None,
                 permission_profiles: vec!["admin".into()],
             },
         );
@@ -45174,7 +45192,7 @@ mod tests {
             ),
             (
                 json!({"prop": "users.bob.permission_profiles", "value": ["operator"]}),
-                "users.bob.uid is required",
+                "users.bob has no credential",
             ),
         ] {
             let response = rpc_roundtrip(&mut dispatcher, &mut rx, "config/set", entry).await;
@@ -46846,6 +46864,7 @@ mod tests {
             UserConfig {
                 principal_id: None,
                 uid: Some(uid),
+                password_hash: None,
                 permission_profiles: vec!["config-writer".into()],
             },
         );
@@ -47103,6 +47122,7 @@ mod tests {
             UserConfig {
                 principal_id: None,
                 uid: Some(uid),
+                password_hash: None,
                 permission_profiles: vec!["session-alpha".into()],
             },
         );
