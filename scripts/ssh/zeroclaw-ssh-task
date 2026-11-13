@@ -14,6 +14,7 @@ import threading
 import time
 import tempfile
 import stat
+import tomllib
 
 ROOT = pathlib.Path(os.environ['ZEROCLAW_SSH_STATE_DIR']) if 'ZEROCLAW_SSH_STATE_DIR' in os.environ else pathlib.Path(os.environ.get('XDG_RUNTIME_DIR', tempfile.gettempdir())) / ('zeroclaw-ssh-' + str(os.getuid()) if hasattr(os, 'getuid') else 'zeroclaw-ssh')
 SSH = '/usr/bin/ssh'
@@ -42,7 +43,7 @@ def parse_args(args):
     return options, host, args
 
 
-def ssh_config(options, host):
+def ssh_config(options, host, include_target=False):
     p = subprocess.run([SSH, '-G', *options, host], check=True,
                        capture_output=True, text=True, timeout=10)
     config = {}
@@ -53,7 +54,83 @@ def ssh_config(options, host):
     # Keep aliases separate and bind reuse to every effective setting, including
     # host-key policy/files, certificates and proxy/authentication configuration.
     key = (host, sorted(config.items()))
-    return hashlib.sha256(json.dumps(key).encode()).hexdigest()[:24]
+    digest = hashlib.sha256(json.dumps(key).encode()).hexdigest()[:24]
+    if include_target:
+        return digest, {field: config[field][0] for field in ('hostname', 'port', 'user')}
+    return digest
+
+
+def scoped_record(alias, target):
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', alias):
+        raise ValueError('Invalid SSH credential alias')
+    root = pathlib.Path(os.environ['ZEROCLAW_SSH_CREDENTIAL_DIR'])
+    config = tomllib.loads((root / 'config.toml').read_text())
+    stored = config.get('http_request', {}).get('scoped_credentials', {}).get(alias, '')
+    if not config.get('secrets', {}).get('encrypt', True) or not stored.startswith('enc2:'):
+        raise ValueError('SSH credential unavailable')
+    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+    blob = bytes.fromhex(stored[5:])
+    master = bytes.fromhex((root / '.secret_key').read_text().strip())
+    record = json.loads(ChaCha20Poly1305(master).decrypt(blob[:12], blob[12:], None))
+    auth = record['auth']
+    if auth.get('kind') != 'ssh_key' or not any(
+        grant['host'].lower() == target['hostname'].lower()
+        and str(grant['port']) == target['port']
+        and grant['username'] == target['user']
+        for grant in auth.get('destinations', [])
+    ):
+        raise ValueError('SSH credential is not authorized for this destination')
+    revision = hashlib.sha256(stored.encode()).hexdigest()
+    return revision, record.get('source', 'local'), auth['private_key']
+
+
+def start_scoped_agent(path, source, value):
+    if source == 'open_bao':
+        fields = value.split('/')
+        if len(fields) < 3 or not all(re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]*', field) for field in fields):
+            raise ValueError('Invalid OpenBao SSH key reference')
+        fetched = subprocess.run(
+            ['bao', 'kv', 'get', '-mount=' + fields[0], '-field=' + fields[-1], '/'.join(fields[1:-1])],
+            capture_output=True, timeout=12, check=False,
+        )
+        if fetched.returncode or len(fetched.stdout) > 16384:
+            raise ValueError('OpenBao SSH key lookup failed')
+        value = fetched.stdout.decode('utf-8')
+    elif source != 'local':
+        raise ValueError('SSH credential source is unsupported by this helper')
+    private = (value.rstrip() + '\n').encode()
+    if len(private) > 16384 or not private.startswith(b'-----BEGIN OPENSSH PRIVATE KEY-----'):
+        raise ValueError('Invalid OpenSSH private key')
+    agent = subprocess.Popen(
+        ['/usr/bin/setpriv', '--pdeathsig', 'TERM', '/usr/bin/ssh-agent', '-D', '-a', str(path)],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 3
+        while not path.is_socket() and agent.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.03)
+        loaded = subprocess.run(
+            ['/usr/bin/ssh-add', '-'], input=private, timeout=6,
+            env=dict(os.environ, SSH_AUTH_SOCK=str(path), SSH_ASKPASS_REQUIRE='never'),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        if loaded.returncode:
+            raise ValueError('Private SSH agent rejected the key')
+        return agent
+    except BaseException:
+        stop_agent(agent, path)
+        raise
+
+
+def stop_agent(agent, path):
+    if agent.poll() is None:
+        agent.terminate()
+        try:
+            agent.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            agent.kill()
+            agent.wait(timeout=3)
+    path.unlink(missing_ok=True)
 
 
 class BoundedLog:
@@ -101,7 +178,7 @@ class Pool:
         # process. Use a task-lifetime thread, never a short client handler.
         self.spawner = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
-    def acquire(self, key, options, host):
+    def acquire(self, key, options, host, credential=None):
         with self.lock:
             if self.closed:
                 raise RuntimeError('SSH task has ended')
@@ -115,13 +192,23 @@ class Pool:
                            '-o', 'ConnectionAttempts=1', '-o', 'ForwardAgent=no',
                            '-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=3',
                            *options, host]
+                if credential:
+                    command[4:4] = ['-o', 'StrictHostKeyChecking=yes', '-o', 'IdentityAgent=' + str(self.directory / (key[:12] + '.agent')), '-o', 'IdentitiesOnly=no', '-o', 'IdentityFile=none',
+                                    '-o', 'PreferredAuthentications=publickey']
                 log = BoundedLog()
+                agent_path = self.directory / (key[:12] + '.agent')
                 def spawn():
-                    process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
-                                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                    agent = start_scoped_agent(agent_path, *credential) if credential else None
+                    try:
+                        process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
+                                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                    except BaseException:
+                        if agent:
+                            stop_agent(agent, agent_path)
+                        raise
                     log.attach(process.stderr)
-                    return process
-                entry = dict(key=key, process=None, future=self.spawner.submit(spawn), path=path,
+                    return process, agent
+                entry = dict(key=key, process=None, agent_path=agent_path, future=self.spawner.submit(spawn), path=path,
                              host=host, log=log, active=0, last=self.clock(), failed=False,
                              ready=threading.Event(), stop_lock=threading.Lock())
                 self.entries[key] = entry
@@ -129,7 +216,7 @@ class Pool:
         # task shutdown never wait behind its network connection deadline.
         if owner:
             try:
-                process = entry['future'].result()
+                process, _ = entry['future'].result()
                 entry['process'] = process
                 deadline = time.monotonic() + 15
                 while not pathlib.Path(entry['path']).exists() and process.poll() is None:
@@ -164,7 +251,7 @@ class Pool:
                 entry['active'] += 1
                 entry['last'] = self.clock()
                 return entry['path']
-        return self.acquire(key, options, host)
+        return self.acquire(key, options, host, credential)
 
     def release(self, key):
         with self.lock:
@@ -177,9 +264,9 @@ class Pool:
     def stop(entry):
         with entry['stop_lock']:
             try:
-                process = entry['future'].result()
+                process, agent = entry['future'].result()
             except Exception:
-                process = None
+                process, agent = None, None
             if process is not None and process.poll() is None:
                 process.terminate()
                 try:
@@ -187,6 +274,8 @@ class Pool:
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=3)
+            if agent:
+                stop_agent(agent, entry['agent_path'])
             entry['log'].close()
             pathlib.Path(entry['path']).unlink(missing_ok=True)
 
@@ -262,8 +351,22 @@ def serve(directory):
             peer.settimeout(20)
             request = read_message(peer)
             options, host, _ = parse_args(list(request['argv']))
-            key = ssh_config(options, host)
-            path = pool.acquire(key, options, host)
+            alias = request.get('credential') or os.environ.get('ZEROCLAW_SSH_DEFAULT_CREDENTIAL')
+            if alias:
+                effective, target = ssh_config(options, host, include_target=True)
+                try:
+                    revision, source, value = scoped_record(alias, target)
+                except ValueError as exc:
+                    if str(exc) in ('SSH credential unavailable', 'SSH credential is not authorized for this destination'):
+                        raise
+                    raise ValueError('SSH credential lookup failed') from None
+                except Exception:
+                    raise ValueError('SSH credential lookup failed') from None
+                key = hashlib.sha256(f'{effective}:{alias}:{revision}'.encode()).hexdigest()[:24]
+                path = pool.acquire(key, options, host, (source, value))
+            else:
+                key = ssh_config(options, host)
+                path = pool.acquire(key, options, host)
             acquired = True
             peer.sendall(json.dumps({'path': path}).encode() + b'\n')
             peer.settimeout(None)
@@ -302,11 +405,16 @@ def client(args):
     scope = os.environ.get('ZEROCLAW_SSH_TASK')
     if not scope or not re.fullmatch('[a-f0-9]{32}', scope):
         raise RuntimeError('SSH requires an active ZeroClaw task; no unmanaged fallback')
+    credential = None
+    if args[:1] == ['--credential']:
+        if len(args) < 3:
+            raise ValueError('SSH credential alias and destination are required')
+        credential, args = args[1], args[2:]
     options, host, commands = parse_args(list(args))
     with socket.socket(socket.AF_UNIX) as peer:
         peer.settimeout(20)
         peer.connect(str(ROOT / scope / 'broker'))
-        peer.sendall(json.dumps({'argv': args}).encode() + b'\n')
+        peer.sendall(json.dumps({'argv': args, 'credential': credential}).encode() + b'\n')
         response = read_message(peer)
         if 'error' in response:
             raise RuntimeError(response['error'])
