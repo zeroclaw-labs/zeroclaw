@@ -471,7 +471,8 @@ pub fn default_tools_with_runtime(
     runtime: Arc<dyn RuntimeAdapter>,
 ) -> Vec<Box<dyn Tool>> {
     let persistent_writes = runtime.has_filesystem_access();
-    vec![
+    let has_shell_access = runtime.has_shell_access();
+    let mut tools: Vec<Box<dyn Tool>> = vec![
         // The shell tool owns its own dialect-aware command + forbidden-path
         // validation (see `ShellTool::execute`), so it is not wrapped in the
         // generic POSIX `PathGuardedTool` — matching `SkillShellTool`. Wrapping it
@@ -514,7 +515,11 @@ pub fn default_tools_with_runtime(
             PathGuardedTool::new(ContentSearchTool::new(security.clone()), security.clone()),
             security,
         )),
-    ]
+    ];
+    if !has_shell_access {
+        tools.retain(|tool| tool.name() != "shell");
+    }
+    tools
 }
 
 /// The registered session-data tools that address other sessions. Each
@@ -2405,20 +2410,26 @@ fn all_tools_with_runtime_on_thread(
             );
         };
     }
-    register_tool!(
-        "shell",
-        Arc::new(RateLimitedTool::new(
-            shell_tool
-                .with_timeout_secs(if security.shell_timeout_secs > 0 {
-                    security.shell_timeout_secs
-                } else {
-                    root_config.shell_tool.timeout_secs
-                })
-                .with_shared_tui_env(tui_env)
-                .with_persistent_writes(persistent_writes),
-            security.clone(),
-        ))
-    );
+    if has_shell_access {
+        register_tool!(
+            "shell",
+            Arc::new(RateLimitedTool::new(
+                shell_tool
+                    .with_timeout_secs(if security.shell_timeout_secs > 0 {
+                        security.shell_timeout_secs
+                    } else {
+                        root_config.shell_tool.timeout_secs
+                    })
+                    .with_shared_tui_env(tui_env)
+                    .with_persistent_writes(persistent_writes),
+                security.clone(),
+            ))
+        );
+    } else {
+        // No shell on this runtime: keep the name reserved so a plugin cannot
+        // claim it, but expose no tool that could only fail.
+        let _ = select_tool!("shell");
+    }
     register_tool!(
         "file_read",
         Arc::new(RateLimitedTool::new(
@@ -2520,15 +2531,20 @@ fn all_tools_with_runtime_on_thread(
     register_tool!("memory_forget", construct_memory(NativeMemoryKind::Forget));
     register_tool!("memory_export", construct_memory(NativeMemoryKind::Export));
     register_tool!("memory_purge", construct_memory(NativeMemoryKind::Purge));
-    register_tool!(
-        "schedule",
-        Arc::new(ScheduleTool::new_with_runtime(
-            security.clone(),
-            Arc::clone(&root_config_shared),
-            agent_alias,
-            runtime.clone(),
-        ))
-    );
+    // `schedule` creates shell-only jobs, so it needs a shell like `shell` does.
+    if has_shell_access {
+        register_tool!(
+            "schedule",
+            Arc::new(ScheduleTool::new_with_runtime(
+                security.clone(),
+                Arc::clone(&root_config_shared),
+                agent_alias,
+                runtime.clone(),
+            ))
+        );
+    } else {
+        let _ = select_tool!("schedule");
+    }
     register_tool!("spawn_subagent", {
         let tool = SpawnSubagentTool::new(
             Arc::clone(&root_config_shared),
@@ -4653,9 +4669,9 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "android")))]
     #[test]
-    fn all_tools_runtime_rejects_empty_or_relative_only_tui_path() {
+    fn all_tools_runtime_has_no_shell_for_empty_or_relative_only_tui_path() {
         use std::ffi::OsString;
 
         for path in [OsString::new(), OsString::from("relative-only")] {
@@ -4664,7 +4680,15 @@ mod tests {
             let tui_env =
                 HashMap::from([("PATH".to_string(), path.to_string_lossy().into_owned())]);
 
-            assert!(runtime_for_all_tools(&root_config, Some(&tui_env)).is_err());
+            // Unusable PATH entries never resolve a shell; the runtime reports
+            // no shell instead of launching a decoy or failing construction.
+            let runtime = runtime_for_all_tools(&root_config, Some(&tui_env)).unwrap();
+            assert!(!runtime.has_shell_access());
+            assert!(
+                runtime
+                    .build_shell_command("echo all-tools", &std::env::temp_dir())
+                    .is_err()
+            );
         }
     }
 
@@ -6463,6 +6487,95 @@ permissions = ["http_client"]
             names.contains(&"shell"),
             "positive control: ordinary tools should still register"
         );
+    }
+
+    /// A native runtime whose shell is absent (the shell-free release image)
+    /// builds, but exposes no `shell` tool. Android pins its shell and never
+    /// reports it absent, so the case does not apply there.
+    #[cfg(all(unix, not(target_os = "android")))]
+    #[tokio::test]
+    async fn native_runtime_without_shell_does_not_register_shell_tool() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: crate::security::AutonomyLevel::Full,
+            workspace_dir: tmp.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let browser = BrowserConfig {
+            enabled: false,
+            ..BrowserConfig::default()
+        };
+        let mut cfg = test_config(&tmp);
+        cfg.runtime.shell = Some("/nonexistent-zeroclaw-shell/bin/sh".into());
+        let risk = zeroclaw_config::schema::RiskProfileConfig {
+            sandbox_enabled: Some(false),
+            sandbox_backend: Some("none".to_string()),
+            ..zeroclaw_config::schema::RiskProfileConfig::default()
+        };
+        let runtime: Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
+            Arc::from(zeroclaw_config::platform::create_runtime(&cfg.runtime).unwrap());
+        assert!(!runtime.has_shell_access());
+
+        let tools = all_tools_with_runtime(
+            Arc::new(cfg.clone()),
+            &security,
+            &risk,
+            "test-agent",
+            runtime,
+            mem,
+            None,
+            None,
+            &browser,
+            &zeroclaw_config::schema::HttpRequestConfig::default(),
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("tool registry builds without a shell")
+        .tools;
+        let names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
+
+        assert!(
+            !names.contains(&"shell"),
+            "shell must not register without a shell: {names:?}"
+        );
+        assert!(
+            !names.contains(&"schedule"),
+            "schedule only creates shell jobs and must not register without a shell: {names:?}"
+        );
+        assert!(
+            names.contains(&"file_read"),
+            "positive control: ordinary tools should still register"
+        );
+
+        // The standalone default registry follows the same rule.
+        let no_shell: Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
+            Arc::from(zeroclaw_config::platform::create_runtime(&cfg.runtime).unwrap());
+        let defaults = default_tools_with_runtime(security.clone(), no_shell);
+        let default_names: Vec<&str> = defaults.iter().map(|tool| tool.name()).collect();
+        assert!(!default_names.contains(&"shell"), "{default_names:?}");
+        assert!(default_names.contains(&"file_read"), "{default_names:?}");
+        let with_shell = default_tools_with_runtime(
+            security.clone(),
+            Arc::new(zeroclaw_config::platform::NativeRuntime::with_shell(
+                "sh".into(),
+            )),
+        );
+        assert!(with_shell.iter().any(|tool| tool.name() == "shell"));
     }
 
     /// An integration enabled in config registers only when its feature is

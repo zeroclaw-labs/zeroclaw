@@ -277,6 +277,63 @@ pub fn windows_std_cmd_shell_command(command: &str) -> std::process::Command {
     process
 }
 
+/// Whether probing `candidate` proves that nothing is there: the probe failed
+/// with `NotFound`, or with `NotADirectory` (a path component is a regular
+/// file, so nothing can live below it).
+///
+/// Any other failure (an unsearchable parent directory, a symlink loop in a
+/// parent component, ...) proves nothing: the entry may well exist.
+#[cfg(unix)]
+fn probe_proves_absent(candidate: &Path) -> bool {
+    match std::fs::symlink_metadata(candidate) {
+        Ok(_) => false,
+        Err(error) => matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        ),
+    }
+}
+
+/// Whether `shell` is absent on this host: every place it could be was probed
+/// and none holds an entry of that name. Present but unusable (not executable,
+/// a directory) is not absent, it stays a misconfiguration. Android pins its
+/// shell to `/system/bin/sh`, so it is never absent here.
+///
+/// A place that cannot be probed (an unsearchable directory, a symlink loop
+/// in a parent component) is not evidence of absence either: the shell may be
+/// there. The result is then "not absent" and the resolver reports the
+/// underlying error, so an unexpectedly missing shell stays diagnosable.
+///
+/// This is decided by probing existence, not by the resolver's error kind:
+/// the resolver reports the error of *some other* PATH entry (for example a
+/// regular file used as a directory) when the shell is nowhere to be found.
+#[cfg(unix)]
+pub(crate) fn shell_is_absent<I, P>(shell: &OsStr, path_entries: I) -> bool
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+{
+    if is_android() {
+        return false;
+    }
+    let requested = Path::new(shell);
+    if requested.is_absolute() {
+        return probe_proves_absent(requested);
+    }
+    // Same entries the resolver considers: absolute ones only.
+    path_entries.into_iter().all(|entry| {
+        let entry = entry.as_ref();
+        !entry.is_absolute() || probe_proves_absent(&entry.join(requested))
+    })
+}
+
+/// [`shell_is_absent`] against the process `PATH`.
+#[cfg(unix)]
+pub(crate) fn shell_is_absent_on_host(shell: &str) -> bool {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    shell_is_absent(OsStr::new(shell), std::env::split_paths(&path))
+}
+
 /// Native runtime — full access, runs on Mac/Linux/Windows/Docker/Raspberry Pi
 pub struct NativeRuntime {
     /// Shell binary to invoke for command execution.
@@ -291,6 +348,10 @@ pub struct NativeRuntime {
     /// Absolute launcher resolved by the TUI-aware runtime factory, when one
     /// was supplied. Ambient callers continue resolving at command build time.
     resolved_shell: Option<PathBuf>,
+    /// Set when the shell is absent from the host (see [`shell_is_absent`]).
+    /// The runtime then reports no shell (`ShellDialect::None`)
+    /// instead of advertising one that every command would fail to launch.
+    shell_unavailable: bool,
 }
 
 impl Default for NativeRuntime {
@@ -301,8 +362,17 @@ impl Default for NativeRuntime {
 
 impl NativeRuntime {
     /// Create a native runtime using the platform's resolved default shell.
+    ///
+    /// Like the runtime factory, a default shell that is not on this host
+    /// yields a runtime that reports no shell rather than one that advertises
+    /// a shell every command would fail to launch.
     pub fn new() -> Self {
-        Self::with_shell(default_shell())
+        let shell = default_shell();
+        #[cfg(unix)]
+        if shell_is_absent_on_host(&shell) {
+            return Self::without_shell(shell);
+        }
+        Self::with_shell(shell)
     }
 
     /// Create a native runtime that uses a specific shell binary.
@@ -318,6 +388,7 @@ impl NativeRuntime {
         Self {
             shell,
             resolved_shell: None,
+            shell_unavailable: false,
         }
     }
 
@@ -328,6 +399,18 @@ impl NativeRuntime {
         Self {
             shell,
             resolved_shell,
+            shell_unavailable: false,
+        }
+    }
+
+    /// Create a native runtime whose configured shell is absent from the host.
+    /// It reports no shell access and refuses to build shell commands.
+    #[cfg(unix)]
+    pub(crate) fn without_shell(shell: String) -> Self {
+        Self {
+            shell,
+            resolved_shell: None,
+            shell_unavailable: true,
         }
     }
 }
@@ -357,6 +440,10 @@ impl RuntimeAdapter for NativeRuntime {
         // a PowerShell interpreter when configured, else `cmd.exe /C` on
         // Windows and POSIX `sh -c` (incl. Android) everywhere else. This is
         // the only sink that reports `WindowsCmd` or `PowerShell`.
+        if self.shell_unavailable {
+            return ShellDialect::None;
+        }
+
         #[cfg(not(target_os = "windows"))]
         if is_android() {
             return ShellDialect::Posix;
@@ -405,6 +492,10 @@ impl RuntimeAdapter for NativeRuntime {
     }
 
     fn shell_program(&self) -> Option<&OsStr> {
+        if self.shell_unavailable {
+            return None;
+        }
+
         #[cfg(not(target_os = "windows"))]
         if is_android() {
             return Some(OsStr::new("/system/bin/sh"));
@@ -423,6 +514,13 @@ impl RuntimeAdapter for NativeRuntime {
         command: &str,
         workspace_dir: &Path,
     ) -> anyhow::Result<tokio::process::Command> {
+        if self.shell_unavailable {
+            anyhow::bail!(
+                "native runtime has no usable shell: {:?} was not found. Set runtime.shell to an installed shell (absolute path or a name on PATH) to enable shell commands",
+                self.shell
+            );
+        }
+
         #[cfg(not(target_os = "windows"))]
         {
             // Android keeps its shell at /system/bin/sh and it is not always
@@ -482,6 +580,10 @@ impl RuntimeAdapter for NativeRuntime {
         workspace_dir: &Path,
         effective_path: Option<&std::ffi::OsStr>,
     ) -> anyhow::Result<tokio::process::Command> {
+        if self.shell_unavailable {
+            return self.build_shell_command(command, workspace_dir);
+        }
+
         #[cfg(not(target_os = "windows"))]
         if let Some(path) = effective_path {
             let configured_shell = if is_android() {
@@ -589,6 +691,168 @@ mod tests {
     #[test]
     fn native_name() {
         assert_eq!(NativeRuntime::new().name(), "native");
+    }
+
+    #[cfg(all(unix, not(target_os = "android")))]
+    #[test]
+    fn shell_absence_is_only_reported_for_a_missing_shell() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Absolute paths do not depend on the process PATH.
+        assert!(shell_is_absent_on_host(
+            "/nonexistent-zeroclaw-shell/bin/sh"
+        ));
+        // Bare names are probed against explicit entries, not the host PATH:
+        // one unsearchable entry there would otherwise change the outcome.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(shell_is_absent(
+            OsStr::new("zc-no-such-shell-on-path"),
+            [empty.path()]
+        ));
+        let with_sh = tempfile::tempdir().unwrap();
+        std::fs::write(with_sh.path().join("sh"), "").unwrap();
+        assert!(!shell_is_absent(OsStr::new("sh"), [with_sh.path()]));
+        // The host PATH can only turn "present" into "not absent" (an entry
+        // that cannot be probed counts as not absent), so this holds on any
+        // PATH that has a shell.
+        assert!(!shell_is_absent_on_host("sh"));
+
+        // Present but unusable is a misconfiguration, not an absent shell.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-executable");
+        std::fs::write(&file, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!shell_is_absent_on_host(&file.to_string_lossy()));
+        assert!(!shell_is_absent_on_host(&dir.path().to_string_lossy()));
+    }
+
+    /// A directory holding an executable `sh` that the current user cannot
+    /// search. Permissions are restored on drop so the tempdir can be removed.
+    #[cfg(all(unix, not(target_os = "android")))]
+    struct LockedDir {
+        _outer: tempfile::TempDir,
+        path: PathBuf,
+    }
+
+    #[cfg(all(unix, not(target_os = "android")))]
+    impl Drop for LockedDir {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+
+            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    /// `None` when the process ignores directory permissions (root): the case
+    /// cannot be built there.
+    #[cfg(all(unix, not(target_os = "android")))]
+    fn unsearchable_dir_with_sh() -> Option<LockedDir> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let outer = tempfile::tempdir().unwrap();
+        let path = outer.path().join("locked");
+        std::fs::create_dir(&path).unwrap();
+        let shell = path.join("sh");
+        std::fs::write(&shell, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let locked = LockedDir {
+            _outer: outer,
+            path,
+        };
+        // Directory permissions are not enforced for this process.
+        std::fs::symlink_metadata(&shell).is_err().then_some(locked)
+    }
+
+    #[cfg(all(unix, not(target_os = "android")))]
+    #[test]
+    fn shell_absence_is_not_concluded_from_an_unprobeable_entry() {
+        let Some(guard) = unsearchable_dir_with_sh() else {
+            eprintln!(
+                "skipped: directory permissions are not enforced for this process (running as root?)"
+            );
+            return;
+        };
+        let locked = guard.path.clone();
+        let empty = tempfile::tempdir().unwrap();
+
+        // The only place the shell could be cannot be probed: not absent.
+        assert!(!shell_is_absent(OsStr::new("sh"), [&locked]));
+        // Absolute path below the unsearchable directory: same.
+        assert!(!shell_is_absent(
+            OsStr::new(&locked.join("sh")),
+            std::iter::empty::<&Path>()
+        ));
+        // One unprobeable entry among readable, empty ones is enough.
+        assert!(!shell_is_absent(
+            OsStr::new("sh"),
+            [empty.path(), locked.as_path()]
+        ));
+        // Positive control: probing every entry and finding nothing is absent.
+        assert!(shell_is_absent(OsStr::new("sh"), [empty.path()]));
+        // A shell in a readable entry means "not absent" in either order, but
+        // for different reasons: found when it comes first, and with the
+        // unprobeable entry first the probe stops there (`all` short-circuits)
+        // and never reaches the readable one.
+        let bin = tempfile::tempdir().unwrap();
+        std::fs::write(bin.path().join("sh"), "").unwrap();
+        assert!(!shell_is_absent(
+            OsStr::new("sh"),
+            [bin.path(), locked.as_path()]
+        ));
+        assert!(!shell_is_absent(
+            OsStr::new("sh"),
+            [locked.as_path(), bin.path()]
+        ));
+    }
+
+    #[cfg(all(unix, not(target_os = "android")))]
+    #[test]
+    fn shell_absence_is_not_concluded_from_a_symlink_loop() {
+        // ELOOP (a loop in a parent component) proves nothing about the shell.
+        // Whether the platform reports it for this layout is checked first.
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        if !matches!(
+            std::fs::symlink_metadata(a.join("sh")),
+            Err(ref error) if error.kind() != std::io::ErrorKind::NotFound
+                && error.kind() != std::io::ErrorKind::NotADirectory
+        ) {
+            eprintln!(
+                "skipped: no error other than NotFound or NotADirectory for the symlink loop"
+            );
+            return;
+        }
+        assert!(!shell_is_absent(OsStr::new("sh"), [&a]));
+    }
+
+    #[cfg(all(unix, not(target_os = "android")))]
+    #[test]
+    fn shell_absence_ignores_unusable_path_entries() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let empty = tempfile::tempdir().unwrap();
+        // An entry that is not a directory (the resolver would report
+        // NotADirectory for it, masking the real NotFound) and a relative one.
+        let not_a_dir = empty.path().join("file");
+        std::fs::write(&not_a_dir, "").unwrap();
+        let entries = [
+            not_a_dir.clone(),
+            PathBuf::from("relative-decoy"),
+            PathBuf::new(),
+            empty.path().to_path_buf(),
+        ];
+        assert!(shell_is_absent(OsStr::new("sh"), &entries));
+
+        // A shell present in a later entry is found even if earlier entries are unusable.
+        let bin = tempfile::tempdir().unwrap();
+        let shell = bin.path().join("sh");
+        std::fs::write(&shell, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let entries = [not_a_dir, bin.path().to_path_buf()];
+        assert!(!shell_is_absent(OsStr::new("sh"), &entries));
     }
 
     #[test]
