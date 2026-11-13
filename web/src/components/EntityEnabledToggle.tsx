@@ -1,7 +1,8 @@
 import { useState } from 'react';
 import { Power } from 'lucide-react';
-import { ApiError, ConfigApiCodes, patchConfig } from '@/lib/api';
+import { ApiError, ConfigApiCodes, patchConfig, type ValidationWarning } from '@/lib/api';
 import { t } from '@/lib/i18n';
+import ConfigSaveWarnings from '@/components/ConfigSaveWarnings';
 
 export interface EntityEnabledToggleProps {
   /** Dotted prefix of the entity (`agents.clamps`, `channels.discord.clamps`, …).
@@ -24,6 +25,7 @@ export default function EntityEnabledToggle({
 }: EntityEnabledToggleProps) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [warnings, setWarnings] = useState<ValidationWarning[]>([]);
   // The drift guard (409 `config_changed_externally`) fires when the on-disk
   // config has diverged from the daemon's in-memory state on this path, e.g. a
   // hand-edit, or a daemon left running across an external config write. Track
@@ -37,12 +39,14 @@ export default function EntityEnabledToggle({
     if (busy) return;
     setBusy(true);
     setError(null);
+    setWarnings([]);
     setDriftConflict(false);
     try {
-      await patchConfig(
+      const response = await patchConfig(
         [{ op: 'replace', path: `${prefix}.enabled`, value: next }],
         overrideDrift ? { overrideDrift: true } : undefined,
       );
+      setWarnings(response.warnings ?? []);
       onChange(next);
     } catch (e) {
       if (
@@ -111,6 +115,7 @@ export default function EntityEnabledToggle({
           </button>
         </div>
       )}
+      <ConfigSaveWarnings warnings={warnings} onDismiss={() => setWarnings([])} compact />
     </div>
   );
 }

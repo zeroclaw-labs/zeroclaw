@@ -68,6 +68,7 @@ import {
   type ListResponseEntry,
   type ObjectArrayPropMeta,
   type PatchOp,
+  type ValidationWarning,
 } from "../../lib/api";
 import { useConfigDraft } from "../../lib/draftStore";
 import { fuzzyFilter } from "../../lib/fuzzy";
@@ -80,6 +81,7 @@ import {
 import { isOptionTypeHint, parseNumberDraft } from "./numberInput.logic";
 import { isLocalModelProviderName, primeModelProviderCatalog } from "../../lib/modelProviders";
 import EntityEnabledToggle from "../EntityEnabledToggle";
+import ConfigSaveWarnings from "../ConfigSaveWarnings";
 
 function entryValue(entry: ListResponseEntry): unknown {
   return entry.populated ? entry.value : undefined;
@@ -975,6 +977,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
     >({});
     const [topError, setTopError] = useState<string | null>(null);
     const [savedAt, setSavedAt] = useState<string | null>(null);
+    const [saveWarnings, setSaveWarnings] = useState<ValidationWarning[]>([]);
     const [loading, setLoading] = useState(true);
     const [saving, setSaving] = useState(false);
     const [schema, setSchema] = useState<Record<string, unknown> | undefined>(
@@ -1084,6 +1087,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
     const handleSave = async (): Promise<boolean> => {
       setSaving(true);
       setSavedAt(null);
+      setSaveWarnings([]);
       setTopError(null);
       setFieldErrors({});
 
@@ -1151,6 +1155,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
       try {
         const resp = await patchConfig(ops);
         setSavedAt(`${t("fieldform.saved_prefix")}${resp.results.length}${t("fieldform.saved_suffix")}`);
+        setSaveWarnings(resp.warnings ?? []);
         if (scopeActionsToIncludedPaths && includePath) {
           configDraft.discardPaths(actionablePaths);
         } else {
@@ -1687,6 +1692,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
                 {saving ? t("fieldform.saving") : t("common.save")}
               </Button>
             </div>
+            {!topError && <ConfigSaveWarnings warnings={saveWarnings} />}
           </div>
         )}
       </div>

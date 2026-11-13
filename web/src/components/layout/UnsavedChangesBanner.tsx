@@ -1,17 +1,17 @@
 // Top-of-page banner shown whenever the cross-section ConfigDraftStore
 // has pending edits. Lists the affected top-level section keys, offers
-// Save-all / Discard-all. Hides itself when there are no drafts.
+// Save-all / Discard-all. Retained save warnings remain visible after drafts clear.
 //
 // Section help and labels come from the gateway's section info; the
 // banner falls back to a humanized key if the section hasn't been
 // fetched yet.
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Save, X } from 'lucide-react';
 import { Button } from '@/components/ui';
 import { t } from '@/lib/i18n';
 import { ApiError, getSections, type ValidationWarning } from '@/lib/api';
-import { validationWarningMessage } from '@/lib/validationWarnings';
+import ConfigSaveWarnings from '@/components/ConfigSaveWarnings';
 import {
   useConfigDirtyCount,
   useConfigDirtySections,
@@ -33,6 +33,14 @@ export default function UnsavedChangesBanner() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [warnings, setWarnings] = useState<ValidationWarning[]>([]);
+  const previousDirtyCount = useRef(dirtyCount);
+
+  useEffect(() => {
+    if (previousDirtyCount.current === 0 && dirtyCount > 0) {
+      setWarnings([]);
+    }
+    previousDirtyCount.current = dirtyCount;
+  }, [dirtyCount]);
 
   // Load section labels once so "channels" renders as "Channels", etc.
   useEffect(() => {
@@ -59,7 +67,15 @@ export default function UnsavedChangesBanner() {
     };
   }, []);
 
-  if (dirtyCount === 0) return null;
+  if (dirtyCount === 0 && warnings.length === 0) return null;
+
+  if (dirtyCount === 0) {
+    return (
+      <div className="border-b border-status-warning/25 bg-status-warning/[0.08] px-4 py-2">
+        <ConfigSaveWarnings warnings={warnings} onDismiss={() => setWarnings([])} />
+      </div>
+    );
+  }
 
   const labelFor = (key: string) => labels[key] ?? humanize(key);
   const sectionList = dirtySections.map(labelFor).join(', ');
@@ -124,15 +140,6 @@ export default function UnsavedChangesBanner() {
         <p className="text-xs text-status-error">
           {error}
         </p>
-      )}
-      {warnings.length > 0 && (
-        <ul className="text-xs flex flex-col gap-0.5 text-pc-text-secondary">
-          {warnings.map((w, i) => (
-            <li key={`${w.path}-${i}`}>
-              ⚠ {w.path}: {validationWarningMessage(w)}
-            </li>
-          ))}
-        </ul>
       )}
     </div>
   );
