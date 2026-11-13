@@ -186,7 +186,9 @@ Pros: strong isolation, works on any OS. Cons: per-invocation container startup 
 
 Native macOS sandbox (`sandbox-exec`). Profiles are SBPL: ZeroClaw bundles one for tool runs. Works on macOS 10.11+.
 
-Limitation: some CLI tools (older `git`, some Homebrew-linked binaries) don't cooperate with Seatbelt's file-access rules. If you see "Operation not permitted" errors from the agent's shell calls on macOS, the tool needs broader filesystem access: consider switching to Docker.
+An "Operation not permitted" error means the active profile denied an operation; it does not establish that the CLI tool is incompatible with Seatbelt. Check the denied path and the effective risk profile before changing filesystem access.
+
+The profile permits reads of hidden files and directories under the resolved current account's home, with the existing credential exclusions and configured forbidden paths. It resolves HOME and the excluded paths before building these rules. Workspace and explicitly configured read-write, read-only, and write-only roots retain their existing grants. A program's internal file opens are checked by Seatbelt even when its command line does not name those files.
 
 ### `none`
 

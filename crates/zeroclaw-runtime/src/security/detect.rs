@@ -15,6 +15,10 @@ pub struct SandboxExtraRoots {
     pub read_write: Vec<PathBuf>,
     pub read_only: Vec<PathBuf>,
     pub write_only: Vec<PathBuf>,
+    /// Absolute forbidden paths from `SecurityPolicy` (tilde already expanded).
+    /// Seatbelt applies these as deny rules under the home-dotfile grant so a
+    /// configured `~/.private-secrets` cannot ride the `HOME/.` prefix.
+    pub forbidden: Vec<PathBuf>,
 }
 
 const NOOP_DESCRIPTION: &str = "No sandboxing (application-layer security only)";
@@ -651,6 +655,7 @@ fn create_selected_sandbox(
                     &extra_roots.read_write,
                     &extra_roots.read_only,
                     &extra_roots.write_only,
+                    &extra_roots.forbidden,
                 );
                 // Once Seatbelt is selected, initialization failure must block
                 // execution rather than trigger the unsandboxed fallback.
