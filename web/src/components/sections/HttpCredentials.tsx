@@ -14,6 +14,15 @@ const sources = {
   google: "project-id/secret-name/latest",
 } satisfies Record<HttpCredentialSource, string>;
 
+const setupLinks = {
+  local: "",
+  open_bao: "https://openbao.org/docs/next/commands/",
+  one_password: "https://developer.1password.com/docs/service-accounts/use-with-1password-cli/",
+  azure: "https://learn.microsoft.com/cli/azure/authenticate-azure-cli",
+  aws: "https://docs.aws.amazon.com/cli/latest/userguide/cli-chap-configure.html",
+  google: "https://docs.cloud.google.com/sdk/docs/install",
+} satisfies Record<HttpCredentialSource, string>;
+
 export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) {
   const [catalog, setCatalog] = useState<Catalog>();
   const [editing, setEditing] = useState<HttpCredentialRow | "new" | null>(null);
@@ -111,6 +120,17 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
               ))}
             </select>
           </label>
+          <details className="space-y-2 rounded-md border p-3 text-sm">
+            <summary className="cursor-pointer font-medium">{t("http_credentials.setup_help")}</summary>
+            <p>{t("http_credentials.setup_host")}</p>
+            <p>{t(`http_credentials.setup_${source}`)}</p>
+            {sources[source] && <code className="block break-all">{sources[source]}</code>}
+            {setupLinks[source] && (
+              <a className="underline" href={setupLinks[source]} target="_blank" rel="noreferrer">
+                {t("http_credentials.setup_docs")}
+              </a>
+            )}
+          </details>
           {kind === "api_key" && (
             <label className="block space-y-1">
               <span>{t("http_credentials.header")}</span>
