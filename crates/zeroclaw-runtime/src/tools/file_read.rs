@@ -763,6 +763,36 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn file_read_blocks_unix_backslash_sibling_and_reads_literal_child() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("project");
+        tokio::fs::create_dir(&workspace).await.unwrap();
+        let sibling = root.path().join(r"project\secret.txt");
+        tokio::fs::write(&sibling, "outside secret").await.unwrap();
+        tokio::fs::write(workspace.join(r"literal\name.txt"), "inside control")
+            .await
+            .unwrap();
+        let tool = test_tool(workspace);
+        let denied = tool.execute(json!({"path": sibling})).await.unwrap();
+        assert!(!denied.success);
+        assert!(denied.output.is_empty());
+        assert!(
+            denied
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("escapes workspace")
+        );
+        let allowed = tool
+            .execute(json!({"path": r"literal\name.txt"}))
+            .await
+            .unwrap();
+        assert!(allowed.success, "{:?}", allowed.error);
+        assert!(allowed.output.contains("inside control"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn file_read_blocks_symlink_escape() {
         use std::os::unix::fs::symlink;
 
