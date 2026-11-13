@@ -3743,6 +3743,28 @@
         ],
         "type": "object"
       },
+      "SessionReloadContextResult": {
+        "description": "`session/reload_context` result. A live session keeps the personality\nfiles (`AGENTS.md`, `SOUL.md`, ...) it read on its first turn, so edits\ndon't invalidate the provider prompt cache mid-conversation. This call\nre-reads them for one session.",
+        "properties": {
+          "changed": {
+            "description": "True when the re-read text differs from the live agent's snapshot.\nThe next request may reuse less of the provider's cache.",
+            "type": "boolean"
+          },
+          "live": {
+            "description": "False when the session has no live agent; its next turn rebuilds\nfrom the files on disk anyway.",
+            "type": "boolean"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "live",
+          "changed"
+        ],
+        "type": "object"
+      },
       "SessionRenameParams": {
         "properties": {
           "name": {
@@ -5155,6 +5177,35 @@
         "kind": "grant",
         "resource": "sessions",
         "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "SessionIdParams"
+      }
+    },
+    {
+      "name": "session/reload_context",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "session_id",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionReloadContextResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sessions",
+        "verb": "update"
       },
       "x-zeroclaw-params": {
         "shape": "typed",
