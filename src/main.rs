@@ -13273,9 +13273,21 @@ Add pricing to the active provider profile or supply a catalog entry."
                 Ok(())
             }
             ConfigCommands::Migrate { json } => {
+                // Load-time notices that do not change the file (retired
+                // ZEROCLAW_* env overrides) are skipped by the startup
+                // `reports_own_migration` gate. Surface them here so
+                // `config migrate` is the one place an operator sees them.
+                let env_notices: Vec<_> = config
+                    .migration_notices
+                    .iter()
+                    .filter(|notice| !notice.changes_file())
+                    .cloned()
+                    .collect();
                 match crate::config::migration::migrate_file_in_place(&config.config_path)? {
                     Some(report) => {
                         let to = report.to_version;
+                        let mut notices = report.notices;
+                        notices.extend(env_notices.iter().cloned());
                         if json {
                             let envelope = serde_json::json!({
                                 "migrated": true,
@@ -13285,7 +13297,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                                     .as_ref()
                                     .map(|path| path.display().to_string()),
                                 "schema_version": to,
-                                "notices": report.notices,
+                                "notices": notices,
                             });
                             println!("{}", serde_json::to_string_pretty(&envelope)?);
                         } else {
@@ -13314,7 +13326,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                                 config.config_path.display()
                             );
                             let path = config.config_path.display().to_string();
-                            for notice in &report.notices {
+                            for notice in &notices {
                                 eprintln!("{}", migration_notice_text(notice, &path));
                             }
                         }
@@ -13333,6 +13345,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                                 "schema_version": crate::config::migration::CURRENT_SCHEMA_VERSION,
                                 "valid": strict_error.is_none(),
                                 "error": strict_error,
+                                "notices": env_notices,
                             });
                             println!("{}", serde_json::to_string_pretty(&envelope)?);
                             if strict_error.is_some() {
@@ -13346,6 +13359,10 @@ Add pricing to the active provider profile or supply a catalog entry."
                                     "Config already at current schema version."
                                 )
                             );
+                            let path = config.config_path.display().to_string();
+                            for notice in &env_notices {
+                                eprintln!("{}", migration_notice_text(notice, &path));
+                            }
                             if let Some(error) = strict_error {
                                 anyhow::bail!(
                                     "config at {} does not deserialize strictly; the resilient \

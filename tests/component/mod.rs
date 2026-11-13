@@ -9,6 +9,7 @@ mod agents_export_cli;
 mod cli_only_build;
 #[cfg(feature = "agent-runtime")]
 mod config_dir_locale_regression;
+mod config_migrate_env_notice;
 mod config_patch_cli;
 mod config_persistence;
 mod config_schema;
