@@ -3628,8 +3628,12 @@ model = "glm-5.2"
 id = "short-profile-model"
 [providers.models.custom."gw.v2".models."fast.v1"]
 id = "versioned-model"
+[risk_profiles.safe]
+[runtime_profiles.default]
 [agents.bot]
 model_provider = "custom.gw.v2.fast.v1"
+risk_profile = "safe"
+runtime_profile = "default"
 "#,
         )
         .unwrap();
