@@ -2572,7 +2572,10 @@ pub async fn run_gateway_with_plugin_webhooks(
         // ── Web Dashboard API routes ──
         .route("/api/status", get(dashboard_core::status))
         .route("/api/version/check", get(version::handle_version_check))
-        .route("/api/version/upgrade", post(version::handle_version_upgrade))
+        .route(
+            "/api/version/upgrade",
+            post(version::handle_version_upgrade),
+        )
         .route(
             "/api/version/upgrade/status",
             get(version::handle_version_upgrade_status),
@@ -2590,10 +2593,7 @@ pub async fn run_gateway_with_plugin_webhooks(
             "/api/sops/{name}/graph",
             get(api_sop_author::handle_sop_graph),
         )
-        .route(
-            "/api/sops/{name}/run",
-            post(api_sop_author::handle_sop_run),
-        )
+        .route("/api/sops/{name}/run", post(api_sop_author::handle_sop_run))
         .route(
             "/api/sops/{name}/rename",
             post(api_sop_author::handle_sop_rename),

@@ -2,6 +2,7 @@ use ratatui::layout::Rect;
 
 use super::{CopyHitKind, CopyHitRegion, UrlHitRegion};
 use crate::mouse;
+use crate::path_open::is_path_target;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ChatContextMenuAction {
@@ -10,6 +11,10 @@ pub(super) enum ChatContextMenuAction {
     AddToChat,
     OpenLink,
     CopyLink,
+    OpenPath,
+    RevealPath,
+    CopyPath,
+    AddPathToChat,
     Edit,
     Delete,
 }
@@ -27,6 +32,19 @@ const URL_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[
 pub(super) const URL_WITH_COPY_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[
     ChatContextMenuAction::OpenLink,
     ChatContextMenuAction::CopyLink,
+    ChatContextMenuAction::Copy,
+];
+pub(super) const PATH_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[
+    ChatContextMenuAction::OpenPath,
+    ChatContextMenuAction::RevealPath,
+    ChatContextMenuAction::CopyPath,
+    ChatContextMenuAction::AddPathToChat,
+];
+const PATH_WITH_COPY_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[
+    ChatContextMenuAction::OpenPath,
+    ChatContextMenuAction::RevealPath,
+    ChatContextMenuAction::CopyPath,
+    ChatContextMenuAction::AddPathToChat,
     ChatContextMenuAction::Copy,
 ];
 pub(super) const QUEUE_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[
@@ -54,7 +72,11 @@ impl ChatContextMenuTarget {
                 CHARACTER_SELECTION_CONTEXT_ACTIONS
             }
             Self::Transcript(_) => TRANSCRIPT_CONTEXT_ACTIONS,
+            Self::Url(url) if is_path_target(&url.url) => PATH_CONTEXT_ACTIONS,
             Self::Url(_) => URL_CONTEXT_ACTIONS,
+            Self::UrlWithCopy { url, .. } if is_path_target(&url.url) => {
+                PATH_WITH_COPY_CONTEXT_ACTIONS
+            }
             Self::UrlWithCopy { .. } => URL_WITH_COPY_CONTEXT_ACTIONS,
             Self::Queue(_) => QUEUE_CONTEXT_ACTIONS,
         }
@@ -135,6 +157,29 @@ impl ChatContextMenu {
             | (ChatContextMenuTarget::UrlWithCopy { url, .. }, ChatContextMenuAction::CopyLink) => {
                 Some(ChatContextMenuRequest::CopyUrl(url.url))
             }
+            (ChatContextMenuTarget::Url(url), ChatContextMenuAction::OpenPath)
+            | (ChatContextMenuTarget::UrlWithCopy { url, .. }, ChatContextMenuAction::OpenPath)
+                if is_path_target(&url.url) =>
+            {
+                Some(ChatContextMenuRequest::OpenUrl(url.url))
+            }
+            (ChatContextMenuTarget::Url(url), ChatContextMenuAction::RevealPath)
+            | (ChatContextMenuTarget::UrlWithCopy { url, .. }, ChatContextMenuAction::RevealPath)
+                if is_path_target(&url.url) =>
+            {
+                Some(ChatContextMenuRequest::RevealPath(url.url))
+            }
+            (ChatContextMenuTarget::Url(url), ChatContextMenuAction::CopyPath)
+            | (ChatContextMenuTarget::UrlWithCopy { url, .. }, ChatContextMenuAction::CopyPath)
+                if is_path_target(&url.url) =>
+            {
+                Some(ChatContextMenuRequest::CopyUrl(url.url))
+            }
+            (ChatContextMenuTarget::Url(url), ChatContextMenuAction::AddPathToChat)
+            | (
+                ChatContextMenuTarget::UrlWithCopy { url, .. },
+                ChatContextMenuAction::AddPathToChat,
+            ) if is_path_target(&url.url) => Some(ChatContextMenuRequest::AddPathToChat(url.url)),
             (ChatContextMenuTarget::UrlWithCopy { copy, .. }, ChatContextMenuAction::Copy) => {
                 Some(ChatContextMenuRequest::CopyTranscript(copy))
             }
@@ -152,8 +197,12 @@ impl ChatContextMenu {
 pub(super) enum ChatContextMenuRequest {
     AddToChat(CopyHitRegion),
     CopyTranscript(CopyHitRegion),
+    /// Open an HTTP(S) URL or a local path (`path_open` decides how).
     OpenUrl(String),
+    /// Copy a URL or a local path.
     CopyUrl(String),
+    RevealPath(String),
+    AddPathToChat(String),
     Queue {
         id: u64,
         action: ChatContextMenuAction,
