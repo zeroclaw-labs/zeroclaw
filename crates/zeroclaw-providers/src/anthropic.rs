@@ -3203,6 +3203,7 @@ impl ModelProvider for AnthropicModelProvider {
             } else {
                 Some(&tool_specs)
             },
+            thinking_level: None,
             thinking: None,
         };
         self.chat(request, model, temperature).await
@@ -4174,6 +4175,7 @@ data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\"
             ProviderChatRequest {
                 messages: &messages,
                 tools: None,
+                thinking_level: None,
                 thinking: None,
             },
             "claude-haiku-4-5",
@@ -4355,6 +4357,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         let request = ProviderChatRequest {
             messages: &messages,
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
         let result = p.chat(request, "claude-sonnet-4-5", Some(0.7)).await;
@@ -4372,6 +4375,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         let request = ProviderChatRequest {
             messages: &messages,
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
         let mut stream = p.stream_chat(
@@ -9446,6 +9450,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         let request = ProviderChatRequest {
             messages: &messages,
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
         let provider = AnthropicModelProvider::builder("test")
@@ -9683,6 +9688,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             let request = ProviderChatRequest {
                 messages: messages.as_slice(),
                 tools: None,
+                thinking_level: None,
                 thinking: None,
             };
             let stream =
@@ -9718,6 +9724,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             let request = ProviderChatRequest {
                 messages: messages.as_slice(),
                 tools: None,
+                thinking_level: None,
                 thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
                     budget_tokens: 1024,
                     display: None,
@@ -9761,6 +9768,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         let request = ProviderChatRequest {
             messages: messages.as_slice(),
             tools: None,
+            thinking_level: None,
             thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
                 budget_tokens: 1024,
                 display: None,
@@ -9803,6 +9811,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         let request = ProviderChatRequest {
             messages: messages.as_slice(),
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
         let _ = provider.chat(request, "claude-sonnet-4-6", None).await;
@@ -9838,6 +9847,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         let request = ProviderChatRequest {
             messages: messages.as_slice(),
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
         let result = provider.chat(request, "claude-sonnet-4-6", Some(0.7)).await;
@@ -9864,6 +9874,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         let request = ProviderChatRequest {
             messages: messages.as_slice(),
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
         let result = provider.chat(request, "claude-sonnet-4-6", None).await;
@@ -9895,6 +9906,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         let request = ProviderChatRequest {
             messages: messages.as_slice(),
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
         let result = provider.chat(request, "claude-sonnet-4-6", None).await;
@@ -10058,6 +10070,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         let request = ProviderChatRequest {
             messages: messages.as_slice(),
             tools: None,
+            thinking_level: None,
             thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
                 budget_tokens: 10_000,
                 display: None,
@@ -10349,6 +10362,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usag
         let request = ProviderChatRequest {
             messages: messages.as_slice(),
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
         let mut stream =
@@ -10388,6 +10402,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usag
         let request = ProviderChatRequest {
             messages: messages.as_slice(),
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
         let mut stream =
@@ -10446,6 +10461,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usag
         let request = ProviderChatRequest {
             messages: messages.as_slice(),
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
         let mut stream =
@@ -10490,6 +10506,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usag
                     ProviderChatRequest {
                         messages: &messages,
                         tools: None,
+                        thinking_level: None,
                         thinking: None,
                     },
                     "claude-sonnet-4-6",
@@ -10516,6 +10533,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usag
                         ProviderChatRequest {
                             messages: &messages,
                             tools: None,
+                            thinking_level: None,
                             thinking: None,
                         },
                         "claude-sonnet-4-6",
@@ -10952,6 +10970,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             ProviderChatRequest {
                 messages: &messages,
                 tools: None,
+                thinking_level: None,
                 thinking: Some(NativeThinkingParams {
                     budget_tokens: 2_048,
                     display: Some(ThinkingDisplay::Updates),
@@ -11182,6 +11201,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 crate::traits::ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "claude-test",

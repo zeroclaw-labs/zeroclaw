@@ -388,6 +388,7 @@ mod tests {
         let request = ChatRequest {
             messages: &[],
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
         for (pin, expected) in [("pinned-model", true), ("other-model", false)] {
@@ -462,6 +463,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "requested-model",

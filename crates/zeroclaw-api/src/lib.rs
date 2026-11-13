@@ -54,4 +54,30 @@ tokio::task_local! {
     /// Native extended thinking parameters, set by the outer orchestration
     /// functions and read by `run_tool_call_loop` when building `ChatRequest`.
     pub static NATIVE_THINKING_OVERRIDE: Option<crate::model_provider::NativeThinkingParams>;
+
+    /// Selected native reasoning level for the current turn, scoped by its
+    /// orchestration owner and copied into each provider `ChatRequest`.
+    /// Independent of the legacy token-budget override above.
+    pub static NATIVE_THINKING_LEVEL: Option<crate::model_provider::ThinkingLevel>;
+
+    /// Native level for a single-call delegate's legacy `chat_with_system`
+    /// request. Only that delegate call scopes it; OpenAI leaves read it there
+    /// instead of the turn carrier so auxiliary one-shot calls stay isolated.
+    pub static ONE_SHOT_NATIVE_THINKING_LEVEL: Option<crate::model_provider::ThinkingLevel>;
+}
+
+/// Read the native level bound to this turn, or `None` outside a turn scope.
+pub fn current_native_thinking_level() -> Option<model_provider::ThinkingLevel> {
+    NATIVE_THINKING_LEVEL
+        .try_with(|level| *level)
+        .ok()
+        .flatten()
+}
+
+/// Read the native level bound to a single-call delegate request.
+pub fn current_one_shot_native_thinking_level() -> Option<model_provider::ThinkingLevel> {
+    ONE_SHOT_NATIVE_THINKING_LEVEL
+        .try_with(|level| *level)
+        .ok()
+        .flatten()
 }

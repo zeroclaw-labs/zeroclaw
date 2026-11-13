@@ -857,6 +857,7 @@ mod tests {
                                     ChatRequest {
                                         messages: &messages,
                                         tools: None,
+                                        thinking_level: None,
                                         thinking: None,
                                     },
                                     "ignored",
@@ -874,6 +875,7 @@ mod tests {
                                     ChatRequest {
                                         messages: &messages,
                                         tools: None,
+                                        thinking_level: None,
                                         thinking: None,
                                     },
                                     "ignored",
@@ -946,6 +948,7 @@ mod tests {
                                 ChatRequest {
                                     messages: &messages,
                                     tools: None,
+                                    thinking_level: None,
                                     thinking: None,
                                 },
                                 "ignored",
@@ -964,6 +967,7 @@ mod tests {
                                     ChatRequest {
                                         messages: &messages,
                                         tools: None,
+                                        thinking_level: None,
                                         thinking: None,
                                     },
                                     "ignored",

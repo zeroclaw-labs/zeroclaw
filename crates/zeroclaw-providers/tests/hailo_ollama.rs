@@ -721,6 +721,7 @@ async fn native_hailo_rejects_call_level_thinking_before_http() {
             zeroclaw_api::model_provider::ChatRequest {
                 messages: &messages,
                 tools: None,
+                thinking_level: None,
                 thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
                     budget_tokens: 1024,
                     display: None,
@@ -1094,6 +1095,7 @@ async fn native_hailo_preserves_usage_for_empty_completed_chat_response() {
             ChatRequest {
                 messages: &messages,
                 tools: None,
+                thinking_level: None,
                 thinking: None,
             },
             "qwen3:1.7b",
@@ -1191,6 +1193,7 @@ async fn native_hailo_emits_ascii_only_json_for_wire_compatibility() {
             zeroclaw_api::model_provider::ChatRequest {
                 messages: &messages,
                 tools: None,
+                thinking_level: Some(zeroclaw_api::model_provider::ThinkingLevel::Max),
                 thinking: None,
             },
             "qwen3:1.7b",
@@ -1312,6 +1315,7 @@ async fn standard_ollama_keeps_default_non_ascii_json_serialization() {
             zeroclaw_api::model_provider::ChatRequest {
                 messages: &messages,
                 tools: None,
+                thinking_level: None,
                 thinking: None,
             },
             "qwen3:1.7b",
@@ -1365,6 +1369,7 @@ async fn native_hailo_omits_temperature_when_caller_does_not_set_it() {
             zeroclaw_api::model_provider::ChatRequest {
                 messages: &messages,
                 tools: None,
+                thinking_level: None,
                 thinking: None,
             },
             "qwen3:1.7b",
@@ -1461,6 +1466,7 @@ async fn native_hailo_preserves_fitting_tool_protocol_and_user_text() {
             zeroclaw_api::model_provider::ChatRequest {
                 messages: &messages,
                 tools: None,
+                thinking_level: None,
                 thinking: None,
             },
             "qwen3:1.7b",
@@ -1524,6 +1530,7 @@ async fn native_hailo_preserves_large_prompt_guided_tool_protocol() {
             zeroclaw_api::model_provider::ChatRequest {
                 messages: &messages,
                 tools: None,
+                thinking_level: None,
                 thinking: None,
             },
             "qwen3:1.7b",

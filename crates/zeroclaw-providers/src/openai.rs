@@ -3,6 +3,9 @@ use crate::openai_codex::{
     ResponsesStreamApiError, ResponsesStreamState, ResponsesToolSpec, append_utf8_stream_chunk,
     build_responses_input, convert_tools, first_nonempty, parse_responses_usage, process_sse_chunk,
 };
+use crate::openai_reasoning::{
+    NativeEffort, ReasoningApi, ReasoningCall, ReasoningContext, profile_temperature,
+};
 use crate::opencode_session::OPENCODE_SESSION_HEADER;
 use crate::stream_guard::AbortOnDrop;
 use crate::traits::{
@@ -33,6 +36,7 @@ pub struct OpenAiModelProvider {
     credential: Option<String>,
     max_tokens: Option<u32>,
     timeout_secs: u64,
+    reasoning_surface: Option<super::openai_reasoning::ReasoningSurface>,
 }
 
 #[derive(Debug, Serialize)]
@@ -43,6 +47,8 @@ struct ChatRequest {
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -99,6 +105,8 @@ struct NativeChatRequest {
     parallel_tool_calls: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -245,9 +253,18 @@ pub struct OpenAiBuilder {
     single_tool_rounds_supported: bool,
     max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
+    reasoning_surface: Option<super::openai_reasoning::ReasoningSurface>,
 }
 
 impl OpenAiBuilder {
+    pub(crate) fn reasoning_surface(
+        mut self,
+        surface: super::openai_reasoning::ReasoningSurface,
+    ) -> Self {
+        self.reasoning_surface = Some(surface);
+        self
+    }
+
     pub(crate) fn single_tool_rounds_supported(mut self, supported: bool) -> Self {
         self.single_tool_rounds_supported = supported;
         self
@@ -296,6 +313,7 @@ impl OpenAiBuilder {
             base_url: self.base_url.unwrap_or_else(|| BASE_URL.to_string()),
             canonical_base_url: self.canonical_base_url.unwrap_or(BASE_URL),
             single_tool_rounds_supported: self.single_tool_rounds_supported,
+            reasoning_surface: self.reasoning_surface,
             credential: self.credential,
             max_tokens: self.max_tokens,
             timeout_secs: self.timeout_secs.unwrap_or(120),
@@ -304,6 +322,25 @@ impl OpenAiBuilder {
 }
 
 impl OpenAiModelProvider {
+    fn profile_effort(
+        &self,
+        model: &str,
+        level: Option<zeroclaw_api::model_provider::ThinkingLevel>,
+        has_tools: bool,
+        call: ReasoningCall,
+    ) -> Option<NativeEffort> {
+        ReasoningContext {
+            surface: self.reasoning_surface,
+            api: ReasoningApi::ChatCompletions,
+            alias: &self.alias,
+            model,
+            has_tools,
+            custom_endpoint: self.base_url != BASE_URL,
+            call,
+        }
+        .resolve_level(level, None, None)
+    }
+
     /// Entry point. Only `alias` is required; every other field is set
     /// via a labelled chain method on the returned [`OpenAiBuilder`].
     pub fn builder(alias: &str) -> OpenAiBuilder {
@@ -313,6 +350,7 @@ impl OpenAiModelProvider {
             base_url: None,
             canonical_base_url: None,
             single_tool_rounds_supported: false,
+            reasoning_surface: None,
             max_tokens: None,
             timeout_secs: None,
         }
@@ -503,8 +541,16 @@ impl ModelProvider for OpenAiModelProvider {
             anyhow::Error::msg("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
         })?;
 
-        let adjusted_temperature =
-            temperature.map(|t| Self::adjust_temperature_for_model(model, t));
+        let effort = self.profile_effort(
+            model,
+            zeroclaw_api::current_one_shot_native_thinking_level(),
+            false,
+            ReasoningCall::OneShot,
+        );
+        let adjusted_temperature = profile_temperature(
+            temperature.map(|t| Self::adjust_temperature_for_model(model, t)),
+            effort,
+        );
 
         let mut messages = Vec::new();
 
@@ -525,6 +571,7 @@ impl ModelProvider for OpenAiModelProvider {
             messages,
             temperature: adjusted_temperature,
             max_tokens: self.max_tokens,
+            reasoning_effort: effort.map(|effort| effort.as_str().to_owned()),
         };
 
         let response = self
@@ -591,11 +638,18 @@ impl ModelProvider for OpenAiModelProvider {
             anyhow::Error::msg("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
         })?;
 
-        let adjusted_temperature =
-            temperature.map(|t| Self::adjust_temperature_for_model(model, t));
-
         let tools = Self::convert_tools(request.tools);
         let tools_count = tools.as_ref().map_or(0, Vec::len);
+        let effort = self.profile_effort(
+            model,
+            request.thinking_level,
+            tools_count > 0,
+            ReasoningCall::Turn,
+        );
+        let adjusted_temperature = profile_temperature(
+            temperature.map(|t| Self::adjust_temperature_for_model(model, t)),
+            effort,
+        );
         let native_request = NativeChatRequest {
             model: model.to_string(),
             messages: Self::convert_messages(request.messages),
@@ -609,6 +663,7 @@ impl ModelProvider for OpenAiModelProvider {
             .then_some(false),
             tools,
             max_tokens: self.max_tokens,
+            reasoning_effort: effort.map(|effort| effort.as_str().to_owned()),
         };
         if ::zeroclaw_log::debug_enabled() {
             ::zeroclaw_log::record!(
@@ -713,6 +768,7 @@ impl ModelProvider for OpenAiModelProvider {
             tools: native_tools,
             parallel_tool_calls: None,
             max_tokens: self.max_tokens,
+            reasoning_effort: None,
         };
 
         let response = self
@@ -1020,6 +1076,7 @@ pub struct OpenAiResponsesModelProvider {
     credential: Option<String>,
     max_tokens: Option<u32>,
     reasoning_effort: Option<String>,
+    reasoning_surface: Option<super::openai_reasoning::ReasoningSurface>,
     /// HTTP request timeout in seconds for non-streaming LLM API calls.
     /// Streaming SSE calls use `streaming_client`, which sets no overall
     /// timeout (long-running responses aren't killed mid-stream) and derives
@@ -1048,11 +1105,20 @@ pub struct OpenAiResponsesBuilder {
     credential: Option<String>,
     max_tokens: Option<u32>,
     reasoning_effort: Option<String>,
+    reasoning_surface: Option<super::openai_reasoning::ReasoningSurface>,
     timeout_secs: Option<u64>,
     extra_headers: std::collections::HashMap<String, String>,
 }
 
 impl OpenAiResponsesBuilder {
+    pub(crate) fn reasoning_surface(
+        mut self,
+        surface: Option<super::openai_reasoning::ReasoningSurface>,
+    ) -> Self {
+        self.reasoning_surface = surface;
+        self
+    }
+
     pub(crate) fn single_tool_rounds_supported(mut self, supported: bool) -> Self {
         self.single_tool_rounds_supported = supported;
         self
@@ -1126,6 +1192,7 @@ impl OpenAiResponsesBuilder {
             credential: self.credential,
             max_tokens: self.max_tokens,
             reasoning_effort: self.reasoning_effort,
+            reasoning_surface: self.reasoning_surface,
             timeout_secs: self.timeout_secs.unwrap_or(120),
             extra_headers: self.extra_headers,
         }
@@ -1133,6 +1200,48 @@ impl OpenAiResponsesBuilder {
 }
 
 impl OpenAiResponsesModelProvider {
+    fn profile_effort(
+        &self,
+        model: &str,
+        level: Option<zeroclaw_api::model_provider::ThinkingLevel>,
+        has_tools: bool,
+        call: ReasoningCall,
+    ) -> Option<NativeEffort> {
+        ReasoningContext {
+            surface: self.reasoning_surface,
+            api: ReasoningApi::Responses,
+            alias: &self.alias,
+            model,
+            has_tools,
+            custom_endpoint: self.responses_url.trim_end_matches('/') != RESPONSES_URL,
+            call,
+        }
+        .resolve_level(
+            level,
+            self.reasoning_effort.as_deref(),
+            self.reasoning_effort.as_deref(),
+        )
+    }
+
+    fn apply_profile_effort(
+        &self,
+        request: &mut ResponsesApiRequest,
+        level: Option<zeroclaw_api::model_provider::ThinkingLevel>,
+        call: ReasoningCall,
+    ) {
+        if let Some(effort) = self.profile_effort(
+            &request.model,
+            level,
+            has_responses_tools(request.tools.as_deref()),
+            call,
+        ) {
+            request.reasoning = Some(ResponsesApiReasoning {
+                effort: effort.as_str().to_owned(),
+            });
+            request.temperature = profile_temperature(request.temperature, Some(effort));
+        }
+    }
+
     /// Entry point. Only `alias` is required; every other field is set
     /// via a labelled chain method on the returned [`OpenAiResponsesBuilder`].
     pub fn builder(alias: &str) -> OpenAiResponsesBuilder {
@@ -1143,6 +1252,7 @@ impl OpenAiResponsesModelProvider {
             credential: None,
             max_tokens: None,
             reasoning_effort: None,
+            reasoning_surface: None,
             timeout_secs: None,
             extra_headers: std::collections::HashMap::new(),
         }
@@ -1376,7 +1486,12 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         } else {
             Some(instructions)
         };
-        let req = self.build_request(instructions, input, None, model, temperature, false);
+        let mut req = self.build_request(instructions, input, None, model, temperature, false);
+        self.apply_profile_effort(
+            &mut req,
+            zeroclaw_api::current_one_shot_native_thinking_level(),
+            ReasoningCall::OneShot,
+        );
         let response = self
             .apply_opencode_session_header(
                 self.http_client()
@@ -1428,6 +1543,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         let tools = convert_tools(request.tools);
         let tools_count = tools.as_ref().map_or(0, Vec::len);
         let mut req = self.build_request(instructions, input, tools, model, temperature, false);
+        self.apply_profile_effort(&mut req, request.thinking_level, ReasoningCall::Turn);
         if tools_count > 0
             && policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single
             && self.supports_single_tool_rounds(model)
@@ -1518,7 +1634,16 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         // not task-locals, so the conversation scope is unreadable inside.
         let opencode_session = self.opencode_session_value();
         let count_tokens = options.count_tokens;
-        let reasoning_effort = self.reasoning_effort.clone();
+        let effort = self.profile_effort(
+            &model,
+            request.thinking_level,
+            request.tools.is_some_and(|tools| !tools.is_empty()),
+            ReasoningCall::Turn,
+        );
+        let reasoning_effort = effort
+            .map(|effort| effort.as_str().to_owned())
+            .or_else(|| self.reasoning_effort.clone());
+        let temperature = profile_temperature(temperature, effort);
         let max_tokens = self.max_tokens;
         let client = self.streaming_client();
         let idle_timeout = super::stream_idle_timeout(self.timeout_secs);
@@ -1712,6 +1837,7 @@ mod tool_round_policy_tests {
         let request = ProviderChatRequest {
             messages: &messages,
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
         for (streaming, retries) in [(false, 0), (false, 1), (true, 0)] {
@@ -1919,6 +2045,7 @@ mod tool_round_policy_tests {
         let request = ProviderChatRequest {
             messages: &messages,
             tools: (tool_shape != 0).then_some(tools.as_slice()),
+            thinking_level: None,
             thinking: None,
         };
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -2309,6 +2436,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "gpt-4o-mini",
@@ -2963,6 +3091,7 @@ mod tests {
             ],
             temperature: Some(0.7),
             max_tokens: None,
+            reasoning_effort: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"role\":\"system\""));
@@ -2980,6 +3109,7 @@ mod tests {
             }],
             temperature: Some(0.0),
             max_tokens: None,
+            reasoning_effort: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("system"));

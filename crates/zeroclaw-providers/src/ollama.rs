@@ -1232,6 +1232,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: Some(&tools),
+                    thinking_level: None,
                     thinking: None,
                 },
                 "llama3",
