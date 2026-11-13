@@ -6,6 +6,8 @@
 use zeroclaw_api::attribution::{ToolKind, ToolProvenance};
 use zeroclaw_api::tool_attribution;
 
+#[cfg(feature = "tool-agy-cli")]
+use crate::agy_cli::AgyCliTool;
 use crate::ask_user::AskUserTool;
 use crate::backup_tool::BackupTool;
 #[cfg(feature = "tools-external")]
@@ -95,6 +97,8 @@ use crate::web_fetch::WebFetchTool;
 #[cfg(feature = "tools-external")]
 use crate::web_search_tool::WebSearchTool;
 
+#[cfg(feature = "tool-agy-cli")]
+tool_attribution!(AgyCliTool, ToolKind::Plugin);
 tool_attribution!(AskUserTool, ToolKind::Wait);
 tool_attribution!(BackupTool, ToolKind::Plugin);
 #[cfg(feature = "tools-external")]

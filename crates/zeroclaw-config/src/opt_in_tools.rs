@@ -26,11 +26,12 @@ pub enum OptInTool {
     ClaudeCodeRunner,
     CodexCli,
     GeminiCli,
+    AgyCli,
     OpenCodeCli,
 }
 
 impl OptInTool {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Jira,
         Self::Notion,
         Self::LinkedIn,
@@ -42,6 +43,7 @@ impl OptInTool {
         Self::ClaudeCodeRunner,
         Self::CodexCli,
         Self::GeminiCli,
+        Self::AgyCli,
         Self::OpenCodeCli,
     ];
 
@@ -59,6 +61,7 @@ impl OptInTool {
             Self::ClaudeCodeRunner => "claude_code_runner",
             Self::CodexCli => "codex_cli",
             Self::GeminiCli => "gemini_cli",
+            Self::AgyCli => "agy_cli",
             Self::OpenCodeCli => "opencode_cli",
         }
     }
@@ -77,6 +80,7 @@ impl OptInTool {
             Self::ClaudeCodeRunner => "tool-claude-code-runner",
             Self::CodexCli => "tool-codex-cli",
             Self::GeminiCli => "tool-gemini-cli",
+            Self::AgyCli => "tool-agy-cli",
             Self::OpenCodeCli => "tool-opencode-cli",
         }
     }
@@ -95,6 +99,7 @@ impl OptInTool {
             Self::ClaudeCodeRunner => cfg!(feature = "tool-claude-code-runner"),
             Self::CodexCli => cfg!(feature = "tool-codex-cli"),
             Self::GeminiCli => cfg!(feature = "tool-gemini-cli"),
+            Self::AgyCli => cfg!(feature = "tool-agy-cli"),
             Self::OpenCodeCli => cfg!(feature = "tool-opencode-cli"),
         }
     }
@@ -113,6 +118,7 @@ impl OptInTool {
             Self::ClaudeCodeRunner => config.claude_code_runner.enabled,
             Self::CodexCli => config.codex_cli.enabled,
             Self::GeminiCli => config.gemini_cli.enabled,
+            Self::AgyCli => config.agy_cli.enabled,
             Self::OpenCodeCli => config.opencode_cli.enabled,
         }
     }
