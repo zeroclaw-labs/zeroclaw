@@ -72,8 +72,8 @@ impl fmt::Display for HeartbeatTask {
 // ── Health Metrics ───────────────────────────────────────────────
 
 /// Live health metrics for the heartbeat subsystem.
-/// Shared via `Arc<ParkingMutex<>>` between the heartbeat worker,
-/// deadman watcher, and API consumers.
+/// Shared via `Arc<ParkingMutex<>>` between the heartbeat worker and API consumers.
+/// The deadman watcher resolves its baseline from the durable heartbeat store.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatMetrics {
     /// Monotonic uptime since the heartbeat loop started.
