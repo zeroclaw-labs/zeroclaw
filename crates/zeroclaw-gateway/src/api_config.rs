@@ -1381,6 +1381,10 @@ pub async fn list_http_credentials(
                     ScopedHttpAuth::UserPassword { .. } => "user_password",
                     ScopedHttpAuth::SshKey { .. } => "ssh_key",
                 };
+                let header = match &record.auth {
+                    ScopedHttpAuth::ApiKey { header, .. } => Some(header),
+                    _ => None,
+                };
                 let destinations = match &record.auth {
                     ScopedHttpAuth::SshKey { destinations, .. } => Some(destinations),
                     _ => None,
@@ -1388,7 +1392,7 @@ pub async fn list_http_credentials(
                 rows.push((
                     name,
                     serde_json::json!({
-                        "name": name, "origin": record.origin, "kind": kind, "source": record.source, "destinations": destinations
+                        "name": name, "origin": record.origin, "kind": kind, "source": record.source, "destinations": destinations, "header": header
                     }),
                 ));
             }

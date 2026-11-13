@@ -1,6 +1,6 @@
 use crate::helpers::domain_guard;
 use async_trait::async_trait;
-use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{AUTHORIZATION, HOST, HeaderMap, HeaderName, HeaderValue};
 use serde_json::json;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
@@ -15,6 +15,10 @@ use zeroclaw_config::schema::{ProxyConfig, ProxyScope};
 const HTTP_REQUEST_PROXY_PINNING_ERROR: &str = "http_request requires direct transport so validated DNS answers remain pinned; set \
      proxy.scope = \"services\" and omit tool.http_request and tool.* from proxy.services, or disable the proxy; \
      proxy.scope = \"environment\" is incompatible with pinned HTTP requests";
+
+fn scoped_credential_message(key: &str) -> String {
+    crate::i18n::get_required_tool_string(key)
+}
 
 /// HTTP request tool for API interactions.
 /// Supports GET, POST, PUT, DELETE methods with configurable security.
@@ -361,10 +365,11 @@ impl HttpRequestTool {
         if matches!(source, ScopedCredentialSource::Local) {
             return Ok(value);
         }
-        let (program, args) = source
-            .command(&value)
-            .ok_or_else(|| anyhow::Error::msg("Invalid external credential reference"))?;
-        let failed = |_| anyhow::Error::msg("External credential lookup failed");
+        let (program, args) = source.command(&value).ok_or_else(|| {
+            anyhow::Error::msg(scoped_credential_message("tool-http-credential-reference"))
+        })?;
+        let failed =
+            |_| anyhow::Error::msg(scoped_credential_message("tool-http-credential-lookup"));
         let mut child = tokio::process::Command::new(program)
             .args(args)
             .stdin(Stdio::null())
@@ -373,10 +378,9 @@ impl HttpRequestTool {
             .kill_on_drop(true)
             .spawn()
             .map_err(failed)?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow::Error::msg("External credential lookup failed"))?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            anyhow::Error::msg(scoped_credential_message("tool-http-credential-lookup"))
+        })?;
         let mut output = Vec::new();
         let status = tokio::time::timeout(Duration::from_secs(15), async {
             stdout.take(65_537).read_to_end(&mut output).await?;
@@ -388,9 +392,13 @@ impl HttpRequestTool {
             child.wait().await
         })
         .await
-        .map_err(|_| anyhow::Error::msg("External credential lookup timed out"))?
+        .map_err(|_| anyhow::Error::msg(scoped_credential_message("tool-http-credential-timeout")))?
         .map_err(failed)?;
-        anyhow::ensure!(status.success(), "External credential lookup failed");
+        anyhow::ensure!(
+            status.success(),
+            "{}",
+            scoped_credential_message("tool-http-credential-lookup")
+        );
         Self::decode_scoped_value(source, output)
     }
 
@@ -424,7 +432,9 @@ impl HttpRequestTool {
                     && value.len() <= 4096
                     && !value.chars().any(char::is_control)
             })
-            .ok_or_else(|| anyhow::Error::msg("Invalid external credential value"))
+            .ok_or_else(|| {
+                anyhow::Error::msg(scoped_credential_message("tool-http-credential-value"))
+            })
     }
 
     async fn apply_scoped_credential(
@@ -439,33 +449,46 @@ impl HttpRequestTool {
             secrets::SecretStore,
         };
 
-        Self::validate_secret_name(name)?;
-        let path = self
-            .config_path
-            .as_ref()
-            .ok_or_else(|| anyhow::Error::msg("Credential store unavailable"))?;
-        let contents = std::fs::read_to_string(path)
-            .map_err(|_| anyhow::Error::msg("Credential store unavailable"))?;
-        let config: Config = toml::from_str(&contents)
-            .map_err(|_| anyhow::Error::msg("Credential store unavailable"))?;
+        if headers.contains_key(HOST) {
+            return Err(anyhow::Error::msg(scoped_credential_message(
+                "tool-http-credential-host",
+            )));
+        }
+        Self::validate_secret_name(name).map_err(|_| {
+            anyhow::Error::msg(scoped_credential_message("tool-http-credential-alias"))
+        })?;
+        let path = self.config_path.as_ref().ok_or_else(|| {
+            anyhow::Error::msg(scoped_credential_message("tool-http-credential-store"))
+        })?;
+        let contents = std::fs::read_to_string(path).map_err(|_| {
+            anyhow::Error::msg(scoped_credential_message("tool-http-credential-store"))
+        })?;
+        let config: Config = toml::from_str(&contents).map_err(|_| {
+            anyhow::Error::msg(scoped_credential_message("tool-http-credential-store"))
+        })?;
         let stored = config
             .http_request
             .scoped_credentials
             .get(name)
             .filter(|value| config.secrets.encrypt && value.starts_with("enc2:"))
-            .ok_or_else(|| anyhow::Error::msg("Scoped HTTP credential unavailable"))?;
-        let dir = path
-            .parent()
-            .ok_or_else(|| anyhow::Error::msg("Credential store unavailable"))?;
-        let plaintext = SecretStore::new(dir, true)
-            .decrypt(stored)
-            .map_err(|_| anyhow::Error::msg("Credential store unavailable"))?;
-        let credential: ScopedHttpCredential = serde_json::from_str(&plaintext)
-            .map_err(|_| anyhow::Error::msg("Invalid stored HTTP credential"))?;
+            .ok_or_else(|| {
+                anyhow::Error::msg(scoped_credential_message("tool-http-credential-missing"))
+            })?;
+        let dir = path.parent().ok_or_else(|| {
+            anyhow::Error::msg(scoped_credential_message("tool-http-credential-store"))
+        })?;
+        let plaintext = SecretStore::new(dir, true).decrypt(stored).map_err(|_| {
+            anyhow::Error::msg(scoped_credential_message("tool-http-credential-store"))
+        })?;
+        let credential: ScopedHttpCredential = serde_json::from_str(&plaintext).map_err(|_| {
+            anyhow::Error::msg(scoped_credential_message("tool-http-credential-invalid"))
+        })?;
         if ScopedHttpCredential::https_origin(&target.url).as_deref()
             != Some(credential.origin.as_str())
         {
-            anyhow::bail!("Scoped HTTP credential does not allow this HTTPS origin");
+            return Err(anyhow::Error::msg(scoped_credential_message(
+                "tool-http-credential-origin",
+            )));
         }
         let (name, authorization, mut sensitive) = match credential.auth {
             ScopedHttpAuth::ApiKey { value, header } => {
@@ -492,11 +515,14 @@ impl HttpRequestTool {
                 )
             }
             ScopedHttpAuth::SshKey { .. } => {
-                anyhow::bail!("SSH keys cannot authenticate HTTP requests")
+                return Err(anyhow::Error::msg(scoped_credential_message(
+                    "tool-http-credential-kind",
+                )));
             }
         };
-        let mut header = HeaderValue::from_str(&authorization)
-            .map_err(|_| anyhow::Error::msg("Invalid stored HTTP credential"))?;
+        let mut header = HeaderValue::from_str(&authorization).map_err(|_| {
+            anyhow::Error::msg(scoped_credential_message("tool-http-credential-invalid"))
+        })?;
         header.set_sensitive(true);
         headers.insert(name, header);
         sensitive.insert(0, authorization);
@@ -839,11 +865,9 @@ impl Tool for HttpRequestTool {
             }
         };
         let scoped = match args.get("credential") {
-            Some(value) => Some(
-                value
-                    .as_str()
-                    .ok_or_else(|| anyhow::Error::msg("'credential' must be a string"))?,
-            ),
+            Some(value) => Some(value.as_str().ok_or_else(|| {
+                anyhow::Error::msg(scoped_credential_message("tool-http-credential-argument"))
+            })?),
             None => None,
         };
         let credential_result = match (scoped, auth_secret) {
@@ -1374,6 +1398,14 @@ mod tests {
         );
         assert_eq!(headers["x-api-key"], "fixture-key");
         assert!(headers["x-api-key"].is_sensitive());
+        let mut forged = HeaderMap::new();
+        forged.insert(HOST, HeaderValue::from_static("another.example.com"));
+        assert!(
+            tool.apply_scoped_credential(&mut forged, "TEST", &target)
+                .await
+                .is_err()
+        );
+        assert!(!forged.contains_key("x-api-key"));
     }
 
     #[test]

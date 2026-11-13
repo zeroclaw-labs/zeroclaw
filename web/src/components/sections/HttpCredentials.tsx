@@ -97,7 +97,7 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
             <p key={JSON.stringify(destination)} className="text-sm">{destination.username}@{destination.host}:{destination.port}</p>
           ))}
           <div className="flex flex-wrap gap-2">
-            <Button size="sm" disabled={disabled} onClick={() => { setRemoving(null); setHeader("bearer"); setSource(row.source); setEditing(row); }}>
+            <Button size="sm" disabled={disabled} onClick={() => { setRemoving(null); setHeader(row.header ?? "bearer"); setSource(row.source); setEditing(row); }}>
               {t("plugin_tls.replace")}
             </Button>
             <Button size="sm" variant="ghost" disabled={disabled} onClick={() => { setEditing(null); setRemoving(row); }}>
