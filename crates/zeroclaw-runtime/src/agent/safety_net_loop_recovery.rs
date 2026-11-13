@@ -159,6 +159,9 @@ struct HookCounts {
     before: AtomicUsize,
     after: AtomicUsize,
     abandoned: AtomicUsize,
+    started_ids: parking_lot::Mutex<Vec<String>>,
+    completed_ids: parking_lot::Mutex<Vec<String>>,
+    abandoned_ids: parking_lot::Mutex<Vec<String>>,
 }
 
 struct TestHook {
@@ -183,6 +186,31 @@ impl crate::hooks::HookHandler for TestHook {
             crate::hooks::HookResult::Continue((name, args))
         }
     }
+    async fn before_tool_call_with_context(
+        &self,
+        context: &crate::hooks::ToolCallHookContext,
+        name: String,
+        args: serde_json::Value,
+    ) -> crate::hooks::HookResult<(String, serde_json::Value)> {
+        self.counts
+            .started_ids
+            .lock()
+            .push(context.invocation_id().to_owned());
+        self.before_tool_call(name, args).await
+    }
+    async fn on_after_tool_call_with_context(
+        &self,
+        context: &crate::hooks::ToolCallHookContext,
+        tool: &str,
+        result: &crate::tools::ToolResult,
+        duration: std::time::Duration,
+    ) {
+        self.counts
+            .completed_ids
+            .lock()
+            .push(context.invocation_id().to_owned());
+        self.on_after_tool_call(tool, result, duration).await;
+    }
     async fn on_after_tool_call(
         &self,
         _tool: &str,
@@ -193,9 +221,13 @@ impl crate::hooks::HookHandler for TestHook {
     }
     async fn on_tool_call_abandoned(
         &self,
-        _context: &crate::hooks::ToolCallHookContext,
+        context: &crate::hooks::ToolCallHookContext,
         _tool: &str,
     ) {
+        self.counts
+            .abandoned_ids
+            .lock()
+            .push(context.invocation_id().to_owned());
         self.counts.abandoned.fetch_add(1, Ordering::SeqCst);
     }
 }
@@ -374,7 +406,21 @@ async fn recovery_retry_changed_url_and_other_useful_batch_work_continue() {
                 responses.push(text_response("recovered"));
                 let (mut agent, requests) = agent_for(responses, tool, Some(Default::default()));
                 agent.config.resolved.parallel_tools = parallel;
+                let counts = Arc::new(HookCounts::default());
+                attach_hook(&mut agent, &counts, false);
                 let (response, _) = run(&mut agent, streamed).await;
+                // A skipped middle call must not donate its hook identity to
+                // the useful call after it. Every admitted identity settles once.
+                let mut terminal_ids = counts.completed_ids.lock().clone();
+                terminal_ids.extend(counts.abandoned_ids.lock().iter().cloned());
+                terminal_ids.sort();
+                let mut started_ids = counts.started_ids.lock().clone();
+                started_ids.sort();
+                assert_eq!(terminal_ids, started_ids);
+                assert_eq!(
+                    counts.abandoned.load(Ordering::SeqCst),
+                    usize::from(scenario == 2)
+                );
                 assert!(response.ends_with("recovered"));
                 assert!(!response.contains(&crate::i18n::get_required_cli_string(
                     "turn-repeated-failure-exhausted"

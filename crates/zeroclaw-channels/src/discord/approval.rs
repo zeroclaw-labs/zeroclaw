@@ -129,9 +129,17 @@ pub(crate) fn approval_button_binding(
 /// makes a click resolvable (an unregistered id resolves to nothing).
 pub(crate) fn build_approval_row(
     token: &str,
+    strict_session_prompt_approval: bool,
 ) -> (DiscordActionRow, Vec<(CustomId, ApprovalDecision)>) {
     let bindings: Vec<(CustomId, ApprovalDecision)> = APPROVAL_BUTTONS
         .iter()
+        .filter(|decision| {
+            !strict_session_prompt_approval
+                || matches!(
+                    decision,
+                    ApprovalDecision::AllowOnce | ApprovalDecision::Deny
+                )
+        })
         .map(|d| approval_button_binding(token, *d))
         .collect();
     let buttons = bindings
@@ -169,8 +177,19 @@ mod tests {
     }
 
     #[test]
+    fn strict_session_prompt_row_has_only_one_time_choices() {
+        let (row, bindings) = build_approval_row("abc123", true);
+        assert_eq!(row.components.len(), 2);
+        assert_eq!(bindings.len(), 2);
+        assert!(bindings.iter().all(|(_, decision)| matches!(
+            decision,
+            ApprovalDecision::AllowOnce | ApprovalDecision::Deny
+        )));
+    }
+
+    #[test]
     fn row_has_four_buttons_with_unique_ids_carrying_the_token() {
-        let (row, bindings) = build_approval_row("abc123");
+        let (row, bindings) = build_approval_row("abc123", false);
         assert_eq!(row.components.len(), 4, "four approval buttons");
         assert_eq!(bindings.len(), 4);
 
@@ -188,7 +207,7 @@ mod tests {
 
     #[test]
     fn bindings_cover_every_decision_exactly_once() {
-        let (_, bindings) = build_approval_row("tok");
+        let (_, bindings) = build_approval_row("tok", false);
         let decisions: Vec<ApprovalDecision> = bindings.iter().map(|(_, d)| *d).collect();
         assert!(decisions.contains(&ApprovalDecision::AllowOnce));
         assert!(decisions.contains(&ApprovalDecision::AllowSession));

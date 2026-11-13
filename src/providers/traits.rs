@@ -139,6 +139,7 @@ mod tests {
         assert!(json.contains("\"type\":\"Chat\""));
 
         let tool_result = ConversationMessage::ToolResults(vec![ToolResultMessage {
+            session_prompt_tool_result: false,
             tool_call_id: "1".into(),
             content: "done".into(),
             tool_name: String::new(),

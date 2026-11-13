@@ -5159,6 +5159,14 @@ impl SlackChannel {
     }
 }
 
+// Slack decodes these entities for display without interpreting their contents
+// as mention/link control syntax. Encode ampersands first to preserve literals.
+fn escape_strict_approval_text(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 /// `chat.postMessage` body for a Socket Mode approval card.
 ///
 /// Split out from the send so the rendered card can be asserted directly.
@@ -5166,21 +5174,48 @@ impl SlackChannel {
 /// [`crate::util::build_yesno_approval_prompt`], so the position line has to be
 /// threaded into both surfaces the operator can read: the `text` notification
 /// fallback and the `mrkdwn` section.
+/// Strict session confirmations instead use literal plain text on both surfaces.
 fn build_socket_mode_approval_body(
     recipient: &str,
     token: &str,
     tool_name: &str,
     arguments_summary: &str,
     position: Option<(u32, u32)>,
+    strict_session_prompt_approval: bool,
 ) -> serde_json::Value {
     let heading = i18n::get_required_cli_string("channel-approval-heading-shout");
     let tool_label = i18n::get_required_cli_string("channel-approval-tool-label");
     let args_label = i18n::get_required_cli_string("channel-approval-args-label");
     let btn_approve = i18n::get_required_cli_string("channel-approval-btn-approve");
     let btn_deny = i18n::get_required_cli_string("channel-approval-btn-deny");
-    let btn_always = i18n::get_required_cli_string("channel-approval-btn-always");
+    let mut elements = vec![
+        serde_json::json!({ "type": "button", "text": { "type": "plain_text", "text": btn_approve }, "action_id": format!("approval_{token}_approve"), "style": "primary" }),
+        serde_json::json!({ "type": "button", "text": { "type": "plain_text", "text": btn_deny }, "action_id": format!("approval_{token}_deny"), "style": "danger" }),
+    ];
+    if !strict_session_prompt_approval {
+        let btn_always = i18n::get_required_cli_string("channel-approval-btn-always");
+        elements.push(serde_json::json!({ "type": "button", "text": { "type": "plain_text", "text": btn_always }, "action_id": format!("approval_{token}_always") }));
+    }
     // Two pending cards from one turn are otherwise identical until tapped.
     let position_line = crate::util::approval_position_line(position);
+    if strict_session_prompt_approval {
+        let text = escape_strict_approval_text(&format!(
+            "{heading} [{token}]\n{position_line}{tool_label}: {tool_name}\n{args_label}: {arguments_summary}"
+        ));
+        return serde_json::json!({
+            "channel": recipient,
+            "text": text,
+            "mrkdwn": false,
+            "parse": "none",
+            "link_names": false,
+            "unfurl_links": false,
+            "unfurl_media": false,
+            "blocks": [{
+                "type": "section",
+                "text": {"type": "plain_text", "text": text, "emoji": false}
+            }, {"type": "actions", "elements": elements}]
+        });
+    }
     serde_json::json!({
         "channel": recipient,
         "text": format!("{heading} [{token}]\n{position_line}{tool_label}: {tool_name}\n{args_label}: {arguments_summary}"),
@@ -5192,11 +5227,7 @@ fn build_socket_mode_approval_body(
             }
         }, {
             "type": "actions",
-            "elements": [
-                { "type": "button", "text": { "type": "plain_text", "text": btn_approve }, "action_id": format!("approval_{token}_approve"), "style": "primary" },
-                { "type": "button", "text": { "type": "plain_text", "text": btn_deny }, "action_id": format!("approval_{token}_deny"), "style": "danger" },
-                { "type": "button", "text": { "type": "plain_text", "text": btn_always }, "action_id": format!("approval_{token}_always") },
-            ]
+            "elements": elements
         }]
     })
 }
@@ -6244,6 +6275,51 @@ impl Channel for SlackChannel {
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         let token = crate::util::new_approval_token();
+        let strict = zeroclaw_api::is_strict_session_prompt_approval(request);
+        let strict_body = if strict {
+            let body = if self.app_token.is_some() {
+                build_socket_mode_approval_body(
+                    recipient,
+                    &token,
+                    &request.tool_name,
+                    &request.arguments_summary,
+                    request.position_counter(),
+                    true,
+                )
+            } else {
+                let message = SendMessage::new(
+                    crate::util::build_yesno_approval_prompt_with_policy(
+                        &token,
+                        &request.tool_name,
+                        &request.arguments_summary,
+                        request.position_counter(),
+                        true,
+                    ),
+                    recipient,
+                );
+                let mut body = serde_json::json!({
+                    "channel": recipient,
+                    "text": escape_strict_approval_text(&message.content),
+                    "mrkdwn": false,
+                    "parse": "none",
+                    "link_names": false,
+                    "unfurl_links": false,
+                    "unfurl_media": false,
+                });
+                if let Some(ts) = self.outbound_thread_ts(&message) {
+                    body["thread_ts"] = serde_json::json!(ts);
+                }
+                body
+            };
+            // Exact confirmation cannot be split or silently truncated. Deny
+            // before parking an approval that the surface cannot display.
+            if body["text"].as_str().map_or(0, str::len) > SLACK_BLOCK_TEXT_MAX_CHARS {
+                return Ok(None);
+            }
+            Some(body)
+        } else {
+            None
+        };
 
         let (tx, rx) = oneshot::channel();
         self.pending_approvals.lock().await.insert(
@@ -6252,6 +6328,9 @@ impl Channel for SlackChannel {
                 sender: tx,
                 destination: recipient.to_string(),
                 tool_name: request.tool_name.clone(),
+                strict_session_prompt_approval: zeroclaw_api::is_strict_session_prompt_approval(
+                    request,
+                ),
             },
         );
         let mut guard = crate::util::PendingApprovalGuard::new(
@@ -6261,13 +6340,37 @@ impl Channel for SlackChannel {
 
         // Socket Mode: send interactive Block Kit buttons.
         // Polling mode: send plain text with token-echo instructions.
-        let send_result = if self.app_token.is_some() {
+        let send_result = if let Some(body) = strict_body {
+            // Proposed content is data: bypass attachment extraction entirely.
+            async {
+                let response = self
+                    .http_client()
+                    .post(self.slack_api_url("chat.postMessage"))
+                    .bearer_auth(&self.bot_token)
+                    .json(&body)
+                    .send()
+                    .await?;
+                if !response.status().is_success() {
+                    anyhow::bail!(
+                        "strict approval delivery failed with HTTP {}",
+                        response.status()
+                    );
+                }
+                let result: serde_json::Value = response.json().await?;
+                if result["ok"] != true {
+                    anyhow::bail!("Slack rejected strict approval delivery");
+                }
+                Ok(())
+            }
+            .await
+        } else if self.app_token.is_some() {
             let body = build_socket_mode_approval_body(
                 recipient,
                 &token,
                 &request.tool_name,
                 &request.arguments_summary,
                 request.position_counter(),
+                zeroclaw_api::is_strict_session_prompt_approval(request),
             );
             self.http_client()
                 .post("https://slack.com/api/chat.postMessage")
@@ -6279,11 +6382,12 @@ impl Channel for SlackChannel {
                 .map_err(anyhow::Error::from)
         } else {
             self.send(&SendMessage::new(
-                crate::util::build_yesno_approval_prompt(
+                crate::util::build_yesno_approval_prompt_with_policy(
                     &token,
                     &request.tool_name,
                     &request.arguments_summary,
                     request.position_counter(),
+                    zeroclaw_api::is_strict_session_prompt_approval(request),
                 ),
                 recipient,
             ))
@@ -6325,6 +6429,142 @@ impl Channel for SlackChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn strict_approval_delivery_is_literal_and_rejects_oversized_previews() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for socket_mode in [false, true] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat.postMessage"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let workspace = tempfile::tempdir().expect("synthetic workspace");
+            std::fs::write(workspace.path().join("report.txt"), "private-test-report")
+                .expect("synthetic attachment");
+            let mut channel =
+                test_slack_channel(&server, workspace.path()).with_approval_timeout_secs(0);
+            channel.app_token = socket_mode.then(|| "test-app-token".into());
+            let summary = "[FILE:report.txt] *literal* <!channel> <@U_SYNTHETIC> <https://example.invalid|text> & &lt; 😀";
+            let mut request = ChannelApprovalRequest {
+                tool_name: "session_prompt_set".into(),
+                arguments_summary: summary.into(),
+                raw_arguments: None,
+                position: None,
+                strict_session_prompt_approval: true,
+            };
+            let response = channel
+                .request_approval_attributed("C123", &request)
+                .await
+                .expect("literal delivery")
+                .expect("timeout decision");
+            assert_eq!(
+                response.source,
+                zeroclaw_api::channel::ApprovalSource::TimedOut
+            );
+            assert!(channel.pending_approvals.lock().await.is_empty());
+            let requests = server.received_requests().await.expect("HTTP requests");
+            assert_eq!(requests.len(), 1, "no attachment expansion calls");
+            let body: serde_json::Value = requests[0].body_json().expect("Slack payload");
+            assert!(
+                body["text"].as_str().expect("fallback text").contains(
+                    &summary
+                        .replace('&', "&amp;")
+                        .replace('<', "&lt;")
+                        .replace('>', "&gt;")
+                )
+            );
+            assert_eq!(request.arguments_summary, summary);
+            assert_eq!(body["parse"], "none");
+            assert_eq!(body["link_names"], false);
+            let encoded = body["text"].as_str().expect("encoded preview");
+            assert!(!encoded.contains("<!channel>"));
+            assert!(!encoded.contains("<@U_SYNTHETIC>"));
+            assert!(
+                encoded
+                    .replace("&lt;", "<")
+                    .replace("&gt;", ">")
+                    .replace("&amp;", "&")
+                    .contains(summary)
+            );
+            for field in ["mrkdwn", "unfurl_links", "unfurl_media"] {
+                assert_eq!(body[field], false);
+            }
+            if socket_mode {
+                assert_eq!(body["blocks"][0]["text"]["type"], "plain_text");
+                assert_eq!(body["blocks"][0]["text"]["text"], body["text"]);
+                assert_eq!(
+                    body["blocks"][1]["elements"]
+                        .as_array()
+                        .expect("buttons")
+                        .len(),
+                    2
+                );
+            } else {
+                assert!(body.get("blocks").is_none());
+            }
+            request.arguments_summary = "x".repeat(SLACK_BLOCK_TEXT_MAX_CHARS);
+            assert!(
+                channel
+                    .request_approval_attributed("C123", &request)
+                    .await
+                    .expect("oversized denial")
+                    .is_none()
+            );
+            assert!(channel.pending_approvals.lock().await.is_empty());
+            assert_eq!(
+                server
+                    .received_requests()
+                    .await
+                    .expect("HTTP requests")
+                    .len(),
+                1
+            );
+        }
+    }
+
+    /// Both strict delivery modes must release pending state on HTTP or API denial.
+    #[tokio::test]
+    async fn strict_approval_failure_removes_pending_without_echoing_content() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for socket_mode in [false, true] {
+            for status in [200, 400] {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .and(path("/chat.postMessage"))
+                    .respond_with(ResponseTemplate::new(status).set_body_json(
+                        serde_json::json!({"ok": false, "error": "PRIVATE-PREVIEW"}),
+                    ))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let workspace = tempfile::tempdir().expect("synthetic workspace");
+                let mut channel = test_slack_channel(&server, workspace.path());
+                channel.app_token = socket_mode.then(|| "test-app-token".into());
+                let request = ChannelApprovalRequest {
+                    tool_name: "session_prompt_set".into(),
+                    arguments_summary: "PRIVATE-PREVIEW".into(),
+                    raw_arguments: None,
+                    position: None,
+                    strict_session_prompt_approval: true,
+                };
+                let error = channel
+                    .request_approval_attributed("C123", &request)
+                    .await
+                    .expect_err("delivery denied");
+                assert!(!error.to_string().contains("PRIVATE-PREVIEW"));
+                assert!(channel.pending_approvals.lock().await.is_empty());
+            }
+        }
+    }
 
     #[test]
     fn split_text_into_chunks_safe_on_multibyte_utf8() {
@@ -6947,6 +7187,7 @@ mod tests {
                 sender: tx,
                 destination: "C_TEST".to_string(),
                 tool_name: "shell".to_string(),
+                strict_session_prompt_approval: false,
             },
         );
 
@@ -7006,6 +7247,7 @@ mod tests {
                 sender: tx,
                 destination: "C_TEST".to_string(),
                 tool_name: "shell".to_string(),
+                strict_session_prompt_approval: false,
             },
         );
 
@@ -9500,6 +9742,7 @@ mod tests {
                 sender: tx,
                 destination: "C_ORIGIN".to_string(),
                 tool_name: "tool".to_string(),
+                strict_session_prompt_approval: false,
             },
         );
 
@@ -9554,6 +9797,7 @@ mod tests {
                 sender: approve_tx,
                 destination: "C_ORIGIN".to_string(),
                 tool_name: "tool".to_string(),
+                strict_session_prompt_approval: false,
             },
         );
         assert_eq!(
@@ -9617,6 +9861,7 @@ mod tests {
                     sender: approved_tx,
                     destination: "C_ORIGIN".into(),
                     tool_name: "tool".to_string(),
+                    strict_session_prompt_approval: false,
                 },
             );
             approvals.insert(
@@ -9625,6 +9870,7 @@ mod tests {
                     sender: wrong_tx,
                     destination: "C_OTHER".into(),
                     tool_name: "tool".to_string(),
+                    strict_session_prompt_approval: false,
                 },
             );
             approvals.insert(
@@ -9633,6 +9879,7 @@ mod tests {
                     sender: unauthorized_tx,
                     destination: "C_ORIGIN".into(),
                     tool_name: "tool".to_string(),
+                    strict_session_prompt_approval: false,
                 },
             );
         }
@@ -10033,6 +10280,7 @@ mod tests {
                     sender: approved_tx,
                     destination: "C_ORIGIN".into(),
                     tool_name: "tool".to_string(),
+                    strict_session_prompt_approval: false,
                 },
             );
             approvals.insert(
@@ -10041,6 +10289,7 @@ mod tests {
                     sender: wrong_tx,
                     destination: "C_ORIGIN".into(),
                     tool_name: "tool".to_string(),
+                    strict_session_prompt_approval: false,
                 },
             );
             approvals.insert(
@@ -10049,6 +10298,7 @@ mod tests {
                     sender: unauthorized_tx,
                     destination: "C_ORIGIN".into(),
                     tool_name: "tool".to_string(),
+                    strict_session_prompt_approval: false,
                 },
             );
         }
@@ -10164,6 +10414,7 @@ mod tests {
             "shell",
             "ls -la",
             Some((2, 3)),
+            false,
         );
         let expected = crate::util::approval_position_line(Some((2, 3)));
         assert!(!expected.is_empty(), "helper should render a 2-of-3 line");
@@ -10191,9 +10442,11 @@ mod tests {
             "shell",
             "ls -la",
             Some((1, 1)),
+            false,
         );
-        let none =
-            super::build_socket_mode_approval_body("C123", "ab12cd", "shell", "ls -la", None);
+        let none = super::build_socket_mode_approval_body(
+            "C123", "ab12cd", "shell", "ls -la", None, false,
+        );
         assert_eq!(
             single, none,
             "a one-call batch renders exactly as an unpositioned card"

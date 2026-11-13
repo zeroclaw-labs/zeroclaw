@@ -1488,6 +1488,7 @@ mod plugin_webhook {
                     registry,
                     authority,
                     None,
+                    None,
                 ),
             ))
         })

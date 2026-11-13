@@ -1,0 +1,460 @@
+//! Gateway session lifecycle coordination shared by the gateway and RPC.
+
+use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
+use std::sync::{Arc, Mutex};
+
+use crate::session_queue::SessionActorQueue;
+
+const GATEWAY_QUEUE_DEPTH: usize = 8;
+const GATEWAY_LOCK_TIMEOUT_SECS: u64 = 30;
+const GATEWAY_IDLE_TTL_SECS: u64 = 600;
+
+/// One daemon generation's gateway queue and turn-cancellation registry.
+///
+/// Supervised gateway restarts and RPC deletion share this handle. Standalone
+/// gateways own a separate handle. RPC retains its intentionally different
+/// depth-32 queue; only Chat deletion acquires both, in RPC-to-gateway order.
+#[derive(Clone)]
+pub struct GatewaySessionCoordination {
+    queue: Arc<SessionActorQueue>,
+    cancellations: Arc<Mutex<GatewayCancellationRegistry>>,
+}
+
+impl GatewaySessionCoordination {
+    /// Construct the existing gateway depth-8, 30-second, 600-second policy.
+    #[must_use]
+    pub fn for_gateway() -> Self {
+        Self {
+            queue: Arc::new(SessionActorQueue::new(
+                GATEWAY_QUEUE_DEPTH,
+                GATEWAY_LOCK_TIMEOUT_SECS,
+                GATEWAY_IDLE_TTL_SECS,
+            )),
+            cancellations: Arc::new(Mutex::new(GatewayCancellationRegistry::default())),
+        }
+    }
+
+    /// The gateway's per-key serialization and generation authority.
+    #[must_use]
+    pub fn queue(&self) -> &Arc<SessionActorQueue> {
+        &self.queue
+    }
+
+    /// The gateway's active-token and pending-deletion authority.
+    #[must_use]
+    pub fn cancellations(&self) -> &Arc<Mutex<GatewayCancellationRegistry>> {
+        &self.cancellations
+    }
+
+    /// Signal one generation and retain its pending signal until completion.
+    #[must_use]
+    pub fn signal_deletion_at_generation(
+        &self,
+        session_key: &str,
+        generation: u64,
+    ) -> GatewayDeletionCancellation {
+        signal_deletion_at_generation(&self.cancellations, session_key, generation)
+    }
+}
+
+/// Gateway session key prefix to avoid collisions with channel sessions.
+pub const GW_SESSION_PREFIX: &str = "gw_";
+
+/// Return the canonical persistence key for a gateway session.
+///
+/// Persistence backends apply the shared filesystem-safe normalization so
+/// their in-memory and on-disk keys remain consistent.
+pub fn gateway_session_key(session_id: &str) -> String {
+    format!(
+        "{GW_SESSION_PREFIX}{}",
+        zeroclaw_api::session_keys::sanitize_session_key(session_id)
+    )
+}
+
+/// Return the process-local cancellation key for a gateway session.
+///
+/// Unlike persistence keys, cancellation keys must preserve the accepted
+/// session id verbatim: filesystem-safe normalization is lossy and would make
+/// distinct live sessions such as `team.alpha` and `team_alpha` cancel one
+/// another.
+pub fn gateway_cancel_key(session_id: &str) -> String {
+    format!("{GW_SESSION_PREFIX}{session_id}")
+}
+
+/// Gateway turn-cancellation state guarded by one synchronous mutex.
+///
+/// The map remains the canonical active-turn lookup used by abort and status
+/// handlers. Pending deletion signals exist only while a DELETE waits for the
+/// same queue incarnation to finalize; they close the admission-registration
+/// race without letting a stale delete affect a successor generation.
+#[derive(Default)]
+pub struct GatewayCancellationRegistry {
+    tokens: HashMap<String, GatewayCancellationEntry>,
+    pending_deletions: HashMap<String, HashMap<u64, usize>>,
+}
+
+/// The queue incarnation bound to one registered gateway turn.
+///
+/// The caller's admitted queue key is canonical: it cannot be reconstructed
+/// from the cancellation lookup key because persistence normalization is lossy
+/// and WebSocket and HTTP transports use different queue-key conventions.
+pub struct GatewayCancellationEntry {
+    /// Exact queue key supplied at turn registration.
+    pub session_key: String,
+    /// Lifecycle generation of that queue at registration.
+    pub generation: u64,
+    /// Cancellation authority for this registered turn.
+    pub token: Arc<tokio_util::sync::CancellationToken>,
+}
+
+impl Deref for GatewayCancellationRegistry {
+    type Target = HashMap<String, GatewayCancellationEntry>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.tokens
+    }
+}
+
+impl DerefMut for GatewayCancellationRegistry {
+    // Direct mutation remains available for map-compatible consumers and
+    // fixtures. Turn admission must use `register_cancel_token`: raw insertion
+    // bypasses the pending-deletion latch and replacement cancellation checks.
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.tokens
+    }
+}
+
+impl GatewayCancellationRegistry {
+    /// Outstanding deletion guard counts per session and generation.
+    pub fn pending_deletions(&self) -> &HashMap<String, HashMap<u64, usize>> {
+        &self.pending_deletions
+    }
+}
+
+/// Register the current turn for a gateway session and cancel any replaced
+/// turn before returning. Both HTTP/SSE and WebSocket transports share this
+/// registry, so replacement ownership must be identical at both edges.
+pub fn register_cancel_token(
+    cancel_tokens: &Arc<std::sync::Mutex<GatewayCancellationRegistry>>,
+    cancel_key: &str,
+    session_key: &str,
+    session_generation: u64,
+    cancel_token: Arc<tokio_util::sync::CancellationToken>,
+) {
+    let (previous_token, pending_delete) = {
+        let mut registry = cancel_tokens.lock().expect("cancel_tokens lock poisoned");
+        let pending_delete = registry
+            .pending_deletions
+            .get(session_key)
+            .is_some_and(|generations| generations.contains_key(&session_generation));
+        let previous = registry.insert(
+            cancel_key.to_owned(),
+            GatewayCancellationEntry {
+                session_key: session_key.to_owned(),
+                generation: session_generation,
+                token: Arc::clone(&cancel_token),
+            },
+        );
+        (previous.map(|entry| entry.token), pending_delete)
+    };
+    if let Some(previous_token) = previous_token {
+        previous_token.cancel();
+    }
+    if pending_delete {
+        cancel_token.cancel();
+    }
+}
+
+/// Remove a turn's registry entry only while it still owns the session key.
+/// A late completion from a replaced WS/SSE turn must never remove the newer
+/// turn's cancellation handle.
+pub fn remove_cancel_token_if_current(
+    cancel_tokens: &Arc<std::sync::Mutex<GatewayCancellationRegistry>>,
+    cancel_key: &str,
+    cancel_token: &Arc<tokio_util::sync::CancellationToken>,
+) {
+    let mut tokens = cancel_tokens.lock().expect("cancel_tokens lock poisoned");
+    if tokens
+        .get(cancel_key)
+        .is_some_and(|entry| Arc::ptr_eq(&entry.token, cancel_token))
+    {
+        tokens.remove(cancel_key);
+    }
+}
+
+/// Lifecycle signal owned by one DELETE request.
+///
+/// Each request retains its generation's signal until its guard is dropped.
+/// Overlapping requests release only their own claim, so an early failure
+/// cannot clear another request's cancellation boundary. Once all requests
+/// finish, later turns cannot inherit an abandoned signal.
+pub struct GatewayDeletionCancellation {
+    cancellations: Arc<Mutex<GatewayCancellationRegistry>>,
+    session_key: String,
+    session_generation: u64,
+    /// Whether this signal cancelled an already registered turn.
+    pub cancelled_active_turn: bool,
+}
+
+impl Drop for GatewayDeletionCancellation {
+    fn drop(&mut self) {
+        let mut cancellations = self
+            .cancellations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(generations) = cancellations.pending_deletions.get_mut(&self.session_key) {
+            if let Some(outstanding) = generations.get_mut(&self.session_generation) {
+                *outstanding -= 1;
+                if *outstanding == 0 {
+                    generations.remove(&self.session_generation);
+                }
+            }
+            if generations.is_empty() {
+                cancellations.pending_deletions.remove(&self.session_key);
+            }
+        }
+    }
+}
+
+/// Cancel matching active turns and retain a deletion claim for the generation.
+///
+/// Gateway session IDs are reusable after deletion. The cancellation registry
+/// carries the same incarnation boundary as the session queue. Every DELETE
+/// retains a claim until its guard drops; only the last guard releases it.
+/// Claims and token registration share one mutex, so late or replacement
+/// registration observes the claim even when DELETE already cancelled a token.
+pub fn signal_deletion_at_generation(
+    registry: &Arc<Mutex<GatewayCancellationRegistry>>,
+    session_key: &str,
+    expected_generation: u64,
+) -> GatewayDeletionCancellation {
+    let mut cancellations = registry.lock().unwrap_or_else(|error| error.into_inner());
+    let mut cancelled_active_turn = false;
+    for entry in cancellations.tokens.values() {
+        if entry.session_key == session_key && entry.generation == expected_generation {
+            entry.token.cancel();
+            cancelled_active_turn = true;
+        }
+    }
+    // Every DELETE owns a claim, including one that cancelled an active turn:
+    // a replacement can register while that request still waits for the queue.
+    // Counts are generation-specific so a stale guard cannot clear a successor.
+    *cancellations
+        .pending_deletions
+        .entry(session_key.to_string())
+        .or_default()
+        .entry(expected_generation)
+        .or_default() += 1;
+    GatewayDeletionCancellation {
+        cancellations: Arc::clone(registry),
+        session_key: session_key.to_owned(),
+        session_generation: expected_generation,
+        cancelled_active_turn,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deletion_does_not_cancel_a_distinct_dotted_queue() {
+        let coordination = GatewaySessionCoordination::for_gateway();
+        let dotted = Arc::new(tokio_util::sync::CancellationToken::new());
+        let underscored = Arc::new(tokio_util::sync::CancellationToken::new());
+        register_cancel_token(
+            coordination.cancellations(),
+            "gw_team.alpha",
+            "gw_team.alpha",
+            0,
+            Arc::clone(&dotted),
+        );
+        register_cancel_token(
+            coordination.cancellations(),
+            "gw_team_alpha",
+            "gw_team_alpha",
+            0,
+            Arc::clone(&underscored),
+        );
+
+        let deletion = coordination.signal_deletion_at_generation("gw_team_alpha", 0);
+        assert!(deletion.cancelled_active_turn);
+        assert!(underscored.is_cancelled());
+        assert!(
+            !dotted.is_cancelled(),
+            "a distinct admitted queue must survive"
+        );
+    }
+
+    #[test]
+    fn deletion_matches_the_registered_queue_not_the_cancel_lookup_key() {
+        let coordination = GatewaySessionCoordination::for_gateway();
+        let token = Arc::new(tokio_util::sync::CancellationToken::new());
+        // HTTP/SSE uses the normalized queue but the raw abort lookup key.
+        register_cancel_token(
+            coordination.cancellations(),
+            "gw_team.alpha",
+            "gw_team_alpha",
+            0,
+            Arc::clone(&token),
+        );
+        let unrelated = coordination.signal_deletion_at_generation("gw_team.alpha", 0);
+        assert!(!unrelated.cancelled_active_turn);
+        assert!(!token.is_cancelled());
+        let owning = coordination.signal_deletion_at_generation("gw_team_alpha", 0);
+        assert!(owning.cancelled_active_turn);
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn a_distinct_active_queue_does_not_suppress_pending_deletion() {
+        let coordination = GatewaySessionCoordination::for_gateway();
+        let dotted = Arc::new(tokio_util::sync::CancellationToken::new());
+        register_cancel_token(
+            coordination.cancellations(),
+            "gw_team.alpha",
+            "gw_team.alpha",
+            0,
+            Arc::clone(&dotted),
+        );
+        let deletion = coordination.signal_deletion_at_generation("gw_team_alpha", 0);
+        assert!(!deletion.cancelled_active_turn);
+        let underscored = Arc::new(tokio_util::sync::CancellationToken::new());
+        register_cancel_token(
+            coordination.cancellations(),
+            "gw_team_alpha",
+            "gw_team_alpha",
+            0,
+            Arc::clone(&underscored),
+        );
+        assert!(
+            underscored.is_cancelled(),
+            "late registration must observe its outstanding deletion claim"
+        );
+        assert!(!dotted.is_cancelled());
+        drop(deletion);
+        assert!(
+            coordination
+                .cancellations()
+                .lock()
+                .unwrap()
+                .pending_deletions()
+                .is_empty()
+        );
+    }
+
+    fn assert_overlapping_delete_lifetime(register_before_delete: bool) {
+        for drop_first in [false, true] {
+            let coordination = GatewaySessionCoordination::for_gateway();
+            let key = "gw_overlapping_delete";
+            let generation = 7;
+            if register_before_delete {
+                register_cancel_token(
+                    coordination.cancellations(),
+                    "current",
+                    key,
+                    generation,
+                    Arc::new(tokio_util::sync::CancellationToken::new()),
+                );
+            }
+            let first = coordination.signal_deletion_at_generation(key, generation);
+            let second = coordination.signal_deletion_at_generation(key, generation);
+            let remaining = if drop_first {
+                drop(first);
+                second
+            } else {
+                drop(second);
+                first
+            };
+            let admitted = Arc::new(tokio_util::sync::CancellationToken::new());
+            register_cancel_token(
+                coordination.cancellations(),
+                "current",
+                key,
+                generation,
+                Arc::clone(&admitted),
+            );
+            assert!(
+                admitted.is_cancelled(),
+                "the remaining DELETE must cancel late registration: active={register_before_delete}, first_dropped={drop_first}"
+            );
+            let successor = Arc::new(tokio_util::sync::CancellationToken::new());
+            register_cancel_token(
+                coordination.cancellations(),
+                "successor",
+                key,
+                generation + 1,
+                Arc::clone(&successor),
+            );
+            assert!(!successor.is_cancelled());
+            drop(remaining);
+            let later = Arc::new(tokio_util::sync::CancellationToken::new());
+            register_cancel_token(
+                coordination.cancellations(),
+                "current",
+                key,
+                generation,
+                Arc::clone(&later),
+            );
+            assert!(
+                !later.is_cancelled(),
+                "all failed DELETE claims were released"
+            );
+            assert!(!successor.is_cancelled());
+            assert!(
+                coordination
+                    .cancellations()
+                    .lock()
+                    .unwrap()
+                    .pending_deletions()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn overlapping_deletions_retain_pre_registration_cancellation() {
+        assert_overlapping_delete_lifetime(false);
+    }
+
+    #[test]
+    fn overlapping_deletions_retain_active_turn_cancellation() {
+        assert_overlapping_delete_lifetime(true);
+    }
+
+    #[tokio::test]
+    async fn gateway_coordination_preserves_depth_eight() {
+        let coordination = GatewaySessionCoordination::for_gateway();
+        let key = "gw_depth";
+        let held = coordination.queue().acquire(key).await.unwrap();
+        let mut waiters = Vec::new();
+        for _ in 1..8 {
+            let queue = Arc::clone(coordination.queue());
+            waiters.push(zeroclaw_spawn::spawn!(
+                async move { queue.acquire(key).await }
+            ));
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while coordination.queue().queue_depth(key).await != 8 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            coordination.queue().acquire(key).await.is_err(),
+            "ninth admission must be refused"
+        );
+        for waiter in waiters {
+            waiter.abort();
+            let error = waiter
+                .await
+                .err()
+                .expect("aborted waiter must be cancelled");
+            assert!(error.is_cancelled());
+        }
+        drop(held);
+        assert_eq!(coordination.queue().queue_depth(key).await, 0);
+    }
+}

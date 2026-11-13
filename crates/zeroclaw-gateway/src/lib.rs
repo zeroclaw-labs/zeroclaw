@@ -94,29 +94,12 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Gateway session key prefix to avoid collisions with channel sessions.
-pub(crate) const GW_SESSION_PREFIX: &str = "gw_";
-
-/// Return the canonical persistence key for a gateway session.
-///
-/// Persistence backends apply the shared filesystem-safe normalization so
-/// their in-memory and on-disk keys remain consistent.
-pub(crate) fn gateway_session_key(session_id: &str) -> String {
-    format!(
-        "{GW_SESSION_PREFIX}{}",
-        zeroclaw_api::session_keys::sanitize_session_key(session_id)
-    )
-}
-
-/// Return the process-local cancellation key for a gateway session.
-///
-/// Unlike persistence keys, cancellation keys must preserve the accepted
-/// session id verbatim: filesystem-safe normalization is lossy and would make
-/// distinct live sessions such as `team.alpha` and `team_alpha` cancel one
-/// another.
-pub(crate) fn gateway_cancel_key(session_id: &str) -> String {
-    format!("{GW_SESSION_PREFIX}{session_id}")
-}
+use zeroclaw_infra::gateway_session::GatewaySessionCoordination;
+pub(crate) use zeroclaw_infra::gateway_session::{
+    GW_SESSION_PREFIX, gateway_cancel_key, gateway_session_key, register_cancel_token,
+    remove_cancel_token_if_current,
+};
+pub use zeroclaw_infra::gateway_session::{GatewayCancellationEntry, GatewayCancellationRegistry};
 
 /// Backoff after a transient `accept()` error so the serve loop does not
 /// hot-spin while the condition (e.g. fd exhaustion) clears.
@@ -810,16 +793,13 @@ pub struct AppState {
     /// WebAuthn state for hardware key authentication (optional, requires `webauthn` feature)
     #[cfg(feature = "webauthn")]
     pub webauthn: Option<Arc<api_webauthn::WebAuthnState>>,
-    /// Per-session cancellation tokens for aborting in-flight agent responses.
-    /// Key is session_key (e.g. `gw_<session_id>`), value is the token for the
-    /// current turn. Entries are inserted before each turn and removed after
-    /// completion (normal or cancelled). The outer `Arc` provides turn identity
-    /// so late cleanup cannot remove a replacement turn's token.
-    pub cancel_tokens: Arc<
-        std::sync::Mutex<
-            std::collections::HashMap<String, Arc<tokio_util::sync::CancellationToken>>,
-        >,
-    >,
+    /// Per-session cancellation registry for in-flight agent responses.
+    ///
+    /// DELETE requests may arrive in the short interval after queue admission
+    /// but before WebSocket turns have registered their tokens. The registry
+    /// retains each generation-bound latch so an out-of-order stale request
+    /// cannot overwrite a successor's cancellation boundary.
+    pub cancel_tokens: Arc<std::sync::Mutex<GatewayCancellationRegistry>>,
     pub pending_reload: Arc<std::sync::atomic::AtomicBool>,
     /// TUI session registry from the daemon (for /api/tuis endpoint).
     /// `None` when the gateway runs standalone without a daemon.
@@ -857,6 +837,7 @@ impl AppState {
 
 /// Daemon-owned services whose lifecycle matches one supervised gateway run.
 pub struct GatewaySupervision {
+    session_coordination: Option<GatewaySessionCoordination>,
     readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
     plugin_webhooks: Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
     authority: zeroclaw_runtime::LiveConfigAuthority,
@@ -877,12 +858,14 @@ impl GatewaySupervision {
         plugin_webhooks: Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
         authority: zeroclaw_runtime::LiveConfigAuthority,
         sop_driver_handles: Option<zeroclaw_runtime::sop::SopDriverHandles>,
+        session_coordination: Option<GatewaySessionCoordination>,
     ) -> Self {
         Self {
             readiness,
             plugin_webhooks,
             authority,
             sop_driver_handles,
+            session_coordination,
             dashboard_ingress: None,
         }
     }
@@ -1374,6 +1357,7 @@ pub async fn run_gateway_with_authority(
             Arc::new(zeroclaw_api::webhook::PluginWebhookRegistry::new()),
             authority,
             sop_driver_handles,
+            None,
         ),
     ))
     .await
@@ -1401,12 +1385,15 @@ pub async fn run_gateway_with_plugin_webhooks(
     supervision: GatewaySupervision,
 ) -> Result<()> {
     let GatewaySupervision {
+        session_coordination,
         readiness,
         plugin_webhooks,
         authority,
         sop_driver_handles,
         dashboard_ingress,
     } = supervision;
+    let session_coordination =
+        session_coordination.unwrap_or_else(GatewaySessionCoordination::for_gateway);
     let (shared_pairing, shared_inbound_auth, shared_config, shared_cert_audit) =
         match daemon_authority {
             Some(authority) => (
@@ -2498,12 +2485,12 @@ pub async fn run_gateway_with_plugin_webhooks(
         node_registry,
         mdns_peer_registry,
         session_backend,
-        session_queue: Arc::new(session_queue::SessionActorQueue::new(8, 30, 600)),
+        session_queue: Arc::clone(session_coordination.queue()),
         device_registry,
         path_prefix: path_prefix.unwrap_or("").to_string(),
         web_dist_dir,
         canvas_store,
-        cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        cancel_tokens: Arc::clone(session_coordination.cancellations()),
         pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         tui_registry,
         sop_engine,
@@ -2534,6 +2521,43 @@ pub async fn run_gateway_with_plugin_webhooks(
             None
         },
     };
+
+    // Supervised gateways share this queue with RPC Chat deletion, while RPC
+    // keeps its separate depth-32 queue. Reclaim idle gateway actor slots
+    // and their tombstones here; connected WebSockets retain a lifecycle
+    // lease, so this cannot erase an incarnation still held by a socket.
+    {
+        let reaper_queue = Arc::clone(&state.session_queue);
+        let mut reaper_shutdown = state.shutdown_tx.subscribe();
+        zeroclaw_spawn::spawn!(async move {
+            const TICK: Duration = Duration::from_secs(60);
+            let mut interval = tokio::time::interval(TICK);
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let queue_evicted = reaper_queue.evict_idle().await;
+                        if queue_evicted > 0 {
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                                    .with_attrs(::serde_json::json!({
+                                        "evicted_queue_slots": queue_evicted,
+                                    })),
+                                "Gateway session queue: released idle actor-queue slots"
+                            );
+                        }
+                    }
+                    changed = reaper_shutdown.changed() => {
+                        if changed.is_err() || *reaper_shutdown.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     let dashboard_layer_state = state.clone();
     // On every route that issues or redeems a pairing code: refused through a
@@ -4321,58 +4345,12 @@ async fn send_sse_frame_or_cancel(
     }
 }
 
-/// Register the current turn for a gateway session and cancel any replaced
-/// turn before returning. Both HTTP/SSE and WebSocket transports share this
-/// registry, so replacement ownership must be identical at both edges.
-pub(crate) fn register_cancel_token(
-    cancel_tokens: &Arc<
-        std::sync::Mutex<
-            std::collections::HashMap<String, Arc<tokio_util::sync::CancellationToken>>,
-        >,
-    >,
-    session_key: &str,
-    cancel_token: Arc<tokio_util::sync::CancellationToken>,
-) {
-    let previous_token = cancel_tokens
-        .lock()
-        .expect("cancel_tokens lock poisoned")
-        .insert(session_key.to_owned(), cancel_token);
-    if let Some(previous_token) = previous_token {
-        previous_token.cancel();
-    }
-}
-
-/// Remove a turn's registry entry only while it still owns the session key.
-/// A late completion from a replaced WS/SSE turn must never remove the newer
-/// turn's cancellation handle.
-pub(crate) fn remove_cancel_token_if_current(
-    cancel_tokens: &Arc<
-        std::sync::Mutex<
-            std::collections::HashMap<String, Arc<tokio_util::sync::CancellationToken>>,
-        >,
-    >,
-    session_key: &str,
-    cancel_token: &Arc<tokio_util::sync::CancellationToken>,
-) {
-    let mut tokens = cancel_tokens.lock().expect("cancel_tokens lock poisoned");
-    if tokens
-        .get(session_key)
-        .is_some_and(|current| Arc::ptr_eq(current, cancel_token))
-    {
-        tokens.remove(session_key);
-    }
-}
-
 struct SseClientStream {
     receiver: tokio::sync::mpsc::Receiver<SseFrame>,
     terminal_receiver: Option<tokio::sync::oneshot::Receiver<SseFrame>>,
     terminal_delivered: bool,
     cancel_token: Arc<tokio_util::sync::CancellationToken>,
-    cancel_tokens: Arc<
-        std::sync::Mutex<
-            std::collections::HashMap<String, Arc<tokio_util::sync::CancellationToken>>,
-        >,
-    >,
+    cancel_tokens: Arc<std::sync::Mutex<GatewayCancellationRegistry>>,
     cancel_key: String,
 }
 
@@ -4465,7 +4443,14 @@ async fn run_gateway_chat_streaming_response(
             )
         }
     };
-    register_cancel_token(&state.cancel_tokens, &cancel_key, Arc::clone(&cancel_token));
+    let session_generation = state.session_queue.lifecycle_generation(&session_key).await;
+    register_cancel_token(
+        &state.cancel_tokens,
+        &cancel_key,
+        &session_key,
+        session_generation,
+        Arc::clone(&cancel_token),
+    );
 
     let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<SseFrame>(16);
     let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel::<SseFrame>();
@@ -4964,25 +4949,27 @@ async fn process_whatsapp_message(
 
     // Route approval replies to pending approval requests before dispatching
     // to the agent.
-    let mut handled_approval_messages = std::collections::HashSet::new();
-    for msg in verified.messages() {
-        let Some((token, response)) = zeroclaw_channels::util::parse_approval_reply(&msg.content)
-        else {
-            continue;
-        };
-        if wa
-            .resolve_pending_approval(
-                &token,
-                response,
-                msg.sender.as_str(),
-                msg.reply_target.as_str(),
-            )
-            .await
-        {
-            handled_approval_messages.insert(msg.id.clone());
-        }
-    }
-    verified.retain(|msg| !handled_approval_messages.contains(&msg.id));
+    let approval_channel = Arc::clone(wa);
+    verified
+        .retain_messages(move |msg| {
+            let approval_channel = Arc::clone(&approval_channel);
+            Box::pin(async move {
+                let Some((token, response)) =
+                    zeroclaw_channels::util::parse_approval_reply(&msg.content)
+                else {
+                    return true;
+                };
+                !approval_channel
+                    .resolve_pending_approval(
+                        &token,
+                        response,
+                        msg.sender.as_str(),
+                        msg.reply_target.as_str(),
+                    )
+                    .await
+            })
+        })
+        .await;
 
     let channel: Arc<dyn Channel> = wa.clone();
     webhook_ingress::dispatch_verified_webhook(
@@ -6345,7 +6332,7 @@ mod tests {
             )),
             device_registry: registry,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -9451,7 +9438,7 @@ path = "{trigger_path}"
             )),
             device_registry: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -9539,7 +9526,7 @@ path = "{trigger_path}"
             )),
             device_registry: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -10276,7 +10263,7 @@ path = "{trigger_path}"
             )),
             device_registry: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -10565,7 +10552,7 @@ path = "{trigger_path}"
                     .lock()
                     .expect("cancel_tokens lock poisoned")
                     .get(session_key)
-                    .cloned()
+                    .map(|entry| Arc::clone(&entry.token))
                 {
                     return token;
                 }
@@ -10588,7 +10575,7 @@ path = "{trigger_path}"
                     .lock()
                     .expect("cancel_tokens lock poisoned")
                     .get(session_key)
-                    .cloned()
+                    .map(|entry| Arc::clone(&entry.token))
                     && !Arc::ptr_eq(&token, previous)
                 {
                     return token;
@@ -10612,7 +10599,7 @@ path = "{trigger_path}"
                     .lock()
                     .expect("cancel_tokens lock poisoned")
                     .get(session_key)
-                    .is_some_and(|current| Arc::ptr_eq(current, expected));
+                    .is_some_and(|entry| Arc::ptr_eq(&entry.token, expected));
                 if matches {
                     return;
                 }
@@ -11130,7 +11117,7 @@ data: [DONE]\n\n";
             .lock()
             .expect("cancel_tokens lock poisoned")
             .get("gw_sse-abort")
-            .cloned();
+            .map(|entry| Arc::clone(&entry.token));
         assert!(
             token.is_some(),
             "streamed webhook turn must register its cancellation token"
@@ -11228,7 +11215,7 @@ data: [DONE]\n\n";
             .lock()
             .expect("cancel_tokens lock poisoned")
             .get("gw_sse-drop")
-            .cloned()
+            .map(|entry| Arc::clone(&entry.token))
             .expect("streamed turn must register its cancellation token");
 
         drop(response);
@@ -11279,7 +11266,7 @@ data: [DONE]\n\n";
             .lock()
             .expect("cancel_tokens lock poisoned")
             .get("gw_sse-replace")
-            .cloned()
+            .map(|entry| Arc::clone(&entry.token))
             .expect("first streamed turn must register its cancellation token");
 
         let (headers, body) = request();
@@ -11296,7 +11283,7 @@ data: [DONE]\n\n";
             .lock()
             .expect("cancel_tokens lock poisoned")
             .get("gw_sse-replace")
-            .cloned()
+            .map(|entry| Arc::clone(&entry.token))
             .expect("replacement streamed turn must register its cancellation token");
 
         tokio::time::timeout(Duration::from_secs(1), first_token.cancelled())
@@ -11308,7 +11295,7 @@ data: [DONE]\n\n";
             .lock()
             .expect("cancel_tokens lock poisoned")
             .get("gw_sse-replace")
-            .cloned()
+            .map(|entry| Arc::clone(&entry.token))
             .expect("old-turn cleanup must preserve the replacement token");
         assert!(Arc::ptr_eq(&current, &second_token));
 
@@ -11739,12 +11726,24 @@ data: [DONE]\n\n";
 
     #[test]
     fn cancellation_registry_preserves_sse_owner_when_ws_finishes() {
-        let registry = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let registry = Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default()));
         let ws_token = Arc::new(tokio_util::sync::CancellationToken::new());
         let sse_token = Arc::new(tokio_util::sync::CancellationToken::new());
 
-        register_cancel_token(&registry, "gw_cross_direction", Arc::clone(&ws_token));
-        register_cancel_token(&registry, "gw_cross_direction", Arc::clone(&sse_token));
+        register_cancel_token(
+            &registry,
+            "gw_cross_direction",
+            "gw_cross_direction",
+            0,
+            Arc::clone(&ws_token),
+        );
+        register_cancel_token(
+            &registry,
+            "gw_cross_direction",
+            "gw_cross_direction",
+            0,
+            Arc::clone(&sse_token),
+        );
         remove_cancel_token_if_current(&registry, "gw_cross_direction", &ws_token);
 
         assert!(ws_token.is_cancelled());
@@ -11752,7 +11751,7 @@ data: [DONE]\n\n";
             .lock()
             .expect("cancel registry lock")
             .get("gw_cross_direction")
-            .cloned()
+            .map(|entry| Arc::clone(&entry.token))
             .expect("replacement SSE token remains registered");
         assert!(Arc::ptr_eq(&current, &sse_token));
         assert!(!sse_token.is_cancelled());
@@ -11760,12 +11759,24 @@ data: [DONE]\n\n";
 
     #[test]
     fn cancellation_registry_preserves_ws_owner_when_sse_finishes() {
-        let registry = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let registry = Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default()));
         let sse_token = Arc::new(tokio_util::sync::CancellationToken::new());
         let ws_token = Arc::new(tokio_util::sync::CancellationToken::new());
 
-        register_cancel_token(&registry, "gw_cross_direction", Arc::clone(&sse_token));
-        register_cancel_token(&registry, "gw_cross_direction", Arc::clone(&ws_token));
+        register_cancel_token(
+            &registry,
+            "gw_cross_direction",
+            "gw_cross_direction",
+            0,
+            Arc::clone(&sse_token),
+        );
+        register_cancel_token(
+            &registry,
+            "gw_cross_direction",
+            "gw_cross_direction",
+            0,
+            Arc::clone(&ws_token),
+        );
         remove_cancel_token_if_current(&registry, "gw_cross_direction", &sse_token);
 
         assert!(sse_token.is_cancelled());
@@ -11773,7 +11784,7 @@ data: [DONE]\n\n";
             .lock()
             .expect("cancel registry lock")
             .get("gw_cross_direction")
-            .cloned()
+            .map(|entry| Arc::clone(&entry.token))
             .expect("replacement WS token remains registered");
         assert!(Arc::ptr_eq(&current, &ws_token));
         assert!(!ws_token.is_cancelled());
@@ -11781,18 +11792,22 @@ data: [DONE]\n\n";
 
     #[test]
     fn cancellation_registry_keeps_lossy_session_ids_separate() {
-        let registry = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let registry = Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default()));
         let dotted_token = Arc::new(tokio_util::sync::CancellationToken::new());
         let underscored_token = Arc::new(tokio_util::sync::CancellationToken::new());
 
         register_cancel_token(
             &registry,
             &gateway_cancel_key("team.alpha"),
+            "gw_team.alpha",
+            0,
             Arc::clone(&dotted_token),
         );
         register_cancel_token(
             &registry,
             &gateway_cancel_key("team_alpha"),
+            "gw_team_alpha",
+            0,
             Arc::clone(&underscored_token),
         );
 
@@ -11863,7 +11878,7 @@ data: [DONE]\n\n";
             )),
             device_registry: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -12784,7 +12799,7 @@ data: [DONE]\n\n";
             )),
             device_registry: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -12907,7 +12922,7 @@ data: [DONE]\n\n";
             )),
             device_registry: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -13009,7 +13024,7 @@ data: [DONE]\n\n";
             )),
             device_registry: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -13217,7 +13232,7 @@ data: [DONE]\n\n";
             )),
             device_registry: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -13306,7 +13321,7 @@ data: [DONE]\n\n";
             )),
             device_registry: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -13400,7 +13415,7 @@ data: [DONE]\n\n";
             )),
             device_registry: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -13499,7 +13514,7 @@ data: [DONE]\n\n";
             )),
             device_registry: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -13593,7 +13608,7 @@ data: [DONE]\n\n";
             )),
             device_registry: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -13695,7 +13710,7 @@ data: [DONE]\n\n";
             )),
             device_registry: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -13848,7 +13863,7 @@ data: [DONE]\n\n";
             )),
             device_registry: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
             sop_engine: None,
             sop_audit: None,
             sop_driver_handles: None,
@@ -14735,7 +14750,7 @@ data: [DONE]\n\n";
             )),
             device_registry: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -14822,7 +14837,7 @@ data: [DONE]\n\n";
             )),
             device_registry: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -15436,7 +15451,7 @@ data: [DONE]\n\n";
             )),
             device_registry: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -15642,6 +15657,72 @@ data: [DONE]\n\n";
         ))
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[tokio::test]
+    async fn whatsapp_webhook_keeps_unknown_approval_reply_in_agent_dispatch() {
+        // The webhook router must consume only replies for a registered
+        // approval. An approval-shaped message with an unknown token remains
+        // an ordinary inbound message instead of disappearing at the routing
+        // boundary. The companion WhatsApp-channel test covers the strict
+        // `always` rejection/parking decision for a registered token.
+        let _capture_guard = lock_gateway_chat_dispatch_capture_for_test().await;
+        clear_gateway_chat_dispatch_captures_for_test();
+
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+            Arc::new(|| vec!["*".to_string()]);
+        let channel = Arc::new(WhatsAppChannel::new(
+            "access-token".into(),
+            "phone-number-id".into(),
+            "verify-token".into(),
+            "work",
+            peer_resolver,
+        ));
+        let mut state = webhook_baseline_state();
+        state.whatsapp = HashMap::from([("work".to_string(), Arc::clone(&channel))]);
+        state.whatsapp_app_secret =
+            HashMap::from([("work".to_string(), Arc::<str>::from("app-secret"))]);
+
+        let body = serde_json::json!({
+            "object": "whatsapp_business_account",
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "15551234567",
+                            "timestamp": "1699999999",
+                            "type": "text",
+                            "text": { "body": "abc123 always" }
+                        }]
+                    }
+                }]
+            }]
+        });
+        let body = serde_json::to_vec(&body).expect("test webhook JSON serializes");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Hub-Signature-256",
+            HeaderValue::from_str(&whatsapp_signature("app-secret", &body)).unwrap(),
+        );
+
+        let (status, _) = process_whatsapp_message(
+            &state,
+            "work",
+            &channel,
+            Some("app-secret"),
+            headers,
+            Bytes::from(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let captures = gateway_chat_dispatch_captures_for_test();
+        let capture = captures
+            .iter()
+            .find(|capture| capture.message == "abc123 always")
+            .expect("unknown approval replies must be dispatched");
+        assert_eq!(capture.session_id.as_deref(), Some("whatsapp_+15551234567"));
     }
 
     #[cfg(feature = "channel-whatsapp-cloud")]

@@ -193,6 +193,11 @@ rpc_type! {
     /// `session/state`, `session/delete`.
     pub struct SessionIdParams {
         pub session_id: String,
+        /// Optional storage domain for `session/delete`. A live session
+        /// supplies its canonical domain; an omitted reaped or missing ID
+        /// preserves the legacy idempotent Chat deletion behavior.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub chat_mode: Option<ChatMode>,
     }
 }
 
@@ -1528,6 +1533,10 @@ rpc_type! {
         pub session_id: String,
         pub request_id: String,
         pub acknowledged: bool,
+        /// The bound request rejected this action and was still pending when
+        /// the response was produced. Missing means retryability is unknown.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub retryable: Option<bool>,
     }
 }
 
@@ -1734,6 +1743,10 @@ pub enum SessionUpdateEvent {
         tool_name: String,
         arguments_summary: String,
         timeout_secs: u64,
+        /// Whether the viewer may offer persistent approval. Absent on older
+        /// servers, which used the ordinary approval affordance.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        allow_always: Option<bool>,
     },
     /// Per-LLM-call token usage. `input_tokens` is the cumulative context size
     /// for this turn. `max_context_tokens` is the preemptive-trim budget (the
@@ -2140,6 +2153,62 @@ mod tests {
     }
 
     #[test]
+    fn approval_result_retry_status_is_optional_on_the_wire() {
+        let old = serde_json::json!({"session_id":"s", "request_id":"r", "acknowledged":false});
+        let parsed: SessionApproveResult = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(parsed.retryable, None);
+        assert_eq!(serde_json::to_value(parsed).unwrap(), old);
+        let retry = serde_json::json!({"session_id":"s", "request_id":"r", "acknowledged":false, "retryable":true});
+        let parsed: SessionApproveResult = serde_json::from_value(retry.clone()).unwrap();
+        assert_eq!(parsed.retryable, Some(true));
+        assert_eq!(serde_json::to_value(parsed).unwrap(), retry);
+    }
+
+    #[test]
+    fn session_id_params_keep_optional_deletion_domain_wire_compatibility() {
+        let old: SessionIdParams = serde_json::from_value(json!({ "session_id": "s" })).unwrap();
+        assert_eq!(old.chat_mode, None);
+        assert!(
+            serde_json::to_value(old)
+                .unwrap()
+                .get("chat_mode")
+                .is_none()
+        );
+        let scoped: SessionIdParams =
+            serde_json::from_value(json!({ "session_id": "s", "chat_mode": "acp" })).unwrap();
+        assert_eq!(scoped.chat_mode, Some(ChatMode::Acp));
+        assert_eq!(serde_json::to_value(scoped).unwrap()["chat_mode"], "acp");
+    }
+
+    #[test]
+    fn approval_request_preserves_optional_always_policy() {
+        for (field, expected) in [
+            (None, None),
+            (Some(false), Some(false)),
+            (Some(true), Some(true)),
+        ] {
+            let mut wire = json!({
+                "type": "approval_request", "session_id": "s",
+                "request_id": "r", "tool_name": "session_prompt_set",
+                "arguments_summary": "a task", "timeout_secs": 30,
+            });
+            if let Some(value) = field {
+                wire["allow_always"] = json!(value);
+            }
+            let event: SessionUpdateEvent = serde_json::from_value(wire).unwrap();
+            let SessionUpdateEvent::ApprovalRequest { allow_always, .. } = &event else {
+                panic!("expected approval request");
+            };
+            assert_eq!(*allow_always, expected);
+            let encoded = serde_json::to_value(event).unwrap();
+            assert_eq!(
+                encoded.get("allow_always"),
+                expected.map(serde_json::Value::Bool).as_ref()
+            );
+        }
+    }
+
+    #[test]
     fn session_update_event_uses_snake_case_variants() {
         // Variants stay PascalCase → wire is snake_case, including the
         // multi-word ones that historically drifted when serde flattened
@@ -2160,6 +2229,7 @@ mod tests {
             tool_name: "shell".into(),
             arguments_summary: "ls".into(),
             timeout_secs: 30,
+            allow_always: None,
         };
         let v = serde_json::to_value(evt).unwrap();
         assert_eq!(v["type"], json!("approval_request"));

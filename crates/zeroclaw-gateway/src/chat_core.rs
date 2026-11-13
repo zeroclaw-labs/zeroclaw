@@ -12,7 +12,7 @@
 //! whose decision the core would record under the wrong approver. A failed
 //! turn is reported without its details, which stay in the core's log.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,7 +36,8 @@ use crate::dashboard_core::{
     not_dispatchable_message,
 };
 use crate::dashboard_session::{
-    DashboardAuth, SessionWatch, WS_CLOSE_SESSION_ENDED, session_known_lost, session_lost,
+    DashboardAuth, SessionWatch, WS_CLOSE_GOING_AWAY, WS_CLOSE_SESSION_ENDED, session_known_lost,
+    session_lost,
 };
 use crate::ws::{
     ConnectParams, WS_PROTOCOL, WsQuery, close_for_reconnect, close_with, gateway_stop_signal,
@@ -458,10 +459,17 @@ impl Chat {
                     });
                     return refusal(sender, &error).await;
                 };
-                self.approve(request_id, decision)
-                    .await
-                    .err()
-                    .map(Stop::Close)
+                match self.approve(request_id, decision).await {
+                    Ok(result) if result.acknowledged => None,
+                    Ok(result) => {
+                        refusal(
+                            sender,
+                            &unacknowledged_approval(result.retryable == Some(true)),
+                        )
+                        .await
+                    }
+                    Err(code) => Some(Stop::Close(code)),
+                }
             }
             "message" => {
                 let content = parsed["content"].as_str().unwrap_or("");
@@ -616,7 +624,7 @@ impl Chat {
             relayed_any: false,
             stop: None,
             meter: ContextMeter::default(),
-            approval_receipts: BTreeSet::new(),
+            approval_receipts: BTreeMap::new(),
         };
 
         loop {
@@ -769,14 +777,33 @@ impl Chat {
                                 }
                             } else if let Some((request_id, decision)) = approval_decision(&parsed) {
                                 let shown = turn.approval_receipts.remove(request_id);
-                                if let Err(code) = self.approve(request_id, decision).await {
-                                    // Not sent: refused with the chat's
-                                    // other approvals as it closes.
-                                    if shown {
-                                        turn.approval_receipts.insert(request_id.to_string());
+                                match self.approve(request_id, decision).await {
+                                    Ok(result) if result.acknowledged => {}
+                                    Ok(result) => {
+                                        // Only the core can establish whether the bound
+                                        // request was still pending when it refused an action.
+                                        let retryable = result.retryable == Some(true);
+                                        let shown = shown.filter(|_| retryable);
+                                        if let Some(ref frame) = shown {
+                                            turn.approval_receipts.insert(request_id.to_string(), frame.clone());
+                                        }
+                                        if send(sender, &unacknowledged_approval(retryable)).await.is_err()
+                                            || if let Some(frame) = shown {
+                                                send(sender, &frame).await.is_err()
+                                            } else {
+                                                false
+                                            }
+                                        {
+                                            turn.disconnect().await;
+                                        }
                                     }
-                                    turn.stop = Some(Stop::Close(code));
-                                    turn.disconnect().await;
+                                    Err(code) => {
+                                        if let Some(frame) = shown {
+                                            turn.approval_receipts.insert(request_id.to_string(), frame);
+                                        }
+                                        turn.stop = Some(Stop::Close(code));
+                                        turn.disconnect().await;
+                                    }
                                 }
                             }
                         }
@@ -810,7 +837,11 @@ impl Chat {
     /// when it no longer does; the answer was not sent.
     // `&mut self`: a shared borrow held across the call would need `Chat:
     // Sync`, which the session watch's pending recheck is not.
-    async fn approve(&mut self, request_id: &str, decision: &str) -> Result<(), u16> {
+    async fn approve(
+        &mut self,
+        request_id: &str,
+        decision: &str,
+    ) -> Result<zeroclaw_rpc_proto::types::SessionApproveResult, u16> {
         let session_id = self.core.core_id.clone();
         let answer = json!({
             "session_id": session_id,
@@ -819,33 +850,49 @@ impl Chat {
         });
         let delivered = match self
             .core
-            .send::<Value>(Method::SessionApprove, answer.clone())
+            .send::<zeroclaw_rpc_proto::types::SessionApproveResult>(
+                Method::SessionApprove,
+                answer.clone(),
+            )
             .await
         {
-            Ok(Sent::Answered(_)) => Ok(()),
+            Ok(Sent::Answered(result)) => Ok(result),
             Ok(Sent::Renewed) => {
                 crate::dashboard_session::session_admits_now(&mut self.watch, &self.state).await?;
                 self.core
-                    .resend::<Value>(Method::SessionApprove, answer)
+                    .resend::<zeroclaw_rpc_proto::types::SessionApproveResult>(
+                        Method::SessionApprove,
+                        answer,
+                    )
                     .await
-                    .map(drop)
             }
             Err(failure) => Err(failure),
         };
-        if let Err(failure) = delivered {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(json!({
-                        "session_id": session_id,
-                        "request_id": request_id,
-                        "error": format!("{failure:?}"),
-                    })),
-                "dashboard chat approval was not delivered to the core"
-            );
+        match delivered {
+            Ok(result) => {
+                if !result.acknowledged {
+                    // The request may have waited while access was revoked.
+                    // Do not redisplay its preview without rechecking access.
+                    crate::dashboard_session::session_admits_now(&mut self.watch, &self.state)
+                        .await?;
+                }
+                Ok(result)
+            }
+            Err(failure) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(json!({
+                            "session_id": session_id,
+                            "request_id": request_id,
+                            "error": format!("{failure:?}"),
+                        })),
+                    "dashboard chat approval was not delivered to the core"
+                );
+                Err(WS_CLOSE_GOING_AWAY)
+            }
         }
-        Ok(())
     }
 }
 
@@ -866,8 +913,9 @@ struct TurnRelay {
     /// How the socket ends once the turn has.
     stop: Option<Stop>,
     meter: ContextMeter,
-    /// Approval requests shown on this socket and not yet answered.
-    approval_receipts: BTreeSet<String>,
+    /// Previews shown on this socket and not yet acknowledged by the core.
+    /// These transient display copies are never an authorization authority.
+    approval_receipts: BTreeMap<String, Value>,
 }
 
 impl TurnRelay {
@@ -883,7 +931,7 @@ impl TurnRelay {
     /// they are refused rather than left to time out.
     async fn disconnect(&mut self) {
         self.client_gone = true;
-        for request_id in std::mem::take(&mut self.approval_receipts) {
+        for (request_id, _) in std::mem::take(&mut self.approval_receipts) {
             refuse_unanswered(&self.client, &self.session_id, &request_id).await;
         }
     }
@@ -931,6 +979,7 @@ impl TurnRelay {
                 tool_name,
                 arguments_summary,
                 timeout_secs,
+                allow_always,
                 ..
             } => {
                 if self.client_gone {
@@ -943,8 +992,9 @@ impl TurnRelay {
                     "tool": tool_name,
                     "arguments_summary": arguments_summary,
                     "timeout_secs": timeout_secs,
+                    "allow_always": allow_always.unwrap_or(true),
                 });
-                self.approval_receipts.insert(request_id);
+                self.approval_receipts.insert(request_id, frame.clone());
                 if send(sender, &frame).await.is_err() {
                     self.disconnect().await;
                 }
@@ -1126,6 +1176,14 @@ fn sop_approval_refusal() -> Value {
         "type": "error",
         "message": "SOP approvals can't be recorded from this chat yet; approve the run from an operator session",
         "code": "CAPABILITY_MISSING",
+    })
+}
+
+fn unacknowledged_approval(retryable: bool) -> Value {
+    json!({
+        "type": "error",
+        "message": if retryable { "The approval action was not accepted; choose an available action" } else { "The approval request could not be confirmed; the turn may need to be retried" },
+        "code": "APPROVAL_ACTION_UNAVAILABLE",
     })
 }
 

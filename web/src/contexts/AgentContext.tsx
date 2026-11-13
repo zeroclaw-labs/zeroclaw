@@ -786,6 +786,9 @@ export function AgentProvider({
           toolName: msg.tool ?? 'unknown',
           argumentsSummary: msg.arguments_summary ?? '',
           timeoutSecs: msg.timeout_secs ?? 120,
+          // Older daemons did not send the policy marker; preserve the
+          // ordinary approval affordance for those compatibility frames.
+          allowAlways: msg.allow_always ?? true,
           receivedAt: Date.now(),
         });
         break;
@@ -809,6 +812,8 @@ export function AgentProvider({
         if (perSocket && msg.code === 'CONVERSATION_LIMIT') break;
         const friendlyMessage = msg.code === 'TURN_RESULT_LOST'
           ? t('agent.turn_result_lost')
+          : msg.code === 'APPROVAL_ACTION_UNAVAILABLE'
+            ? t('agent.approval_action_unavailable')
           : friendlyAgentError(msg.message);
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => [

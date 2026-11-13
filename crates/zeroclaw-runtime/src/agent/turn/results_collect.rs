@@ -26,6 +26,8 @@ pub(crate) struct ToolRoundResult {
     pub(crate) tool_call_id: Option<String>,
     pub(crate) output: String,
     pub(crate) attachments: Vec<RenderedMarker>,
+    /// Privacy provenance bound to the executed identity, including hook rewrites.
+    pub(crate) sensitive_session_prompt: bool,
 }
 
 /// One round's collected tool results.
@@ -180,6 +182,8 @@ pub(crate) fn collect_tool_results(
             tool_call_id,
             output: result_output.clone(),
             attachments,
+            sensitive_session_prompt:
+                crate::agent::tool_execution::is_sensitive_session_prompt_tool(&tool_name),
         });
         let _ = writeln!(
             tool_results,

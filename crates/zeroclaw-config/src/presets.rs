@@ -80,6 +80,7 @@ fn locked_down_risk() -> RiskProfileConfig {
         shell_env_passthrough: vec![],
         auto_approve: vec![],
         always_ask: vec![],
+        session_prompt_approval: None,
         allowed_roots: vec![],
         delegation_policy: DelegationPolicy::default(),
         approval_route: None,
@@ -104,6 +105,7 @@ fn balanced_risk() -> RiskProfileConfig {
         shell_env_passthrough: vec![],
         auto_approve: vec![],
         always_ask: vec![],
+        session_prompt_approval: None,
         allowed_roots: vec![],
         delegation_policy: DelegationPolicy {
             mode: DelegationMode::Allow,
@@ -130,6 +132,7 @@ fn yolo_risk() -> RiskProfileConfig {
         shell_env_passthrough: vec![],
         auto_approve: vec!["*".to_string()],
         always_ask: vec![],
+        session_prompt_approval: None,
         allowed_roots: vec![],
         delegation_policy: DelegationPolicy {
             mode: DelegationMode::Allow,

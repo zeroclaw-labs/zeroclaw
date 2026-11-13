@@ -13,6 +13,7 @@ use super::stream_consume::{
     StreamProviderFailure, consume_provider_streaming_response_with_policy,
 };
 use crate::agent::cost::check_tool_loop_budget;
+use crate::agent::prompt::redact_session_prompt_tool_exchanges_for_export;
 use crate::cost::types::{BudgetCheck, UsagePeriod};
 use crate::observability::ObserverEvent;
 use crate::tools::ToolSpec;
@@ -158,12 +159,11 @@ pub(crate) async fn announce_llm_request(
             && policy.captures_payload()
             && let ::serde_json::Value::Object(map) = &mut attrs
         {
-            let rendered: Vec<::serde_json::Value> = request_messages
-                .iter()
-                .map(|m| {
-                    ::serde_json::json!({"role": m.role.as_str(), "content": m.content.as_str()})
-                })
-                .collect();
+            let rendered: Vec<::serde_json::Value> =
+                redact_session_prompt_tool_exchanges_for_export(request_messages)
+                    .iter()
+                    .map(|m| ::serde_json::json!({"role": m.role.as_str(), "content": m.content}))
+                    .collect();
             let serialized = ::serde_json::to_string(&rendered).unwrap_or_default();
             let scrubbed = scrub_credentials(&serialized);
             if let Some(capture) =
@@ -195,7 +195,8 @@ pub(crate) async fn announce_llm_request(
 
     // Fire void hook before LLM call
     if let Some(hooks) = ctx.hooks {
-        hooks.fire_llm_input(request_messages, active_model).await;
+        let export_messages = redact_session_prompt_tool_exchanges_for_export(request_messages);
+        hooks.fire_llm_input(&export_messages, active_model).await;
     }
 
     llm_started_at
@@ -760,6 +761,7 @@ mod payload_capture_tests {
             },
             temperature: None,
             approval: None,
+            session_prompt_approval_required: true,
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
@@ -859,6 +861,8 @@ mod payload_capture_tests {
     // redacts the value, preserving only its first 4 chars. The unique secret
     // tail below must NOT survive into the captured payload.
     const SECRET_TAIL: &str = "ABCDEF1234567890SECRET";
+    const SESSION_PROMPT_MARKER: &str = "session-prompt-private-marker";
+    const PAYLOAD_CAPTURE_TRACE_ID: &str = "trace-payload-capture-test";
 
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
@@ -876,7 +880,9 @@ mod payload_capture_tests {
         let pacing = PacingConfig::default();
         let provider = StubProvider;
         let history = vec![
-            ChatMessage::system("You are a helpful assistant."),
+            ChatMessage::system(format!(
+                "You are a helpful assistant.\n\n## Session Prompts\n- id: \"task\"; content: \"{SESSION_PROMPT_MARKER}\"\n"
+            )),
             ChatMessage::user(format!("deploy with api_key: sk-{SECRET_TAIL} please")),
         ];
 
@@ -884,8 +890,10 @@ mod payload_capture_tests {
         install_writer("redacted");
         while rx.try_recv().is_ok() {}
 
-        let mut ctx = test_ctx(&observer, &pacing);
-        ctx.turn_id = "trace-payload-capture-test";
+        let ctx = TurnCtx {
+            turn_id: PAYLOAD_CAPTURE_TRACE_ID,
+            ..test_ctx(&observer, &pacing)
+        };
         let _ =
             announce_llm_request(&ctx, &history, None, &provider, "stub", "stub-model", 0).await;
         let on_record = next_llm_request(&mut rx, ctx.turn_id).await;
@@ -900,6 +908,10 @@ mod payload_capture_tests {
         assert!(
             !request_messages.contains(SECRET_TAIL),
             "captured payload must not contain the raw secret; got: {request_messages}"
+        );
+        assert!(
+            !request_messages.contains(SESSION_PROMPT_MARKER),
+            "captured payload must not contain session-prompt content; got: {request_messages}"
         );
         assert_eq!(
             attrs
@@ -925,8 +937,10 @@ mod payload_capture_tests {
         install_writer("off");
         while rx.try_recv().is_ok() {}
 
-        let mut ctx = test_ctx(&observer, &pacing);
-        ctx.turn_id = "trace-payload-capture-test";
+        let ctx = TurnCtx {
+            turn_id: PAYLOAD_CAPTURE_TRACE_ID,
+            ..test_ctx(&observer, &pacing)
+        };
         let _ =
             announce_llm_request(&ctx, &history, None, &provider, "stub", "stub-model", 0).await;
         let off_record = next_llm_request(&mut rx, ctx.turn_id).await;
@@ -948,6 +962,67 @@ mod payload_capture_tests {
         );
 
         zeroclaw_log::clear_broadcast_hook();
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn llm_request_payload_masks_replayed_private_tool_results() {
+        use crate::agent::dispatcher::{NativeToolDispatcher, ToolDispatcher};
+        use crate::agent::prompt::SESSION_PROMPT_HISTORY_RESULT_KEY;
+
+        // Match the capture tests' lock order across the awaited broadcast.
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        struct ResetCapture;
+        impl Drop for ResetCapture {
+            fn drop(&mut self) {
+                install_writer("off");
+                zeroclaw_log::clear_broadcast_hook();
+            }
+        }
+        let _reset = ResetCapture;
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        let cfg = LogConfig {
+            log_llm_request_payload: "redacted".into(),
+            log_tool_io_truncate_bytes: 65_536,
+            log_persistence: "none".into(),
+            ..LogConfig::default()
+        };
+        zeroclaw_log::init_from_config(&cfg, std::path::Path::new("/"));
+        let private_body = "synthetic-private-replayed-log-result";
+        let flat =
+            vec![
+            ChatMessage::user("public-replay-log-control"),
+            ChatMessage::assistant(serde_json::json!({
+                "tool_calls": [{"id": "rewritten", "name": "ordinary_tool", "arguments": "{}"}],
+            }).to_string()),
+            ChatMessage::tool(serde_json::json!({
+                "tool_call_id": "rewritten", "content": private_body,
+                "attachments": [], SESSION_PROMPT_HISTORY_RESULT_KEY: true,
+            }).to_string()),
+        ];
+        let replayed = crate::agent::Agent::replay_loop_messages_for_retention(&flat);
+        let request = NativeToolDispatcher.to_provider_messages(&replayed);
+        assert!(request.iter().any(|msg| msg.content.contains(private_body)));
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let ctx = TurnCtx {
+            turn_id: "trace-replayed-private-result",
+            ..test_ctx(&observer, &pacing)
+        };
+        let _ = announce_llm_request(&ctx, &request, None, &StubProvider, "stub", "stub-model", 0)
+            .await;
+        let record = next_llm_request(&mut rx, ctx.turn_id).await;
+        let payload = record["attributes"]["request_messages"].as_str().unwrap();
+        assert!(payload.contains("public-replay-log-control"));
+        assert!(payload.contains("Session-prompt tool exchange omitted"));
+        assert!(!payload.contains(private_body));
+        assert!(
+            record["attributes"]
+                .get("request_messages_truncated")
+                .is_none()
+        );
     }
 
     fn test_tool_spec(name: &str) -> ToolSpec {
@@ -1131,8 +1206,10 @@ mod payload_capture_tests {
         let tools = vec![test_tool_spec("alpha"), test_tool_spec("beta")];
         let expected = prefix_fingerprint(&history, Some(&tools));
 
-        let mut ctx = test_ctx(&observer, &pacing);
-        ctx.turn_id = "trace-prefix-fingerprint-test";
+        let ctx = TurnCtx {
+            turn_id: "trace-prefix-fingerprint-test",
+            ..test_ctx(&observer, &pacing)
+        };
         let _ = announce_llm_request(
             &ctx,
             &history,
@@ -1239,6 +1316,7 @@ mod streaming_fallback_tests {
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
             temperature: Some(0.0),
             approval: None,
+            session_prompt_approval_required: true,
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
@@ -1924,6 +2002,7 @@ mod streaming_fallback_tests {
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
             temperature: Some(0.0),
             approval: None,
+            session_prompt_approval_required: true,
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: Some(&token),
@@ -2040,6 +2119,7 @@ mod streaming_fallback_tests {
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
             temperature: Some(0.0),
             approval: None,
+            session_prompt_approval_required: true,
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
@@ -2103,6 +2183,7 @@ mod streaming_fallback_tests {
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
             temperature: Some(0.0),
             approval: None,
+            session_prompt_approval_required: true,
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
@@ -2247,6 +2328,7 @@ mod streaming_fallback_tests {
                 context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
                 temperature: Some(0.0),
                 approval: None,
+                session_prompt_approval_required: true,
                 channel_name: "test",
                 channel_reply_target: None,
                 cancellation_token: None,
@@ -2467,6 +2549,7 @@ mod streaming_fallback_tests {
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
             temperature: Some(0.0),
             approval: None,
+            session_prompt_approval_required: true,
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
@@ -2580,6 +2663,7 @@ mod streaming_fallback_tests {
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
             temperature: Some(0.0),
             approval: None,
+            session_prompt_approval_required: true,
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
@@ -2659,6 +2743,7 @@ mod streaming_fallback_tests {
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
             temperature: Some(0.0),
             approval: None,
+            session_prompt_approval_required: true,
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: Some(&cancellation),
@@ -2739,6 +2824,7 @@ mod streaming_fallback_tests {
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
             temperature: Some(0.0),
             approval: None,
+            session_prompt_approval_required: true,
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
@@ -3539,6 +3625,7 @@ mod streaming_fallback_tests {
             dedup_exempt_tools: &[],
             pacing: &pacing,
             strict_tool_parsing: false,
+            session_prompt_approval_required: true,
             channel: None,
             draft_reasoning: StreamReasoningMode::Status,
             turn_id: "test-turn",
@@ -3653,6 +3740,7 @@ mod streaming_fallback_tests {
             dedup_exempt_tools: &[],
             pacing: &pacing,
             strict_tool_parsing: false,
+            session_prompt_approval_required: true,
             channel: None,
             draft_reasoning: StreamReasoningMode::Status,
             turn_id: "test-turn",
@@ -3920,6 +4008,7 @@ mod streaming_fallback_tests {
             dedup_exempt_tools: &[],
             pacing: &pacing,
             strict_tool_parsing: false,
+            session_prompt_approval_required: true,
             channel: None,
             draft_reasoning: StreamReasoningMode::Status,
             turn_id: "test-turn",
@@ -4005,6 +4094,7 @@ mod streaming_fallback_tests {
             dedup_exempt_tools: &[],
             pacing: &pacing,
             strict_tool_parsing: false,
+            session_prompt_approval_required: true,
             channel: None,
             draft_reasoning: StreamReasoningMode::Status,
             turn_id: "test-turn",

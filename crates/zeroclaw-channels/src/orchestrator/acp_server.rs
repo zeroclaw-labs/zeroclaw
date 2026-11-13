@@ -6456,6 +6456,7 @@ mod tests {
             tool_call_id: "tc-replay".into(),
             content: " M acp_server.rs".into(),
             tool_name: "shell".into(),
+            session_prompt_tool_result: false,
         }]);
         let result_notes = history_notifications_for_message("sid", &result, &mut titles);
         assert_eq!(
@@ -7565,6 +7566,7 @@ mod tests {
                 reasoning_content: None,
             },
             ConversationMessage::ToolResults(vec![ToolResultMessage {
+                session_prompt_tool_result: false,
                 tool_call_id: "toolu_read_1".to_string(),
                 content: "port = 8080".to_string(),
                 tool_name: "read_file".to_string(),
@@ -7653,6 +7655,7 @@ mod tests {
                 reasoning_content: None,
             }),
             seed_row(ConversationMessage::ToolResults(vec![ToolResultMessage {
+                session_prompt_tool_result: false,
                 tool_call_id: "toolu_ok".to_string(),
                 content: "done".to_string(),
                 tool_name: "shell".to_string(),
@@ -7670,6 +7673,7 @@ mod tests {
         })];
         partial.push(seed_row(ConversationMessage::ToolResults(vec![
             ToolResultMessage {
+                session_prompt_tool_result: false,
                 tool_call_id: "toolu_ok".to_string(),
                 content: "done".to_string(),
                 tool_name: "shell".to_string(),

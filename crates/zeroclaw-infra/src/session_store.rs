@@ -653,6 +653,27 @@ impl SessionBackend for SessionStore {
         self.delete_session_unlocked(session_key)
     }
 
+    fn delete_session_key_set_authorized(
+        &self,
+        session_keys: &[&str],
+        expected_owner: Option<&str>,
+        authorize: &crate::session_backend::SessionEffectAuthorization<'_>,
+    ) -> std::io::Result<bool> {
+        let _guard = self.mutation_guard()?;
+        let _authority = authorize(None)?;
+        if expected_owner.is_some() {
+            return Ok(false);
+        }
+        // JSONL has no prompt attachments or transactional alias storage.
+        // Preserve its sequential cleanup, but keep current authority and the
+        // migration fence for the entire operation rather than per file.
+        let mut deleted = false;
+        for session_key in session_keys {
+            deleted |= self.delete_session_unlocked(session_key)?;
+        }
+        Ok(deleted)
+    }
+
     fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
         self.delete_session(session_key)
     }
@@ -666,6 +687,116 @@ impl SessionBackend for SessionStore {
 
 #[cfg(test)]
 mod tests {
+    // JSONL keeps its existing sequential cleanup when prompts are disabled;
+    // the new RPC guard must not make these ordinary sessions undeletable.
+    #[test]
+    fn guarded_alias_delete_preserves_jsonl_cleanup_and_holds_one_lease() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+        let keys = ["chat", "rpc_chat", "gw_chat"];
+        for key in keys {
+            store.append(key, &ChatMessage::user("saved")).unwrap();
+            store.set_trim_breadcrumb(key, true).unwrap();
+        }
+        struct Lease(Vec<PathBuf>);
+        impl Drop for Lease {
+            fn drop(&mut self) {
+                assert!(self.0.iter().all(|path| !path.exists()));
+            }
+        }
+        let calls = std::cell::Cell::new(0);
+        assert!(
+            backend
+                .delete_session_key_set_authorized(&keys, None, &|owner| {
+                    assert_eq!(owner, None);
+                    calls.set(calls.get() + 1);
+                    Ok(Box::new(Lease(
+                        keys.iter()
+                            .flat_map(|key| {
+                                [store.session_path(key), store.trim_breadcrumb_path(key)]
+                            })
+                            .collect(),
+                    )))
+                })
+                .unwrap()
+        );
+        assert_eq!(calls.get(), 1);
+        assert!(
+            keys.iter()
+                .all(|key| store.try_load(key).unwrap().is_empty())
+        );
+    }
+
+    #[test]
+    fn guarded_alias_delete_refusal_preserves_every_jsonl_alias() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+        let keys = ["chat", "rpc_chat", "gw_chat"];
+        for key in keys {
+            store.append(key, &ChatMessage::user("saved")).unwrap();
+        }
+        let error = backend
+            .delete_session_key_set_authorized(&keys, None, &|_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "revoked",
+                ))
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            !backend
+                .delete_session_key_set_authorized(&keys, Some("user:owner"), &|_| Ok(Box::new(())))
+                .unwrap()
+        );
+        assert!(
+            keys.iter()
+                .all(|key| store.try_load(key).unwrap().len() == 1)
+        );
+    }
+
+    #[test]
+    fn guarded_alias_delete_rechecks_authority_after_jsonl_storage_wait() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        store.append("chat", &ChatMessage::user("saved")).unwrap();
+        let allowed = Arc::new(AtomicBool::new(true));
+        let held = store.mutation_guard().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (resolved_tx, resolved_rx) = mpsc::channel();
+        let worker_store = Arc::clone(&store);
+        let worker_allowed = Arc::clone(&allowed);
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let backend: &dyn SessionBackend = worker_store.as_ref();
+            backend.delete_session_key_set_authorized(&["chat"], None, &|_| {
+                resolved_tx.send(()).unwrap();
+                if worker_allowed.load(Ordering::SeqCst) {
+                    Ok(Box::new(()))
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "revoked",
+                    ))
+                }
+            })
+        });
+        started_rx.recv().unwrap();
+        let early = resolved_rx.recv_timeout(Duration::from_millis(100));
+        allowed.store(false, Ordering::SeqCst);
+        drop(held);
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(
+            early.is_err(),
+            "authority must resolve after the storage lock"
+        );
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(store.try_load("chat").unwrap().len(), 1);
+    }
+
     #[test]
     fn guarded_jsonl_append_requires_existing_authorized_session() {
         let tmp = tempfile::TempDir::new().unwrap();
