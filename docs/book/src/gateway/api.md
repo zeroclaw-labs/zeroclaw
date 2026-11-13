@@ -123,7 +123,9 @@ safely attributed reject the write. A pre-existing unrelated error may be
 retained only when validation can safely continue past it without skipping a
 related check; otherwise the write is rejected. Retained diagnostics use the
 `pre_existing_validation_error` warning code in responses that carry warnings.
-Secret and initialization responses keep their documented response shapes.
+Secret and initialization responses keep their documented shapes and do not
+include warnings. A pre-existing error retained during one of those writes is
+saved unchanged and reported only in the gateway log.
 
 For lists addressed by a natural key, indexed validation diagnostics are matched
 to the edited entry when its identity can be resolved. An ambiguous or unknown

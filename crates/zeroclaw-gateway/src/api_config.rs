@@ -5746,6 +5746,7 @@ mod tests {
         )
         .unwrap();
         assert!(reloaded.transcription.openai.is_some());
+        assert!(reloaded.gateway.host.is_empty());
     }
 
     #[tokio::test]
