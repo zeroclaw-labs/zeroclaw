@@ -46,6 +46,13 @@ const VOICE_DROP_NOTICE_TIMEOUT: Duration = Duration::from_secs(10);
 /// (including its error-body read). A stalled Telegram must not pin the turn.
 const REACTION_CLEAR_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Ceiling on one replied-to attachment prep download (`getFile` plus the
+/// CDN fetch). The prep runs inline while the update queue is being
+/// processed, and the HTTP client sets no request timeout — unbounded, a
+/// stalled Telegram answer would head-of-line block every later message.
+/// The prep is best-effort, so on timeout the file is simply not cached.
+const REPLY_PREP_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
+
 static ORPHAN_THINK_TAG_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(r"</?(?:redacted_)?think(?:ing)?>").expect("ORPHAN_THINK_TAG_RE must compile")
 });
@@ -6113,12 +6120,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let Some(doc) = reply.get("document") else {
             return;
         };
-        let (username, sender_id, _) = Self::extract_sender_info(message);
-        let mut identities = vec![username.as_str()];
-        if let Some(id) = sender_id.as_deref() {
-            identities.push(id);
-        }
-        if !self.is_any_user_allowed(identities.iter().copied()) {
+        // Same allowlist source as the message parsers: never the
+        // `"unknown"` display placeholder, only genuine identities.
+        if !self.is_any_user_allowed(
+            Self::authorization_identities(message)
+                .iter()
+                .map(String::as_str),
+        ) {
             return;
         }
 
@@ -6144,7 +6152,37 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             None => return,
         };
         let save_dir = workspace.join("telegram_files");
-        if tokio::fs::create_dir_all(&save_dir).await.is_err() {
+        if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "error_key": "telegram.reply_prep.save_dir_failed",
+                        "error": zeroclaw_runtime::security::scrub(&format!("{}", e)),
+                    })),
+                "Failed to create telegram_files directory for replied-to attachment"
+            );
+            return;
+        }
+
+        // Declared size comes from the update JSON before any download —
+        // the same ceiling the ordinary attachment path applies.
+        let declared_size = reply
+            .get("document")
+            .and_then(|doc| doc.get("file_size"))
+            .and_then(serde_json::Value::as_u64);
+        if let Some(size) = declared_size
+            && size > TELEGRAM_MAX_FILE_DOWNLOAD_BYTES
+        {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                &format!(
+                    "Skipping replied-to attachment: file size {size} bytes exceeds {} MB limit",
+                    TELEGRAM_MAX_FILE_DOWNLOAD_BYTES / (1024 * 1024)
+                )
+            );
             return;
         }
 
@@ -6159,16 +6197,102 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .unwrap_or_else(|| "file".to_string());
         let local_filename = format!("doc_{chat_id}_{reply_mid}_{file_name}");
 
-        let tg_file_path = match self.get_file_path(&file_id).await {
-            Ok(p) => p,
-            Err(_) => return,
+        let tg_file_path =
+            match tokio::time::timeout(REPLY_PREP_DOWNLOAD_TIMEOUT, self.get_file_path(&file_id))
+                .await
+            {
+                Ok(Ok(p)) => p,
+                Ok(Err(e)) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "error_key": "telegram.reply_prep.file_lookup_failed",
+                                "error": zeroclaw_runtime::security::scrub(&format!("{}", e)),
+                                "classification": format!("{:?}", e.kind),
+                            })),
+                        "Failed to get replied-to attachment file path"
+                    );
+                    return;
+                }
+                Err(_) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "error_key": "telegram.reply_prep.file_lookup_timeout",
+                                "timeout_secs": REPLY_PREP_DOWNLOAD_TIMEOUT.as_secs(),
+                            })),
+                        "Timed out getting replied-to attachment file path"
+                    );
+                    return;
+                }
+            };
+        let data = match tokio::time::timeout(
+            REPLY_PREP_DOWNLOAD_TIMEOUT,
+            self.download_file(&tg_file_path),
+        )
+        .await
+        {
+            Ok(Ok(d)) => d,
+            Ok(Err(e)) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "error_key": "telegram.reply_prep.download_failed",
+                            "error": zeroclaw_runtime::security::scrub(&format!("{}", e)),
+                        })),
+                    "Failed to download replied-to attachment"
+                );
+                return;
+            }
+            Err(_) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "error_key": "telegram.reply_prep.download_timeout",
+                            "timeout_secs": REPLY_PREP_DOWNLOAD_TIMEOUT.as_secs(),
+                        })),
+                    "Timed out downloading replied-to attachment"
+                );
+                return;
+            }
         };
-        let data = match self.download_file(&tg_file_path).await {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        // The declared size is absent for some media; enforce the ceiling on
+        // the actual payload as well.
+        if data.len() as u64 > TELEGRAM_MAX_FILE_DOWNLOAD_BYTES {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                &format!(
+                    "Skipping replied-to attachment: downloaded {} bytes exceeds {} MB limit",
+                    data.len(),
+                    TELEGRAM_MAX_FILE_DOWNLOAD_BYTES / (1024 * 1024)
+                )
+            );
+            return;
+        }
         let local_path = save_dir.join(&local_filename);
-        if tokio::fs::write(&local_path, &data).await.is_err() {
+        if let Err(e) = tokio::fs::write(&local_path, &data).await {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "error_key": "telegram.reply_prep.save_failed",
+                        "error": zeroclaw_runtime::security::scrub(&format!("{}", e)),
+                    })),
+                &format!(
+                    "Failed to save replied-to attachment to {}",
+                    local_path.display()
+                )
+            );
             return;
         }
         let mut cache = self.reply_file_paths.lock();
@@ -7778,6 +7902,14 @@ impl TelegramChannel {
         tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
         batch: MediaGroupBatch,
     ) -> MediaGroupDispatchOutcome {
+        // Cache replied-to attachments of album members before parsing, so
+        // the anchor's reply context can reference them exactly like an
+        // ordinary update does in `process_update`. Best-effort and
+        // idempotent: members without a reply return immediately, and an
+        // already-cached file is not re-downloaded.
+        for update in &batch.updates {
+            self.prepopulate_reply_attachment_context(update).await;
+        }
         let disposition = self
             .try_parse_media_group_with_unsupported(&batch.updates, &batch.unsupported)
             .await;
