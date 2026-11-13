@@ -3799,6 +3799,84 @@ enroll_url = \"https://gateway.example/zeroclaw\"
     }
 
     #[test]
+    fn concurrent_theme_and_locale_persists_keep_both_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config_path(dir.path()),
+            "[theme]\nname = \"default\"\n\n[future]\nkeep = true\n",
+        )
+        .unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let theme_dir = dir.path().to_path_buf();
+        let locale_dir = dir.path().to_path_buf();
+        let theme_barrier = barrier.clone();
+        let locale_barrier = barrier;
+        let theme = std::thread::spawn(move || {
+            theme_barrier.wait();
+            for i in 0..20 {
+                let name = if i == 19 {
+                    "nord".to_string()
+                } else {
+                    format!("nord-{i}")
+                };
+                persist_theme(&theme_dir, &name).expect("concurrent theme save");
+            }
+        });
+        let locale = std::thread::spawn(move || {
+            locale_barrier.wait();
+            for i in 0..20 {
+                let value = if i == 19 { "fr" } else { "en" };
+                persist_locale(&locale_dir, value).expect("concurrent locale save");
+            }
+        });
+        theme.join().expect("theme persist thread");
+        locale.join().expect("locale persist thread");
+        let doc: toml::Table =
+            toml::from_str(&std::fs::read_to_string(config_path(dir.path())).unwrap()).unwrap();
+        assert_eq!(doc["theme"]["name"].as_str(), Some("nord"));
+        assert_eq!(doc["locale"].as_str(), Some("fr"));
+        assert_eq!(doc["future"]["keep"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn concurrent_theme_and_sidebar_persists_keep_both_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config_path(dir.path()),
+            "[theme]\nname = \"default\"\n\n[sidebar]\nvisible = true\n",
+        )
+        .unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let theme_dir = dir.path().to_path_buf();
+        let sidebar_dir = dir.path().to_path_buf();
+        let theme_barrier = barrier.clone();
+        let sidebar_barrier = barrier;
+        let theme = std::thread::spawn(move || {
+            theme_barrier.wait();
+            for i in 0..20 {
+                let name = if i == 19 {
+                    "nord".to_string()
+                } else {
+                    format!("nord-{i}")
+                };
+                persist_theme(&theme_dir, &name).expect("concurrent theme save");
+            }
+        });
+        let sidebar = std::thread::spawn(move || {
+            sidebar_barrier.wait();
+            for i in 0..20 {
+                persist_sidebar_visible(&sidebar_dir, i != 19).expect("concurrent sidebar save");
+            }
+        });
+        theme.join().expect("theme persist thread");
+        sidebar.join().expect("sidebar persist thread");
+        let doc: toml::Table =
+            toml::from_str(&std::fs::read_to_string(config_path(dir.path())).unwrap()).unwrap();
+        assert_eq!(doc["theme"]["name"].as_str(), Some("nord"));
+        assert_eq!(doc["sidebar"]["visible"].as_bool(), Some(false));
+    }
+
+    #[test]
     fn a_config_lock_that_is_never_released_fails_with_an_actionable_error() {
         let dir = tempfile::tempdir().unwrap();
         let _held = ConfigWriteLock::acquire(dir.path()).unwrap();
