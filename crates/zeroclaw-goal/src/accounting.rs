@@ -237,8 +237,8 @@ pub struct GoalUsagePrice {
     pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
-/// A single admitted Goal-owned model operation can settle only after all
-/// physical attempts in the ordinary provider path have reported.
+/// A single admitted Goal-owned model operation settles after its physical
+/// attempts have reported or been classified as outcome-unknown.
 #[async_trait]
 pub trait GoalOperationAccounting: Send + Sync {
     /// Admit work only with complete durable accounting. Incomplete accounting
@@ -251,6 +251,10 @@ pub trait GoalOperationAccounting: Send + Sync {
     /// is durable, known usage is recorded, and admission is closed. Any other
     /// error means settlement may not be durable and a pending marker may remain.
     async fn settle(&self, settlement: GoalOperationSettlement) -> anyhow::Result<()>;
+    /// Release an admitted operation only when its provider-dispatch future
+    /// has never been polled. No physical attempt or usage can exist in that
+    /// case. A failed release must leave durable pending evidence intact.
+    async fn release_unstarted(&self) -> anyhow::Result<()>;
     async fn pricing_complete(&self) -> anyhow::Result<bool>;
 }
 

@@ -77,6 +77,7 @@ impl LiveConfigAuthority {
     /// Create an authority that exclusively owns this config across processes.
     pub fn new_owned(config: Config) -> Result<Self> {
         let ownership = ConfigOwnershipGuard::acquire(&config.data_dir)?;
+        ownership.recover_abandoned_turns_or_log();
         Ok(Self::new_with_ownership(config, ownership))
     }
 
@@ -387,8 +388,9 @@ impl AgentExecutionSelection {
 
 impl AgentExecutionCapability {
     pub fn capture_selection(&self) -> AgentExecutionSelection {
-        // Never nest the lifecycle mutex and config lock. A mutation between
-        // these reads changes the generation and is rejected at admission.
+        // Release the lifecycle mutex before acquiring config here. SOP RPC
+        // effects may already hold a config read guard; lifecycle operations
+        // never acquire config while retaining this mutex.
         let (generations, closing) = {
             let state = self.agent_lifecycle.state.lock();
             let generations: HashMap<_, _> = state
@@ -409,7 +411,9 @@ impl AgentExecutionCapability {
         };
         let generations = self
             .config
-            .read()
+            // A queued writer must not block this nested read behind the
+            // outer SOP effect guard that the writer itself is waiting on.
+            .read_recursive()
             .agents
             .keys()
             .map(|alias| {
@@ -540,6 +544,8 @@ impl AgentExecutionAdmission {
 #[derive(Debug)]
 pub struct ConfigOwnershipGuard {
     _file: File,
+    /// The data directory this guard locked.
+    data_dir: PathBuf,
 }
 
 /// The data-directory entry that holds the config lifecycle lock.
@@ -715,9 +721,33 @@ fn lock_dir_creation_error(
     ))
 }
 
+/// Render `path` for a pasted shell remedy.
+///
+/// Relative paths whose first component starts with `-` would be read as
+/// options by `rm`, and by GNU `chmod`/`chown`. BSD `chmod`/`chown` also reject
+/// a `--` separator, so prefix those paths with `./` instead. Absolute paths
+/// and every other relative form are left alone.
+#[cfg(unix)]
+fn remedy_shell_path(path: &Path) -> std::path::PathBuf {
+    use std::path::Component;
+
+    let mut components = path.components();
+    match components.next() {
+        Some(Component::Normal(first)) if first.to_string_lossy().starts_with('-') => {
+            let mut out = std::path::PathBuf::from(".");
+            out.push(path);
+            out
+        }
+        _ => path.to_path_buf(),
+    }
+}
+
 #[cfg(unix)]
 fn remedy_command(command: &str, path: &Path) -> String {
-    format!("{command} {}", crate::util::shell_escape(path.as_os_str()))
+    format!(
+        "{command} {}",
+        crate::util::shell_escape(remedy_shell_path(path).as_os_str())
+    )
 }
 
 /// The account name for `uid`, when the user database has one.
@@ -849,13 +879,42 @@ impl ConfigOwnershipGuard {
                         )));
                     }
                 }
-                Ok(Self { _file: file })
+                Ok(Self {
+                    _file: file,
+                    data_dir: data_dir.to_path_buf(),
+                })
             }
             Err(TryLockError::WouldBlock) => Err(ConfigOwnershipError::AlreadyOwned { path }),
             Err(TryLockError::Error(error)) => Err(ConfigOwnershipError::Unavailable(
                 anyhow::Error::new(error)
                     .context(format!("locking config lifecycle at {}", path.display())),
             )),
+        }
+    }
+}
+
+impl ConfigOwnershipGuard {
+    /// Settle the session turns a previous process left marked "running" in
+    /// the data directory this guard locked. Holding the guard is what makes
+    /// that safe; see [`zeroclaw_infra::recover_abandoned_session_turns`],
+    /// which does the work and acts once per process. Call it before the
+    /// process admits a turn of its own.
+    pub fn recover_abandoned_turns(&self) -> std::io::Result<usize> {
+        zeroclaw_infra::recover_abandoned_session_turns(&self.data_dir)
+    }
+
+    /// [`Self::recover_abandoned_turns`] for a startup path: a store that
+    /// cannot be settled is no reason to refuse to start, so the failure is
+    /// logged and startup goes on.
+    pub fn recover_abandoned_turns_or_log(&self) {
+        if let Err(error) = self.recover_abandoned_turns() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({ "error": error.to_string() })),
+                "could not settle session turns left running by a previous process"
+            );
         }
     }
 }
@@ -1965,6 +2024,71 @@ mod tests {
         assert!(error.contains(&command), "missing `{command}`: {error}");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn remedy_commands_keep_dash_prefixed_relative_paths_as_paths() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let _spawning = SPAWN_VS_LOCK_REACQUIRE.blocking_write();
+        let temp = tempfile::TempDir::new().unwrap();
+        let lock_dir = temp
+            .path()
+            .join("-install")
+            .join("data")
+            .join(LIFECYCLE_DIR);
+        std::fs::create_dir_all(&lock_dir).unwrap();
+        std::fs::set_permissions(&lock_dir, PermissionsExt::from_mode(0o775)).unwrap();
+
+        let relative = Path::new("-install").join("data").join(LIFECYCLE_DIR);
+        let chmod_cmd = remedy_command("chmod 700", &relative);
+        assert_eq!(chmod_cmd, "chmod 700 ./-install/data/.lifecycle");
+        assert!(
+            Command::new("sh")
+                .arg("-c")
+                .arg(&chmod_cmd)
+                .current_dir(temp.path())
+                .status()
+                .unwrap()
+                .success(),
+            "chmod remedy must succeed when pasted: {chmod_cmd}"
+        );
+        assert_eq!(mode_of(&lock_dir) & 0o777, 0o700);
+
+        // Replace the directory with a symlink so `rm` is the pasted fix.
+        std::fs::remove_dir(&lock_dir).unwrap();
+        let elsewhere = temp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &lock_dir).unwrap();
+        let rm_cmd = remedy_command("rm", &relative);
+        assert_eq!(rm_cmd, "rm ./-install/data/.lifecycle");
+        assert!(
+            Command::new("sh")
+                .arg("-c")
+                .arg(&rm_cmd)
+                .current_dir(temp.path())
+                .status()
+                .unwrap()
+                .success(),
+            "rm remedy must succeed when pasted: {rm_cmd}"
+        );
+        assert!(!lock_dir.exists());
+        assert!(
+            elsewhere.exists(),
+            "rm must remove the link, not the target"
+        );
+
+        // Absolute paths, and relatives that do not start with `-`, stay as-is.
+        assert_eq!(
+            remedy_command("chmod 700", Path::new("/tmp/data/.lifecycle")),
+            "chmod 700 /tmp/data/.lifecycle"
+        );
+        assert_eq!(
+            remedy_command("rm", Path::new("data/.lifecycle")),
+            "rm data/.lifecycle"
+        );
+    }
+
     /// Remedy commands are pasted into a shell, so the rendered text must not
     /// carry Fluent's invisible bidi isolation marks around placeables.
     #[cfg(unix)]
@@ -2810,5 +2934,136 @@ mod tests {
         assert!(next.agent_lifecycle().reserve_turn("alpha").is_ok());
         drop(next);
         assert!(ConfigOwnershipGuard::acquire(temp.path()).is_ok());
+    }
+
+    fn store_with_running_turn(
+        data_dir: &Path,
+    ) -> Arc<dyn zeroclaw_infra::session_backend::SessionBackend> {
+        use zeroclaw_api::model_provider::ChatMessage;
+        let backend = zeroclaw_infra::make_session_backend(data_dir, "sqlite").unwrap();
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend
+            .set_session_state("s1", "running", Some("turn-1"))
+            .unwrap();
+        backend
+    }
+
+    fn owned_config(data_dir: &Path) -> Config {
+        Config {
+            data_dir: data_dir.to_path_buf(),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn fresh_owner_settles_turns_a_killed_process_left_running() {
+        let temp = tempfile::TempDir::new().unwrap();
+        // The previous process: it marked a turn running and never came back.
+        drop(store_with_running_turn(temp.path()));
+
+        let authority = LiveConfigAuthority::new_owned(owned_config(temp.path())).unwrap();
+
+        let store = zeroclaw_infra::make_session_backend(temp.path(), "sqlite").unwrap();
+        assert!(store.list_running_sessions().is_empty());
+        let state = store.get_session_state("s1").unwrap().unwrap();
+        assert_eq!(state.state, "error");
+        assert_eq!(state.turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(store.load("s1").len(), 1, "the session's history is kept");
+        drop(authority);
+    }
+
+    #[test]
+    fn process_refused_ownership_settles_nothing() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let owner = LiveConfigAuthority::new_owned(owned_config(temp.path())).unwrap();
+        // The owner is running this turn right now.
+        let store = store_with_running_turn(temp.path());
+
+        assert!(LiveConfigAuthority::new_owned(owned_config(temp.path())).is_err());
+
+        assert_eq!(store.list_running_sessions().len(), 1);
+        assert_eq!(
+            store.get_session_state("s1").unwrap().unwrap().state,
+            "running"
+        );
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn reload_leaves_live_turns_running() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let authority = LiveConfigAuthority::new_owned(owned_config(temp.path())).unwrap();
+        // A turn this process started after it took ownership, still
+        // draining while the daemon reloads.
+        let store = store_with_running_turn(temp.path());
+
+        authority.close_agent_lifecycle();
+        authority.drain_agent_lifecycle_retaining_ownership().await;
+        let guard = authority
+            .take_process_ownership()
+            .expect("reload drain retains ownership for transfer");
+        // The next generation starts up exactly as the first one did.
+        assert_eq!(guard.recover_abandoned_turns().unwrap(), 0);
+        let next = LiveConfigAuthority::new_with_ownership(owned_config(temp.path()), guard);
+
+        assert_eq!(
+            store.get_session_state("s1").unwrap().unwrap().state,
+            "running"
+        );
+        drop(next);
+    }
+
+    #[test]
+    fn taking_ownership_again_in_the_same_process_settles_nothing() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let first = LiveConfigAuthority::new_owned(owned_config(temp.path())).unwrap();
+        // A turn started under the first acquisition and detached from it:
+        // it is still running when the surface that admitted it is torn
+        // down and started again.
+        let store = store_with_running_turn(temp.path());
+        drop(first);
+
+        let second = LiveConfigAuthority::new_owned(owned_config(temp.path())).unwrap();
+
+        assert_eq!(
+            store.get_session_state("s1").unwrap().unwrap().state,
+            "running"
+        );
+        drop(second);
+    }
+
+    /// Run state lives in the SQLite store whichever backend is configured:
+    /// a process started on JSONL can reload onto SQLite later, and must not
+    /// find turns from before it started still marked running.
+    #[test]
+    fn fresh_owner_settles_the_sqlite_store_when_jsonl_is_configured() {
+        let temp = tempfile::TempDir::new().unwrap();
+        drop(store_with_running_turn(temp.path()));
+        let mut config = owned_config(temp.path());
+        config.channels.session_backend = "jsonl".to_string();
+
+        let authority = LiveConfigAuthority::new_owned(config).unwrap();
+
+        let store = zeroclaw_infra::make_session_backend(temp.path(), "sqlite").unwrap();
+        assert!(store.list_running_sessions().is_empty());
+        drop(authority);
+    }
+
+    #[test]
+    fn unreadable_store_does_not_stop_startup_and_the_error_is_returned() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db_path = zeroclaw_infra::session_sqlite::SqliteSessionBackend::db_path(temp.path());
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        std::fs::write(&db_path, b"not a database").unwrap();
+
+        let guard = ConfigOwnershipGuard::acquire(temp.path()).unwrap();
+        assert!(guard.recover_abandoned_turns().is_err());
+        drop(guard);
+
+        let other = tempfile::TempDir::new().unwrap();
+        let db_path = zeroclaw_infra::session_sqlite::SqliteSessionBackend::db_path(other.path());
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        std::fs::write(&db_path, b"not a database").unwrap();
+        assert!(LiveConfigAuthority::new_owned(owned_config(other.path())).is_ok());
     }
 }

@@ -153,8 +153,8 @@ impl GoalExecutionEngine {
                     if !candidate.trim().is_empty() {
                         candidate
                     } else {
-                        self.fail(scope, "candidate_empty").await?;
-                        bail!("Goal parent returned an empty candidate");
+                        let error = anyhow::Error::msg("Goal parent returned an empty candidate");
+                        return Err(self.fail_with(scope, "candidate_empty", error).await);
                     }
                 }
                 Err(error) => {
@@ -225,8 +225,10 @@ impl GoalExecutionEngine {
                     return Ok(GoalExecutionOutcome::VerifierBlocked);
                 }
                 Err(error) => {
-                    self.fail(scope, "verifier_protocol_invalid").await?;
-                    return Err(error).context("Goal verifier response is invalid");
+                    let error = error.context("Goal verifier response is invalid");
+                    return Err(self
+                        .fail_with(scope, "verifier_protocol_invalid", error)
+                        .await);
                 }
             }
         }
@@ -255,8 +257,10 @@ impl GoalExecutionEngine {
                 .await);
         }
         if goal.effective_cost_limit_usd.is_some() && !accountant.pricing_complete().await? {
-            self.fail(scope, "pricing_unavailable").await?;
-            bail!("Goal cost budget lacks complete pricing for actual provider usage");
+            let error = anyhow::Error::msg(
+                "Goal cost budget lacks complete pricing for actual provider usage",
+            );
+            return Err(self.fail_with(scope, "pricing_unavailable", error).await);
         }
         Ok(())
     }

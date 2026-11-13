@@ -253,7 +253,7 @@ whatsapp-web = [
 # Channels with no optional deps (cfg gate only)
 channel-discord = ["ws-transport"]
 channel-slack = ["ws-transport"]
-channel-signal = []
+channel-signal = ["dep:mime_guess"]
 channel-mattermost = ["ws-transport"]
 channel-irc = ["tls-client"]
 channel-twitch = ["channel-irc"]

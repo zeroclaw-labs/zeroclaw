@@ -1182,6 +1182,17 @@ async fn start_without_budget_flags_or_defaults_returns_budget_required() {
     }
 }
 
+#[test]
+fn goal_budget_value_has_one_type_across_public_paths() {
+    let configured = ConfigGoalBudgetLimits {
+        token_limit: Some(10),
+        cost_limit_usd: Some(2.5),
+    };
+    let command: zeroclaw_commands::goal::GoalBudgetLimits = configured;
+    let shared: zeroclaw_api::goal::GoalBudgetLimits = command;
+    assert_eq!(shared, configured);
+}
+
 #[tokio::test]
 async fn explicit_command_budgets_start_without_configured_defaults() {
     use zeroclaw_commands::goal::{GoalBudgetLimits, GoalBudgetSelection};
@@ -1594,6 +1605,7 @@ enum ScriptedFault {
     PauseDuringVerifier,
     ParentError,
     PauseThenParentError,
+    PauseThenEmptyParent,
     ParentAccountingFailure,
     VerifierAccountingFailure,
     SettleIncomplete,
@@ -1722,6 +1734,7 @@ impl GoalSessionExecutionLease for ScriptedLease {
                 self.pause(scope).await;
                 anyhow::bail!("fixture provider failed");
             }
+            Some(ScriptedFault::PauseThenEmptyParent) => self.pause(scope).await,
             Some(ScriptedFault::ParentAccountingFailure) => {
                 return Err(Self::accounting_error());
             }
@@ -1815,6 +1828,10 @@ impl GoalOperationAccounting for ScriptedAccounting {
         Ok(())
     }
 
+    async fn release_unstarted(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     async fn pricing_complete(&self) -> anyhow::Result<bool> {
         Ok(true)
     }
@@ -1825,6 +1842,56 @@ struct ScriptedAccountingFactory;
 impl GoalOperationAccountingFactory for ScriptedAccountingFactory {
     fn for_scope(&self, _scope: GoalExecutionScope) -> Arc<dyn GoalOperationAccounting> {
         Arc::new(ScriptedAccounting)
+    }
+}
+
+struct PauseDuringPricingFactory(Arc<SqliteTaskStore>);
+
+struct PauseDuringPricing {
+    store: Arc<SqliteTaskStore>,
+    scope: GoalExecutionScope,
+}
+
+#[async_trait]
+impl GoalOperationAccounting for PauseDuringPricing {
+    async fn admit(&self, _request: GoalOperationRequest) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn settle(&self, _settlement: GoalOperationSettlement) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn release_unstarted(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn pricing_complete(&self) -> anyhow::Result<bool> {
+        assert_eq!(
+            self.store
+                .pause_session_goal(
+                    self.scope.task_id(),
+                    self.scope.session_id(),
+                    self.scope.execution_epoch(),
+                    GoalPauseState {
+                        reason: GoalPauseReason::OperatorPaused,
+                        description: None,
+                        blockers: Vec::new(),
+                    },
+                )
+                .await?,
+            GoalTransitionResult::Applied
+        );
+        Ok(false)
+    }
+}
+
+impl GoalOperationAccountingFactory for PauseDuringPricingFactory {
+    fn for_scope(&self, scope: GoalExecutionScope) -> Arc<dyn GoalOperationAccounting> {
+        Arc::new(PauseDuringPricing {
+            store: Arc::clone(&self.0),
+            scope,
+        })
     }
 }
 
@@ -1972,6 +2039,66 @@ async fn engine_candidate_persistence_failure_fails_without_verifying_or_complet
         Some("candidate_persistence_failed")
     );
     assert!(fixture.history().is_empty());
+}
+
+#[tokio::test]
+async fn engine_empty_candidate_keeps_its_error_when_pause_wins() {
+    let mut fixture =
+        EngineFixture::new(&[""], &[], Some(ScriptedFault::PauseThenEmptyParent)).await;
+    let error = fixture.run().await.unwrap_err();
+    let chain = format!("{error:#}");
+    assert!(chain.contains("Goal parent returned an empty candidate"));
+    assert!(chain.contains("Goal failure lost its execution fence"));
+    assert_eq!(fixture.task().await.status, TaskStatus::Paused);
+}
+
+#[tokio::test]
+async fn engine_invalid_verifier_keeps_its_error_when_pause_wins() {
+    let mut fixture = EngineFixture::new(
+        &["answer"],
+        &["not valid JSON"],
+        Some(ScriptedFault::PauseDuringVerifier),
+    )
+    .await;
+    let error = fixture.run().await.unwrap_err();
+    let chain = format!("{error:#}");
+    assert!(chain.contains("Goal verifier response is invalid"));
+    assert!(chain.contains("Goal failure lost its execution fence"));
+    assert_eq!(fixture.task().await.status, TaskStatus::Paused);
+}
+
+#[tokio::test]
+async fn engine_unavailable_pricing_keeps_its_error_when_pause_wins() {
+    let mut fixture = EngineFixture::new(&["answer"], &[], None).await;
+    assert_eq!(
+        fixture
+            .store
+            .update_session_goal_limits(
+                fixture.scope.task_id(),
+                fixture.scope.session_id(),
+                fixture.scope.execution_epoch(),
+                Some(100),
+                Some(1.0),
+            )
+            .await
+            .unwrap(),
+        GoalTransitionResult::Applied
+    );
+    let error = fixture
+        .runtime
+        .execution_engine(Arc::new(PauseDuringPricingFactory(Arc::clone(
+            &fixture.store,
+        ))))
+        .run(
+            &host_settings(&fixture.config),
+            fixture.request.take().unwrap(),
+        )
+        .await
+        .unwrap_err();
+    let chain = format!("{error:#}");
+    assert!(chain.contains("Goal cost budget lacks complete pricing for actual provider usage"));
+    assert!(chain.contains("Goal failure lost its execution fence"));
+    assert_eq!(fixture.task().await.status, TaskStatus::Paused);
 }
 
 #[tokio::test]
@@ -3480,46 +3607,42 @@ async fn matrix_goal_control_requires_the_exact_raw_principal_after_key_normaliz
         )
         .await
         .unwrap();
-    assert!(matches!(
-        controller
-            .submit(&host_settings(&config), &first_start)
-            .await
-            .unwrap(),
-        GoalResponse::Started(_)
-    ));
+    let GoalResponse::Started(started) = controller
+        .submit(&host_settings(&config), &first_start)
+        .await
+        .unwrap()
+    else {
+        panic!("owner should be able to start the Goal");
+    };
 
-    let colliding_status = host
-        .submit(
-            &host_settings(&config),
-            colliding_ingress.clone(),
-            recording_driver(&colliding_ingress),
-            GoalCommand::Status,
-        )
-        .await
-        .unwrap();
-    assert!(matches!(
-        controller
-            .submit(&host_settings(&config), &colliding_status)
+    for command in [
+        GoalCommand::Status,
+        GoalCommand::Budget,
+        GoalCommand::SetBudget(zeroclaw_commands::goal::GoalBudgetSelection::Unlimited),
+        GoalCommand::Pause { immediate: false },
+        GoalCommand::Pause { immediate: true },
+        GoalCommand::Resume {
+            response: Some("a response from another principal".into()),
+        },
+        GoalCommand::Cancel,
+    ] {
+        let submission = host
+            .submit(
+                &host_settings(&config),
+                colliding_ingress.clone(),
+                recording_driver(&colliding_ingress),
+                command,
+            )
             .await
-            .unwrap(),
-        GoalResponse::NoCurrentGoal
-    ));
-    let colliding_cancel = host
-        .submit(
-            &host_settings(&config),
-            colliding_ingress.clone(),
-            recording_driver(&colliding_ingress),
-            GoalCommand::Cancel,
-        )
-        .await
-        .unwrap();
-    assert!(matches!(
-        controller
-            .submit(&host_settings(&config), &colliding_cancel)
-            .await
-            .unwrap(),
-        GoalResponse::NoCurrentGoal
-    ));
+            .unwrap();
+        assert_eq!(
+            controller
+                .submit(&host_settings(&config), &submission)
+                .await
+                .unwrap(),
+            GoalResponse::SessionUnavailable
+        );
+    }
     let colliding_start = host
         .submit(
             &host_settings(&config),
@@ -3537,8 +3660,25 @@ async fn matrix_goal_control_requires_the_exact_raw_principal_after_key_normaliz
             .submit(&host_settings(&config), &colliding_start)
             .await
             .unwrap(),
-        GoalResponse::NoCurrentGoal
+        GoalResponse::SessionUnavailable
     ));
+
+    let first_status = host
+        .submit(
+            &host_settings(&config),
+            first_ingress.clone(),
+            recording_driver(&first_ingress),
+            GoalCommand::Status,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        controller
+            .submit(&host_settings(&config), &first_status)
+            .await
+            .unwrap(),
+        GoalResponse::Status(started)
+    );
 
     let first_cancel = host
         .submit(
@@ -3574,7 +3714,7 @@ async fn matrix_goal_control_requires_the_exact_raw_principal_after_key_normaliz
             .submit(&host_settings(&config), &colliding_terminal_replacement)
             .await
             .unwrap(),
-        GoalResponse::NoCurrentGoal
+        GoalResponse::SessionUnavailable
     ));
 
     let first_terminal_status = host

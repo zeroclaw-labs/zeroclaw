@@ -494,6 +494,31 @@ impl GoalOperationAccounting for GoalOperationAccountant {
         }
     }
 
+    async fn release_unstarted(&self) -> Result<()> {
+        let operation = self
+            .admitted
+            .lock()
+            .await
+            .take()
+            .context("Goal operation released without a matching admission")?;
+        match self
+            .registry
+            .settle_pending_operation(
+                self.scope.task_id(),
+                self.scope.session_id(),
+                self.scope.execution_epoch(),
+                &operation.id,
+                GoalAccountingState::Complete,
+            )
+            .await?
+        {
+            GoalTransitionResult::Applied => Ok(()),
+            GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
+                bail!("unstarted Goal operation release lost its execution fence")
+            }
+        }
+    }
+
     async fn pricing_complete(&self) -> Result<bool> {
         Ok(self.strict_totals().await?.2)
     }
@@ -1118,6 +1143,123 @@ mod tests {
         assert!(goal.pause_reason.is_none());
         assert!(goal.pending_call_id.is_some());
         assert_eq!(goal.pending_call_epoch, Some(scope.execution_epoch()));
+    }
+
+    #[tokio::test]
+    async fn unstarted_operation_release_clears_pending_without_usage() {
+        let (store, factory, _tracker, scope, directory) = fixture().await;
+        let accountant = factory.for_scope(scope.clone());
+        accountant
+            .admit(GoalOperationRequest::new("fallback", "model"))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .get_goal_task(scope.task_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .pending_call_id
+                .is_some()
+        );
+        accountant.release_unstarted().await.unwrap();
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
+        assert!(goal.pending_call_id.is_none());
+        assert!(goal.pending_call_epoch.is_none());
+        assert!(!directory.path().join("state/costs.jsonl").exists());
+        accountant
+            .admit(GoalOperationRequest::new("fallback", "model"))
+            .await
+            .expect("a known-unstarted operation does not close admission");
+        accountant.release_unstarted().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unstarted_release_after_pause_allows_explicit_resume() {
+        let (store, factory, _tracker, scope, _directory) = fixture().await;
+        let accountant = factory.for_scope(scope.clone());
+        accountant
+            .admit(GoalOperationRequest::new("fallback", "model"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .pause_session_goal(
+                    scope.task_id(),
+                    scope.session_id(),
+                    scope.execution_epoch(),
+                    GoalPauseState {
+                        reason: GoalPauseReason::OperatorPaused,
+                        description: None,
+                        blockers: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        accountant.release_unstarted().await.unwrap();
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
+        assert!(goal.pending_call_id.is_none());
+        assert!(goal.pending_call_epoch.is_none());
+        assert_eq!(
+            store
+                .resume_session_goal(
+                    scope.task_id(),
+                    scope.session_id(),
+                    scope.execution_epoch() + 1,
+                    2,
+                    "resumed-boot",
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        let resumed_scope = GoalExecutionScope::new(
+            scope.task_id(),
+            scope.session_id(),
+            scope.execution_epoch() + 2,
+        )
+        .unwrap();
+        let resumed = factory.for_scope(resumed_scope);
+        resumed
+            .admit(GoalOperationRequest::new("fallback", "model"))
+            .await
+            .expect("explicitly resumed Goal can admit work after an unstarted release");
+        resumed.release_unstarted().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_unstarted_release_keeps_the_pending_fence() {
+        let (store, factory, _tracker, scope, _directory) = fixture().await;
+        let faulted = faulted_factory(
+            &factory,
+            Arc::clone(&store),
+            AdmissionFault::Settlement(GoalTransitionResult::Stale),
+        );
+        let accountant = faulted.for_scope(scope.clone());
+        accountant
+            .admit(GoalOperationRequest::new("fallback", "model"))
+            .await
+            .unwrap();
+        let error = accountant.release_unstarted().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("release lost its execution fence")
+        );
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert!(goal.pending_call_id.is_some());
+        assert_eq!(goal.pending_call_epoch, Some(scope.execution_epoch()));
+        assert!(
+            accountant
+                .admit(GoalOperationRequest::new("fallback", "model"))
+                .await
+                .is_err(),
+            "a failed release must not admit another operation"
+        );
     }
 
     #[tokio::test]

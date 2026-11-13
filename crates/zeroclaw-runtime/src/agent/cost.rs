@@ -234,6 +234,18 @@ pub(crate) fn goal_operation_accounting_is_scoped() -> bool {
         .unwrap_or(false)
 }
 
+/// Release a Goal admission only when provider dispatch was never polled.
+pub(crate) async fn release_unstarted_goal_operation_if_scoped() -> anyhow::Result<()> {
+    if let Some(accounting) = GOAL_OPERATION_ACCOUNTING
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+    {
+        accounting.release_unstarted().await?;
+    }
+    Ok(())
+}
+
 fn goal_operation_settlement(
     attempts: &[zeroclaw_providers::dispatch::AccountedAttempt],
 ) -> GoalOperationSettlement {
@@ -615,6 +627,28 @@ pub(crate) async fn settle_provider_attempts(
         );
     }
     Ok(())
+}
+
+/// An interrupted dispatch with no reported leaves has an unknown outcome,
+/// rather than a known missing usage report. Known leaves follow normal
+/// settlement and retain their reported lower bounds.
+pub(crate) async fn settle_interrupted_provider_attempts(
+    attempts: &[zeroclaw_providers::dispatch::AccountedAttempt],
+) -> anyhow::Result<()> {
+    if attempts.is_empty()
+        && let Some(accounting) = GOAL_OPERATION_ACCOUNTING
+            .try_with(Clone::clone)
+            .ok()
+            .flatten()
+    {
+        return accounting
+            .settle(GoalOperationSettlement {
+                accounting_state: crate::control_plane::GoalAccountingState::OutcomeUnknown,
+                events: Vec::new(),
+            })
+            .await;
+    }
+    settle_provider_attempts(attempts, None).await
 }
 
 fn record_tool_loop_cost_usage_inner(
@@ -1484,6 +1518,10 @@ mod tests {
 
         async fn settle(&self, settlement: GoalOperationSettlement) -> anyhow::Result<()> {
             self.0.lock().push(settlement);
+            Ok(())
+        }
+
+        async fn release_unstarted(&self) -> anyhow::Result<()> {
             Ok(())
         }
 

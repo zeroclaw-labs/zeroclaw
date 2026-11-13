@@ -1,14 +1,19 @@
 //! The resolved per-agent execution context the turn engine requires.
 
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 use zeroclaw_api::model_provider::{ChatRequest, ChatResponse, SemanticEmptyTerminalCompletion};
 use zeroclaw_config::schema::{MultimodalConfig, PacingConfig, ResolvedContextLimits};
 use zeroclaw_providers::dispatch::{AccountedAttempt, with_exact_dispatch_route};
 use zeroclaw_providers::{ModelProvider, ProviderDispatch, multimodal};
 
 use super::{ContextLimitsResolver, LoopKnobs, ModelSwitchCallback};
-use crate::agent::cost::admit_goal_operation_if_scoped;
+use crate::agent::cost::{
+    admit_goal_operation_if_scoped, release_unstarted_goal_operation_if_scoped,
+};
 use crate::agent::tool_receipts::ReceiptGenerator;
 use crate::approval::ApprovalManager;
 use crate::hooks::HookRunner;
@@ -74,12 +79,94 @@ fn extend_rejected_summaries(out: &mut Vec<SettledAttemptSummary>, attempts: &[A
     }
 }
 
+/// The existing turn deadline and cancellation signal, shared by summary
+/// preparation and its provider call. No new timeout budget is introduced.
+#[derive(Clone, Copy)]
+pub(super) struct ModelQueryControl<'a> {
+    pub deadline: Option<Instant>,
+    pub cancellation_token: Option<&'a CancellationToken>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum ModelQueryInterruption {
+    Cancelled,
+    TimedOut,
+}
+
+impl std::fmt::Display for ModelQueryInterruption {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Cancelled => "model query cancelled",
+            Self::TimedOut => "model query timed out",
+        })
+    }
+}
+
+impl std::error::Error for ModelQueryInterruption {}
+
+impl ModelQueryControl<'_> {
+    fn current(self) -> Option<ModelQueryInterruption> {
+        if self
+            .cancellation_token
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            Some(ModelQueryInterruption::Cancelled)
+        } else if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            Some(ModelQueryInterruption::TimedOut)
+        } else {
+            None
+        }
+    }
+
+    pub(super) async fn interrupted(self) -> ModelQueryInterruption {
+        match (self.cancellation_token, self.deadline) {
+            (Some(token), Some(deadline)) => tokio::select! {
+                biased;
+                () = token.cancelled() => ModelQueryInterruption::Cancelled,
+                () = tokio::time::sleep_until(deadline) => ModelQueryInterruption::TimedOut,
+            },
+            (Some(token), None) => {
+                token.cancelled().await;
+                ModelQueryInterruption::Cancelled
+            }
+            (None, Some(deadline)) => {
+                tokio::time::sleep_until(deadline).await;
+                ModelQueryInterruption::TimedOut
+            }
+            (None, None) => std::future::pending().await,
+        }
+    }
+}
+
 impl ResolvedModelAccess<'_> {
     pub async fn run_model_query(
         &self,
         request: ChatRequest<'_>,
         settled_out: &mut Vec<SettledAttemptSummary>,
     ) -> anyhow::Result<ChatResponse> {
+        self.run_model_query_controlled(
+            request,
+            settled_out,
+            ModelQueryControl {
+                deadline: None,
+                cancellation_token: None,
+            },
+        )
+        .await
+    }
+
+    pub(super) async fn run_model_query_controlled(
+        &self,
+        request: ChatRequest<'_>,
+        settled_out: &mut Vec<SettledAttemptSummary>,
+        control: ModelQueryControl<'_>,
+    ) -> anyhow::Result<ChatResponse> {
+        if let Some(interruption) = control.current() {
+            return Err(interruption.into());
+        }
         // Fail closed before spending a provider call when the enclosing turn's
         // cost budget is already exhausted. No-op when unscoped.
         crate::agent::turn::provider_call::enforce_tool_loop_budget()?;
@@ -105,20 +192,57 @@ impl ResolvedModelAccess<'_> {
             tools,
             thinking,
         };
+        if let Some(interruption) = control.current() {
+            return Err(interruption.into());
+        }
+        // Admission may commit a durable pending marker. Do not race and drop
+        // that future: after it completes, release it if no dispatch began.
         admit_goal_operation_if_scoped(self.provider_name, self.model).await?;
+        if let Some(interruption) = control.current() {
+            release_unstarted_goal_operation_if_scoped()
+                .await
+                .map_err(|error| error.context(format!("while handling {interruption}")))?;
+            return Err(interruption.into());
+        }
         let dispatcher = ProviderDispatch::from_ref(self.model_provider);
         let scope = zeroclaw_providers::dispatch::AccountedChatScope::new();
-        let result = scope
-            // The route identity records the model that actually serves this
-            // request, while the dispatch call keeps the provider-facing
-            // selector: a routed provider may need `hint:<name>` even though
-            // `model` already records the resolved model behind that hint.
-            .scope(with_exact_dispatch_route(
+        let mut dispatch_polled = false;
+        let outcome = {
+            // Drop the provider future before taking the scope so an in-flight
+            // attempt is finalized as outcome-unknown on interruption.
+            let provider_future = scope.scope(with_exact_dispatch_route(
                 self.provider_name.to_string(),
                 self.model.to_string(),
                 dispatcher.chat(request, self.dispatch_model, self.temperature),
-            ))
-            .await;
+            ));
+            tokio::pin!(provider_future);
+            tokio::select! {
+                biased;
+                interruption = control.interrupted() => Err(interruption),
+                result = std::future::poll_fn(|cx| {
+                    dispatch_polled = true;
+                    provider_future.as_mut().poll(cx)
+                }) => Ok(result),
+            }
+        };
+        let result = match outcome {
+            Ok(result) => result,
+            Err(interruption) => {
+                let accounting = scope.take();
+                if dispatch_polled {
+                    let attempts = accounting.attempts();
+                    extend_rejected_summaries(settled_out, attempts);
+                    crate::agent::cost::settle_interrupted_provider_attempts(attempts)
+                        .await
+                        .map_err(|error| error.context(format!("while handling {interruption}")))?;
+                } else {
+                    release_unstarted_goal_operation_if_scoped()
+                        .await
+                        .map_err(|error| error.context(format!("while handling {interruption}")))?;
+                }
+                return Err(interruption.into());
+            }
+        };
         if result.is_ok() {
             scope.mark_logical_success();
         }
@@ -139,31 +263,31 @@ impl ResolvedModelAccess<'_> {
                 // and successful response telemetry before returning its typed
                 // cause to every one-shot caller.
                 if response.is_semantically_empty_terminal() {
-                    crate::agent::cost::settle_provider_attempts(attempts, None).await?;
                     extend_rejected_summaries(settled_out, attempts);
+                    crate::agent::cost::settle_provider_attempts(attempts, None).await?;
                     return Err(anyhow::Error::new(SemanticEmptyTerminalCompletion));
                 }
                 zeroclaw_providers::dispatch::commit_accepted_provider_route(accepted_route);
                 if goal_scoped {
+                    extend_rejected_summaries(
+                        settled_out,
+                        &attempts[..attempts.len().saturating_sub(1)],
+                    );
                     crate::agent::cost::settle_provider_attempts(
                         attempts,
                         Some(attempts.len().saturating_sub(1)),
                     )
                     .await?;
+                } else {
                     extend_rejected_summaries(
                         settled_out,
                         &attempts[..attempts.len().saturating_sub(1)],
                     );
-                } else {
                     crate::agent::cost::settle_provider_attempts(
                         &attempts[..attempts.len().saturating_sub(1)],
                         None,
                     )
                     .await?;
-                    extend_rejected_summaries(
-                        settled_out,
-                        &attempts[..attempts.len().saturating_sub(1)],
-                    );
                 }
                 // Only a semantically valid result controls accepted context
                 // usage and successful response telemetry.
@@ -207,8 +331,8 @@ impl ResolvedModelAccess<'_> {
                 Ok(response)
             }
             Err(error) => {
-                crate::agent::cost::settle_provider_attempts(attempts, None).await?;
                 extend_rejected_summaries(settled_out, attempts);
+                crate::agent::cost::settle_provider_attempts(attempts, None).await?;
                 Err(error)
             }
         }
@@ -261,6 +385,7 @@ pub struct ResolvedAgentExecution<'a> {
     pub parallel_tools: bool,
     /// Truncation limit for tool outputs.
     pub max_tool_result_chars: usize,
+    pub keep_tool_context_turns: usize,
     /// Capacity and proactive-trim budget resolved together for the selected
     /// route at the turn boundary.
     pub context_limits: ResolvedContextLimits,
@@ -308,6 +433,7 @@ pub struct ResolvedRuntimeKnobs<'a> {
     pub strict_tool_parsing: bool,
     pub parallel_tools: bool,
     pub max_tool_result_chars: usize,
+    pub keep_tool_context_turns: usize,
     pub context_limits: ResolvedContextLimits,
     /// Single live limits authority; see [`ResolvedAgentExecution::context_limits_resolver`].
     pub context_limits_resolver: Option<ContextLimitsResolver>,
@@ -339,6 +465,7 @@ impl<'a> ResolvedAgentExecution<'a> {
             strict_tool_parsing: runtime.strict_tool_parsing,
             parallel_tools: runtime.parallel_tools,
             max_tool_result_chars: runtime.max_tool_result_chars,
+            keep_tool_context_turns: runtime.keep_tool_context_turns,
             context_limits: runtime.context_limits,
             context_limits_resolver: runtime.context_limits_resolver,
             receipt_generator: io.receipt_generator,
@@ -649,6 +776,10 @@ mod run_model_query_tests {
             settlement: zeroclaw_goal::accounting::GoalOperationSettlement,
         ) -> anyhow::Result<()> {
             self.0.lock().push(settlement);
+            Ok(())
+        }
+
+        async fn release_unstarted(&self) -> anyhow::Result<()> {
             Ok(())
         }
 

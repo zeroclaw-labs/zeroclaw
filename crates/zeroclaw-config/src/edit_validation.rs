@@ -293,6 +293,106 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_sign_in_baseline_error_allows_unrelated_edit() {
+        let mut baseline = Config::default();
+        baseline.gateway.dashboard_sign_in.session_lifetime_secs = 0;
+        let mut candidate = baseline.clone();
+        candidate.scheduler.max_tasks += 1;
+        candidate.mark_dirty("scheduler.max_tasks");
+
+        let warnings = validate_without_mutation(&candidate, &baseline)
+            .expect("an unrelated edit should retain the dashboard warning");
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(
+            warnings[0].path,
+            "gateway.dashboard_sign_in.session_lifetime_secs"
+        );
+    }
+
+    #[test]
+    fn dashboard_sign_in_baseline_error_does_not_hide_a_new_error() {
+        let mut baseline = Config::default();
+        baseline.gateway.dashboard_sign_in.session_lifetime_secs = 0;
+        let mut candidate = baseline.clone();
+        candidate
+            .gateway
+            .dashboard_sign_in
+            .oidc
+            .push("missing".into());
+        candidate.mark_dirty("gateway.dashboard_sign_in.oidc");
+
+        assert_error(
+            validate_without_mutation(&candidate, &baseline),
+            ConfigApiCode::DanglingReference,
+            Some("gateway.dashboard_sign_in.oidc"),
+        );
+    }
+
+    #[test]
+    fn relay_dashboard_baseline_errors_allow_unrelated_edit() {
+        let mut baseline = Config::default();
+        baseline.relay.enabled = true;
+        baseline.relay.url = "relay.example.com:443".into();
+        baseline.relay.dashboard.enabled = true;
+        let mut candidate = baseline.clone();
+        candidate.scheduler.max_tasks += 1;
+        candidate.mark_dirty("scheduler.max_tasks");
+
+        let warnings = validate_without_mutation(&candidate, &baseline)
+            .expect("an unrelated edit should retain the relay warnings");
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.path == "relay.dashboard.domain")
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.path == "gateway.dashboard_sign_in.oidc")
+        );
+    }
+
+    #[test]
+    fn relay_dashboard_baseline_error_does_not_hide_a_new_error() {
+        let mut baseline = Config::default();
+        baseline.relay.enabled = true;
+        baseline.relay.url = "relay.example.com:443".into();
+        baseline.relay.dashboard.enabled = true;
+        let mut candidate = baseline.clone();
+        candidate.relay.dashboard.port = 0;
+        candidate.mark_dirty("relay.dashboard.port");
+
+        assert_error(
+            validate_without_mutation(&candidate, &baseline),
+            ConfigApiCode::InvalidNumericRange,
+            Some("relay.dashboard.port"),
+        );
+    }
+
+    #[test]
+    fn enabling_relay_rejects_an_existing_invalid_dashboard_domain() {
+        let mut baseline = Config::default();
+        baseline.relay.url = "relay.example.com:443".into();
+        baseline.relay.dashboard.enabled = true;
+        let mut candidate = baseline.clone();
+        candidate.relay.enabled = true;
+        candidate.mark_dirty("relay.enabled");
+
+        assert_error(
+            validate_without_mutation(&candidate, &baseline),
+            ConfigApiCode::ValidationFailed,
+            Some("relay.dashboard.domain"),
+        );
+
+        let mut repaired = baseline.clone();
+        repaired.relay.dashboard.enabled = false;
+        repaired.mark_dirty("relay.dashboard.enabled");
+        let warnings = validate_without_mutation(&repaired, &baseline)
+            .expect("disabling the dashboard removes the invalid configuration");
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
     fn p9_signal_helper_scope_blocks_a_dirty_sibling() {
         let mut baseline = Config::default();
         baseline.channels.signal.insert(
