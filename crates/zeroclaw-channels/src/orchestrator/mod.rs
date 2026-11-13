@@ -3094,6 +3094,7 @@ async fn load_runtime_config_and_defaults(
     let applied = zeroclaw_config::env_overrides::apply_env_overrides(&mut parsed)?;
     parsed.env_overridden_paths = applied.paths;
     parsed.pre_override_snapshots = applied.snapshots;
+    parsed.pre_override_openai_stt_section_was_absent = applied.openai_stt_section_was_absent;
 
     let model_provider = resolved_runtime_model_provider_ref(&parsed, agent_alias)?;
     let defaults = runtime_defaults_from_config(&parsed, &model_provider)?;

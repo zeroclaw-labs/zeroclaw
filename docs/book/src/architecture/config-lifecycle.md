@@ -84,6 +84,12 @@ Do not add ad-hoc `std::env::var("PROVIDER_API_KEY")` reads inside provider, cha
 
 If ZeroClaw intentionally supports a native environment bridge for an integration family, document that bridge at the integration boundary and map it into the same typed config value before construction. Otherwise, ecosystem-default shell names such as `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, or `QDRANT_URL` should be bridged by operators into the corresponding `ZEROCLAW_*` schema-mirror variable; see [Environment variables](../reference/env-vars.md#bridging-ecosystem-default-env-vars).
 
+The legacy OpenAI STT section `[transcription.openai]` is a narrow documented
+exception: `TRANSCRIPTION_API_KEY` and `OPENAI_API_KEY` are mapped into its
+typed `api_key` field during config loading, before manager construction. The
+bridge follows the same secret visibility and save-masking rules as other
+environment overrides. See [Environment variables](../reference/env-vars.md#native-openai-stt-credential-bridge).
+
 ## Dirty paths and incremental writes
 
 Most editing surfaces use `Config::mark_dirty()` plus `save_dirty()`, not a

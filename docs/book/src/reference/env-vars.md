@@ -94,6 +94,24 @@ Substitute the alias name in place of `home` to match your config. For multiple 
 
 These lines are shell bridges into typed config, not a general rule that constructors read provider-native env vars. Runtime code should receive the resolved value from `Config` unless the integration family explicitly documents a native env bridge.
 
+### Native OpenAI STT credential bridge
+
+The legacy `[transcription.openai]` provider also accepts `TRANSCRIPTION_API_KEY`
+and `OPENAI_API_KEY`. During config loading, a non-empty
+`TRANSCRIPTION_API_KEY` fills a missing `[transcription.openai].api_key`; if it
+is unset or blank, `OPENAI_API_KEY` is tried. A non-empty configured key wins
+over these native aliases. When `[transcription.openai]` exists, the canonical
+`ZEROCLAW_transcription__openai__api_key` schema-mirror override is applied
+first and keeps its usual override precedence. The native aliases also cover
+the case where that optional table is absent.
+
+The bridge writes the selected value into the typed `Config` before the
+transcription manager is built. The value is treated as a secret, marked as an
+env override, and masked from config saves. These aliases apply to the legacy
+`[transcription.openai]` section; typed
+`[providers.transcription.openai.<alias>]` entries use the standard
+schema-mirror variable instead.
+
 ## OAuth and CLI-path fields
 
 A handful of fields live as schema fields, reachable via the standard mapping:
