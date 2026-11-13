@@ -1333,6 +1333,167 @@ async fn mutate_plugin_tls_credential_inner(
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HttpCredentialMutation {
+    name: String,
+    operation: PluginTlsCredentialOperation,
+    credential: Option<zeroclaw_config::schema::ScopedHttpCredential>,
+}
+
+pub async fn list_http_credentials(
+    State(state): State<AppState>,
+    principal: RequestPrincipal,
+) -> Response {
+    credential_no_store(
+        async {
+            use zeroclaw_config::{
+                schema::{ScopedHttpAuth, ScopedHttpCredential},
+                secrets::SecretStore,
+            };
+            let Ok(guard) = state.begin_config_commit().await else {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            };
+            if let Err(denied) = crate::principal_gate::require_config_operator(&principal, &guard)
+            {
+                return denied.into_response();
+            }
+            let config = guard.current_config();
+            let Some(dir) = config.config_path.parent() else {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            };
+            let store = SecretStore::new(dir, config.secrets.encrypt);
+            let mut rows = Vec::new();
+            for (name, stored) in &config.http_request.scoped_credentials {
+                let decoded = if stored.starts_with("enc2:") {
+                    store.decrypt(stored)
+                } else {
+                    // The live config loader may already have decrypted secret fields.
+                    Ok(stored.clone())
+                };
+                let Ok(record) = decoded.and_then(|value| {
+                    serde_json::from_str::<ScopedHttpCredential>(&value).map_err(Into::into)
+                }) else {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                };
+                let kind = match record.auth {
+                    ScopedHttpAuth::ApiKey { .. } => "api_key",
+                    ScopedHttpAuth::UserPassword { .. } => "user_password",
+                };
+                rows.push((
+                    name,
+                    serde_json::json!({
+                        "name": name, "origin": record.origin, "kind": kind
+                    }),
+                ));
+            }
+            rows.sort_by(|(left, _), (right, _)| left.cmp(right));
+            Json(serde_json::json!({
+                "encryption_enabled": config.secrets.encrypt,
+                "credentials": rows.into_iter().map(|(_, row)| row).collect::<Vec<_>>()
+            }))
+            .into_response()
+        }
+        .await,
+    )
+}
+
+pub async fn mutate_http_credential(
+    State(state): State<AppState>,
+    principal: RequestPrincipal,
+    body: axum::body::Bytes,
+) -> Response {
+    credential_no_store(
+        async {
+            use zeroclaw_config::{
+                schema::{ScopedHttpAuth, ScopedHttpCredential},
+                secrets::SecretStore,
+            };
+            let Ok(guard) = state.begin_config_commit().await else {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            };
+            if let Err(denied) = crate::principal_gate::require_config_operator(&principal, &guard)
+            {
+                return denied.into_response();
+            }
+            let Ok(mutation) = serde_json::from_slice::<HttpCredentialMutation>(&body) else {
+                return StatusCode::BAD_REQUEST.into_response();
+            };
+            let mut config = guard.current_config();
+            let Some(dir) = config.config_path.parent() else {
+                return StatusCode::PRECONDITION_FAILED.into_response();
+            };
+            if !config.secrets.encrypt || !dir.join(".secret_key").is_file() {
+                return StatusCode::PRECONDITION_FAILED.into_response();
+            }
+            if !ScopedHttpCredential::valid_name(&mutation.name)
+                || config.http_request.secrets.contains_key(&mutation.name)
+            {
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+            let credentials = &mut config.http_request.scoped_credentials;
+            let present = credentials.contains_key(&mutation.name);
+            let verb = match (mutation.operation, &mutation.credential, present) {
+                (PluginTlsCredentialOperation::Create, Some(_), false) => Verb::Create,
+                (PluginTlsCredentialOperation::Replace, Some(_), true) => Verb::Update,
+                (PluginTlsCredentialOperation::Delete, None, true) => Verb::Delete,
+                _ => return StatusCode::CONFLICT.into_response(),
+            };
+            if let Some(mut credential) = mutation.credential {
+                let Some(origin) = ScopedHttpCredential::https_origin(&credential.origin) else {
+                    return StatusCode::BAD_REQUEST.into_response();
+                };
+                if credential.origin.trim_end_matches('/') != origin {
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
+                credential.origin = origin;
+                let valid = |value: &str| {
+                    !value.trim().is_empty()
+                        && value.len() <= 4096
+                        && !value.chars().any(char::is_control)
+                        && reject_masked_secret_value("", true, value).is_ok()
+                };
+                let valid_auth = match &credential.auth {
+                    ScopedHttpAuth::ApiKey { value, .. } => valid(value) && value.is_ascii(),
+                    ScopedHttpAuth::UserPassword { username, password } => {
+                        valid(username) && !username.contains(':') && valid(password)
+                    }
+                };
+                if !valid_auth {
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
+                let Ok(ciphertext) = serde_json::to_string(&credential)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|value| SecretStore::new(dir, true).encrypt(&value))
+                else {
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                };
+                credentials.insert(mutation.name.clone(), ciphertext);
+            } else {
+                credentials.remove(&mutation.name);
+            }
+            let path = format!("http_request.scoped_credentials.{}", mutation.name);
+            config.mark_dirty(&path);
+            let authorization = match authorize_config_write(
+                &principal,
+                ConfigWriteSet::default().with(path, verb),
+                &guard,
+            ) {
+                Ok(authorization) => authorization,
+                Err(denied) => return denied.into_response(),
+            };
+            if persist_and_swap(&state, authorization, config, guard)
+                .await
+                .is_err()
+            {
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        .await,
+    )
+}
+
 pub async fn handle_prop_get(
     State(state): State<AppState>,
     Query(q): Query<PropQuery>,

@@ -350,6 +350,75 @@ impl HttpRequestTool {
         }
     }
 
+    fn apply_scoped_credential(
+        &self,
+        headers: &mut HeaderMap,
+        name: &str,
+        target: &ValidatedHttpRequestTarget,
+    ) -> anyhow::Result<Vec<String>> {
+        use base64::Engine as _;
+        use zeroclaw_config::{
+            schema::{Config, ScopedApiKeyHeader, ScopedHttpAuth, ScopedHttpCredential},
+            secrets::SecretStore,
+        };
+
+        Self::validate_secret_name(name)?;
+        let path = self
+            .config_path
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Credential store unavailable"))?;
+        let contents = std::fs::read_to_string(path)
+            .map_err(|_| anyhow::anyhow!("Credential store unavailable"))?;
+        let config: Config = toml::from_str(&contents)
+            .map_err(|_| anyhow::anyhow!("Credential store unavailable"))?;
+        let stored = config
+            .http_request
+            .scoped_credentials
+            .get(name)
+            .filter(|value| config.secrets.encrypt && value.starts_with("enc2:"))
+            .ok_or_else(|| anyhow::anyhow!("Scoped HTTP credential unavailable"))?;
+        let dir = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Credential store unavailable"))?;
+        let plaintext = SecretStore::new(dir, true)
+            .decrypt(stored)
+            .map_err(|_| anyhow::anyhow!("Credential store unavailable"))?;
+        let credential: ScopedHttpCredential = serde_json::from_str(&plaintext)
+            .map_err(|_| anyhow::anyhow!("Invalid stored HTTP credential"))?;
+        if ScopedHttpCredential::https_origin(&target.url).as_deref()
+            != Some(credential.origin.as_str())
+        {
+            anyhow::bail!("Scoped HTTP credential does not allow this HTTPS origin");
+        }
+        let (name, authorization, mut sensitive) = match credential.auth {
+            ScopedHttpAuth::ApiKey { value, header } => match header {
+                ScopedApiKeyHeader::Bearer => {
+                    (AUTHORIZATION, format!("Bearer {value}"), vec![value])
+                }
+                ScopedApiKeyHeader::XApiKey => (
+                    HeaderName::from_static("x-api-key"),
+                    value.clone(),
+                    vec![value],
+                ),
+            },
+            ScopedHttpAuth::UserPassword { username, password } => {
+                let pair = format!("{username}:{password}");
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&pair);
+                (
+                    AUTHORIZATION,
+                    format!("Basic {encoded}"),
+                    vec![pair, encoded, password, username],
+                )
+            }
+        };
+        let mut header = HeaderValue::from_str(&authorization)
+            .map_err(|_| anyhow::anyhow!("Invalid stored HTTP credential"))?;
+        header.set_sensitive(true);
+        headers.insert(name, header);
+        sensitive.insert(0, authorization);
+        Ok(sensitive)
+    }
+
     fn apply_auth_secret(
         &self,
         headers: &mut HeaderMap,
@@ -366,6 +435,27 @@ impl HttpRequestTool {
         })?;
         headers.insert(AUTHORIZATION, header_value);
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn scoped_credential_fixture(
+        &mut self,
+        dir: &Path,
+        credential: zeroclaw_config::schema::ScopedHttpCredential,
+    ) {
+        use zeroclaw_config::{schema::Config, secrets::SecretStore};
+        let mut config = Config::default();
+        config.secrets.encrypt = true;
+        let stored = SecretStore::new(dir, true)
+            .encrypt(&serde_json::to_string(&credential).unwrap())
+            .unwrap();
+        config
+            .http_request
+            .scoped_credentials
+            .insert("TEST".into(), stored);
+        let path = dir.join("config.toml");
+        std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        self.config_path = Some(path);
     }
 
     #[cfg(test)]
@@ -535,6 +625,10 @@ impl Tool for HttpRequestTool {
                     "description": "Optional HTTP headers as key-value pairs. Use auth_secret for Authorization values that should come from config secrets.",
                     "default": {}
                 },
+                "credential": {
+                    "type": "string",
+                    "description": "Operator-managed credential alias bound to this HTTPS origin. Supports Bearer tokens, X-API-Key, and HTTP Basic. Pass only the alias."
+                },
                 "auth_secret": {
                     "type": "string",
                     "description": "Name of a secret in [http_request.secrets] to send as the Authorization header. Secret entries may be literal, encrypted, or environment-backed as ${ENV_VAR}. Overrides any literal Authorization header."
@@ -660,13 +754,41 @@ impl Tool for HttpRequestTool {
                 });
             }
         };
-        if let Err(e) = self.apply_auth_secret(&mut request_headers, auth_secret) {
-            return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(e.to_string()),
-            });
-        }
+        let scoped = match args.get("credential") {
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("'credential' must be a string"))?,
+            ),
+            None => None,
+        };
+        let credential_result = match (scoped, auth_secret) {
+            (Some(_), Some(_)) => Err(anyhow::anyhow!(
+                "Choose credential or auth_secret, not both"
+            )),
+            (Some(name), None) => self.apply_scoped_credential(&mut request_headers, name, &target),
+            (None, _) => self
+                .apply_auth_secret(&mut request_headers, auth_secret)
+                .map(|()| Vec::new()),
+        };
+        let sensitive = match credential_result {
+            Ok(sensitive) => sensitive,
+            Err(error) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(error.to_string()),
+                });
+            }
+        };
+        let redact = |mut output: String| {
+            for value in &sensitive {
+                if !value.is_empty() {
+                    output = output.replace(value, "[REDACTED]");
+                }
+            }
+            output
+        };
 
         match self
             .execute_request(&target, method.clone(), request_headers, body)
@@ -704,6 +826,8 @@ impl Tool for HttpRequestTool {
                         ),
                     };
 
+                let headers_text = redact(headers_text);
+                let response_text = redact(response_text);
                 let output = format!(
                     "Status: {} {}\nResponse Headers: {}\n\nResponse Body:\n{}",
                     status_code,
@@ -1078,6 +1202,61 @@ mod tests {
             properties.contains_key("auth_secret"),
             "http_request schema must expose auth_secret"
         );
+    }
+
+    #[test]
+    fn scoped_credential_cannot_cross_https_origins() {
+        use zeroclaw_config::schema::{ScopedApiKeyHeader, ScopedHttpAuth, ScopedHttpCredential};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["*".into()],
+            1024,
+            10,
+            false,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        tool.scoped_credential_fixture(
+            dir.path(),
+            ScopedHttpCredential {
+                origin: "https://example.com".into(),
+                auth: ScopedHttpAuth::ApiKey {
+                    value: "fixture-key".into(),
+                    header: ScopedApiKeyHeader::XApiKey,
+                },
+            },
+        );
+        let mut headers = HeaderMap::new();
+        for url in [
+            "http://example.com",
+            "https://other.example.com",
+            "https://example.com:8443",
+        ] {
+            let target = ValidatedHttpRequestTarget {
+                url: url.into(),
+                host: String::new(),
+                resolved_addrs: Vec::new(),
+            };
+            assert!(
+                tool.apply_scoped_credential(&mut headers, "TEST", &target)
+                    .is_err()
+            );
+            assert!(headers.is_empty());
+        }
+        let target = ValidatedHttpRequestTarget {
+            url: "https://example.com/api".into(),
+            host: String::new(),
+            resolved_addrs: Vec::new(),
+        };
+        assert!(
+            tool.apply_scoped_credential(&mut headers, "TEST", &target)
+                .is_ok()
+        );
+        assert_eq!(headers["x-api-key"], "fixture-key");
+        assert!(headers["x-api-key"].is_sensitive());
     }
 
     #[test]
