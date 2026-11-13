@@ -58,6 +58,11 @@ impl SopApproveTool {
 
 #[async_trait]
 impl Tool for SopApproveTool {
+    fn requires_unrestricted_principal(&self) -> bool {
+        // Resuming a run can assemble agents outside the caller's ceilings.
+        true
+    }
+
     fn name(&self) -> &str {
         "sop_approve"
     }

@@ -22,7 +22,9 @@ export interface WebSocketClientOptions {
   reconnectDelay?: number;
   /** Maximum reconnect delay in ms. */
   maxReconnectDelay?: number;
-  /** Set to false to disable auto-reconnect. Default true. */
+  /** Set to false to disable auto-reconnect, on a timer and after a
+   * re-authentication alike: a socket that is one conversation ends for good
+   * when it closes. Default true. */
   autoReconnect?: boolean;
 }
 
@@ -33,6 +35,12 @@ const MAX_RECONNECT_DELAY = 30000;
 export const WS_CLOSE_SESSION_ENDED = 4401;
 /** The gateway closed a signed-in session's socket: its access was removed. */
 export const WS_CLOSE_ACCESS_LOST = 4403;
+/** The gateway refused a new conversation: the account's open conversations
+ * are all busy. The socket waits for the user to try again. */
+export const WS_CLOSE_CONVERSATION_LIMIT = 4409;
+/** The gateway closed this conversation under the socket. Reconnecting on the
+ * same id starts a fresh one, so this reconnects like any other close. */
+export const WS_CLOSE_CONVERSATION_CLOSED = 4410;
 
 /**
  * Route a socket close under dashboard sign-in. Returns true when the socket
@@ -132,6 +140,9 @@ export class WebSocketClient {
     this.ws.onclose = (ev: CloseEvent) => {
       this.onClose?.(ev);
       if (this.intentionallyClosed) return;
+      // Retrying on a timer would only hit the limit again; the owner calls
+      // connect() when the user asks to try again.
+      if (ev.code === WS_CLOSE_CONVERSATION_LIMIT) return;
       if (routeSessionClose(ev.code)) {
         this.haltedForAuth = true;
         return;
@@ -187,7 +198,7 @@ export class WebSocketClient {
   // ---------------------------------------------------------------------------
 
   private readonly handleAuthResumed = (): void => {
-    if (!this.haltedForAuth || this.intentionallyClosed) return;
+    if (!this.haltedForAuth || this.intentionallyClosed || !this.autoReconnect) return;
     this.currentDelay = this.reconnectDelay;
     this.connect();
   };
