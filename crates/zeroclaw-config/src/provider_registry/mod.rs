@@ -19,6 +19,7 @@ pub use api::*;
 pub use connection::*;
 pub use ids::{ModelRef, PresetId, ProviderId};
 pub use model::*;
+pub(crate) use options::option_fields;
 pub use options::{
     AsrOptionsPatch, ChatOptionsPatch, ModelPreset, Preset, TextExtraction, TtsOptionsPatch,
 };

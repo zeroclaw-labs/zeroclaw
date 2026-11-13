@@ -14,6 +14,56 @@
 
 use std::process::Command;
 
+#[test]
+#[cfg(feature = "agent-runtime")]
+fn models_set_persists_model_and_preserves_slash_bearing_ids() {
+    let dir = tempfile::TempDir::new().expect("temp config dir");
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        format!(
+            r#"
+schema_version = {}
+[providers.connections.anthropic]
+kind = "anthropic"
+[providers.models.primary]
+capability = "chat"
+provider = "anthropic"
+model = "claude-opus-4-7"
+"#,
+            zeroclaw_config::migration::CURRENT_SCHEMA_VERSION
+        ),
+    )
+    .unwrap();
+
+    // Exercise real dispatch, config ownership, reload and persistence without
+    // mutating the parent test process's config-directory environment.
+    for model in ["claude-sonnet-4-6", "anthropic/claude-sonnet-4-20250514"] {
+        run(dir.path(), &["models", "set", model]);
+        let persisted: toml::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        assert_eq!(
+            persisted["providers"]["models"]["primary"]["model"].as_str(),
+            Some(model)
+        );
+    }
+
+    std::fs::write(
+        &path,
+        format!(
+            "schema_version = {}\n",
+            zeroclaw_config::migration::CURRENT_SCHEMA_VERSION
+        ),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_zeroclaw"))
+        .env("ZEROCLAW_CONFIG_DIR", dir.path())
+        .args(["models", "set", "any-model"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("No model provider configured"));
+}
+
 const CONFIG_WITH_DEFAULT: &str = r#"
 [providers.models.openai.gw]
 uri = "http://127.0.0.1:1"

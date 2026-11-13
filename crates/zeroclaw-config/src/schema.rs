@@ -23700,14 +23700,6 @@ impl Config {
     /// this scanner once to make that loss visible. It operates on TOML
     /// tables directly, preserving quoted dotted registry keys as one key.
     pub fn unknown_canonical_option_fields(raw_toml: &str) -> Vec<String> {
-        fn option_fields(capability: &str) -> &'static [&'static str] {
-            match capability {
-                "chat" => crate::provider_registry::ChatOptionsPatch::FIELDS,
-                "tts" => crate::provider_registry::TtsOptionsPatch::FIELDS,
-                "asr" => crate::provider_registry::AsrOptionsPatch::FIELDS,
-                _ => &[],
-            }
-        }
         fn key_segment(key: &str) -> String {
             toml_edit::Key::new(key).to_string()
         }
@@ -23720,7 +23712,7 @@ impl Config {
             let Some(options) = options.and_then(toml::Value::as_table) else {
                 return;
             };
-            let known = option_fields(capability);
+            let known = crate::provider_registry::option_fields(capability);
             for field in options
                 .keys()
                 .filter(|field| !known.contains(&field.as_str()))

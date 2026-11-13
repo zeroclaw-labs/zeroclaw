@@ -53,7 +53,7 @@ pub(crate) fn snapshot_document(document: &Value, path: &str) -> Result<String> 
     let mut missing_parents = Vec::new();
     let mut parent = pointer.rsplit_once('/').map(|(parent, _)| parent);
     while let Some(path) = parent {
-        if document.pointer(path).is_none() {
+        if document.pointer(path).is_none_or(Value::is_null) {
             missing_parents.push(path.to_owned());
         }
         parent = path.rsplit_once('/').map(|(parent, _)| parent);
@@ -203,6 +203,46 @@ pub(crate) fn set(config: &mut Config, path: &str, value: &str, restore: bool) -
         .filter(|value| !value.is_null() && !value.is_string())
         .unwrap_or_else(|| literal.clone());
     set_document(&mut document, path, parsed.clone(), None)?;
+    // Option patches tolerate unknown keys when loading files (the startup
+    // scanner reports them). Env edits instead fail atomically. Validate
+    // these permissive leaves from the same field declarations; every other
+    // canonical container is checked by its strict typed deserializer.
+    let parts: Vec<_> = path
+        .trim_start_matches('/')
+        .split('/')
+        .map(|part| part.replace("~1", "/").replace("~0", "~"))
+        .collect();
+    let target_field = parts.last().map(String::as_str);
+    let capability = match parts
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        [
+            "providers",
+            section @ ("models" | "model_presets"),
+            key,
+            "options",
+            ..,
+        ] => document[*section][*key]["capability"].as_str(),
+        [
+            "providers",
+            "connections",
+            _key,
+            "api",
+            capability,
+            "options",
+            ..,
+        ] => Some(*capability),
+        _ => None,
+    };
+    if let (Some(capability), Some(field)) = (capability, target_field) {
+        ensure!(
+            super::option_fields(capability).contains(&field),
+            "unknown registry override field"
+        );
+    }
     let candidate = serde_json::from_value(document.clone());
     let candidate: crate::providers::Providers = match candidate {
         Ok(candidate) => candidate,
@@ -212,17 +252,6 @@ pub(crate) fn set(config: &mut Config, path: &str, value: &str, restore: bool) -
             serde_json::from_value(document)?
         }
     };
-    // Config files report unknown options at startup. Environment overrides
-    // must fail atomically if their target disappears during typed decoding.
-    if !value.is_empty() {
-        let pointer = path
-            .strip_prefix("/providers")
-            .ok_or_else(|| anyhow::Error::msg("invalid registry override path"))?;
-        ensure!(
-            serde_json::to_value(&candidate)?.pointer(pointer).is_some(),
-            "unknown registry override field"
-        );
-    }
     config.providers = candidate;
     Ok(())
 }
@@ -440,6 +469,38 @@ mod tests {
                 serde_json::json!({"enable_thinking":false,"limit":123})
             );
             set(&mut config, &path, &saved, true).unwrap();
+        }
+    }
+
+    #[test]
+    fn empty_collections_are_valid_even_when_serialization_omits_them() {
+        let mut config = fixture();
+        config.providers.connections.insert(
+            "grok.local".into(),
+            serde_json::from_value(serde_json::json!({
+                "kind": "grok_cli", "api": {"chat": {
+                    "env_passthrough": ["PATH"], "extra_args": ["--verbose"]
+                }}
+            }))
+            .unwrap(),
+        );
+        for field in ["env_passthrough", "extra_args"] {
+            let path = path(
+                &config,
+                &format!("providers__connections__grok.local__api__chat__{field}"),
+            )
+            .unwrap();
+            let before = serde_json::to_value(&config.providers).unwrap();
+            let saved = snapshot(&config, &path).unwrap();
+            set(&mut config, &path, "[]", false).unwrap();
+            let value = serde_json::to_value(&config.providers).unwrap();
+            assert!(
+                value["connections"]["grok.local"]["api"]["chat"]
+                    .get(field)
+                    .is_none()
+            );
+            set(&mut config, &path, &saved, true).unwrap();
+            assert_eq!(serde_json::to_value(&config.providers).unwrap(), before);
         }
     }
 

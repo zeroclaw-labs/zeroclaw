@@ -5,6 +5,15 @@ use serde::{Deserialize, Serialize};
 use super::Override;
 use crate::schema::{CacheTtl, ToolResultImagePolicy, WireApi};
 
+pub(crate) fn option_fields(capability: &str) -> &'static [&'static str] {
+    match capability {
+        "chat" => ChatOptionsPatch::FIELDS,
+        "tts" => TtsOptionsPatch::FIELDS,
+        "asr" => AsrOptionsPatch::FIELDS,
+        _ => &[],
+    }
+}
+
 macro_rules! options_patch {
     ($name:ident { $($field:ident: $type:ty),* $(,)? }) => {
         #[derive(Debug, Clone, Default, Serialize, Deserialize)]

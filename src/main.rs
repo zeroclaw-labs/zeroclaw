@@ -22269,94 +22269,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    #[cfg(feature = "agent-runtime")]
-    async fn models_set_persists_model_and_preserves_slash_bearing_ids() {
-        use crate::config::schema::{AnthropicModelProviderConfig, Config, ModelProviderConfig};
-
-        let tmp = tempfile::TempDir::new().expect("temp dir");
-        let config_path = tmp.path().join("config.toml");
-
-        std::fs::write(
-            &config_path,
-            format!(
-                "schema_version = {}\n\n[providers.models.anthropic.default]\nmodel = \"claude-opus-4-7\"\n",
-                crate::config::migration::CURRENT_SCHEMA_VERSION,
-            ),
-        )
-        .unwrap();
-
-        let mut config = Config {
-            config_path: config_path.clone(),
-            data_dir: tmp.path().join("workspace"),
-            schema_version: crate::config::migration::CURRENT_SCHEMA_VERSION,
-            ..Config::default()
-        };
-        config.providers.models.anthropic.insert(
-            "default".to_string(),
-            AnthropicModelProviderConfig {
-                base: ModelProviderConfig {
-                    model: Some("claude-opus-4-7".to_string()),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        );
-
-        // ── Test 1: Normal model ID persists via the dispatch boundary ──
-        dispatch_models_command(
-            ModelCommands::Set {
-                model: "claude-sonnet-4-6".to_string(),
-            },
-            &mut config,
-        )
-        .await
-        .expect("normal model ID must persist");
-
-        let contents = std::fs::read_to_string(&config_path).unwrap();
-        assert!(
-            contents.contains("claude-sonnet-4-6"),
-            "normal model ID must be persisted to config.toml; got:\n{contents}"
-        );
-
-        // ── Test 2: Slash-bearing model ID preserved as-is ──
-        dispatch_models_command(
-            ModelCommands::Set {
-                model: "anthropic/claude-sonnet-4-20250514".to_string(),
-            },
-            &mut config,
-        )
-        .await
-        .expect("slash-bearing model ID must persist");
-
-        let contents = std::fs::read_to_string(&config_path).unwrap();
-        assert!(
-            contents.contains("anthropic/claude-sonnet-4-20250514"),
-            "slash-bearing model ID must be stored as-is; got:\n{contents}"
-        );
-
-        // ── Test 3: No configured provider → error surfaced by dispatch ──
-        let mut empty_config = Config {
-            config_path: tmp.path().join("empty.toml"),
-            data_dir: tmp.path().join("empty_workspace"),
-            schema_version: crate::config::migration::CURRENT_SCHEMA_VERSION,
-            ..Config::default()
-        };
-        let err = dispatch_models_command(
-            ModelCommands::Set {
-                model: "any-model".to_string(),
-            },
-            &mut empty_config,
-        )
-        .await
-        .expect_err("empty config must fail");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("No model provider configured"),
-            "error must mention missing provider; got: {msg}"
-        );
-    }
-
     #[cfg(not(feature = "agent-runtime"))]
     #[tokio::test]
     async fn kernel_agent_model_uses_target_alias_uri_and_nested_options() {
@@ -22430,11 +22342,10 @@ mod tests {
     }
 
     #[cfg(feature = "agent-runtime")]
-    #[cfg(feature = "agent-runtime")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sop_llm_resolves_live_model_configuration_on_each_call() {
         use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
-        use zeroclaw_config::schema::{AliasedAgentConfig, ModelEntryConfig};
+        use zeroclaw_config::schema::AliasedAgentConfig;
 
         let first = MockServer::start().await;
         let second = MockServer::start().await;
@@ -22448,30 +22359,26 @@ mod tests {
         }
         let mut config = Config::default();
         config.reliability.provider_retries = 0;
-        let profile = config.providers.models.ensure("custom", "gw.v2").unwrap();
-        profile.uri = Some(first.uri());
-        profile.api_key = Some("sop-fixture-first-key".into());
-        profile.model = Some("legacy-id".into());
-        profile.temperature = Some(0.7);
-        profile.max_tokens = Some(111);
-        profile.provider_extra = Some(serde_json::json!({"seed": 1}));
-        for (alias, temperature, limit, seed) in [("default", 0.1, 21, 2), ("fast", 0.2, 41, 3)] {
-            profile.models.insert(
-                alias.into(),
-                ModelEntryConfig {
-                    // Identical wire IDs must still retain the selected tuning.
-                    id: Some("shared-id".into()),
-                    temperature: Some(temperature),
-                    max_tokens: Some(limit),
-                    provider_extra: Some(serde_json::json!({"seed": seed})),
-                    ..Default::default()
-                },
-            );
-        }
+        config.providers = serde_json::from_value(serde_json::json!({
+            "connections": {"gateway.v2": {
+                "kind": "custom", "uri": first.uri(),
+                "auth": {"mode": "api_key", "api_key": "sop-fixture-first-key"},
+                "api": {"chat": {"options": {
+                    "temperature": 0.7, "max_tokens": 111, "provider_extra": {"seed": 1}
+                }}}
+            }},
+            "models": {
+                "chat.base": {"capability": "chat", "provider": "gateway.v2", "model": "base-id"},
+                "chat.default": {"capability": "chat", "provider": "gateway.v2", "model": "shared-id",
+                    "options": {"temperature": 0.1, "max_tokens": 21, "provider_extra": {"seed": 2}}},
+                "chat.fast": {"capability": "chat", "provider": "gateway.v2", "model": "shared-id",
+                    "options": {"temperature": 0.2, "max_tokens": 41, "provider_extra": {"seed": 3}}}
+            }
+        })).unwrap();
         config.agents.insert(
             "default".into(),
             AliasedAgentConfig {
-                model_provider: "custom.gw.v2.fast".into(),
+                model_provider: "chat.fast".into(),
                 ..Default::default()
             },
         );
@@ -22498,38 +22405,49 @@ mod tests {
             (3, "updated-id", None, 111, 1),
             (4, "shared-id", Some(0.1), 21, 2),
             (5, "shared-id", Some(0.1), 21, 2),
-            (6, "legacy-id", None, 111, 1),
+            (6, "base-id", None, 111, 1),
         ] {
             if stage > 0 {
-                let profile = config.providers.models.ensure("custom", "gw.v2").unwrap();
-                let fast = profile.models.get_mut("fast").unwrap();
+                let mut registry = serde_json::to_value(&config.providers).unwrap();
                 match stage {
                     1 => {
-                        profile.uri = Some(second.uri());
-                        profile.api_key = Some("sop-fixture-second-key".into());
-                        fast.id = Some(model.into());
-                        fast.temperature = temperature;
-                        fast.max_tokens = Some(limit);
-                        fast.provider_extra = Some(serde_json::json!({"seed": seed}));
+                        registry["connections"]["gateway.v2"]["uri"] = second.uri().into();
+                        registry["connections"]["gateway.v2"]["auth"]["api_key"] =
+                            "sop-fixture-second-key".into();
+                        registry["models"]["chat.fast"]["model"] = model.into();
+                        registry["models"]["chat.fast"]["options"] = serde_json::json!({
+                            "temperature": temperature, "max_tokens": limit, "provider_extra": {"seed": seed}
+                        });
                     }
                     2 => {
-                        fast.temperature = None;
-                        fast.max_tokens = None;
-                        fast.provider_extra = None;
+                        registry["models"]["chat.fast"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("options");
                     }
-                    3 => profile.temperature = None,
+                    3 => {
+                        registry["connections"]["gateway.v2"]["api"]["chat"]["options"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("temperature");
+                    }
                     4 => {
                         config.agents.get_mut("default").unwrap().model_provider =
-                            "custom.gw.v2".into();
+                            "chat.default".into();
                     }
-                    5 => profile.api_key = None,
+                    5 => {
+                        registry["connections"]["gateway.v2"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("auth");
+                    }
                     6 => {
-                        fast.id = None;
                         config.agents.get_mut("default").unwrap().model_provider =
-                            "custom.gw.v2.fast".into();
+                            "chat.base".into();
                     }
                     _ => unreachable!(),
                 }
+                config.providers = serde_json::from_value(registry).unwrap();
                 authority.publish_for_test(config.clone());
             }
             let call_adapter = std::sync::Arc::clone(&adapter);
@@ -22567,7 +22485,7 @@ mod tests {
             }
         }
         // A bad live reference must fail rather than reuse the previous model.
-        config.agents.get_mut("default").unwrap().model_provider = "custom.gw.v2.typo".into();
+        config.agents.get_mut("default").unwrap().model_provider = "chat.typo".into();
         authority.publish_for_test(config);
         let error = tokio::task::spawn_blocking(move || adapter.generate_typed(None, "prompt"))
             .await
