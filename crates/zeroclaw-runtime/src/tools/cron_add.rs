@@ -445,6 +445,7 @@ impl Tool for CronAddTool {
                     &self.security,
                     command,
                     approved,
+                    &self.config.data_dir,
                 ) {
                     return Ok(ToolResult {
                         success: false,

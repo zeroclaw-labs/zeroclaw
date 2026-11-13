@@ -1,5 +1,7 @@
 //! Shared baseline environment for shell child processes.
 
+use std::ffi::OsString;
+
 /// One immutable, session-scoped client environment shared by shell execution
 /// and RPC admission. Only the handles are cloned; values are neither copied
 /// into admission state nor persisted. Eligibility is resolved from live grants.
@@ -34,6 +36,38 @@ pub(crate) const SAFE_SHELL_ENV_VARS: &[&str] = &[
     "LANG",
     "USERNAME",
 ];
+
+/// Variables the runtime's command builder set on `process`; `None` marks one
+/// the builder removed. They are part of the builder's spawn contract, which
+/// `zeroclaw_config::platform::native` owns, so a spawner that must
+/// `env_clear` takes this snapshot first and restores it with
+/// [`reapply_command_env`].
+pub(crate) fn command_env_snapshot(
+    process: &tokio::process::Command,
+) -> Vec<(OsString, Option<OsString>)> {
+    process
+        .as_std()
+        .get_envs()
+        .map(|(key, value)| (key.to_os_string(), value.map(|value| value.to_os_string())))
+        .collect()
+}
+
+/// Restore a [`command_env_snapshot`] after `env_clear`.
+pub(crate) fn reapply_command_env(
+    process: &mut tokio::process::Command,
+    snapshot: Vec<(OsString, Option<OsString>)>,
+) {
+    for (key, value) in snapshot {
+        match value {
+            Some(value) => {
+                process.env(key, value);
+            }
+            None => {
+                process.env_remove(key);
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

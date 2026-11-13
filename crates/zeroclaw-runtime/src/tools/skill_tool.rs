@@ -2,7 +2,7 @@
 
 use crate::platform::{NativeRuntime, RuntimeAdapter};
 use crate::security::SecurityPolicy;
-use crate::tools::shell_env::SAFE_SHELL_ENV_VARS;
+use crate::tools::shell_env::{SAFE_SHELL_ENV_VARS, command_env_snapshot, reapply_command_env};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -211,6 +211,9 @@ impl Tool for SkillShellTool {
                 });
             }
         };
+        // `command_env_snapshot` explains why the runtime builder's own
+        // variables must survive the reset below.
+        let builder_env = command_env_snapshot(&cmd);
         cmd.env_clear();
 
         // Only pass safe environment variables
@@ -224,6 +227,8 @@ impl Tool for SkillShellTool {
         if let Some(session_id) = get_session_id() {
             cmd.env(SESSION_ID_ENV_VAR, session_id);
         }
+
+        reapply_command_env(&mut cmd, builder_env);
 
         let result =
             tokio::time::timeout(Duration::from_secs(self.timeout_secs), cmd.output()).await;
@@ -713,6 +718,41 @@ mod tests {
         let result = tool.execute(serde_json::json!({})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("hello-skill"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn skill_shell_child_sees_cwd_exe_search_hardening_after_env_clear() {
+        use zeroclaw_config::platform::native::NO_DEFAULT_CURRENT_DIRECTORY_IN_EXE_PATH as HARDENING;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_commands: vec!["set".into()],
+            ..SecurityPolicy::default()
+        });
+        let skill = SkillTool {
+            name: "hardening_probe".into(),
+            description: "Read the working-directory search switch".into(),
+            kind: "shell".into(),
+            // `set NAME` prints the variables whose names start with NAME.
+            command: format!("set {HARDENING}"),
+            args: HashMap::new(),
+            target: None,
+            locked_args: HashMap::new(),
+            timeout_secs: None,
+        };
+        let tool = SkillShellTool::new_with_runtime(
+            "test",
+            &skill,
+            security,
+            Arc::new(NativeRuntime::with_shell("cmd".into())),
+        );
+
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(result.output.trim(), format!("{HARDENING}=1"));
     }
 
     #[cfg(windows)]

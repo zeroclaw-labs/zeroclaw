@@ -213,6 +213,7 @@ impl Tool for CronRunTool {
                 &self.security,
                 &job.command,
                 approved,
+                &config.data_dir,
             )
         {
             return Ok(ToolResult {

@@ -1659,9 +1659,16 @@ async fn run_job_command_with_runtime_and_timeout(
     // Jobs created via the validated helpers were already checked at creation
     // time, but we re-validate at execution time to catch policy changes and
     // manually-edited job stores.
-    if let Err(error) =
-        crate::cron::validate_shell_command_with_security(runtime, security, &job.command, approved)
-    {
+    // The job's shell starts in the data directory. Validation probes that same
+    // directory, so both read one binding and cannot drift apart.
+    let job_cwd = &config.data_dir;
+    if let Err(error) = crate::cron::validate_shell_command_with_security(
+        runtime,
+        security,
+        &job.command,
+        approved,
+        job_cwd,
+    ) {
         return (false, error.to_string());
     }
 
@@ -1688,7 +1695,7 @@ async fn run_job_command_with_runtime_and_timeout(
     // override an imperative job's stored format.
     let output_format = &job.shell_output_format;
 
-    let mut command = match runtime.build_shell_command(&job.command, &config.data_dir) {
+    let mut command = match runtime.build_shell_command(&job.command, job_cwd) {
         Ok(command) => command,
         Err(error) => return (false, format!("shell setup error: {error}")),
     };
@@ -4395,6 +4402,7 @@ mod tests {
             &security,
             "Write-Output $PSHOME",
             false,
+            &config.data_dir,
         )
         .expect("documented read-only PowerShell command should pass");
         assert!(
@@ -4403,9 +4411,47 @@ mod tests {
                 &security,
                 "echo ([System.IO.File]::Delete('important.txt'))",
                 false,
+                &config.data_dir,
             )
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "windows")]
+    async fn run_job_command_probes_data_dir_for_cmd_shadow() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.runtime.shell = Some("cmd".into());
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let security = SecurityPolicy {
+            autonomy: crate::security::AutonomyLevel::Full,
+            workspace_dir: workspace.clone(),
+            allowed_commands: vec!["whoami".into()],
+            ..SecurityPolicy::default()
+        };
+        let job = test_job("whoami");
+
+        // A cron shell starts in the data directory, so that is where cmd.exe
+        // would look first. The job is refused before it spawns.
+        let shadow = config.data_dir.join("whoami.cmd");
+        std::fs::write(&shadow, "@echo HIJACKED\r\n").unwrap();
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(!success, "{output}");
+        assert!(
+            output.contains("working directory shadows command"),
+            "{output}"
+        );
+        assert!(!output.contains("HIJACKED"), "{output}");
+
+        // The same file in the workspace does not concern a cron job: its
+        // shell never starts there.
+        std::fs::remove_file(&shadow).unwrap();
+        std::fs::write(workspace.join("whoami.cmd"), "@echo HIJACKED\r\n").unwrap();
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(success, "{output}");
+        assert!(!output.contains("HIJACKED"), "{output}");
     }
 
     #[tokio::test]
