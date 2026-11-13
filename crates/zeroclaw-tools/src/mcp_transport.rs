@@ -84,7 +84,7 @@ fn apply_request_timeout(
     }
 }
 
-fn require_https_url(server_name: &str, url: &str, target: &str) -> Result<()> {
+pub(crate) fn require_https_url(server_name: &str, url: &str, target: &str) -> Result<()> {
     let parsed = reqwest::Url::parse(url)
         .with_context(|| format!("MCP server `{server_name}`: invalid {target} URL"))?;
     if parsed.scheme() != "https" {
@@ -120,7 +120,7 @@ fn open_tls_ca_file(path: &str) -> std::io::Result<std::fs::File> {
     options.open(path)
 }
 
-fn load_tls_ca_pem(config: &McpServerConfig, path: &str) -> Result<Vec<u8>> {
+pub(crate) fn load_tls_ca_pem(config: &McpServerConfig, path: &str) -> Result<Vec<u8>> {
     let file = open_tls_ca_file(path).with_context(|| {
         format!(
             "MCP server `{}`: cannot read TLS CA certificate at `{path}`",
@@ -892,7 +892,10 @@ fn resolve_max_response_bytes(config: &McpServerConfig) -> u64 {
 /// reads at most `limit + 1` bytes via tokio's own `Take` adapter, so a body
 /// over the cap is detected by length without ever buffering past it and without
 /// a hand-rolled `AsyncRead` that could violate the `read_to_end` contract.
-async fn read_body_bounded_to_string(resp: reqwest::Response, limit: u64) -> Result<String> {
+pub(crate) async fn read_body_bounded_to_string(
+    resp: reqwest::Response,
+    limit: u64,
+) -> Result<String> {
     if let Some(len) = resp.content_length()
         && len > limit
     {
