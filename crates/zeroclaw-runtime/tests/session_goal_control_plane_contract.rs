@@ -1428,6 +1428,97 @@ async fn migration_fails_nonterminal_legacy_goals_but_keeps_terminal_audit_rows(
 }
 
 #[tokio::test]
+async fn delayed_settlement_cannot_clear_a_later_operation_with_a_fresh_id() {
+    let store = SqliteTaskStore::new_in_memory().expect("initialize store");
+    assert_eq!(
+        store
+            .create_or_replace_session_goal(
+                session_goal_task("goal-fresh-call-ids", "fresh-call-id-session"),
+                session_goal_extension("goal-fresh-call-ids"),
+            )
+            .await
+            .expect("create session Goal"),
+        GoalTransitionResult::Applied
+    );
+
+    assert_eq!(
+        store
+            .admit_pending_operation(
+                "goal-fresh-call-ids",
+                "fresh-call-id-session",
+                1,
+                "operation-first",
+            )
+            .await
+            .expect("admit first operation"),
+        GoalTransitionResult::Applied
+    );
+    assert_eq!(
+        store
+            .settle_pending_operation(
+                "goal-fresh-call-ids",
+                "fresh-call-id-session",
+                1,
+                "operation-first",
+                GoalAccountingState::Complete,
+            )
+            .await
+            .expect("settle first operation"),
+        GoalTransitionResult::Applied
+    );
+
+    assert_eq!(
+        store
+            .admit_pending_operation(
+                "goal-fresh-call-ids",
+                "fresh-call-id-session",
+                1,
+                "operation-second",
+            )
+            .await
+            .expect("admit later operation with a fresh id"),
+        GoalTransitionResult::Applied
+    );
+    assert_eq!(
+        store
+            .settle_pending_operation(
+                "goal-fresh-call-ids",
+                "fresh-call-id-session",
+                1,
+                "operation-first",
+                GoalAccountingState::Complete,
+            )
+            .await
+            .expect("reject delayed settlement for the first operation"),
+        GoalTransitionResult::Stale
+    );
+    assert_eq!(
+        store
+            .get_goal_task("goal-fresh-call-ids")
+            .await
+            .expect("read current pending operation")
+            .expect("Goal extension exists")
+            .pending_call_id
+            .as_deref(),
+        Some("operation-second"),
+        "a delayed settlement must leave the later operation fenced"
+    );
+    assert_eq!(
+        store
+            .settle_pending_operation(
+                "goal-fresh-call-ids",
+                "fresh-call-id-session",
+                1,
+                "operation-second",
+                GoalAccountingState::Complete,
+            )
+            .await
+            .expect("settle later operation with its own id"),
+        GoalTransitionResult::Applied
+    );
+}
+
+#[tokio::test]
 async fn boot_recovery_pauses_clean_goals_and_fails_unsettled_operations() {
     let directory = tempfile::tempdir().expect("create temporary control-plane directory");
     let store = SqliteTaskStore::new(directory.path()).expect("initialize store");

@@ -11,6 +11,9 @@ use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 pub struct SopAdvanceTool {
     engine: Arc<Mutex<SopEngine>>,
     audit: Option<Arc<SopAuditLogger>>,
+    /// The session memory of the registry this tool was assembled into; once
+    /// that session is pinned, audit rows go to its owner's plane.
+    session_memory: Option<Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>>,
     collector: Option<Arc<SopMetricsCollector>>,
 }
 
@@ -19,6 +22,7 @@ impl SopAdvanceTool {
         Self {
             engine,
             audit: None,
+            session_memory: None,
             collector: None,
         }
     }
@@ -26,6 +30,22 @@ impl SopAdvanceTool {
     pub fn with_audit(mut self, audit: Arc<SopAuditLogger>) -> Self {
         self.audit = Some(audit);
         self
+    }
+
+    /// Share the session memory route of the registry this tool is
+    /// assembled into.
+    #[must_use]
+    pub fn with_session_memory(
+        mut self,
+        route: Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>,
+    ) -> Self {
+        self.session_memory = Some(route);
+        self
+    }
+
+    /// The audit logger this call writes through (see `session_audit`).
+    fn audit(&self) -> Option<Arc<SopAuditLogger>> {
+        crate::sop::audit::session_audit(self.audit.as_ref(), self.session_memory.as_ref())
     }
 
     pub fn with_collector(mut self, collector: Arc<SopMetricsCollector>) -> Self {
@@ -36,6 +56,11 @@ impl SopAdvanceTool {
 
 #[async_trait]
 impl Tool for SopAdvanceTool {
+    fn requires_unrestricted_principal(&self) -> bool {
+        // Advancing can enqueue another step without the caller's ceilings.
+        true
+    }
+
     fn name(&self) -> &str {
         "sop_advance"
     }
@@ -119,7 +144,13 @@ impl Tool for SopAdvanceTool {
         };
 
         // Lock engine, advance step, snapshot data for audit, then drop lock
-        let (action, step_result_ok, finished_run) = {
+        let owner = self
+            .session_memory
+            .as_ref()
+            .and_then(|route| route.routed())
+            .and_then(|routed| routed.memory.principal_scope());
+
+        let (action, step_result_ok, finished_run, memory_owner) = {
             let mut engine = self.engine.lock().map_err(|e| {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -132,19 +163,21 @@ impl Tool for SopAdvanceTool {
                 anyhow::Error::msg(format!("Engine lock poisoned: {e}"))
             })?;
 
-            let current_step = engine
+            let Some(run) = engine
                 .get_run(run_id)
-                .map(|r| r.current_step)
-                .ok_or_else(|| {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"run_id": run_id})),
-                        "sop_advance tool: run not found"
-                    );
-                    anyhow::Error::msg(format!("Run not found: {run_id}"))
-                })?;
+                .filter(|run| run.is_accessible_from(owner.as_ref()))
+            else {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(crate::i18n::get_required_cli_string(
+                        "cli-sop-run-unavailable",
+                    )),
+                });
+            };
+            let memory_owner = run.memory_owner.clone();
+
+            let current_step = run.current_step;
 
             let now = now_iso8601();
             let step_result = SopStepResult {
@@ -170,14 +203,15 @@ impl Tool for SopAdvanceTool {
                         _ => None,
                     };
                     // Only audit step result when advance succeeded
-                    (Ok(action), Some(step_result_clone), finished)
+                    (Ok(action), Some(step_result_clone), finished, memory_owner)
                 }
-                Err(e) => (Err(e), None, None),
+                Err(e) => (Err(e), None, None, memory_owner),
             }
         };
 
         // Audit logging (engine lock dropped, safe to await)
-        if let Some(ref audit) = self.audit {
+        let audit = crate::sop::audit::audit_for_run(self.audit(), memory_owner.as_ref());
+        if let Some(ref audit) = audit {
             if let Some(ref sr) = step_result_ok
                 && let Err(e) = audit.log_step_result(run_id, sr).await
             {
@@ -210,11 +244,7 @@ impl Tool for SopAdvanceTool {
         }
 
         if let Ok(ref action) = action {
-            crate::sop::executor::enqueue_live_action(
-                Arc::clone(&self.engine),
-                self.audit.clone(),
-                action,
-            );
+            crate::sop::executor::enqueue_live_action(Arc::clone(&self.engine), audit, action);
         }
 
         match action {
@@ -439,7 +469,13 @@ mod tests {
                 "output": "done"
             }))
             .await;
-        assert!(result.is_err());
+        let result = result.expect("missing and foreign runs use the same tool refusal");
+        assert!(!result.success);
+        assert!(result.output.is_empty());
+        assert_eq!(
+            result.error.as_deref(),
+            Some(crate::i18n::get_required_cli_string("cli-sop-run-unavailable").as_str())
+        );
     }
 
     #[test]
@@ -454,7 +490,7 @@ mod tests {
 
     #[tokio::test]
     async fn advance_error_does_not_write_step_audit() {
-        // Use a run_id that doesn't exist — advance_step will fail
+        // A missing run is refused before the engine transition or audit writes.
         let engine = Arc::new(Mutex::new(SopEngine::new(SopConfig::default())));
         let tmp = tempfile::tempdir().unwrap();
         let mem_cfg = zeroclaw_config::schema::MemoryConfig {
@@ -473,8 +509,13 @@ mod tests {
                 "output": "done"
             }))
             .await;
-        // advance_step on nonexistent run returns Err (anyhow)
-        assert!(result.is_err());
+        let result = result.expect("missing and foreign runs use the same tool refusal");
+        assert!(!result.success);
+        assert!(result.output.is_empty());
+        assert_eq!(
+            result.error.as_deref(),
+            Some(crate::i18n::get_required_cli_string("cli-sop-run-unavailable").as_str())
+        );
 
         // Verify no phantom audit entries were written
         let runs = audit.list_runs().await.unwrap();

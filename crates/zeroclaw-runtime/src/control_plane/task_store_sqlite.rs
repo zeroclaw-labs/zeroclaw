@@ -63,10 +63,24 @@ impl SqliteTaskStore {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn insert_legacy_terminal_settlement_intent_for_test(
+        &self,
+        intent: &TerminalSettlementIntent,
+    ) -> Result<bool> {
+        // Bypass the current Goal writer guard only to model a valid row left by
+        // an older writer. Keep the ordinary intent validation in place.
+        let mut conn = self.conn.lock();
+        persist_settlement_intent_record(&mut conn, intent)
+    }
+
     fn init(conn: Connection) -> Result<Self> {
+        // In WAL mode, FULL adds a WAL sync after each commit; fullfsync
+        // requests F_FULLFSYNC where the SQLite VFS supports it.
         conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;
+            "PRAGMA fullfsync = ON;
+             PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = FULL;
              PRAGMA busy_timeout = 5000;
              PRAGMA temp_store = MEMORY;
              PRAGMA foreign_keys = ON;",
@@ -161,38 +175,37 @@ impl SqliteTaskStore {
 }
 
 fn migrate_schema(conn: &Connection) -> Result<()> {
-    let version: i64 = conn
+    let mut version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .context("read control-plane schema version")?;
     if version < CONTROL_PLANE_SCHEMA_VERSION {
-        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
-            .context("begin control-plane schema migration")?;
-        add_column_if_missing(
-            &tx,
-            "tasks",
-            "session_id",
-            "ALTER TABLE tasks ADD COLUMN session_id TEXT",
-        )?;
-        add_column_if_missing(
-            &tx,
-            "tasks",
-            "execution_epoch",
-            "ALTER TABLE tasks ADD COLUMN execution_epoch INTEGER NOT NULL DEFAULT 0",
-        )?;
-        add_column_if_missing(
-            &tx,
-            "tasks",
-            "originator_chain",
-            "ALTER TABLE tasks ADD COLUMN originator_chain TEXT",
-        )?;
-        add_column_if_missing(
-            &tx,
-            "tasks",
-            "progress",
-            "ALTER TABLE tasks ADD COLUMN progress TEXT",
-        )?;
-        tx.execute_batch(
-            "CREATE TABLE IF NOT EXISTS terminal_settlement_intents (
+        version = migrate_schema_transaction(conn, |tx| {
+            add_column_if_missing(
+                tx,
+                "tasks",
+                "session_id",
+                "ALTER TABLE tasks ADD COLUMN session_id TEXT",
+            )?;
+            add_column_if_missing(
+                tx,
+                "tasks",
+                "execution_epoch",
+                "ALTER TABLE tasks ADD COLUMN execution_epoch INTEGER NOT NULL DEFAULT 0",
+            )?;
+            add_column_if_missing(
+                tx,
+                "tasks",
+                "originator_chain",
+                "ALTER TABLE tasks ADD COLUMN originator_chain TEXT",
+            )?;
+            add_column_if_missing(
+                tx,
+                "tasks",
+                "progress",
+                "ALTER TABLE tasks ADD COLUMN progress TEXT",
+            )?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS terminal_settlement_intents (
                      task_id          TEXT PRIMARY KEY
                                       REFERENCES tasks(id) ON DELETE CASCADE,
                      owner_pid        INTEGER NOT NULL,
@@ -205,19 +218,15 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
                  );
                  CREATE INDEX IF NOT EXISTS idx_terminal_settlement_intents_owner
                     ON terminal_settlement_intents(owner_pid, owner_boot_id);",
-        )
-        .context("ensure terminal settlement schema")?;
-        // Version 8 existed both as upstream terminal-settlement schema and as
-        // a provisional Goal schema. Converge older databases through Goal's
-        // additive final schema; its session index replaces the superseded
-        // context uniqueness index without recreating it on legacy rows.
-        goal::converge_schema(&tx)?;
-        tx.execute_batch(&format!(
-            "PRAGMA user_version = {CONTROL_PLANE_SCHEMA_VERSION};"
-        ))
-        .context("mark final control-plane schema version")?;
-        tx.commit()
-            .context("commit control-plane schema migration")?;
+            )
+            .context("ensure terminal settlement schema")?;
+            // Version 8 existed both as upstream terminal-settlement schema and as
+            // a provisional Goal schema. Converge older databases through Goal's
+            // additive final schema; its session index replaces the superseded
+            // context uniqueness index without recreating it on legacy rows.
+            goal::converge_schema(tx)?;
+            Ok(())
+        })?;
     }
     if version > CONTROL_PLANE_SCHEMA_VERSION {
         ::zeroclaw_log::record!(
@@ -232,6 +241,30 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn migrate_schema_transaction(
+    conn: &Connection,
+    apply_migrations: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<()>,
+) -> Result<i64> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .context("begin control-plane schema migration")?;
+    let version: i64 = tx
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .context("recheck control-plane schema version after acquiring migration lock")?;
+    let final_version = if version < CONTROL_PLANE_SCHEMA_VERSION {
+        apply_migrations(&tx)?;
+        tx.execute_batch(&format!(
+            "PRAGMA user_version = {CONTROL_PLANE_SCHEMA_VERSION};"
+        ))
+        .context("mark final control-plane schema version")?;
+        CONTROL_PLANE_SCHEMA_VERSION
+    } else {
+        version
+    };
+    tx.commit()
+        .context("commit control-plane schema migration")?;
+    Ok(final_version)
 }
 
 fn add_column_if_missing(
@@ -1150,6 +1183,17 @@ impl TaskRegistry for SqliteTaskStore {
 mod tests {
     use super::*;
 
+    static MIGRATION_LOCK_OBSERVED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    static MIGRATION_CALLBACK_CALLED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    fn signal_migration_lock(_: i32) -> bool {
+        MIGRATION_LOCK_OBSERVED.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        true
+    }
+
     /// Copy the released schema independently of the candidate's migration.
     /// DDL comes from control_plane/task_store_sqlite.rs::{init,migrate_schema}
     /// and control_plane/task_store_sqlite/goal.rs::migrate_schema before the
@@ -1523,6 +1567,83 @@ CREATE TABLE IF NOT EXISTS terminal_settlement_intents (
 
         assert_eq!(version, CONTROL_PLANE_SCHEMA_VERSION);
         assert_eq!(outbox_exists, 1);
+    }
+
+    #[test]
+    fn each_file_backed_control_plane_connection_uses_wal_full_and_fullfsync() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = SqliteTaskStore::new(directory.path()).unwrap();
+        let second = SqliteTaskStore::new(directory.path()).unwrap();
+
+        for store in [&first, &second] {
+            let conn = store.conn.lock();
+            let journal_mode: String = conn
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap();
+            let synchronous: i64 = conn
+                .query_row("PRAGMA synchronous", [], |row| row.get(0))
+                .unwrap();
+            let fullfsync: i64 = conn
+                .query_row("PRAGMA fullfsync", [], |row| row.get(0))
+                .unwrap();
+
+            assert_eq!(journal_mode, "wal");
+            assert_eq!(synchronous, 2, "SQLite FULL synchronous mode");
+            assert_eq!(fullfsync, 1, "SQLite fullfsync mode");
+        }
+    }
+
+    #[test]
+    fn migration_rechecks_schema_version_after_waiting_for_write_lock() {
+        use std::sync::atomic::Ordering;
+        use std::time::Instant;
+
+        MIGRATION_LOCK_OBSERVED.store(false, Ordering::SeqCst);
+        MIGRATION_CALLBACK_CALLED.store(false, Ordering::SeqCst);
+
+        let directory = tempfile::tempdir().unwrap();
+        SqliteTaskStore::new(directory.path()).unwrap();
+        let database = directory.path().join("control_plane.db");
+        let writer = Connection::open(&database).unwrap();
+        writer
+            .execute_batch("PRAGMA user_version = 12; BEGIN IMMEDIATE;")
+            .unwrap();
+
+        let worker_database = database.clone();
+        let worker = std::thread::spawn(move || {
+            let connection = Connection::open(worker_database).unwrap();
+            connection
+                .busy_handler(Some(signal_migration_lock))
+                .unwrap();
+            migrate_schema_transaction(&connection, |_| {
+                MIGRATION_CALLBACK_CALLED.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while !MIGRATION_LOCK_OBSERVED.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            MIGRATION_LOCK_OBSERVED.load(Ordering::SeqCst),
+            "the migration worker should wait for the existing writer"
+        );
+
+        writer
+            .execute_batch("PRAGMA user_version = 13; COMMIT;")
+            .unwrap();
+        let version = worker.join().unwrap().unwrap();
+
+        assert_eq!(version, CONTROL_PLANE_SCHEMA_VERSION);
+        assert!(
+            !MIGRATION_CALLBACK_CALLED.load(Ordering::SeqCst),
+            "a migration already completed by another opener must not be replayed"
+        );
+        let stored_version: i64 = writer
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stored_version, CONTROL_PLANE_SCHEMA_VERSION);
     }
 
     #[tokio::test]
