@@ -212,8 +212,7 @@ pub(crate) fn set(config: &mut Config, path: &str, value: &str, restore: bool) -
         .split('/')
         .map(|part| part.replace("~1", "/").replace("~0", "~"))
         .collect();
-    let target_field = parts.last().map(String::as_str);
-    let capability = match parts
+    let options = match parts
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>()
@@ -225,23 +224,30 @@ pub(crate) fn set(config: &mut Config, path: &str, value: &str, restore: bool) -
             key,
             "options",
             ..,
-        ] => document[*section][*key]["capability"].as_str(),
+        ] => document[*section][*key]["capability"]
+            .as_str()
+            .map(|capability| (capability, &document[*section][*key]["options"])),
         [
             "providers",
             "connections",
-            _key,
+            key,
             "api",
             capability,
             "options",
             ..,
-        ] => Some(*capability),
+        ] => Some((
+            *capability,
+            &document["connections"][*key]["api"][*capability]["options"],
+        )),
         _ => None,
     };
-    if let (Some(capability), Some(field)) = (capability, target_field) {
-        ensure!(
-            super::option_fields(capability).contains(&field),
-            "unknown registry override field"
-        );
+    if let Some((capability, options)) = options {
+        for field in options.as_object().into_iter().flat_map(|map| map.keys()) {
+            ensure!(
+                super::option_fields(capability).contains(&field.as_str()),
+                "unknown registry override field"
+            );
+        }
     }
     let candidate = serde_json::from_value(document.clone());
     let candidate: crate::providers::Providers = match candidate {
@@ -502,6 +508,9 @@ mod tests {
             set(&mut config, &path, &saved, true).unwrap();
             assert_eq!(serde_json::to_value(&config.providers).unwrap(), before);
         }
+        let path = path(&config, "providers__models__chat.Fast.v2__options").unwrap();
+        set(&mut config, &path, "{}", false).unwrap();
+        assert!(set(&mut config, &path, r#"{"temperatur":0.5}"#, false).is_err());
     }
 
     #[test]
