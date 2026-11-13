@@ -33193,11 +33193,13 @@ options = {{ native_tools = true, temperature = 0.1 }}
             alt_model_provider,
         );
 
-        let mut prompt_config = zeroclaw_config::schema::Config::default();
-        prompt_config.providers = serde_json::from_value(serde_json::json!({
-            "connections": {"gateway.router": {"kind": "openrouter"}},
-            "models": {"openrouter.default": {"capability": "chat", "provider": "gateway.router", "model": "default-model"}}
-        })).unwrap();
+        let prompt_config = zeroclaw_config::schema::Config {
+            providers: serde_json::from_value(serde_json::json!({
+                "connections": {"gateway.router": {"kind": "openrouter"}},
+                "models": {"openrouter.default": {"capability": "chat", "provider": "gateway.router", "model": "default-model"}}
+            })).unwrap(),
+            ..Default::default()
+        };
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
