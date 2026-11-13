@@ -33530,7 +33530,18 @@ options = {{ native_tools = true, temperature = 0.1 }}
         // The prompt config owns the profile accepted by ModelSwitchTool and
         // later resolved by the channel switch handler.
         let prompt_config = {
-            let mut cfg = zeroclaw_config::schema::Config::default();
+            let mut cfg = zeroclaw_config::schema::Config {
+                providers: serde_json::from_value(serde_json::json!({
+                    "connections": {"gateway.router": {
+                        "kind": "openrouter",
+                        "auth": {"mode": "api_key", "api_key": "config-openrouter-key"}
+                    }},
+                    "models": {"openrouter.default": {
+                        "capability": "chat", "provider": "gateway.router", "model": "switched-model"
+                    }}
+                })).unwrap(),
+                ..Default::default()
+            };
             cfg.runtime_profiles.insert(
                 "trim-switch".to_string(),
                 zeroclaw_config::schema::RuntimeProfileConfig {
@@ -33547,15 +33558,6 @@ options = {{ native_tools = true, temperature = 0.1 }}
                     ..Default::default()
                 },
             );
-            {
-                let entry = cfg
-                    .providers
-                    .models
-                    .ensure("openrouter", "default")
-                    .expect("openrouter.default provider slot must be creatable");
-                entry.api_key = Some("config-openrouter-key".to_string());
-                entry.model = Some("switched-model".to_string());
-            }
             zeroclaw_config::migration::bind_test_route_model(
                 &mut cfg,
                 switched_provider_ref,
