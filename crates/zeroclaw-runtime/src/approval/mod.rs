@@ -105,6 +105,10 @@ pub struct ApprovalManager {
     audit_log: Mutex<Vec<ApprovalLogEntry>>,
 }
 
+fn lists_tool(entries: &HashSet<String>, tool_name: &str) -> bool {
+    entries.contains("*") || entries.contains(tool_name)
+}
+
 fn normalized_always_ask(entries: &[String]) -> HashSet<String> {
     entries
         .iter()
@@ -246,9 +250,7 @@ impl ApprovalManager {
     }
 
     fn always_asks(&self, tool_name: &str) -> bool {
-        [&self.always_ask, &self.caller_always_ask]
-            .iter()
-            .any(|set| set.contains("*") || set.contains(tool_name))
+        lists_tool(&self.always_ask, tool_name) || lists_tool(&self.caller_always_ask, tool_name)
     }
 
     /// Check whether a tool call requires interactive approval.
@@ -258,6 +260,11 @@ impl ApprovalManager {
     }
 
     pub fn approval_requirement(&self, tool_name: &str) -> ApprovalRequirement {
+        // ReadOnly still runs read tools, so a caller limit must apply first.
+        if lists_tool(&self.caller_always_ask, tool_name) {
+            return ApprovalRequirement::Prompt;
+        }
+
         // ReadOnly blocks everything — handled elsewhere; no prompt needed.
         if self.autonomy_level == AutonomyLevel::ReadOnly {
             return ApprovalRequirement::NotRequired;
@@ -1100,6 +1107,20 @@ mod tests {
                 "{case}: tools the caller did not list keep the target decision"
             );
         }
+        let read_only = RiskProfileConfig {
+            level: AutonomyLevel::ReadOnly,
+            ..RiskProfileConfig::default()
+        };
+        let mgr = ApprovalManager::for_bounded_non_interactive(&read_only, &["file_read".into()]);
+        assert_eq!(
+            mgr.approval_requirement("file_read"),
+            ApprovalRequirement::Prompt,
+            "read_only: read tools still run, so the caller entry must apply"
+        );
+        assert_eq!(
+            mgr.approval_requirement("memory_recall"),
+            ApprovalRequirement::NotRequired
+        );
     }
 
     #[test]

@@ -2095,9 +2095,9 @@ impl DelegateTool {
                 None => self.risk_profiles.get(profile_name),
             };
             let Some(profile) = profile else {
-                return Err(format!(
-                    "delegation refused: risk profile {profile_name:?} could not be resolved for \
-                     the bounded child's caller always_ask limit"
+                return Err(crate::i18n::get_required_cli_string_with_args(
+                    "tool-delegate-error-caller-profile-unresolved",
+                    &[("profile", profile_name)],
                 ));
             };
             entries.extend(profile.always_ask.iter().cloned());
@@ -3657,6 +3657,25 @@ impl DelegateTool {
         if let Some(refusal) = refusal {
             return Ok(refusal);
         }
+        // The worker runs as the target, so resolve this caller's limit now.
+        let inherited_caller_always_ask = match admitted_config.as_deref().map_or_else(
+            || self.mode_for_target(agent_name),
+            |config| self.mode_for_target_from_config(config, agent_name),
+        ) {
+            DelegateExecutionMode::Bounded => match self.bounded_caller_always_ask(
+                admitted_config.as_deref().or(self.root_config.as_deref()),
+            ) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(error),
+                    });
+                }
+            },
+            DelegateExecutionMode::Independent => Vec::new(),
+        };
 
         // Runaway backstop: refuse a new background delegation once too many are already in
         // flight (each is a full agent loop). The in-flight set is the live cancel-token map.
@@ -3864,7 +3883,6 @@ impl DelegateTool {
         // wrapper's own context fallbacks resolve the identical scopes the
         // original call site would have built.
         let inherited_cost_tracker = self.inherited_cost_tracker.clone();
-        let inherited_caller_always_ask = self.inherited_caller_always_ask.clone();
         let terminal_store = Arc::clone(&task_control_plane.store);
         let terminal_owner_pid = std::process::id();
         let terminal_owner_boot_id = task_control_plane.boot_id.clone();
@@ -12085,6 +12103,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bounded_caller_always_ask_denies_read_tool_under_read_only_target() {
+        assert_denied_before_execution(
+            "caller always_ask / target read_only",
+            bounded_caller_approval_probe(
+                caller_always_ask(&["file_read"]),
+                RiskProfileConfig {
+                    level: AutonomyLevel::ReadOnly,
+                    ..RiskProfileConfig::default()
+                },
+                Vec::new(),
+                "file_read",
+            )
+            .await,
+        );
+    }
+
+    #[tokio::test]
     async fn bounded_caller_always_ask_leaves_unlisted_tools_to_the_target() {
         assert_executed(
             "caller always_ask other tool / target full",
@@ -12163,6 +12198,137 @@ mod tests {
                     "could not be resolved for the bounded child's caller always_ask limit"
                 ),
             "got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_bounded_child_keeps_the_callers_always_ask() {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+
+        let (server, captured) = start_scripted_chat_server(&[
+            chat_completion_tool_call(
+                "echo_tool",
+                "call_echo_bg",
+                serde_json::json!({"value": "probe"}),
+            ),
+            serde_json::json!({"choices": [{"message": {"content": "background done"}}]}),
+        ])
+        .await;
+        let tmp = TempDir::new().unwrap();
+        let model_provider_config = ModelProviderConfig {
+            uri: Some(server.uri.clone()),
+            model: Some("always-ask-test-model".to_string()),
+            api_key: Some("always-ask-test-key".to_string()),
+            timeout_secs: Some(5),
+            native_tools: Some(true),
+            ..ModelProviderConfig::default()
+        };
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.providers.models.custom.insert(
+            "local".to_string(),
+            CustomModelProviderConfig {
+                base: model_provider_config.clone(),
+            },
+        );
+        config.risk_profiles.insert(
+            "caller_profile".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec![DelegateTool::NAME.to_string(), "echo_tool".to_string()],
+                always_ask: vec!["echo_tool".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("target_profile".to_string(), full_target());
+        config.runtime_profiles.insert(
+            "target_agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 2,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.local".into(),
+                risk_profile: "caller_profile".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode: DelegateExecutionMode::Bounded,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.local".into(),
+                risk_profile: "target_profile".into(),
+                runtime_profile: "target_agentic".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+        let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
+            HashMap::new();
+        providers_models
+            .entry("custom".to_string())
+            .or_default()
+            .insert("local".to_string(), model_provider_config);
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tool = DelegateTool::new(
+            config.agents.clone(),
+            None,
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").unwrap()),
+        )
+        .with_root_config(Arc::clone(&config))
+        .with_caller_alias("caller")
+        .with_workspace_dir(tmp.path().join("workspace"))
+        .with_providers_models(providers_models)
+        .with_risk_profiles(config.risk_profiles.clone())
+        .with_runtime_profiles(config.runtime_profiles.clone())
+        .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(CountingEchoTool {
+            name: "echo_tool",
+            executions: Arc::clone(&executions),
+        })])));
+
+        let result = tool
+            .execute(json!({"agent": "target", "prompt": "run", "background": true}))
+            .await
+            .unwrap();
+        assert!(result.success, "background delegate failed: {result:?}");
+        let task_id = result
+            .output
+            .lines()
+            .find(|line| line.starts_with("task_id:"))
+            .unwrap()
+            .trim_start_matches("task_id: ")
+            .trim();
+        let settled = wait_for_terminal_background_result(&tool, task_id).await;
+        assert_eq!(
+            settled.status,
+            BackgroundTaskStatus::Completed,
+            "{settled:?}"
+        );
+
+        assert_eq!(
+            executions.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the background child must not run a tool its caller lists in always_ask"
+        );
+        let bodies = captured.lock().unwrap();
+        assert!(
+            bodies.iter().any(|body| body.contains("requires approval")),
+            "expected an approval denial in the child's tool result: {bodies:?}"
         );
     }
 

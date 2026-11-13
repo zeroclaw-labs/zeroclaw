@@ -1600,6 +1600,7 @@ cli-tunnel-tcp-service-published = {"  "}🔒 Tunnel {$service} (TLS passthrough
 # ── Supplied capabilities (CLI session channel, delegate tool preparation) ──
 cli-agent-error-channel-unavailable = This agent has no channel for the CLI session.
 tool-delegate-error-target-tools-initialization = Tools could not be prepared safely for agent '{$agent_name}'.
+tool-delegate-error-caller-profile-unresolved = delegation refused: risk profile "{$profile}" could not be resolved for the bounded child's caller always_ask limit
 
 # ── Context window (doctor update-context-windows, agent interactive) ──
 cli-delegate-error-invalid-semantic-completion = Agent '{$agent_name}' failed: model provider returned an invalid semantic completion.
