@@ -29,6 +29,8 @@ pub(super) struct EntryLayoutInput<'a> {
     pub entry: &'a ChatEntry,
     pub highlighted: bool,
     pub disclosure: ToolDisclosure,
+    /// A tool card whose call started in the running turn and has no result.
+    pub waiting: bool,
 }
 
 /// Coupled committed layout indexes. Production consumers only borrow this view.
@@ -261,6 +263,7 @@ impl TranscriptLayoutCache {
             show_thoughts,
             input.disclosure,
             width,
+            input.waiting,
             &mut self.layout.cached_lines,
         );
         let after = self.layout.cached_lines.len();

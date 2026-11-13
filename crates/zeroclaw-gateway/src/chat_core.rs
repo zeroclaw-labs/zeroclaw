@@ -961,6 +961,9 @@ impl TurnRelay {
                 return Relayed::Continue;
             }
             SessionUpdateEvent::BudgetWarning { .. } => return Relayed::Continue,
+            // Delegate child activity is a live TUI affordance; the dashboard
+            // chat frame protocol has no slot for it yet.
+            SessionUpdateEvent::DelegateActivity { .. } => return Relayed::Continue,
             SessionUpdateEvent::AgentMessageChunk { text, .. } => {
                 json!({ "type": "chunk", "content": text })
             }
@@ -1037,6 +1040,7 @@ fn event_session(event: &SessionUpdateEvent) -> &str {
         | SessionUpdateEvent::ApprovalRequest { session_id, .. }
         | SessionUpdateEvent::ContextUsage { session_id, .. }
         | SessionUpdateEvent::Plan { session_id, .. }
+        | SessionUpdateEvent::DelegateActivity { session_id, .. }
         | SessionUpdateEvent::TurnComplete { session_id, .. }
         | SessionUpdateEvent::BudgetWarning { session_id, .. }
         | SessionUpdateEvent::HistoryTrimmed { session_id, .. } => session_id,
