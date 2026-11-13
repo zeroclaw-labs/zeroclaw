@@ -233,5 +233,15 @@ mod tests {
             no_results_message("q")
         );
         assert!(format_response("q", 1, &json!({"content":[]})).is_err());
+        // A result URL is server-controlled and is rendered for the model to
+        // act on: a non-http(s) scheme, or a control character smuggled past
+        // `Url::parse`'s own newline stripping, must fail the whole response.
+        for url in ["javascript:alert(1)", "https://example.org/a\nb"] {
+            let payload = json!({"structuredContent":{"results":[{"url":url,"excerpts":[]}]}});
+            assert!(
+                format_response("q", 1, &payload).is_err(),
+                "the URL guard accepted {url:?}"
+            );
+        }
     }
 }
