@@ -94,7 +94,7 @@ tidy_paragraphs() {
 }
 
 highlight_bullets() {
-    section "Highlights" | { grep -E '^[-*] ' || true; } | head -"$1" | sed -E 's/^[-*] +//' | strip_markdown
+    section "Highlights" | { grep -E '^[-*] ' || true; } | sed -n "1,${1}p" | sed -E 's/^[-*] +//' | strip_markdown
 }
 
 BODY="$(section "In brief" | strip_markdown | tidy_paragraphs)"

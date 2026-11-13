@@ -129,4 +129,18 @@ actual="$(cd "$repo" && bash "$composer" --notes "$work/nocounts.md" --tag v1.1.
 expected="$(printf 'Short.\n\n3 commits. 2 contributors.')"
 assert_equal "git counts excluding bots" "$expected" "$actual"
 
+# A long Highlights section must be drained even when only two bullets are used.
+{
+  printf '## Highlights\n\n- First.\n- Second.\n'
+  awk 'BEGIN { for (i = 0; i < 10000; i++) print "- Extra release note that must not appear in the announcement." }'
+} > "$work/many-highlights.md"
+actual="$(bash "$composer" --notes "$work/many-highlights.md")"
+assert_equal "large highlights fallback" "$(printf 'First.\n\nSecond.')" "$actual"
+{
+  printf '## In brief\n\nBrief.\n\n'
+  cat "$work/many-highlights.md"
+} > "$work/brief-many-highlights.md"
+actual="$(bash "$composer" --notes "$work/brief-many-highlights.md" --highlights 2)"
+assert_equal "large highlights explicit selection" "$(printf 'Brief.\n\n• First.\n• Second.')" "$actual"
+
 echo "release_post_text.test.sh: all checks passed"
