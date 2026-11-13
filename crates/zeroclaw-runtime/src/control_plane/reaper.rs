@@ -103,6 +103,14 @@ async fn recover_terminal_settlements(store: &dyn TaskRegistry) -> anyhow::Resul
             continue;
         };
 
+        // Goal lifecycle is owned by its controller. Supported generic writers
+        // reject session-bound Goal settlement intents; preserve any legacy or
+        // anomalous row instead of applying delegate settlement rules or
+        // aborting recovery for unrelated tasks.
+        if task.kind == TaskKind::Goal {
+            continue;
+        }
+
         // A terminal winner is authoritative. The outbox row can only be stale.
         if task.status.is_terminal() {
             if is_authoritative_owner(intent.owner_pid, &intent.owner_boot_id) {
@@ -261,6 +269,12 @@ pub async fn sweep(
     let _ = recover_terminal_settlements(store).await?;
     let now = Utc::now();
     for rec in store.list_running().await? {
+        // Goal restart policy is fenced by GoalTaskRegistry. Generic task
+        // reaping must not turn an interrupted goal into Lost before the
+        // goal-specific recovery owner can classify its pending operation.
+        if rec.kind == TaskKind::Goal {
+            continue;
+        }
         if rec.owner_boot_id != boot_id {
             // Prior-boot orphan — reclaim (authority-guarded inside reconcile_lost).
             let _ = store.reconcile_lost(&rec.id, boot_id).await?;
@@ -284,6 +298,8 @@ mod tests {
         TaskKind, TaskRecord, TaskStatus, TerminalSettlementIntent,
     };
     use crate::control_plane::task_store_sqlite::SqliteTaskStore;
+    use crate::control_plane::{GoalTaskRecord, GoalTaskRegistry};
+    use rusqlite::Connection;
 
     fn rec(id: &str, boot: &str, pid: u32, beat_secs_ago: Option<i64>) -> TaskRecord {
         let beat = beat_secs_ago.map(|s| (Utc::now() - chrono::Duration::seconds(s)).to_rfc3339());
@@ -302,6 +318,8 @@ mod tests {
             delivered: false,
             idem_key: None,
             principal_id: None,
+            session_id: None,
+            execution_epoch: 0,
             started_at: Utc::now().to_rfc3339(),
             finished_at: None,
         }
@@ -406,6 +424,104 @@ mod tests {
         assert_eq!(
             s.get("ordinary-timeout").await.unwrap().unwrap().status,
             TaskStatus::TimedOut
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_preserves_goal_settlement_intents_without_blocking_delegates() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteTaskStore::new(dir.path()).unwrap();
+        let goal_id = "goal-with-legacy-settlement";
+        let goal = TaskRecord {
+            id: goal_id.into(),
+            kind: TaskKind::Goal,
+            agent: "main".into(),
+            status: TaskStatus::Running,
+            owner_pid: 999_999,
+            owner_boot_id: "boot-OLD".into(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: None,
+            originator_chain: Vec::new(),
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            session_id: Some("goal-session".into()),
+            execution_epoch: 0,
+            started_at: Utc::now().to_rfc3339(),
+            finished_at: None,
+        };
+        store
+            .create_or_replace_session_goal(
+                goal,
+                GoalTaskRecord {
+                    task_id: goal_id.into(),
+                    objective: "goal objective".into(),
+                    ..GoalTaskRecord::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let goal_path = dir.path().join(format!("{goal_id}.json"));
+        let goal_bytes = br#"{"task_id":"goal-with-legacy-settlement","output":"goal"}"#;
+        tokio::fs::write(&goal_path, goal_bytes).await.unwrap();
+        let goal_intent = intent(goal_id, &goal_path, TaskStatus::Completed, goal_bytes);
+        assert!(
+            store
+                .insert_legacy_terminal_settlement_intent_for_test(&goal_intent)
+                .unwrap()
+        );
+
+        let delegate_id = "ordinary-delegate-settlement";
+        let delegate_path = dir.path().join(format!("{delegate_id}.json"));
+        let delegate_bytes = br#"{"task_id":"ordinary-delegate-settlement","output":"done"}"#;
+        tokio::fs::write(&delegate_path, delegate_bytes)
+            .await
+            .unwrap();
+        store
+            .create(rec(delegate_id, "boot-OLD", 999_999, None))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .persist_terminal_settlement_intent(intent(
+                    delegate_id,
+                    &delegate_path,
+                    TaskStatus::Completed,
+                    delegate_bytes,
+                ))
+                .await
+                .unwrap()
+        );
+        store
+            .create(rec("ordinary-orphan", "boot-OLD", 999_999, None))
+            .await
+            .unwrap();
+
+        assert_eq!(recovery_pass(&store, "boot-NEW").await.unwrap(), 2);
+        assert_eq!(
+            store.get(delegate_id).await.unwrap().unwrap().status,
+            TaskStatus::Completed
+        );
+        assert_eq!(
+            store.get("ordinary-orphan").await.unwrap().unwrap().status,
+            TaskStatus::Lost
+        );
+        assert_eq!(
+            store.get(goal_id).await.unwrap().unwrap().status,
+            TaskStatus::Running
+        );
+        let remaining = store.list_terminal_settlement_intents().await.unwrap();
+        assert_eq!(remaining, vec![goal_intent.clone()]);
+
+        // The periodic reaper shares settlement recovery and must also tolerate
+        // the preserved Goal row on later sweeps.
+        sweep(&store, "boot-NEW", 600).await.unwrap();
+        assert_eq!(
+            store.list_terminal_settlement_intents().await.unwrap(),
+            vec![goal_intent]
         );
     }
 
@@ -556,6 +672,56 @@ mod tests {
         );
         assert_eq!(
             s.get("fresh").await.unwrap().unwrap().status,
+            TaskStatus::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_leaves_session_bound_goals_to_the_goal_controller() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteTaskStore::new(dir.path()).unwrap();
+        let task = TaskRecord {
+            id: "goal".into(),
+            kind: TaskKind::Goal,
+            agent: "main".into(),
+            status: TaskStatus::Running,
+            owner_pid: std::process::id(),
+            owner_boot_id: "boot-NEW".into(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: None,
+            originator_chain: Vec::new(),
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            session_id: Some("session".into()),
+            execution_epoch: 0,
+            started_at: Utc::now().to_rfc3339(),
+            finished_at: None,
+        };
+        let goal = GoalTaskRecord {
+            task_id: "goal".into(),
+            objective: "objective".into(),
+            ..GoalTaskRecord::default()
+        };
+        store
+            .create_or_replace_session_goal(task, goal)
+            .await
+            .unwrap();
+
+        let db = dir.path().join("control_plane.db");
+        Connection::open(db)
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET heartbeat_at = ?1 WHERE id = 'goal'",
+                [(Utc::now() - chrono::Duration::seconds(99_999)).to_rfc3339()],
+            )
+            .unwrap();
+
+        sweep(&store, "boot-NEW", 600).await.unwrap();
+        assert_eq!(
+            store.get("goal").await.unwrap().unwrap().status,
             TaskStatus::Running
         );
     }
