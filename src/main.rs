@@ -24581,6 +24581,7 @@ type = "string"
             P::MemoryWrite,
             P::StateRead,
             P::StateWrite,
+            P::AgentDispatch,
         ] {
             let uses_declaration = match permission {
                 P::HttpClient | P::WebSocketClient | P::SocketClient => true,
@@ -24590,7 +24591,8 @@ type = "string"
                 | P::MemoryRead
                 | P::MemoryWrite
                 | P::StateRead
-                | P::StateWrite => false,
+                | P::StateWrite
+                | P::AgentDispatch => false,
             };
             let name = serde_json::to_value(permission).expect("a permission serializes");
             let (manifest, rows) = rows_for(&[name.as_str().expect("a permission is a string")]);

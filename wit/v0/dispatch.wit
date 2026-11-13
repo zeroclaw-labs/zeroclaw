@@ -1,0 +1,27 @@
+package zeroclaw:plugin@0.1.0;
+
+/// Host-mediated asynchronous agent wake dispatch for tool plugins.
+@unstable(feature = plugins-wit-v0-dispatch)
+interface dispatch {
+    /// Closed failure categories returned across the guest boundary.
+    @unstable(feature = plugins-wit-v0-dispatch)
+    enum dispatch-error {
+        /// Instance lacks `agent_dispatch`, target is not granted in
+        /// `dispatch_agents`, or the dispatch hop ceiling was reached.
+        access-denied,
+        /// Target agent alias is unknown or disabled.
+        unknown-agent,
+        /// Per-instance wake budget exceeded.
+        rate-limited,
+        /// Wake prompt is empty, oversized, or contains disallowed control characters.
+        invalid-request,
+        /// Outside an authorized tool call frame, host-call budget exhausted,
+        /// or runtime execution/task-store is unavailable.
+        unavailable,
+    }
+
+    /// Enqueue an asynchronous wake turn for `target-agent` with a bounded
+    /// notification `prompt`. Returns once admitted; never awaits the turn.
+    @unstable(feature = plugins-wit-v0-dispatch)
+    wake: func(target-agent: string, prompt: string) -> result<_, dispatch-error>;
+}

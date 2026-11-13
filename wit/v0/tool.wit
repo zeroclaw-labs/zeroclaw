@@ -53,6 +53,11 @@ world tool-plugin {
     /// egress grant first.
     @unstable(feature = plugins-wit-v0-websocket)
     import websocket;
+    /// Host-mediated asynchronous agent wakeups. Linked only for an instance
+    /// holding the `agent_dispatch` grant; every target passes the instance's
+    /// operator grant first.
+    @unstable(feature = plugins-wit-v0-dispatch)
+    import dispatch;
     export plugin-info;
     export tool;
 }
