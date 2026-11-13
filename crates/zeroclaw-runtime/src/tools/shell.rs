@@ -193,17 +193,16 @@ impl Tool for ShellTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
+        // Keep `approved` out of the model-facing schema. The agent runtime
+        // injects it via `set_runtime_approved_arg` after the operator gate;
+        // exposing it made models emit a value that looked like it controlled
+        // approval.
         json!({
             "type": "object",
             "properties": {
                 "command": {
                     "type": "string",
                     "description": "The shell command to execute"
-                },
-                "approved": {
-                    "type": "boolean",
-                    "description": "Set true to explicitly approve medium/high-risk commands in supervised mode",
-                    "default": false
                 }
             },
             "required": ["command"]
@@ -788,7 +787,10 @@ mod tests {
                 .expect("schema required field should be an array")
                 .contains(&json!("command"))
         );
-        assert!(schema["properties"]["approved"].is_object());
+        assert!(
+            schema["properties"].get("approved").is_none(),
+            "approved must not be model-facing; runtime injects it after the approval gate (#12227)"
+        );
     }
 
     #[cfg(all(any(unix, windows), not(target_os = "android")))]
