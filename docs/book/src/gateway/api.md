@@ -28,10 +28,12 @@ safe to expose unauthenticated regardless of TLS posture.
 Builds with WASM plugin support expose `GET` and `POST /plugin/{path}` when a running,
 explicitly configured channel plugin claims that path. This is a raw transport
 boundary: the gateway preserves the HTTP method, raw query, body bytes, and
-lowercase UTF-8 headers in a typed request to the component's `parse-webhook`
-export. The component verifies its platform request with its scoped secret and
-returns either normalized messages or an explicit challenge reply. The request
-never runs an agent turn inline; replies never enter the agent queue.
+headers, and the core ingress passes them in a typed request to the component's
+`parse-webhook` export. Header names are lowercased; a header whose value holds
+anything but visible ASCII, space, or tab is dropped. The component verifies
+its platform request with its scoped secret and returns either normalized
+messages or an explicit challenge reply. The request never runs an agent turn
+inline; replies never enter the agent queue.
 
 A claimed path must be 1–64 ASCII letters, digits,
 hyphens, or underscores. Duplicate or invalid claimants are rejected before the
@@ -40,7 +42,7 @@ daemon atomically publishes its runtime route map.
 | Status | Public body | Meaning |
 |---|---|---|
 | `200` | empty or challenge text | The verified request delivered authorized messages, ignored duplicates/denied senders, or returned a response-only challenge of at most 4096 UTF-8 bytes. |
-| `400` | `invalid webhook` | The guest authenticated the request but rejected its payload shape. |
+| `400` | `invalid webhook` | The guest authenticated the request but rejected its payload shape. A request outside the ingress bounds (512 headers, 512 KiB of header names and values, a 64 KiB query) also gets this response before the component is invoked, logged as `plugin_webhook_request_invalid`. The HTTP listener's own header and URI limits are tighter and normally refuse such a request first with `431` or `414`. |
 | `401` | `unauthorized webhook` | Guest platform-authenticity verification failed. |
 | `404` | `webhook not found` | No live plugin channel owns the path. |
 | `405` | empty, `Allow: GET, POST` header | `HEAD` or another unsupported method; the component is not invoked. |
@@ -53,9 +55,17 @@ The gateway never returns guest, Wasmtime, secret, config, or downstream error
 detail on this unauthenticated surface. Those details are bounded and logged
 with plugin attribution. The standard 64 KiB gateway body ceiling applies.
 After guest authentication, the host applies the live peer group for
-`plugin.<alias>` before idempotency reservation and delivery. Stable message IDs
-use route-namespaced, ownership-safe reservations: an in-flight duplicate waits
-for commit or rollback instead of being acknowledged prematurely.
+`plugin.<alias>` before idempotency reservation and delivery. The core ingress
+service, not the gateway, deduplicates stable message IDs. Reservations are
+keyed by the owning plugin instance (package and alias), route path, and
+message ID, and last for one daemon generation, so a gateway restart keeps them
+and a reload clears them. Suppression is best effort: a key is held for
+`gateway.idempotency_ttl_secs` or until `gateway.idempotency_max_keys` newer
+message IDs across all plugin routes displace it. It collapses platform
+retries and is not replay protection, which stays with the plugin's signature
+and timestamp checks. An in-flight duplicate waits for commit or rollback
+instead of being acknowledged prematurely. The capacity is separate from the
+`/webhook` and `/sop/*` replay store.
 
 ## Discovering the surface
 

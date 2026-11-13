@@ -220,6 +220,7 @@ fn activation_config(deployment: &Deployment, alias: &str, url: &str, grant: &Gr
         PluginChannelConfig {
             package: PACKAGE.to_string(),
             enabled: true,
+            ..PluginChannelConfig::default()
         },
     );
     config.agents.insert(

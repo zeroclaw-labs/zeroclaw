@@ -1936,6 +1936,164 @@ pub struct SessionOverrides {
 }
 
 // ══════════════════════════════════════════════════════════════════════
+// ── Plugin webhooks ──────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+
+rpc_type! {
+    /// One request header forwarded to the plugin. The core lowercases the
+    /// name; the value may hold only visible ASCII, space and tab.
+    pub struct PluginWebhookHeader {
+        pub name: String,
+        pub value: String,
+    }
+}
+
+rpc_type! {
+    /// `plugin-webhook/dispatch` params: one inbound webhook request for the
+    /// channel plugin that owns `path`. Every field is required.
+    pub struct PluginWebhookDispatchParams {
+        /// Caller-chosen id naming this dispatch for `plugin-webhook/cancel`:
+        /// 1 to 128 bytes of printable ASCII without spaces, unique among the
+        /// connection's in-flight dispatches.
+        pub request_id: String,
+        /// Route path (the `{path}` of `/plugin/{path}`). An unknown or
+        /// malformed path is the `not_found` outcome.
+        pub path: String,
+        /// `GET` or `POST`.
+        pub method: String,
+        /// Raw query string without the leading `?`.
+        pub query: String,
+        /// Request headers in order; repeated names are kept.
+        pub headers: Vec<PluginWebhookHeader>,
+        /// Exact body bytes, standard base64 with padding.
+        pub body_b64: String,
+    }
+}
+
+rpc_type! {
+    /// How the core ingress answered one dispatch.
+    #[derive(Copy, PartialEq, Eq)]
+    pub enum PluginWebhookDispatchOutcome {
+        /// The plugin accepted the request; no response body.
+        Ack,
+        /// The plugin answered with `body`.
+        Reply,
+        /// No live route owns the path, or the path is malformed.
+        NotFound,
+        /// The route queue or this connection's in-flight limit is full.
+        QueueFull,
+        /// The route or plugin could not take the request, or the daemon runs
+        /// no plugin webhook ingress.
+        Unavailable,
+        /// The plugin rejected the request's credentials.
+        Unauthorized,
+        /// The plugin rejected the payload as malformed.
+        BadRequest,
+        /// The plugin's response broke the host response rules.
+        InvalidResponse,
+        /// No outcome within the deadline, counted from enqueue.
+        Timeout,
+        /// Cancelled by `plugin-webhook/cancel`. When the connection closes or
+        /// the daemon reloads, in-flight dispatches end with no response.
+        Cancelled,
+    }
+}
+
+rpc_type! {
+    /// `plugin-webhook/dispatch` result.
+    #[derive(PartialEq, Eq)]
+    pub struct PluginWebhookDispatchResult {
+        pub outcome: PluginWebhookDispatchOutcome,
+        /// Present only when `outcome` is `reply`; at most 4096 UTF-8 bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub body: Option<String>,
+    }
+}
+
+rpc_type! {
+    /// `plugin-webhook/cancel` params.
+    pub struct PluginWebhookCancelParams {
+        /// The `request_id` of a dispatch in flight on this connection.
+        pub request_id: String,
+    }
+}
+
+rpc_type! {
+    /// `plugin-webhook/cancel` result.
+    pub struct PluginWebhookCancelResult {
+        /// `true` when a dispatch with that id was in flight on this
+        /// connection. The dispatch's own response stays authoritative for
+        /// its outcome.
+        pub cancelled: bool,
+    }
+}
+
+rpc_type! {
+    /// One published plugin webhook route and the channel instance that owns it.
+    pub struct PluginWebhookRouteInfo {
+        pub path: String,
+        /// Plugin package name.
+        pub plugin: String,
+        /// Configured channel alias of the owning instance.
+        pub channel_alias: String,
+    }
+}
+
+rpc_type! {
+    /// `plugin-webhook/routes` result: a diagnostic snapshot of the routes.
+    pub struct PluginWebhookRoutesResult {
+        /// Route generation of this daemon generation's registry. It
+        /// increments each time the channel supervisor starts a generation and
+        /// restarts after a reload, so compare it only within one connection.
+        pub generation: u64,
+        /// Sorted by `path`.
+        pub routes: Vec<PluginWebhookRouteInfo>,
+    }
+}
+
+/// Longest plugin webhook `request_id`, in bytes.
+pub const MAX_PLUGIN_WEBHOOK_REQUEST_ID_BYTES: usize = 128;
+
+/// Whether `id` is a well-formed plugin webhook `request_id`: 1 to
+/// [`MAX_PLUGIN_WEBHOOK_REQUEST_ID_BYTES`] bytes of printable ASCII without
+/// spaces.
+#[must_use]
+pub fn is_valid_plugin_webhook_request_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_PLUGIN_WEBHOOK_REQUEST_ID_BYTES
+        && id.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
+impl From<zeroclaw_api::webhook::PluginWebhookOutcome> for PluginWebhookDispatchResult {
+    fn from(outcome: zeroclaw_api::webhook::PluginWebhookOutcome) -> Self {
+        use PluginWebhookDispatchOutcome as Wire;
+        use zeroclaw_api::webhook::PluginWebhookOutcome as Ingress;
+        // No wildcard: a new ingress outcome must choose its wire name here.
+        let outcome = match outcome {
+            Ingress::Reply(body) => {
+                return Self {
+                    outcome: Wire::Reply,
+                    body: Some(body),
+                };
+            }
+            Ingress::Ack => Wire::Ack,
+            Ingress::NotFound => Wire::NotFound,
+            Ingress::QueueFull => Wire::QueueFull,
+            Ingress::Unavailable => Wire::Unavailable,
+            Ingress::Unauthorized => Wire::Unauthorized,
+            Ingress::BadRequest => Wire::BadRequest,
+            Ingress::InvalidResponse => Wire::InvalidResponse,
+            Ingress::Timeout => Wire::Timeout,
+            Ingress::Cancelled => Wire::Cancelled,
+        };
+        Self {
+            outcome,
+            body: None,
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // ── Quickstart (wire-stable subset) ──────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════
 
@@ -2408,6 +2566,114 @@ mod tests {
             value["log_path"],
             json!("/var/lib/zeroclaw/runtime-trace.jsonl")
         );
+    }
+
+    #[test]
+    fn plugin_webhook_dispatch_outcome_wire_names() {
+        for (outcome, wire) in [
+            (PluginWebhookDispatchOutcome::Ack, "ack"),
+            (PluginWebhookDispatchOutcome::Reply, "reply"),
+            (PluginWebhookDispatchOutcome::NotFound, "not_found"),
+            (PluginWebhookDispatchOutcome::QueueFull, "queue_full"),
+            (PluginWebhookDispatchOutcome::Unavailable, "unavailable"),
+            (PluginWebhookDispatchOutcome::Unauthorized, "unauthorized"),
+            (PluginWebhookDispatchOutcome::BadRequest, "bad_request"),
+            (
+                PluginWebhookDispatchOutcome::InvalidResponse,
+                "invalid_response",
+            ),
+            (PluginWebhookDispatchOutcome::Timeout, "timeout"),
+            (PluginWebhookDispatchOutcome::Cancelled, "cancelled"),
+        ] {
+            assert_eq!(serde_json::to_value(outcome).unwrap(), json!(wire));
+            assert_eq!(
+                serde_json::from_value::<PluginWebhookDispatchOutcome>(json!(wire)).unwrap(),
+                outcome
+            );
+        }
+    }
+
+    #[test]
+    fn plugin_webhook_dispatch_result_from_outcome() {
+        use zeroclaw_api::webhook::PluginWebhookOutcome as Ingress;
+        for (outcome, wire) in [
+            (Ingress::Ack, json!({"outcome": "ack"})),
+            (
+                Ingress::Reply("hi".into()),
+                json!({"outcome": "reply", "body": "hi"}),
+            ),
+            (
+                Ingress::Reply(String::new()),
+                json!({"outcome": "reply", "body": ""}),
+            ),
+            (Ingress::NotFound, json!({"outcome": "not_found"})),
+            (Ingress::QueueFull, json!({"outcome": "queue_full"})),
+            (Ingress::Unavailable, json!({"outcome": "unavailable"})),
+            (Ingress::Unauthorized, json!({"outcome": "unauthorized"})),
+            (Ingress::BadRequest, json!({"outcome": "bad_request"})),
+            (
+                Ingress::InvalidResponse,
+                json!({"outcome": "invalid_response"}),
+            ),
+            (Ingress::Timeout, json!({"outcome": "timeout"})),
+            (Ingress::Cancelled, json!({"outcome": "cancelled"})),
+        ] {
+            let shown = format!("{outcome:?}");
+            let result = PluginWebhookDispatchResult::from(outcome);
+            assert_eq!(serde_json::to_value(&result).unwrap(), wire, "{shown}");
+            let parsed: PluginWebhookDispatchResult = serde_json::from_value(wire).unwrap();
+            assert_eq!(parsed, result, "{shown}");
+        }
+        assert_eq!(
+            zeroclaw_api::webhook::MAX_WEBHOOK_RESPONSE_BODY_BYTES,
+            4096,
+            "the `body` doc and rpc-socket.md state this bound"
+        );
+    }
+
+    #[test]
+    fn plugin_webhook_dispatch_params_require_every_field() {
+        let complete = json!({
+            "request_id": "gw-1",
+            "path": "fixture",
+            "method": "POST",
+            "query": "a=1",
+            "headers": [{"name": "x-signature", "value": "v"}],
+            "body_b64": "e30=",
+        });
+        let parsed: PluginWebhookDispatchParams = serde_json::from_value(complete.clone()).unwrap();
+        assert_eq!(parsed.request_id, "gw-1");
+        assert_eq!(parsed.headers.len(), 1);
+        assert_eq!(parsed.headers[0].name, "x-signature");
+        assert_eq!(parsed.body_b64, "e30=");
+
+        for missing in [
+            "request_id",
+            "path",
+            "method",
+            "query",
+            "headers",
+            "body_b64",
+        ] {
+            let mut params = complete.clone();
+            params.as_object_mut().unwrap().remove(missing);
+            assert!(
+                serde_json::from_value::<PluginWebhookDispatchParams>(params).is_err(),
+                "a dispatch without `{missing}` must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn plugin_webhook_request_id_rule() {
+        let longest = "x".repeat(MAX_PLUGIN_WEBHOOK_REQUEST_ID_BYTES);
+        for valid in ["a", longest.as_str(), "gw-1:2/3"] {
+            assert!(is_valid_plugin_webhook_request_id(valid), "{valid:?}");
+        }
+        let too_long = "x".repeat(MAX_PLUGIN_WEBHOOK_REQUEST_ID_BYTES + 1);
+        for invalid in ["", too_long.as_str(), "a b", "a\tb", "a\n", "\u{e9}"] {
+            assert!(!is_valid_plugin_webhook_request_id(invalid), "{invalid:?}");
+        }
     }
 
     #[test]

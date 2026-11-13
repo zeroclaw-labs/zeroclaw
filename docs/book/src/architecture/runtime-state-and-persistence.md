@@ -65,6 +65,7 @@ new runtime state should be described in terms of `<install>/data/`,
 | Paired device metadata | Device registry rows keyed by token hash | `data/devices.db` | `DeviceRegistry` cache plus SQLite | Registry reconciles metadata against the canonical paired-token set | This DB makes paired devices visible/manageable; it does not invent valid tokens. |
 | Health and component status | running subsystems report component state | none | gateway health/status state | Process-local; reset/rebuilt on daemon restart or reload | `/health`, `/api/health`, and `/api/status` are current observations, not durable configuration. |
 | Queues, debouncers, watchdogs | `zeroclaw-infra` process utilities | none unless a caller stores results elsewhere | in-memory queues/debouncers/watchdogs | Process-local; used to serialize, coalesce, or detect stalls | Treat these as coordination state. Persist only the domain data they protect, not the queue itself. |
+| Plugin webhook routes and dedup | Routes published by the channel supervisor; reservations made by channel workers | none | `zeroclaw_infra::plugin_webhook::PluginWebhookIngress`, one per daemon generation | Rebuilt empty on reload; survives gateway restarts within a generation | The gateway and the RPC `plugin-webhook/*` methods borrow the ingress and own no route table or dedup state. |
 
 ## Reload and restart
 
