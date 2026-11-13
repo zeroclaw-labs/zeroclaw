@@ -328,6 +328,28 @@ pub enum TaskContinuationConversationScope {
     ReplyTarget,
 }
 
+/// Proof that an admitted operation passed its final lifecycle check while
+/// holding its session's dispatch gate. Drop it immediately after the first
+/// provider-dispatch poll, without awaiting anything else while it is held.
+#[must_use = "dropping before dispatch entry reopens the fence race"]
+pub struct GoalDispatchStart {
+    _gate: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl GoalDispatchStart {
+    pub fn new(gate: tokio::sync::OwnedMutexGuard<()>) -> Self {
+        Self { _gate: gate }
+    }
+}
+
+impl std::fmt::Debug for GoalDispatchStart {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GoalDispatchStart")
+            .finish_non_exhaustive()
+    }
+}
+
 #[async_trait::async_trait]
 pub trait GoalTaskRegistry: Send + Sync {
     /// Persist a pending audit intent before acknowledging deferred work.
@@ -439,7 +461,23 @@ pub trait GoalTaskRegistry: Send + Sync {
         goal: GoalTaskRecord,
     ) -> anyhow::Result<GoalTransitionResult>;
 
-    /// Fence a running Goal and persist its pause state. An operation already
+    /// Acquire this registry instance's session dispatch gate and atomically
+    /// confirm the exact running Goal and pending operation. Returns `None`
+    /// when any guard fails. A second registry instance or process does not
+    /// share this gate, although durable epoch and marker guards still apply.
+    /// Implementations must hold the same gate for pause and finish commits.
+    async fn begin_operation_dispatch(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        pending_call_id: &str,
+    ) -> anyhow::Result<Option<GoalDispatchStart>>;
+
+    /// Fence a running Goal and persist its pause state. The commit is
+    /// serialized with dispatch entry through this registry instance: a
+    /// fence that commits first prevents entry, and a waiting fence observes
+    /// an operation that has entered. An operation already
     /// admitted for the fenced epoch is allowed to settle; resume remains
     /// unavailable until that settlement clears the pending-operation slot.
     async fn pause_session_goal(
@@ -462,6 +500,7 @@ pub trait GoalTaskRegistry: Send + Sync {
 
     /// Complete a lifecycle transition only for the exact running or paused
     /// Goal epoch. Terminal state remains owned by the task record. This method
+    /// serializes its commit with dispatch entry in the same way as pause. It
     /// does not inspect or clear the pending-operation slot; callers must
     /// settle that slot before finishing. If an executor disappears with the
     /// slot still reserved, the Goal remains fenced for the rest of that daemon

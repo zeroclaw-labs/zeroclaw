@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use zeroclaw_api::model_provider::TokenUsage;
 
 use crate::control::GoalExecutionScope;
+use crate::task::GoalDispatchStart;
 
 /// A Goal operation was refused because its exact execution scope is no longer
 /// running. The committed lifecycle transition, not this refusal, decides the
@@ -256,6 +257,13 @@ pub trait GoalOperationAccounting: Send + Sync {
     /// Admit work only with complete durable accounting. Incomplete accounting
     /// returns a [`GoalAccountingFailure`], independently of the Goal budget.
     async fn admit(&self, request: GoalOperationRequest) -> anyhow::Result<()>;
+    /// After awaited pre-dispatch work, check the admitted operation while
+    /// acquiring the registry's session gate. This read-only check takes no
+    /// additional operation permit. On error the caller must not dispatch and
+    /// must release the unstarted admission. The guard orders dispatch entry,
+    /// not physical transmission, against fences using the same registry
+    /// instance. Retries and fallback within an entered operation are not gated.
+    async fn begin_dispatch(&self) -> anyhow::Result<GoalDispatchStart>;
     /// Persist known usage and its accounting classification before reopening
     /// admission. `Ok` means settlement is durable and no accounting error was
     /// observed by the accountant; the reported settlement may itself still be

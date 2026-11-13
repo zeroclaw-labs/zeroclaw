@@ -2768,6 +2768,12 @@ async fn run_tool_call_loop_impl<'a>(
         } else {
             None
         };
+        // Refused Goal work must not emit a request announcement.
+        crate::agent::cost::admit_goal_operation_if_scoped(
+            ctx.provider_name,
+            provider_request_model,
+        )
+        .await?;
         let llm_started_at = announce_llm_request(
             &ctx,
             &provider_request_messages,
@@ -2812,6 +2818,46 @@ async fn run_tool_call_loop_impl<'a>(
             );
         }
 
+        let dispatch_start = if crate::agent::cost::goal_operation_accounting_is_scoped() {
+            let cancelled = || {
+                ctx.cancellation_token
+                    .is_some_and(|token| token.is_cancelled())
+            };
+            let gated = if cancelled() {
+                Err(anyhow::Error::new(ToolLoopCancelled))
+            } else {
+                match crate::agent::cost::begin_goal_dispatch_if_scoped().await {
+                    Ok(start) if cancelled() => {
+                        drop(start);
+                        Err(anyhow::Error::new(ToolLoopCancelled))
+                    }
+                    other => other,
+                }
+            };
+            match gated {
+                Ok(start) => start,
+                Err(error) => {
+                    let release =
+                        crate::agent::cost::release_unstarted_goal_operation_if_scoped().await;
+                    record_llm_failure(
+                        &ctx,
+                        provider_request_model,
+                        llm_started_at,
+                        iteration,
+                        &error,
+                    );
+                    return Err(match release {
+                        Ok(()) => error,
+                        Err(release_error) => {
+                            crate::agent::cost::with_settlement_failure(error, release_error)
+                        }
+                    });
+                }
+            }
+        } else {
+            None
+        };
+        // Only synchronous work may occur before this future's first poll.
         let ProviderCallOutcome {
             chat_result,
             attempts,
@@ -2820,25 +2866,28 @@ async fn run_tool_call_loop_impl<'a>(
             streamed_protocol_suppressed,
             streamed_visible_text,
             image_recovery_succeeded,
-        } = call_provider(
-            &ctx,
-            active_model_provider,
-            active_model_provider_name,
-            provider_request_model,
-            provider_dispatch_model,
-            zeroclaw_api::model_provider::ChatRequest {
-                messages: &provider_request_messages,
-                tools: request_tools,
-                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                    .try_with(Clone::clone)
-                    .ok()
-                    .flatten(),
-            },
-            image_recovery_messages.as_deref(),
-            should_consume_provider_stream,
-            policy,
-            iteration,
-            use_native_tools.then_some(iteration_tool_specs.tool_specs.as_slice()),
+        } = crate::agent::cost::release_after_first_poll(
+            dispatch_start,
+            call_provider(
+                &ctx,
+                active_model_provider,
+                active_model_provider_name,
+                provider_request_model,
+                provider_dispatch_model,
+                zeroclaw_api::model_provider::ChatRequest {
+                    messages: &provider_request_messages,
+                    tools: request_tools,
+                    thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                        .try_with(Clone::clone)
+                        .ok()
+                        .flatten(),
+                },
+                image_recovery_messages.as_deref(),
+                should_consume_provider_stream,
+                policy,
+                iteration,
+                use_native_tools.then_some(iteration_tool_specs.tool_specs.as_slice()),
+            ),
         )
         .await?;
         let accepted_request_messages = if image_recovery_succeeded {
@@ -11326,7 +11375,7 @@ mod tool_lifecycle_abandonment_tests {
     async fn run_scripted_loop_with_events(
         provider: &dyn ModelProvider,
         tools_registry: &crate::tools::scoped::ScopedToolRegistry,
-        observer: &NoopObserver,
+        observer: &dyn crate::observability::Observer,
         hooks: Option<&crate::hooks::HookRunner>,
         pacing: &zeroclaw_config::schema::PacingConfig,
         turn_id: &str,
@@ -11336,6 +11385,40 @@ mod tool_lifecycle_abandonment_tests {
         context_token_budget: usize,
         image_cache: Option<ToolLoopImageState<'_>>,
         event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
+    ) -> anyhow::Result<String> {
+        run_scripted_loop_with_events_and_delta(
+            provider,
+            tools_registry,
+            observer,
+            hooks,
+            pacing,
+            turn_id,
+            parallel_tools,
+            cancellation_token,
+            history,
+            context_token_budget,
+            image_cache,
+            event_tx,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_scripted_loop_with_events_and_delta(
+        provider: &dyn ModelProvider,
+        tools_registry: &crate::tools::scoped::ScopedToolRegistry,
+        observer: &dyn crate::observability::Observer,
+        hooks: Option<&crate::hooks::HookRunner>,
+        pacing: &zeroclaw_config::schema::PacingConfig,
+        turn_id: &str,
+        parallel_tools: bool,
+        cancellation_token: Option<CancellationToken>,
+        history: &mut Vec<ChatMessage>,
+        context_token_budget: usize,
+        image_cache: Option<ToolLoopImageState<'_>>,
+        event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
+        on_delta: Option<tokio::sync::mpsc::Sender<StreamDelta>>,
     ) -> anyhow::Result<String> {
         let mut crumb_present = false;
         let mut injected_preamble = None;
@@ -11383,7 +11466,7 @@ mod tool_lifecycle_abandonment_tests {
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token,
-            on_delta: None,
+            on_delta,
             shared_budget: None,
             channel: None,
             collected_receipts: None,
@@ -11407,6 +11490,879 @@ mod tool_lifecycle_abandonment_tests {
     }
 
     #[derive(Default)]
+    struct GateObserver(Mutex<Vec<crate::observability::ObserverEvent>>);
+
+    impl crate::observability::Observer for GateObserver {
+        fn record_event(&self, event: &crate::observability::ObserverEvent) {
+            self.0.lock().unwrap().push(event.clone());
+        }
+        fn record_metric(&self, _: &zeroclaw_api::observability_traits::ObserverMetric) {}
+        fn name(&self) -> &str {
+            "goal-gate-test"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[derive(Default)]
+    struct GateAccounting {
+        sequence: Arc<Mutex<Vec<&'static str>>>,
+        refusal: Option<bool>,
+        fail_begin: bool,
+        fail_release: bool,
+        cancel_on_begin: Option<CancellationToken>,
+        releases: std::sync::atomic::AtomicUsize,
+        settlements: Mutex<Vec<zeroclaw_goal::accounting::GoalOperationSettlement>>,
+    }
+
+    #[async_trait::async_trait]
+    impl zeroclaw_goal::accounting::GoalOperationAccounting for GateAccounting {
+        async fn admit(
+            &self,
+            _: zeroclaw_goal::accounting::GoalOperationRequest,
+        ) -> anyhow::Result<()> {
+            self.sequence.lock().unwrap().push("admit");
+            match self.refusal {
+                Some(true) => Err(anyhow::Error::new(
+                    zeroclaw_goal::accounting::GoalOperationFenced::BUDGET_EXHAUSTED,
+                )),
+                Some(false) => Err(anyhow::Error::new(
+                    zeroclaw_goal::accounting::GoalAccountingFailure::incomplete(
+                        zeroclaw_goal::GoalAccountingState::Missing,
+                        false,
+                    ),
+                )),
+                None => Ok(()),
+            }
+        }
+
+        async fn begin_dispatch(&self) -> anyhow::Result<zeroclaw_goal::task::GoalDispatchStart> {
+            self.sequence.lock().unwrap().push("begin");
+            if self.fail_begin {
+                anyhow::bail!("fixture dispatch read failed");
+            }
+            if let Some(token) = &self.cancel_on_begin {
+                token.cancel();
+            }
+            Ok(zeroclaw_goal::task::GoalDispatchStart::new(
+                Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,
+            ))
+        }
+
+        async fn settle(
+            &self,
+            settlement: zeroclaw_goal::accounting::GoalOperationSettlement,
+        ) -> anyhow::Result<()> {
+            self.settlements.lock().unwrap().push(settlement);
+            Ok(())
+        }
+
+        async fn release_unstarted(&self) -> anyhow::Result<()> {
+            self.releases
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail_release {
+                anyhow::bail!("fixture release failed");
+            }
+            Ok(())
+        }
+
+        async fn pricing_complete(&self) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    struct GateProvider(Arc<Mutex<Vec<&'static str>>>);
+
+    impl zeroclaw_api::attribution::Attributable for GateProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "goal-gate-provider"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for GateProvider {
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            unreachable!("the fixture uses structured chat")
+        }
+
+        async fn chat(
+            &self,
+            _: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.0.lock().unwrap().push("provider");
+            Ok(ChatResponse {
+                text: Some("done".into()),
+                tool_calls: Vec::new(),
+                usage: Some(zeroclaw_api::model_provider::TokenUsage {
+                    input_tokens: Some(2),
+                    output_tokens: Some(1),
+                    cached_input_tokens: Some(0),
+                    cache_creation_input_tokens: Some(0),
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    struct GateHook {
+        sequence: Arc<Mutex<Vec<&'static str>>>,
+        cancel: Option<CancellationToken>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::hooks::HookHandler for GateHook {
+        fn name(&self) -> &str {
+            "goal-gate-test"
+        }
+        async fn on_llm_input(&self, _: &[ChatMessage], _: &str) {
+            self.sequence.lock().unwrap().push("hook");
+            if let Some(token) = &self.cancel {
+                token.cancel();
+            }
+        }
+    }
+
+    async fn run_goal_gate_fixture(
+        accounting: Option<Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting>>,
+        sequence: Arc<Mutex<Vec<&'static str>>>,
+        token: Option<CancellationToken>,
+        cancel_in_hook: bool,
+        observer: &GateObserver,
+    ) -> (anyhow::Result<String>, Vec<TurnEvent>) {
+        let provider = GateProvider(Arc::clone(&sequence));
+        let mut hooks = crate::hooks::HookRunner::new();
+        hooks.register(Box::new(GateHook {
+            sequence,
+            cancel: if cancel_in_hook { token.clone() } else { None },
+        }));
+        let registry = registry_with(Vec::new());
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let mut history = vec![ChatMessage::user("hi")];
+        let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+        let result = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+            .scope(
+                accounting,
+                run_scripted_loop_with_events(
+                    &provider,
+                    &registry,
+                    observer,
+                    Some(&hooks),
+                    &pacing,
+                    "goal-gate-test",
+                    false,
+                    token,
+                    &mut history,
+                    100_000,
+                    None,
+                    Some(tx),
+                ),
+            )
+            .await;
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        (result, events)
+    }
+
+    #[tokio::test]
+    async fn goal_turn_refusal_precedes_all_request_announcement() {
+        for budget in [true, false] {
+            let accounting = Arc::new(GateAccounting {
+                refusal: Some(budget),
+                ..Default::default()
+            });
+            let observer = GateObserver::default();
+            let (result, events) = run_goal_gate_fixture(
+                Some(accounting.clone()),
+                Arc::clone(&accounting.sequence),
+                None,
+                false,
+                &observer,
+            )
+            .await;
+            let error = result.unwrap_err();
+            if budget {
+                assert!(
+                    error
+                        .downcast_ref::<zeroclaw_goal::accounting::GoalOperationFenced>()
+                        .is_some()
+                );
+            } else {
+                assert!(
+                    error
+                        .downcast_ref::<zeroclaw_goal::accounting::GoalAccountingFailure>()
+                        .is_some()
+                );
+            }
+            assert_eq!(*accounting.sequence.lock().unwrap(), ["admit"]);
+            assert_eq!(
+                accounting
+                    .releases
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                0
+            );
+            assert!(accounting.settlements.lock().unwrap().is_empty());
+            assert!(!observer.0.lock().unwrap().iter().any(|event| matches!(
+                event,
+                crate::observability::ObserverEvent::LlmRequest { .. }
+                    | crate::observability::ObserverEvent::LlmResponse { .. }
+            )));
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, TurnEvent::Usage { .. }))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_turn_admitted_request_announces_before_dispatch() {
+        let accounting = Arc::new(GateAccounting::default());
+        let observer = GateObserver::default();
+        let (result, _) = run_goal_gate_fixture(
+            Some(accounting.clone()),
+            Arc::clone(&accounting.sequence),
+            None,
+            false,
+            &observer,
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            *accounting.sequence.lock().unwrap(),
+            ["admit", "hook", "begin", "provider"]
+        );
+        let events = observer.0.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    crate::observability::ObserverEvent::LlmRequest { .. }
+                ))
+                .count(),
+            1
+        );
+        let settlements = accounting.settlements.lock().unwrap();
+        assert_eq!(settlements.len(), 1);
+        assert_eq!(
+            settlements[0].accounting_state,
+            zeroclaw_goal::GoalAccountingState::Complete
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_turn_pre_dispatch_stops_release_and_pair_announcement() {
+        use std::sync::atomic::Ordering;
+
+        for (cancel_in_hook, cancel_on_begin, fail_begin, fail_release) in [
+            (true, false, false, false),
+            (true, false, false, true),
+            (false, true, false, false),
+            (false, false, true, false),
+        ] {
+            let token = CancellationToken::new();
+            let accounting = Arc::new(GateAccounting {
+                fail_begin,
+                fail_release,
+                cancel_on_begin: cancel_on_begin.then(|| token.clone()),
+                ..Default::default()
+            });
+            let observer = GateObserver::default();
+            let (result, _) = run_goal_gate_fixture(
+                Some(accounting.clone()),
+                Arc::clone(&accounting.sequence),
+                Some(token),
+                cancel_in_hook,
+                &observer,
+            )
+            .await;
+            let error = result.unwrap_err();
+            assert!(!accounting.sequence.lock().unwrap().contains(&"provider"));
+            assert_eq!(accounting.releases.load(Ordering::SeqCst), 1);
+            assert!(accounting.settlements.lock().unwrap().is_empty());
+            let events = observer.0.lock().unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        crate::observability::ObserverEvent::LlmRequest { .. }
+                    ))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        crate::observability::ObserverEvent::LlmResponse { success: false, .. }
+                    ))
+                    .count(),
+                1
+            );
+            if fail_begin {
+                assert!(error.to_string().contains("fixture dispatch read failed"));
+            } else if fail_release {
+                assert!(!is_tool_loop_cancelled(&error));
+                assert!(error.chain().any(|cause| cause.is::<ToolLoopCancelled>()));
+                assert!(error.to_string().contains("fixture release failed"));
+            } else {
+                assert!(is_tool_loop_cancelled(&error));
+            }
+            assert_eq!(
+                accounting.sequence.lock().unwrap().contains(&"begin"),
+                !cancel_in_hook
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_turn_does_not_enter_the_goal_dispatch_gate() {
+        let accounting = Arc::new(GateAccounting::default());
+        let observer = GateObserver::default();
+        let token = CancellationToken::new();
+        let (_result, _) = run_goal_gate_fixture(
+            None,
+            Arc::clone(&accounting.sequence),
+            Some(token),
+            true,
+            &observer,
+        )
+        .await;
+        assert_eq!(*accounting.sequence.lock().unwrap(), ["hook", "provider"]);
+    }
+
+    struct GoalFenceHook {
+        store: Arc<crate::control_plane::SqliteTaskStore>,
+        scope: zeroclaw_goal::GoalExecutionScope,
+        cancel: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::hooks::HookHandler for GoalFenceHook {
+        fn name(&self) -> &str {
+            "goal-fence-hook"
+        }
+        async fn on_llm_input(&self, _: &[ChatMessage], _: &str) {
+            use zeroclaw_goal::{
+                GoalPauseReason, GoalPauseState, GoalTaskRegistry, GoalTransitionResult,
+            };
+            let result = if self.cancel {
+                self.store
+                    .finish_session_goal(
+                        self.scope.task_id(),
+                        self.scope.session_id(),
+                        self.scope.execution_epoch(),
+                        zeroclaw_api::task::TaskStatus::Cancelled,
+                        None,
+                    )
+                    .await
+            } else {
+                self.store
+                    .pause_session_goal(
+                        self.scope.task_id(),
+                        self.scope.session_id(),
+                        self.scope.execution_epoch(),
+                        GoalPauseState {
+                            reason: GoalPauseReason::OperatorPaused,
+                            description: None,
+                            blockers: Vec::new(),
+                        },
+                    )
+                    .await
+            }
+            .unwrap();
+            assert_eq!(result, GoalTransitionResult::Applied);
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_turn_fence_during_announcement_prevents_dispatch() {
+        use zeroclaw_goal::accounting::GoalOperationAccountingFactory;
+        use zeroclaw_goal::{GoalAccountingState, GoalTaskRegistry};
+
+        for cancel in [false, true] {
+            let (store, factory, _tracker, scope, directory) =
+                crate::goal_accounting::tests::fixture().await;
+            let accountant = factory.for_scope(scope.clone());
+            let sequence = Arc::new(Mutex::new(Vec::new()));
+            let provider = GateProvider(Arc::clone(&sequence));
+            let observer = GateObserver::default();
+            let mut hooks = crate::hooks::HookRunner::new();
+            hooks.register(Box::new(GoalFenceHook {
+                store: Arc::clone(&store),
+                scope: scope.clone(),
+                cancel,
+            }));
+            let registry = registry_with(Vec::new());
+            let pacing = zeroclaw_config::schema::PacingConfig::default();
+            let mut history = vec![ChatMessage::user("hi")];
+            let error = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+                .scope(
+                    Some(accountant),
+                    run_scripted_loop_with_events(
+                        &provider,
+                        &registry,
+                        &observer,
+                        Some(&hooks),
+                        &pacing,
+                        "fence-hook",
+                        false,
+                        None,
+                        &mut history,
+                        100_000,
+                        None,
+                        None,
+                    ),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<zeroclaw_goal::accounting::GoalOperationFenced>()
+                    .is_some()
+            );
+            assert!(sequence.lock().unwrap().is_empty());
+            let task = store
+                .current_goal_for_session(scope.session_id())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                task.status,
+                if cancel {
+                    zeroclaw_api::task::TaskStatus::Cancelled
+                } else {
+                    zeroclaw_api::task::TaskStatus::Paused
+                }
+            );
+            let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+            assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
+            assert!(goal.pending_call_id.is_none());
+            assert!(!directory.path().join("state/costs.jsonl").exists());
+            let events = observer.0.lock().unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        crate::observability::ObserverEvent::LlmRequest { .. }
+                    ))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        crate::observability::ObserverEvent::LlmResponse { success: false, .. }
+                    ))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_turn_fence_while_progress_send_is_blocked_prevents_dispatch() {
+        use crate::goal_accounting::tests::{DispatchProbe, DispatchProbeMode};
+        use zeroclaw_goal::accounting::GoalOperationAccountingFactory;
+        use zeroclaw_goal::{
+            GoalAccountingState, GoalPauseReason, GoalPauseState, GoalTaskRegistry,
+            GoalTransitionResult,
+        };
+
+        let (store, factory, _tracker, scope, _directory) =
+            crate::goal_accounting::tests::fixture().await;
+        let probe = Arc::new(DispatchProbe::new(
+            factory.for_scope(scope.clone()),
+            Arc::clone(&store),
+            scope.clone(),
+            DispatchProbeMode::ObserveOnly,
+        ));
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel(1);
+        delta_tx
+            .send(StreamDelta::Text("occupied".into()))
+            .await
+            .unwrap();
+        let admitted = Arc::clone(&probe.admitted);
+        let fence_store = Arc::clone(&store);
+        let fence_scope = scope.clone();
+        let fencer = ::zeroclaw_spawn::spawn!(async move {
+            admitted.notified().await;
+            let result = fence_store
+                .pause_session_goal(
+                    fence_scope.task_id(),
+                    fence_scope.session_id(),
+                    fence_scope.execution_epoch(),
+                    GoalPauseState {
+                        reason: GoalPauseReason::OperatorPaused,
+                        description: None,
+                        blockers: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(result, GoalTransitionResult::Applied);
+            delta_rx.recv().await;
+        });
+        let sequence = Arc::new(Mutex::new(Vec::new()));
+        let provider = GateProvider(Arc::clone(&sequence));
+        let observer = GateObserver::default();
+        let registry = registry_with(Vec::new());
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let mut history = vec![ChatMessage::user("hi")];
+        let error = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+            .scope(
+                Some(probe.clone()),
+                run_scripted_loop_with_events_and_delta(
+                    &provider,
+                    &registry,
+                    &observer,
+                    None,
+                    &pacing,
+                    "blocked-progress",
+                    false,
+                    None,
+                    &mut history,
+                    100_000,
+                    None,
+                    None,
+                    Some(delta_tx),
+                ),
+            )
+            .await
+            .unwrap_err();
+        fencer.await.unwrap();
+        assert!(
+            error
+                .downcast_ref::<zeroclaw_goal::accounting::GoalOperationFenced>()
+                .is_some()
+        );
+        assert!(sequence.lock().unwrap().is_empty());
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
+        assert!(goal.pending_call_id.is_none());
+        let events = observer.0.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    crate::observability::ObserverEvent::LlmRequest { .. }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    crate::observability::ObserverEvent::LlmResponse { success: false, .. }
+                ))
+                .count(),
+            1
+        );
+    }
+
+    struct FenceEntryProvider {
+        store: Arc<crate::control_plane::SqliteTaskStore>,
+        scope: zeroclaw_goal::GoalExecutionScope,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for FenceEntryProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "fence-entry-provider"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for FenceEntryProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            unreachable!("the fixture uses structured chat")
+        }
+        async fn chat(
+            &self,
+            _: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            use zeroclaw_goal::GoalTaskRegistry;
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let task = self
+                .store
+                .current_goal_for_session(self.scope.session_id())
+                .await?
+                .unwrap();
+            assert_eq!(task.status, zeroclaw_api::task::TaskStatus::Running);
+            tokio::task::yield_now().await;
+            Ok(ChatResponse {
+                text: None,
+                tool_calls: vec![tool_call("fixture-call", "echo", serde_json::json!({}))],
+                usage: Some(zeroclaw_api::model_provider::TokenUsage {
+                    input_tokens: Some(2),
+                    output_tokens: Some(1),
+                    cached_input_tokens: Some(0),
+                    cache_creation_input_tokens: Some(0),
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn goal_turn_dispatch_entry_precedes_a_queued_fence() {
+        use crate::goal_accounting::tests::{DispatchProbe, DispatchProbeMode};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use zeroclaw_goal::accounting::GoalOperationAccountingFactory;
+        use zeroclaw_goal::{GoalAccountingState, GoalTaskRegistry, GoalTransitionResult};
+
+        let (store, factory, _tracker, scope, _directory) =
+            crate::goal_accounting::tests::fixture().await;
+        let probe = Arc::new(DispatchProbe::new(
+            factory.for_scope(scope.clone()),
+            Arc::clone(&store),
+            scope.clone(),
+            DispatchProbeMode::QueueFenceAfterStart,
+        ));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = FenceEntryProvider {
+            store: Arc::clone(&store),
+            scope: scope.clone(),
+            calls: Arc::clone(&calls),
+        };
+        let registry = registry_with(vec![Box::new(EchoTool {
+            name: "echo".into(),
+        })]);
+        let observer = NoopObserver;
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let mut history = vec![ChatMessage::user("hi")];
+        let error = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+            .scope(
+                Some(probe.clone()),
+                run_scripted_loop_with_events(
+                    &provider,
+                    &registry,
+                    &observer,
+                    None,
+                    &pacing,
+                    "queued-fence",
+                    false,
+                    None,
+                    &mut history,
+                    100_000,
+                    None,
+                    None,
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<zeroclaw_goal::accounting::GoalOperationFenced>()
+                .is_some()
+        );
+        assert_eq!(
+            probe.wait_for_fence().await.unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.admissions.load(Ordering::SeqCst), 2);
+        assert_eq!(probe.settlements.load(Ordering::SeqCst), 1);
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
+        assert!(goal.pending_call_id.is_none());
+        assert_eq!(
+            store
+                .current_goal_for_session(scope.session_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            zeroclaw_api::task::TaskStatus::Paused
+        );
+    }
+
+    struct StreamingFenceProvider {
+        database: std::path::PathBuf,
+        task_id: String,
+        token: CancellationToken,
+        constructed: Arc<std::sync::atomic::AtomicBool>,
+        polled: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for StreamingFenceProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "streaming-fence-provider"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for StreamingFenceProvider {
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+        fn supports_streaming_tool_events(&self) -> bool {
+            true
+        }
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            unreachable!("the fixture streams")
+        }
+        fn stream_chat(
+            &self,
+            _: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+            _: zeroclaw_api::model_provider::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_api::model_provider::StreamResult<zeroclaw_api::model_provider::StreamEvent>,
+        > {
+            let connection = rusqlite::Connection::open(&self.database).unwrap();
+            let status: String = connection
+                .query_row(
+                    "SELECT status FROM tasks WHERE id = ?1",
+                    [&self.task_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, "running");
+            self.constructed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.token.cancel();
+            let polled = Arc::clone(&self.polled);
+            Box::pin(futures_util::stream::poll_fn(move |_| {
+                polled.store(true, std::sync::atomic::Ordering::SeqCst);
+                std::task::Poll::Pending
+            }))
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn goal_turn_stream_constructor_precedes_a_queued_fence() {
+        use crate::goal_accounting::tests::{DispatchProbe, DispatchProbeMode};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use zeroclaw_goal::accounting::GoalOperationAccountingFactory;
+        use zeroclaw_goal::{GoalAccountingState, GoalTaskRegistry, GoalTransitionResult};
+
+        for _ in 0..128 {
+            let directory = tempfile::TempDir::new().unwrap();
+            let database = directory.path().join("control_plane.db");
+            let store =
+                Arc::new(crate::control_plane::SqliteTaskStore::new(directory.path()).unwrap());
+            let (store, factory, _tracker, scope, _directory) =
+                crate::goal_accounting::tests::fixture_with_store(store, directory).await;
+            let probe = Arc::new(DispatchProbe::new(
+                factory.for_scope(scope.clone()),
+                Arc::clone(&store),
+                scope.clone(),
+                DispatchProbeMode::QueueFenceAfterStart,
+            ));
+            let token = CancellationToken::new();
+            let constructed = Arc::new(AtomicBool::new(false));
+            let polled = Arc::new(AtomicBool::new(false));
+            let provider = StreamingFenceProvider {
+                database,
+                task_id: scope.task_id().to_owned(),
+                token: token.clone(),
+                constructed: Arc::clone(&constructed),
+                polled: Arc::clone(&polled),
+            };
+            let registry = registry_with(Vec::new());
+            let observer = NoopObserver;
+            let pacing = zeroclaw_config::schema::PacingConfig::default();
+            let mut history = vec![ChatMessage::user("hi")];
+            let (tx, _rx) = tokio::sync::mpsc::channel(128);
+            let error = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+                .scope(
+                    Some(probe.clone()),
+                    run_scripted_loop_with_events(
+                        &provider,
+                        &registry,
+                        &observer,
+                        None,
+                        &pacing,
+                        "stream-fence",
+                        false,
+                        Some(token),
+                        &mut history,
+                        100_000,
+                        None,
+                        Some(tx),
+                    ),
+                )
+                .await
+                .unwrap_err();
+            assert!(is_tool_loop_cancelled(&error), "{error:#}");
+            assert_eq!(
+                probe.wait_for_fence().await.unwrap(),
+                GoalTransitionResult::Applied
+            );
+            assert!(constructed.load(Ordering::SeqCst));
+            if !polled.load(Ordering::SeqCst) {
+                assert_eq!(probe.releases.load(Ordering::SeqCst), 0);
+                assert_eq!(probe.settlements.load(Ordering::SeqCst), 1);
+                let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+                assert_eq!(goal.accounting_state, GoalAccountingState::OutcomeUnknown);
+                assert!(goal.pending_call_id.is_none());
+                return;
+            }
+        }
+        panic!("no cancellation won before the stream's first poll");
+    }
+
+    #[derive(Default)]
     struct ObservedTurnSettlement {
         settlements: Mutex<Vec<zeroclaw_goal::accounting::GoalOperationSettlement>>,
         releases: std::sync::atomic::AtomicUsize,
@@ -11414,6 +12370,13 @@ mod tool_lifecycle_abandonment_tests {
 
     #[async_trait::async_trait]
     impl zeroclaw_goal::accounting::GoalOperationAccounting for ObservedTurnSettlement {
+        async fn begin_dispatch(&self) -> anyhow::Result<zeroclaw_goal::task::GoalDispatchStart> {
+            Ok(zeroclaw_goal::task::GoalDispatchStart::new(
+                std::sync::Arc::new(tokio::sync::Mutex::new(()))
+                    .lock_owned()
+                    .await,
+            ))
+        }
         async fn admit(
             &self,
             _: zeroclaw_goal::accounting::GoalOperationRequest,
@@ -11598,6 +12561,13 @@ mod tool_lifecycle_abandonment_tests {
 
     #[async_trait::async_trait]
     impl zeroclaw_goal::accounting::GoalOperationAccounting for FailingTurnSettlement {
+        async fn begin_dispatch(&self) -> anyhow::Result<zeroclaw_goal::task::GoalDispatchStart> {
+            Ok(zeroclaw_goal::task::GoalDispatchStart::new(
+                std::sync::Arc::new(tokio::sync::Mutex::new(()))
+                    .lock_owned()
+                    .await,
+            ))
+        }
         async fn admit(
             &self,
             _: zeroclaw_goal::accounting::GoalOperationRequest,

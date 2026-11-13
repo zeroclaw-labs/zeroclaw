@@ -234,6 +234,34 @@ pub(crate) fn goal_operation_accounting_is_scoped() -> bool {
         .unwrap_or(false)
 }
 
+/// Acquire the final dispatch guard only for a Goal-scoped operation.
+pub(crate) async fn begin_goal_dispatch_if_scoped()
+-> anyhow::Result<Option<zeroclaw_goal::task::GoalDispatchStart>> {
+    match GOAL_OPERATION_ACCOUNTING
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+    {
+        Some(accounting) => accounting.begin_dispatch().await.map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Poll the dispatch once under its guard, then release it. The caller must
+/// not await other work between acquiring the guard and awaiting this future.
+pub(crate) async fn release_after_first_poll<F: std::future::Future>(
+    mut start: Option<zeroclaw_goal::task::GoalDispatchStart>,
+    future: F,
+) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(|cx| {
+        let result = future.as_mut().poll(cx);
+        drop(start.take());
+        result
+    })
+    .await
+}
+
 /// Release a Goal admission only when provider dispatch was never polled.
 pub(crate) async fn release_unstarted_goal_operation_if_scoped() -> anyhow::Result<()> {
     if let Some(accounting) = GOAL_OPERATION_ACCOUNTING
@@ -1570,6 +1598,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl zeroclaw_goal::accounting::GoalOperationAccounting for CapturedGoalSettlement {
+        async fn begin_dispatch(&self) -> anyhow::Result<zeroclaw_goal::task::GoalDispatchStart> {
+            Ok(zeroclaw_goal::task::GoalDispatchStart::new(
+                std::sync::Arc::new(tokio::sync::Mutex::new(()))
+                    .lock_owned()
+                    .await,
+            ))
+        }
         async fn admit(&self, _request: GoalOperationRequest) -> anyhow::Result<()> {
             Ok(())
         }

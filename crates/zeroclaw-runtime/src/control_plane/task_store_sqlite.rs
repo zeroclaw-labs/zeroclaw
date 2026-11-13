@@ -1,6 +1,8 @@
 //! The single SQLite-backed [`TaskRegistry`] — EPIC A's durable index.
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, Weak};
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
@@ -18,6 +20,29 @@ const CONTROL_PLANE_SCHEMA_VERSION: i64 = 14;
 
 pub struct SqliteTaskStore {
     conn: Mutex<Connection>,
+    goal_dispatch_gates: SessionDispatchGates,
+}
+
+/// Process-local coordination only; durable lifecycle state remains in SQLite.
+/// Fencers and dispatchers must share this store instance (the daemon owner).
+/// A separately opened store or another process does not share these gates.
+#[derive(Default)]
+struct SessionDispatchGates(std::sync::Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>);
+
+impl SessionDispatchGates {
+    fn gate(&self, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut gates = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(gate) = gates.get(session_id).and_then(Weak::upgrade) {
+            return gate;
+        }
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        gates.insert(session_id.to_owned(), Arc::downgrade(&gate));
+        gate
+    }
 }
 
 impl SqliteTaskStore {
@@ -119,6 +144,7 @@ impl SqliteTaskStore {
         migrate_schema(&conn).context("migrate control-plane schema")?;
         Ok(Self {
             conn: Mutex::new(conn),
+            goal_dispatch_gates: SessionDispatchGates::default(),
         })
     }
 

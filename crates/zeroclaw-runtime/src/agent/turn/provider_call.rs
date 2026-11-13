@@ -12,7 +12,7 @@ use super::redact::scrub_credentials;
 use super::stream_consume::{
     StreamProviderFailure, consume_provider_streaming_response_with_policy,
 };
-use crate::agent::cost::{admit_goal_operation_if_scoped, check_tool_loop_budget};
+use crate::agent::cost::check_tool_loop_budget;
 use crate::cost::types::{BudgetCheck, UsagePeriod};
 use crate::observability::ObserverEvent;
 use crate::tools::ToolSpec;
@@ -298,6 +298,8 @@ pub(crate) fn announce_budget_warning(
 /// with non-streaming fallback, or plain non-streaming chat with optional
 /// per-step timeout and cancel select. See [`ProviderCallOutcome`] for the
 /// cancel asymmetry this function must preserve.
+/// Callers must admit Goal work and pass its pre-dispatch gate first; the first
+/// poll enters provider dispatch, and streaming constructors may start a send.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_provider(
     ctx: &TurnCtx<'_>,
@@ -312,7 +314,6 @@ pub(crate) async fn call_provider(
     iteration: usize,
     guard_tools: Option<&[ToolSpec]>,
 ) -> Result<ProviderCallOutcome> {
-    admit_goal_operation_if_scoped(ctx.provider_name, active_model).await?;
     let mut streamed_live_deltas = false;
     let mut streamed_protocol_suppressed = false;
     let mut streamed_visible_text = String::new();

@@ -362,6 +362,16 @@ impl LeaseObservingRegistry {
 
 #[async_trait]
 impl GoalTaskRegistry for LeaseObservingRegistry {
+    async fn begin_operation_dispatch(
+        &self,
+        _task_id: &str,
+        _session_id: &str,
+        _expected_epoch: i64,
+        _pending_call_id: &str,
+    ) -> anyhow::Result<Option<zeroclaw_goal::task::GoalDispatchStart>> {
+        panic!("unexpected dispatch in lifecycle-only registry")
+    }
+
     async fn latest_active_goal_for_agent(
         &self,
         _agent: &str,
@@ -1900,6 +1910,13 @@ struct ScriptedAccounting;
 
 #[async_trait]
 impl GoalOperationAccounting for ScriptedAccounting {
+    async fn begin_dispatch(&self) -> anyhow::Result<zeroclaw_goal::task::GoalDispatchStart> {
+        Ok(zeroclaw_goal::task::GoalDispatchStart::new(
+            std::sync::Arc::new(tokio::sync::Mutex::new(()))
+                .lock_owned()
+                .await,
+        ))
+    }
     async fn admit(&self, _request: GoalOperationRequest) -> anyhow::Result<()> {
         Ok(())
     }
@@ -1939,6 +1956,13 @@ struct FailingPricing {
 
 #[async_trait]
 impl GoalOperationAccounting for FailingPricing {
+    async fn begin_dispatch(&self) -> anyhow::Result<zeroclaw_goal::task::GoalDispatchStart> {
+        Ok(zeroclaw_goal::task::GoalDispatchStart::new(
+            std::sync::Arc::new(tokio::sync::Mutex::new(()))
+                .lock_owned()
+                .await,
+        ))
+    }
     async fn admit(&self, _request: GoalOperationRequest) -> anyhow::Result<()> {
         Ok(())
     }
@@ -1993,6 +2017,13 @@ struct PauseDuringPricing {
 
 #[async_trait]
 impl GoalOperationAccounting for PauseDuringPricing {
+    async fn begin_dispatch(&self) -> anyhow::Result<zeroclaw_goal::task::GoalDispatchStart> {
+        Ok(zeroclaw_goal::task::GoalDispatchStart::new(
+            std::sync::Arc::new(tokio::sync::Mutex::new(()))
+                .lock_owned()
+                .await,
+        ))
+    }
     async fn admit(&self, _request: GoalOperationRequest) -> anyhow::Result<()> {
         Ok(())
     }

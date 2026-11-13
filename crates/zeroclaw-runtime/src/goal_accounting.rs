@@ -15,7 +15,9 @@ use zeroclaw_goal::{
         GoalOperationFenced, GoalOperationRequest, GoalOperationSettlement, GoalUsageEvent,
         GoalUsagePrice, GoalUsagePricer, combine_accounting_state,
     },
-    task::{GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState, TaskGoal},
+    task::{
+        GoalBlocker, GoalBlockerKind, GoalDispatchStart, GoalPauseReason, GoalPauseState, TaskGoal,
+    },
 };
 
 use crate::agent::cost::{ModelProviderPricing, cost_usage_with_pricing};
@@ -399,6 +401,25 @@ impl GoalOperationAccounting for GoalOperationAccountant {
         }
     }
 
+    async fn begin_dispatch(&self) -> Result<GoalDispatchStart> {
+        let id = self
+            .admitted
+            .lock()
+            .await
+            .as_ref()
+            .map(|operation| operation.id.clone())
+            .context("Goal operation dispatch began without a matching admission")?;
+        self.registry
+            .begin_operation_dispatch(
+                self.scope.task_id(),
+                self.scope.session_id(),
+                self.scope.execution_epoch(),
+                &id,
+            )
+            .await?
+            .ok_or_else(|| anyhow::Error::new(GoalOperationFenced::ADMISSION_FENCE_LOST))
+    }
+
     async fn settle(&self, settlement: GoalOperationSettlement) -> Result<()> {
         let operation = {
             let mut admitted = self.admitted.lock().await;
@@ -525,7 +546,7 @@ impl GoalOperationAccounting for GoalOperationAccountant {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::control_plane::{SqliteTaskStore, TaskKind, TaskRecord};
     use std::collections::HashMap;
@@ -539,6 +560,7 @@ mod tests {
         ReadFailure,
         Admission(GoalTransitionResult),
         StoreFailure,
+        DispatchReadFailure,
         Pause(GoalTransitionResult),
         PauseStoreFailure,
         Settlement(GoalTransitionResult),
@@ -553,6 +575,21 @@ mod tests {
 
     #[async_trait]
     impl GoalTaskRegistry for AdmissionFaultRegistry {
+        async fn begin_operation_dispatch(
+            &self,
+            task_id: &str,
+            session_id: &str,
+            expected_epoch: i64,
+            pending_call_id: &str,
+        ) -> Result<Option<GoalDispatchStart>> {
+            if matches!(self.fault, AdmissionFault::DispatchReadFailure) {
+                bail!("fixture dispatch read failed");
+            }
+            self.store
+                .begin_operation_dispatch(task_id, session_id, expected_epoch, pending_call_id)
+                .await
+        }
+
         async fn get_goal_task(&self, task_id: &str) -> Result<Option<GoalTaskRecord>> {
             match self.fault {
                 AdmissionFault::MissingExtension => Ok(None),
@@ -790,6 +827,120 @@ mod tests {
         .unwrap()
     }
 
+    #[derive(Clone, Copy)]
+    pub(crate) enum DispatchProbeMode {
+        ObserveOnly,
+        FenceBeforeStart,
+        QueueFenceAfterStart,
+    }
+
+    pub(crate) struct DispatchProbe {
+        inner: Arc<dyn GoalOperationAccounting>,
+        store: Arc<SqliteTaskStore>,
+        scope: GoalExecutionScope,
+        mode: DispatchProbeMode,
+        pub admissions: std::sync::atomic::AtomicUsize,
+        pub releases: std::sync::atomic::AtomicUsize,
+        pub settlements: std::sync::atomic::AtomicUsize,
+        pub admitted: Arc<tokio::sync::Notify>,
+        fence: std::sync::Mutex<Option<tokio::task::JoinHandle<Result<GoalTransitionResult>>>>,
+    }
+
+    impl DispatchProbe {
+        pub(crate) fn new(
+            inner: Arc<dyn GoalOperationAccounting>,
+            store: Arc<SqliteTaskStore>,
+            scope: GoalExecutionScope,
+            mode: DispatchProbeMode,
+        ) -> Self {
+            Self {
+                inner,
+                store,
+                scope,
+                mode,
+                admissions: std::sync::atomic::AtomicUsize::new(0),
+                releases: std::sync::atomic::AtomicUsize::new(0),
+                settlements: std::sync::atomic::AtomicUsize::new(0),
+                admitted: Arc::new(tokio::sync::Notify::new()),
+                fence: std::sync::Mutex::new(None),
+            }
+        }
+
+        pub(crate) async fn wait_for_fence(&self) -> Result<GoalTransitionResult> {
+            let fence = self.fence.lock().unwrap().take().expect("queued fence");
+            tokio::time::timeout(std::time::Duration::from_secs(2), fence)
+                .await
+                .context("waiting for fixture fence")??
+        }
+    }
+
+    #[async_trait]
+    impl GoalOperationAccounting for DispatchProbe {
+        async fn admit(&self, request: GoalOperationRequest) -> Result<()> {
+            self.admissions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.admit(request).await?;
+            self.admitted.notify_one();
+            Ok(())
+        }
+
+        async fn begin_dispatch(&self) -> Result<GoalDispatchStart> {
+            if matches!(self.mode, DispatchProbeMode::FenceBeforeStart) {
+                assert_eq!(
+                    self.store
+                        .pause_session_goal(
+                            self.scope.task_id(),
+                            self.scope.session_id(),
+                            self.scope.execution_epoch(),
+                            operator_pause(GoalPauseReason::OperatorPaused),
+                        )
+                        .await?,
+                    GoalTransitionResult::Applied
+                );
+            }
+            let start = self.inner.begin_dispatch().await?;
+            if matches!(self.mode, DispatchProbeMode::QueueFenceAfterStart) {
+                let store = Arc::clone(&self.store);
+                let scope = self.scope.clone();
+                let fence = ::zeroclaw_spawn::spawn!(async move {
+                    store
+                        .pause_session_goal(
+                            scope.task_id(),
+                            scope.session_id(),
+                            scope.execution_epoch(),
+                            operator_pause(GoalPauseReason::OperatorPaused),
+                        )
+                        .await
+                });
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+                assert!(
+                    !fence.is_finished(),
+                    "the fence must wait for dispatch entry"
+                );
+                *self.fence.lock().unwrap() = Some(fence);
+            }
+            Ok(start)
+        }
+
+        async fn settle(&self, settlement: GoalOperationSettlement) -> Result<()> {
+            self.settlements
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.settle(settlement).await
+        }
+
+        async fn release_unstarted(&self) -> Result<()> {
+            self.releases
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.release_unstarted().await
+        }
+
+        async fn pricing_complete(&self) -> Result<bool> {
+            self.inner.pricing_complete().await
+        }
+    }
+
     #[tokio::test]
     async fn fenced_admission_after_durable_admission_rejection_preserves_its_error() {
         for result in [GoalTransitionResult::Stale, GoalTransitionResult::Missing] {
@@ -837,7 +988,7 @@ mod tests {
         }
     }
 
-    async fn fixture() -> (
+    pub(crate) async fn fixture() -> (
         Arc<SqliteTaskStore>,
         RuntimeGoalOperationAccountingFactory,
         Arc<CostTracker>,
@@ -848,7 +999,7 @@ mod tests {
         fixture_with_store(store, TempDir::new().unwrap()).await
     }
 
-    async fn fixture_with_store(
+    pub(crate) async fn fixture_with_store(
         store: Arc<SqliteTaskStore>,
         directory: TempDir,
     ) -> (
@@ -1173,6 +1324,520 @@ mod tests {
             .await
             .expect("a known-unstarted operation does not close admission");
         accountant.release_unstarted().await.unwrap();
+    }
+
+    fn operator_pause(reason: GoalPauseReason) -> GoalPauseState {
+        GoalPauseState {
+            reason,
+            description: None,
+            blockers: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_fence_committed_first_refuses_and_releases_unstarted_work() {
+        use zeroclaw_api::task::TaskStatus;
+
+        for reason in [
+            Some(GoalPauseReason::OperatorPaused),
+            Some(GoalPauseReason::DaemonRestart),
+            None,
+        ] {
+            let (store, factory, _tracker, scope, _directory) = fixture().await;
+            let accountant = factory.for_scope(scope.clone());
+            accountant
+                .admit(GoalOperationRequest::new("fallback", "model"))
+                .await
+                .unwrap();
+            let result = match reason {
+                Some(reason) => {
+                    store
+                        .pause_session_goal(
+                            scope.task_id(),
+                            scope.session_id(),
+                            scope.execution_epoch(),
+                            operator_pause(reason),
+                        )
+                        .await
+                }
+                None => {
+                    store
+                        .finish_session_goal(
+                            scope.task_id(),
+                            scope.session_id(),
+                            scope.execution_epoch(),
+                            TaskStatus::Cancelled,
+                            None,
+                        )
+                        .await
+                }
+            }
+            .unwrap();
+            assert_eq!(result, GoalTransitionResult::Applied);
+            let error = accountant.begin_dispatch().await.unwrap_err();
+            assert!(error.downcast_ref::<GoalOperationFenced>().is_some());
+            assert_eq!(
+                error.to_string(),
+                GoalOperationFenced::ADMISSION_FENCE_LOST.to_string()
+            );
+            accountant.release_unstarted().await.unwrap();
+            let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+            assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
+            assert!(goal.pending_call_id.is_none());
+            assert!(goal.pending_call_epoch.is_none());
+            let task = store
+                .current_goal_for_session(scope.session_id())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                task.status,
+                if reason.is_some() {
+                    TaskStatus::Paused
+                } else {
+                    TaskStatus::Cancelled
+                }
+            );
+            if let Some(reason) = reason {
+                assert_eq!(goal.pause_reason, Some(reason));
+                assert_eq!(
+                    store
+                        .resume_session_goal(
+                            scope.task_id(),
+                            scope.session_id(),
+                            task.execution_epoch,
+                            2,
+                            "resumed-boot",
+                        )
+                        .await
+                        .unwrap(),
+                    GoalTransitionResult::Applied
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_guard_orders_pause_and_allows_started_attempts_to_settle() {
+        use zeroclaw_api::task::TaskStatus;
+
+        for reason in [
+            GoalPauseReason::OperatorPaused,
+            GoalPauseReason::DaemonRestart,
+        ] {
+            let (store, factory, tracker, scope, _directory) = fixture().await;
+            let accountant = factory.for_scope(scope.clone());
+            accountant
+                .admit(GoalOperationRequest::new("fallback", "model"))
+                .await
+                .unwrap();
+            let start = accountant.begin_dispatch().await.unwrap();
+            let fence_store = Arc::clone(&store);
+            let fence_scope = scope.clone();
+            let fencer = ::zeroclaw_spawn::spawn!(async move {
+                fence_store
+                    .pause_session_goal(
+                        fence_scope.task_id(),
+                        fence_scope.session_id(),
+                        fence_scope.execution_epoch(),
+                        operator_pause(reason),
+                    )
+                    .await
+            });
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            assert!(!fencer.is_finished());
+            assert_eq!(
+                store
+                    .current_goal_for_session(scope.session_id())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                TaskStatus::Running
+            );
+            drop(start);
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(2), fencer)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+                GoalTransitionResult::Applied
+            );
+            assert!(
+                store
+                    .get_goal_task(scope.task_id())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .pending_call_id
+                    .is_some()
+            );
+            accountant
+                .settle(GoalOperationSettlement {
+                    accounting_state: GoalAccountingState::Complete,
+                    events: vec![
+                        usage_event("fallback", 10, 2),
+                        usage_event("fallback", 20, 3),
+                    ],
+                })
+                .await
+                .unwrap();
+            let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+            assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
+            assert!(goal.pending_call_id.is_none());
+            assert_eq!(goal.pause_reason, Some(reason));
+            assert_eq!(
+                tracker
+                    .get_strict_usage_totals_for_task_with_pricing(scope.task_id())
+                    .unwrap()
+                    .0,
+                35
+            );
+            assert!(
+                factory
+                    .for_scope(scope.clone())
+                    .admit(GoalOperationRequest::new("fallback", "model"))
+                    .await
+                    .is_err()
+            );
+            let task = store
+                .current_goal_for_session(scope.session_id())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(task.status, TaskStatus::Paused);
+            assert_eq!(
+                store
+                    .resume_session_goal(
+                        scope.task_id(),
+                        scope.session_id(),
+                        task.execution_epoch,
+                        2,
+                        "resumed-boot"
+                    )
+                    .await
+                    .unwrap(),
+                GoalTransitionResult::Applied
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_guard_checks_exact_goal_and_pending_marker() {
+        let (store, factory, _tracker, scope, _directory) = fixture().await;
+        let accountant = factory.for_scope(scope.clone());
+        accountant
+            .admit(GoalOperationRequest::new("fallback", "model"))
+            .await
+            .unwrap();
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        let marker = goal.pending_call_id.unwrap();
+        for (task, session, epoch, pending) in [
+            (
+                "missing",
+                scope.session_id(),
+                scope.execution_epoch(),
+                marker.as_str(),
+            ),
+            (
+                scope.task_id(),
+                "another-session",
+                scope.execution_epoch(),
+                marker.as_str(),
+            ),
+            (
+                scope.task_id(),
+                scope.session_id(),
+                scope.execution_epoch() + 1,
+                marker.as_str(),
+            ),
+            (
+                scope.task_id(),
+                scope.session_id(),
+                scope.execution_epoch(),
+                "wrong-marker",
+            ),
+        ] {
+            assert!(
+                store
+                    .begin_operation_dispatch(task, session, epoch, pending)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                store.pause_session_goal(
+                    scope.task_id(),
+                    scope.session_id(),
+                    scope.execution_epoch(),
+                    operator_pause(GoalPauseReason::OperatorPaused),
+                )
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert!(
+            store
+                .begin_operation_dispatch(
+                    scope.task_id(),
+                    scope.session_id(),
+                    scope.execution_epoch(),
+                    &marker
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        accountant.release_unstarted().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatch_guard_rejects_wrong_pending_epoch_and_terminal_tasks() {
+        use zeroclaw_api::task::TaskStatus;
+
+        for status in [TaskStatus::Cancelled, TaskStatus::Completed] {
+            let directory = TempDir::new().unwrap();
+            let store = Arc::new(SqliteTaskStore::new(directory.path()).unwrap());
+            let (store, factory, _tracker, scope, directory) =
+                fixture_with_store(store, directory).await;
+            let accountant = factory.for_scope(scope.clone());
+            accountant
+                .admit(GoalOperationRequest::new("fallback", "model"))
+                .await
+                .unwrap();
+            let marker = store
+                .get_goal_task(scope.task_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .pending_call_id
+                .unwrap();
+            let connection =
+                rusqlite::Connection::open(directory.path().join("control_plane.db")).unwrap();
+            connection
+                .execute(
+                    "UPDATE goal_tasks SET pending_call_epoch = 2 WHERE task_id = ?1",
+                    [scope.task_id()],
+                )
+                .unwrap();
+            assert!(
+                store
+                    .begin_operation_dispatch(
+                        scope.task_id(),
+                        scope.session_id(),
+                        scope.execution_epoch(),
+                        &marker
+                    )
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            connection
+                .execute(
+                    "UPDATE goal_tasks SET pending_call_epoch = 1 WHERE task_id = ?1",
+                    [scope.task_id()],
+                )
+                .unwrap();
+            drop(connection);
+            assert_eq!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    store.finish_session_goal(
+                        scope.task_id(),
+                        scope.session_id(),
+                        scope.execution_epoch(),
+                        status,
+                        None,
+                    )
+                )
+                .await
+                .unwrap()
+                .unwrap(),
+                GoalTransitionResult::Applied
+            );
+            assert!(
+                store
+                    .begin_operation_dispatch(
+                        scope.task_id(),
+                        scope.session_id(),
+                        scope.execution_epoch(),
+                        &marker
+                    )
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            accountant.release_unstarted().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_read_failure_keeps_the_original_error_and_releases_admission() {
+        let (store, factory, _tracker, scope, _directory) = fixture().await;
+        let faulted = faulted_factory(
+            &factory,
+            Arc::clone(&store),
+            AdmissionFault::DispatchReadFailure,
+        );
+        let accountant = faulted.for_scope(scope.clone());
+        accountant
+            .admit(GoalOperationRequest::new("fallback", "model"))
+            .await
+            .unwrap();
+        assert!(
+            accountant
+                .begin_dispatch()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("fixture dispatch read failed")
+        );
+        accountant.release_unstarted().await.unwrap();
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert!(goal.pending_call_id.is_none());
+        assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_guard_is_local_to_one_store_instance() {
+        use zeroclaw_api::task::TaskStatus;
+
+        let directory = TempDir::new().unwrap();
+        let first = Arc::new(SqliteTaskStore::new(directory.path()).unwrap());
+        let second = Arc::new(SqliteTaskStore::new(directory.path()).unwrap());
+        let (store, factory, _tracker, scope, _directory) =
+            fixture_with_store(first, directory).await;
+        let accountant = factory.for_scope(scope.clone());
+        accountant
+            .admit(GoalOperationRequest::new("fallback", "model"))
+            .await
+            .unwrap();
+        let start = accountant.begin_dispatch().await.unwrap();
+        let fence_scope = scope.clone();
+        let fencer = ::zeroclaw_spawn::spawn!(async move {
+            second
+                .pause_session_goal(
+                    fence_scope.task_id(),
+                    fence_scope.session_id(),
+                    fence_scope.execution_epoch(),
+                    operator_pause(GoalPauseReason::OperatorPaused),
+                )
+                .await
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        drop(start);
+        accountant
+            .settle(GoalOperationSettlement {
+                accounting_state: GoalAccountingState::Complete,
+                events: vec![usage_event("fallback", 1, 1)],
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), fencer)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        let task = store
+            .current_goal_for_session(scope.session_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Paused);
+        assert_eq!(goal.pause_reason, Some(GoalPauseReason::OperatorPaused));
+        assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
+        assert!(goal.pending_call_id.is_none());
+        assert!(
+            factory
+                .for_scope(scope)
+                .admit(GoalOperationRequest::new("fallback", "model"))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_guard_does_not_soft_fence_a_failed_pause() {
+        use zeroclaw_api::task::TaskStatus;
+
+        let directory = TempDir::new().unwrap();
+        let store = Arc::new(SqliteTaskStore::new(directory.path()).unwrap());
+        let (store, factory, _tracker, scope, directory) =
+            fixture_with_store(store, directory).await;
+        let accountant = factory.for_scope(scope.clone());
+        accountant
+            .admit(GoalOperationRequest::new("fallback", "model"))
+            .await
+            .unwrap();
+        let connection =
+            rusqlite::Connection::open(directory.path().join("control_plane.db")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_fixture_pause BEFORE UPDATE OF status ON tasks
+             WHEN NEW.status = 'paused'
+             BEGIN SELECT RAISE(ABORT, 'fixture pause write failed'); END;",
+            )
+            .unwrap();
+        drop(connection);
+        let start = accountant.begin_dispatch().await.unwrap();
+        let fence_store = Arc::clone(&store);
+        let fence_scope = scope.clone();
+        let fencer = ::zeroclaw_spawn::spawn!(async move {
+            fence_store
+                .pause_session_goal(
+                    fence_scope.task_id(),
+                    fence_scope.session_id(),
+                    fence_scope.execution_epoch(),
+                    operator_pause(GoalPauseReason::OperatorPaused),
+                )
+                .await
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!fencer.is_finished());
+        drop(start);
+        let error = tokio::time::timeout(std::time::Duration::from_secs(2), fencer)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("fixture pause write failed"));
+        assert_eq!(
+            store
+                .current_goal_for_session(scope.session_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskStatus::Running
+        );
+        accountant
+            .settle(GoalOperationSettlement {
+                accounting_state: GoalAccountingState::Complete,
+                events: vec![usage_event("fallback", 1, 1)],
+            })
+            .await
+            .unwrap();
+        let next = factory.for_scope(scope);
+        next.admit(GoalOperationRequest::new("fallback", "model"))
+            .await
+            .unwrap();
+        next.release_unstarted().await.unwrap();
     }
 
     #[tokio::test]
