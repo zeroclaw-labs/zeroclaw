@@ -621,10 +621,36 @@ fn windows_policy_path(path: &Path) -> Option<String> {
         || has_windows_drive_prefix(text)
         || (text.starts_with(r"\\") && path_text_is_unc(text))
     {
-        Some(normalized.to_ascii_lowercase())
+        Some(collapse_windows_dot_segments(&normalized).to_ascii_lowercase())
     } else {
         None
     }
+}
+
+/// `D:\work\.\private` and `D:\work\\private` name the same file as
+/// `D:\work\private`, but a plain string comparison would not see the nested
+/// forbid they belong to. Drop `.` and empty segments so both sides of a prefix
+/// comparison use the same spelling. `..` is deliberately kept: the callers
+/// that reject traversal still need to see it.
+fn collapse_windows_dot_segments(normalized: &str) -> String {
+    let (unc_prefix, rest) = match normalized.strip_prefix(r"\\") {
+        Some(rest) => (r"\\", rest),
+        None => ("", normalized),
+    };
+    let mut collapsed = String::with_capacity(normalized.len());
+    collapsed.push_str(unc_prefix);
+    let mut has_segment = false;
+    for segment in rest.split('\\') {
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        if has_segment {
+            collapsed.push('\\');
+        }
+        collapsed.push_str(segment);
+        has_segment = true;
+    }
+    collapsed
 }
 
 /// Prefix matching and specificity must use the same path namespace. A single
@@ -12663,6 +12689,22 @@ mod tests {
                 assert!(!policy.is_path_allowed(r"D:\workspace\file"));
                 policy.forbidden_paths.push(r"\\?\D:\work\private".into());
                 assert!(!policy.is_path_allowed(r"D:\work\private\secret"));
+                // A dotted or repeated separator spelling still names the
+                // nested forbid, so it must not slip past it.
+                for target in [
+                    r"d:\WORK\.\private\secret",
+                    r"\\?\d:\WORK\.\private\secret",
+                    "//?/d:/WORK/./private/secret",
+                    r"D:\work\private\secret",
+                    r"\\?\D:\work\\private\secret",
+                    "D:\\work\\private\\secret",
+                    "D:\\work//private/secret",
+                ] {
+                    assert!(
+                        !policy.is_path_allowed(target),
+                        "dotted or doubled separator: {target}"
+                    );
+                }
                 policy.forbidden_paths.push(root.into());
                 assert!(
                     !policy.is_path_allowed(r"D:\work\file"),

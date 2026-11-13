@@ -19468,7 +19468,7 @@ fn filesystem_path_is_drvfs_mnt_letter(path: &str) -> bool {
 
 #[cfg(test)]
 mod filesystem_path_drvfs_tests {
-    use super::filesystem_path_is_drvfs_mnt_letter;
+    use super::{FilesystemConfig, filesystem_path_is_drvfs_mnt_letter};
 
     #[test]
     fn normalizes_equivalent_spellings() {
@@ -19481,6 +19481,35 @@ mod filesystem_path_drvfs_tests {
         assert!(!filesystem_path_is_drvfs_mnt_letter("/mnt/c/Users"));
         assert!(!filesystem_path_is_drvfs_mnt_letter("/mnt"));
         assert!(!filesystem_path_is_drvfs_mnt_letter("/media/c"));
+    }
+
+    #[test]
+    fn a_resolved_wsl_drive_mount_is_refused_like_a_configured_one() {
+        let config = FilesystemConfig {
+            paths: vec!["/srv/inbox".to_string()],
+            ..FilesystemConfig::default()
+        };
+        // A link that resolves into a DrvFs mount is still a drive watch.
+        let err = config
+            .ensure_resolved_path_is_not_broad("/srv/inbox", std::path::Path::new("/mnt/c"))
+            .expect_err("a resolved /mnt/c must be refused");
+        assert!(
+            err.to_string().contains("WSL drive mount"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            config
+                .ensure_resolved_path_is_not_broad(
+                    "/srv/inbox",
+                    std::path::Path::new("/mnt/c/projects")
+                )
+                .is_ok()
+        );
+        assert!(
+            config
+                .ensure_resolved_path_is_not_broad("/srv/inbox", std::path::Path::new("/srv/inbox"))
+                .is_ok()
+        );
     }
 }
 
@@ -19531,9 +19560,27 @@ impl FilesystemConfig {
             Ok(resolved) => resolved,
             Err(err) => anyhow::bail!("path '{path}' cannot be resolved: {err}"),
         };
-        if is_filesystem_broad_root(&resolved.to_string_lossy()) {
+        self.ensure_resolved_path_is_not_broad(path, &resolved)
+    }
+
+    /// The resolved spelling has to pass the same broad-root rules as the
+    /// configured one, or a link such as `/srv/inbox -> /mnt/c` would be
+    /// watched as if it were a narrow path.
+    fn ensure_resolved_path_is_not_broad(
+        &self,
+        path: &str,
+        resolved: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        let resolved_text = resolved.to_string_lossy();
+        if is_filesystem_broad_root(&resolved_text) {
             anyhow::bail!(
                 "path '{path}' resolves to broad system root '{}'; set allow_broad_roots = true to watch it",
+                resolved.display()
+            );
+        }
+        if filesystem_path_is_drvfs_mnt_letter(&resolved_text) {
+            anyhow::bail!(
+                "path '{path}' resolves to WSL drive mount '{}'; set allow_broad_roots = true to watch it",
                 resolved.display()
             );
         }
