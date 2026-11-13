@@ -12,15 +12,20 @@ pub(crate) const SAFE_SHELL_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
 
-/// Windows variables needed for cmd.exe, PowerShell module discovery, and program resolution.
-#[cfg(target_os = "windows")]
-pub(crate) const SAFE_SHELL_ENV_VARS: &[&str] = &[
+/// Windows allowlist kept as a named slice so every platform's tests can assert
+/// APPDATA / LOCALAPPDATA without scanning this file's source (tests also quote
+/// those names).
+#[cfg(any(test, target_os = "windows"))]
+pub(crate) const WINDOWS_SAFE_SHELL_ENV_VARS: &[&str] = &[
     "PATH",
     "PATHEXT",
     "HOME",
     "USERPROFILE",
     "HOMEDRIVE",
     "HOMEPATH",
+    // Per-user config/cred/cache roots used by gh, npm, and most Win32 tools.
+    "APPDATA",
+    "LOCALAPPDATA",
     "SYSTEMROOT",
     "SYSTEMDRIVE",
     "WINDIR",
@@ -34,6 +39,10 @@ pub(crate) const SAFE_SHELL_ENV_VARS: &[&str] = &[
     "LANG",
     "USERNAME",
 ];
+
+/// Windows variables needed for cmd.exe, PowerShell module discovery, and program resolution.
+#[cfg(target_os = "windows")]
+pub(crate) const SAFE_SHELL_ENV_VARS: &[&str] = WINDOWS_SAFE_SHELL_ENV_VARS;
 
 #[cfg(test)]
 mod tests {
@@ -64,5 +73,27 @@ mod tests {
     fn safe_shell_env_vars_preserve_powershell_module_discovery() {
         assert!(SAFE_SHELL_ENV_VARS.contains(&"PSModulePath"));
         assert!(SAFE_SHELL_ENV_VARS.contains(&"PSModuleAnalysisCachePath"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn safe_shell_env_vars_forward_windows_profile_roots() {
+        assert!(SAFE_SHELL_ENV_VARS.contains(&"APPDATA"));
+        assert!(SAFE_SHELL_ENV_VARS.contains(&"LOCALAPPDATA"));
+    }
+
+    #[test]
+    fn windows_profile_roots_stay_in_the_windows_allowlist() {
+        // Cross-platform: assert the Windows allowlist declaration directly so
+        // Linux CI still catches a regression that drops APPDATA / LOCALAPPDATA
+        // without matching the same strings inside this test module.
+        assert!(
+            super::WINDOWS_SAFE_SHELL_ENV_VARS.contains(&"APPDATA"),
+            "Windows SAFE_SHELL_ENV_VARS must forward APPDATA"
+        );
+        assert!(
+            super::WINDOWS_SAFE_SHELL_ENV_VARS.contains(&"LOCALAPPDATA"),
+            "Windows SAFE_SHELL_ENV_VARS must forward LOCALAPPDATA"
+        );
     }
 }
