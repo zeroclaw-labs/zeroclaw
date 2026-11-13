@@ -125,6 +125,12 @@ related check; otherwise the write is rejected. Retained diagnostics use the
 `pre_existing_validation_error` warning code in responses that carry warnings.
 Secret and initialization responses keep their documented response shapes.
 
+For lists addressed by a natural key, indexed validation diagnostics are matched
+to the edited entry when its identity can be resolved. An ambiguous or unknown
+identity is treated as related to the edit and rejected. Removing or reordering
+entries can change a diagnostic's index, so an otherwise unchanged error may be
+treated as new and reject the write.
+
 Accepted state is persisted and swapped in. If any operation or validation
 fails, on-disk and in-memory state are unchanged. Comment annotations are
 applied after the save on a non-fatal, best-effort basis.

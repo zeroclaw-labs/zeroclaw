@@ -6015,6 +6015,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn editor_validation_regression_natural_key_matches_indexed_route_diagnostic() {
+        use zeroclaw_config::schema::ModelRouteConfig;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        goal_configure_test_verifier(&mut config);
+        config.model_routes = vec![
+            ModelRouteConfig {
+                hint: "reasoning".into(),
+                model_provider: "openai.default".into(),
+                model: String::new(),
+                ..Default::default()
+            },
+            ModelRouteConfig {
+                hint: "fast".into(),
+                model_provider: "openai.default".into(),
+                model: "m".into(),
+                ..Default::default()
+            },
+        ];
+        config.save().await.unwrap();
+        let state = test_state(config);
+
+        let (status, json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "replace",
+                    "path": "/model_routes/fast/model",
+                    "value": "m2"
+                }])),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let warnings: Vec<_> = json["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|warning| warning["code"] == "pre_existing_validation_error")
+            .collect();
+        assert_eq!(warnings.len(), 1, "{json}");
+        assert_eq!(warnings[0]["code"], "pre_existing_validation_error");
+        assert_eq!(warnings[0]["path"], "model_routes[0].model");
+        let config_path = state.config.read().config_path.clone();
+        let disk_before = std::fs::read(&config_path).unwrap();
+        let reloaded = zeroclaw_config::migration::migrate_to_current(
+            std::str::from_utf8(&disk_before).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reloaded.model_routes[0].model, "");
+        assert_eq!(reloaded.model_routes[1].model, "m2");
+        let revision_before = state.config.revision();
+        let pending_before = state
+            .pending_reload
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        let (status, json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "replace",
+                    "path": "/model_routes/reasoning/model",
+                    "value": "  "
+                }])),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(json["code"], "required_field_empty", "{json}");
+        assert_eq!(json["path"], "model_routes[0].model", "{json}");
+        assert_eq!(std::fs::read(config_path).unwrap(), disk_before);
+        assert_eq!(state.config.revision(), revision_before);
+        assert_eq!(
+            state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::Relaxed),
+            pending_before
+        );
+    }
+
+    #[tokio::test]
     async fn goal_patch_enabling_with_configured_verifier_saves_without_budget_keys() {
         // A valid enable-only save must not invent default budget values.
         let tmp = tempfile::tempdir().unwrap();
