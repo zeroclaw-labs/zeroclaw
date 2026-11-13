@@ -141,17 +141,20 @@ interface RawResult {
 const inFlightGets = new Map<string, Promise<RawResult>>();
 
 /**
- * Drop any in-flight coalesced GET for `path` so the next caller performs a
- * fresh request. Callers already awaiting the shared request still receive
- * its payload; the point is that a read started after a mutation can never
+ * Drop any in-flight coalesced GET for `path` and its query variants so the
+ * next caller performs a fresh request. Callers already awaiting the shared
+ * request still receive its payload; a read started after a mutation cannot
  * attach to a request that began before it and report pre-mutation state as
  * the newest result. Mutating endpoints call this for the listings they
  * affect.
  */
 function invalidateInFlightGet(path: string): void {
-  const suffix = ` ${apiOrigin}${basePath}${path}`;
+  const url = `${apiOrigin}${basePath}${path}`;
   for (const key of [...inFlightGets.keys()]) {
-    if (key.endsWith(suffix)) inFlightGets.delete(key);
+    const requestUrl = key.slice(key.indexOf(" ") + 1);
+    if (requestUrl === url || requestUrl.startsWith(`${url}?`)) {
+      inFlightGets.delete(key);
+    }
   }
 }
 
@@ -724,6 +727,7 @@ export async function patchConfig(
       ? { headers: { "X-ZeroClaw-Override-Drift": "true" } }
       : {}),
   });
+  invalidateInFlightGet("/api/config/list");
   // Config structure changed: notify listeners (e.g. the ⌘K search index)
   // so they can invalidate caches. Decoupled via a browser event to avoid a
   // circular import (configSearch.ts imports from this module).
