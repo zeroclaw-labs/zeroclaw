@@ -1670,7 +1670,15 @@ fn runtime_shell_assembly(
         Some(&security.workspace_dir),
         &sandbox_extra_roots,
     );
-    let shell_tool = ShellTool::new_with_sandbox(security, runtime, sandbox.clone());
+    // Every command gets its own session, so what a command leaves running in
+    // that group is reachable from here and nowhere else. Resolve the sweep
+    // from canonical config at this one seam so every shell tool the registry
+    // builds — including the one `shell_tool_for_runtime` hands out — agrees.
+    let shell_tool = ShellTool::new_with_sandbox(security, runtime, sandbox.clone())
+        .with_background_reap(
+            root_config.shell_tool.reap_background_on_return,
+            std::time::Duration::from_secs(root_config.shell_tool.reap_grace_secs),
+        );
     RuntimeShellAssembly {
         shell_tool,
         sandbox,

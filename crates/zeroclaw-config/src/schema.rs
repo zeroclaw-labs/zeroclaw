@@ -9304,7 +9304,9 @@ impl Default for TextBrowserConfig {
 ///
 /// Controls the behaviour of the `shell` execution tool. The main
 /// tunable is `timeout_secs` — the maximum wall-clock time a single
-/// shell command may run before it is killed.
+/// shell command may run before it is killed. `reap_background_on_return`
+/// and `reap_grace_secs` govern what the tool does with the work a
+/// command leaves running behind it once that command has returned.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "shell_tool"]
@@ -9312,16 +9314,57 @@ pub struct ShellToolConfig {
     /// Maximum shell command execution time in seconds (default: 60).
     #[serde(default = "default_shell_tool_timeout_secs")]
     pub timeout_secs: u64,
+
+    /// Terminate whatever is still alive in the command's process group
+    /// after the command itself has returned (default: `true`).
+    ///
+    /// Every command runs in its own session, so its process group is its
+    /// own. A command that backgrounds work and returns — `sleep 300 &`,
+    /// `yes > /dev/null &` — leaves that work running after the tool has
+    /// answered the model: the command timeout no longer applies to it,
+    /// and the process is reparented to init and outlives the turn, the
+    /// job, and any daemon restart. When this is enabled the tool instead
+    /// sends `SIGTERM` to that group, waits `reap_grace_secs`, and then
+    /// sends `SIGKILL` to whatever has not exited, logging how many
+    /// processes it swept.
+    ///
+    /// Only that one process group is ever signalled, so the sweep cannot
+    /// reach the daemon or an unrelated process. It does not reach a
+    /// descendant that called `setsid()` or `setpgid()` itself and left the
+    /// group — the same limit group cleanup has on the timeout and
+    /// cancellation paths.
+    ///
+    /// Set this to `false` when the `shell` tool is deliberately used to
+    /// start detached daemons that must outlive the command that started
+    /// them; start those from a service manager instead, where nothing is
+    /// left unbounded. Timeout and cancellation cleanup is unaffected
+    /// either way.
+    #[serde(default = "default_true")]
+    pub reap_background_on_return: bool,
+
+    /// Grace period in seconds between the `SIGTERM` sweep of a returned
+    /// command's process group and the `SIGKILL` escalation (default: 2).
+    ///
+    /// Consulted only when `reap_background_on_return` is enabled. `0`
+    /// skips the grace and escalates immediately.
+    #[serde(default = "default_shell_tool_reap_grace_secs")]
+    pub reap_grace_secs: u64,
 }
 
 fn default_shell_tool_timeout_secs() -> u64 {
     60
 }
 
+fn default_shell_tool_reap_grace_secs() -> u64 {
+    2
+}
+
 impl Default for ShellToolConfig {
     fn default() -> Self {
         Self {
             timeout_secs: default_shell_tool_timeout_secs(),
+            reap_background_on_return: default_true(),
+            reap_grace_secs: default_shell_tool_reap_grace_secs(),
         }
     }
 }
@@ -55208,5 +55251,51 @@ model_provider = \"ollama.default\"
         duplicate_route
             .validate()
             .expect("legacy duplicate route hints remain valid");
+    }
+
+    #[::core::prelude::v1::test]
+    fn shell_tool_reaps_background_processes_by_default() {
+        // A command that backgrounds work and returns would otherwise leave
+        // it running unbounded, so the sweep is on unless an operator turns
+        // it off.
+        let config: Config = toml::from_str("").expect("empty config should parse");
+        assert!(config.shell_tool.reap_background_on_return);
+        assert_eq!(config.shell_tool.reap_grace_secs, 2);
+    }
+
+    #[::core::prelude::v1::test]
+    fn shell_tool_reap_can_be_turned_off_for_detached_daemons() {
+        let config: Config = toml::from_str(
+            r#"
+            [shell_tool]
+            reap_background_on_return = false
+            reap_grace_secs = 30
+            "#,
+        )
+        .expect("shell tool config should parse");
+        assert!(!config.shell_tool.reap_background_on_return);
+        assert_eq!(config.shell_tool.reap_grace_secs, 30);
+        // The neighbouring timeout key is untouched by the reap keys.
+        assert_eq!(
+            config.shell_tool.timeout_secs,
+            default_shell_tool_timeout_secs()
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn shell_tool_partial_section_keeps_the_remaining_defaults() {
+        let config: Config = toml::from_str(
+            r#"
+            [shell_tool]
+            reap_grace_secs = 0
+            "#,
+        )
+        .expect("shell tool config should parse");
+        assert!(config.shell_tool.reap_background_on_return);
+        assert_eq!(config.shell_tool.reap_grace_secs, 0);
+        assert_eq!(
+            config.shell_tool.timeout_secs,
+            default_shell_tool_timeout_secs()
+        );
     }
 }
