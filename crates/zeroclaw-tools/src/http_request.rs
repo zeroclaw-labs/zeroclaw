@@ -872,9 +872,9 @@ impl Tool for HttpRequestTool {
             None => None,
         };
         let credential_result = match (scoped, auth_secret) {
-            (Some(_), Some(_)) => Err(anyhow::Error::msg(
-                scoped_credential_message("tool-http-credential-exclusive"),
-            )),
+            (Some(_), Some(_)) => Err(anyhow::Error::msg(scoped_credential_message(
+                "tool-http-credential-exclusive",
+            ))),
             (Some(name), None) => {
                 self.apply_scoped_credential(&mut request_headers, name, &target)
                     .await
