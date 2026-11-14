@@ -48,9 +48,12 @@ test("config saves and toggles retain warnings only for the relevant result", as
     path: "nodes.mdns.peer_ttl_secs",
     message: "fixture retained diagnostic",
   };
+  const ratePrefix = "cost.rates.providers.models.openai.fixture-model";
+  const ratePath = `${ratePrefix}.input_per_mtok`;
   const values: Record<string, string> = {
     "browser.enabled": "false",
     "browser.timeout_ms": "5000",
+    [ratePath]: "1",
   };
   let mode: "warning" | "none" | "error" = "warning";
   let failNextReload = false;
@@ -67,12 +70,25 @@ test("config saves and toggles retain warnings only for the relevant result", as
         return Response.json({ code: "reload_failed", message: "fixture reload failed" }, { status: 500 });
       }
       return Response.json({
-        entries: Object.entries(values).map(([path, value]) => ({
+        entries: Object.entries(values).filter(([path]) => path.startsWith("browser.")).map(([path, value]) => ({
           path, value, populated: true, is_secret: false,
           kind: path.endsWith("enabled") ? "bool" : "integer",
           type_hint: path.endsWith("enabled") ? "bool" : "u64",
         })),
       });
+    }
+    if (url === "/api/config/map-keys?path=cost.rates.providers.models.openai") {
+      return Response.json({ keys: ["fixture-model"] });
+    }
+    if (url === "/api/config/templates") return Response.json({ templates: [] });
+    if (url === "/api/config/catalog/models?provider=openai") {
+      return Response.json({ models: [], model_provider: "openai", local: false, live: false });
+    }
+    if (url === `/api/config/list?prefix=${encodeURIComponent(ratePrefix)}`) {
+      return Response.json({ entries: [{
+        path: ratePath, value: values[ratePath], populated: true, is_secret: false,
+        kind: "integer", type_hint: "u64",
+      }] });
     }
     assert.equal(url, "/api/config");
     assert.equal(init?.method, "PATCH");
@@ -93,6 +109,9 @@ test("config saves and toggles retain warnings only for the relevant result", as
       alias: { "@": new URL("../../", import.meta.url).pathname },
     });
     const { default: FieldForm } = await jiti.import<typeof import("./FieldForm.tsx")>("./FieldForm.tsx");
+    const { default: CostRatesEditor } = await jiti.import<typeof import("./CostRatesEditor.tsx")>(
+      "./CostRatesEditor.tsx",
+    );
     const { default: Banner } = await jiti.import<typeof import("../layout/UnsavedChangesBanner.tsx")>(
       "../layout/UnsavedChangesBanner.tsx",
     );
@@ -206,6 +225,45 @@ test("config saves and toggles retain warnings only for the relevant result", as
     await click(form, "disabled");
     await click(form, "Dismiss warnings");
     assert.equal(form.querySelector('[role="status"]'), null);
+
+    let savedRates = 0;
+    await act(async () => {
+      root?.render(React.createElement(ConfigDraftProvider, null,
+        React.createElement(CostRatesEditor, {
+          category: "models", providerType: "openai", onSaved: () => { savedRates += 1; },
+        }),
+      ));
+      await flushEffects();
+    });
+    const rateRow = Array.from(container.querySelectorAll("button"))
+      .find((item) => item.textContent?.includes("models.openai.fixture-model"));
+    assert.ok(rateRow, `expected rate row: ${container.textContent}`);
+    await act(async () => { rateRow.click(); await flushEffects(); });
+    const editRate = async (value: string) => {
+      await act(async () => {
+        const input = domWindow.document.getElementById(ratePath) as HappyInput | null;
+        assert.ok(input);
+        const setter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(input), "value")?.set;
+        assert.ok(setter);
+        setter.call(input, value);
+        input.dispatchEvent(new domWindow.Event("input", { bubbles: true }) as HappyEvent);
+        input.dispatchEvent(new domWindow.Event("change", { bubbles: true }) as HappyEvent);
+      });
+    };
+    mode = "warning";
+    await editRate("2");
+    await click(container as unknown as HTMLElement, "Save");
+    assert.equal(values[ratePath], "2");
+    assert.equal(savedRates, 1);
+    assert.match(container.querySelector('[role="status"]')?.textContent ?? "", /fixture retained diagnostic/);
+    assert.equal((domWindow.document.getElementById(ratePath) as HappyInput).value, "2");
+    assert.equal(button(container as unknown as HTMLElement, "Save").disabled, true);
+    mode = "none";
+    await editRate("3");
+    await click(container as unknown as HTMLElement, "Save");
+    assert.equal(values[ratePath], "3");
+    assert.equal(savedRates, 2);
+    assert.equal(container.querySelector('[role="status"]'), null);
   } finally {
     await act(async () => { root?.unmount(); });
     globalThis.fetch = previousFetch;
