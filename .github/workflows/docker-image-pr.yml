@@ -9,6 +9,9 @@ on:
       - Dockerfile.alpine
       - Dockerfile.ci
       - Containerfile
+      - dev/ci/filter-emudhra-ca-bundle.sh
+      - dev/ci/test_filter_emudhra_ca_bundle.py
+      - crates/zeroclaw-tls/tests/fixtures/emudhra/**
       - docker-compose.yml
       - docker-compose.alpine.yml
       - .dockerignore
@@ -16,6 +19,7 @@ on:
       - .github/workflows/docker-image-pr.yml
       - .github/workflows/release-stable-manual.yml
       - scripts/ci/prepare_docker_context.sh
+      - scripts/ci/dist_runner_memory.sh
       - scripts/ci/smoke_docker_compose.sh
 
 concurrency:
@@ -38,13 +42,16 @@ jobs:
         with:
           fetch-depth: 2
 
+      - name: Test StageX trust-bundle filter
+        run: python3 -m unittest dev/ci/test_filter_emudhra_ca_bundle.py
+
       - name: Detect source-build inputs
         id: detect
         run: |
           changed_files=$(git diff --name-only HEAD^1 HEAD^2)
           containerfile_required=false
           if [ -z "$changed_files" ] || \
-             printf '%s\n' "$changed_files" | grep -Eq '^(Containerfile|\.github/workflows/docker-image-pr\.yml)$'; then
+             printf '%s\n' "$changed_files" | grep -Eq '^(Containerfile|dev/ci/(filter-emudhra-ca-bundle\.sh|test_filter_emudhra_ca_bundle\.py)|crates/zeroclaw-tls/tests/fixtures/emudhra/.*|\.github/workflows/docker-image-pr\.yml)$'; then
             containerfile_required=true
           fi
 
@@ -55,7 +62,7 @@ jobs:
           # the release workflow therefore gains nothing from the source
           # matrix, and on long-lived PRs that edit it for unrelated release
           # steps it reran every push.
-          source_inputs='^(Dockerfile|Dockerfile\.debian|Dockerfile\.alpine|Dockerfile\.ci|Containerfile|docker-compose\.yml|docker-compose\.alpine\.yml|\.dockerignore|dev/config\.template\.toml|\.github/workflows/docker-image-pr\.yml|scripts/ci/prepare_docker_context\.sh|scripts/ci/smoke_docker_compose\.sh)$'
+          source_inputs='^(Dockerfile|Dockerfile\.debian|Dockerfile\.alpine|Dockerfile\.ci|Containerfile|dev/ci/(filter-emudhra-ca-bundle\.sh|test_filter_emudhra_ca_bundle\.py)|crates/zeroclaw-tls/tests/fixtures/emudhra/.*|docker-compose\.yml|docker-compose\.alpine\.yml|\.dockerignore|dev/config\.template\.toml|\.github/workflows/docker-image-pr\.yml|scripts/ci/prepare_docker_context\.sh|scripts/ci/dist_runner_memory\.sh|scripts/ci/smoke_docker_compose\.sh)$'
           source_builds=true
 
           if [ -n "$changed_files" ] && \
@@ -171,6 +178,12 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - name: Prepare bounded memory for default ARM64 source build
+        if: matrix.dockerfile == 'Dockerfile' && matrix.platform == 'linux/arm64' && !matrix.cargo_flags
+        id: source_memory
+        timeout-minutes: 5
+        run: bash scripts/ci/dist_runner_memory.sh prepare
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
@@ -237,3 +250,11 @@ jobs:
           done
           dashboard=$(curl -fsS http://127.0.0.1:42617/)
           printf '%s\n' "$dashboard" | grep -Eqi '<html'
+
+      - name: Release bounded ARM64 source-build memory
+        if: always() && matrix.dockerfile == 'Dockerfile' && matrix.platform == 'linux/arm64' && !matrix.cargo_flags
+        timeout-minutes: 5
+        env:
+          ZC_DIST_SWAP_FILE: ${{ steps.source_memory.outputs.swap_file }}
+          ZC_DIST_SWAP_IDENTITY: ${{ steps.source_memory.outputs.swap_identity }}
+        run: bash scripts/ci/dist_runner_memory.sh cleanup

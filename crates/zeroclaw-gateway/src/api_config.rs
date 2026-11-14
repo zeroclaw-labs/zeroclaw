@@ -342,6 +342,7 @@ fn lookup_prop_field(
                     tab: zeroclaw_config::traits::ConfigTab::None,
                     alias_source: None,
                     multiline: false,
+                    setup: None,
                     application: Default::default(),
                 }
             })
@@ -2973,6 +2974,12 @@ pub struct MigrateResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backup_path: Option<String>,
     pub schema_version: u32,
+    /// What the migration changed or assumed, one line each, as
+    /// `zeroclaw config migrate` reports them: a retired key removed, or a
+    /// missing `schema_version` read as V1 or V3. Key paths and reasons only,
+    /// never values.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<String>,
 }
 
 pub async fn handle_migrate(
@@ -3002,7 +3009,7 @@ pub async fn handle_migrate(
         }
     };
 
-    let migrated = match zeroclaw_config::migration::migrate_file(&raw) {
+    let migrated = match zeroclaw_config::migration::migrate_file_with_notices(&raw) {
         Ok(out) => out,
         Err(e) => {
             return error_response(ConfigApiError::new(
@@ -3013,7 +3020,14 @@ pub async fn handle_migrate(
     };
 
     match migrated {
-        Some(new_content) => {
+        Some((new_content, notices)) => {
+            // The `.bak` written below is replaced by the next save. Keep the
+            // pre-upgrade original as well, once per version, as
+            // `config migrate` and the save paths do.
+            let from_version = toml::from_str::<toml::Value>(&raw)
+                .ok()
+                .and_then(|value| zeroclaw_config::migration::detect_version(&value).ok())
+                .filter(|version| *version < zeroclaw_config::migration::CURRENT_SCHEMA_VERSION);
             let backup_path = config_path.with_extension("toml.bak");
             let parent = match config_path.parent() {
                 Some(p) => p.to_path_buf(),
@@ -3120,6 +3134,19 @@ pub async fn handle_migrate(
                     }
 
                     // 2. Backup BEFORE replacing the original.
+                    if let Some(version) = from_version
+                        && let Err(e) = zeroclaw_config::schema::keep_pre_upgrade_backup(
+                            &replace_config_path,
+                            version,
+                        )
+                        .await
+                    {
+                        let _ = tokio::fs::remove_file(&temp_path).await;
+                        return Err(ConfigApiError::new(
+                            ConfigApiCode::InternalError,
+                            format!("{e:#}"),
+                        ));
+                    }
                     if let Err(e) = tokio::fs::copy(&replace_config_path, &backup_path).await {
                         let _ = tokio::fs::remove_file(&temp_path).await;
                         return Err(ConfigApiError::new(
@@ -3177,6 +3204,10 @@ pub async fn handle_migrate(
                 migrated: true,
                 backup_path: Some(response_backup_path),
                 schema_version: zeroclaw_config::migration::CURRENT_SCHEMA_VERSION,
+                notices: notices
+                    .iter()
+                    .map(zeroclaw_config::migration::MigrationNotice::message)
+                    .collect(),
             })
             .into_response()
         }
@@ -3184,6 +3215,7 @@ pub async fn handle_migrate(
             migrated: false,
             backup_path: None,
             schema_version: zeroclaw_config::migration::CURRENT_SCHEMA_VERSION,
+            notices: Vec::new(),
         })
         .into_response(),
     }
@@ -3462,7 +3494,6 @@ mod tests {
             session_backend: None,
             session_queue: Arc::new(crate::session_queue::SessionActorQueue::new(8, 30, 600)),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
@@ -3661,7 +3692,11 @@ mod tests {
             )
             .unwrap(),
         );
-        let router = crate::config_admin_router(&auth).with_state(state.clone());
+        let router = crate::config_admin_router(crate::principal_gate::ConfigRouteAuth::new(
+            &auth,
+            &state.config,
+        ))
+        .with_state(state.clone());
         let read = || {
             axum::http::Request::builder()
                 .uri("/api/config/reload-status")
@@ -4040,6 +4075,36 @@ mod tests {
         }
     }
 
+    /// The dashboard's migrate reports what it changed, as `config migrate`
+    /// does, so an operator learns that a retired table was removed.
+    #[tokio::test]
+    async fn migration_reports_its_notices() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        tokio::fs::write(
+            &config_path,
+            "schema_version = 3\n\n[security.nevis]\nenabled = true\n",
+        )
+        .await
+        .unwrap();
+        let state = test_state(zeroclaw_config::schema::Config {
+            config_path: config_path.clone(),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        });
+
+        let (status, json) = response_json(handle_migrate(State(state), None).await).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let notices = json["notices"].as_array().expect("notices are returned");
+        assert!(
+            notices.iter().any(|notice| notice
+                .as_str()
+                .is_some_and(|n| n.contains("security.nevis"))),
+            "{json}"
+        );
+    }
+
     #[tokio::test]
     async fn migration_preserves_runtime_paths_and_publishes_schema_version() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4057,10 +4122,18 @@ mod tests {
             ..Default::default()
         });
 
+        let original = tokio::fs::read_to_string(&config_path).await.unwrap();
         let (status, json) = response_json(handle_migrate(State(state.clone()), None).await).await;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["migrated"], true);
+        assert_eq!(
+            tokio::fs::read_to_string(tmp.path().join("selected-config.toml.v2.backup"))
+                .await
+                .unwrap(),
+            original,
+            "the pre-upgrade original is kept where the next save cannot replace it"
+        );
         assert_eq!(
             state.config.read().config_path,
             config_path,
@@ -4542,6 +4615,10 @@ mod tests {
             !config_path.with_extension("toml.bak").exists(),
             "no backup may be written before the candidate is accepted"
         );
+        assert!(
+            !install.path().join("config.toml.v1.backup").exists(),
+            "nor the lasting pre-upgrade copy"
+        );
         let residue: Vec<std::ffi::OsString> = std::fs::read_dir(install.path())
             .unwrap()
             .filter_map(|entry| entry.ok())
@@ -4681,6 +4758,54 @@ mod tests {
                 .openai
                 .is_empty()
         );
+    }
+
+    /// Enabling an opt-in tool through the config API follows the build. A
+    /// build without Microsoft 365 saves the section without its credentials
+    /// and says once that the tool is compiled out; a build with it still
+    /// refuses the section until its credentials are set.
+    #[tokio::test]
+    async fn patch_enabling_an_opt_in_tool_follows_whether_the_build_carries_it() {
+        use zeroclaw_config::opt_in_tools::OptInTool;
+        let tmp = tempfile::tempdir().unwrap();
+        let config = temp_config(&tmp);
+        config.save().await.unwrap();
+        let state = test_state(config);
+        let (status, json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "replace",
+                    "path": "/microsoft365/enabled",
+                    "value": true
+                }])),
+            )
+            .await,
+        )
+        .await;
+
+        if OptInTool::Microsoft365.compiled() {
+            assert_ne!(status, StatusCode::OK, "{json}");
+            assert!(
+                json.to_string().contains("microsoft365.tenant_id"),
+                "{json}"
+            );
+            assert!(!state.config.read().microsoft365.enabled);
+        } else {
+            assert_eq!(status, StatusCode::OK, "{json}");
+            assert_eq!(json["saved"], true);
+            assert!(state.config.read().microsoft365.enabled);
+            let compiled_out: Vec<_> = json["warnings"]
+                .as_array()
+                .expect("warnings is an array")
+                .iter()
+                .filter(|warning| warning["code"] == "tool_compiled_out")
+                .collect();
+            assert_eq!(compiled_out.len(), 1, "{json}");
+            assert_eq!(compiled_out[0]["path"], "microsoft365.enabled");
+        }
     }
 
     #[tokio::test]
@@ -5531,6 +5656,31 @@ mod tests {
         assert!(drift.is_empty());
     }
 
+    /// An upgraded file without `[tools]`, or with a `[tools]` section that
+    /// omits `optional`, loads full both through the loader and through the
+    /// plain parse drift compares against, so it reports no drift.
+    #[tokio::test]
+    async fn compute_drift_ignores_an_omitted_tools_selector() {
+        let version = zeroclaw_config::migration::CURRENT_SCHEMA_VERSION;
+        for raw in [
+            format!("schema_version = {version}\n"),
+            format!("schema_version = {version}\n[tools]\n"),
+        ] {
+            let (_tmp, path) = temp_config_path();
+            tokio::fs::write(&path, &raw).await.unwrap();
+            let mut cfg = zeroclaw_config::migration::migrate_to_current_salvaged(&raw).config;
+            cfg.config_path = path.clone();
+            assert_eq!(cfg.tools.optional, ["*"], "{raw}");
+
+            let drift = try_compute_drift(&cfg).await.expect("drift");
+            assert!(
+                drift.iter().all(|entry| !entry.path.starts_with("tools")),
+                "{raw}: {drift:?}"
+            );
+            assert!(drift.is_empty(), "{raw}: {drift:?}");
+        }
+    }
+
     #[tokio::test]
     async fn apply_comments_writes_decoration_to_existing_value() {
         let (_tmp, path) = temp_config_path();
@@ -6188,7 +6338,11 @@ mod tests {
             )
             .unwrap(),
         );
-        let router = crate::config_admin_router(&auth).with_state(state.clone());
+        let router = crate::config_admin_router(crate::principal_gate::ConfigRouteAuth::new(
+            &auth,
+            &state.config,
+        ))
+        .with_state(state.clone());
         let response = router
             .oneshot(
                 axum::http::Request::builder()

@@ -22,7 +22,7 @@ use zeroclaw_runtime::cron;
 /// environment; `config_dir_locale_regression.rs` shows config drives locale.
 /// The explicit `risk_profile` is required — without it every cron command
 /// fails with "no resolvable risk_profile".
-const CONFIG_TOML: &str = r#"schema_version = 3
+const CONFIG_TOML: &str = r#"schema_version = 4
 locale = "en"
 
 [risk_profiles.default]
@@ -282,7 +282,7 @@ fn cron_update_patches_delivery_without_dropping_unspecified_fields() {
 /// resolves the owner as the single enabled agent whose `[agents.<x>].cron_jobs`
 /// lists it; without exactly one such claim the sync skips the entry and nothing
 /// is materialized.
-const DECLARATIVE_CONFIG_TOML: &str = r#"schema_version = 3
+const DECLARATIVE_CONFIG_TOML: &str = r#"schema_version = 4
 locale = "en"
 
 [risk_profiles.default]

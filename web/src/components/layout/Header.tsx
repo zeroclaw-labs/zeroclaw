@@ -5,6 +5,7 @@ import { t, SUPPORTED_LOCALES } from '@/lib/i18n';
 import { useLocaleContext } from '@/App';
 import { useAuth } from '@/hooks/useAuth';
 import { SettingsModal } from '@/components/SettingsModal';
+import { AccountMenu } from '@/components/auth/AccountMenu';
 import { Button } from '@/components/ui';
 
 // Exact-path titles. The dashboard ('/') must stay exact so it doesn't
@@ -51,7 +52,7 @@ interface HeaderProps {
 
 export default function Header({ onMenuToggle, onOpenPalette }: HeaderProps) {
   const location = useLocation();
-  const { logout } = useAuth();
+  const { logout, session, signOut } = useAuth();
   const { locale, setAppLocale } = useLocaleContext();
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [langOpen, setLangOpen] = useState(false);
@@ -203,16 +204,20 @@ export default function Header({ onMenuToggle, onOpenPalette }: HeaderProps) {
             )}
           </div>
 
-          {/* Logout */}
-          <Button
-            variant="ghost"
-            onClick={handleLogout}
-            className="h-9 px-3 text-xs gap-1.5 hover:text-status-error hover:border-status-error/25 hover:bg-status-error/10"
-            aria-label={t('auth.logout')}
-          >
-            <LogOut className="h-[20px] w-[20px] shrink-0" />
-            <span className="hidden sm:inline">{t('auth.logout')}</span>
-          </Button>
+          {/* Signed in with a provider: account menu with sign-out. Paired: logout. */}
+          {session ? (
+            <AccountMenu session={session} onSignOut={signOut} />
+          ) : (
+            <Button
+              variant="ghost"
+              onClick={handleLogout}
+              className="h-9 px-3 text-xs gap-1.5 hover:text-status-error hover:border-status-error/25 hover:bg-status-error/10"
+              aria-label={t('auth.logout')}
+            >
+              <LogOut className="h-[20px] w-[20px] shrink-0" />
+              <span className="hidden sm:inline">{t('auth.logout')}</span>
+            </Button>
+          )}
         </div>
       </header>
 

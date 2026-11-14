@@ -1,4 +1,4 @@
-schema_version = 3
+schema_version = 4
 
 # Ollama runs on the host. This is an endpoint, not a bearer credential.
 [providers.models.ollama.default]

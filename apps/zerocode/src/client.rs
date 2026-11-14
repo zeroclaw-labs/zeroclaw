@@ -245,9 +245,12 @@ pub struct RpcInboundRequest {
 ///
 /// Sized for N concurrent sessions streaming at once (the agent sidebar keeps
 /// background sessions live): chunk volume multiplies between draw-loop
-/// drains, and a `Lagged`-dropped `TurnComplete` would strand a background
-/// session's status dot in "running" forever.
-pub const NOTIFICATION_CHANNEL_CAPACITY: usize = 1024;
+/// drains, and a `Lagged` receiver forces a durable transcript reload of
+/// every tracked session, during which their live stream is gated. The draw
+/// loop wakes early to drain pending notifications; this capacity is the
+/// headroom for draw stalls (resize storms, full transcript rebuilds, the
+/// process being descheduled) on top of that.
+pub const NOTIFICATION_CHANNEL_CAPACITY: usize = 4096;
 
 // ── Typed session updates ────────────────────────────────────────
 
@@ -326,6 +329,15 @@ pub enum SessionUpdate {
         client_turn_generation: Option<u64>,
         message_count: Option<usize>,
     },
+    /// Recorded spend reached `cost.warn_at_percent` of the daily or monthly
+    /// limit. The turn continues; this is a heads-up only.
+    BudgetWarning {
+        session_id: String,
+        current_usd: f64,
+        limit_usd: f64,
+        /// `"day"` or `"month"`.
+        period: String,
+    },
     /// The agent published or updated its execution plan (TodoWrite).
     /// Whole-list replacement; `entries` is the complete authoritative
     /// list. An empty vec clears the tracker.
@@ -348,7 +360,8 @@ impl SessionUpdate {
             | SessionUpdate::ContextUsage { session_id, .. }
             | SessionUpdate::HistoryTrimmed { session_id, .. }
             | SessionUpdate::TurnComplete { session_id, .. }
-            | SessionUpdate::Plan { session_id, .. } => session_id,
+            | SessionUpdate::Plan { session_id, .. }
+            | SessionUpdate::BudgetWarning { session_id, .. } => session_id,
         }
     }
 }
@@ -430,6 +443,12 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
             unsatisfiable_floor: params.get("unsatisfiable_floor").and_then(|v| v.as_bool()),
+        }),
+        "budget_warning" => Some(SessionUpdate::BudgetWarning {
+            session_id: sid,
+            current_usd: params.get("current_usd")?.as_f64()?,
+            limit_usd: params.get("limit_usd")?.as_f64()?,
+            period: params.get("period")?.as_str()?.to_string(),
         }),
         "turn_complete" => Some(SessionUpdate::TurnComplete {
             session_id: sid,
@@ -620,6 +639,18 @@ impl fmt::Display for DaemonRpcTimeout {
     }
 }
 
+/// The daemon's reason when it refused an RPC for the caller's permissions
+/// (`FORBIDDEN`): the principal lacks the method's grant, or the method is
+/// limited to administrators. Read from the structured error, never from its
+/// text. Like a stalled call, one pane's refusal is not a reason to exit the
+/// TUI: a pane that only reads shows the reason and stays open.
+pub(crate) fn forbidden_reason(error: &anyhow::Error) -> Option<&str> {
+    error
+        .downcast_ref::<crate::jsonrpc::JsonRpcError>()
+        .filter(|error| error.code == crate::jsonrpc::error_codes::FORBIDDEN)
+        .map(|error| error.message.as_str())
+}
+
 impl std::error::Error for DaemonRpcTimeout {}
 
 #[derive(Debug)]
@@ -690,6 +721,18 @@ pub(crate) fn parse_initialize_response(resp: &Value) -> Result<InitializeRespon
     })
 }
 
+/// Retain the handshake's structured authentication verdict so startup can
+/// re-enroll a saved login once. Never infer this from error message text.
+#[derive(Debug)]
+pub(crate) struct AuthenticationRequired;
+
+impl fmt::Display for AuthenticationRequired {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("initialize: authentication required (-32010)")
+    }
+}
+impl std::error::Error for AuthenticationRequired {}
+
 async fn request_initialize(
     rpc: &RpcOutbound,
     init_params: Value,
@@ -697,6 +740,9 @@ async fn request_initialize(
 ) -> Result<Value> {
     match tokio::time::timeout(timeout, rpc.request(method::INITIALIZE, init_params)).await {
         Ok(Ok(resp)) => Ok(resp),
+        Ok(Err(e)) if e.code == zeroclaw_api::jsonrpc::error_codes::AUTH_REQUIRED => {
+            Err(AuthenticationRequired.into())
+        }
         Ok(Err(e)) => Err(anyhow::Error::msg(format!(
             "initialize: {} ({})",
             e.message, e.code
@@ -2167,10 +2213,9 @@ impl RpcClient {
                 .context("adding daemon CA to the client root store")?;
             builder.with_root_certificates(roots)
         } else {
-            anyhow::bail!(
-                "WSS client certificate requires either tls.ca_cert_path (the daemon CA to trust) \
-                 or tls.skip_verify"
-            );
+            let mut roots = rustls::RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            builder.with_root_certificates(roots)
         };
 
         // Mutual-TLS client identity.
@@ -4614,6 +4659,9 @@ pub struct SessionListResult {
 pub struct AgentStatusEntry {
     pub alias: String,
     pub enabled: bool,
+    /// Daemon-configured profile, not in-flight session telemetry.
+    #[serde(default)]
+    pub runtime_profile: Option<String>,
     #[serde(default)]
     pub live_sessions: usize,
     #[serde(default)]
@@ -4626,6 +4674,26 @@ pub struct AgentStatusEntry {
 #[serde(rename_all = "snake_case")]
 pub struct AgentsStatusResult {
     pub agents: Vec<AgentStatusEntry>,
+}
+
+#[cfg(test)]
+mod runtime_profile_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_profile_accepts_legacy_and_current_agent_status() {
+        let legacy: AgentStatusEntry = serde_json::from_value(serde_json::json!({
+            "alias": "coder", "enabled": true
+        }))
+        .unwrap();
+        assert!(legacy.runtime_profile.is_none());
+
+        let current: AgentStatusEntry = serde_json::from_value(serde_json::json!({
+            "alias": "coder", "enabled": true, "runtime_profile": "coding"
+        }))
+        .unwrap();
+        assert_eq!(current.runtime_profile.as_deref(), Some("coding"));
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -6525,15 +6593,9 @@ mod tls_tests {
     }
 
     #[test]
-    fn client_cert_requires_ca_or_skip() {
-        // A client cert with neither a CA nor skip_verify is a clear error, not
-        // a silent fall-through to system roots.
-        let tls = ClientTls {
-            client_cert_path: Some("/x/cert.pem".into()),
-            client_key_path: Some("/x/key.pem".into()),
-            ..Default::default()
-        };
-        assert!(RpcClient::wss_tls_config(&tls).is_err());
+    fn default_tls_config_uses_public_roots() {
+        let cfg = RpcClient::wss_tls_config(&ClientTls::default()).unwrap();
+        assert!(!cfg.client_auth_cert_resolver.has_certs());
     }
 
     #[test]
@@ -6651,6 +6713,31 @@ mod plan_parse_tests {
         match parse_session_update(&params).expect("empty plan parses") {
             SessionUpdate::Plan { entries, .. } => assert!(entries.is_empty()),
             _ => panic!("expected SessionUpdate::Plan"),
+        }
+    }
+
+    #[test]
+    fn parses_budget_warning_update() {
+        let params = serde_json::json!({
+            "type": "budget_warning",
+            "session_id": "s1",
+            "current_usd": 8.25,
+            "limit_usd": 10.0,
+            "period": "day",
+        });
+        match parse_session_update(&params) {
+            Some(SessionUpdate::BudgetWarning {
+                session_id,
+                current_usd,
+                limit_usd,
+                period,
+            }) => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(current_usd, 8.25);
+                assert_eq!(limit_usd, 10.0);
+                assert_eq!(period, "day");
+            }
+            other => panic!("expected BudgetWarning, got {other:?}"),
         }
     }
 
