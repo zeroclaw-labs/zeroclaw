@@ -1,19 +1,25 @@
 //! Runtime persistence adapter for Goal-owned provider accounting contracts.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc, Weak,
+    atomic::{AtomicBool, Ordering},
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use parking_lot::Mutex;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroclaw_api::model_provider::TokenUsage;
 use zeroclaw_config::cost::{CostTracker, types::TokenUsage as CostTokenUsage};
 use zeroclaw_goal::{
     GoalAccountingState, GoalExecutionScope, GoalTaskRegistry, GoalTransitionResult,
     accounting::{
-        GoalAccountingFailure, GoalOperationAccounting, GoalOperationAccountingFactory,
-        GoalOperationFenced, GoalOperationRequest, GoalOperationSettlement, GoalUsageEvent,
-        GoalUsagePrice, GoalUsagePricer, combine_accounting_state,
+        GoalAbandonmentSettlement, GoalAccountingFailure, GoalOperationAccounting,
+        GoalOperationAccountingFactory, GoalOperationFenced, GoalOperationGuard,
+        GoalOperationRequest, GoalOperationSettlement, GoalUsageEvent, GoalUsagePrice,
+        GoalUsagePricer, combine_accounting_state,
     },
     task::{
         GoalBlocker, GoalBlockerKind, GoalDispatchStart, GoalPauseReason, GoalPauseState, TaskGoal,
@@ -100,19 +106,106 @@ impl RuntimeGoalOperationAccountingFactory {
 
 impl GoalOperationAccountingFactory for RuntimeGoalOperationAccountingFactory {
     fn for_scope(&self, scope: GoalExecutionScope) -> Arc<dyn GoalOperationAccounting> {
-        Arc::new(GoalOperationAccountant::new(
-            Arc::clone(&self.registry),
-            Arc::clone(&self.tracker),
-            self.agent_alias.clone(),
-            Arc::clone(&self.pricer),
-            scope,
-        ))
+        Arc::new_cyclic(|owner| {
+            GoalOperationAccountant::new(
+                Arc::clone(&self.registry),
+                Arc::clone(&self.tracker),
+                self.agent_alias.clone(),
+                Arc::clone(&self.pricer),
+                scope,
+                owner.clone(),
+            )
+        })
     }
+}
+
+#[derive(Default)]
+struct OperationProgress {
+    finished: AtomicBool,
+    dispatch_entered: AtomicBool,
+    abandonment: Mutex<Option<GoalAbandonmentSettlement>>,
 }
 
 struct AdmittedOperation {
     id: String,
     _permit: OwnedSemaphorePermit,
+    progress: Arc<OperationProgress>,
+}
+
+impl Drop for AdmittedOperation {
+    fn drop(&mut self) {
+        self.progress.finished.store(true, Ordering::Release);
+    }
+}
+
+struct AdmissionWitness {
+    progress: Arc<OperationProgress>,
+    abandoned: CancellationToken,
+    owner: Weak<GoalOperationAccountant>,
+}
+
+struct AbandonmentFailureFence {
+    abandoned: CancellationToken,
+    armed: bool,
+}
+
+impl Drop for AbandonmentFailureFence {
+    fn drop(&mut self) {
+        if self.armed {
+            self.abandoned.cancel();
+        }
+    }
+}
+
+impl Drop for AdmissionWitness {
+    fn drop(&mut self) {
+        if self.progress.finished.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(owner) = self.owner.upgrade() else {
+            self.abandoned.cancel();
+            return;
+        };
+        if tokio::runtime::Handle::try_current().is_err() {
+            self.abandoned.cancel();
+            return;
+        }
+        let progress = Arc::clone(&self.progress);
+        // Construct this before spawning: even a task dropped before its first
+        // poll must wake waiters and retain the durable pending marker.
+        let fence = AbandonmentFailureFence {
+            abandoned: self.abandoned.clone(),
+            armed: true,
+        };
+        let recovery = async move {
+            let mut fence = fence;
+            let is_current = owner
+                .admitted
+                .lock()
+                .as_ref()
+                .is_some_and(|operation| Arc::ptr_eq(&operation.progress, &progress));
+            if !is_current {
+                return;
+            }
+            let result = if progress.dispatch_entered.load(Ordering::Acquire) {
+                let source = progress.abandonment.lock().take();
+                let settlement = source.map_or_else(
+                    || GoalOperationSettlement {
+                        accounting_state: GoalAccountingState::OutcomeUnknown,
+                        events: Vec::new(),
+                    },
+                    |source| source(),
+                );
+                owner.settle(settlement).await
+            } else {
+                owner.release_unstarted().await
+            };
+            if result.is_ok() {
+                fence.armed = false;
+            }
+        };
+        drop(::zeroclaw_spawn::spawn!(recovery));
+    }
 }
 
 /// One Goal epoch's runtime-backed provider accountant. The permit spans
@@ -125,6 +218,8 @@ struct GoalOperationAccountant {
     scope: GoalExecutionScope,
     permit: Arc<Semaphore>,
     admitted: Mutex<Option<AdmittedOperation>>,
+    abandoned: CancellationToken,
+    owner: Weak<Self>,
 }
 
 impl GoalOperationAccountant {
@@ -134,6 +229,7 @@ impl GoalOperationAccountant {
         agent_alias: String,
         pricer: Arc<dyn GoalUsagePricer>,
         scope: GoalExecutionScope,
+        owner: Weak<Self>,
     ) -> Self {
         Self {
             registry,
@@ -143,6 +239,8 @@ impl GoalOperationAccountant {
             scope,
             permit: Arc::new(Semaphore::new(1)),
             admitted: Mutex::new(None),
+            abandoned: CancellationToken::new(),
+            owner,
         }
     }
 
@@ -324,12 +422,25 @@ fn with_accounting_causes(error: anyhow::Error, causes: &[String]) -> anyhow::Er
 #[async_trait]
 impl GoalOperationAccounting for GoalOperationAccountant {
     async fn admit(&self, request: GoalOperationRequest) -> Result<()> {
-        let permit = Arc::clone(&self.permit)
-            .acquire_owned()
-            .await
-            .context("Goal operation permit closed")?;
+        let acquire = Arc::clone(&self.permit).acquire_owned();
+        let permit = tokio::select! {
+            biased;
+            () = self.abandoned.cancelled() => {
+                return Err(anyhow::Error::new(GoalAccountingFailure::incomplete(
+                    GoalAccountingState::OutcomeUnknown,
+                    true,
+                )));
+            }
+            result = acquire => result.context("Goal operation permit closed")?,
+        };
+        if self.abandoned.is_cancelled() {
+            return Err(anyhow::Error::new(GoalAccountingFailure::incomplete(
+                GoalAccountingState::OutcomeUnknown,
+                true,
+            )));
+        }
         ensure!(
-            self.admitted.lock().await.is_none(),
+            self.admitted.lock().is_none(),
             "Goal operation is already admitted"
         );
 
@@ -340,10 +451,13 @@ impl GoalOperationAccounting for GoalOperationAccountant {
                 false,
             )));
         }
-        ensure!(
-            goal.goal().pending_call_id.is_none() && goal.goal().pending_call_epoch.is_none(),
-            "Goal already has a pending operation"
-        );
+        if goal.goal().pending_call_id.is_some() || goal.goal().pending_call_epoch.is_some() {
+            return Err(anyhow::Error::new(GoalAccountingFailure::incomplete(
+                goal.goal().accounting_state,
+                true,
+            ))
+            .context("Goal already has a pending operation"));
+        }
         let (tokens, cost, pricing_complete) = self.strict_totals().await?;
         if goal
             .goal()
@@ -387,11 +501,12 @@ impl GoalOperationAccounting for GoalOperationAccountant {
             .await?
         {
             GoalTransitionResult::Applied => {
-                let mut admitted = self.admitted.lock().await;
+                let mut admitted = self.admitted.lock();
                 debug_assert!(admitted.is_none());
                 *admitted = Some(AdmittedOperation {
                     id: operation_id,
                     _permit: permit,
+                    progress: Arc::new(OperationProgress::default()),
                 });
                 Ok(())
             }
@@ -401,11 +516,47 @@ impl GoalOperationAccounting for GoalOperationAccountant {
         }
     }
 
+    fn admission_guard(&self) -> Result<GoalOperationGuard> {
+        let progress = self
+            .admitted
+            .lock()
+            .as_ref()
+            .map(|operation| Arc::clone(&operation.progress))
+            .context("Goal admission guard requested without an admission")?;
+        Ok(GoalOperationGuard::new(AdmissionWitness {
+            progress,
+            abandoned: self.abandoned.clone(),
+            owner: self.owner.clone(),
+        }))
+    }
+
+    fn mark_dispatch_entered(&self) {
+        if let Some(operation) = self.admitted.lock().as_ref() {
+            operation
+                .progress
+                .dispatch_entered
+                .store(true, Ordering::Release);
+        }
+    }
+
+    fn set_abandonment_settlement(&self, source: GoalAbandonmentSettlement) {
+        if let Some(operation) = self.admitted.lock().as_ref() {
+            *operation.progress.abandonment.lock() = Some(source);
+        }
+    }
+
+    async fn quiesce(&self) {
+        tokio::select! {
+            biased;
+            () = self.abandoned.cancelled() => {}
+            _ = self.permit.acquire() => {}
+        }
+    }
+
     async fn begin_dispatch(&self) -> Result<GoalDispatchStart> {
         let id = self
             .admitted
             .lock()
-            .await
             .as_ref()
             .map(|operation| operation.id.clone())
             .context("Goal operation dispatch began without a matching admission")?;
@@ -422,7 +573,7 @@ impl GoalOperationAccounting for GoalOperationAccountant {
 
     async fn settle(&self, settlement: GoalOperationSettlement) -> Result<()> {
         let operation = {
-            let mut admitted = self.admitted.lock().await;
+            let mut admitted = self.admitted.lock();
             admitted
                 .take()
                 .context("Goal operation settled without a matching admission")?
@@ -519,7 +670,6 @@ impl GoalOperationAccounting for GoalOperationAccountant {
         let operation = self
             .admitted
             .lock()
-            .await
             .take()
             .context("Goal operation released without a matching admission")?;
         match self
@@ -884,6 +1034,10 @@ pub(crate) mod tests {
             Ok(())
         }
 
+        fn admission_guard(&self) -> Result<GoalOperationGuard> {
+            self.inner.admission_guard()
+        }
+
         async fn begin_dispatch(&self) -> Result<GoalDispatchStart> {
             if matches!(self.mode, DispatchProbeMode::FenceBeforeStart) {
                 assert_eq!(
@@ -1173,6 +1327,7 @@ pub(crate) mod tests {
             factory.agent_alias.clone(),
             Arc::clone(&factory.pricer),
             scope,
+            Weak::new(),
         )
     }
 
@@ -1194,15 +1349,387 @@ pub(crate) mod tests {
         let accountant = concrete_accountant(&factory, scope);
         // Exercise the defensive invariant independently of semaphore waiting:
         // a real admitted operation holds the accountant's only permit.
-        *accountant.admitted.lock().await = Some(AdmittedOperation {
+        let fixture_permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+        *accountant.admitted.lock() = Some(AdmittedOperation {
             id: "fixture-existing-operation".to_owned(),
-            _permit: Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap(),
+            _permit: fixture_permit,
+            progress: Arc::new(OperationProgress::default()),
         });
         let error = accountant
             .admit(GoalOperationRequest::new("fallback", "model"))
             .await
             .unwrap_err();
         assert_untyped_refusal(&error, "Goal operation is already admitted");
+    }
+
+    #[tokio::test]
+    async fn abandoned_child_operation_refuses_the_next_admission() {
+        let (store, factory, _tracker, scope, _directory) = fixture().await;
+        let accountant = factory.for_scope(scope.clone());
+        let (started, observed) = tokio::sync::oneshot::channel();
+        let mut child = Box::pin(zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING.scope(
+            Some(Arc::clone(&accountant)),
+            async move {
+                let _admission =
+                    crate::agent::cost::admit_goal_operation_if_scoped("fallback", "model")
+                        .await
+                        .unwrap();
+                let start = crate::agent::cost::begin_goal_dispatch_if_scoped()
+                    .await
+                    .unwrap();
+                let mut dispatch = Box::pin(crate::agent::cost::release_after_first_poll(
+                    start,
+                    std::future::pending::<()>(),
+                ));
+                std::future::poll_fn(|context| {
+                    assert!(std::future::Future::poll(dispatch.as_mut(), context).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                started.send(()).unwrap();
+                std::future::pending::<()>().await;
+            },
+        ));
+        tokio::select! {
+            result = &mut child => panic!("child unexpectedly completed: {result:?}"),
+            result = observed => result.unwrap(),
+        }
+        let mut successor =
+            Box::pin(accountant.admit(GoalOperationRequest::new("fallback", "model")));
+        tokio::select! {
+            biased;
+            result = &mut successor => panic!("live operation did not serialize: {result:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+        // An agentic delegate can drop its child loop on timeout after dispatch.
+        drop(child);
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), &mut successor)
+            .await
+            .expect("an abandoned operation must not block admission forever")
+            .expect_err("uncertain accounting must refuse the next operation");
+        assert!(error.downcast_ref::<GoalAccountingFailure>().is_some());
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert!(goal.pending_call_id.is_none());
+        assert!(goal.pending_call_epoch.is_none());
+        assert_eq!(goal.accounting_state, GoalAccountingState::OutcomeUnknown);
+    }
+
+    #[tokio::test]
+    async fn live_sibling_waits_for_settlement_and_old_guard_does_not_poison_it() {
+        let (store, factory, tracker, scope, _directory) = fixture().await;
+        let accountant = factory.for_scope(scope.clone());
+        let child_accountant = Arc::clone(&accountant);
+        let (started, observed) = tokio::sync::oneshot::channel();
+        let (finish, wait_for_finish) = tokio::sync::oneshot::channel();
+        let mut child = Box::pin(zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING.scope(
+            Some(Arc::clone(&accountant)),
+            async move {
+                let guard = crate::agent::cost::admit_goal_operation_if_scoped("fallback", "model")
+                    .await
+                    .unwrap();
+                started.send(()).unwrap();
+                wait_for_finish.await.unwrap();
+                child_accountant
+                    .settle(GoalOperationSettlement {
+                        accounting_state: GoalAccountingState::Complete,
+                        events: vec![usage_event("fallback", 10, 2)],
+                    })
+                    .await
+                    .unwrap();
+                guard
+            },
+        ));
+        tokio::select! {
+            _ = &mut child => panic!("child finished before its release"),
+            result = observed => result.unwrap(),
+        }
+        let mut sibling =
+            Box::pin(accountant.admit(GoalOperationRequest::new("fallback", "model")));
+        tokio::select! {
+            biased;
+            result = &mut sibling => panic!("live sibling was not serialized: {result:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+        finish.send(()).unwrap();
+        let (old_guard, sibling_result) = tokio::join!(child, sibling);
+        sibling_result.expect("settled work must allow the waiting sibling");
+        // A caller may retain the old witness after settlement. It must not
+        // mark the newly admitted sibling as abandoned when it is dropped.
+        drop(old_guard);
+        accountant.release_unstarted().await.unwrap();
+        accountant
+            .admit(GoalOperationRequest::new("fallback", "model"))
+            .await
+            .expect("the old witness must not close later admission");
+        accountant.release_unstarted().await.unwrap();
+        assert_eq!(
+            tracker
+                .get_strict_usage_totals_for_task_with_pricing(scope.task_id())
+                .unwrap()
+                .0,
+            12,
+        );
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
+        assert!(goal.pending_call_id.is_none());
+    }
+
+    async fn tracked_admission(
+        accountant: &Arc<dyn GoalOperationAccounting>,
+    ) -> GoalOperationGuard {
+        zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+            .scope(Some(Arc::clone(accountant)), async {
+                crate::agent::cost::admit_goal_operation_if_scoped("fallback", "model")
+                    .await
+                    .unwrap()
+                    .expect("Goal scope supplies a witness")
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn abandoned_unstarted_admission_is_released() {
+        let (store, factory, _tracker, scope, directory) = fixture().await;
+        let accountant = factory.for_scope(scope.clone());
+        let guard = tracked_admission(&accountant).await;
+        drop(guard);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            accountant.admit(GoalOperationRequest::new("fallback", "model")),
+        )
+        .await
+        .expect("unstarted abandonment must release the permit")
+        .expect("unstarted abandonment must not close admission");
+        accountant.release_unstarted().await.unwrap();
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
+        assert!(goal.pending_call_id.is_none());
+        assert!(!directory.path().join("state/costs.jsonl").exists());
+    }
+
+    #[tokio::test]
+    async fn abandoned_unstarted_dispatch_after_pause_is_resumable() {
+        let (store, factory, _tracker, scope, _directory) = fixture().await;
+        let accountant = factory.for_scope(scope.clone());
+        let guard = tracked_admission(&accountant).await;
+        // Hold the session dispatch gate, queue pause first, then queue the
+        // child's dispatch check behind it. Neither has polled a provider.
+        let held = accountant.begin_dispatch().await.unwrap();
+        let pause = store.pause_session_goal(
+            scope.task_id(),
+            scope.session_id(),
+            scope.execution_epoch(),
+            operator_pause(GoalPauseReason::OperatorPaused),
+        );
+        tokio::pin!(pause);
+        tokio::select! {
+            biased;
+            result = &mut pause => panic!("pause unexpectedly passed the gate: {result:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+        let mut child_check = Box::pin(accountant.begin_dispatch());
+        tokio::select! {
+            biased;
+            _ = &mut child_check => panic!("child unexpectedly passed the gate"),
+            () = tokio::task::yield_now() => {}
+        }
+        drop(held);
+        assert_eq!(pause.await.unwrap(), GoalTransitionResult::Applied);
+        drop(child_check);
+        drop(guard);
+        accountant.quiesce().await;
+
+        let task = store
+            .current_goal_for_session(scope.session_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, zeroclaw_api::task::TaskStatus::Paused);
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
+        assert!(goal.pending_call_id.is_none());
+        assert_eq!(
+            store
+                .resume_session_goal(
+                    scope.task_id(),
+                    scope.session_id(),
+                    task.execution_epoch,
+                    2,
+                    "resumed-boot",
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_waiter_does_not_abandon_the_live_operation() {
+        let (_store, factory, tracker, scope, _directory) = fixture().await;
+        let accountant = factory.for_scope(scope.clone());
+        let guard = tracked_admission(&accountant).await;
+        let mut waiter = Box::pin(accountant.admit(GoalOperationRequest::new("fallback", "model")));
+        tokio::select! {
+            biased;
+            result = &mut waiter => panic!("waiter unexpectedly entered: {result:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+        drop(waiter);
+        accountant
+            .settle(GoalOperationSettlement {
+                accounting_state: GoalAccountingState::Complete,
+                events: vec![usage_event("fallback", 10, 2)],
+            })
+            .await
+            .unwrap();
+        drop(guard);
+        accountant
+            .admit(GoalOperationRequest::new("fallback", "model"))
+            .await
+            .expect("dropping a waiter must not fence its live sibling");
+        accountant.release_unstarted().await.unwrap();
+        assert_eq!(
+            tracker
+                .get_strict_usage_totals_for_task_with_pricing(scope.task_id())
+                .unwrap()
+                .0,
+            12,
+        );
+    }
+
+    #[tokio::test]
+    async fn abandoned_returned_report_settles_once_and_allows_successor() {
+        let (store, factory, tracker, scope, directory) = fixture().await;
+        let accountant = factory.for_scope(scope.clone());
+        let guard = tracked_admission(&accountant).await;
+        accountant.mark_dispatch_entered();
+        accountant.set_abandonment_settlement(Box::new(|| GoalOperationSettlement {
+            accounting_state: GoalAccountingState::Complete,
+            events: vec![usage_event("fallback", 10, 2)],
+        }));
+        drop(guard);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            accountant.admit(GoalOperationRequest::new("fallback", "model")),
+        )
+        .await
+        .expect("recovery must release the permit")
+        .expect("a complete returned report permits a successor");
+        accountant.release_unstarted().await.unwrap();
+        assert_eq!(
+            tracker
+                .get_strict_usage_totals_for_task_with_pricing(scope.task_id())
+                .unwrap()
+                .0,
+            12,
+        );
+        let ledger = std::fs::read_to_string(directory.path().join("state/costs.jsonl")).unwrap();
+        assert_eq!(ledger.lines().count(), 1);
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
+        assert!(goal.pending_call_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn abandoned_settlement_storage_failure_keeps_pending_and_wakes_waiter() {
+        let (store, factory, _tracker, scope, directory) = fixture().await;
+        let accountant = factory.for_scope(scope.clone());
+        let guard = tracked_admission(&accountant).await;
+        accountant.mark_dispatch_entered();
+        accountant.set_abandonment_settlement(Box::new(|| GoalOperationSettlement {
+            accounting_state: GoalAccountingState::OutcomeUnknown,
+            events: vec![usage_event("fallback", 10, 2)],
+        }));
+        std::fs::create_dir_all(directory.path().join("state/costs.jsonl")).unwrap();
+        drop(guard);
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            accountant.admit(GoalOperationRequest::new("fallback", "model")),
+        )
+        .await
+        .expect("failed recovery must wake the waiter")
+        .expect_err("failed persistence must fence the next operation");
+        assert!(error.downcast_ref::<GoalAccountingFailure>().is_some());
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert!(goal.pending_call_id.is_some());
+        assert_eq!(goal.pending_call_epoch, Some(scope.execution_epoch()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_goal_scope_keeps_accountant_alive_for_recovery() {
+        let (store, factory, tracker, scope, _directory) = fixture().await;
+        let accountant = factory.for_scope(scope.clone());
+        let weak = Arc::downgrade(&accountant);
+        let (started, observed) = tokio::sync::oneshot::channel();
+        let (recovering, recovery_observed) = tokio::sync::oneshot::channel();
+        let mut outer = Box::pin(zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING.scope(
+            Some(accountant),
+            async move {
+                let _guard =
+                    crate::agent::cost::admit_goal_operation_if_scoped("fallback", "model")
+                        .await
+                        .unwrap();
+                zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING.with(|accounting| {
+                    let accounting = accounting.as_ref().unwrap();
+                    accounting.mark_dispatch_entered();
+                    accounting.set_abandonment_settlement(Box::new(move || {
+                        let owner = weak.upgrade().expect("recovery retains the owner");
+                        assert!(recovering.send(owner).is_ok());
+                        GoalOperationSettlement {
+                            accounting_state: GoalAccountingState::OutcomeUnknown,
+                            events: vec![usage_event("fallback", 10, 2)],
+                        }
+                    }));
+                });
+                started.send(()).unwrap();
+                std::future::pending::<()>().await;
+            },
+        ));
+        tokio::select! {
+            _ = &mut outer => panic!("Goal scope unexpectedly completed"),
+            result = observed => result.unwrap(),
+        }
+        drop(outer);
+        let owner = tokio::time::timeout(std::time::Duration::from_secs(1), recovery_observed)
+            .await
+            .expect("dropped Goal scope must start recovery")
+            .unwrap();
+        owner.quiesce().await;
+        assert_eq!(
+            tracker
+                .get_strict_usage_totals_for_task_with_pricing(scope.task_id())
+                .unwrap()
+                .0,
+            12,
+        );
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert_eq!(goal.accounting_state, GoalAccountingState::OutcomeUnknown);
+        assert!(goal.pending_call_id.is_none());
+    }
+
+    #[test]
+    fn abandonment_without_a_current_runtime_fails_closed() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (store, factory, _tracker, scope, _directory) = runtime.block_on(fixture());
+        let accountant = factory.for_scope(scope.clone());
+        let guard = runtime.block_on(tracked_admission(&accountant));
+        // The runtime exists but is not entered on this thread.
+        drop(guard);
+        let error = runtime
+            .block_on(accountant.admit(GoalOperationRequest::new("fallback", "model")))
+            .unwrap_err();
+        assert!(error.downcast_ref::<GoalAccountingFailure>().is_some());
+        let goal = runtime
+            .block_on(store.get_goal_task(scope.task_id()))
+            .unwrap()
+            .unwrap();
+        assert!(goal.pending_call_id.is_some());
     }
 
     #[tokio::test]
@@ -2224,6 +2751,7 @@ pub(crate) mod tests {
             .await
             .expect_err("a pending operation must fence the next model call");
         assert!(next_error.to_string().contains("pending operation"));
+        assert!(next_error.downcast_ref::<GoalAccountingFailure>().is_some());
         assert!(
             next_error
                 .downcast_ref::<zeroclaw_goal::accounting::GoalOperationFenced>()

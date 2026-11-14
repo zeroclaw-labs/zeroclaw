@@ -772,6 +772,9 @@ mod graceful_summary_metering_tests {
 
     #[async_trait]
     impl zeroclaw_goal::accounting::GoalOperationAccounting for SummaryAccounting {
+        fn admission_guard(&self) -> anyhow::Result<zeroclaw_goal::accounting::GoalOperationGuard> {
+            Ok(zeroclaw_goal::accounting::GoalOperationGuard::new(()))
+        }
         async fn begin_dispatch(&self) -> anyhow::Result<zeroclaw_goal::task::GoalDispatchStart> {
             Ok(zeroclaw_goal::task::GoalDispatchStart::new(
                 std::sync::Arc::new(tokio::sync::Mutex::new(()))

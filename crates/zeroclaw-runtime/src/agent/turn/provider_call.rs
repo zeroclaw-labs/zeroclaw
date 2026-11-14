@@ -18,6 +18,7 @@ use crate::observability::ObserverEvent;
 use crate::tools::ToolSpec;
 use anyhow::Result;
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use zeroclaw_api::turn_stop::{TurnStop, TurnStopCode};
 use zeroclaw_config::schema::StreamReasoningMode;
@@ -327,7 +328,8 @@ pub(crate) async fn call_provider(
         // The stream is lazily consumed inside this call-scoped owner. Its
         // permitted non-stream recovery therefore shares the same Reliable
         // attempt ledger instead of opening a second scope.
-        let scope = zeroclaw_providers::dispatch::AccountedChatScope::new();
+        let scope = Arc::new(zeroclaw_providers::dispatch::AccountedChatScope::new());
+        crate::agent::cost::register_goal_attempt_scope(&scope);
         let (result, live_deltas, protocol_suppressed, visible_text, recovered_image_request) = scope
             .scope(Box::pin(zeroclaw_providers::reliable::scope_provider_fallback(Box::pin(async {
                     match crate::agent::cost::release_after_first_poll(
@@ -594,7 +596,8 @@ pub(crate) async fn call_provider(
         // Non-streaming path: wrap with optional per-step timeout from
         // pacing config to catch hung model responses.
         let dispatcher = ProviderDispatch::from_ref(active_model_provider);
-        let scope = zeroclaw_providers::dispatch::AccountedChatScope::new();
+        let scope = Arc::new(zeroclaw_providers::dispatch::AccountedChatScope::new());
+        crate::agent::cost::register_goal_attempt_scope(&scope);
         // Both attempts belong to one inference step: recovery must not
         // outlive cancellation or receive a fresh timeout allowance.
         let chat_future = crate::agent::cost::release_after_first_poll(dispatch_start, async {
@@ -691,6 +694,7 @@ pub(crate) async fn call_provider(
         (result, scope.take())
     };
     let (attempts, _, accepted_route) = accounting.into_attempts_and_parts();
+    crate::agent::cost::register_goal_returned_attempts(&attempts);
 
     Ok(ProviderCallOutcome {
         chat_result,

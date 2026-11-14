@@ -250,6 +250,25 @@ pub struct GoalUsagePrice {
     pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
+/// Keeps the admission's liveness witness for the caller's operation scope.
+/// Dropping it before settlement lets the accounting owner settle abandoned work.
+#[must_use = "the admission guard must live until settlement or release"]
+pub struct GoalOperationGuard {
+    _witness: Box<dyn Send>,
+}
+
+impl GoalOperationGuard {
+    /// Wrap an accounting owner's operation-lifetime witness.
+    pub fn new(witness: impl Send + 'static) -> Self {
+        Self {
+            _witness: Box::new(witness),
+        }
+    }
+}
+
+/// A one-shot source of the best available settlement when a caller is dropped.
+pub type GoalAbandonmentSettlement = Box<dyn FnOnce() -> GoalOperationSettlement + Send>;
+
 /// A single admitted Goal-owned model operation settles after its physical
 /// attempts have reported or been classified as outcome-unknown.
 #[async_trait]
@@ -257,6 +276,15 @@ pub trait GoalOperationAccounting: Send + Sync {
     /// Admit work only with complete durable accounting. Incomplete accounting
     /// returns a [`GoalAccountingFailure`], independently of the Goal budget.
     async fn admit(&self, request: GoalOperationRequest) -> anyhow::Result<()>;
+    /// Obtain the witness immediately after admission, before yielding. Hold it
+    /// through settlement or release, including if the caller is cancelled.
+    fn admission_guard(&self) -> anyhow::Result<GoalOperationGuard>;
+    /// Mark the first poll of the admitted provider dispatch.
+    fn mark_dispatch_entered(&self) {}
+    /// Replace the current admission's source for abandonment settlement.
+    fn set_abandonment_settlement(&self, _source: GoalAbandonmentSettlement) {}
+    /// Wait for the accountant's outstanding local settlement, if any.
+    async fn quiesce(&self) {}
     /// After awaited pre-dispatch work, check the admitted operation while
     /// acquiring the registry's session gate. This read-only check takes no
     /// additional operation permit. On error the caller must not dispatch and

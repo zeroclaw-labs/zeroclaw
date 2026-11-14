@@ -197,7 +197,8 @@ impl ResolvedModelAccess<'_> {
         }
         // Admission may commit a durable pending marker. Do not race and drop
         // that future: after it completes, release it if no dispatch began.
-        admit_goal_operation_if_scoped(self.provider_name, self.model).await?;
+        let _goal_admission =
+            admit_goal_operation_if_scoped(self.provider_name, self.model).await?;
         if let Some(interruption) = control.current() {
             release_unstarted_goal_operation_if_scoped()
                 .await
@@ -239,7 +240,8 @@ impl ResolvedModelAccess<'_> {
             None
         };
         let dispatcher = ProviderDispatch::from_ref(self.model_provider);
-        let scope = zeroclaw_providers::dispatch::AccountedChatScope::new();
+        let scope = Arc::new(zeroclaw_providers::dispatch::AccountedChatScope::new());
+        crate::agent::cost::register_goal_attempt_scope(&scope);
         let mut dispatch_polled = false;
         let outcome = {
             // Drop the provider future before taking the scope so an in-flight
@@ -258,6 +260,7 @@ impl ResolvedModelAccess<'_> {
                 },
                 result = std::future::poll_fn(|cx| {
                     dispatch_polled = true;
+                    crate::agent::cost::mark_goal_dispatch_entered();
                     let result = provider_future.as_mut().poll(cx);
                     drop(dispatch_start.take());
                     result
@@ -1044,6 +1047,9 @@ mod run_model_query_tests {
 
     #[async_trait]
     impl zeroclaw_goal::accounting::GoalOperationAccounting for FailingGoalSettlement {
+        fn admission_guard(&self) -> anyhow::Result<zeroclaw_goal::accounting::GoalOperationGuard> {
+            Ok(zeroclaw_goal::accounting::GoalOperationGuard::new(()))
+        }
         async fn begin_dispatch(&self) -> anyhow::Result<zeroclaw_goal::task::GoalDispatchStart> {
             Ok(zeroclaw_goal::task::GoalDispatchStart::new(
                 std::sync::Arc::new(tokio::sync::Mutex::new(()))
@@ -1131,6 +1137,9 @@ mod run_model_query_tests {
 
     #[async_trait]
     impl zeroclaw_goal::accounting::GoalOperationAccounting for CapturedGoalSettlement {
+        fn admission_guard(&self) -> anyhow::Result<zeroclaw_goal::accounting::GoalOperationGuard> {
+            Ok(zeroclaw_goal::accounting::GoalOperationGuard::new(()))
+        }
         async fn begin_dispatch(&self) -> anyhow::Result<zeroclaw_goal::task::GoalDispatchStart> {
             Ok(zeroclaw_goal::task::GoalDispatchStart::new(
                 std::sync::Arc::new(tokio::sync::Mutex::new(()))

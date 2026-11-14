@@ -2769,7 +2769,7 @@ async fn run_tool_call_loop_impl<'a>(
             None
         };
         // Refused Goal work must not emit a request announcement.
-        crate::agent::cost::admit_goal_operation_if_scoped(
+        let _goal_admission = crate::agent::cost::admit_goal_operation_if_scoped(
             ctx.provider_name,
             provider_request_model,
         )
@@ -11517,6 +11517,9 @@ mod tool_lifecycle_abandonment_tests {
 
     #[async_trait::async_trait]
     impl zeroclaw_goal::accounting::GoalOperationAccounting for GateAccounting {
+        fn admission_guard(&self) -> anyhow::Result<zeroclaw_goal::accounting::GoalOperationGuard> {
+            Ok(zeroclaw_goal::accounting::GoalOperationGuard::new(()))
+        }
         async fn admit(
             &self,
             _: zeroclaw_goal::accounting::GoalOperationRequest,
@@ -12369,6 +12372,9 @@ mod tool_lifecycle_abandonment_tests {
 
     #[async_trait::async_trait]
     impl zeroclaw_goal::accounting::GoalOperationAccounting for ObservedTurnSettlement {
+        fn admission_guard(&self) -> anyhow::Result<zeroclaw_goal::accounting::GoalOperationGuard> {
+            Ok(zeroclaw_goal::accounting::GoalOperationGuard::new(()))
+        }
         async fn begin_dispatch(&self) -> anyhow::Result<zeroclaw_goal::task::GoalDispatchStart> {
             Ok(zeroclaw_goal::task::GoalDispatchStart::new(
                 std::sync::Arc::new(tokio::sync::Mutex::new(()))
@@ -12556,10 +12562,246 @@ mod tool_lifecycle_abandonment_tests {
         assert_unknown_settlement(&accounting);
     }
 
+    struct PendingGoalProvider {
+        started: tokio::sync::Notify,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for PendingGoalProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "pending-goal-provider"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for PendingGoalProvider {
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            unreachable!("the fixture uses structured chat")
+        }
+
+        async fn chat(
+            &self,
+            _: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.started.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn dropped_goal_turn_wakes_next_admission_without_dispatching_again() {
+        use zeroclaw_goal::{
+            GoalAccountingState, GoalTaskRegistry,
+            accounting::{
+                GoalAccountingFailure, GoalOperationAccountingFactory, GoalOperationRequest,
+            },
+        };
+
+        let (store, factory, _tracker, scope, _directory) =
+            crate::goal_accounting::tests::fixture().await;
+        let accountant = factory.for_scope(scope.clone());
+        let provider = PendingGoalProvider {
+            started: tokio::sync::Notify::new(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let registry = registry_with(Vec::new());
+        let observer = NoopObserver;
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let mut history = vec![ChatMessage::user("hi")];
+        let mut child = Box::pin(zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING.scope(
+            Some(Arc::clone(&accountant)),
+            run_scripted_loop_with_events(
+                &provider,
+                &registry,
+                &observer,
+                None,
+                &pacing,
+                "dropped-goal-turn",
+                false,
+                None,
+                &mut history,
+                100_000,
+                None,
+                None,
+            ),
+        ));
+        tokio::select! {
+            result = &mut child => panic!("provider unexpectedly completed: {result:?}"),
+            () = provider.started.notified() => {}
+        }
+        drop(child);
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            accountant.admit(GoalOperationRequest::new("fallback", "model")),
+        )
+        .await
+        .expect("the abandoned turn must not deadlock admission")
+        .expect_err("uncertain usage must prevent another Goal operation");
+        assert!(error.downcast_ref::<GoalAccountingFailure>().is_some());
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert!(goal.pending_call_id.is_none());
+        assert_eq!(goal.accounting_state, GoalAccountingState::OutcomeUnknown);
+    }
+
+    struct StreamingUsagePendingProvider {
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for StreamingUsagePendingProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "streaming-usage-pending"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for StreamingUsagePendingProvider {
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            unreachable!("the fixture uses streaming chat")
+        }
+
+        fn stream_chat(
+            &self,
+            _: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+            _: zeroclaw_api::model_provider::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_api::model_provider::StreamResult<zeroclaw_api::model_provider::StreamEvent>,
+        > {
+            use futures_util::StreamExt;
+            use zeroclaw_api::model_provider::{StreamEvent, TokenUsage};
+
+            let started = Arc::clone(&self.started);
+            let usage = futures_util::stream::once(async {
+                Ok(StreamEvent::Usage(TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                }))
+            });
+            let pending = futures_util::stream::poll_fn(move |_| {
+                started.notify_one();
+                std::task::Poll::Pending
+            });
+            Box::pin(usage.chain(pending))
+        }
+    }
+
+    #[tokio::test]
+    async fn dropped_goal_stream_settles_observed_usage_as_unknown() {
+        use zeroclaw_goal::{
+            GoalAccountingState, GoalTaskRegistry,
+            accounting::{
+                GoalAccountingFailure, GoalOperationAccountingFactory, GoalOperationRequest,
+            },
+        };
+
+        let (store, factory, tracker, scope, directory) =
+            crate::goal_accounting::tests::fixture().await;
+        let accountant = factory.for_scope(scope.clone());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let provider = StreamingUsagePendingProvider {
+            started: Arc::clone(&started),
+        };
+        let registry = registry_with(Vec::new());
+        let observer = NoopObserver;
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let mut history = vec![ChatMessage::user("hi")];
+        let (tx, _rx) = tokio::sync::mpsc::channel(128);
+        let mut child = Box::pin(zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING.scope(
+            Some(Arc::clone(&accountant)),
+            run_scripted_loop_with_events(
+                &provider,
+                &registry,
+                &observer,
+                None,
+                &pacing,
+                "dropped-goal-stream",
+                false,
+                None,
+                &mut history,
+                100_000,
+                None,
+                Some(tx),
+            ),
+        ));
+        tokio::select! {
+            result = &mut child => panic!("stream unexpectedly completed: {result:?}"),
+            () = started.notified() => {}
+        }
+        drop(child);
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            accountant.admit(GoalOperationRequest::new("fallback", "model")),
+        )
+        .await
+        .expect("abandoned stream must not deadlock admission")
+        .expect_err("unknown stream outcome must block a successor");
+        assert!(error.downcast_ref::<GoalAccountingFailure>().is_some());
+        assert_eq!(
+            tracker
+                .get_strict_usage_totals_for_task_with_pricing(scope.task_id())
+                .unwrap()
+                .0,
+            15,
+        );
+        let ledger = std::fs::read_to_string(directory.path().join("state/costs.jsonl")).unwrap();
+        assert_eq!(ledger.lines().count(), 1);
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert_eq!(goal.accounting_state, GoalAccountingState::OutcomeUnknown);
+        assert!(goal.pending_call_id.is_none());
+    }
+
     struct FailingTurnSettlement;
 
     #[async_trait::async_trait]
     impl zeroclaw_goal::accounting::GoalOperationAccounting for FailingTurnSettlement {
+        fn admission_guard(&self) -> anyhow::Result<zeroclaw_goal::accounting::GoalOperationGuard> {
+            Ok(zeroclaw_goal::accounting::GoalOperationGuard::new(()))
+        }
         async fn begin_dispatch(&self) -> anyhow::Result<zeroclaw_goal::task::GoalDispatchStart> {
             Ok(zeroclaw_goal::task::GoalDispatchStart::new(
                 std::sync::Arc::new(tokio::sync::Mutex::new(()))

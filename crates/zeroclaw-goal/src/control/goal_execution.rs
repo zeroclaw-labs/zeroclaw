@@ -182,6 +182,7 @@ impl GoalExecutionEngine {
                     let (reason, error) = self
                         .classify_operation_failure(
                             scope,
+                            accountant.as_ref(),
                             error,
                             "parent_operation_failed",
                             "Goal parent operation failed",
@@ -223,6 +224,7 @@ impl GoalExecutionEngine {
                     let (reason, error) = self
                         .classify_operation_failure(
                             scope,
+                            accountant.as_ref(),
                             error,
                             "verifier_operation_failed",
                             "Goal verifier operation failed",
@@ -261,6 +263,7 @@ impl GoalExecutionEngine {
         scope: &GoalExecutionScope,
         accountant: &dyn crate::accounting::GoalOperationAccounting,
     ) -> Result<()> {
+        accountant.quiesce().await;
         let goal = match self.registry.get_goal_task(scope.task_id()).await {
             Ok(Some(goal)) => goal,
             Ok(None) => {
@@ -314,10 +317,12 @@ impl GoalExecutionEngine {
     async fn classify_operation_failure(
         &self,
         scope: &GoalExecutionScope,
+        accountant: &dyn crate::accounting::GoalOperationAccounting,
         error: anyhow::Error,
         operation_reason: &'static str,
         operation_context: &'static str,
     ) -> (&'static str, anyhow::Error) {
+        accountant.quiesce().await;
         if is_accounting_failure(&error) {
             return ("accounting_missing_or_invalid", error);
         }
@@ -633,6 +638,10 @@ fn parse_verifier_response(raw: &str) -> Result<VerifierDecision> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "goal_execution_quiescence_tests.rs"]
+mod quiescence_tests;
 
 #[cfg(test)]
 mod tests {

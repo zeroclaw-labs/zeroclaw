@@ -1910,6 +1910,9 @@ struct ScriptedAccounting;
 
 #[async_trait]
 impl GoalOperationAccounting for ScriptedAccounting {
+    fn admission_guard(&self) -> anyhow::Result<zeroclaw_goal::accounting::GoalOperationGuard> {
+        Ok(zeroclaw_goal::accounting::GoalOperationGuard::new(()))
+    }
     async fn begin_dispatch(&self) -> anyhow::Result<zeroclaw_goal::task::GoalDispatchStart> {
         Ok(zeroclaw_goal::task::GoalDispatchStart::new(
             std::sync::Arc::new(tokio::sync::Mutex::new(()))
@@ -1956,6 +1959,9 @@ struct FailingPricing {
 
 #[async_trait]
 impl GoalOperationAccounting for FailingPricing {
+    fn admission_guard(&self) -> anyhow::Result<zeroclaw_goal::accounting::GoalOperationGuard> {
+        Ok(zeroclaw_goal::accounting::GoalOperationGuard::new(()))
+    }
     async fn begin_dispatch(&self) -> anyhow::Result<zeroclaw_goal::task::GoalDispatchStart> {
         Ok(zeroclaw_goal::task::GoalDispatchStart::new(
             std::sync::Arc::new(tokio::sync::Mutex::new(()))
@@ -2017,6 +2023,9 @@ struct PauseDuringPricing {
 
 #[async_trait]
 impl GoalOperationAccounting for PauseDuringPricing {
+    fn admission_guard(&self) -> anyhow::Result<zeroclaw_goal::accounting::GoalOperationGuard> {
+        Ok(zeroclaw_goal::accounting::GoalOperationGuard::new(()))
+    }
     async fn begin_dispatch(&self) -> anyhow::Result<zeroclaw_goal::task::GoalDispatchStart> {
         Ok(zeroclaw_goal::task::GoalDispatchStart::new(
             std::sync::Arc::new(tokio::sync::Mutex::new(()))
