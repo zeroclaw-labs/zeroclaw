@@ -1122,10 +1122,13 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
                                 format!("{reference}: no credential/auth configured"),
                             ));
                         }
-                        match config.model_provider_context_window_opt(
-                            reference.as_str(),
-                            model.upstream_model().unwrap_or_default(),
-                        ) {
+                        let context_window = match model {
+                            zeroclaw_config::provider_registry::ModelDefinition::Chat(chat) => {
+                                chat.metadata.context_window
+                            }
+                            _ => None,
+                        };
+                        match context_window {
                             Some(0) => items.push(DiagItem::error(
                                 cat,
                                 crate::i18n::get_required_cli_string_with_args(
@@ -1157,9 +1160,20 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
                                 ),
                             )),
                         }
-                        if let Some(temperature) =
-                            config.resolve_model_temperature(reference.as_str())
-                        {
+                        let temperature = match model {
+                            zeroclaw_config::provider_registry::ModelDefinition::Chat(chat) => chat
+                                .options
+                                .temperature
+                                .as_ref()
+                                .and_then(|value| match value {
+                                    zeroclaw_config::provider_registry::Override::Set(value) => {
+                                        Some(*value)
+                                    }
+                                    zeroclaw_config::provider_registry::Override::Clear => None,
+                                }),
+                            _ => None,
+                        };
+                        if let Some(temperature) = temperature {
                             if !(0.0..=2.0).contains(&temperature) {
                                 items.push(DiagItem::error(
                                     cat,
