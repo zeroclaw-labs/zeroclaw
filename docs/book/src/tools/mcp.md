@@ -203,7 +203,28 @@ hardcoded per provider: the protected-resource URL comes from the server's
 RFC 9728 `WWW-Authenticate` / well-known metadata, the authorization server
 endpoints from RFC 8414 metadata, and scopes are requested verbatim from
 `oauth_scopes`. Setting `oauth` (or its sub-fields) on a stdio server is
-rejected by config validation.
+rejected by config validation. Discovery follows the MCP contract in order:
+the `resource_metadata` from a 401 challenge when present, then the RFC 9728
+well-known path form, then the root well-known form, and, if no document was
+found at all, one anonymous probe GET of the configured endpoint to ask the
+server for its challenge, followed by one anonymous `initialize` POST when
+that endpoint answers 405 (a streamable-HTTP endpoint may emit the challenge
+only over POST). An advertised hint that fails the URL policy is
+reported, never fetched. Authorization-server documents are read from the
+RFC 8414 well-known form or the OpenID Connect `openid-configuration` forms,
+with issuer identity verified against the advertised identifier in every
+case. An endpoint such as a login service hosted on a different origin than
+the `issuer` its document declares is accepted (RFC 8414 permits it) after
+the same URL and pinned-destination checks, with a warning naming both
+origins. Only when the resource challenges but publishes no protected-resource
+document anywhere does ZeroClaw accept authorization-server metadata hosted
+by the resource's own origin, and only if that document declares exactly
+that origin as its `issuer` (logged with a warning). An error status that is
+not a challenge attests only that the origin spoke, so it does not unlock that
+fallback; the warning names both parties, and every candidate miss stays in the
+connect error when discovery ultimately fails. Each discovery pass
+runs under a 45-second budget with a bounded issuer candidate list, so a
+misconfigured metadata host cannot stall the rest of the connect queue.
 
 First sign-in: ZeroClaw registers itself as a public PKCE client through RFC
 7591 dynamic registration when `oauth_client_id` is unset; if the server has
@@ -238,7 +259,9 @@ lets already-running daemons and gateways pick the grant up on their next
 connect without a restart.
 
 Token lifecycle: tokens are refreshed proactively before expiry and once per
-401. On the `http` transport the request is then retried exactly once when
+401; a 401 challenge that advertises a different metadata location triggers
+one metadata re-discovery per server and process (RFC 9728 §5.2), later ones
+are treated as token noise. On the `http` transport the request is then retried exactly once when
 the method is safe to replay (`initialize`, `tools/list`, resource/prompt
 reads); a `tools/call`, and every POST on the `sse` transport (the request is
 bound to stream bookkeeping there), is never replayed: the call fails as a

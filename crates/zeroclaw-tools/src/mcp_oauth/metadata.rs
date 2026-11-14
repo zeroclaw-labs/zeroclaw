@@ -73,6 +73,96 @@ pub struct ValidatedAs {
     pub require_iss: bool,
 }
 
+/// Outcome of a document fetch that distinguishes "this URL holds a
+/// document that broke the contract" (`Invalid`) from "this URL simply does
+/// not serve one" (`Miss`). RFC 9728/8414 fallback chains only continue past
+/// a MISS: a present-but-broken document is the server asserting metadata
+/// and getting it wrong, which must not be papered over by trying another
+/// location.
+pub enum DocFetch {
+    Found(serde_json::Value),
+    Miss(String),
+}
+
+/// `fetch_json_document` with the miss/hard split above: every status,
+/// redirect, content-type, size, or JSON failure becomes a (truncated)
+/// `Miss` string; `Err` is reserved for the caller-supplied client failing
+/// at the transport/policy level.
+pub async fn fetch_json_document_opt(
+    client: &reqwest::Client,
+    url: &Url,
+    what: &str,
+) -> Result<DocFetch> {
+    let response = match client
+        .get(url.as_str())
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            return Err(anyhow::Error::new(err.without_url())
+                .context(format!("failed to fetch {what} from {url}")));
+        }
+    };
+    let status = response.status();
+    // Same redirect posture as `fetch_json_document`: a 3xx or a moved
+    // final URL is a policy answer, not a document.
+    if status.is_redirection() || response.url() != url {
+        return Ok(DocFetch::Miss(format!(
+            "{what} fetch from {url} was redirected (to {}); MCP OAuth metadata must not follow redirects",
+            response.url()
+        )));
+    }
+    if status != reqwest::StatusCode::OK {
+        return Ok(DocFetch::Miss(format!("GET {url} \u{2192} HTTP {status}")));
+    }
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if media_type != "application/json" {
+        return Ok(DocFetch::Miss(format!(
+            "GET {url} \u{2192} HTTP {status} with content-type {:?}, expected application/json",
+            super::truncate_untrusted(content_type)
+        )));
+    }
+    let body = match super::super::mcp_transport::read_body_bounded_to_string(
+        response,
+        MAX_METADATA_BYTES,
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(err) => {
+            return Ok(DocFetch::Miss(format!(
+                "{what} from {url} exceeded size or encoding limits: {err:#}"
+            )));
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(value) => value,
+        Err(err) => {
+            return Ok(DocFetch::Miss(format!(
+                "GET {url} \u{2192} HTTP {status} but the body is not valid JSON ({err})"
+            )));
+        }
+    };
+    if !value.is_object() {
+        return Ok(DocFetch::Miss(format!(
+            "GET {url} \u{2192} HTTP {status} but the JSON body is not an object"
+        )));
+    }
+    Ok(DocFetch::Found(value))
+}
+
 /// GET one JSON document: no redirects (client posture), success status,
 /// `application/json` content type, and a hard size bound.
 pub async fn fetch_json_document(
@@ -243,9 +333,31 @@ pub fn validate_auth_server(document: serde_json::Value, issuer: &Url) -> Result
             format!("authorization-server metadata {field} {raw:?} violates the URL policy")
         })?;
         if origin_key(&url)? != origin_key(issuer)? {
-            bail!(
-                "authorization-server metadata {field} {:?} must share the issuer origin {issuer}",
-                url.as_str()
+            // RFC 8414 imposes no shared-host requirement on advertised
+            // endpoints (only the exact `issuer` match and the URL policy
+            // above), and split-host authorization services are common in
+            // the wild, so a different origin is accepted. What is lost is
+            // the stricter same-host posture FAPI-style profiles recommend
+            // against mix-up-style endpoint substitution, so the relaxation
+            // is recorded rather than silent: the endpoints still have to
+            // pass the policy check and the pinned-DNS client the factory
+            // builds for them.
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
+                    .with_attrs(::serde_json::json!({
+                        "mcp_oauth": "cross-origin-endpoint",
+                        "field": field,
+                        "endpoint": url.as_str(),
+                        "issuer": issuer.as_str(),
+                    })),
+                &format!(
+                    "MCP OAuth accepted authorization-server metadata {field} {} served from an \
+                     origin other than the declared issuer {}; RFC 8414 places no shared-host \
+                     requirement on endpoints, and the URL policy plus the pinned-destination \
+                     client still apply",
+                    url, issuer
+                )
             );
         }
         Ok(url)
@@ -482,15 +594,18 @@ mod tests {
     }
 
     #[test]
-    fn asm_endpoints_must_share_issuer_origin_and_policy() {
-        let err = validate_auth_server(
+    fn asm_endpoints_are_policy_checked_and_cross_origin_ones_are_accepted() {
+        // RFC 8414 places no shared-host requirement on endpoints, so a
+        // split-host login service is accepted (and warned about); the URL
+        // policy still decides.
+        let validated = validate_auth_server(
             asm_json(serde_json::json!({"token_endpoint": "https://elsewhere.example/token"})),
             &issuer(),
         )
-        .expect_err("cross-origin token endpoint");
-        assert!(
-            err.to_string().contains("share the issuer origin"),
-            "got: {err}"
+        .expect("cross-origin token endpoint is RFC 8414 legal");
+        assert_eq!(
+            validated.token_endpoint.as_str(),
+            "https://elsewhere.example/token"
         );
 
         let err = validate_auth_server(
