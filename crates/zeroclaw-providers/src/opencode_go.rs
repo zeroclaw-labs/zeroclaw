@@ -151,7 +151,6 @@ mod tests {
                     model: Some("constructed-model".into()),
                     ..ModelProviderConfig::default()
                 },
-                ..OpencodeModelProviderConfig::default()
             },
         );
         let options =
