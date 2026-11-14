@@ -171,7 +171,7 @@ language = "de"
 }
 
 #[test]
-fn registry_getter_never_projects_manually_injected_retired_tables() {
+fn canonical_registry_never_projects_manually_injected_retired_tables() {
     let mut config = Config::default();
     config
         .providers
@@ -181,7 +181,8 @@ fn registry_getter_never_projects_manually_injected_retired_tables() {
         .model = Some("legacy-upstream".into());
     assert!(
         !config
-            .provider_registry()
+            .providers
+            .canonical_registry()
             .unwrap()
             .models
             .contains_key("openai.unadmitted")

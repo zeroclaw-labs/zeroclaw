@@ -3091,7 +3091,7 @@ pub fn normalize_test_input(config: &mut Config) {
 /// An explicit input boundary for fixtures that keep their historical source
 /// mutable while exercising canonical consumers. Preserve non-serialized state.
 #[cfg(any(test, feature = "test-helpers"))]
-pub fn admit_test_input(input: &Config) -> Config {
+pub fn try_admit_test_input(input: &Config) -> Result<Config> {
     // Keep the historical typed maps available to fixture code that performs
     // a second edit before admitting the next candidate. They are still only
     // input data: canonical consumers resolve the registry below, and a
@@ -3133,7 +3133,7 @@ pub fn admit_test_input(input: &Config) -> Config {
         .canonical_models
         .retain(|_, model| !generated_connections.contains(model.provider()));
 
-    normalize_test_input(&mut config);
+    provider_inputs::normalize(&mut config)?;
     if source_models.iter_entries().next().is_some() {
         let canonical_models = config.providers.models.canonical_models.clone();
         config.providers.models = source_models;
@@ -3145,7 +3145,13 @@ pub fn admit_test_input(input: &Config) -> Config {
     if source_transcription.iter_entries().next().is_some() {
         config.providers.transcription = source_transcription;
     }
-    config
+    Ok(config)
+}
+
+/// Admit a valid historical fixture, preserving the existing test-helper API.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn admit_test_input(input: &Config) -> Config {
+    try_admit_test_input(input).expect("valid historical provider fixture")
 }
 
 #[cfg(test)]
