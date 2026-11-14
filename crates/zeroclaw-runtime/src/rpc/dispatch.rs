@@ -10056,9 +10056,26 @@ impl RpcDispatcher {
             // The registry edit is now authoritative. Do not let the
             // historical typed source rows re-project their pre-edit value
             // on the next test-only admission.
-            let canonical_models = candidate.providers.models.canonical_models.clone();
+            let canonical_models: Vec<_> = candidate
+                .providers
+                .models
+                .canonical_model_refs()
+                .filter_map(|reference| {
+                    candidate
+                        .providers
+                        .models
+                        .canonical_model(reference)
+                        .cloned()
+                        .map(|model| (reference.clone(), model))
+                })
+                .collect();
             candidate.providers.models = Default::default();
-            candidate.providers.models.canonical_models = canonical_models;
+            for (reference, model) in canonical_models {
+                candidate
+                    .providers
+                    .models
+                    .insert_canonical_model(reference, model);
+            }
             candidate.providers.tts = Default::default();
             candidate.providers.transcription = Default::default();
         }
