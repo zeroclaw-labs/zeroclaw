@@ -740,12 +740,9 @@ fn authorize_sop_cancel(
             subject,
         ));
     }
-    let effective_client_ip = if state.trust_forwarded_headers {
-        super::forwarded_client_ip(headers)
-    } else {
-        Some(peer.ip())
-    };
-    if effective_client_ip.is_some_and(|ip| ip.is_loopback()) {
+    // Same locality rule as the rate-limit key: a forwarded loopback address
+    // is never local, even when the peer itself is loopback.
+    if super::request_is_local(Some(*peer), headers, state.trust_forwarded_headers) {
         return Ok(zeroclaw_runtime::sop::approval::ApprovalPrincipal::cli(
             None,
         ));
@@ -1970,6 +1967,82 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert_eq!(run_status(&state, &run_id), Some(SopRunStatus::Running));
+    }
+
+    #[tokio::test]
+    async fn authoring_cancel_rejects_forwarded_loopback_with_loopback_peer() {
+        let (mut state, run_id) = authoring_state_with_running_run("unused");
+        state.pairing = Arc::new(PairingGuard::new(
+            false,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
+        state.trust_forwarded_headers = true;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_static("127.0.0.1"));
+
+        let response = handle_sop_cancel(
+            State(state.clone()),
+            loopback_peer(),
+            headers,
+            Path(("deploy".to_string(), run_id.clone())),
+            Bytes::new(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(run_status(&state, &run_id), Some(SopRunStatus::Running));
+    }
+
+    #[tokio::test]
+    async fn authoring_cancel_rejects_forwarded_loopback_with_remote_peer() {
+        let (mut state, run_id) = authoring_state_with_running_run("unused");
+        state.pairing = Arc::new(PairingGuard::new(
+            false,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
+        state.trust_forwarded_headers = true;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_static("127.0.0.1"));
+
+        let response = handle_sop_cancel(
+            State(state.clone()),
+            remote_peer(),
+            headers,
+            Path(("deploy".to_string(), run_id.clone())),
+            Bytes::new(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(run_status(&state, &run_id), Some(SopRunStatus::Running));
+    }
+
+    #[tokio::test]
+    async fn authoring_cancel_allows_direct_loopback_with_trust_and_no_forwarded_header() {
+        let (mut state, run_id) = authoring_state_with_running_run("unused");
+        state.pairing = Arc::new(PairingGuard::new(
+            false,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
+        state.trust_forwarded_headers = true;
+
+        let response = handle_sop_cancel(
+            State(state.clone()),
+            loopback_peer(),
+            HeaderMap::new(),
+            Path(("deploy".to_string(), run_id.clone())),
+            Bytes::new(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            run_status(&state, &run_id),
+            Some(SopRunStatus::CancelRequested),
+        );
     }
 
     #[tokio::test]
