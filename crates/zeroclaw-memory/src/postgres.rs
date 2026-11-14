@@ -185,9 +185,7 @@ impl PostgresMemory {
         embedder: &Arc<dyn EmbeddingProvider>,
         search_mode: &SearchMode,
     ) -> bool {
-        vector_column
-            && embedder.dimensions() > 0
-            && !matches!(search_mode, SearchMode::Bm25)
+        vector_column && embedder.dimensions() > 0 && !matches!(search_mode, SearchMode::Bm25)
     }
 
     /// Swap the live embedder in place and recompute the vector-stage gate.
@@ -442,7 +440,8 @@ impl PostgresMemory {
         let id = id.to_string();
         run_on_os_thread(move || -> Result<()> {
             let mut client = client.lock();
-            let stmt = format!("UPDATE {qualified_table} SET embedding = $2::text::vector WHERE id = $1");
+            let stmt =
+                format!("UPDATE {qualified_table} SET embedding = $2::text::vector WHERE id = $1");
             client.execute(&stmt, &[&id, &lit])?;
             Ok(())
         })
@@ -619,7 +618,8 @@ impl PostgresMemory {
                 params.push(Box::new(until_owned.clone()));
             }
             params.push(Box::new(limit_i64));
-            let refs: Vec<&(dyn ToSql + Sync)> = params.iter().map(|p| &**p as &(dyn ToSql + Sync)).collect();
+            let refs: Vec<&(dyn ToSql + Sync)> =
+                params.iter().map(|p| &**p as &(dyn ToSql + Sync)).collect();
 
             let rows = client.query(&stmt, refs.as_slice())?;
             Ok(rows
@@ -1239,8 +1239,7 @@ impl Memory for PostgresMemory {
             let qualified_table = self.qualified_table.clone();
             let res = run_on_os_thread(move || -> Result<()> {
                 let mut client = client.lock();
-                client
-                    .batch_execute(&format!("REINDEX TABLE {qualified_table}"))?;
+                client.batch_execute(&format!("REINDEX TABLE {qualified_table}"))?;
                 Ok(())
             })
             .await;
@@ -1314,14 +1313,16 @@ impl Memory for PostgresMemory {
                 // Provider returned a short batch; stop so we never spin on the
                 // same unfillable rows. Partial progress is kept.
                 for ((id, _), v) in batch.iter().zip(vectors.iter()) {
-                    self.write_embedding(&client, &qualified_table, id, v).await?;
+                    self.write_embedding(&client, &qualified_table, id, v)
+                        .await?;
                     updated += 1;
                 }
                 break;
             }
 
             for ((id, _), v) in batch.iter().zip(vectors.iter()) {
-                self.write_embedding(&client, &qualified_table, id, v).await?;
+                self.write_embedding(&client, &qualified_table, id, v)
+                    .await?;
                 updated += 1;
             }
         }
@@ -1338,12 +1339,9 @@ impl Memory for PostgresMemory {
     ) {
         // Rebuild from freshly-resolved settings and swap in place — mirrors
         // `SqliteMemory::refresh_embedder`. No provider state is cached twice.
-        let embedder: Arc<dyn EmbeddingProvider> = Arc::from(embeddings::create_embedding_provider(
-            model_provider,
-            api_key,
-            model,
-            dimensions,
-        ));
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::from(
+            embeddings::create_embedding_provider(model_provider, api_key, model, dimensions),
+        );
         self.swap_embedder(embedder);
     }
     async fn ensure_agent_uuid(&self, alias: &str) -> Result<String> {
@@ -1413,7 +1411,6 @@ mod tests {
         );
         assert_eq!(next, 5);
     }
-
 
     #[test]
     fn valid_identifiers_pass_validation() {
@@ -1793,5 +1790,4 @@ mod tests {
         );
         assert!(near_id != far_id);
     }
-
 }
