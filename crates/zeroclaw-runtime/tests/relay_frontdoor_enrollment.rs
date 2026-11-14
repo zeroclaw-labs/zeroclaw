@@ -236,6 +236,7 @@ async fn register_bridge_daemon(
             daemon_pubkey: B64.encode(kp.public_key().as_ref()),
             node_id: node_id.to_string(),
             relay_token: None,
+            dashboard: false,
         }
         .to_json(),
     ))
@@ -275,7 +276,7 @@ async fn register_bridge_daemon(
                 incoming = stream.next() => match incoming {
                     Some(Ok(Message::Text(t))) => {
                         match Control::from_json(t.as_str()) {
-                            Ok(Control::Open { conn_id, peer_hint }) => {
+                            Ok(Control::Open { conn_id, peer_hint, .. }) => {
                                 assert_eq!(
                                     peer_hint.as_deref(),
                                     Some(PEER_HINT_ENROLL),

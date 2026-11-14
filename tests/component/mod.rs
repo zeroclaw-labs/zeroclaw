@@ -5,6 +5,8 @@ mod acp_retry_stop_notice_stdio;
 #[cfg(feature = "channel-acp-server")]
 mod acp_session_cwd_stdio;
 mod agents_export_cli;
+#[cfg(all(feature = "agent-runtime", not(feature = "gateway")))]
+mod cli_only_build;
 #[cfg(feature = "agent-runtime")]
 mod config_dir_locale_regression;
 mod config_patch_cli;
@@ -17,7 +19,7 @@ mod cron_delivery_cli;
 mod cron_help_examples;
 mod daemon_startup_feedback;
 mod degraded_config_remediation;
-#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+#[cfg(all(feature = "agent-runtime", feature = "gateway", target_os = "linux"))]
 mod desktop_cli_linux;
 mod direct_cli_terminal_completion;
 mod dockerignore_test;

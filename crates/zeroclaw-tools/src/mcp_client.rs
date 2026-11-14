@@ -1223,9 +1223,15 @@ impl McpRegistry {
         }
     }
 
-    /// All prefixed tool names across all connected servers.
+    /// All prefixed tool names across all connected servers, sorted.
+    ///
+    /// Sorted because callers render this list into the system prompt and the
+    /// tool specs; `HashMap` order differs per registry instance, which would
+    /// change the prompt on every session and defeat provider prompt caching.
     pub fn tool_names(&self) -> Vec<String> {
-        self.tool_index.keys().cloned().collect()
+        let mut names: Vec<String> = self.tool_index.keys().cloned().collect();
+        names.sort_unstable();
+        names
     }
 
     /// Tool definition for a given prefixed name (cloned).
@@ -1746,6 +1752,26 @@ mod tests {
             .await
             .expect("connect_all should succeed");
         assert!(registry.tool_names().is_empty());
+    }
+
+    #[test]
+    fn tool_names_are_sorted_regardless_of_insertion_order() {
+        let names = [
+            "zeta__b", "alpha__z", "mid__a", "alpha__a", "zeta__a", "beta__c",
+        ];
+        let registry = |order: &mut dyn Iterator<Item = &&str>| McpRegistry {
+            servers: Vec::new(),
+            tool_index: order
+                .map(|n| ((*n).to_string(), (0usize, (*n).to_string())))
+                .collect(),
+            server_index: HashMap::new(),
+        };
+        let forward = registry(&mut names.iter()).tool_names();
+        let reverse = registry(&mut names.iter().rev()).tool_names();
+        let mut expected: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
+        expected.sort();
+        assert_eq!(forward, expected);
+        assert_eq!(reverse, expected);
     }
 
     #[tokio::test]
