@@ -396,7 +396,7 @@ fn redact_write_only_warnings(
         warnings.clear();
         warnings.push(
             zeroclaw_config::validation_warnings::ValidationWarning::new(
-                "config_warning_details_hidden",
+                zeroclaw_config::validation_warnings::CONFIG_WARNING_DETAILS_HIDDEN,
                 "Configuration warnings exist; Config read access is required for details",
                 "configuration",
             ),
@@ -2938,6 +2938,9 @@ pub struct InitQuery {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct InitResponse {
     pub initialized: Vec<String>,
+    /// Non-fatal warnings about the saved configuration, when present.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<zeroclaw_config::validation_warnings::ValidationWarning>,
 }
 
 /// POST /api/config/init?section=model_providers — instantiate `None` nested
@@ -2961,7 +2964,11 @@ pub async fn handle_init(
         .collect();
 
     if initialized.is_empty() {
-        return axum::Json(InitResponse { initialized }).into_response();
+        return axum::Json(InitResponse {
+            initialized,
+            warnings: Vec::new(),
+        })
+        .into_response();
     }
 
     for section in &initialized {
@@ -2983,14 +2990,23 @@ pub async fn handle_init(
         Ok(authorization) => authorization,
         Err(denied) => return denied.into_response(),
     };
-    if let Err(err) = scoped_validate(&working, &before, authorization.can_read_config()) {
-        return error_response(err);
-    }
+    let scoped_warnings = match scoped_validate(&working, &before, authorization.can_read_config())
+    {
+        Ok(warnings) => warnings,
+        Err(err) => return error_response(err),
+    };
+    let mut warnings = working.collect_warnings();
+    warnings.extend(scoped_warnings);
+    redact_write_only_warnings(&mut warnings, authorization.can_read_config());
     if let Err(e) = persist_and_swap(&state, authorization, working, _cfg_guard).await {
         return e;
     }
 
-    axum::Json(InitResponse { initialized }).into_response()
+    axum::Json(InitResponse {
+        initialized,
+        warnings,
+    })
+    .into_response()
 }
 
 #[derive(Debug, Serialize)]
@@ -5774,17 +5790,32 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{json}");
-        assert_eq!(json.as_object().unwrap().len(), 1);
         assert_eq!(
             json["initialized"],
             serde_json::json!(["transcription.openai"])
         );
+        assert!(json["warnings"].as_array().unwrap().iter().any(|warning| {
+            warning["code"] == "pre_existing_validation_error" && warning["path"] == "gateway.host"
+        }));
         let reloaded = zeroclaw_config::migration::migrate_to_current(
             &std::fs::read_to_string(&state.config.read().config_path).unwrap(),
         )
         .unwrap();
         assert!(reloaded.transcription.openai.is_some());
         assert!(reloaded.gateway.host.is_empty());
+        let (status, no_op) = response_json(
+            handle_init(
+                State(state),
+                None,
+                Query(InitQuery {
+                    section: Some("transcription.openai".into()),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{no_op}");
+        assert_eq!(no_op, serde_json::json!({"initialized": []}));
     }
 
     #[tokio::test]

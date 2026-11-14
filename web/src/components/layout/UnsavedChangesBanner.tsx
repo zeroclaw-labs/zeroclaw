@@ -11,6 +11,7 @@ import { Save, X } from 'lucide-react';
 import { Button } from '@/components/ui';
 import { t } from '@/lib/i18n';
 import { ApiError, getSections, type ValidationWarning } from '@/lib/api';
+import { captureConfigWarningAuthority, subscribeConfigWarningAuthority, subscribeConfigWarnings } from '@/lib/configWarningEvents';
 import ConfigSaveWarnings from '@/components/ConfigSaveWarnings';
 import {
   useConfigDirtyCount,
@@ -33,7 +34,25 @@ export default function UnsavedChangesBanner() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [warnings, setWarnings] = useState<ValidationWarning[]>([]);
+  const [otherWarnings, setOtherWarnings] = useState<ValidationWarning[]>([]);
   const previousDirtyCount = useRef(dirtyCount);
+
+  useEffect(() => subscribeConfigWarnings((incoming) => {
+    setOtherWarnings((previous) => {
+      const merged = [...previous];
+      for (const warning of incoming) {
+        if (!merged.some((item) => item.code === warning.code && item.path === warning.path && item.message === warning.message)) {
+          merged.push(warning);
+        }
+      }
+      return merged;
+    });
+  }), []);
+
+  useEffect(() => {
+    const clear = () => { setWarnings([]); setOtherWarnings([]); };
+    return subscribeConfigWarningAuthority(clear);
+  }, []);
 
   useEffect(() => {
     if (previousDirtyCount.current === 0 && dirtyCount > 0) {
@@ -67,12 +86,20 @@ export default function UnsavedChangesBanner() {
     };
   }, []);
 
-  if (dirtyCount === 0 && warnings.length === 0) return null;
+  const visibleWarnings = [...warnings];
+  for (const warning of otherWarnings) {
+    if (!visibleWarnings.some((item) => item.code === warning.code && item.path === warning.path && item.message === warning.message)) {
+      visibleWarnings.push(warning);
+    }
+  }
+  const dismissWarnings = () => { setWarnings([]); setOtherWarnings([]); };
+
+  if (dirtyCount === 0 && visibleWarnings.length === 0) return null;
 
   if (dirtyCount === 0) {
     return (
       <div className="border-b border-status-warning/25 bg-status-warning/[0.08] px-4 py-2">
-        <ConfigSaveWarnings warnings={warnings} onDismiss={() => setWarnings([])} />
+        <ConfigSaveWarnings warnings={visibleWarnings} onDismiss={dismissWarnings} />
       </div>
     );
   }
@@ -84,9 +111,10 @@ export default function UnsavedChangesBanner() {
     setSaving(true);
     setError(null);
     setWarnings([]);
+    const authority = captureConfigWarningAuthority();
     try {
       const resp = await saveAll();
-      setWarnings(resp.warnings ?? []);
+      setWarnings(authority.isCurrent() ? (resp.warnings ?? []) : []);
     } catch (e) {
       if (e instanceof ApiError) {
         const env = e.envelope as { code?: string; message?: string; path?: string };
@@ -96,6 +124,7 @@ export default function UnsavedChangesBanner() {
         setError(e instanceof Error ? e.message : String(e));
       }
     } finally {
+      authority.dispose();
       setSaving(false);
     }
   };
@@ -141,6 +170,7 @@ export default function UnsavedChangesBanner() {
           {error}
         </p>
       )}
+      <ConfigSaveWarnings warnings={visibleWarnings} onDismiss={dismissWarnings} />
     </div>
   );
 }

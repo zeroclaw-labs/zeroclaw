@@ -82,6 +82,7 @@ import { isOptionTypeHint, parseNumberDraft } from "./numberInput.logic";
 import { isLocalModelProviderName, primeModelProviderCatalog } from "../../lib/modelProviders";
 import EntityEnabledToggle from "../EntityEnabledToggle";
 import ConfigSaveWarnings from "../ConfigSaveWarnings";
+import { captureConfigWarningAuthority, subscribeConfigWarningAuthority } from "../../lib/configWarningEvents";
 
 function entryValue(entry: ListResponseEntry): unknown {
   return entry.populated ? entry.value : undefined;
@@ -978,6 +979,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
     const [topError, setTopError] = useState<string | null>(null);
     const [savedAt, setSavedAt] = useState<string | null>(null);
     const [saveWarnings, setSaveWarnings] = useState<ValidationWarning[]>([]);
+    useEffect(() => subscribeConfigWarningAuthority(() => setSaveWarnings([])), []);
     const [loading, setLoading] = useState(true);
     const [saving, setSaving] = useState(false);
     const [schema, setSchema] = useState<Record<string, unknown> | undefined>(
@@ -1152,10 +1154,11 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
         return true;
       }
 
+      const authority = captureConfigWarningAuthority();
       try {
-        const resp = await patchConfig(ops);
+        const resp = await patchConfig(ops, { warningsHandledLocally: true });
         setSavedAt(`${t("fieldform.saved_prefix")}${resp.results.length}${t("fieldform.saved_suffix")}`);
-        setSaveWarnings(resp.warnings ?? []);
+        setSaveWarnings(authority.isCurrent() ? (resp.warnings ?? []) : []);
         if (scopeActionsToIncludedPaths && includePath) {
           configDraft.discardPaths(actionablePaths);
         } else {
@@ -1182,6 +1185,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
         }
         return false;
       } finally {
+        authority.dispose();
         setSaving(false);
       }
     };

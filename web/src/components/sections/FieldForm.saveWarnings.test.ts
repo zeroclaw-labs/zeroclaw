@@ -90,6 +90,14 @@ test("config saves and toggles retain warnings only for the relevant result", as
         kind: "integer", type_hint: "u64",
       }] });
     }
+    if ((url === "/api/config/prop" && init?.method === "PUT") ||
+        (url.startsWith("/api/config/prop?") && init?.method === "DELETE") ||
+        (url.startsWith("/api/config/init") && init?.method === "POST")) {
+      if (mode === "error") {
+        return Response.json({ code: "invalid_format", message: "fixture save failed" }, { status: 400 });
+      }
+      return Response.json({ path: "fixture.path", initialized: ["fixture"], warnings: mode === "warning" ? [warning] : [] });
+    }
     assert.equal(url, "/api/config");
     assert.equal(init?.method, "PATCH");
     if (mode === "error") {
@@ -121,6 +129,8 @@ test("config saves and toggles retain warnings only for the relevant result", as
     const { ConfigDraftProvider } = await jiti.import<typeof import("../../lib/draftStore.tsx")>(
       "../../lib/draftStore.tsx",
     );
+    const api = await jiti.import<typeof import("../../lib/api.ts")>("../../lib/api.ts");
+    const auth = await jiti.import<typeof import("../../lib/auth.ts")>("../../lib/auth.ts");
     root = createRoot(container as unknown as HTMLElement);
     await act(async () => {
       root?.render(React.createElement(ConfigDraftProvider, null,
@@ -164,6 +174,62 @@ test("config saves and toggles retain warnings only for the relevant result", as
     assert.match(presenter.textContent ?? "", /unknown fallback/);
     assert.doesNotMatch(presenter.textContent ?? "", /fallback not shown/);
 
+    // Writers without their own warning display use the persistent banner.
+    await act(async () => { await api.putProp("fixture.path", true); await flushEffects(); });
+    assert.match(banner.textContent ?? "", /fixture retained diagnostic/);
+    await act(async () => {
+      await api.patchConfig([{ op: "replace", path: "fixture.path", value: true }]);
+      await api.deleteProp("fixture.path");
+      await api.initSection("fixture");
+      await flushEffects();
+    });
+    assert.equal((banner.textContent?.match(/fixture retained diagnostic/g) ?? []).length, 1);
+    await edit("5500");
+    assert.match(banner.textContent ?? "", /unsaved change/);
+    assert.match(banner.textContent ?? "", /fixture retained diagnostic/);
+    await click(banner, "Discard all");
+    assert.match(banner.textContent ?? "", /fixture retained diagnostic/);
+    await click(banner, "Dismiss warnings");
+    mode = "none";
+    await act(async () => { await api.putProp("fixture.path", true); await flushEffects(); });
+    assert.equal(banner.textContent, "");
+    mode = "error";
+    await act(async () => {
+      await assert.rejects(api.putProp("fixture.path", true));
+      await flushEffects();
+    });
+    assert.equal(banner.textContent, "");
+    mode = "warning";
+
+    // Warning text belongs to the authority that received it, including when
+    // an old response arrives after the session loses config access.
+    await act(async () => { await api.putProp("fixture.path", true); await flushEffects(); });
+    assert.match(banner.textContent ?? "", /fixture retained diagnostic/);
+    const session = {
+      kind: "oidc" as const, provider: "oidc.fixture", principal_id: "fixture-user",
+      display_name: "Fixture", admin: false, expires_at: 4_000_000_000,
+      csrf_token: "fixture-csrf", features: { chat: true, operator_pages: true, config: true },
+    };
+    await act(async () => { auth.setOidcSession(session); await flushEffects(); });
+    assert.equal(banner.textContent, "");
+    const mockFetch = globalThis.fetch;
+    let finishWrite!: (response: Response) => void;
+    const delayed = new Promise<Response>((resolve) => { finishWrite = resolve; });
+    globalThis.fetch = async () => delayed;
+    const pendingWrite = api.patchConfig([{ op: "replace", path: "fixture.path", value: true }]);
+    await act(async () => {
+      auth.setOidcSession({ ...session, features: { ...session.features, config: false } });
+      // Even an intervening return to the same session object must not make
+      // an old response authoritative again.
+      auth.setOidcSession(session);
+      finishWrite(Response.json({ saved: true, results: [], warnings: [warning] }));
+      assert.deepEqual((await pendingWrite).warnings, []);
+      await flushEffects();
+    });
+    assert.equal(banner.textContent, "");
+    globalThis.fetch = mockFetch;
+    await act(async () => { auth.setOidcSession(null); await flushEffects(); });
+
     await edit("6000");
     await click(form, "Save");
     assert.match(form.textContent ?? "", /Saved 1 field/);
@@ -172,6 +238,10 @@ test("config saves and toggles retain warnings only for the relevant result", as
       /nodes\.mdns\.peer_ttl_secs.*fixture retained diagnostic/,
     );
     assert.equal(form.querySelector('[role="status"]')?.getAttribute("aria-live"), "polite");
+    assert.doesNotMatch(banner.textContent ?? "", /fixture retained diagnostic/);
+    await act(async () => { auth.setOidcSession(session); await flushEffects(); });
+    assert.equal(form.querySelector('[role="status"]'), null);
+    await act(async () => { auth.setOidcSession(null); await flushEffects(); });
     await edit("6500");
     failNextReload = true;
     await click(form, "Save");

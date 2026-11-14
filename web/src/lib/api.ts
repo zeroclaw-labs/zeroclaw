@@ -34,6 +34,7 @@ import {
   type AuthFailureReason,
 } from "./authSession";
 import { apiOrigin, basePath } from "./basePath";
+import { announceConfigWarnings, captureConfigWarningAuthority } from "./configWarningEvents";
 
 // ---------------------------------------------------------------------------
 // Base fetch wrapper
@@ -682,24 +683,41 @@ export function getProp(path: string): Promise<PropResponse> {
   );
 }
 
-export function putProp(
+async function withConfigWarningAuthority<T extends { warnings?: ValidationWarning[] }>(
+  operation: () => Promise<T>,
+  announce = true,
+): Promise<T> {
+  const authority = captureConfigWarningAuthority();
+  try {
+    const result = await operation();
+    const safeResult = authority.isCurrent() ? result : { ...result, warnings: [] };
+    if (announce) announceConfigWarnings(safeResult.warnings);
+    return safeResult;
+  } finally {
+    authority.dispose();
+  }
+}
+
+export async function putProp(
   path: string,
   value: unknown,
   comment?: string,
 ): Promise<PropResponse> {
-  return apiFetch<PropResponse>("/api/config/prop", {
+  const result = await withConfigWarningAuthority(() => apiFetch<PropResponse>("/api/config/prop", {
     method: "PUT",
     body: JSON.stringify({ path, value, comment }),
-  });
+  }));
+  return result;
 }
 
-export function deleteProp(path: string): Promise<PropResponse> {
-  return apiFetch<PropResponse>(
+export async function deleteProp(path: string): Promise<PropResponse> {
+  const result = await withConfigWarningAuthority(() => apiFetch<PropResponse>(
     `/api/config/prop?path=${encodeURIComponent(path)}`,
     {
       method: "DELETE",
     },
-  );
+  ));
+  return result;
 }
 
 export function listProps(prefix?: string): Promise<ListResponse> {
@@ -715,15 +733,17 @@ export async function patchConfig(
      *  path (otherwise that returns 409 `config_changed_externally`). Use only
      *  after the operator has chosen to overwrite a known drift. */
     overrideDrift?: boolean;
+    /** The caller renders the returned warnings itself. */
+    warningsHandledLocally?: boolean;
   },
 ): Promise<PatchResponse> {
-  const result = await apiFetch<PatchResponse>("/api/config", {
+  const result = await withConfigWarningAuthority(() => apiFetch<PatchResponse>("/api/config", {
     method: "PATCH",
     body: JSON.stringify(ops),
     ...(opts?.overrideDrift
       ? { headers: { "X-ZeroClaw-Override-Drift": "true" } }
       : {}),
-  });
+  }), !opts?.warningsHandledLocally);
   // Config structure changed: notify listeners (e.g. the ⌘K search index)
   // so they can invalidate caches. Decoupled via a browser event to avoid a
   // circular import (configSearch.ts imports from this module).
@@ -731,13 +751,14 @@ export async function patchConfig(
   return result;
 }
 
-export function initSection(
+export async function initSection(
   section?: string,
-): Promise<{ initialized: string[] }> {
+): Promise<{ initialized: string[]; warnings?: ValidationWarning[] }> {
   const q = section ? `?section=${encodeURIComponent(section)}` : "";
-  return apiFetch<{ initialized: string[] }>(`/api/config/init${q}`, {
+  const result = await withConfigWarningAuthority(() => apiFetch<{ initialized: string[]; warnings?: ValidationWarning[] }>(`/api/config/init${q}`, {
     method: "POST",
-  });
+  }));
+  return result;
 }
 
 export function getDrift(): Promise<{ drifted: DriftEntry[] }> {

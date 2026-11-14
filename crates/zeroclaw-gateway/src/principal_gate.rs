@@ -1494,6 +1494,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn config_init_without_read_hides_retained_warning_details() {
+        let tmp = tempfile::tempdir().unwrap();
+        let idp = introspection_idp(&["ops"]).await;
+        let mut config = editor_config(
+            &tmp,
+            &idp.uri(),
+            &[Verb::Create, Verb::Update],
+            &["transcription.openai", "transcription.openai.*"],
+        );
+        config.gateway.host.clear();
+        let router = router_for(config);
+        let (status, body) = send(
+            &router,
+            "POST",
+            "/api/config/init?section=transcription.openai",
+            SCOPED.0,
+            SCOPED.1,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["initialized"],
+            serde_json::json!(["transcription.openai"])
+        );
+        assert_eq!(body["warnings"][0]["code"], "config_warning_details_hidden");
+        assert!(!body.to_string().contains("gateway.host"), "{body}");
+    }
+
+    #[tokio::test]
     async fn config_writer_without_read_receives_generic_validation_failure() {
         let tmp = tempfile::tempdir().unwrap();
         let idp = introspection_idp(&["ops"]).await;
