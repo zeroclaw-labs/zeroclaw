@@ -399,13 +399,30 @@ impl Tool for ShellTool {
                         append_truncation_marker(&mut stderr, "\n... [stderr truncated at 1MB]");
                     }
 
+                    let success = status.success();
+                    // On failure, put the exit status plus stderr (or stdout if
+                    // stderr is empty) into `error`. Leaving `error` empty made
+                    // run logs show `"error":""` and hid the command's diagnostic
+                    // from the model. When stdout is used as the failure detail,
+                    // clear `output` so the dispatcher does not fold a duplicate
+                    // copy into the model-visible text.
+                    let used_stdout_as_error =
+                        !success && stderr.trim_end().is_empty() && !stdout.trim_end().is_empty();
                     ToolResult {
-                        success: status.success(),
-                        output: stdout.into(),
-                        error: if stderr.is_empty() {
-                            None
+                        success,
+                        output: if used_stdout_as_error {
+                            ToolOutput::default()
                         } else {
-                            Some(stderr)
+                            stdout.clone().into()
+                        },
+                        error: if success {
+                            if stderr.is_empty() {
+                                None
+                            } else {
+                                Some(stderr)
+                            }
+                        } else {
+                            Some(format_shell_failure_error(status, &stderr, &stdout))
                         },
                     }
                 }
@@ -536,6 +553,48 @@ async fn drain_capped_into<R>(
             }
             Err(_) => break,
         }
+    }
+}
+
+fn exit_status_label(status: std::process::ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        let code = code.to_string();
+        crate::i18n::get_required_cli_string_with_args("tool-shell-exit-status", &[("code", &code)])
+    } else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            if let Some(signal) = status.signal() {
+                let signal = signal.to_string();
+                return crate::i18n::get_required_cli_string_with_args(
+                    "tool-shell-killed-by-signal",
+                    &[("signal", &signal)],
+                );
+            }
+        }
+        crate::i18n::get_required_cli_string("tool-shell-exited-unsuccessfully")
+    }
+}
+
+fn format_shell_failure_error(
+    status: std::process::ExitStatus,
+    stderr: &str,
+    stdout: &str,
+) -> String {
+    let status_text = exit_status_label(status);
+    let stderr = stderr.trim_end();
+    let detail = if !stderr.is_empty() {
+        stderr
+    } else {
+        stdout.trim_end()
+    };
+    if detail.is_empty() {
+        status_text
+    } else {
+        crate::i18n::get_required_cli_string_with_args(
+            "tool-shell-failure-with-detail",
+            &[("status", &status_text), ("detail", detail)],
+        )
     }
 }
 
@@ -691,6 +750,16 @@ mod tests {
         })
     }
 
+    fn unrestricted_shell_policy() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        })
+    }
+
     fn test_runtime() -> Arc<dyn RuntimeAdapter> {
         #[cfg(windows)]
         let runtime = NativeRuntime::with_shell("cmd.exe".into());
@@ -717,6 +786,36 @@ mod tests {
     #[cfg(not(windows))]
     fn success_with_stderr_command() -> &'static str {
         "echo out; echo warn >&2"
+    }
+
+    #[cfg(windows)]
+    fn failure_with_stderr_command() -> &'static str {
+        "echo fail_msg 1>&2 && exit 2"
+    }
+
+    #[cfg(not(windows))]
+    fn failure_with_stderr_command() -> &'static str {
+        "echo fail_msg >&2; exit 2"
+    }
+
+    #[cfg(windows)]
+    fn failure_stdout_only_command() -> &'static str {
+        "echo fail_out && exit 3"
+    }
+
+    #[cfg(not(windows))]
+    fn failure_stdout_only_command() -> &'static str {
+        "echo fail_out; exit 3"
+    }
+
+    #[cfg(windows)]
+    fn failure_silent_command() -> &'static str {
+        "exit 4"
+    }
+
+    #[cfg(not(windows))]
+    fn failure_silent_command() -> &'static str {
+        "exit 4"
     }
 
     #[cfg(windows)]
@@ -1427,13 +1526,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shell_captures_exit_code() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+    async fn shell_captures_exit_code_and_stderr_on_failure() {
+        let tool = ShellTool::new(unrestricted_shell_policy(), test_runtime());
         let result = tool
-            .execute(json!({"command": "ls /nonexistent_dir_xyz"}))
+            .execute(json!({"command": failure_with_stderr_command()}))
             .await
-            .expect("command with nonexistent path should return a result");
+            .expect("failing command should return a result");
         assert!(!result.success);
+        let error = result.error.as_deref().unwrap_or("");
+        let status = expected_exit_status_label(2);
+        assert!(
+            error.contains(&status) && error.contains("fail_msg"),
+            "failed shell result must surface the exit status and stderr, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_uses_stdout_in_error_when_stderr_is_empty_on_failure() {
+        let tool = ShellTool::new(unrestricted_shell_policy(), test_runtime());
+        let result = tool
+            .execute(json!({"command": failure_stdout_only_command()}))
+            .await
+            .expect("failing command should return a result");
+        assert!(!result.success);
+        let error = result.error.as_deref().unwrap_or("");
+        let status = expected_exit_status_label(3);
+        assert!(
+            error.contains(&status) && error.contains("fail_out"),
+            "failed shell result must fall back to stdout when stderr is empty, got: {error:?}"
+        );
+        assert!(
+            result.output.is_empty(),
+            "stdout already included in error must not also remain in output (dispatcher would duplicate it), got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_reports_exit_status_when_failure_has_no_output() {
+        let tool = ShellTool::new(unrestricted_shell_policy(), test_runtime());
+        let result = tool
+            .execute(json!({"command": failure_silent_command()}))
+            .await
+            .expect("failing command should return a result");
+        assert!(!result.success);
+        assert_eq!(
+            result.error.as_deref(),
+            Some(expected_exit_status_label(4).as_str())
+        );
+    }
+
+    /// Builds the expected status label through the same Fluent helper as the
+    /// tool, so these tests pass under any configured locale.
+    fn expected_exit_status_label(code: i32) -> String {
+        let code = code.to_string();
+        crate::i18n::get_required_cli_string_with_args("tool-shell-exit-status", &[("code", &code)])
     }
 
     // ── Ephemeral-workspace warning────────────────

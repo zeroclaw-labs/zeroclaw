@@ -1346,6 +1346,12 @@ sop-rpc-policy-unavailable = 待機中の SOP ポリシーを利用できませ�
 tool-runtime-command-build-failed = ランタイムコマンドの構築に失敗しました: {$error}
 tool-runtime-command-docker-workspace-path = ランタイムコマンドの構築に失敗しました: Docker ワークスペースパス {$path} の正規化に失敗しました: {$cause}
 tool-runtime-command-docker-allowed-root = ランタイムコマンドの構築に失敗しました: Docker ワークスペースルート {$path} の正規化に失敗しました: {$cause}
+
+# ── Shell tool failure labels (user-facing ToolComplete.error) ──
+tool-shell-exit-status = 終了ステータス { $code }
+tool-shell-killed-by-signal = シグナル { $signal } により終了
+tool-shell-exited-unsuccessfully = 異常終了
+tool-shell-failure-with-detail = { $status }: { $detail }
 cli-approval-request = 🔧 エージェントが実行しようとしています: {$tool}
 cli-approval-prompt = { "   " }[Y] はい / [N] いいえ / [A] 常に許可（{$tool}）:{ " " }
 channel-approval-heading = ツールの承認が必要です

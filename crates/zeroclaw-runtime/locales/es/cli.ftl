@@ -1348,6 +1348,12 @@ sop-rpc-policy-unavailable = La política del SOP en espera no está disponible:
 tool-runtime-command-build-failed = No se pudo construir el comando de ejecución: {$error}
 tool-runtime-command-docker-workspace-path = No se pudo construir el comando de ejecución: No se pudo canonicalizar la ruta del espacio de trabajo de Docker {$path}: {$cause}
 tool-runtime-command-docker-allowed-root = No se pudo compilar el comando de ejecución: No se pudo canonizar la raíz del espacio de trabajo de Docker {$path}: {$cause}
+
+# ── Shell tool failure labels (user-facing ToolComplete.error) ──
+tool-shell-exit-status = estado de salida { $code }
+tool-shell-killed-by-signal = terminado por la señal { $signal }
+tool-shell-exited-unsuccessfully = finalizó sin éxito
+tool-shell-failure-with-detail = { $status }: { $detail }
 cli-approval-request = 🔧 El agente quiere ejecutar: {$tool}
 cli-approval-prompt = { "   " }[Y] Sí / [N] No / [A] Siempre para {$tool}:{ " " }
 channel-approval-heading = Se requiere aprobación de la herramienta

@@ -1347,6 +1347,12 @@ sop-rpc-policy-unavailable = 暂停的 SOP 策略不可用：{$reason}。
 tool-runtime-command-build-failed = 无法构建运行时命令：{$error}
 tool-runtime-command-docker-workspace-path = 无法构建运行时命令：无法规范化 Docker 工作区路径 {$path}：{$cause}
 tool-runtime-command-docker-allowed-root = 构建运行时命令失败：无法规范化 Docker 工作区根目录 {$path}：{$cause}
+
+# ── Shell tool failure labels (user-facing ToolComplete.error) ──
+tool-shell-exit-status = 退出状态 { $code }
+tool-shell-killed-by-signal = 被信号 { $signal } 终止
+tool-shell-exited-unsuccessfully = 未成功退出
+tool-shell-failure-with-detail = { $status }: { $detail }
 cli-approval-request = 🔧 代理想要执行：{$tool}
 cli-approval-prompt = { "   " }[Y] 是 / [N] 否 / [A] 始终允许 {$tool}：{ " " }
 channel-approval-heading = 需要工具批准
