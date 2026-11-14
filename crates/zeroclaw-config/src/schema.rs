@@ -24630,6 +24630,33 @@ impl Config {
                 format!("peer_groups.{group_name}.channel"),
             ));
         }
+
+        // A route for a peer the same group ignores can never be used: an
+        // ignored peer is not routable. Keep it loadable but say so.
+        let mut group_names: Vec<&String> = self.peer_groups.keys().collect();
+        group_names.sort();
+        for group_name in group_names {
+            let group = &self.peer_groups[group_name];
+            let ignored: std::collections::HashSet<String> = group
+                .ignore
+                .iter()
+                .map(|entry| entry.as_str().trim().trim_start_matches('@').to_lowercase())
+                .collect();
+            let mut route_keys: Vec<&String> = group.routes.keys().collect();
+            route_keys.sort();
+            for key in route_keys {
+                let peer = key.trim().trim_start_matches('@').to_lowercase();
+                if ignored.contains("*") || ignored.contains(&peer) {
+                    warnings.push(crate::validation_warnings::ValidationWarning::new(
+                        "peer_group_route_ignored",
+                        format!(
+                            "peer_groups.{group_name}.routes.{key} is unused: peer_groups.{group_name}.ignore covers {key:?}, and an ignored peer is not routable"
+                        ),
+                        format!("peer_groups.{group_name}.routes.{key}"),
+                    ));
+                }
+            }
+        }
     }
 
     /// Validate configuration values that would cause runtime failures.
@@ -26431,6 +26458,70 @@ impl Config {
                         InvalidFormat,
                         format!("peer_groups.{group_name}.agents[{i}]"),
                         "peer_groups.{group_name}.agents[{i}] = {member_str:?} but agents.{member_str}.channels has no {needs_msg}",
+                    );
+                }
+            }
+            // Routes give an external peer an explicit delivery address. Only
+            // Discord sends read them, so a route anywhere else is an error
+            // rather than silently unused. A route never grants admission: its
+            // key must already be one of the group's `external_peers`.
+            let mut route_keys: Vec<&String> = group.routes.keys().collect();
+            route_keys.sort();
+            let mut routed_peers = std::collections::HashSet::new();
+            for key in route_keys {
+                let route_path = format!("peer_groups.{group_name}.routes.{key}");
+                if group_channel_type != "discord" {
+                    validation_bail!(
+                        InvalidFormat,
+                        route_path,
+                        "{route_path} is set, but peer_groups.{group_name}.channel = {group_channel:?}; routes are supported only on Discord peer groups",
+                    );
+                }
+                let peer = key.trim().trim_start_matches('@').to_lowercase();
+                if peer.is_empty() || peer == "*" {
+                    validation_bail!(
+                        InvalidFormat,
+                        route_path,
+                        "{route_path} must be keyed by one external peer, not {key:?}",
+                    );
+                }
+                if !peer.bytes().all(|b| b.is_ascii_digit()) {
+                    validation_bail!(
+                        InvalidFormat,
+                        route_path,
+                        "{route_path} must be keyed by the peer's Discord user ID (digits only), not {key:?}; Discord identifies senders by user ID",
+                    );
+                }
+                if !routed_peers.insert(peer.clone()) {
+                    validation_bail!(
+                        InvalidFormat,
+                        route_path,
+                        "{route_path} routes a peer that another key of peer_groups.{group_name}.routes already routes",
+                    );
+                }
+                let listed = group.external_peers.iter().any(|entry| {
+                    entry.as_str().trim().trim_start_matches('@').to_lowercase() == peer
+                });
+                if !listed {
+                    validation_bail!(
+                        DanglingReference,
+                        route_path,
+                        "{route_path} is keyed by {key:?}, which is not in peer_groups.{group_name}.external_peers; a route does not admit a peer",
+                    );
+                }
+                let destination = group.routes[key].destination.trim();
+                if destination.is_empty() {
+                    validation_bail!(
+                        RequiredFieldEmpty,
+                        format!("{route_path}.destination"),
+                        "{route_path}.destination must name the Discord channel or thread ID to post in",
+                    );
+                }
+                if !destination.bytes().all(|b| b.is_ascii_digit()) {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("{route_path}.destination"),
+                        "{route_path}.destination = {destination:?} must be a Discord channel or thread ID (digits only)",
                     );
                 }
             }
@@ -52330,6 +52421,179 @@ allowed_users = []
         config
             .validate()
             .expect("two-member same-channel peer group must validate cleanly");
+    }
+
+    /// `alpha` listening on `discord.ops`, in peer group `bots` with one
+    /// external peer, and `routes` as given: `(key, destination)`.
+    fn discord_route_test_config(group_channel: &str, routes: &[(&str, &str)]) -> Config {
+        let mut config = multi_agent_test_config();
+        config
+            .channels
+            .discord
+            .insert("ops".to_string(), DiscordConfig::default());
+        config
+            .agents
+            .get_mut("alpha")
+            .expect("test config has alpha")
+            .channels
+            .push(crate::providers::ChannelRef::new("discord.ops"));
+        let group = crate::multi_agent::PeerGroupConfig {
+            channel: group_channel.into(),
+            agents: vec![crate::multi_agent::AgentAlias::new("alpha")],
+            external_peers: vec![crate::multi_agent::PeerUsername::new("111111111111111111")],
+            routes: routes
+                .iter()
+                .map(|(key, destination)| {
+                    (
+                        (*key).to_string(),
+                        crate::multi_agent::PeerRouteConfig {
+                            destination: (*destination).to_string(),
+                            mention: false,
+                        },
+                    )
+                })
+                .collect(),
+            ..crate::multi_agent::PeerGroupConfig::default()
+        };
+        config.peer_groups.insert("bots".to_string(), group);
+        config
+    }
+
+    fn route_validation_error(config: &Config) -> String {
+        config
+            .validate()
+            .expect_err("invalid route must fail validation")
+            .to_string()
+    }
+
+    #[test]
+    async fn validate_accepts_discord_peer_route() {
+        let config = discord_route_test_config(
+            "discord.ops",
+            &[("111111111111111111", "333333333333333333")],
+        );
+        config
+            .validate()
+            .expect("a listed peer routed to a channel ID validates");
+    }
+
+    #[test]
+    async fn validate_rejects_route_for_peer_outside_external_peers() {
+        let config = discord_route_test_config(
+            "discord.ops",
+            &[("222222222222222222", "333333333333333333")],
+        );
+        let msg = route_validation_error(&config);
+        assert!(
+            msg.contains("peer_groups.bots.routes.222222222222222222"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("not in peer_groups.bots.external_peers"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_wildcard_route_key() {
+        let mut config = discord_route_test_config("discord.ops", &[("*", "333333333333333333")]);
+        config.peer_groups.get_mut("bots").unwrap().external_peers =
+            vec![crate::multi_agent::PeerUsername::new("*")];
+        let msg = route_validation_error(&config);
+        assert!(msg.contains("must be keyed by one external peer"), "{msg}");
+    }
+
+    #[test]
+    async fn validate_rejects_a_route_key_that_is_not_a_discord_user_id() {
+        let mut config =
+            discord_route_test_config("discord.ops", &[("@operator", "333333333333333333")]);
+        config.peer_groups.get_mut("bots").unwrap().external_peers =
+            vec![crate::multi_agent::PeerUsername::new("@operator")];
+        let msg = route_validation_error(&config);
+        assert!(msg.contains("peer_groups.bots.routes.@operator"), "{msg}");
+        assert!(msg.contains("Discord user ID"), "{msg}");
+
+        let config = discord_route_test_config(
+            "discord.ops",
+            &[("@111111111111111111", "333333333333333333")],
+        );
+        config
+            .validate()
+            .expect("a leading @ on a user ID key is accepted");
+    }
+
+    #[test]
+    async fn validate_rejects_non_numeric_or_empty_discord_route_destination() {
+        for destination in ["general", "<#333333333333333333>", "  "] {
+            let config =
+                discord_route_test_config("discord.ops", &[("111111111111111111", destination)]);
+            let msg = route_validation_error(&config);
+            assert!(
+                msg.contains("peer_groups.bots.routes.111111111111111111.destination"),
+                "{destination:?}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    async fn validate_rejects_route_on_a_channel_type_without_route_support() {
+        let mut config = multi_agent_test_config();
+        let group = crate::multi_agent::PeerGroupConfig {
+            channel: "telegram".into(),
+            agents: vec![crate::multi_agent::AgentAlias::new("alpha")],
+            external_peers: vec![crate::multi_agent::PeerUsername::new("@operator")],
+            routes: [(
+                "@operator".to_string(),
+                crate::multi_agent::PeerRouteConfig {
+                    destination: "12345".to_string(),
+                    mention: false,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..crate::multi_agent::PeerGroupConfig::default()
+        };
+        config.peer_groups.insert("team_chat".to_string(), group);
+        let msg = route_validation_error(&config);
+        assert!(
+            msg.contains("routes are supported only on Discord peer groups"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_two_route_keys_for_one_peer() {
+        let config = discord_route_test_config(
+            "discord",
+            &[
+                ("111111111111111111", "333333333333333333"),
+                ("@111111111111111111", "444444444444444444"),
+            ],
+        );
+        let msg = route_validation_error(&config);
+        assert!(msg.contains("already routes"), "{msg}");
+    }
+
+    #[test]
+    async fn collect_warnings_flags_route_for_a_peer_the_group_ignores() {
+        let mut config = discord_route_test_config(
+            "discord.ops",
+            &[("111111111111111111", "333333333333333333")],
+        );
+        config.peer_groups.get_mut("bots").unwrap().ignore =
+            vec![crate::multi_agent::PeerUsername::new("111111111111111111")];
+        let warnings = warnings_with_code(&config, "peer_group_route_ignored");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(
+            warnings[0].path,
+            "peer_groups.bots.routes.111111111111111111"
+        );
+
+        let clean = discord_route_test_config(
+            "discord.ops",
+            &[("111111111111111111", "333333333333333333")],
+        );
+        assert!(warnings_with_code(&clean, "peer_group_route_ignored").is_empty());
     }
 
     const PEER_GROUP_CHANNEL_DANGLING_WARNING: &str = "peer_group_channel_dangling";

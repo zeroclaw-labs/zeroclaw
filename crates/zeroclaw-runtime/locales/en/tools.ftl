@@ -274,3 +274,8 @@ tool-a2a-cancel = Cancel an in-flight A2A task on a peer. Returns the updated Ta
 tool-a2a-cancel-desc-peer = Configured peer name hosting the task.
 tool-a2a-cancel-desc-task-id = The task id to cancel.
 tool-a2a-cancel-desc-agent = Optional agent alias or tenant that created the task (from a2a_send). Helps route the cancel to the correct interface when discovery is re-run (the cached route is used first).
+
+# send_via: Discord external-peer routes
+tool-send-via-error-no-routed-peer = Peer group '{ $group }' has no routed external peer on '{ $channel }'. Discord delivery needs an explicit route: add [peer_groups.{ $group }.routes."<peer ID>"] with destination = "<channel or thread ID>"
+tool-send-via-error-several-routed-peers = Peer group '{ $group }' has several routed external peers on '{ $channel }' ({ $peers }), so send_via cannot choose one; use send_message_to_peer to address one peer
+tool-send-via-error-route-conflict = External peer '{ $peer }' is routed differently on '{ $channel }' by peer groups { $groups }; make those routes agree or keep the route in one group

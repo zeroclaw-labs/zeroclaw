@@ -8,6 +8,9 @@ use zeroclaw_api::channel::{Channel, SendMessage};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::multi_agent::OutputModality;
 use zeroclaw_config::multi_agent::PeerGroupConfig;
+use zeroclaw_config::multi_agent::{
+    PeerRouteLookup, ResolvedPeerRoute, lookup_peer_route, routed_peers_of_group,
+};
 use zeroclaw_config::policy::{SecurityPolicy, ToolOperation};
 
 /// Per-tool channel-map handle — matches `zeroclaw_runtime::tools::PerToolChannelHandle`.
@@ -24,7 +27,51 @@ tokio::task_local! {
 
 /// Return type of [`SendViaTool::resolve_target`]: resolved channel key, channel arc,
 /// modality, and optional explicit recipient.
-type ResolvedTarget = Result<(String, Arc<dyn Channel>, OutputModality, Option<String>), String>;
+type ResolvedTarget = Result<(String, Arc<dyn Channel>, OutputModality, Option<Recipient>), String>;
+
+/// Where a `send_via` message is addressed on the resolved channel.
+#[derive(Debug, Clone)]
+struct Recipient {
+    /// Channel-native address the message is posted to.
+    address: String,
+    /// The peer route that supplied `address`, when a configured route did.
+    peer_route: Option<ResolvedPeerRoute>,
+}
+
+/// Content and mention policy for a message posted on an external peer's
+/// Discord route. Routed messages always carry an explicit policy: with
+/// `mention`, the peer's mention is prefixed and only the peer may be pinged;
+/// without it, the message pings nobody.
+pub fn discord_routed_content(route: &ResolvedPeerRoute, body: &str) -> (String, Vec<String>) {
+    if !route.mention {
+        return (body.to_string(), Vec::new());
+    }
+    let peer = route.peer.trim_start_matches('@');
+    let mention = format!("<@{peer}>");
+    let content = if body.trim_start().starts_with(&mention) {
+        body.to_string()
+    } else {
+        format!("{mention} {body}")
+    };
+    (content, vec![peer.to_string()])
+}
+
+/// The `send_via` rejection for a Discord peer group without one eligible
+/// routed external peer.
+fn no_routed_peer_error(group_name: &str, channel_key: &str) -> String {
+    crate::i18n::get_required_tool_string_with_args(
+        "tool-send-via-error-no-routed-peer",
+        &[("group", group_name), ("channel", channel_key)],
+    )
+}
+
+/// Whether a resolved `<type>.<alias>` channel key names a Discord channel.
+fn is_discord_channel_key(channel_key: &str) -> bool {
+    channel_key
+        .split_once('.')
+        .map_or(channel_key, |(channel_type, _)| channel_type)
+        .eq_ignore_ascii_case("discord")
+}
 
 /// A single per-turn routing instruction written by `send_via` in no-body mode.
 /// The orchestrator reads this after `run_tool_call_loop` returns.
@@ -36,6 +83,26 @@ pub struct TurnRoutingEntry {
     pub modality: OutputModality,
     /// Explicit recipient override. `None` = inherit from `msg.reply_target`.
     pub recipient: Option<String>,
+    /// The external peer route that supplied `recipient`, if any. A routed
+    /// reply carries the route's mention policy; see
+    /// [`TurnRoutingEntry::routed_content`].
+    pub peer_route: Option<ResolvedPeerRoute>,
+}
+
+impl TurnRoutingEntry {
+    /// The reply content and mention policy for this route. A Discord peer
+    /// route prefixes the peer's mention when configured and always carries an
+    /// explicit policy; any other route leaves the content unchanged and the
+    /// channel's default mention handling in place.
+    pub fn routed_content(&self, content: &str) -> (String, Option<Vec<String>>) {
+        match &self.peer_route {
+            Some(route) => {
+                let (content, mentions) = discord_routed_content(route, content);
+                (content, Some(mentions))
+            }
+            None => (content.to_string(), None),
+        }
+    }
 }
 
 /// Handle to one turn's routing state. The orchestrator creates a fresh handle
@@ -114,6 +181,63 @@ impl SendViaTool {
         }
     }
 
+    /// The recipient for a send to peer group `group_name` on `channel_key`.
+    ///
+    /// On Discord a peer entry is a user ID, not somewhere to post, so the
+    /// recipient comes only from a configured route: exactly one external peer
+    /// of the group must have an eligible route, and routes for that peer in
+    /// the agent's other groups covering the channel must agree. A group with
+    /// no external peers has no recipient on any channel, as before. Other
+    /// channel types keep the group's first external peer.
+    fn group_recipient(
+        group_name: &str,
+        group: &PeerGroupConfig,
+        channel_key: &str,
+        agent_peer_groups: &HashMap<String, PeerGroupConfig>,
+    ) -> Result<Option<Recipient>, String> {
+        if !is_discord_channel_key(channel_key) || group.external_peers.is_empty() {
+            return Ok(group.external_peers.first().map(|p| Recipient {
+                address: p.as_str().to_string(),
+                peer_route: None,
+            }));
+        }
+        let routed = routed_peers_of_group(group, agent_peer_groups.values(), channel_key);
+        let peer = match routed.as_slice() {
+            [peer] => peer,
+            [] => return Err(no_routed_peer_error(group_name, channel_key)),
+            several => {
+                return Err(crate::i18n::get_required_tool_string_with_args(
+                    "tool-send-via-error-several-routed-peers",
+                    &[
+                        ("group", group_name),
+                        ("channel", channel_key),
+                        ("peers", &several.join(", ")),
+                    ],
+                ));
+            }
+        };
+        let scope = agent_peer_groups
+            .iter()
+            .map(|(name, group)| (name.as_str(), group));
+        match lookup_peer_route(scope, channel_key, peer) {
+            PeerRouteLookup::Routed(route) => Ok(Some(Recipient {
+                address: route.destination.clone(),
+                peer_route: Some(route),
+            })),
+            PeerRouteLookup::Conflict(groups) => {
+                Err(crate::i18n::get_required_tool_string_with_args(
+                    "tool-send-via-error-route-conflict",
+                    &[
+                        ("peer", peer.as_str()),
+                        ("channel", channel_key),
+                        ("groups", &groups.join(", ")),
+                    ],
+                ))
+            }
+            PeerRouteLookup::Unrouted => Err(no_routed_peer_error(group_name, channel_key)),
+        }
+    }
+
     /// Resolve `target` to `(channel_key, channel, peer_group_output_modality)`.
     /// `target` may be a peer group name, a composite channel key, or a bare type.
     /// Returns `Err(reason)` when the target is rejected or not found.
@@ -137,11 +261,11 @@ impl SendViaTool {
                     .map(|ch| (default_key, Arc::clone(ch)))
             };
 
-            // Recipient: first external peer configured in this group, if any.
-            let recipient = pg.external_peers.first().map(|p| p.as_str().to_string());
-
             return match resolved {
-                Some((key, ch)) => Ok((key, ch, pg.output_modality, recipient)),
+                Some((key, ch)) => {
+                    let recipient = Self::group_recipient(target, pg, &key, &agent_peer_groups)?;
+                    Ok((key, ch, pg.output_modality, recipient))
+                }
                 None => Err(format!(
                     "Peer group '{target}' specifies channel '{pg_channel}' \
                      but no matching channel is registered (a bare type resolves \
@@ -181,8 +305,8 @@ impl SendViaTool {
                 "Channel '{channel_key}' is not within any peer group this agent belongs to"
             )),
             1 => {
-                let (_, pg) = matching.remove(0);
-                let recipient = pg.external_peers.first().map(|p| p.as_str().to_string());
+                let (name, pg) = matching.remove(0);
+                let recipient = Self::group_recipient(name, pg, &channel_key, &agent_peer_groups)?;
                 Ok((channel_key, channel, pg.output_modality, recipient))
             }
             _ => {
@@ -380,23 +504,39 @@ impl Tool for SendViaTool {
             };
 
             let modality = explicit_modality.unwrap_or(pg_modality);
+            // A routed peer's message carries the route's mention policy.
+            let (content, allowed_mentions) = match &recipient.peer_route {
+                Some(route) => {
+                    let (content, mentions) = discord_routed_content(route, &body);
+                    (content, Some(mentions))
+                }
+                None => (body.clone(), None),
+            };
+            let message = SendMessage::new(&content, &recipient.address)
+                .with_allowed_mentions(allowed_mentions);
             let message = match modality {
-                OutputModality::Voice => SendMessage::new(&body, &recipient).force_voice(),
-                OutputModality::Text => SendMessage::new(&body, &recipient).suppress_voice(),
-                OutputModality::Mirror => SendMessage::new(&body, &recipient),
+                OutputModality::Voice => message.force_voice(),
+                OutputModality::Text => message.suppress_voice(),
+                OutputModality::Mirror => message,
             };
 
             return match channel.send(&message).await {
-                Ok(()) => Ok(ToolResult {
-                    success: true,
-                    output: ToolOutput::json(json!({
+                Ok(()) => {
+                    let mut output = json!({
                         "target": channel_key,
                         "mode": "immediate",
                         "resolved_modality": modality_str(modality),
                         "status": "ok"
-                    })),
-                    error: None,
-                }),
+                    });
+                    if recipient.peer_route.is_some() {
+                        output["destination"] = json!(recipient.address);
+                    }
+                    Ok(ToolResult {
+                        success: true,
+                        output: ToolOutput::json(output),
+                        error: None,
+                    })
+                }
                 Err(e) => Ok(ToolResult {
                     success: false,
                     output: ToolOutput::json(json!({
@@ -475,10 +615,19 @@ impl Tool for SendViaTool {
             (None, modality, None)
         };
 
+        let (recipient, peer_route) = match resolved_recipient {
+            Some(Recipient {
+                address,
+                peer_route,
+            }) => (Some(address), peer_route),
+            None => (None, None),
+        };
+        let destination = peer_route.as_ref().map(|route| route.destination.clone());
         let entry = TurnRoutingEntry {
             channel: resolved_channel.clone(),
             modality: resolved_modality,
-            recipient: resolved_recipient,
+            recipient,
+            peer_route,
         };
 
         // Write to the current turn's routing handle. Each turn scopes its own
@@ -508,14 +657,18 @@ impl Tool for SendViaTool {
             });
         }
 
+        let mut output = json!({
+            "target": resolved_channel.as_deref().unwrap_or("<originating>"),
+            "mode": "routing",
+            "resolved_modality": modality_str(resolved_modality),
+            "status": "queued"
+        });
+        if let Some(destination) = destination {
+            output["destination"] = json!(destination);
+        }
         Ok(ToolResult {
             success: true,
-            output: ToolOutput::json(json!({
-                "target": resolved_channel.as_deref().unwrap_or("<originating>"),
-                "mode": "routing",
-                "resolved_modality": modality_str(resolved_modality),
-                "status": "queued"
-            })),
+            output: ToolOutput::json(output),
             error: None,
         })
     }
@@ -1281,5 +1434,216 @@ mod tests {
             matches!(after.modality, OutputModality::Voice),
             "reloaded output_modality must take effect live"
         );
+    }
+
+    const BOT: &str = "111111111111111111";
+    const OPERATOR: &str = "222222222222222222";
+    const THREAD: &str = "333333333333333333";
+
+    /// A Discord peer group on `discord.main` with `peers`, routing each
+    /// `(peer, destination, mention)`.
+    fn discord_pg(peers: &[&str], routes: &[(&str, &str, bool)]) -> PeerGroupConfig {
+        let mut group = pg_with_peers("discord.main", &["elisa"], peers);
+        group.routes = routes
+            .iter()
+            .map(|(peer, destination, mention)| {
+                (
+                    (*peer).to_string(),
+                    zeroclaw_config::multi_agent::PeerRouteConfig {
+                        destination: (*destination).to_string(),
+                        mention: *mention,
+                    },
+                )
+            })
+            .collect();
+        group
+    }
+
+    fn discord_tool(
+        groups: Vec<(&str, PeerGroupConfig)>,
+    ) -> (
+        TestTool,
+        TurnRoutingHandle,
+        Arc<parking_lot::RwLock<Vec<SendMessage>>>,
+    ) {
+        let ch = Arc::new(StubChannel::new("discord.main"));
+        let sent = Arc::clone(&ch.sent);
+        let groups = groups
+            .into_iter()
+            .map(|(name, group)| (name.to_string(), group))
+            .collect();
+        let (tool, routing) = make_tool(vec![("discord.main", ch as Arc<dyn Channel>)], groups);
+        (tool, routing, sent)
+    }
+
+    #[tokio::test]
+    async fn discord_send_uses_the_one_routed_peer_regardless_of_peer_order() {
+        for peers in [[OPERATOR, BOT], [BOT, OPERATOR]] {
+            let (tool, _, sent) =
+                discord_tool(vec![("bots", discord_pg(&peers, &[(BOT, THREAD, false)]))]);
+            let result = tool
+                .execute(json!({"target": "bots", "body": "hello"}))
+                .await
+                .unwrap();
+            assert!(result.success, "{peers:?}: {}", result.output);
+            let out: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+            assert_eq!(
+                out["destination"], THREAD,
+                "the result names the destination"
+            );
+            let sent = sent.read();
+            assert_eq!(sent.len(), 1);
+            assert_eq!(
+                sent[0].recipient, THREAD,
+                "{peers:?}: posts to the route, not a peer"
+            );
+            assert_eq!(sent[0].content, "hello");
+            assert_eq!(
+                sent[0].allowed_mentions,
+                Some(Vec::new()),
+                "a routed message without `mention` pings nobody"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn discord_send_mentions_only_the_routed_peer() {
+        let (tool, _, sent) =
+            discord_tool(vec![("bots", discord_pg(&[BOT], &[(BOT, THREAD, true)]))]);
+        let result = tool
+            .execute(json!({"target": "discord.main", "body": "hi @everyone and <@999>"}))
+            .await
+            .unwrap();
+        assert!(result.success, "{}", result.output);
+        let sent = sent.read();
+        assert_eq!(sent[0].content, format!("<@{BOT}> hi @everyone and <@999>"));
+        assert_eq!(sent[0].allowed_mentions, Some(vec![BOT.to_string()]));
+    }
+
+    #[tokio::test]
+    async fn discord_send_without_a_single_routed_peer_fails_closed() {
+        for (name, group) in [
+            ("unrouted", discord_pg(&[BOT, OPERATOR], &[])),
+            (
+                "several",
+                discord_pg(
+                    &[BOT, OPERATOR],
+                    &[(BOT, THREAD, false), (OPERATOR, THREAD, false)],
+                ),
+            ),
+        ] {
+            let (tool, routing, sent) = discord_tool(vec![(name, group)]);
+            for args in [
+                json!({"target": name, "body": "hello"}),
+                json!({"target": name}),
+            ] {
+                let result = tool.execute(args).await.unwrap();
+                assert!(!result.success, "{name}: {}", result.output);
+                let out: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+                assert_eq!(out["status"], "rejected");
+                assert!(out["reason"].as_str().unwrap().contains(name), "{out}");
+            }
+            assert!(sent.read().is_empty(), "{name}: nothing may be sent");
+            assert!(
+                routing.lock().unwrap().is_empty(),
+                "{name}: no route may be queued"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn discord_send_excludes_a_peer_another_of_the_agents_groups_ignores() {
+        // The routed peer is ignored by another of the agent's groups on the
+        // channel, so the group has no eligible routed peer.
+        let mut deny = discord_pg(&[], &[]);
+        deny.ignore = vec![PeerUsername::new(BOT)];
+        let (tool, _, sent) = discord_tool(vec![
+            ("bots", discord_pg(&[BOT], &[(BOT, THREAD, false)])),
+            ("deny", deny),
+        ]);
+        let result = tool
+            .execute(json!({"target": "bots", "body": "hello"}))
+            .await
+            .unwrap();
+        assert!(!result.success, "{}", result.output);
+        assert!(sent.read().is_empty());
+    }
+
+    #[tokio::test]
+    async fn discord_agent_only_group_keeps_the_no_external_peers_rejection() {
+        let (tool, routing, sent) = discord_tool(vec![("agents", discord_pg(&[], &[]))]);
+        for args in [
+            json!({"target": "agents", "body": "hello"}),
+            json!({"target": "agents"}),
+        ] {
+            let result = tool.execute(args.clone()).await.unwrap();
+            assert!(!result.success, "{args}: {}", result.output);
+            let out: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+            let reason = out["reason"].as_str().unwrap();
+            assert!(
+                reason.contains("no external_peers configured"),
+                "{args}: {reason}"
+            );
+        }
+        assert!(sent.read().is_empty());
+        assert!(routing.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn discord_send_rejects_conflicting_routes_across_the_agents_groups() {
+        let mut typed = discord_pg(&[BOT], &[(BOT, "444444444444444444", false)]);
+        typed.channel = "discord".into();
+        let (tool, _, sent) = discord_tool(vec![
+            ("bots", discord_pg(&[BOT], &[(BOT, THREAD, false)])),
+            ("typed", typed),
+        ]);
+        let result = tool
+            .execute(json!({"target": "bots", "body": "hello"}))
+            .await
+            .unwrap();
+        assert!(!result.success, "{}", result.output);
+        let out: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        let reason = out["reason"].as_str().unwrap();
+        assert!(reason.contains("bots, typed"), "{reason}");
+        assert!(sent.read().is_empty());
+    }
+
+    #[tokio::test]
+    async fn discord_routing_instruction_carries_the_route() {
+        let (tool, routing, _) = discord_tool(vec![(
+            "bots",
+            discord_pg(&[OPERATOR, BOT], &[(BOT, THREAD, true)]),
+        )]);
+        let result = tool.execute(json!({"target": "bots"})).await.unwrap();
+        assert!(result.success, "{}", result.output);
+        let out: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(out["destination"], THREAD);
+        let entry = routing.lock().unwrap()[0].clone();
+        assert_eq!(entry.recipient.as_deref(), Some(THREAD));
+        let (content, mentions) = entry.routed_content("reply");
+        assert_eq!(content, format!("<@{BOT}> reply"));
+        assert_eq!(mentions, Some(vec![BOT.to_string()]));
+    }
+
+    #[test]
+    fn unrouted_entries_leave_content_and_mentions_alone() {
+        let entry = TurnRoutingEntry {
+            channel: Some("telegram.default".to_string()),
+            modality: OutputModality::Text,
+            recipient: Some("@amaury".to_string()),
+            peer_route: None,
+        };
+        assert_eq!(entry.routed_content("reply"), ("reply".to_string(), None));
+    }
+
+    #[test]
+    fn discord_routed_content_does_not_repeat_a_leading_mention() {
+        let route = ResolvedPeerRoute {
+            peer: BOT.to_string(),
+            destination: THREAD.to_string(),
+            mention: true,
+        };
+        let (content, _) = discord_routed_content(&route, &format!("<@{BOT}> already there"));
+        assert_eq!(content, format!("<@{BOT}> already there"));
     }
 }
