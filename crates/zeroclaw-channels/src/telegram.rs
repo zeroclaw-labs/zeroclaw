@@ -2789,7 +2789,7 @@ impl TelegramChannel {
             transcription_manager: None,
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
             voice_file_paths: Mutex::new(std::collections::HashMap::new()),
-            voice_reply_prep_timeout: Duration::from_secs(30),
+            voice_reply_prep_timeout: VOICE_REPLY_PREP_TIMEOUT,
             workspace_dir: None,
             ack_reactions: true,
             tts_manager: None,
