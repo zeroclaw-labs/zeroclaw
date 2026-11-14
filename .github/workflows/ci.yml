@@ -1244,7 +1244,7 @@ jobs:
           inputs = ['Cargo.toml', 'Cargo.lock', 'crates/zeroclaw-plugins/tests/fixtures/tool-fixture/Cargo.toml',
                     'crates/zeroclaw-plugins/tests/fixtures/tool-fixture/src/lib.rs']
           inputs += [str(path.relative_to(workspace)) for path in sorted((workspace / 'wit/v0').iterdir()) if path.is_file()]
-          if len(inputs) != 17:
+          if len(inputs) != 18:
               raise RuntimeError('unexpected WIT input inventory')
           input_rows = [{'path': path, **digest(workspace / path, 4 * 1024 * 1024)} for path in inputs]
           components = {}
