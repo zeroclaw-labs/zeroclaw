@@ -1759,6 +1759,10 @@ cli-sop-run-unavailable = SOP run unavailable in this session.
 cli-sop-step-owner-principal-mismatch = SOP step refused: this run belongs to a different principal than the one this turn's capabilities act for.
 cli-sop-step-owner-memory-unavailable = SOP step failed: the memory of this run's owner is unavailable ({ $error }).
 
+turn-loop-detected = Repeated tool calls were stopped. Completed work is retained; unresolved actions remain pending.
+
+turn-loop-repeat-refused = Refused repeated tool { $tool } before execution after { $repeats } identical calls. Stop retrying and report completed, failed and pending work.
+
 # Result-aware Agent loop recovery
 turn-repeated-success-advisory = The same tool call returned the same successful result repeatedly. Reconsider whether another call will help. Polling may continue when needed.
 turn-repeated-failure-recovery = The same tool call failed with the same result repeatedly. Change the approach or explain the blocker. One further identical retry is available before this turn stops.

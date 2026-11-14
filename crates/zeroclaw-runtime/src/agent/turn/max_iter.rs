@@ -20,6 +20,7 @@ use zeroclaw_tool_call_parser::{strip_think_tags, strip_trailing_terminal_marker
 pub(crate) enum CompletionLimit {
     LocalIterations(usize),
     ExecutionTree,
+    LoopDetected,
 }
 
 impl CompletionLimit {
@@ -29,13 +30,21 @@ impl CompletionLimit {
                 format!("Agent exceeded maximum tool iterations ({limit})")
             }
             Self::ExecutionTree => "Agent exhausted the execution-tree iteration budget".into(),
+            Self::LoopDetected => "Repeated tool calls were stopped by the loop detector".into(),
         }
     }
 
     /// The iteration-cap stop, shared by the `ErrorAtCap` exit and the
     /// graceful-summary failure paths so all of them carry one code and one message.
     fn stop(self) -> TurnStop {
-        TurnStop::close_out(TurnStopCode::MaxIterations, self.explanation())
+        TurnStop::close_out(self.code(), self.explanation())
+    }
+
+    fn code(self) -> TurnStopCode {
+        match self {
+            Self::LoopDetected => TurnStopCode::LoopDetector,
+            Self::LocalIterations(_) | Self::ExecutionTree => TurnStopCode::MaxIterations,
+        }
     }
 }
 
@@ -168,8 +177,13 @@ pub(crate) async fn finish_after_max_iterations(
         ),
         None => (model_provider, provider_name, model, dispatch_model),
     };
+    let closeout_instructions = if matches!(limit, CompletionLimit::LoopDetected) {
+        "Do not retry tools or claim unverified success. Distinguish completed actions with evidence, failed attempts, and pending work. Explain the blocker and the next safe step."
+    } else {
+        ""
+    };
     let summary_prompt = ChatMessage::user(format!(
-        "{exhaustion}. Please provide your best answer based on the work completed so far. \
+        "{exhaustion}. {closeout_instructions} Please provide your best answer based on the work completed so far. \
          Summarize what you accomplished and what remains to be done."
     ));
     let summary_prompt_mirror = summary_prompt.clone();
@@ -424,7 +438,7 @@ pub(crate) async fn finish_after_max_iterations(
         }
         SummaryCall::TimedOut(step_secs) => {
             return Err(TurnStop::close_out(
-                TurnStopCode::MaxIterations,
+                limit.code(),
                 format!("Final summary LLM call timed out after {step_secs}s (step_timeout_secs)"),
             )
             .into());
@@ -535,6 +549,7 @@ pub(crate) async fn finish_after_max_iterations(
         CompletionLimit::ExecutionTree => {
             crate::i18n::get_required_cli_string("turn-execution-tree-budget-reached")
         }
+        CompletionLimit::LoopDetected => crate::i18n::get_required_cli_string("turn-loop-detected"),
     };
     let segment = format!("{display_text}\n\n{stop_reason}");
     // This summary is the turn's only visible output on the max-iteration
@@ -561,10 +576,12 @@ mod graceful_summary_metering_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
     use zeroclaw_api::model_provider::{
         ChatRequest, ChatResponse, ProviderCapabilities, SemanticEmptyTerminalCompletion,
     };
+    use zeroclaw_api::turn_stop::TurnStopCode;
     use zeroclaw_config::schema::{
         CostConfig, MultimodalConfig, PacingConfig, ResolvedContextLimits,
     };
@@ -576,6 +593,7 @@ mod graceful_summary_metering_tests {
     /// Provider stub that counts calls and returns a summary WITH token usage.
     struct CountingUsageProvider {
         calls: Arc<AtomicUsize>,
+        delay: Duration,
     }
 
     #[async_trait]
@@ -592,11 +610,18 @@ mod graceful_summary_metering_tests {
 
         async fn chat(
             &self,
-            _request: ChatRequest<'_>,
+            request: ChatRequest<'_>,
             _model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
+            assert!(
+                request.tools.is_none(),
+                "closeout must never dispatch tools"
+            );
             self.calls.fetch_add(1, Ordering::SeqCst);
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
             Ok(ChatResponse {
                 text: Some("wrap-up summary".to_string()),
                 tool_calls: Vec::new(),
@@ -660,14 +685,84 @@ mod graceful_summary_metering_tests {
         }
     }
 
+    #[tokio::test]
+    async fn loop_closeout_uses_one_tools_free_summary_with_visible_stop_reason() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = CountingUsageProvider {
+            calls: Arc::clone(&calls),
+            delay: Duration::ZERO,
+        };
+        let result = run_summary_with_limit(
+            &provider,
+            String::new(),
+            None,
+            None,
+            CompletionLimit::LoopDetected,
+            None,
+        )
+        .await
+        .expect("loop closes out gracefully");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(result.contains("wrap-up summary"));
+        assert!(result.contains(&crate::i18n::get_required_cli_string("turn-loop-detected")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn summary_timeout_preserves_the_selected_stop_code() {
+        for (limit, expected) in [
+            (CompletionLimit::LoopDetected, TurnStopCode::LoopDetector),
+            (
+                CompletionLimit::LocalIterations(2),
+                TurnStopCode::MaxIterations,
+            ),
+            (CompletionLimit::ExecutionTree, TurnStopCode::MaxIterations),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let provider = CountingUsageProvider {
+                calls: Arc::clone(&calls),
+                delay: Duration::from_secs(2),
+            };
+            let error =
+                run_summary_with_limit(&provider, String::new(), None, None, limit, Some(1))
+                    .await
+                    .expect_err("summary should time out");
+            let stop = zeroclaw_api::turn_stop::turn_stop(&error).expect("typed turn stop");
+            assert_eq!(stop.code, expected);
+            assert!(error.to_string().contains("timed out after 1s"));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
     async fn run_summary_with_events(
         provider: &dyn ModelProvider,
         accumulated_display_text: String,
         event_tx: Option<&Sender<TurnEvent>>,
         on_delta: Option<&Sender<StreamDelta>>,
     ) -> anyhow::Result<String> {
+        run_summary_with_limit(
+            provider,
+            accumulated_display_text,
+            event_tx,
+            on_delta,
+            CompletionLimit::LocalIterations(2),
+            None,
+        )
+        .await
+    }
+
+    async fn run_summary_with_limit(
+        provider: &dyn ModelProvider,
+        accumulated_display_text: String,
+        event_tx: Option<&Sender<TurnEvent>>,
+        on_delta: Option<&Sender<StreamDelta>>,
+        limit: CompletionLimit,
+        step_timeout_secs: Option<u64>,
+    ) -> anyhow::Result<String> {
         let mut history = vec![ChatMessage::user("do the work")];
-        let pacing = PacingConfig::default();
+        let pacing = PacingConfig {
+            step_timeout_secs,
+            ..PacingConfig::default()
+        };
         let knobs = LoopKnobs::default(); // GracefulSummary
         let multimodal_config = MultimodalConfig::default();
         finish_after_max_iterations(
@@ -680,7 +775,7 @@ mod graceful_summary_metering_tests {
             None,
             &pacing,
             None,
-            CompletionLimit::LocalIterations(2),
+            limit,
             accumulated_display_text,
             "trace-req-test",
             &knobs,
@@ -714,6 +809,7 @@ mod graceful_summary_metering_tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let provider = CountingUsageProvider {
             calls: Arc::clone(&calls),
+            delay: Duration::ZERO,
         };
         let ctx = ToolLoopCostTrackingContext::usage_only();
         let turn_usage = Arc::clone(&ctx.turn_usage);
@@ -746,6 +842,7 @@ mod graceful_summary_metering_tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let provider = CountingUsageProvider {
             calls: Arc::clone(&calls),
+            delay: Duration::ZERO,
         };
         let ctx = ToolLoopCostTrackingContext::usage_only();
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
@@ -827,6 +924,7 @@ mod graceful_summary_metering_tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let provider = CountingUsageProvider {
             calls: Arc::clone(&calls),
+            delay: Duration::ZERO,
         };
         let tmp = tempfile::TempDir::new().unwrap();
         let cfg = CostConfig {
@@ -2247,6 +2345,10 @@ mod tests {
             TurnStopCode::MaxIterations
         );
 
+        assert_eq!(
+            CompletionLimit::LoopDetected.stop().code,
+            TurnStopCode::LoopDetector
+        );
         let tree = CompletionLimit::ExecutionTree.stop();
         assert_eq!(tree.code, TurnStopCode::MaxIterations);
         assert_eq!(

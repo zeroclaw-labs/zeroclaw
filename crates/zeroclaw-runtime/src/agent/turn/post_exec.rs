@@ -5,7 +5,7 @@ use super::call_prep::StreamToolCall;
 use super::context::TurnCtx;
 use super::events::{ProgressEvent, StreamDelta, send_progress};
 use super::redact::scrub_credentials;
-use crate::agent::tool_execution::ToolExecutionOutcome;
+use crate::agent::tool_execution::{CompletedToolExecution, ToolExecutionOutcome};
 use zeroclaw_tool_call_parser::ParsedToolCall;
 
 /// Record each executed tool call's outcome (upstream loop body,
@@ -17,7 +17,7 @@ pub(crate) async fn record_executed_outcomes(
     executable_indices: &[usize],
     executable_calls: &[ParsedToolCall],
     stream_calls: &[Option<StreamToolCall>],
-    executed_outcomes: Vec<ToolExecutionOutcome>,
+    executed_outcomes: Vec<CompletedToolExecution>,
     ordered_results: &mut [Option<(String, Option<String>, ToolExecutionOutcome)>],
     iteration: usize,
 ) {
@@ -27,6 +27,8 @@ pub(crate) async fn record_executed_outcomes(
         .zip(stream_calls.iter())
         .zip(executed_outcomes)
     {
+        let was_executed = outcome.executed_tool_name.is_some();
+        let outcome = outcome.outcome;
         // The pending ToolCall and terminal ToolResult are emitted by the
         // executor (execute_one_tool) at dispatch and completion time so serial
         // batches interleave call->result per tool. Post-exec only records the
@@ -34,45 +36,58 @@ pub(crate) async fn record_executed_outcomes(
 
         ::zeroclaw_log::record!(
             INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
-                .with_category(::zeroclaw_log::EventCategory::Tool)
-                .with_outcome(if outcome.success {
-                    ::zeroclaw_log::EventOutcome::Success
+            ::zeroclaw_log::Event::new(
+                module_path!(),
+                if was_executed {
+                    ::zeroclaw_log::Action::Complete
                 } else {
-                    ::zeroclaw_log::EventOutcome::Failure
-                })
-                .with_duration(u64::try_from(outcome.duration.as_millis()).unwrap_or(u64::MAX))
-                .with_attrs(::serde_json::json!({
-                    "model": ctx.model,
-                    "iteration": iteration + 1,
-                    "tool": call.name.clone(),
-                    "error_reason": outcome.error_reason.as_deref().map(scrub_credentials),
-                    "output": scrub_credentials(&outcome.output),
-                    "trace_id": ctx.turn_id,
-                })),
+                    ::zeroclaw_log::Action::Note
+                }
+            )
+            .with_category(::zeroclaw_log::EventCategory::Tool)
+            .with_outcome(if outcome.success {
+                ::zeroclaw_log::EventOutcome::Success
+            } else {
+                ::zeroclaw_log::EventOutcome::Failure
+            })
+            .with_duration(u64::try_from(outcome.duration.as_millis()).unwrap_or(u64::MAX))
+            .with_attrs(::serde_json::json!({
+                "model": ctx.model,
+                "iteration": iteration + 1,
+                "tool": call.name.clone(),
+                "error_reason": outcome.error_reason.as_deref().map(scrub_credentials),
+                "output": scrub_credentials(&outcome.output),
+                "trace_id": ctx.turn_id,
+            })),
             "tool_call_result"
         );
 
         // ── Hook: after_tool_call (void) ─────────────────
         if let Some(hooks) = ctx.hooks {
             let hook_context = crate::hooks::tool_call_hook_context(ctx.turn_id, iteration, *idx);
-            let tool_result_obj = crate::tools::ToolResult {
-                success: outcome.success,
-                output: outcome.output.clone().into(),
-                error: None,
-            };
-            // The prepared arguments travel with the completion call so
-            // argument-auditing hooks export what was actually dispatched and
-            // never need to retain arguments between the hook phases.
-            hooks
-                .fire_after_tool_call_with_context_and_args(
-                    &hook_context,
-                    &call.name,
-                    &call.arguments,
-                    &tool_result_obj,
-                    outcome.duration,
-                )
-                .await;
+            if !was_executed {
+                hooks
+                    .fire_tool_call_abandoned(&hook_context, &call.name)
+                    .await;
+            } else {
+                let tool_result_obj = crate::tools::ToolResult {
+                    success: outcome.success,
+                    output: outcome.output.clone().into(),
+                    error: None,
+                };
+                // The prepared arguments travel with the completion call so
+                // argument-auditing hooks export what was actually dispatched and
+                // never need to retain arguments between the hook phases.
+                hooks
+                    .fire_after_tool_call_with_context_and_args(
+                        &hook_context,
+                        &call.name,
+                        &call.arguments,
+                        &tool_result_obj,
+                        outcome.duration,
+                    )
+                    .await;
+            }
         }
 
         // ── Progress: tool completion ───────────────────────
@@ -98,7 +113,9 @@ pub(crate) async fn record_executed_outcomes(
                 .await;
         }
 
-        // Capture into the innermost live SOP step scope (no-op otherwise).
+        // The SOP ledger retains attempted calls too, including denied or
+        // unknown calls with their failed outcomes. This is separate from
+        // completion hooks, which require actual dispatch provenance.
         if crate::sop::executor::step_capture_active() {
             crate::sop::executor::record_step_tool_call(
                 &call.name,
