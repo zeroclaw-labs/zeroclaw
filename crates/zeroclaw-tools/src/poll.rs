@@ -3,7 +3,7 @@ use parking_lot::RwLock;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
-use zeroclaw_api::channel::{Channel, PollRequest, SendMessage};
+use zeroclaw_api::channel::{Channel, PollRequest, PollVoteReply, SendMessage};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
@@ -170,6 +170,11 @@ On ACP channels that advertise elicitation.form, the tool blocks until the user 
                     "type": "integer",
                     "minimum": 1,
                     "description": "Poll duration in minutes (default: 60)"
+                },
+                "vote_reply": {
+                    "type": "string",
+                    "enum": ["ignore", "in_chat", "direct"],
+                    "description": "What happens when someone votes, on channels with native polls. 'ignore' (default) records votes silently, for polls that only gather opinions. 'in_chat' answers each voter where the poll was posted. 'direct' answers each voter privately, for a poll that opens a conversation such as taking an order."
                 },
                 "multi_select": {
                     "type": "boolean",
@@ -354,8 +359,14 @@ On ACP channels that advertise elicitation.form, the tool blocks until the user 
             } else {
                 1
             };
+            let vote_reply = match args.get("vote_reply").and_then(|v| v.as_str()) {
+                Some("in_chat") => PollVoteReply::InChat,
+                Some("direct") => PollVoteReply::Direct,
+                _ => PollVoteReply::Ignore,
+            };
             let poll = PollRequest::new(&recipient_id, &question, options.clone())
-                .with_selectable_count(selectable_count);
+                .with_selectable_count(selectable_count)
+                .with_vote_reply(vote_reply);
             return Ok(match channel.send_poll(&poll).await {
                 Ok(()) => ToolResult {
                     success: true,
@@ -363,8 +374,13 @@ On ACP channels that advertise elicitation.form, the tool blocks until the user 
                         "Native poll created on '{channel_name}':\n\
                          Question: {question}\n\
                          Options: {}\n\
-                         Multi-select: {multi_select}",
-                        options.join(", ")
+                         Multi-select: {multi_select} | Votes: {}",
+                        options.join(", "),
+                        match vote_reply {
+                            PollVoteReply::Ignore => "recorded, no reply",
+                            PollVoteReply::InChat => "answered in the chat",
+                            PollVoteReply::Direct => "answered privately",
+                        }
                     )
                     .into(),
                     error: None,
@@ -746,6 +762,61 @@ mod tests {
             channel.sent.read().is_empty(),
             "the text fallback must not also go out"
         );
+    }
+
+    #[tokio::test]
+    async fn a_poll_records_votes_silently_unless_it_asks_for_replies() {
+        let channel = Arc::new(NativePollChannel::new("whatsapp", false));
+        let tool = PollTool::new(
+            Arc::new(SecurityPolicy::default()),
+            make_channel_map(vec![channel.clone()]),
+        );
+
+        tool.execute(json!({
+            "question": "Which wines do you like?",
+            "options": ["Malbec", "Syrah"],
+            "channel": "whatsapp",
+            "recipient": "15550001111",
+        }))
+        .await
+        .expect("tool runs");
+
+        assert_eq!(
+            channel.polls.read()[0].vote_reply,
+            PollVoteReply::Ignore,
+            "a poll that only gathers opinions must not start a turn per voter"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_poll_can_ask_for_a_reply_per_voter() {
+        for (requested, want) in [
+            ("in_chat", PollVoteReply::InChat),
+            ("direct", PollVoteReply::Direct),
+            ("nonsense", PollVoteReply::Ignore),
+        ] {
+            let channel = Arc::new(NativePollChannel::new("whatsapp", false));
+            let tool = PollTool::new(
+                Arc::new(SecurityPolicy::default()),
+                make_channel_map(vec![channel.clone()]),
+            );
+
+            tool.execute(json!({
+                "question": "Which wine are you ordering?",
+                "options": ["Malbec", "Syrah"],
+                "channel": "whatsapp",
+                "recipient": "15550001111",
+                "vote_reply": requested,
+            }))
+            .await
+            .expect("tool runs");
+
+            assert_eq!(
+                channel.polls.read()[0].vote_reply,
+                want,
+                "vote_reply={requested} must map to {want:?}, and an unknown value must fall back to the quiet default"
+            );
+        }
     }
 
     #[tokio::test]
