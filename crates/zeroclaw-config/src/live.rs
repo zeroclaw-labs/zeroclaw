@@ -152,6 +152,22 @@ impl LiveConfig {
         }
     }
 
+    /// Construct a live fixture without admitting its historical typed input.
+    ///
+    /// Test-only RPC boundaries need to exercise an edit against the same
+    /// source representation that a legacy fixture supplied. Canonical
+    /// consumers still use the test-helper admission at their own resolver
+    /// boundary; production construction has no access to this method.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn new_raw_for_tests(config: Config) -> Self {
+        Self {
+            pair: Arc::new(RwLock::new(PublishedPair {
+                config,
+                revision: ConfigRevision::initial(ConfigEpoch::new()),
+            })),
+        }
+    }
+
     /// The read-only facade over this storage.
     pub fn handle(&self) -> LiveConfigHandle {
         LiveConfigHandle {

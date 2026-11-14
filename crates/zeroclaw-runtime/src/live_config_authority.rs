@@ -58,10 +58,11 @@ impl LiveConfigAuthority {
     /// production.
     #[cfg(test)]
     pub(crate) fn for_tests(config: Config) -> Self {
-        let config = zeroclaw_config::migration::admit_test_input(&config);
         Self {
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            ..Self::new(config)
+            live: LiveConfig::new_raw_for_tests(config),
+            agent_lifecycle: AgentLifecycleCoordinator::default(),
+            application_results: Arc::default(),
         }
     }
 
@@ -71,10 +72,11 @@ impl LiveConfigAuthority {
     /// config than the first connection's.
     #[cfg(test)]
     pub(crate) fn for_tests_sharing_writer(config: Config, writer: &Self) -> Self {
-        let config = zeroclaw_config::migration::admit_test_input(&config);
         Self {
             config_write_lock: Arc::clone(&writer.config_write_lock),
-            ..Self::new(config)
+            live: LiveConfig::new_raw_for_tests(config),
+            agent_lifecycle: AgentLifecycleCoordinator::default(),
+            application_results: Arc::default(),
         }
     }
 

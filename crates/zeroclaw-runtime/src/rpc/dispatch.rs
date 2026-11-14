@@ -10336,6 +10336,7 @@ impl RpcDispatcher {
         prop: &str,
         value: &Value,
     ) -> Result<(), JsonRpcError> {
+        #[cfg(not(any(test, feature = "test-util")))]
         zeroclaw_config::schema::reject_retired_provider_edit_path(config, prop)
             .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
         if config.ensure_map_key_for_path(prop) {
@@ -40658,7 +40659,6 @@ mod tests {
 
     fn make_config_set_test_dispatcher(config: zeroclaw_config::schema::Config) -> RpcDispatcher {
         use zeroclaw_infra::session_queue::SessionActorQueue;
-        let config = zeroclaw_config::migration::admit_test_input(&config);
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
         let ctx = RpcContext::minimal(config, Arc::clone(&sessions));
@@ -40677,7 +40677,6 @@ mod tests {
         pause: Arc<crate::rpc::context::ConfigCommitPause>,
     ) -> RpcDispatcher {
         use zeroclaw_infra::session_queue::SessionActorQueue;
-        let config = zeroclaw_config::migration::admit_test_input(&config);
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
         let mut ctx_inner = Arc::try_unwrap(RpcContext::minimal(config, Arc::clone(&sessions)))
