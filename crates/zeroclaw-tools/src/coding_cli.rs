@@ -268,6 +268,40 @@ pub(crate) fn add_coding_cli_env(command: &mut CodingCliCommand, passthrough: &[
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn direct_executor_preserves_argument_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let arguments = [
+            "",
+            "two words",
+            "--option-looking-prompt",
+            "问题🦀 e\u{301}",
+            "line one\nline two",
+            "\"quoted\" 'single' \\ path",
+            "$(printf expanded); * $HOME",
+            "",
+        ];
+        let mut command = CodingCliCommand::new("/bin/sh", dir.path().to_path_buf(), 10);
+        // The fixed probe prints each positional argument with a NUL delimiter;
+        // argument contents are never interpolated into the shell program.
+        command.args(["-c", "printf '%s\\0' \"$@\"", "argv-probe"]);
+        command.args(arguments);
+
+        let output = DirectCodingCliExecutor.output(command).await.unwrap();
+        assert!(
+            output.status.success(),
+            "argument probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut expected = Vec::new();
+        for argument in arguments {
+            expected.extend_from_slice(argument.as_bytes());
+            expected.push(0);
+        }
+        assert_eq!(output.stdout, expected);
+    }
+
     #[test]
     fn host_native_windows_program_preserves_known_cli_shims() {
         assert_eq!(
