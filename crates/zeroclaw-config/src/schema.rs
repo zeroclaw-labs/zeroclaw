@@ -55464,7 +55464,7 @@ model_provider = \"ollama.default\"
         );
         validate_provider_input_fixture(&config).unwrap();
         let config = crate::migration::admit_test_input(&config);
-        assert_eq!(config.providers.models.openai.len(), 2);
+        assert_eq!(config.providers.models.canonical_models.len(), 2);
         assert!(
             config
                 .providers

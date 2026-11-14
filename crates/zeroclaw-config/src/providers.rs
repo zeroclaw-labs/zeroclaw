@@ -553,17 +553,16 @@ impl ModelProviders {
     }
 
     /// True when `family`'s typed slot has at least one configured
-    /// alias entry. Returns `false` for unknown families.
+    /// alias entry. Runtime consumers resolve this from the admitted
+    /// connection/model registry; historical typed maps are projected before
+    /// this method is reached.
     pub fn contains_model_provider_type(&self, family: &str) -> bool {
-        macro_rules! emit_contains {
-            ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
-                match family {
-                    $( $type_str => !self.$field.is_empty(), )+
-                    _ => false,
-                }
-            };
-        }
-        for_each_model_provider_slot!(emit_contains)
+        self.canonical_models.keys().any(|reference| {
+            reference
+                .as_str()
+                .split_once('.')
+                .is_some_and(|(prefix, _)| prefix == family)
+        })
     }
 
     /// Iterate the alias keys for a given model_provider type. Returns an empty

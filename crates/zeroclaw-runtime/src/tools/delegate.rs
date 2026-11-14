@@ -924,7 +924,9 @@ impl DelegateTool {
         let mut config = self.root_config.as_deref().cloned().unwrap_or_default();
         config.providers = serde_json::from_value(serde_json::json!({"models":m})).unwrap();
         config.agents = (*self.agents).clone();
-        self.root_config = Some(Arc::new(config));
+        self.root_config = Some(Arc::new(zeroclaw_config::migration::admit_test_input(
+            &config,
+        )));
         self
     }
 

@@ -5994,7 +5994,7 @@ mod tests {
                 },
             },
         );
-        cfg
+        zeroclaw_config::migration::admit_test_input(&cfg)
     }
 
     fn direct_live_generation_config(
@@ -6051,7 +6051,7 @@ mod tests {
             hint: "fast".to_string(),
             model_ref: provider_ref,
         }];
-        cfg
+        zeroclaw_config::migration::admit_test_input(&cfg)
     }
 
     #[test]
@@ -6925,7 +6925,7 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
                 None,
             )
             .unwrap();
-            let limits_config = config.clone();
+            let limits_config = zeroclaw_config::migration::admit_test_input(&config);
             let mut agent = Agent::builder()
                 .model_runtime(rt)
                 .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
@@ -22914,9 +22914,14 @@ model_provider = "custom.primary"
                 .provider_switch_config
                 .as_ref()
                 .and_then(|switch| switch.config.as_ref())
-                .and_then(|cfg| cfg.providers.models.custom.get("old"))
-                .and_then(|provider| provider.base.model.as_deref()),
-            Some("old-model"),
+                .and_then(|cfg| cfg.provider_registry().ok())
+                .and_then(|registry| {
+                    registry
+                        .resolve_chat(&"custom.old".into())
+                        .ok()
+                        .and_then(|model| model.upstream_model().map(str::to_owned))
+                }),
+            Some("old-model".to_string()),
             "the provider-rebuild snapshot must stay on the retained Agent's generation"
         );
 
@@ -23038,9 +23043,14 @@ model_provider = "custom.primary"
                 .provider_switch_config
                 .as_ref()
                 .and_then(|cfg| cfg.config.as_ref())
-                .and_then(|cfg| cfg.providers.models.custom.get("large"))
-                .and_then(|p| p.base.model.as_deref()),
-            Some("large-v2"),
+                .and_then(|cfg| cfg.provider_registry().ok())
+                .and_then(|registry| {
+                    registry
+                        .resolve_chat(&"custom.large".into())
+                        .ok()
+                        .and_then(|model| model.upstream_model().map(str::to_owned))
+                }),
+            Some("large-v2".to_string()),
             "the provider-rebuild snapshot must be the refreshed generation, not the \
              construction-time clone"
         );
@@ -23083,8 +23093,18 @@ model_provider = "custom.primary"
                 .provider_switch_config
                 .as_ref()
                 .and_then(|cfg| cfg.config.as_ref())
-                .and_then(|cfg| cfg.providers.models.custom.get("large"))
-                .and_then(|p| p.base.context_window),
+                .and_then(|cfg| cfg.provider_registry().ok())
+                .and_then(|registry| {
+                    registry
+                        .resolve_chat(&"custom.large".into())
+                        .ok()
+                        .and_then(|resolved| match resolved.selection.model {
+                            zeroclaw_config::provider_registry::ModelDefinition::Chat(model) => {
+                                model.metadata.context_window
+                            }
+                            _ => None,
+                        })
+                }),
             Some(8_000),
             "the provider-rebuild snapshot must follow the same published generation"
         );
@@ -25997,7 +26017,9 @@ mod capability_construction_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_live_capability_agent_switches_against_the_refreshed_config() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let live = zeroclaw_config::live::LiveConfig::new(two_provider_config(&tmp));
+        let live = zeroclaw_config::live::LiveConfig::new(
+            zeroclaw_config::migration::admit_test_input(&two_provider_config(&tmp)),
+        );
         let live_handle = live.handle();
         let providers = Arc::new(RecordingProviders::default());
         let principal = PrincipalId::for_oidc("https://issuer.example", "subject-3");
@@ -26031,8 +26053,13 @@ mod capability_construction_tests {
         // The operator retargets the switch profile; the RPC refresh
         // transaction republishes the generation.
         let (mut refreshed, previous_revision) = live_handle.snapshot_with_revision();
-        if let Some(smart) = refreshed.providers.models.openai.get_mut("smart") {
-            smart.base.model = Some("gpt-4.1".to_string());
+        if let zeroclaw_config::provider_registry::ModelDefinition::Chat(model) = refreshed
+            .providers
+            .models
+            .canonical_model_mut(&"openai.smart".into())
+            .expect("canonical smart model exists")
+        {
+            model.model = Some("gpt-4.1".into());
         }
         let refreshed_revision = live.next_revision().unwrap();
         live.publish(refreshed_revision, refreshed).unwrap();
@@ -26040,10 +26067,12 @@ mod capability_construction_tests {
         assert_eq!(revision, refreshed_revision);
         assert_ne!(revision, previous_revision);
         assert_eq!(
-            published.providers.models.openai["smart"]
-                .base
-                .model
-                .as_deref(),
+            published
+                .provider_registry()
+                .expect("published registry")
+                .resolve_chat(&"openai.smart".into())
+                .expect("published smart model")
+                .upstream_model(),
             Some("gpt-4.1")
         );
         agent.sync_config_generation();
