@@ -44,6 +44,10 @@ impl VisionOverrideProvider {
 
 #[async_trait]
 impl ModelProvider for VisionOverrideProvider {
+    fn supports_forced_tool_choice(&self, model: &str) -> bool {
+        self.inner.supports_forced_tool_choice(model)
+    }
+
     fn supports_exact_request_replay(&self, request: ChatRequest<'_>, model: &str) -> bool {
         self.inner.supports_exact_request_replay(request, model)
     }
@@ -398,6 +402,9 @@ mod tests {
 
     #[async_trait]
     impl ModelProvider for ModelAwareCapabilityFake {
+        fn supports_forced_tool_choice(&self, model: &str) -> bool {
+            model == "routed-model"
+        }
         fn supports_exact_request_replay(&self, request: ChatRequest<'_>, model: &str) -> bool {
             model == "routed-model" && request.tools.is_none()
         }
@@ -428,6 +435,9 @@ mod tests {
     #[test]
     fn vision_override_preserves_model_aware_tool_capabilities() {
         let wrapped = VisionOverrideProvider::new(Box::new(ModelAwareCapabilityFake), false);
+
+        assert!(wrapped.supports_forced_tool_choice("routed-model"));
+        assert!(!wrapped.supports_forced_tool_choice("other-model"));
 
         let capabilities = wrapped.capabilities_for_model("routed-model");
         assert!(

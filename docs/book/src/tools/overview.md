@@ -219,6 +219,11 @@ Register via the runtime's tool factory. See [Developing → Plugin protocol](..
 
 ## Describing tools to the model
 
+The memory consolidator also uses an internal
+[`extract_consolidation` envelope](../architecture/memory-payload-lifecycle.md#consolidation-extraction).
+It validates structured output without registering or executing a tool action.
+It does not enter the ordinary approval, execution, or receipt lifecycle.
+
 Tool descriptions are [Mozilla Fluent](https://projectfluent.org/) strings: one per tool, localised per locale. This keeps tool descriptions terse in the model's context window while allowing UI localisation.
 
 Source of truth: `crates/zeroclaw-runtime/locales/en/tools.ftl`. Translations are generated and maintained via `cargo fluent fill --locale <code>` (see [Maintainers → Docs & Translations](../maintainers/docs-and-translations.md)).

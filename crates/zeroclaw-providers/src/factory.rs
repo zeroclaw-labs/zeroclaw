@@ -2774,6 +2774,30 @@ mod tests {
     }
 
     #[test]
+    fn forced_tool_choice_is_limited_to_verified_anthropic_routes() {
+        let opts = ModelProviderRuntimeOptions::default();
+        let config = AnthropicModelProviderConfig::default();
+        let official = config
+            .create_provider("test", Some("test-key"), None, &opts)
+            .unwrap();
+        assert!(official.supports_forced_tool_choice("claude-sonnet-4-6"));
+        let custom = config
+            .create_provider(
+                "test",
+                Some("test-key"),
+                Some("https://custom.example"),
+                &opts,
+            )
+            .unwrap();
+        assert!(!custom.supports_forced_tool_choice("claude-sonnet-4-6"));
+        let openai = OpenAIModelProviderConfig::default()
+            .create_provider("test", Some("test-key"), None, &opts)
+            .unwrap();
+        assert!(openai.supports_native_tools());
+        assert!(!openai.supports_forced_tool_choice("gpt-4o"));
+    }
+
+    #[test]
     fn openai_factory_defaults_new_provider_to_responses_wire() {
         // Creating a new OpenAI provider slot (create_map_key / ensure) uses
         // OpenAIModelProviderConfig::default(), which must select responses.
