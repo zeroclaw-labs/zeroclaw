@@ -11101,6 +11101,12 @@ impl RpcDispatcher {
             Ok(req) => req,
             Err(err) => return Box::pin(std::future::ready(Err(err))),
         };
+        if matches!(
+            req.path.as_str(),
+            "connections" | "models" | "model_presets" | "fallback"
+        ) {
+            return self.handle_config_registry_key_rename(req);
+        }
         if let Err(error) = zeroclaw_config::schema::reject_retired_provider_edit_path(
             &self.ctx.config.read(),
             &req.path,
@@ -11233,6 +11239,57 @@ impl RpcDispatcher {
                 to: req.to,
                 renamed,
                 rewritten: usize::from(renamed) * 2,
+                warnings: Vec::new(),
+            })
+        })
+    }
+
+    fn handle_config_registry_key_rename<'a>(
+        &'a self,
+        req: ConfigMapKeyRenameParams,
+    ) -> BoxRpcFuture<'a> {
+        Box::pin(async move {
+            use zeroclaw_config::provider_registry::editor;
+
+            self.selector_config_write(Method::ConfigMapKeyRename, "providers")?;
+            let config_commit = self
+                .ctx
+                .begin_config_commit()
+                .await
+                .map_err(config_commit_admission_error)?;
+            self.recheck_config_write_authority(
+                Method::ConfigMapKeyRename,
+                Some("providers"),
+                &config_commit,
+            )?;
+
+            let mut working = config_commit.current_config();
+            editor::rename_entry(&mut working, &req.path, &req.from, &req.to)
+                .map_err(|error| rpc_err(INVALID_PARAMS, format!("{error:#}")))?;
+            let scope = match req.path.as_str() {
+                // Canonical model references can contain dots, so the
+                // registry editor remains the authority for the cascade and
+                // the live refresh uses prefix-aware model-reference logic.
+                "models" => LiveSessionRefreshScope::ProviderAliasRename {
+                    old_ref: req.from.clone(),
+                    new_ref: req.to.clone(),
+                },
+                _ => LiveSessionRefreshScope::SharedConstruction,
+            };
+            let _revision = self
+                .commit_config_with_live_session_refresh(
+                    working,
+                    config_commit,
+                    &scope,
+                    RpcConfigCommitEffects::default(),
+                )
+                .await?;
+            to_result(ConfigMapKeyRenameResult {
+                path: req.path,
+                from: req.from,
+                to: req.to,
+                renamed: true,
+                rewritten: 1,
                 warnings: Vec::new(),
             })
         })
@@ -33321,7 +33378,7 @@ mod tests {
         use zeroclaw_infra::session_queue::SessionActorQueue;
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
-        let ctx = RpcContext::minimal(config, Arc::clone(&sessions));
+        let ctx = RpcContext::minimal_raw(config, Arc::clone(&sessions));
         let mut ctx = Arc::try_unwrap(ctx)
             .ok()
             .expect("minimal test context should be uniquely owned");
@@ -33343,7 +33400,7 @@ mod tests {
 
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
-        let ctx = RpcContext::minimal(config, Arc::clone(&sessions));
+        let ctx = RpcContext::minimal_raw(config, Arc::clone(&sessions));
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-stack:pid=1".into());
         dispatcher.set_authenticated_for_test();
@@ -40719,7 +40776,7 @@ mod tests {
         use zeroclaw_infra::session_queue::SessionActorQueue;
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
-        let mut ctx_inner = Arc::try_unwrap(RpcContext::minimal(config, Arc::clone(&sessions)))
+        let mut ctx_inner = Arc::try_unwrap(RpcContext::minimal_raw(config, Arc::clone(&sessions)))
             .unwrap_or_else(|_| panic!("freshly constructed ctx must be uniquely owned"));
         ctx_inner.config_commit_pause = Some(pause);
         let ctx = Arc::new(ctx_inner);
@@ -40738,7 +40795,8 @@ mod tests {
         first: &RpcContext,
         config: zeroclaw_config::schema::Config,
     ) -> RpcDispatcher {
-        let config = zeroclaw_config::migration::admit_test_input(&config);
+        let mut config = config;
+        zeroclaw_config::migration::normalize_test_input(&mut config);
         let authority =
             crate::LiveConfigAuthority::for_tests_sharing_writer(config, &first.config_authority);
         let ctx = RpcContext::for_authority(&authority, Arc::clone(&first.sessions));
@@ -43027,9 +43085,9 @@ mod tests {
 
         dispatcher
             .handle_config_map_key_rename(&json!({
-                "path": "providers.models.openai",
-                "from": "tool_provider",
-                "to": "tool_renamed"
+                "path": "models",
+                "from": "openai.tool_provider",
+                "to": "openai.tool_renamed"
             }))
             .await
             .expect("renaming an in-turn selected provider must rebuild its binding");
@@ -44868,9 +44926,9 @@ model = "before"
         // rule and is only reachable through the direct `ensure` constructor.
         let res = dispatcher
             .handle_config_map_key_rename(&json!({
-                "path": "providers.models.openai",
-                "from": "test-provider",
-                "to": "renamed_provider"
+                "path": "models",
+                "from": "openai.test-provider",
+                "to": "openai.renamed_provider"
             }))
             .await;
         assert!(res.is_ok(), "provider alias rename must succeed: {res:?}");
@@ -44944,9 +45002,9 @@ model = "before"
         // Rename the alias the override points at.
         dispatcher
             .handle_config_map_key_rename(&json!({
-                "path": "providers.models.openai",
-                "from": "pinned_provider",
-                "to": "pinned_renamed"
+                "path": "models",
+                "from": "openai.pinned_provider",
+                "to": "openai.pinned_renamed"
             }))
             .await
             .expect("provider alias rename must succeed for an override-pinned session");
@@ -44995,29 +45053,29 @@ model = "before"
     }
 
     #[tokio::test]
-    async fn provider_alias_rename_preserves_nested_selection_in_live_and_saved_refs() {
+    async fn canonical_nested_model_rename_preserves_live_and_saved_refs() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = make_model_refresh_test_config(&tmp);
-        let profile = config
-            .providers
-            .models
-            .ensure("openai", "nested_provider")
-            .expect("nested provider slot exists");
-        profile.api_key = Some("nested-key".into());
-        profile.uri = Some("http://127.0.0.1:1".into());
-        profile.models.insert(
-            "fast".into(),
-            zeroclaw_config::schema::ModelEntryConfig {
-                id: Some("nested-fast-model".into()),
-                ..Default::default()
-            },
-        );
+        config.providers = toml::from_str(
+            r#"
+[connections."gateway.test"]
+kind = "custom"
+uri = "http://127.0.0.1:1/v1"
+auth = { mode = "api_key", api_key = "nested-key" }
+[models."openai.nested_provider.fast"]
+capability = "chat"
+provider = "gateway.test"
+model = "nested-fast-model"
+"#,
+        )
+        .expect("canonical nested model fixture");
         config
             .agents
             .get_mut("test-agent")
             .expect("test agent exists")
             .model_provider = "openai.nested_provider.fast".into();
 
+        let config = zeroclaw_config::migration::admit_test_input(&config);
         let dispatcher = make_config_set_test_dispatcher(config);
         let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
         dispatcher
@@ -45030,9 +45088,9 @@ model = "before"
 
         dispatcher
             .handle_config_map_key_rename(&json!({
-                "path": "providers.models.openai",
-                "from": "nested_provider",
-                "to": "nested_renamed"
+                "path": "models",
+                "from": "openai.nested_provider.fast",
+                "to": "openai.nested_renamed.fast"
             }))
             .await
             .expect("provider alias rename must preserve the nested selection");
@@ -45107,9 +45165,14 @@ model = "before"
             model_name_for_session(&dispatcher, &session_id).await,
             "default-model"
         );
-        dispatcher.handle_config_map_key_rename(&json!({
-            "path": "providers.models.openai.test-provider.models", "from": "default", "to": "other"
-        })).await.unwrap();
+        dispatcher
+            .handle_config_map_key_rename(&json!({
+                "path": "models",
+                "from": "openai.test-provider.default",
+                "to": "openai.test-provider.other"
+            }))
+            .await
+            .unwrap();
         assert_eq!(
             model_name_for_session(&dispatcher, &session_id).await,
             "old-model"
@@ -45265,9 +45328,9 @@ options = { temperature = 0.2 }
 
         dispatcher
             .handle_config_map_key_rename(&json!({
-                "path": "providers.models.openai.test-provider.models",
-                "from": "fast",
-                "to": "quick"
+                "path": "models",
+                "from": "openai.test-provider.fast",
+                "to": "openai.test-provider.quick"
             }))
             .await
             .expect("nested model rename must refresh live sessions");

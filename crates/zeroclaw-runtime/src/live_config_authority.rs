@@ -58,6 +58,14 @@ impl LiveConfigAuthority {
     /// production.
     #[cfg(test)]
     pub(crate) fn for_tests(config: Config) -> Self {
+        Self::new(config)
+    }
+
+    /// Test-only authority retaining historical typed input for RPC property
+    /// edit fixtures. Canonical production-like test authorities use
+    /// [`Self::for_tests`] above.
+    #[cfg(test)]
+    pub(crate) fn for_tests_raw(config: Config) -> Self {
         Self {
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             live: LiveConfig::new_raw_for_tests(config),
@@ -74,7 +82,7 @@ impl LiveConfigAuthority {
     pub(crate) fn for_tests_sharing_writer(config: Config, writer: &Self) -> Self {
         Self {
             config_write_lock: Arc::clone(&writer.config_write_lock),
-            live: LiveConfig::new_raw_for_tests(config),
+            live: LiveConfig::new(config),
             agent_lifecycle: AgentLifecycleCoordinator::default(),
             application_results: Arc::default(),
         }
