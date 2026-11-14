@@ -3092,81 +3092,8 @@ pub fn normalize_test_input(config: &mut Config) {
 /// mutable while exercising canonical consumers. Preserve non-serialized state.
 #[cfg(any(test, feature = "test-helpers"))]
 pub fn try_admit_test_input(input: &Config) -> Result<Config> {
-    // Keep the historical typed maps available to fixture code that performs
-    // a second edit before admitting the next candidate. They are still only
-    // input data: canonical consumers resolve the registry below, and a
-    // subsequent admission re-projects any edits into that registry.
-    let source_models = input.providers.models.clone();
-    let source_tts = input.providers.tts.clone();
-    let source_transcription = input.providers.transcription.clone();
     let mut config = input.clone();
-
-    // A fixture may mutate a legacy family map after an earlier admission
-    // (for example a test toggling live_pricing).  Drop only the canonical
-    // rows that the previous admission generated from those family maps;
-    // explicit registry entries remain authoritative.  This keeps the
-    // admission helper a real input boundary without making the production
-    // registry getter reinterpret legacy state on every read.
-    let mut generated_connections = std::collections::BTreeSet::new();
-    let mut generated_models = std::collections::BTreeSet::new();
-    for (family, alias, profile) in source_models.iter_entries() {
-        generated_connections.insert(crate::provider_registry::ProviderId::from(format!(
-            "legacy.{family}.{alias}"
-        )));
-        generated_models.insert(crate::provider_registry::ModelRef::from(format!(
-            "{family}.{alias}"
-        )));
-        generated_models.extend(profile.models.keys().map(|model_alias| {
-            crate::provider_registry::ModelRef::from(format!("{family}.{alias}.{model_alias}"))
-        }));
-    }
-    for (family, alias, _) in source_tts.iter_entries() {
-        generated_connections.insert(crate::provider_registry::ProviderId::from(format!(
-            "legacy.tts.{family}.{alias}"
-        )));
-        generated_models.insert(crate::provider_registry::ModelRef::from(format!(
-            "tts.{family}.{alias}"
-        )));
-        generated_models.insert(crate::provider_registry::ModelRef::from(format!(
-            "{family}.{alias}"
-        )));
-    }
-    for (family, alias, _) in source_transcription.iter_entries() {
-        generated_connections.insert(crate::provider_registry::ProviderId::from(format!(
-            "legacy.asr.{family}.{alias}"
-        )));
-        generated_models.insert(crate::provider_registry::ModelRef::from(format!(
-            "asr.{family}.{alias}"
-        )));
-        generated_models.insert(crate::provider_registry::ModelRef::from(format!(
-            "{family}.{alias}"
-        )));
-    }
-    config
-        .providers
-        .connections
-        .retain(|id, _| !generated_connections.contains(id));
-    config
-        .providers
-        .models
-        .canonical_models
-        .retain(|reference, model| {
-            !(generated_connections.contains(model.provider())
-                && generated_models.contains(reference))
-        });
-
     provider_inputs::normalize_for_test(&mut config)?;
-    if source_models.iter_entries().next().is_some() {
-        let canonical_models = config.providers.models.canonical_models.clone();
-        config.providers.models = source_models;
-        config.providers.models.canonical_models = canonical_models;
-    }
-    if source_tts.iter_entries().next().is_some() {
-        config.providers.tts = source_tts;
-    }
-    if source_transcription.iter_entries().next().is_some() {
-        config.providers.transcription = source_transcription;
-    }
     Ok(config)
 }
 
