@@ -563,6 +563,7 @@ impl ScopedToolRegistry {
             Default::default(),
             None,
             None,
+            None,
         )
     }
 }
