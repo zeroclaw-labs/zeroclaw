@@ -379,6 +379,39 @@ mod tests {
     }
 
     #[test]
+    fn migration_preserves_unicode_message_and_structured_payload_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("trace.jsonl");
+        let message = "  问题🦀\n\"quoted\" e\u{301}\r\n";
+        let payload = serde_json::json!({
+            "嵌套": { "values": [null, true, "回答\nsecond line"] },
+            "literal": "{\"event_type\":\"quoted\"}"
+        });
+        let legacy = serde_json::json!({
+            "id": "unicode-migration",
+            "timestamp": "2026-05-15T19:00:00Z",
+            "event_type": "llm_response",
+            "success": true,
+            "message": message,
+            "payload": payload
+        });
+        write_jsonl(&path, &[&legacy.to_string()]);
+
+        migrate_legacy_jsonl_in_place(&path).unwrap();
+
+        let migrated = fs::read(&path).unwrap();
+        assert_eq!(migrated.iter().filter(|&&byte| byte == b'\n').count(), 1);
+        let row: Value = serde_json::from_slice(&migrated).unwrap();
+        assert_eq!(row["message"], message);
+        assert_eq!(row["attributes"], payload);
+        assert_eq!(row["@timestamp"], "2026-05-15T19:00:00Z");
+        assert_eq!(row["schema_version"], LogEvent::SCHEMA_VERSION);
+
+        migrate_legacy_jsonl_in_place(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), migrated);
+    }
+
+    #[test]
     fn already_current_is_noop() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("trace.jsonl");
