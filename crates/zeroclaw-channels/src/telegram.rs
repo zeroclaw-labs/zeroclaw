@@ -5640,7 +5640,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
     /// Attempt to parse a Telegram update as a voice message and transcribe it.
     /// Returns `SkipPermanent` if the message is not a voice message, transcription is
-    /// disabled, or the message exceeds duration limits; `RetryTransient` if download or
+    /// disabled, the message exceeds duration limits, or no transcription provider is
+    /// resolvable for the owning agent (neither `transcription_provider` nor a
+    /// `[transcription].default_provider` fallback); `RetryTransient` if download or
     /// transcription I/O fails.
     ///
     /// Every permanent drop that reaches an allowed sender is announced to them
@@ -5776,7 +5778,28 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
         };
 
-        let text = match manager.transcribe(&audio_data, &file_name).await {
+        // Resolve the provider the same way `TranscriptionManager::transcribe`
+        // does — the agent's own `transcription_provider`, else the configured
+        // `[transcription].default_provider` — but skip permanently instead of
+        // retrying when nothing is resolvable.
+        let provider_alias = manager.resolved_agent_alias();
+        if provider_alias.is_empty() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "chat_id": chat_id,
+                    })),
+                "Skipping voice message: agent has no transcription_provider and no transcription default_provider is set"
+            );
+            return UpdateDisposition::SkipPermanent;
+        }
+
+        let text = match manager
+            .transcribe_with_provider(&audio_data, &file_name, provider_alias)
+            .await
+        {
             Ok(t) => t,
             Err(e) => {
                 ::zeroclaw_log::record!(
@@ -21328,7 +21351,7 @@ mod tests {
             api_key: Some(api_key),
             ..Default::default()
         };
-        let manager = crate::transcription::TranscriptionManager::new(&config)
+        let manager = crate::transcription::TranscriptionManager::new(&config, None)
             .expect("TranscriptionManager::new should succeed with valid GROQ_API_KEY");
         let transcript: String = manager
             .transcribe(&audio_data, "hello.mp3")

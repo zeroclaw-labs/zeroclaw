@@ -5703,6 +5703,12 @@ pub struct TranscriptionConfig {
     /// Enable voice transcription for channels that support it.
     #[serde(default)]
     pub enabled: bool,
+    /// Default transcription provider alias (e.g. "groq.default"). When set,
+    /// agents without their own `transcription_provider` use this alias
+    /// instead of failing; an explicit per-agent `transcription_provider`
+    /// always wins.
+    #[serde(default)]
+    pub default_provider: Option<String>,
     /// API key used for transcription requests (Groq transcription provider).
     ///
     /// Use the schema-mirror env grammar (`ZEROCLAW_transcription__api_key=...`)
@@ -5765,6 +5771,7 @@ impl Default for TranscriptionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            default_provider: None,
             api_key: None,
             api_url: default_transcription_api_url(),
             model: default_transcription_model(),
@@ -26098,11 +26105,13 @@ impl Config {
 
             // Per-agent provider refs that resolve into the typed provider
             // sections. Empty = no preference for that category (no TTS / no
-            // STT for this agent), which is valid. Non-empty values must
-            // match a configured `[providers.<category>.<type>.<alias>]`
+            // STT for this agent), which is valid — for STT,
+            // `[transcription].default_provider` is the deployment-wide
+            // fallback then. Non-empty values must match a configured
+            // `[providers.<category>.<type>.<alias>]`
             // entry, fail loud with the dangling ref otherwise.
-            // there is no global default-X-provider concept — every consumer
-            // either picks a configured alias or opts out entirely.
+            // there is no global default for the other categories — every
+            // consumer either picks a configured alias or opts out entirely.
             let typed_provider_refs: &[(&str, &str, &str)] = &[
                 ("providers.tts", "tts_provider", agent.tts_provider.trim()),
                 (
@@ -43580,6 +43589,7 @@ enabled = false
         assert!(tc.max_audio_bytes.is_none());
         assert_eq!(tc.max_duration_secs, 120);
         assert!(!tc.transcribe_non_ptt_audio);
+        assert!(tc.default_provider.is_none());
     }
 
     #[test]

@@ -9454,18 +9454,12 @@ async fn process_channel_message_body(
         // Build from legacy config; if that fails (e.g. no legacy api_key
         // but typed providers are configured), fall back to an empty shell
         // so with_typed_providers() can still populate the registry.
-        let transcription_manager = {
-            let base = crate::transcription::TranscriptionManager::new(&ctx.transcription_config)
-                .unwrap_or_else(|_| crate::transcription::TranscriptionManager::empty());
-            let m = base
-                .with_typed_providers(&ctx.prompt_config.providers.transcription)
-                .with_agent_transcription_provider(ctx.agent_transcription_provider.clone());
-            if m.available_providers().is_empty() {
-                None
-            } else {
-                Some(m)
-            }
-        };
+        let transcription_manager =
+            crate::transcription::build_media_pipeline_transcription_manager(
+                &ctx.transcription_config,
+                &ctx.prompt_config.providers.transcription,
+                &ctx.agent_transcription_provider,
+            );
         let pipeline = media_pipeline::MediaPipeline::new(
             &ctx.media_pipeline,
             transcription_manager.as_ref(),
