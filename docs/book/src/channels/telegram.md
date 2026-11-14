@@ -83,6 +83,38 @@ started and served by the resolved default enabled agent. Declare explicit
 bindings as shown above so an unlisted bot is genuinely inactive rather than
 silently running under the default agent.
 
+### Tables and rich messages
+
+Telegram HTML has no table tag. Markdown tables are sent as preformatted text
+so a grid stays together instead of being split mid-row or read as inline HTML.
+A table longer than one Telegram message continues on the next message with
+its header repeated.
+
+Set `rich_messages = true` on the channel alias to send final replies with Bot
+API `sendRichMessage`. Headings, lists, quotes, and tables then render
+natively. Some clients still show those messages as unsupported, so leave the
+flag off unless every client in use can render them.
+
+```toml
+[channels.telegram.home]
+rich_messages = true
+```
+
+Tables wider than 20 columns stay fenced as code, which is the Bot API column
+limit. A fenced table longer than one rich message continues as code: each
+piece closes the fence, and the next piece opens it again, so the text after
+the table stays outside the block. If `sendRichMessage` fails, the reply is
+sent as HTML. A retry continues after the HTML pieces Telegram already
+accepted. Draft updates while a reply is still being written stay plain text.
+
+Inbound updates that carry only `rich_message` (including a reply to one of
+those messages) are projected to GitHub-flavored markdown before the agent
+sees them. The same markdown is what the WebUI chat already renders for
+assistant messages: headings, lists, quotes, tables, and fenced code. A
+Telegram client that does not implement Bot API 10.1 still shows its own
+"message is not supported" placeholder for the native rich bubble; that
+placeholder is client-side and is not the text ZeroClaw stores.
+
 ## 3. Choose how the first users are authorized
 
 Choose one of the following paths before starting the bot.
