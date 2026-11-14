@@ -16006,27 +16006,28 @@ mod accept_error_tests {
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
         config.gateway.require_pairing = false;
-        config.providers.models.ollama.insert(
-            "priced".to_string(),
-            zeroclaw_config::schema::OllamaModelProviderConfig {
-                base: zeroclaw_config::schema::ModelProviderConfig {
-                    uri: Some("http://127.0.0.1:9".to_string()),
-                    model: Some("priced-model".to_string()),
-                    live_pricing: true,
-                    ..Default::default()
-                },
-                ..Default::default()
+        config.providers = serde_json::from_value(serde_json::json!({
+            "connections": {
+                "ollama.priced": {
+                    "kind": "ollama",
+                    "uri": "http://127.0.0.1:9",
+                    "api": {"chat": {"live_pricing": true}}
+                }
             },
-        );
-
-        // The exact property path the config API accepts for this flag, taken
-        // from the schema rather than spelled by hand.
-        let live_pricing_path = config
-            .prop_fields()
-            .into_iter()
-            .map(|field| field.name)
-            .find(|name| name.contains(".priced.") && name.contains("live"))
-            .expect("the schema exposes the provider's live-pricing flag");
+            "models": {
+                "ollama.priced": {
+                    "capability": "chat",
+                    "provider": "ollama.priced",
+                    "model": "priced-model"
+                }
+            }
+        }))
+        .expect("canonical pricing fixture deserializes");
+        let expected = zeroclaw_config::provider_registry::editor::snapshot(&config)
+            .expect("canonical pricing fixture snapshots");
+        let mut registry = expected.clone();
+        registry["connections"]["ollama.priced"]["api"]["chat"]["live_pricing"] =
+            serde_json::json!(false);
 
         let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
         let addr_tx = std::sync::Mutex::new(Some(addr_tx));
@@ -16062,12 +16063,12 @@ mod accept_error_tests {
         );
 
         let body = serde_json::json!({
-            "path": live_pricing_path,
-            "value": false,
+            "expected": expected,
+            "registry": registry,
         })
         .to_string();
         let request = format!(
-            "PUT /api/config/prop HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+            "PUT /api/config/provider-registry HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
              Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );

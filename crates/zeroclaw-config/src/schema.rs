@@ -30456,8 +30456,8 @@ mod tests {
 
     #[::core::prelude::v1::test]
     fn context_limits_follow_selected_provider_alias_and_model() {
-        let mut cfg = Config::default();
-        cfg.providers = serde_json::from_value(serde_json::json!({
+        let mut cfg = Config {
+            providers: serde_json::from_value(serde_json::json!({
             "connections": {"gateway": {"kind": "custom", "uri": "https://example.invalid/v1"}},
             "models": {
                 "custom.large": {"capability": "chat", "provider": "gateway", "model": "large-model", "metadata": {"context_window": 200_000}},
@@ -30466,7 +30466,9 @@ mod tests {
                 "custom.multi": {"capability": "chat", "provider": "gateway", "model": "legacy-model", "metadata": {"context_window": 100_000}},
                 "custom.multi.fast": {"capability": "chat", "provider": "gateway", "model": "nested-fast-model", "metadata": {"context_window": 16_000}}
             }
-        })).unwrap();
+            })).unwrap(),
+            ..Config::default()
+        };
         cfg.runtime_profiles.insert(
             "ratio".to_string(),
             RuntimeProfileConfig {
@@ -30540,11 +30542,13 @@ mod tests {
     /// `usize` cannot express.
     #[::core::prelude::v1::test]
     fn configured_context_window_reports_unset_distinctly_from_the_fallback() {
-        let mut cfg = super::Config::default();
-        cfg.providers = serde_json::from_value(serde_json::json!({
+        let mut cfg = super::Config {
+            providers: serde_json::from_value(serde_json::json!({
             "connections": {"local": {"kind": "ollama"}},
             "models": {"ollama.local": {"capability": "chat", "provider": "local", "model": "qwen3"}}
-        })).unwrap();
+            })).unwrap(),
+            ..Default::default()
+        };
         cfg.agents.insert(
             "coder".to_string(),
             super::AliasedAgentConfig {

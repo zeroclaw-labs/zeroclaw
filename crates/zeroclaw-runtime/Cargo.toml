@@ -149,7 +149,10 @@ sandbox-bubblewrap = []
 # zeroclaw-channels and zeroclaw-gateway). Off by default and never enabled by
 # any production dependency edge, so these helpers are absent from shipped
 # builds.
-test-util = []
+test-util = [
+    "zeroclaw-config/test-helpers",
+    "zeroclaw-providers/test-helpers",
+]
 
 [dev-dependencies]
 opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "logs"] }
