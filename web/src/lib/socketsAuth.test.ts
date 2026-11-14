@@ -112,12 +112,12 @@ beforeEach(() => {
 // WebSocket
 // ---------------------------------------------------------------------------
 
-test("pairing mode puts the token on the chat socket, as before", () => {
+test("pairing mode authenticates by subprotocol without a token in the URL", () => {
   auth.setToken("tok");
   const client = newClient();
   client.connect();
   const socket = lastSocket();
-  assert.match(socket.url, /[?&]token=tok(&|$)/);
+  assert.doesNotMatch(socket.url, /[?&]token=/);
   assert.deepEqual(socket.protocols, ["zeroclaw.v1", "bearer.tok"]);
   client.disconnect();
 });

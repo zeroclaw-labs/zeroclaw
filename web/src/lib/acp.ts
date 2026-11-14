@@ -121,11 +121,7 @@ export class AcpWebSocketClient {
     }
 
     const token = getToken();
-    const params = new URLSearchParams();
-    if (token) params.set('token', token);
-
-    const query = params.toString();
-    const url = `${acpWebSocketBaseUrl()}${basePath}/acp${query ? `?${query}` : ''}`;
+    const url = `${acpWebSocketBaseUrl()}${basePath}/acp`;
     const protocols = token ? [ACP_PROTOCOL, `bearer.${token}`] : [ACP_PROTOCOL];
 
     this.ws = new WebSocket(url, protocols);
