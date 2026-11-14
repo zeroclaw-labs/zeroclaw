@@ -4001,6 +4001,65 @@ impl TelegramChannel {
             .clone()
     }
 
+    /// `channels.telegram.<alias>.owner_chat_id`, resolved live from the
+    /// shared config handle at send time — the same staleness contract as
+    /// [`Self::configured_unauthorized_message`]. Blank values behave as
+    /// unset so a config that once carried an ID and was emptied does not
+    /// keep notifying.
+    fn configured_owner_chat(&self) -> Option<String> {
+        self.persist
+            .as_ref()?
+            .live_handle()
+            .read()
+            .channels
+            .telegram
+            .get(&self.alias)?
+            .owner_chat_id
+            .clone()
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+    }
+
+    /// Bounded single-line preview of the turned-away message for the owner
+    /// notice: caption-aware like every other text read here, whitespace
+    /// collapsed, `PREVIEW_MAX_CHARS` cap with an ellipsis. Non-text
+    /// payloads (voice, bare attachments) preview as an empty string — the
+    /// owner notice still names the sender and the source chat.
+    fn unauthorized_preview(message: &serde_json::Value) -> String {
+        const PREVIEW_MAX_CHARS: usize = 160;
+        let text = message
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| message.get("caption").and_then(serde_json::Value::as_str))
+            .unwrap_or_default();
+        let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut preview: String = collapsed.chars().take(PREVIEW_MAX_CHARS).collect();
+        if collapsed.chars().count() > PREVIEW_MAX_CHARS {
+            preview.push('…');
+        }
+        preview
+    }
+
+    /// Compose the operator-facing heads-up for a turned-away sender.
+    fn unauthorized_owner_notice(
+        identity: &str,
+        chat_id: &str,
+        preview: &str,
+        bind_command: &str,
+        alias: &str,
+    ) -> String {
+        i18n::get_required_cli_string_with_args(
+            "channel-telegram-unauthorized-owner-notice",
+            &[
+                ("identity", identity),
+                ("chat", chat_id),
+                ("preview", preview),
+                ("bindCommand", bind_command),
+                ("alias", alias),
+            ],
+        )
+    }
+
     /// Compose the notice an unauthorized sender receives.
     ///
     /// A blank `custom` falls back to the built-in copy, which has two
@@ -5053,6 +5112,72 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     &chat_id,
                 )
                 .await;
+        }
+
+        // Owner heads-up: the public stub reaches the sender, but in a group
+        // it is all bystanders see, and without this the operator learns
+        // about unapproved callers only from the logs. Skipped when the
+        // owner chat is the sender's own chat — the public notice already
+        // went there, and echoing it back would just double every attempt.
+        if let Some(owner_chat) = self.configured_owner_chat()
+            && owner_chat != chat_id
+        {
+            let owner_notice = Self::unauthorized_owner_notice(
+                &suggested_identity,
+                &chat_id,
+                &Self::unauthorized_preview(message),
+                &bind_command,
+                &self.alias,
+            );
+            let delivery = Self::deliver_owner_notice(
+                self.http_client(),
+                self.api_url("sendMessage"),
+                self.alias.clone(),
+                owner_notice,
+                owner_chat,
+            );
+            #[cfg(test)]
+            {
+                // Tests drive the handler directly and assert against the
+                // mock server; completing inline keeps that deterministic.
+                delivery.await;
+            }
+            #[cfg(not(test))]
+            let _delivery_task = ::zeroclaw_spawn::spawn!(delivery);
+        }
+    }
+
+    /// Deliver the owner heads-up off the serial inbound loop.
+    ///
+    /// Telegram answers a flood-limit `sendMessage` with a `retry_after` of
+    /// up to [`TELEGRAM_MAX_INLINE_RETRY_AFTER`] per retry, and honoring that
+    /// inline would freeze every later update — including authorized messages
+    /// from unrelated chats. The future owns its state (client, URL, copies)
+    /// so the caller can hand it to a bounded background task; the flood-limit
+    /// waits then happen off the inbound loop. Delivery failure is logged as
+    /// a failure event — never silently dropped — and never re-fires the
+    /// public stub, which already reached the sender.
+    async fn deliver_owner_notice(
+        http: reqwest::Client,
+        send_url: String,
+        alias: String,
+        notice: String,
+        owner_chat: String,
+    ) {
+        if let Err(err) =
+            Self::post_text_chunks(&http, &send_url, &notice, &owner_chat, None, 0).await
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "alias": alias,
+                        "owner_chat": owner_chat,
+                        "error": err.to_string(),
+                    })),
+                "Telegram owner notice delivery failed; owner was not notified"
+            );
         }
     }
 
@@ -6360,6 +6485,32 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         thread_id: Option<&str>,
         skip_chunks: usize,
     ) -> Result<usize, SendChunksError> {
+        Self::post_text_chunks(
+            &self.http_client(),
+            &self.api_url("sendMessage"),
+            message,
+            chat_id,
+            thread_id,
+            skip_chunks,
+        )
+        .await
+    }
+
+    /// Chunked `sendMessage` posting against an explicit client and URL.
+    ///
+    /// Extracted from [`Self::send_text_chunks`] so a caller that cannot
+    /// borrow the channel across an `await` — the background owner-notice
+    /// delivery — can own its state and still reuse the exact chunking,
+    /// formatting, and flood-limit honoring of every other text send.
+    #[allow(clippy::too_many_arguments)]
+    async fn post_text_chunks(
+        http: &reqwest::Client,
+        send_url: &str,
+        message: &str,
+        chat_id: &str,
+        thread_id: Option<&str>,
+        skip_chunks: usize,
+    ) -> Result<usize, SendChunksError> {
         let chunks = split_message_for_telegram(message);
 
         for (index, chunk) in chunks.iter().enumerate() {
@@ -6380,31 +6531,31 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 markdown_body["message_thread_id"] = serde_json::Value::String(tid.to_string());
             }
 
-            let (markdown_status, markdown_err) = match self
-                .send_message_honoring_rate_limit(&markdown_body)
-                .await
-                .map_err(|e| SendChunksError {
-                    delivered: index,
-                    rate_limited: false,
-                    source: e.into(),
-                })? {
-                SendMessageAttempt::Sent => {
-                    if index < chunks.len() - 1 {
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
-                    continue;
-                }
-                SendMessageAttempt::RateLimited { status, body } => {
-                    return Err(SendChunksError {
+            let (markdown_status, markdown_err) =
+                match Self::post_message_honoring_rate_limit(http, send_url, &markdown_body)
+                    .await
+                    .map_err(|e| SendChunksError {
                         delivered: index,
-                        rate_limited: true,
-                        source: anyhow::Error::msg(format!(
-                            "Telegram sendMessage rate limited ({status}): {body}"
-                        )),
-                    });
-                }
-                SendMessageAttempt::Failed { status, body } => (status, body),
-            };
+                        rate_limited: false,
+                        source: e.into(),
+                    })? {
+                    SendMessageAttempt::Sent => {
+                        if index < chunks.len() - 1 {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        continue;
+                    }
+                    SendMessageAttempt::RateLimited { status, body } => {
+                        return Err(SendChunksError {
+                            delivered: index,
+                            rate_limited: true,
+                            source: anyhow::Error::msg(format!(
+                                "Telegram sendMessage rate limited ({status}): {body}"
+                            )),
+                        });
+                    }
+                    SendMessageAttempt::Failed { status, body } => (status, body),
+                };
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -6422,8 +6573,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             if let Some(tid) = thread_id {
                 plain_body["message_thread_id"] = serde_json::Value::String(tid.to_string());
             }
-            match self
-                .send_message_honoring_rate_limit(&plain_body)
+            match Self::post_message_honoring_rate_limit(http, send_url, &plain_body)
                 .await
                 .map_err(|e| SendChunksError {
                     delivered: index,
@@ -6469,18 +6619,14 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// `retry_after` (up to [`TELEGRAM_MAX_INLINE_RETRY_AFTER`]) and resends the
     /// same body, at most [`TELEGRAM_RATE_LIMIT_RETRIES`] times, so a flood
     /// limit is never answered with immediate extra requests.
-    async fn send_message_honoring_rate_limit(
-        &self,
+    async fn post_message_honoring_rate_limit(
+        http: &reqwest::Client,
+        send_url: &str,
         body: &serde_json::Value,
     ) -> Result<SendMessageAttempt, reqwest::Error> {
         let mut retries = 0;
         loop {
-            let resp = self
-                .http_client()
-                .post(self.api_url("sendMessage"))
-                .json(body)
-                .send()
-                .await?;
+            let resp = http.post(send_url).json(body).send().await?;
             let status = resp.status();
             if status.is_success() {
                 return Ok(SendMessageAttempt::Sent);
@@ -9262,6 +9408,7 @@ mod tests {
         config.channels.telegram.insert(
             alias.to_string(),
             TelegramConfig {
+                owner_chat_id: None,
                 bot_token: "fake-token".into(),
                 multi_message_delay_ms,
                 ..TelegramConfig::default()
@@ -16386,6 +16533,158 @@ mod tests {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
         assert_eq!(sent_text, "Ask support to authorize 100050.");
+    }
+
+    /// Every `sendMessage` the unauthorized path emitted, as ordered
+    /// (chat_id, text) pairs — the owner-notice tests assert on the
+    /// recipient as well as the copy, since a notice to the wrong chat is
+    /// a notice lost.
+    async fn sent_chat_text_pairs(mock_server: &wiremock::MockServer) -> Vec<(String, String)> {
+        mock_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|request| request.url.path().ends_with("/sendMessage"))
+            .filter_map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).ok())
+            .map(|body| {
+                (
+                    body.get("chat_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    body.get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+            })
+            .collect()
+    }
+
+    async fn unauthorized_with_owner_chat(owner_chat_id: Option<&str>) -> Vec<(String, String)> {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok": true, "result": {}})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.telegram.insert(
+            "telegram_test_alias".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                owner_chat_id: owner_chat_id.map(str::to_string),
+                ..Default::default()
+            },
+        );
+
+        let ch = TelegramChannel::new(
+            "test-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["zeroclaw_user".to_string()]),
+            false,
+        )
+        .with_api_base(mock_server.uri())
+        .with_persistence_authority(LiveConfigAuthority::new(config));
+
+        ch.handle_unauthorized_message(&telegram_text_update(
+            7_000,
+            50,
+            3_030,
+            "zeroclaw_unauthorized",
+            "hello there",
+        ))
+        .await;
+
+        sent_chat_text_pairs(&mock_server).await
+    }
+
+    #[tokio::test]
+    async fn owner_notice_reaches_configured_owner_chat() {
+        let sent = unauthorized_with_owner_chat(Some("9001")).await;
+        assert_eq!(
+            sent.len(),
+            2,
+            "expected the public stub plus the owner heads-up, got: {sent:?}"
+        );
+        assert_eq!(
+            sent[0].0, "3030",
+            "the public stub goes to the sender's chat, got: {sent:?}"
+        );
+        assert_eq!(
+            sent[1].0, "9001",
+            "the owner heads-up goes to the configured owner chat, got: {sent:?}"
+        );
+        let owner_notice = &sent[1].1;
+        for expected in [
+            "100050",
+            "3030",
+            "hello there",
+            "bind-telegram",
+            "telegram_test_alias",
+        ] {
+            assert!(
+                owner_notice.contains(expected),
+                "owner notice must carry {expected:?}, got: {owner_notice}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_notice_skipped_when_owner_chat_is_the_senders_chat() {
+        let sent = unauthorized_with_owner_chat(Some("3030")).await;
+        assert_eq!(
+            sent.len(),
+            1,
+            "echoing the stub back into the sender's own chat doubles every attempt, got: {sent:?}"
+        );
+        assert_eq!(sent[0].0, "3030");
+    }
+
+    #[tokio::test]
+    async fn owner_notice_skipped_without_owner_chat() {
+        let sent = unauthorized_with_owner_chat(None).await;
+        assert_eq!(
+            sent.len(),
+            1,
+            "no owner_chat_id configured means no owner notification, got: {sent:?}"
+        );
+        assert_eq!(sent[0].0, "3030");
+    }
+
+    #[test]
+    fn unauthorized_preview_collapses_truncates_and_reads_captions() {
+        let long = "word ".repeat(60);
+        let preview = TelegramChannel::unauthorized_preview(&serde_json::json!({
+            "text": long
+        }));
+        assert!(
+            preview.ends_with('…'),
+            "an over-long preview must end with an ellipsis, got: {preview:?}"
+        );
+        assert!(
+            preview.chars().count() <= 161,
+            "preview must stay within the cap plus the ellipsis, got {} chars",
+            preview.chars().count()
+        );
+        assert!(!preview.contains("\n"), "preview must be single-line");
+
+        let captioned = TelegramChannel::unauthorized_preview(&serde_json::json!({
+            "caption": "look at this"
+        }));
+        assert_eq!(captioned, "look at this");
+
+        let voice = TelegramChannel::unauthorized_preview(&serde_json::json!({
+            "voice": {"file_id": "v1"}
+        }));
+        assert_eq!(voice, "", "non-text payloads preview as empty");
     }
 
     /// Every `sendMessage` body the mock server received, in order, reduced

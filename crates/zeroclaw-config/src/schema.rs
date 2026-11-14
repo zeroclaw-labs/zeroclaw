@@ -17222,6 +17222,17 @@ pub struct TelegramConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub unauthorized_message: Option<String>,
+    /// Numeric chat ID where the bot delivers a short heads-up whenever it
+    /// turns an unauthorized sender away, typically the operator's DM with
+    /// the bot. The notice names the sender identity and the source chat and
+    /// carries a bounded preview of the turned-away message plus the same
+    /// authorization hint the sender received, so the operator learns about
+    /// unapproved callers even when the public stub is all a group sees.
+    /// Unset (default): no owner notification. A value equal to the
+    /// sender's own chat is ignored: the public notice already reaches it.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub owner_chat_id: Option<String>,
     /// When `true` (default), group-chat sessions key on the sender, so
     /// distinct members of the same group (or forum topic) each get an
     /// isolated conversation context (matches the existing behavior). When
@@ -17306,6 +17317,7 @@ impl Default for TelegramConfig {
             interrupt_on_new_message: false,
             mention_only: false,
             unauthorized_message: None,
+            owner_chat_id: None,
             per_user_session: true,
             passive_group_context: false,
             ack_reactions: None,
@@ -34956,6 +34968,7 @@ auto_save = true
                 telegram: HashMap::from([(
                     "default".to_string(),
                     TelegramConfig {
+                        owner_chat_id: None,
                         enabled: true,
                         bot_token: "123:ABC".into(),
                         api_base_url: default_telegram_api_base_url(),
@@ -36996,6 +37009,7 @@ default_temperature = 0.7
     #[test]
     async fn telegram_config_serde() {
         let tc = TelegramConfig {
+            owner_chat_id: None,
             enabled: true,
             bot_token: "123:XYZ".into(),
             api_base_url: default_telegram_api_base_url(),
@@ -43822,6 +43836,7 @@ high_entropy_tokens = false
         config.channels.telegram.insert(
             "default".to_string(),
             TelegramConfig {
+                owner_chat_id: None,
                 enabled: true,
                 bot_token: plaintext_token.into(),
                 api_base_url: default_telegram_api_base_url(),
