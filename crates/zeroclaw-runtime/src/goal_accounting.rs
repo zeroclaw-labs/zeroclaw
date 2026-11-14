@@ -18,8 +18,8 @@ use zeroclaw_goal::{
     accounting::{
         GoalAbandonmentSettlement, GoalAccountingFailure, GoalOperationAccounting,
         GoalOperationAccountingFactory, GoalOperationFenced, GoalOperationGuard,
-        GoalOperationRequest, GoalOperationSettlement, GoalUsageEvent, GoalUsagePrice,
-        GoalUsagePricer, combine_accounting_state,
+        GoalOperationRequest, GoalOperationSettlement, GoalUnsettledOperation, GoalUsageEvent,
+        GoalUsagePrice, GoalUsagePricer, combine_accounting_state,
     },
     task::{
         GoalBlocker, GoalBlockerKind, GoalDispatchStart, GoalPauseReason, GoalPauseState, TaskGoal,
@@ -142,24 +142,105 @@ struct AdmissionWitness {
     progress: Arc<OperationProgress>,
     abandoned: CancellationToken,
     owner: Weak<GoalOperationAccountant>,
-}
-
-struct AbandonmentFailureFence {
-    abandoned: CancellationToken,
     armed: bool,
 }
 
-impl Drop for AbandonmentFailureFence {
+/// Keeps admission ownership alive until its result is delivered or recovered.
+struct AdmissionReceipt {
+    owner: Arc<GoalOperationAccountant>,
+    permit: Option<OwnedSemaphorePermit>,
+    uncertain: bool,
+    result: Option<Result<AdmissionWitness>>,
+    delivered: bool,
+}
+
+impl AdmissionReceipt {
+    fn deliver(mut self) -> Result<AdmissionWitness> {
+        match self.result.take() {
+            Some(result) => {
+                self.delivered = true;
+                result
+            }
+            None => Err(anyhow::Error::msg(
+                "Goal accounting admission task returned no result",
+            )),
+        }
+    }
+}
+
+impl Drop for AdmissionReceipt {
     fn drop(&mut self) {
-        if self.armed {
-            self.abandoned.cancel();
+        if self.delivered {
+            return;
+        }
+        match self.result.take() {
+            // The witness must run while the receipt still owns the accountant.
+            Some(Ok(witness)) => drop(witness),
+            Some(Err(error)) if self.uncertain => self.owner.fail_admission_closed(&error),
+            None if self.uncertain => self.owner.fail_admission_closed(&anyhow::Error::msg(
+                "Goal accounting owner task did not finish",
+            )),
+            _ => {}
+        }
+    }
+}
+
+enum OwnerWork {
+    Settle(GoalOperationSettlement),
+    Recover,
+    Release,
+}
+
+/// Keeps the permit until the owner task's result is delivered or retained.
+struct OperationReceipt {
+    owner: Arc<GoalOperationAccountant>,
+    operation: AdmittedOperation,
+    disposition: GoalUnsettledOperation,
+    result: Option<Result<()>>,
+    delivered: bool,
+}
+
+impl OperationReceipt {
+    fn deliver(mut self) -> Result<()> {
+        match self.result.take() {
+            Some(result) => {
+                self.delivered = true;
+                result
+            }
+            None => Err(anyhow::Error::msg(
+                "Goal accounting owner task returned no result",
+            )),
+        }
+    }
+}
+
+impl Drop for OperationReceipt {
+    fn drop(&mut self) {
+        if self.delivered {
+            return;
+        }
+        let error = match self.result.take() {
+            Some(Ok(())) => return,
+            Some(Err(error)) => error,
+            None => anyhow::Error::msg("Goal accounting owner task did not finish"),
+        };
+        self.owner.fail_closed(self.disposition, &error);
+    }
+}
+
+impl AdmissionWitness {
+    fn disposition(&self) -> GoalUnsettledOperation {
+        if self.progress.dispatch_entered.load(Ordering::Acquire) {
+            GoalUnsettledOperation::Dispatched
+        } else {
+            GoalUnsettledOperation::NeverDispatched
         }
     }
 }
 
 impl Drop for AdmissionWitness {
     fn drop(&mut self) {
-        if self.progress.finished.load(Ordering::Acquire) {
+        if !self.armed || self.progress.finished.load(Ordering::Acquire) {
             return;
         }
         let Some(owner) = self.owner.upgrade() else {
@@ -167,44 +248,15 @@ impl Drop for AdmissionWitness {
             return;
         };
         if tokio::runtime::Handle::try_current().is_err() {
-            self.abandoned.cancel();
+            owner.fail_closed(
+                self.disposition(),
+                &anyhow::Error::msg("Goal accounting recovery has no active runtime"),
+            );
             return;
         }
-        let progress = Arc::clone(&self.progress);
-        // Construct this before spawning: even a task dropped before its first
-        // poll must wake waiters and retain the durable pending marker.
-        let fence = AbandonmentFailureFence {
-            abandoned: self.abandoned.clone(),
-            armed: true,
-        };
-        let recovery = async move {
-            let mut fence = fence;
-            let is_current = owner
-                .admitted
-                .lock()
-                .as_ref()
-                .is_some_and(|operation| Arc::ptr_eq(&operation.progress, &progress));
-            if !is_current {
-                return;
-            }
-            let result = if progress.dispatch_entered.load(Ordering::Acquire) {
-                let source = progress.abandonment.lock().take();
-                let settlement = source.map_or_else(
-                    || GoalOperationSettlement {
-                        accounting_state: GoalAccountingState::OutcomeUnknown,
-                        events: Vec::new(),
-                    },
-                    |source| source(),
-                );
-                owner.settle(settlement).await
-            } else {
-                owner.release_unstarted().await
-            };
-            if result.is_ok() {
-                fence.armed = false;
-            }
-        };
-        drop(::zeroclaw_spawn::spawn!(recovery));
+        if let Some(operation) = owner.take_operation(Some(&self.progress)) {
+            drop(owner.detach_operation(operation, OwnerWork::Recover));
+        }
     }
 }
 
@@ -219,6 +271,7 @@ struct GoalOperationAccountant {
     permit: Arc<Semaphore>,
     admitted: Mutex<Option<AdmittedOperation>>,
     abandoned: CancellationToken,
+    failure: Mutex<Option<GoalAccountingFailure>>,
     owner: Weak<Self>,
 }
 
@@ -240,8 +293,126 @@ impl GoalOperationAccountant {
             permit: Arc::new(Semaphore::new(1)),
             admitted: Mutex::new(None),
             abandoned: CancellationToken::new(),
+            failure: Mutex::new(None),
             owner,
         }
+    }
+
+    fn take_operation(
+        &self,
+        expected: Option<&Arc<OperationProgress>>,
+    ) -> Option<AdmittedOperation> {
+        let mut admitted = self.admitted.lock();
+        if expected.is_some_and(|expected| {
+            !admitted
+                .as_ref()
+                .is_some_and(|operation| Arc::ptr_eq(&operation.progress, expected))
+        }) {
+            return None;
+        }
+        let operation = admitted.take()?;
+        operation.progress.finished.store(true, Ordering::Release);
+        Some(operation)
+    }
+
+    fn fail_closed(&self, disposition: GoalUnsettledOperation, error: &anyhow::Error) {
+        let failure = if let Some(failure) = error.downcast_ref::<GoalAccountingFailure>() {
+            failure.redacted(crate::security::scrub)
+        } else {
+            GoalAccountingFailure::unsettled(
+                disposition,
+                &crate::security::scrub(&format!("{error:#}")),
+            )
+        };
+        self.retain_failure(failure);
+    }
+
+    fn fail_admission_closed(&self, error: &anyhow::Error) {
+        self.retain_failure(GoalAccountingFailure::admission_unconfirmed(
+            &crate::security::scrub(&format!("{error:#}")),
+        ));
+    }
+
+    fn retain_failure(&self, failure: GoalAccountingFailure) {
+        let mut retained = self.failure.lock();
+        if retained.is_none() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": failure.to_string()})),
+                "Goal accounting owner work failed"
+            );
+            *retained = Some(failure);
+        }
+        drop(retained);
+        self.abandoned.cancel();
+    }
+
+    fn failure_or_fallback(&self) -> GoalAccountingFailure {
+        self.failure.lock().clone().unwrap_or_else(|| {
+            GoalAccountingFailure::incomplete(GoalAccountingState::OutcomeUnknown, true)
+        })
+    }
+
+    fn detach_operation(
+        self: &Arc<Self>,
+        operation: AdmittedOperation,
+        work: OwnerWork,
+    ) -> tokio::task::JoinHandle<OperationReceipt> {
+        let disposition = match &work {
+            OwnerWork::Settle(_) => GoalUnsettledOperation::Dispatched,
+            OwnerWork::Release => GoalUnsettledOperation::NeverDispatched,
+            OwnerWork::Recover => {
+                if operation.progress.dispatch_entered.load(Ordering::Acquire) {
+                    GoalUnsettledOperation::Dispatched
+                } else {
+                    GoalUnsettledOperation::NeverDispatched
+                }
+            }
+        };
+        // The receipt exists before spawn so even an unpolled task keeps the
+        // marker fenced and wakes waiters when it is dropped.
+        let receipt = OperationReceipt {
+            owner: Arc::clone(self),
+            operation,
+            disposition,
+            result: None,
+            delivered: false,
+        };
+        ::zeroclaw_spawn::spawn!(async move {
+            let mut receipt = receipt;
+            let result = match work {
+                OwnerWork::Settle(settlement) => {
+                    receipt
+                        .owner
+                        .settle_owned(&receipt.operation, settlement)
+                        .await
+                }
+                OwnerWork::Release => receipt.owner.release_owned(&receipt.operation).await,
+                OwnerWork::Recover => match receipt.disposition {
+                    GoalUnsettledOperation::NeverDispatched => {
+                        receipt.owner.release_owned(&receipt.operation).await
+                    }
+                    GoalUnsettledOperation::Dispatched => {
+                        let source = receipt.operation.progress.abandonment.lock().take();
+                        let settlement = source.map_or_else(
+                            || GoalOperationSettlement {
+                                accounting_state: GoalAccountingState::OutcomeUnknown,
+                                events: Vec::new(),
+                            },
+                            |source| source(),
+                        );
+                        receipt
+                            .owner
+                            .settle_owned(&receipt.operation, settlement)
+                            .await
+                    }
+                },
+            };
+            receipt.result = Some(result);
+            receipt
+        })
     }
 
     async fn current_running_goal(&self) -> Result<TaskGoal> {
@@ -398,187 +569,11 @@ impl GoalOperationAccountant {
         .await
         .context("join Goal ledger settlement")?
     }
-}
-
-fn usage_warning_attributes(event: &GoalUsageEvent, error: &anyhow::Error) -> serde_json::Value {
-    serde_json::json!({
-        "provider_ref": event.provider_ref,
-        "model": event.model,
-        "error": crate::security::scrub(&format!("{error:#}")),
-    })
-}
-
-fn with_accounting_causes(error: anyhow::Error, causes: &[String]) -> anyhow::Error {
-    if causes.is_empty() {
-        error
-    } else {
-        error.context(format!(
-            "Goal usage settlement did not complete, and Goal accounting also failed: {}",
-            causes.join("; ")
-        ))
-    }
-}
-
-#[async_trait]
-impl GoalOperationAccounting for GoalOperationAccountant {
-    async fn admit(&self, request: GoalOperationRequest) -> Result<()> {
-        let acquire = Arc::clone(&self.permit).acquire_owned();
-        let permit = tokio::select! {
-            biased;
-            () = self.abandoned.cancelled() => {
-                return Err(anyhow::Error::new(GoalAccountingFailure::incomplete(
-                    GoalAccountingState::OutcomeUnknown,
-                    true,
-                )));
-            }
-            result = acquire => result.context("Goal operation permit closed")?,
-        };
-        if self.abandoned.is_cancelled() {
-            return Err(anyhow::Error::new(GoalAccountingFailure::incomplete(
-                GoalAccountingState::OutcomeUnknown,
-                true,
-            )));
-        }
-        ensure!(
-            self.admitted.lock().is_none(),
-            "Goal operation is already admitted"
-        );
-
-        let goal = self.current_running_goal().await?;
-        if goal.goal().accounting_state != GoalAccountingState::Complete {
-            return Err(anyhow::Error::new(GoalAccountingFailure::incomplete(
-                goal.goal().accounting_state,
-                false,
-            )));
-        }
-        if goal.goal().pending_call_id.is_some() || goal.goal().pending_call_epoch.is_some() {
-            return Err(anyhow::Error::new(GoalAccountingFailure::incomplete(
-                goal.goal().accounting_state,
-                true,
-            ))
-            .context("Goal already has a pending operation"));
-        }
-        let (tokens, cost, pricing_complete) = self.strict_totals().await?;
-        if goal
-            .goal()
-            .effective_token_limit
-            .is_some_and(|limit| tokens >= limit)
-            || goal
-                .goal()
-                .effective_cost_limit_usd
-                .is_some_and(|limit| cost >= limit)
-        {
-            drop(permit);
-            self.pause_budget_exhausted().await?;
-            return Err(anyhow::Error::new(GoalOperationFenced::BUDGET_EXHAUSTED));
-        }
-        let configured_route_usage = TokenUsage {
-            input_tokens: Some(1),
-            output_tokens: Some(1),
-            cached_input_tokens: Some(0),
-            cache_creation_input_tokens: Some(0),
-        };
-        let configured_route_pricing = self.pricer.price(
-            &request.model_provider,
-            &request.model,
-            &configured_route_usage,
-        )?;
-        if goal.goal().effective_cost_limit_usd.is_some()
-            && (!pricing_complete || !configured_route_pricing.pricing_available)
-        {
-            bail!("Goal cost budget lacks complete pricing for the configured route");
-        }
-
-        let operation_id = Uuid::new_v4().to_string();
-        match self
-            .registry
-            .admit_pending_operation(
-                self.scope.task_id(),
-                self.scope.session_id(),
-                self.scope.execution_epoch(),
-                &operation_id,
-            )
-            .await?
-        {
-            GoalTransitionResult::Applied => {
-                let mut admitted = self.admitted.lock();
-                debug_assert!(admitted.is_none());
-                *admitted = Some(AdmittedOperation {
-                    id: operation_id,
-                    _permit: permit,
-                    progress: Arc::new(OperationProgress::default()),
-                });
-                Ok(())
-            }
-            GoalTransitionResult::Stale | GoalTransitionResult::Missing => Err(anyhow::Error::new(
-                GoalOperationFenced::ADMISSION_FENCE_LOST,
-            )),
-        }
-    }
-
-    fn admission_guard(&self) -> Result<GoalOperationGuard> {
-        let progress = self
-            .admitted
-            .lock()
-            .as_ref()
-            .map(|operation| Arc::clone(&operation.progress))
-            .context("Goal admission guard requested without an admission")?;
-        Ok(GoalOperationGuard::new(AdmissionWitness {
-            progress,
-            abandoned: self.abandoned.clone(),
-            owner: self.owner.clone(),
-        }))
-    }
-
-    fn mark_dispatch_entered(&self) {
-        if let Some(operation) = self.admitted.lock().as_ref() {
-            operation
-                .progress
-                .dispatch_entered
-                .store(true, Ordering::Release);
-        }
-    }
-
-    fn set_abandonment_settlement(&self, source: GoalAbandonmentSettlement) {
-        if let Some(operation) = self.admitted.lock().as_ref() {
-            *operation.progress.abandonment.lock() = Some(source);
-        }
-    }
-
-    async fn quiesce(&self) {
-        tokio::select! {
-            biased;
-            () = self.abandoned.cancelled() => {}
-            _ = self.permit.acquire() => {}
-        }
-    }
-
-    async fn begin_dispatch(&self) -> Result<GoalDispatchStart> {
-        let id = self
-            .admitted
-            .lock()
-            .as_ref()
-            .map(|operation| operation.id.clone())
-            .context("Goal operation dispatch began without a matching admission")?;
-        self.registry
-            .begin_operation_dispatch(
-                self.scope.task_id(),
-                self.scope.session_id(),
-                self.scope.execution_epoch(),
-                &id,
-            )
-            .await?
-            .ok_or_else(|| anyhow::Error::new(GoalOperationFenced::ADMISSION_FENCE_LOST))
-    }
-
-    async fn settle(&self, settlement: GoalOperationSettlement) -> Result<()> {
-        let operation = {
-            let mut admitted = self.admitted.lock();
-            admitted
-                .take()
-                .context("Goal operation settled without a matching admission")?
-        };
-
+    async fn settle_owned(
+        &self,
+        operation: &AdmittedOperation,
+        settlement: GoalOperationSettlement,
+    ) -> Result<()> {
         let mut accounting_state = settlement.accounting_state;
         let mut events = Vec::with_capacity(settlement.events.len());
         let mut causes = Vec::new();
@@ -666,12 +661,7 @@ impl GoalOperationAccounting for GoalOperationAccountant {
         }
     }
 
-    async fn release_unstarted(&self) -> Result<()> {
-        let operation = self
-            .admitted
-            .lock()
-            .take()
-            .context("Goal operation released without a matching admission")?;
+    async fn release_owned(&self, operation: &AdmittedOperation) -> Result<()> {
         match self
             .registry
             .settle_pending_operation(
@@ -689,7 +679,250 @@ impl GoalOperationAccounting for GoalOperationAccountant {
             }
         }
     }
+}
 
+fn usage_warning_attributes(event: &GoalUsageEvent, error: &anyhow::Error) -> serde_json::Value {
+    serde_json::json!({
+        "provider_ref": event.provider_ref,
+        "model": event.model,
+        "error": crate::security::scrub(&format!("{error:#}")),
+    })
+}
+
+fn with_accounting_causes(error: anyhow::Error, causes: &[String]) -> anyhow::Error {
+    if causes.is_empty() {
+        error
+    } else {
+        error.context(format!(
+            "Goal usage settlement did not complete, and Goal accounting also failed: {}",
+            causes.join("; ")
+        ))
+    }
+}
+
+#[async_trait]
+impl GoalOperationAccounting for GoalOperationAccountant {
+    async fn admit(&self, request: GoalOperationRequest) -> Result<()> {
+        let acquire = Arc::clone(&self.permit).acquire_owned();
+        let permit = tokio::select! {
+            biased;
+            () = self.abandoned.cancelled() => {
+                return Err(anyhow::Error::new(self.failure_or_fallback()));
+            }
+            result = acquire => result.context("Goal operation permit closed")?,
+        };
+        if self.abandoned.is_cancelled() {
+            return Err(anyhow::Error::new(self.failure_or_fallback()));
+        }
+        ensure!(
+            self.admitted.lock().is_none(),
+            "Goal operation is already admitted"
+        );
+
+        let goal = self.current_running_goal().await?;
+        if goal.goal().accounting_state != GoalAccountingState::Complete {
+            return Err(anyhow::Error::new(GoalAccountingFailure::incomplete(
+                goal.goal().accounting_state,
+                false,
+            )));
+        }
+        if goal.goal().pending_call_id.is_some() || goal.goal().pending_call_epoch.is_some() {
+            return Err(anyhow::Error::new(GoalAccountingFailure::incomplete(
+                goal.goal().accounting_state,
+                true,
+            ))
+            .context("Goal already has a pending operation"));
+        }
+        let (tokens, cost, pricing_complete) = self.strict_totals().await?;
+        if goal
+            .goal()
+            .effective_token_limit
+            .is_some_and(|limit| tokens >= limit)
+            || goal
+                .goal()
+                .effective_cost_limit_usd
+                .is_some_and(|limit| cost >= limit)
+        {
+            drop(permit);
+            self.pause_budget_exhausted().await?;
+            return Err(anyhow::Error::new(GoalOperationFenced::BUDGET_EXHAUSTED));
+        }
+        let configured_route_usage = TokenUsage {
+            input_tokens: Some(1),
+            output_tokens: Some(1),
+            cached_input_tokens: Some(0),
+            cache_creation_input_tokens: Some(0),
+        };
+        let configured_route_pricing = self.pricer.price(
+            &request.model_provider,
+            &request.model,
+            &configured_route_usage,
+        )?;
+        if goal.goal().effective_cost_limit_usd.is_some()
+            && (!pricing_complete || !configured_route_pricing.pricing_available)
+        {
+            bail!("Goal cost budget lacks complete pricing for the configured route");
+        }
+
+        tokio::runtime::Handle::try_current().context("Goal admission has no active runtime")?;
+        let owner = self
+            .owner
+            .upgrade()
+            .context("Goal accounting owner is unavailable")?;
+        let operation_id = Uuid::new_v4().to_string();
+        let receipt = AdmissionReceipt {
+            owner,
+            permit: Some(permit),
+            uncertain: false,
+            result: None,
+            delivered: false,
+        };
+        let task = ::zeroclaw_spawn::spawn!(async move {
+            let mut receipt = receipt;
+            receipt.uncertain = true;
+            let result = receipt
+                .owner
+                .registry
+                .admit_pending_operation(
+                    receipt.owner.scope.task_id(),
+                    receipt.owner.scope.session_id(),
+                    receipt.owner.scope.execution_epoch(),
+                    &operation_id,
+                )
+                .await;
+            if result.is_ok() {
+                receipt.uncertain = false;
+            }
+            receipt.result = Some(match result {
+                Ok(GoalTransitionResult::Applied) => {
+                    let Some(permit) = receipt.permit.take() else {
+                        receipt.uncertain = true;
+                        receipt.result = Some(Err(anyhow::Error::msg(
+                            "Goal accounting admission lost its permit",
+                        )));
+                        return receipt;
+                    };
+                    let progress = Arc::new(OperationProgress::default());
+                    let mut admitted = receipt.owner.admitted.lock();
+                    debug_assert!(admitted.is_none());
+                    *admitted = Some(AdmittedOperation {
+                        id: operation_id,
+                        _permit: permit,
+                        progress: Arc::clone(&progress),
+                    });
+                    Ok(AdmissionWitness {
+                        progress,
+                        abandoned: receipt.owner.abandoned.clone(),
+                        owner: receipt.owner.owner.clone(),
+                        armed: true,
+                    })
+                }
+                Ok(GoalTransitionResult::Stale | GoalTransitionResult::Missing) => Err(
+                    anyhow::Error::new(GoalOperationFenced::ADMISSION_FENCE_LOST),
+                ),
+                Err(error) => Err(error),
+            });
+            receipt
+        });
+        let mut witness = task
+            .await
+            .context("join Goal operation admission")?
+            .deliver()?;
+        witness.armed = false;
+        Ok(())
+    }
+
+    fn admission_guard(&self) -> Result<GoalOperationGuard> {
+        let progress = self
+            .admitted
+            .lock()
+            .as_ref()
+            .map(|operation| Arc::clone(&operation.progress))
+            .context("Goal admission guard requested without an admission")?;
+        Ok(GoalOperationGuard::new(AdmissionWitness {
+            progress,
+            abandoned: self.abandoned.clone(),
+            owner: self.owner.clone(),
+            armed: true,
+        }))
+    }
+
+    fn mark_dispatch_entered(&self) {
+        if let Some(operation) = self.admitted.lock().as_ref() {
+            operation
+                .progress
+                .dispatch_entered
+                .store(true, Ordering::Release);
+        }
+    }
+
+    fn set_abandonment_settlement(&self, source: GoalAbandonmentSettlement) {
+        if let Some(operation) = self.admitted.lock().as_ref() {
+            *operation.progress.abandonment.lock() = Some(source);
+        }
+    }
+
+    async fn quiesce(&self) {
+        tokio::select! {
+            biased;
+            () = self.abandoned.cancelled() => {}
+            _ = self.permit.acquire() => {}
+        }
+    }
+
+    fn unsettled_failure(&self) -> Option<GoalAccountingFailure> {
+        self.failure.lock().clone()
+    }
+
+    async fn begin_dispatch(&self) -> Result<GoalDispatchStart> {
+        let id = self
+            .admitted
+            .lock()
+            .as_ref()
+            .map(|operation| operation.id.clone())
+            .context("Goal operation dispatch began without a matching admission")?;
+        self.registry
+            .begin_operation_dispatch(
+                self.scope.task_id(),
+                self.scope.session_id(),
+                self.scope.execution_epoch(),
+                &id,
+            )
+            .await?
+            .ok_or_else(|| anyhow::Error::new(GoalOperationFenced::ADMISSION_FENCE_LOST))
+    }
+
+    async fn settle(&self, settlement: GoalOperationSettlement) -> Result<()> {
+        tokio::runtime::Handle::try_current().context("Goal settlement has no active runtime")?;
+        let owner = self
+            .owner
+            .upgrade()
+            .context("Goal accounting owner is unavailable")?;
+        let operation = self
+            .take_operation(None)
+            .context("Goal operation settled without a matching admission")?;
+        owner
+            .detach_operation(operation, OwnerWork::Settle(settlement))
+            .await
+            .context("join Goal operation settlement")?
+            .deliver()
+    }
+
+    async fn release_unstarted(&self) -> Result<()> {
+        tokio::runtime::Handle::try_current().context("Goal release has no active runtime")?;
+        let owner = self
+            .owner
+            .upgrade()
+            .context("Goal accounting owner is unavailable")?;
+        let operation = self
+            .take_operation(None)
+            .context("Goal operation released without a matching admission")?;
+        owner
+            .detach_operation(operation, OwnerWork::Release)
+            .await
+            .context("join Goal operation release")?
+            .deliver()
+    }
     async fn pricing_complete(&self) -> Result<bool> {
         Ok(self.strict_totals().await?.2)
     }
@@ -710,10 +943,40 @@ pub(crate) mod tests {
         ReadFailure,
         Admission(GoalTransitionResult),
         StoreFailure,
+        AdmissionErrorAfterCommit,
+        AdmissionPanicAfterCommit,
         DispatchReadFailure,
         Pause(GoalTransitionResult),
         PauseStoreFailure,
         Settlement(GoalTransitionResult),
+        SettlementError,
+        GateSettlementBefore,
+        GateSettlementAfter,
+        GateAdmissionBefore,
+        GateAdmissionAfter,
+    }
+
+    struct RegistryGate {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+        settled: tokio::sync::Notify,
+    }
+
+    impl Default for RegistryGate {
+        fn default() -> Self {
+            Self {
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Semaphore::new(0),
+                settled: tokio::sync::Notify::new(),
+            }
+        }
+    }
+
+    impl RegistryGate {
+        async fn wait(&self) {
+            self.entered.notify_one();
+            self.release.acquire().await.unwrap().forget();
+        }
     }
 
     // Only the queried failure boundary is injected. All lifecycle and ledger
@@ -721,6 +984,7 @@ pub(crate) mod tests {
     struct AdmissionFaultRegistry {
         store: Arc<SqliteTaskStore>,
         fault: AdmissionFault,
+        gate: Option<Arc<RegistryGate>>,
     }
 
     #[async_trait]
@@ -761,17 +1025,51 @@ pub(crate) mod tests {
             pending_call_id: &str,
         ) -> Result<GoalTransitionResult> {
             match self.fault {
-                AdmissionFault::Admission(result) => Ok(result),
-                AdmissionFault::StoreFailure => bail!("fixture registry admission failed"),
+                AdmissionFault::Admission(result) => {
+                    if let Some(gate) = &self.gate {
+                        gate.wait().await;
+                    }
+                    Ok(result)
+                }
+                AdmissionFault::StoreFailure => {
+                    if let Some(gate) = &self.gate {
+                        gate.wait().await;
+                    }
+                    bail!("fixture registry admission failed")
+                }
                 _ => {
-                    self.store
+                    if matches!(self.fault, AdmissionFault::GateAdmissionBefore) {
+                        self.gate.as_ref().unwrap().wait().await;
+                    }
+                    let result = self
+                        .store
                         .admit_pending_operation(
                             task_id,
                             session_id,
                             expected_epoch,
                             pending_call_id,
                         )
-                        .await
+                        .await;
+                    if matches!(
+                        self.fault,
+                        AdmissionFault::GateAdmissionAfter
+                            | AdmissionFault::AdmissionErrorAfterCommit
+                            | AdmissionFault::AdmissionPanicAfterCommit
+                    ) && let Some(gate) = &self.gate
+                    {
+                        gate.wait().await;
+                    }
+                    if matches!(self.fault, AdmissionFault::AdmissionErrorAfterCommit) {
+                        result?;
+                        bail!(
+                            "fixture registry URL https://api.telegram.org/bot123456:ABC-def_GHI/getUpdates"
+                        );
+                    }
+                    if matches!(self.fault, AdmissionFault::AdmissionPanicAfterCommit) {
+                        result?;
+                        panic!("fixture registry admission panicked after commit");
+                    }
+                    result
                 }
             }
         }
@@ -917,9 +1215,26 @@ pub(crate) mod tests {
             accounting_state: GoalAccountingState,
         ) -> Result<GoalTransitionResult> {
             match self.fault {
-                AdmissionFault::Settlement(result) => Ok(result),
+                AdmissionFault::Settlement(result) => {
+                    if let Some(gate) = &self.gate {
+                        gate.wait().await;
+                    }
+                    Ok(result)
+                }
+                AdmissionFault::SettlementError => {
+                    if let Some(gate) = &self.gate {
+                        gate.wait().await;
+                    }
+                    bail!(
+                        "fixture registry URL https://api.telegram.org/bot123456:ABC-def_GHI/getUpdates"
+                    )
+                }
                 _ => {
-                    self.store
+                    if matches!(self.fault, AdmissionFault::GateSettlementBefore) {
+                        self.gate.as_ref().unwrap().wait().await;
+                    }
+                    let result = self
+                        .store
                         .settle_pending_operation(
                             task_id,
                             session_id,
@@ -927,7 +1242,14 @@ pub(crate) mod tests {
                             pending_call_id,
                             accounting_state,
                         )
-                        .await
+                        .await;
+                    if matches!(self.fault, AdmissionFault::GateSettlementAfter) {
+                        self.gate.as_ref().unwrap().wait().await;
+                    }
+                    if let Some(gate) = &self.gate {
+                        gate.settled.notify_one();
+                    }
+                    result
                 }
             }
         }
@@ -969,7 +1291,30 @@ pub(crate) mod tests {
         fault: AdmissionFault,
     ) -> RuntimeGoalOperationAccountingFactory {
         RuntimeGoalOperationAccountingFactory::new(
-            Arc::new(AdmissionFaultRegistry { store, fault }),
+            Arc::new(AdmissionFaultRegistry {
+                store,
+                fault,
+                gate: None,
+            }),
+            Arc::clone(&factory.tracker),
+            &factory.agent_alias,
+            Arc::clone(&factory.pricer),
+        )
+        .unwrap()
+    }
+
+    fn gated_factory(
+        factory: &RuntimeGoalOperationAccountingFactory,
+        store: Arc<SqliteTaskStore>,
+        fault: AdmissionFault,
+        gate: Arc<RegistryGate>,
+    ) -> RuntimeGoalOperationAccountingFactory {
+        RuntimeGoalOperationAccountingFactory::new(
+            Arc::new(AdmissionFaultRegistry {
+                store,
+                fault,
+                gate: Some(gate),
+            }),
             Arc::clone(&factory.tracker),
             &factory.agent_alias,
             Arc::clone(&factory.pricer),
@@ -1320,15 +1665,17 @@ pub(crate) mod tests {
     fn concrete_accountant(
         factory: &RuntimeGoalOperationAccountingFactory,
         scope: GoalExecutionScope,
-    ) -> GoalOperationAccountant {
-        GoalOperationAccountant::new(
-            Arc::clone(&factory.registry),
-            Arc::clone(&factory.tracker),
-            factory.agent_alias.clone(),
-            Arc::clone(&factory.pricer),
-            scope,
-            Weak::new(),
-        )
+    ) -> Arc<GoalOperationAccountant> {
+        Arc::new_cyclic(|owner| {
+            GoalOperationAccountant::new(
+                Arc::clone(&factory.registry),
+                Arc::clone(&factory.tracker),
+                factory.agent_alias.clone(),
+                Arc::clone(&factory.pricer),
+                scope,
+                owner.clone(),
+            )
+        })
     }
 
     #[tokio::test]
@@ -1653,9 +2000,727 @@ pub(crate) mod tests {
         .expect("failed recovery must wake the waiter")
         .expect_err("failed persistence must fence the next operation");
         assert!(error.downcast_ref::<GoalAccountingFailure>().is_some());
+        assert!(error.to_string().contains("cost storage"));
+        assert!(error.to_string().contains("usage settlement"));
+        assert_eq!(
+            accountant.unsettled_failure().unwrap().to_string(),
+            error.to_string()
+        );
         let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
         assert!(goal.pending_call_id.is_some());
         assert_eq!(goal.pending_call_epoch, Some(scope.execution_epoch()));
+    }
+
+    async fn assert_pending_once<F: std::future::Future + ?Sized>(
+        mut future: std::pin::Pin<&mut F>,
+    ) {
+        std::future::poll_fn(|cx| {
+            assert!(future.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn dropped_settlement_finishes_before_quiescence_and_successor() {
+        let (store, factory, tracker, scope, directory) = fixture().await;
+        let gate = Arc::new(RegistryGate::default());
+        let factory = gated_factory(
+            &factory,
+            Arc::clone(&store),
+            AdmissionFault::GateSettlementBefore,
+            Arc::clone(&gate),
+        );
+        let accountant = factory.for_scope(scope.clone());
+        let guard = tracked_admission(&accountant).await;
+        accountant.mark_dispatch_entered();
+        let mut settlement = Box::pin(accountant.settle(GoalOperationSettlement {
+            accounting_state: GoalAccountingState::Complete,
+            events: vec![usage_event("fallback", 10, 2)],
+        }));
+        assert_pending_once(settlement.as_mut()).await;
+        gate.entered.notified().await;
+        drop(settlement);
+        drop(guard);
+
+        let mut quiesce = Box::pin(accountant.quiesce());
+        let mut next = Box::pin(accountant.admit(GoalOperationRequest::new("fallback", "model")));
+        assert_pending_once(quiesce.as_mut()).await;
+        assert_pending_once(next.as_mut()).await;
+        gate.release.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(1), quiesce)
+            .await
+            .expect("settlement must become quiescent");
+        tokio::time::timeout(std::time::Duration::from_secs(1), next)
+            .await
+            .expect("successor must wake")
+            .expect("complete settlement permits a successor");
+        gate.release.add_permits(1);
+        accountant.release_unstarted().await.unwrap();
+        assert!(accountant.unsettled_failure().is_none());
+        assert_eq!(
+            tracker
+                .get_strict_usage_totals_for_task_with_pricing(scope.task_id())
+                .unwrap()
+                .0,
+            12
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("state/costs.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
+        assert!(goal.pending_call_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn dropped_unstarted_release_finishes_on_either_side_of_commit() {
+        for fault in [
+            AdmissionFault::GateSettlementBefore,
+            AdmissionFault::GateSettlementAfter,
+        ] {
+            let (store, factory, _tracker, scope, _directory) = fixture().await;
+            let gate = Arc::new(RegistryGate::default());
+            let factory = gated_factory(&factory, Arc::clone(&store), fault, Arc::clone(&gate));
+            let accountant = factory.for_scope(scope.clone());
+            let guard = tracked_admission(&accountant).await;
+            let mut release = Box::pin(accountant.release_unstarted());
+            assert_pending_once(release.as_mut()).await;
+            gate.entered.notified().await;
+            drop(release);
+            drop(guard);
+            let mut quiesce = Box::pin(accountant.quiesce());
+            assert_pending_once(quiesce.as_mut()).await;
+            gate.release.add_permits(1);
+            tokio::time::timeout(std::time::Duration::from_secs(1), quiesce)
+                .await
+                .unwrap();
+            assert!(accountant.unsettled_failure().is_none());
+            let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+            assert!(goal.pending_call_id.is_none());
+            assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
+            accountant
+                .admit(GoalOperationRequest::new("fallback", "model"))
+                .await
+                .unwrap();
+            gate.release.add_permits(1);
+            accountant.release_unstarted().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn dropped_unstarted_release_after_pause_allows_resume() {
+        for fault in [
+            AdmissionFault::GateSettlementBefore,
+            AdmissionFault::GateSettlementAfter,
+        ] {
+            let (store, factory, tracker, scope, _directory) = fixture().await;
+            let gate = Arc::new(RegistryGate::default());
+            let factory = gated_factory(&factory, Arc::clone(&store), fault, Arc::clone(&gate));
+            let accountant = factory.for_scope(scope.clone());
+            let guard = tracked_admission(&accountant).await;
+            assert_eq!(
+                store
+                    .pause_session_goal(
+                        scope.task_id(),
+                        scope.session_id(),
+                        scope.execution_epoch(),
+                        operator_pause(GoalPauseReason::OperatorPaused),
+                    )
+                    .await
+                    .unwrap(),
+                GoalTransitionResult::Applied
+            );
+            let mut release = Box::pin(accountant.release_unstarted());
+            assert_pending_once(release.as_mut()).await;
+            gate.entered.notified().await;
+            drop(release);
+            drop(guard);
+            let mut quiesce = Box::pin(accountant.quiesce());
+            assert_pending_once(quiesce.as_mut()).await;
+            gate.release.add_permits(1);
+            tokio::time::timeout(std::time::Duration::from_secs(1), quiesce)
+                .await
+                .expect("release must finish after pause");
+            assert!(accountant.unsettled_failure().is_none());
+            let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+            assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
+            assert!(goal.pending_call_id.is_none());
+            assert_eq!(
+                tracker
+                    .get_strict_usage_totals_for_task_with_pricing(scope.task_id())
+                    .unwrap()
+                    .0,
+                0
+            );
+            assert_eq!(
+                store
+                    .resume_session_goal(
+                        scope.task_id(),
+                        scope.session_id(),
+                        scope.execution_epoch() + 1,
+                        2,
+                        "resumed-boot",
+                    )
+                    .await
+                    .unwrap(),
+                GoalTransitionResult::Applied
+            );
+            let resumed = factory.for_scope(
+                GoalExecutionScope::new(
+                    scope.task_id(),
+                    scope.session_id(),
+                    scope.execution_epoch() + 2,
+                )
+                .unwrap(),
+            );
+            resumed
+                .admit(GoalOperationRequest::new("fallback", "model"))
+                .await
+                .unwrap();
+            gate.release.add_permits(1);
+            resumed.release_unstarted().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn dropped_admission_releases_marker_on_either_side_of_commit() {
+        for fault in [
+            AdmissionFault::GateAdmissionBefore,
+            AdmissionFault::GateAdmissionAfter,
+        ] {
+            let (store, factory, tracker, scope, _directory) = fixture().await;
+            let gate = Arc::new(RegistryGate::default());
+            let factory = gated_factory(&factory, Arc::clone(&store), fault, Arc::clone(&gate));
+            let accountant = factory.for_scope(scope.clone());
+            let mut admission =
+                Box::pin(accountant.admit(GoalOperationRequest::new("fallback", "model")));
+            tokio::select! {
+                result = &mut admission => panic!("admission unexpectedly finished: {result:?}"),
+                () = gate.entered.notified() => {}
+            }
+            drop(admission);
+            let mut quiesce = Box::pin(accountant.quiesce());
+            assert_pending_once(quiesce.as_mut()).await;
+            gate.release.add_permits(1);
+            tokio::time::timeout(std::time::Duration::from_secs(1), quiesce)
+                .await
+                .unwrap();
+            assert!(accountant.unsettled_failure().is_none());
+            let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+            assert!(goal.pending_call_id.is_none());
+            assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
+            assert_eq!(
+                tracker
+                    .get_strict_usage_totals_for_task_with_pricing(scope.task_id())
+                    .unwrap()
+                    .0,
+                0
+            );
+            gate.release.add_permits(1);
+            accountant
+                .admit(GoalOperationRequest::new("fallback", "model"))
+                .await
+                .unwrap();
+            accountant.release_unstarted().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn dropped_admission_releases_marker_after_last_accountant_reference() {
+        let (store, factory, tracker, scope, _directory) = fixture().await;
+        let gate = Arc::new(RegistryGate::default());
+        let factory = gated_factory(
+            &factory,
+            Arc::clone(&store),
+            AdmissionFault::GateAdmissionAfter,
+            Arc::clone(&gate),
+        );
+        let accountant = factory.for_scope(scope.clone());
+        let mut admission =
+            Box::pin(accountant.admit(GoalOperationRequest::new("fallback", "model")));
+        tokio::select! {
+            result = &mut admission => panic!("admission unexpectedly finished: {result:?}"),
+            () = gate.entered.notified() => {}
+        }
+        drop(admission);
+        drop(accountant);
+        gate.release.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(1), gate.settled.notified())
+            .await
+            .expect("the abandoned admission must be released");
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert!(goal.pending_call_id.is_none());
+        assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
+        assert_eq!(
+            tracker
+                .get_strict_usage_totals_for_task_with_pricing(scope.task_id())
+                .unwrap()
+                .0,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_admission_error_after_commit_fences_before_waking_waiters() {
+        let (store, factory, tracker, scope, _directory) = fixture().await;
+        let gate = Arc::new(RegistryGate::default());
+        let factory = gated_factory(
+            &factory,
+            Arc::clone(&store),
+            AdmissionFault::AdmissionErrorAfterCommit,
+            Arc::clone(&gate),
+        );
+        let accountant = factory.for_scope(scope.clone());
+        let mut admission =
+            Box::pin(accountant.admit(GoalOperationRequest::new("fallback", "model")));
+        tokio::select! {
+            result = &mut admission => panic!("admission unexpectedly finished: {result:?}"),
+            () = gate.entered.notified() => {}
+        }
+        drop(admission);
+        let mut quiesce = Box::pin(accountant.quiesce());
+        let mut next = Box::pin(accountant.admit(GoalOperationRequest::new("fallback", "model")));
+        assert_pending_once(quiesce.as_mut()).await;
+        assert_pending_once(next.as_mut()).await;
+        gate.release.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(1), quiesce)
+            .await
+            .expect("quiescence must wake after admission fails");
+        let failure = accountant
+            .unsettled_failure()
+            .expect("failure retained before quiescence");
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), next)
+            .await
+            .expect("successor must wake")
+            .expect_err("uncertain admission must fence successors");
+        assert!(error.downcast_ref::<GoalAccountingFailure>().is_some());
+        assert_eq!(error.to_string(), failure.to_string());
+        let message = failure.to_string();
+        assert!(message.contains("never dispatched"));
+        assert!(message.contains("may remain pending"));
+        assert!(message.contains("[REDACTED_BOT_TOKEN]"));
+        for forbidden in [
+            "123456:ABC-def_GHI",
+            "could not be released",
+            "outcome of an earlier",
+            "has not settled",
+        ] {
+            assert!(
+                !message.contains(forbidden),
+                "unexpected {forbidden}: {message}"
+            );
+        }
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert!(goal.pending_call_id.is_some());
+        assert_eq!(goal.pending_call_epoch, Some(scope.execution_epoch()));
+        assert_eq!(
+            tracker
+                .get_strict_usage_totals_for_task_with_pricing(scope.task_id())
+                .unwrap()
+                .0,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_admission_panic_after_commit_retains_failure() {
+        let (store, factory, _tracker, scope, _directory) = fixture().await;
+        let gate = Arc::new(RegistryGate::default());
+        let factory = gated_factory(
+            &factory,
+            Arc::clone(&store),
+            AdmissionFault::AdmissionPanicAfterCommit,
+            Arc::clone(&gate),
+        );
+        let accountant = factory.for_scope(scope.clone());
+        let mut admission =
+            Box::pin(accountant.admit(GoalOperationRequest::new("fallback", "model")));
+        tokio::select! {
+            result = &mut admission => panic!("admission unexpectedly finished: {result:?}"),
+            () = gate.entered.notified() => {}
+        }
+        drop(admission);
+        let mut quiesce = Box::pin(accountant.quiesce());
+        assert_pending_once(quiesce.as_mut()).await;
+        gate.release.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(1), quiesce)
+            .await
+            .expect("panic must wake waiters");
+        let message = accountant
+            .unsettled_failure()
+            .expect("panic must retain failure")
+            .to_string();
+        assert!(message.contains("did not finish"));
+        assert!(message.contains("never dispatched"));
+        assert!(
+            store
+                .get_goal_task(scope.task_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .pending_call_id
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn live_admission_error_after_commit_preserves_original_error() {
+        let (store, factory, _tracker, scope, _directory) = fixture().await;
+        let factory = faulted_factory(
+            &factory,
+            Arc::clone(&store),
+            AdmissionFault::AdmissionErrorAfterCommit,
+        );
+        let accountant = factory.for_scope(scope.clone());
+        let error = accountant
+            .admit(GoalOperationRequest::new("fallback", "model"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "fixture registry URL https://api.telegram.org/bot123456:ABC-def_GHI/getUpdates"
+        );
+        assert!(error.downcast_ref::<GoalOperationFenced>().is_none());
+        assert!(error.downcast_ref::<GoalAccountingFailure>().is_none());
+        assert!(accountant.unsettled_failure().is_none());
+        let next = accountant
+            .admit(GoalOperationRequest::new("fallback", "model"))
+            .await
+            .unwrap_err();
+        assert!(format!("{next:#}").contains("Goal already has a pending operation"));
+    }
+
+    #[tokio::test]
+    async fn live_admission_panic_after_commit_returns_join_error_and_retains_failure() {
+        let (store, factory, _tracker, scope, _directory) = fixture().await;
+        let factory = faulted_factory(&factory, store, AdmissionFault::AdmissionPanicAfterCommit);
+        let accountant = factory.for_scope(scope);
+        let error = accountant
+            .admit(GoalOperationRequest::new("fallback", "model"))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("join Goal operation admission"));
+        assert!(
+            accountant
+                .unsettled_failure()
+                .expect("panic must retain failure")
+                .to_string()
+                .contains("did not finish")
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_definite_admission_refusal_does_not_fence_accounting() {
+        for result in [GoalTransitionResult::Stale, GoalTransitionResult::Missing] {
+            let (store, factory, _tracker, scope, _directory) = fixture().await;
+            let gate = Arc::new(RegistryGate::default());
+            let factory = gated_factory(
+                &factory,
+                Arc::clone(&store),
+                AdmissionFault::Admission(result),
+                Arc::clone(&gate),
+            );
+            let accountant = factory.for_scope(scope.clone());
+            let mut admission =
+                Box::pin(accountant.admit(GoalOperationRequest::new("fallback", "model")));
+            tokio::select! {
+                result = &mut admission => panic!("admission unexpectedly finished: {result:?}"),
+                () = gate.entered.notified() => {}
+            }
+            drop(admission);
+            let mut quiesce = Box::pin(accountant.quiesce());
+            assert_pending_once(quiesce.as_mut()).await;
+            gate.release.add_permits(1);
+            tokio::time::timeout(std::time::Duration::from_secs(1), quiesce)
+                .await
+                .expect("refusal must become quiescent");
+            assert!(accountant.unsettled_failure().is_none());
+            assert!(
+                store
+                    .get_goal_task(scope.task_id())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .pending_call_id
+                    .is_none()
+            );
+            gate.release.add_permits(1);
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                accountant.admit(GoalOperationRequest::new("fallback", "model")),
+            )
+            .await
+            .expect("second refusal must finish")
+            .unwrap_err();
+            assert!(error.downcast_ref::<GoalOperationFenced>().is_some());
+            assert!(error.downcast_ref::<GoalAccountingFailure>().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn dropped_no_write_admission_error_reports_uncertainty_without_claiming_marker() {
+        let (store, factory, _tracker, scope, _directory) = fixture().await;
+        let gate = Arc::new(RegistryGate::default());
+        let factory = gated_factory(
+            &factory,
+            Arc::clone(&store),
+            AdmissionFault::StoreFailure,
+            Arc::clone(&gate),
+        );
+        let accountant = factory.for_scope(scope.clone());
+        let mut admission =
+            Box::pin(accountant.admit(GoalOperationRequest::new("fallback", "model")));
+        tokio::select! {
+            result = &mut admission => panic!("admission unexpectedly finished: {result:?}"),
+            () = gate.entered.notified() => {}
+        }
+        drop(admission);
+        let mut quiesce = Box::pin(accountant.quiesce());
+        assert_pending_once(quiesce.as_mut()).await;
+        gate.release.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(1), quiesce)
+            .await
+            .expect("failure must become quiescent");
+        let message = accountant
+            .unsettled_failure()
+            .expect("uncertain error must be retained")
+            .to_string();
+        assert!(message.contains("never dispatched"));
+        assert!(message.contains("may remain pending"));
+        assert!(!message.contains("could not be released"));
+        assert!(
+            store
+                .get_goal_task(scope.task_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .pending_call_id
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn abandoned_unstarted_release_retains_scrubbed_registry_error() {
+        let (store, factory, _tracker, scope, _directory) = fixture().await;
+        let factory = faulted_factory(
+            &factory,
+            Arc::clone(&store),
+            AdmissionFault::SettlementError,
+        );
+        let accountant = factory.for_scope(scope.clone());
+        let guard = tracked_admission(&accountant).await;
+        drop(guard);
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            accountant.admit(GoalOperationRequest::new("fallback", "model")),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("never dispatched"));
+        assert!(message.contains("[REDACTED_BOT_TOKEN]"));
+        assert!(!message.contains("123456:ABC-def_GHI"));
+        assert!(!message.contains("outcome of an earlier"));
+        assert!(
+            store
+                .get_goal_task(scope.task_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .pending_call_id
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_settlement_retains_storage_failure_before_waking_waiter() {
+        let (store, factory, _tracker, scope, directory) = fixture().await;
+        let accountant = factory.for_scope(scope.clone());
+        let guard = tracked_admission(&accountant).await;
+        accountant.mark_dispatch_entered();
+        std::fs::create_dir_all(directory.path().join("state/costs.jsonl")).unwrap();
+        let mut settlement = Box::pin(accountant.settle(GoalOperationSettlement {
+            accounting_state: GoalAccountingState::Complete,
+            events: vec![usage_event("fallback", 10, 2)],
+        }));
+        assert_pending_once(settlement.as_mut()).await;
+        drop(settlement);
+        drop(guard);
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            accountant.admit(GoalOperationRequest::new("fallback", "model")),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(error.to_string().contains("cost storage"));
+        assert_eq!(
+            accountant.unsettled_failure().unwrap().to_string(),
+            error.to_string()
+        );
+        assert!(
+            store
+                .get_goal_task(scope.task_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .pending_call_id
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_settlement_retains_registry_failure_after_recording_once() {
+        for (fault, expected) in [
+            (
+                AdmissionFault::Settlement(GoalTransitionResult::Stale),
+                "lost its execution fence",
+            ),
+            (AdmissionFault::SettlementError, "[REDACTED_BOT_TOKEN]"),
+        ] {
+            let (store, factory, tracker, scope, directory) = fixture().await;
+            let gate = Arc::new(RegistryGate::default());
+            let factory = gated_factory(&factory, Arc::clone(&store), fault, Arc::clone(&gate));
+            let accountant = factory.for_scope(scope.clone());
+            let guard = tracked_admission(&accountant).await;
+            accountant.mark_dispatch_entered();
+            let mut settlement = Box::pin(accountant.settle(GoalOperationSettlement {
+                accounting_state: GoalAccountingState::Complete,
+                events: vec![usage_event("fallback", 10, 2)],
+            }));
+            assert_pending_once(settlement.as_mut()).await;
+            gate.entered.notified().await;
+            drop(settlement);
+            drop(guard);
+            let mut quiesce = Box::pin(accountant.quiesce());
+            assert_pending_once(quiesce.as_mut()).await;
+            gate.release.add_permits(1);
+            tokio::time::timeout(std::time::Duration::from_secs(1), quiesce)
+                .await
+                .expect("failed settlement must become quiescent");
+            let message = accountant
+                .unsettled_failure()
+                .expect("registry failure retained")
+                .to_string();
+            assert!(message.contains(expected), "{message}");
+            assert!(!message.contains("123456:ABC-def_GHI"));
+            assert!(
+                store
+                    .get_goal_task(scope.task_id())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .pending_call_id
+                    .is_some()
+            );
+            assert_eq!(
+                tracker
+                    .get_strict_usage_totals_for_task_with_pricing(scope.task_id())
+                    .unwrap()
+                    .0,
+                12
+            );
+            assert_eq!(
+                std::fs::read_to_string(directory.path().join("state/costs.jsonl"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+        }
+    }
+
+    struct PanicOnSettlementPricer(Arc<dyn GoalUsagePricer>);
+
+    impl GoalUsagePricer for PanicOnSettlementPricer {
+        fn price(
+            &self,
+            provider_ref: &str,
+            model: &str,
+            usage: &TokenUsage,
+        ) -> Result<GoalUsagePrice> {
+            assert_ne!(
+                provider_ref, "panic-on-settlement",
+                "fixture settlement pricing panic"
+            );
+            self.0.price(provider_ref, model, usage)
+        }
+    }
+
+    #[tokio::test]
+    async fn settlement_pricer_panic_fences_abandoned_work_and_reaches_live_caller() {
+        for drop_caller in [true, false] {
+            let (store, mut factory, _tracker, scope, _directory) = fixture().await;
+            factory.pricer = Arc::new(PanicOnSettlementPricer(Arc::clone(&factory.pricer)));
+            let accountant = factory.for_scope(scope.clone());
+            let guard = tracked_admission(&accountant).await;
+            accountant.mark_dispatch_entered();
+            let mut settlement = Box::pin(accountant.settle(GoalOperationSettlement {
+                accounting_state: GoalAccountingState::Complete,
+                events: vec![usage_event("panic-on-settlement", 10, 2)],
+            }));
+            assert_pending_once(settlement.as_mut()).await;
+            if drop_caller {
+                drop(settlement);
+            } else {
+                let error = tokio::time::timeout(std::time::Duration::from_secs(1), settlement)
+                    .await
+                    .expect("panicked settlement must wake caller")
+                    .unwrap_err();
+                assert!(format!("{error:#}").contains("join Goal operation settlement"));
+            }
+            drop(guard);
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                accountant.admit(GoalOperationRequest::new("fallback", "model")),
+            )
+            .await
+            .expect("panic must wake successor")
+            .unwrap_err();
+            assert!(error.downcast_ref::<GoalAccountingFailure>().is_some());
+            assert!(accountant.unsettled_failure().is_some());
+            assert!(
+                store
+                    .get_goal_task(scope.task_id())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .pending_call_id
+                    .is_some()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn abandoned_durable_pricing_failure_is_not_reported_as_pending() {
+        let (store, mut factory, _tracker, scope, _directory) = fixture().await;
+        factory.pricer = Arc::new(RouteFailingPricer::new("primary"));
+        let accountant = factory.for_scope(scope.clone());
+        let guard = tracked_admission(&accountant).await;
+        accountant.mark_dispatch_entered();
+        accountant.set_abandonment_settlement(Box::new(|| GoalOperationSettlement {
+            accounting_state: GoalAccountingState::Complete,
+            events: vec![usage_event("primary", 10, 2)],
+        }));
+        drop(guard);
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            accountant.admit(GoalOperationRequest::new("fallback", "model")),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(error.to_string().contains("pricing failed"));
+        assert!(!error.to_string().contains("has not settled"));
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert_eq!(goal.accounting_state, GoalAccountingState::Invalid);
+        assert!(goal.pending_call_id.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1725,6 +2790,8 @@ pub(crate) mod tests {
             .block_on(accountant.admit(GoalOperationRequest::new("fallback", "model")))
             .unwrap_err();
         assert!(error.downcast_ref::<GoalAccountingFailure>().is_some());
+        assert!(error.to_string().contains("never dispatched"));
+        assert!(!error.to_string().contains("outcome of an earlier"));
         let goal = runtime
             .block_on(store.get_goal_task(scope.task_id()))
             .unwrap()
@@ -2442,6 +3509,7 @@ pub(crate) mod tests {
                 .to_string()
                 .contains("release lost its execution fence")
         );
+        assert!(accountant.unsettled_failure().is_none());
         let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
         assert!(goal.pending_call_id.is_some());
         assert_eq!(goal.pending_call_epoch, Some(scope.execution_epoch()));

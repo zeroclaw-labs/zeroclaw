@@ -2216,6 +2216,84 @@ mod tests {
         assert!(goal.pending_call_id.is_none());
     }
 
+    #[tokio::test]
+    async fn dropped_goal_attempt_settlement_records_usage_once() {
+        use zeroclaw_goal::{
+            GoalAccountingState, GoalTaskRegistry, accounting::GoalOperationAccountingFactory,
+        };
+
+        let (store, factory, tracker, goal_scope, directory) =
+            crate::goal_accounting::tests::fixture().await;
+        let accountant = factory.for_scope(goal_scope.clone());
+        GOAL_OPERATION_ACCOUNTING
+            .scope(Some(Arc::clone(&accountant)), async {
+                let guard = admit_goal_operation_if_scoped("fallback", "model")
+                    .await
+                    .unwrap();
+                let start = begin_goal_dispatch_if_scoped().await.unwrap();
+                let attempts = AccountedChatScope::new();
+                let messages = [ChatMessage::user("test")];
+                let leaf = PricedLeaf {
+                    alias: "returned",
+                    usage: reported_usage(10, 2),
+                };
+                release_after_first_poll(
+                    start,
+                    attempts.scope(with_exact_dispatch_route(
+                        "fallback".to_owned(),
+                        "model".to_owned(),
+                        ProviderDispatch::from_ref(&leaf).chat(
+                            ChatRequest {
+                                messages: &messages,
+                                tools: None,
+                                thinking: None,
+                            },
+                            "model",
+                            None,
+                        ),
+                    )),
+                )
+                .await
+                .unwrap();
+                attempts.mark_logical_success();
+                let (events, _, _) = attempts.take().into_attempts_and_parts();
+                let mut settlement = Box::pin(settle_provider_attempts(&events, Some(0)));
+                std::future::poll_fn(|cx| {
+                    assert!(std::future::Future::poll(settlement.as_mut(), cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                drop(settlement);
+                drop(guard);
+            })
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), accountant.quiesce())
+            .await
+            .expect("dropped settlement must finish");
+        assert!(accountant.unsettled_failure().is_none());
+        assert_eq!(
+            tracker
+                .get_strict_usage_totals_for_task_with_pricing(goal_scope.task_id())
+                .unwrap()
+                .0,
+            12
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("state/costs.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        let goal = store
+            .get_goal_task(goal_scope.task_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
+        assert!(goal.pending_call_id.is_none());
+    }
+
     struct FailingWithUsageLeaf {
         alias: &'static str,
     }

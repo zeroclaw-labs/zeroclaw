@@ -1626,6 +1626,8 @@ enum ScriptedFault {
     CorruptGoalAfterVerifier,
     CorruptTaskAfterAppend,
     CorruptTaskAfterContinue,
+    AbandonWithBlockedLedger,
+    DropSettlement,
 }
 
 struct ExecutionScript {
@@ -1641,6 +1643,7 @@ struct ScriptedDriver {
     sessions: Arc<SqliteSessionBackend>,
     script: Arc<StdMutex<ExecutionScript>>,
     control_db: PathBuf,
+    ledger_file: PathBuf,
 }
 
 struct ScriptedLease {
@@ -1650,6 +1653,7 @@ struct ScriptedLease {
     script: Arc<StdMutex<ExecutionScript>>,
     scope: Option<GoalExecutionScope>,
     control_db: PathBuf,
+    ledger_file: PathBuf,
 }
 
 impl ScriptedLease {
@@ -1754,6 +1758,7 @@ impl GoalSessionDriver for ScriptedDriver {
             script: Arc::clone(&self.script),
             scope: None,
             control_db: self.control_db.clone(),
+            ledger_file: self.ledger_file.clone(),
         }))
     }
 }
@@ -1844,6 +1849,43 @@ impl GoalSessionExecutionLease for ScriptedLease {
                 );
             }
             Some(ScriptedFault::CorruptGoalAfterParent) => self.corrupt_goal_record(scope)?,
+            Some(ScriptedFault::AbandonWithBlockedLedger | ScriptedFault::DropSettlement) => {
+                let accounting = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+                    .try_with(Clone::clone)?
+                    .expect("fixture requires Goal accounting");
+                accounting
+                    .admit(GoalOperationRequest::new("fallback", "model"))
+                    .await?;
+                let guard = accounting.admission_guard()?;
+                accounting.mark_dispatch_entered();
+                let settlement = GoalOperationSettlement {
+                    accounting_state: GoalAccountingState::Complete,
+                    events: vec![zeroclaw_goal::accounting::GoalUsageEvent {
+                        provider_ref: "fallback".into(),
+                        model: "model".into(),
+                        usage: zeroclaw_api::model_provider::TokenUsage {
+                            input_tokens: Some(10),
+                            output_tokens: Some(2),
+                            cached_input_tokens: Some(0),
+                            cache_creation_input_tokens: Some(0),
+                        },
+                        priceable: true,
+                    }],
+                };
+                if matches!(fault, Some(ScriptedFault::AbandonWithBlockedLedger)) {
+                    std::fs::create_dir_all(&self.ledger_file)?;
+                    accounting.set_abandonment_settlement(Box::new(move || settlement));
+                } else {
+                    let mut pending = Box::pin(accounting.settle(settlement));
+                    std::future::poll_fn(|cx| {
+                        assert!(std::future::Future::poll(pending.as_mut(), cx).is_pending());
+                        std::task::Poll::Ready(())
+                    })
+                    .await;
+                    drop(pending);
+                }
+                drop(guard);
+            }
             _ => {}
         }
         Ok(self.script.lock().unwrap().parents.pop_front().unwrap())
@@ -2104,6 +2146,7 @@ impl EngineFixture {
                 fault,
             })),
             control_db: directory.path().join("control/control_plane.db"),
+            ledger_file: directory.path().join("state/costs.jsonl"),
         });
         let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
         let (_, request) = runtime
@@ -2202,6 +2245,112 @@ impl EngineFixture {
 
 const SCRIPTED_COMPLETE: &str =
     r#"{"decision":"complete","reason":"all criteria met","blockers":[]}"#;
+
+fn real_goal_accounting(
+    fixture: &EngineFixture,
+) -> (
+    Arc<zeroclaw_config::cost::CostTracker>,
+    Arc<zeroclaw_runtime::goal_accounting::RuntimeGoalOperationAccountingFactory>,
+) {
+    let tracker = Arc::new(
+        zeroclaw_config::cost::CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            fixture._directory.path(),
+        )
+        .unwrap(),
+    );
+    let pricer = Arc::new(
+        zeroclaw_runtime::goal_accounting::ModelProviderGoalUsagePricer::new(Arc::new(
+            std::collections::HashMap::new(),
+        )),
+    );
+    let factory = Arc::new(
+        zeroclaw_runtime::goal_accounting::RuntimeGoalOperationAccountingFactory::new(
+            fixture.store.clone() as Arc<dyn GoalTaskRegistry>,
+            Arc::clone(&tracker),
+            "main",
+            pricer,
+        )
+        .unwrap(),
+    );
+    (tracker, factory)
+}
+
+#[tokio::test]
+async fn engine_surfaces_abandoned_real_accountant_ledger_failure_before_verifier() {
+    let mut fixture = EngineFixture::new(
+        &["candidate"],
+        &[],
+        Some(ScriptedFault::AbandonWithBlockedLedger),
+    )
+    .await;
+    let (_tracker, factory) = real_goal_accounting(&fixture);
+    let error = fixture
+        .runtime
+        .execution_engine(factory)
+        .run(
+            &host_settings(&fixture.config),
+            fixture.request.take().unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("cost storage"));
+    assert_eq!(fixture.task().await.status, TaskStatus::Failed);
+    assert_eq!(
+        fixture.reason().await.as_deref(),
+        Some("accounting_missing_or_invalid")
+    );
+    assert!(
+        !fixture
+            .steps()
+            .iter()
+            .any(|step| matches!(step, ScriptedStep::Verifier(_)))
+    );
+}
+
+#[tokio::test]
+async fn engine_waits_for_dropped_real_settlement_before_verifying() {
+    let mut fixture = EngineFixture::new(
+        &["candidate"],
+        &[SCRIPTED_COMPLETE],
+        Some(ScriptedFault::DropSettlement),
+    )
+    .await;
+    let (tracker, factory) = real_goal_accounting(&fixture);
+    let outcome = fixture
+        .runtime
+        .execution_engine(factory)
+        .run(
+            &host_settings(&fixture.config),
+            fixture.request.take().unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome, zeroclaw_goal::GoalExecutionOutcome::Completed);
+    assert!(
+        fixture
+            .steps()
+            .iter()
+            .any(|step| matches!(step, ScriptedStep::Verifier(_)))
+    );
+    assert_eq!(
+        tracker
+            .get_strict_usage_totals_for_task_with_pricing(fixture.scope.task_id())
+            .unwrap()
+            .0,
+        12
+    );
+    assert_eq!(
+        std::fs::read_to_string(&fixture.driver.ledger_file)
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+}
 
 #[tokio::test]
 async fn engine_persists_a_verified_candidate_before_completing() {

@@ -264,6 +264,15 @@ impl GoalExecutionEngine {
         accountant: &dyn crate::accounting::GoalOperationAccounting,
     ) -> Result<()> {
         accountant.quiesce().await;
+        if let Some(failure) = accountant.unsettled_failure() {
+            return Err(self
+                .fail_with(
+                    scope,
+                    "accounting_missing_or_invalid",
+                    anyhow::Error::new(failure),
+                )
+                .await);
+        }
         let goal = match self.registry.get_goal_task(scope.task_id()).await {
             Ok(Some(goal)) => goal,
             Ok(None) => {
@@ -325,6 +334,10 @@ impl GoalExecutionEngine {
         accountant.quiesce().await;
         if is_accounting_failure(&error) {
             return ("accounting_missing_or_invalid", error);
+        }
+        if let Some(failure) = accountant.unsettled_failure() {
+            let context = failure.for_operation(&error);
+            return ("accounting_missing_or_invalid", error.context(context));
         }
         match self.registry.get_goal_task(scope.task_id()).await {
             Ok(Some(goal))

@@ -3,13 +3,14 @@
 use super::*;
 use crate::accounting::{
     GoalOperationAccounting, GoalOperationGuard, GoalOperationRequest, GoalOperationSettlement,
+    GoalUnsettledOperation,
 };
 use crate::task::{GoalDispatchStart, GoalTaskRecord, TaskContinuationContext};
 use std::sync::Mutex;
 
 type Events = Arc<Mutex<Vec<&'static str>>>;
 
-struct RecordingAccountant(Events);
+struct RecordingAccountant(Events, Option<GoalAccountingFailure>);
 
 #[async_trait::async_trait]
 impl GoalOperationAccounting for RecordingAccountant {
@@ -34,6 +35,12 @@ impl GoalOperationAccounting for RecordingAccountant {
     async fn quiesce(&self) {
         tokio::task::yield_now().await;
         self.0.lock().unwrap().push("quiesce");
+    }
+    fn unsettled_failure(&self) -> Option<GoalAccountingFailure> {
+        if self.1.is_some() {
+            self.0.lock().unwrap().push("failure");
+        }
+        self.1.clone()
     }
 }
 
@@ -138,10 +145,13 @@ impl GoalTaskRegistry for RecordingRegistry {
         _: &str,
         _: &str,
         _: i64,
-        _: TaskStatus,
-        _: Option<String>,
+        status: TaskStatus,
+        reason: Option<String>,
     ) -> Result<GoalTransitionResult> {
-        unreachable!()
+        assert_eq!(status, TaskStatus::Failed);
+        assert_eq!(reason.as_deref(), Some("accounting_missing_or_invalid"));
+        self.0.lock().unwrap().push("fail");
+        Ok(GoalTransitionResult::Applied)
     }
     async fn admit_pending_operation(
         &self,
@@ -182,7 +192,7 @@ async fn engine_quiesces_before_accounting_classification() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let registry: Arc<dyn GoalTaskRegistry> = Arc::new(RecordingRegistry(Arc::clone(&events)));
     let engine = GoalExecutionEngine::new(GoalRuntime::new(registry), Arc::new(UnusedFactory));
-    let accountant = RecordingAccountant(Arc::clone(&events));
+    let accountant = RecordingAccountant(Arc::clone(&events), None);
     let scope = GoalExecutionScope::new("task", "session", 1).unwrap();
 
     engine
@@ -220,4 +230,40 @@ async fn engine_quiesces_before_accounting_classification() {
         .await;
     assert_eq!(reason, "accounting_missing_or_invalid");
     assert_eq!(*events.lock().unwrap(), ["quiesce"]);
+}
+
+#[tokio::test]
+async fn engine_surfaces_retained_settlement_failure_after_quiescence() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let registry: Arc<dyn GoalTaskRegistry> = Arc::new(RecordingRegistry(Arc::clone(&events)));
+    let engine = GoalExecutionEngine::new(GoalRuntime::new(registry), Arc::new(UnusedFactory));
+    let failure = GoalAccountingFailure::unsettled(
+        GoalUnsettledOperation::Dispatched,
+        "fixture ledger failure",
+    );
+    let accountant = RecordingAccountant(Arc::clone(&events), Some(failure.clone()));
+    let scope = GoalExecutionScope::new("task", "session", 1).unwrap();
+
+    let error = engine
+        .require_complete_accounting(&scope, &accountant)
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), failure.to_string());
+    assert_eq!(*events.lock().unwrap(), ["quiesce", "failure", "fail"]);
+    events.lock().unwrap().clear();
+
+    let (reason, error) = engine
+        .classify_operation_failure(
+            &scope,
+            &accountant,
+            anyhow::Error::msg("provider failed"),
+            "parent_operation_failed",
+            "parent failed",
+        )
+        .await;
+    assert_eq!(reason, "accounting_missing_or_invalid");
+    let text = error.to_string();
+    assert_eq!(text.matches("fixture ledger failure").count(), 1);
+    assert!(text.contains("original operation error: provider failed"));
+    assert_eq!(*events.lock().unwrap(), ["quiesce", "failure"]);
 }

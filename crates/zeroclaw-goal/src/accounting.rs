@@ -59,12 +59,19 @@ impl std::fmt::Display for GoalOperationFenced {
 impl std::error::Error for GoalOperationFenced {}
 
 /// Goal accounting made incomplete by an observed condition, closing admission
-/// to every further Goal-owned model call. The message embeds each original
-/// error chain unchanged. There is no source, so the bare failure's plain and
-/// alternate displays both show the complete diagnostic exactly once.
-#[derive(Debug)]
+/// to every further Goal-owned model call. Delivered errors retain their original
+/// detail; failures retained by an accounting owner are scrubbed before reuse.
+/// There is no source, so both displays show the complete diagnostic once.
+#[derive(Clone, Debug)]
 pub struct GoalAccountingFailure {
     message: String,
+}
+
+/// Whether an unsettled operation had entered provider dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GoalUnsettledOperation {
+    NeverDispatched,
+    Dispatched,
 }
 
 impl GoalAccountingFailure {
@@ -119,6 +126,49 @@ impl GoalAccountingFailure {
             )
         };
         Self { message }
+    }
+
+    /// Report a failed durable operation without conflating an unstarted call
+    /// with an unknown provider outcome.
+    #[must_use]
+    pub fn unsettled(operation: GoalUnsettledOperation, detail: &str) -> Self {
+        let condition = match operation {
+            GoalUnsettledOperation::NeverDispatched => {
+                "an admitted Goal model call that was never dispatched could not be released, so it remains pending"
+            }
+            GoalUnsettledOperation::Dispatched => {
+                "usage settlement for an earlier Goal model call did not become durable, so the call may remain pending"
+            }
+        };
+        Self {
+            message: format!(
+                "Goal accounting is incomplete: {condition}; no further Goal model call will be admitted: {detail}"
+            ),
+        }
+    }
+
+    /// Report an admission whose durable result was not delivered to its caller.
+    #[must_use]
+    pub fn admission_unconfirmed(detail: &str) -> Self {
+        Self {
+            message: format!(
+                "Goal accounting is incomplete: the admission of a Goal model call that was never dispatched did not finish, so the call may remain pending; no further Goal model call will be admitted: {detail}"
+            ),
+        }
+    }
+
+    /// Return a copy whose diagnostic has passed through the caller's scrubber.
+    #[must_use]
+    pub fn redacted(&self, scrub: impl FnOnce(&str) -> String) -> Self {
+        Self {
+            message: scrub(&self.message),
+        }
+    }
+
+    pub(crate) fn for_operation(mut self, operation_error: &anyhow::Error) -> Self {
+        self.message
+            .push_str(&format!("; original operation error: {operation_error:#}"));
+        self
     }
 
     pub(crate) fn incomplete_for_operation(
@@ -275,6 +325,9 @@ pub type GoalAbandonmentSettlement = Box<dyn FnOnce() -> GoalOperationSettlement
 pub trait GoalOperationAccounting: Send + Sync {
     /// Admit work only with complete durable accounting. Incomplete accounting
     /// returns a [`GoalAccountingFailure`], independently of the Goal budget.
+    /// Once the durable admission starts, dropping the future does not cancel it.
+    /// An undelivered applied admission is released, a definite refusal is left
+    /// unchanged, and an uncertain failure is retained with scrubbed detail.
     async fn admit(&self, request: GoalOperationRequest) -> anyhow::Result<()>;
     /// Obtain the witness immediately after admission, before yielding. Hold it
     /// through settlement or release, including if the caller is cancelled.
@@ -283,8 +336,13 @@ pub trait GoalOperationAccounting: Send + Sync {
     fn mark_dispatch_entered(&self) {}
     /// Replace the current admission's source for abandonment settlement.
     fn set_abandonment_settlement(&self, _source: GoalAbandonmentSettlement) {}
-    /// Wait for the accountant's outstanding local settlement, if any.
+    /// Wait for outstanding local accounting work, including any retained
+    /// failure, to become observable.
     async fn quiesce(&self) {}
+    /// Return an undelivered owner-side failure, with sensitive detail scrubbed.
+    fn unsettled_failure(&self) -> Option<GoalAccountingFailure> {
+        None
+    }
     /// After awaited pre-dispatch work, check the admitted operation while
     /// acquiring the registry's session gate. This read-only check takes no
     /// additional operation permit. On error the caller must not dispatch and
@@ -298,10 +356,14 @@ pub trait GoalOperationAccounting: Send + Sync {
     /// incomplete. An error carrying [`GoalAccountingFailure`] means settlement
     /// is durable, known usage is recorded, and admission is closed. Any other
     /// error means settlement may not be durable and a pending marker may remain.
+    /// Once its durable section starts, dropping this future does not cancel it;
+    /// an undelivered failure is retained with scrubbed detail.
     async fn settle(&self, settlement: GoalOperationSettlement) -> anyhow::Result<()>;
     /// Release an admitted operation only when its provider-dispatch future
     /// has never been polled. No physical attempt or usage can exist in that
-    /// case. A failed release must leave durable pending evidence intact.
+    /// case. A failed release must leave durable pending evidence intact. Once
+    /// its durable section starts, dropping this future does not cancel it; an
+    /// undelivered failure is retained with scrubbed detail.
     async fn release_unstarted(&self) -> anyhow::Result<()>;
     async fn pricing_complete(&self) -> anyhow::Result<bool>;
 }
@@ -335,6 +397,44 @@ mod tests {
         let error = anyhow::Error::new(failure);
         assert_eq!(error.to_string(), expected);
         assert_eq!(format!("{error:#}"), expected);
+    }
+
+    #[test]
+    fn unsettled_failures_distinguish_dispatch_and_retain_scrubbed_detail() {
+        let unstarted = GoalAccountingFailure::unsettled(
+            GoalUnsettledOperation::NeverDispatched,
+            "registry secret",
+        );
+        assert!(unstarted.to_string().contains("never dispatched"));
+        assert!(!unstarted.to_string().contains("outcome of an earlier"));
+        let redacted = unstarted.redacted(|message| message.replace("secret", "[redacted]"));
+        assert!(redacted.to_string().contains("registry [redacted]"));
+
+        let dispatched = GoalAccountingFailure::unsettled(
+            GoalUnsettledOperation::Dispatched,
+            "ledger unavailable",
+        )
+        .for_operation(&anyhow::Error::msg("provider failed"));
+        assert!(dispatched.to_string().contains("usage settlement"));
+        assert!(dispatched.to_string().contains("ledger unavailable"));
+        assert!(
+            dispatched
+                .to_string()
+                .contains("original operation error: provider failed")
+        );
+    }
+
+    #[test]
+    fn unconfirmed_admission_does_not_claim_a_marker_exists() {
+        let message = GoalAccountingFailure::admission_unconfirmed("fixture error").to_string();
+        assert!(message.starts_with("Goal accounting is incomplete:"));
+        assert!(message.ends_with("no further Goal model call will be admitted: fixture error"));
+        assert!(message.contains("never dispatched"));
+        assert!(message.contains("may remain pending"));
+        assert!(!message.contains("could not be released"));
+        assert!(!message.contains("outcome of an earlier"));
+        assert!(!message.contains("has not settled"));
+        assert_eq!(message.matches("fixture error").count(), 1);
     }
 
     #[test]
