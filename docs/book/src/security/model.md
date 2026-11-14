@@ -45,16 +45,17 @@ The validator runs *before* the command hits the shell. A blocked command surfac
 
 ## OS-level sandbox
 
-When a sandbox backend is available, tool invocations run inside it:
+When a sandbox backend is available, tool invocations run inside it. `sandbox_backend = "auto"` resolves one when the sandbox is created:
 
-| Platform | Default backend |
+| Platform | Auto-detected order |
 |---|---|
-| Linux | Landlock (kernel) / Bubblewrap / Firejail / Docker, auto-detected |
-| macOS | Seatbelt (native) |
-| Windows | AppContainer (experimental) |
-| Any | Docker (if the daemon is reachable) |
+| Linux | Landlock (only when compiled with `sandbox-landlock`) → Firejail |
+| macOS | Bubblewrap (only when compiled with `sandbox-bubblewrap`) → Seatbelt (`sandbox-exec`) |
+| Windows | No OS-level backend |
 
-The sandbox confines filesystem access to the workspace, drops network reachability except what the tool explicitly needs, and removes access to the parent process's secrets.
+Docker comes after the platform list and only when the runtime kind is neither `native` nor `docker`, so the native runtime never falls back to it. When no backend is available, the native runtime uses application-layer security only (`none`), while the Docker runtime keeps its container boundary (`docker-runtime`).
+
+The sandbox confines filesystem access to the workspace and removes access to the parent process's secrets. Network handling varies by backend; see [Sandboxing](./sandboxing.md#network).
 
 Docs: [Sandboxing](./sandboxing.md).
 

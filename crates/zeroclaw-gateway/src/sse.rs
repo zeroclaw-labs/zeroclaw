@@ -30,14 +30,19 @@ use zeroclaw_runtime::observability::broadcast::{history_events, is_public_event
 /// buffering the secret, which the credential boundary forbids.
 pub async fn handle_sse_events(
     State(state): State<AppState>,
+    dashboard: Option<axum::Extension<std::sync::Arc<crate::dashboard_session::DashboardAuth>>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    use crate::dashboard_session::{OperatorSession, operator_session, session_lost};
+
     // Auth check. When pairing is enabled every subscriber that reaches the
     // stream below has passed the bearer check, so the stream is authenticated;
     // when it is disabled no subscriber is authenticated. That posture decides
     // whether broadcast-only pairing secrets may ride the stream (see
-    // `sse_frame_for_stream`).
+    // `sse_frame_for_stream`). A signed-in administrator session stands in for
+    // the bearer; its stream ends when the session stops admitting it.
     let auth_enforced = state.pairing.require_pairing();
+    let mut session_watch = None;
     if auth_enforced {
         let token = headers
             .get(header::AUTHORIZATION)
@@ -45,14 +50,43 @@ pub async fn handle_sse_events(
             .and_then(|auth| auth.strip_prefix("Bearer "))
             .unwrap_or("");
 
-        if !state.pairing.is_authenticated(token) {
-            return (
-                StatusCode::UNAUTHORIZED,
-                "Unauthorized — provide Authorization: Bearer <token>",
-            )
-                .into_response();
+        let session = if token.is_empty() {
+            operator_session(dashboard.as_ref().map(|axum::Extension(auth)| auth), &state)
+        } else {
+            OperatorSession::Absent
+        };
+        match session {
+            OperatorSession::Admitted(watch) => session_watch = watch,
+            OperatorSession::Denied(denied) => return denied,
+            OperatorSession::Absent => {
+                if !state.pairing.is_authenticated(token) {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        "Unauthorized — provide Authorization: Bearer <token>",
+                    )
+                        .into_response();
+                }
+            }
         }
     }
+    // The session is watched from a task of its own, so a response body the
+    // transport stopped polling holds nothing of the session: the stream
+    // keeps only the cancellation that ends it, and the guard that stops the
+    // watching task when the stream is dropped.
+    let session_ended = tokio_util::sync::CancellationToken::new();
+    let direct_ends = session_watch
+        .as_ref()
+        .map(crate::dashboard_session::SessionWatch::direct_ends);
+    let watcher = session_watch.map(|watch| {
+        let ended = session_ended.clone();
+        let watch_state = state.clone();
+        crate::dashboard_session::TaskGuard(zeroclaw_spawn::spawn!(async move {
+            let mut watch = Some(watch);
+            session_lost(&mut watch, &watch_state).await;
+            drop(watch);
+            ended.cancel();
+        }))
+    });
 
     let rx = state.event_tx.subscribe();
     let stream = BroadcastStream::new(rx).filter_map(
@@ -67,6 +101,25 @@ pub async fn handle_sse_events(
             }
         },
     );
+
+    // Ends with the dashboard session that opened it; never, otherwise. What
+    // the stream can see by itself ends it at once; the rest (expiry, a
+    // recheck the policy fails) arrives through the watching task.
+    let ended = async move {
+        match direct_ends {
+            Some((session_cancelled, mut stopping)) => tokio::select! {
+                () = session_ended.cancelled() => {}
+                () = session_cancelled.cancelled() => {}
+                () = crate::dashboard_session::SessionWatch::generation_stopped(&mut stopping) => {}
+            },
+            None => session_ended.cancelled().await,
+        }
+    };
+    let stream = futures_util::StreamExt::take_until(stream, ended);
+    let stream = futures_util::StreamExt::map(stream, move |event| {
+        let _watching = &watcher;
+        event
+    });
 
     Sse::new(stream)
         .keep_alive(KeepAlive::default())

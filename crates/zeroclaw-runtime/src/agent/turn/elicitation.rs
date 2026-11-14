@@ -644,6 +644,7 @@ runtime_profile = "hinted"
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                 crate::agent::loop_::ResolvedModelAccess {
                     model_provider: spec.provider,
@@ -673,6 +674,7 @@ runtime_profile = "hinted"
                     strict_tool_parsing: false,
                     parallel_tools: false,
                     max_tool_result_chars: 30_000,
+                    keep_tool_context_turns: 2,
                     context_limits: zeroclaw_config::schema::ResolvedContextLimits {
                         model_context_window: 100_000,
                         context_token_budget: 100_000,
