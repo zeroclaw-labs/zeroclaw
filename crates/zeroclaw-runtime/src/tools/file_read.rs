@@ -912,6 +912,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_read_large_ranges_preserve_unicode_lines_and_clamp_at_eof() {
+        let workspace = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            workspace.path().join("lines.txt"),
+            "first 中文\r\nsecond 🦀\r\nthird e\u{301}\r\n",
+        )
+        .await
+        .unwrap();
+        let tool = test_tool(workspace.path().to_path_buf());
+        for (offset, expected) in [
+            (
+                1,
+                "1: first 中文\n2: second 🦀\n3: third e\u{301}\n[3 lines total]",
+            ),
+            (2, "2: second 🦀\n3: third e\u{301}\n[Lines 2-3 of 3]"),
+            (u64::MAX, "[No lines in range, file has 3 lines]"),
+        ] {
+            let result = tool
+                .execute(json!({"path": "lines.txt", "offset": offset, "limit": u64::MAX}))
+                .await
+                .unwrap();
+            assert!(result.success, "offset={offset}: {result:?}");
+            assert_eq!(result.output.as_str(), expected, "offset={offset}");
+        }
+    }
+
+    #[tokio::test]
     async fn file_read_offset_beyond_end() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_read_offset_end");
         let _ = tokio::fs::remove_dir_all(&dir).await;
