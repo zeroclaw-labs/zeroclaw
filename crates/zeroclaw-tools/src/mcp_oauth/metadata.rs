@@ -192,24 +192,25 @@ pub fn validate_protected_resource(
 
 /// RFC 8414 §3.3 issuer comparison: exact scheme, case-insensitive host,
 /// defaulted port, exact path. (The RFC's https relaxation is a subset of
-/// this stricter equality after URL normalization.)
-fn issuer_matches(actual: &Url, expected: &Url) -> bool {
+/// this stricter equality after URL normalization.) Also used by the
+/// manager to bind a stored grant to the discovered issuer (S3-4).
+pub(crate) fn issuer_matches(actual: &Url, expected: &Url) -> bool {
     // RFC 8414 §2: an issuer identifier carries no query or fragment, so a
     // declared issuer that does carries none of the identity it claims;
     // rejecting it here keeps the check symmetric with the PRM side.
     if actual.query().is_some() || actual.fragment().is_some() {
         return false;
     }
-    origin_key(actual).is_ok()
-        && origin_key(expected).is_ok()
-        && origin_key(actual).expect("checked") == origin_key(expected).expect("checked")
-        && {
-            let ap = actual.path().trim_end_matches('/');
-            let ep = expected.path().trim_end_matches('/');
-            let ap = if ap.is_empty() { "/" } else { ap };
-            let ep = if ep.is_empty() { "/" } else { ep };
-            ap == ep
-        }
+    matches!(
+        (origin_key(actual), origin_key(expected)),
+        (Ok(a), Ok(b)) if a == b
+    ) && {
+        let ap = actual.path().trim_end_matches('/');
+        let ep = expected.path().trim_end_matches('/');
+        let ap = if ap.is_empty() { "/" } else { ap };
+        let ep = if ep.is_empty() { "/" } else { ep };
+        ap == ep
+    }
 }
 
 /// Validate an authorization-server document for the expected issuer and
@@ -272,7 +273,7 @@ pub fn validate_auth_server(document: serde_json::Value, issuer: &Url) -> Result
         .unwrap_or_else(|| vec!["authorization_code".to_string(), "implicit".to_string()]);
     if !grants.iter().any(|g| g == "authorization_code") {
         bail!(
-            "authorization server {issuer} does not support the authorization_code grant (advertiseds: {grants:?})"
+            "authorization server {issuer} does not support the authorization_code grant (advertised: {grants:?})"
         );
     }
     let responses = metadata
@@ -280,7 +281,7 @@ pub fn validate_auth_server(document: serde_json::Value, issuer: &Url) -> Result
         .unwrap_or_else(|| vec!["code".to_string()]);
     if !responses.iter().any(|r| r == "code") {
         bail!(
-            "authorization server {issuer} does not support the `code` response type (advertiseds: {responses:?})"
+            "authorization server {issuer} does not support the `code` response type (advertised: {responses:?})"
         );
     }
     let challenges = metadata
@@ -288,7 +289,7 @@ pub fn validate_auth_server(document: serde_json::Value, issuer: &Url) -> Result
         .unwrap_or_default();
     if !challenges.iter().any(|m| m == "S256") {
         bail!(
-            "authorization server {issuer} does not advertise PKCE S256 support (advertiseds: {challenges:?}); plain authorization-code without PKCE is not accepted for public clients"
+            "authorization server {issuer} does not advertise PKCE S256 support (advertised: {challenges:?}); plain authorization-code without PKCE is not accepted for public clients"
         );
     }
     let auth_methods = metadata
@@ -296,7 +297,7 @@ pub fn validate_auth_server(document: serde_json::Value, issuer: &Url) -> Result
         .unwrap_or_else(|| vec!["client_secret_basic".to_string()]);
     if !auth_methods.iter().any(|m| m == "none") {
         bail!(
-            "authorization server {issuer} does not support public-client token auth (`none`); ZeroClaw does not manage client secrets (advertiseds: {auth_methods:?})"
+            "authorization server {issuer} does not support public-client token auth (`none`); ZeroClaw does not manage client secrets (advertised: {auth_methods:?})"
         );
     }
 

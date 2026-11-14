@@ -30,6 +30,7 @@ pub mod browser;
 pub mod challenge;
 pub mod discovery;
 pub mod listener;
+pub mod manager;
 pub mod metadata;
 pub mod pkce;
 pub mod policy;
@@ -38,16 +39,18 @@ pub mod registration;
 pub mod resource;
 pub mod store;
 pub mod tokens;
+pub mod wiring;
 
 pub use browser::{BrowserLauncher, SystemBrowserLauncher};
 pub use challenge::{BearerChallenge, parse_bearer_challenge};
 pub use discovery::{OAuthDiscovery, discover_oauth};
 pub use listener::{CALLBACK_WAIT_TIMEOUT, CallbackFlow, LoopbackListener};
+pub use manager::{McpOAuthManager, TransportOAuth};
 pub use metadata::{AuthorizationServerMetadata, ProtectedResourceMetadata, ValidatedAs};
 pub use pkce::Pkce;
 pub use policy::{
     OAuthClientFactory, build_oauth_http_client, ensure_oauth_url, is_exact_loopback_host,
-    origin_key, validate_advertised_message_endpoint,
+    origin_key,
 };
 pub use refresh::RefreshCoordinator;
 pub use registration::{RegisteredClient, register_client};
@@ -57,3 +60,4 @@ pub use tokens::{
     TokenEndpointError, TokenErrorKind, TokenSet, bearer_header_value, exchange_code,
     refresh_tokens,
 };
+pub use wiring::shared_oauth_manager;

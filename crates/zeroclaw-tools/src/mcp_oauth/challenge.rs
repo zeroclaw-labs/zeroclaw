@@ -229,9 +229,91 @@ fn is_token_char(byte: u8) -> bool {
     )
 }
 
+/// Pick the `WWW-Authenticate` field of a response that carries the OAuth
+/// challenge. A server advertising several schemes may send one field per
+/// scheme (RFC 9110 §8.6.1 allows that as readily as a comma-separated
+/// list), and the first is then often a `Basic` challenge while the Bearer
+/// parameters naming this resource's authorization server sit in a later
+/// field; reading only the first drops the `resource_metadata` hint that
+/// lets discovery reach a login service at a custom URL. Every field goes
+/// through [`parse_bearer_challenge`], so a field that packs several
+/// challenges stays handled. When no field carries a Bearer challenge the
+/// first one is returned unchanged, so a caller sees the answer it sees
+/// today.
+pub fn pick_bearer_challenge(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let mut first: Option<&str> = None;
+    for value in headers
+        .get_all(reqwest::header::WWW_AUTHENTICATE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+    {
+        if first.is_none() {
+            first = Some(value);
+        }
+        if parse_bearer_challenge(value).is_some() {
+            return Some(value.to_string());
+        }
+    }
+    first.map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn picks_the_field_that_carries_the_bearer_challenge() {
+        // A server may advertise one scheme per field, and the Bearer
+        // parameters that make discovery work are then in the second field.
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.append(
+            reqwest::header::WWW_AUTHENTICATE,
+            reqwest::header::HeaderValue::from_static("Basic realm=\"mcp\""),
+        );
+        headers.append(
+            reqwest::header::WWW_AUTHENTICATE,
+            reqwest::header::HeaderValue::from_static(
+                "Bearer realm=\"mcp\", resource_metadata=\"https://as.example/prm\"",
+            ),
+        );
+        let picked = pick_bearer_challenge(&headers).expect("a bearer field");
+        assert_eq!(
+            picked,
+            "Bearer realm=\"mcp\", resource_metadata=\"https://as.example/prm\""
+        );
+        assert_eq!(
+            parse_bearer_challenge(&picked)
+                .expect("the picked field parses")
+                .resource_metadata
+                .as_deref(),
+            Some("https://as.example/prm"),
+            "the picked field is the one carrying the hint discovery needs"
+        );
+    }
+
+    #[test]
+    fn keeps_the_first_field_when_no_bearer_challenge_is_present() {
+        // A non-Bearer answer is still the answer the server gave: the caller
+        // reports it rather than inventing a challenge.
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.append(
+            reqwest::header::WWW_AUTHENTICATE,
+            reqwest::header::HeaderValue::from_static("Basic realm=\"mcp\""),
+        );
+        headers.append(
+            reqwest::header::WWW_AUTHENTICATE,
+            reqwest::header::HeaderValue::from_static("Negotiate"),
+        );
+        assert_eq!(
+            pick_bearer_challenge(&headers).as_deref(),
+            Some("Basic realm=\"mcp\"")
+        );
+        assert_eq!(
+            pick_bearer_challenge(&reqwest::header::HeaderMap::new()),
+            None,
+            "no challenge header is not a challenge"
+        );
+    }
 
     #[test]
     fn parses_typical_mcp_401_challenge() {

@@ -26,9 +26,11 @@
 //! - the OAuth fetch client follows **no redirects at all**, and bearer
 //!   material never rides along (tokens are only attached by the transport to
 //!   the resource origin, never to these discovery URLs);
-//! - a server-advertised SSE message endpoint must share the configured
-//!   URL's origin: an advertised endpoint is untrusted server output and may
-//!   not move the session to another host.
+//! - a server-advertised SSE message endpoint is confined to the configured
+//!   URL's origin by the shared `require_sse_origin` gate in `mcp_transport`
+//!   (the confined-SSE-endpoints change); with `oauth = true` the configured
+//!   URL must itself be scheme-safe (https, or http on exact loopback), so
+//!   the bearer can never ride plaintext.
 
 use anyhow::{Context, Result, bail};
 use reqwest::Url;
@@ -107,21 +109,6 @@ pub fn ensure_oauth_url(url: &Url, what: &str) -> Result<()> {
     }
     if url.host_str().filter(|host| !host.is_empty()).is_none() {
         bail!("{what} URL has no host");
-    }
-    Ok(())
-}
-
-/// Reject a server-advertised SSE message endpoint that does not share the
-/// configured MCP URL's origin. The configured URL is trusted operator
-/// input; the advertised endpoint is not.
-pub fn validate_advertised_message_endpoint(configured: &Url, advertised: &Url) -> Result<()> {
-    ensure_oauth_url(advertised, "SSE message endpoint")?;
-    if origin_key(configured)? != origin_key(advertised)? {
-        bail!(
-            "advertised SSE message endpoint must share the configured MCP origin, got {} for {}",
-            advertised,
-            configured
-        );
     }
     Ok(())
 }
@@ -472,25 +459,6 @@ mod tests {
             origin_key(&url("https://host:8443/x")).expect("ok"),
             origin_key(&url("https://host/x")).expect("ok")
         );
-    }
-
-    #[test]
-    fn advertised_endpoint_must_share_origin() {
-        let configured = url("https://mcp.example.com/mcp");
-        validate_advertised_message_endpoint(
-            &configured,
-            &url("https://mcp.example.com/sse/messages"),
-        )
-        .expect("same origin ok");
-        validate_advertised_message_endpoint(
-            &configured,
-            &url("https://evil.example.com/messages"),
-        )
-        .expect_err("cross-origin rejected");
-        validate_advertised_message_endpoint(&configured, &url("http://mcp.example.com/messages"))
-            .expect_err("downgrade rejected");
-        validate_advertised_message_endpoint(&configured, &url("https://mcp.example.com:8443/msg"))
-            .expect_err("port change rejected");
     }
 
     #[test]
