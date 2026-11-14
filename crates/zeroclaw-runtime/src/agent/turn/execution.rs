@@ -203,6 +203,9 @@ pub struct ResolvedAgentExecution<'a> {
     pub observer: &'a dyn Observer,
     /// Suppress stderr output (subagents/reviews run silent).
     pub silent: bool,
+    /// Entry-declared interactivity for live-SOP step re-assembly (see
+    /// [`ResolvedIo::live_sop_interactive`]).
+    pub live_sop_interactive: bool,
     /// Approval policy + back-channel; `None` for paths that never prompt.
     pub approval: Option<&'a ApprovalManager>,
     /// The agent's filesystem policy, applied by the no-vision image-marker
@@ -262,6 +265,14 @@ pub struct ResolvedIo<'a> {
     pub tools_registry: &'a ScopedToolRegistry,
     pub observer: &'a dyn Observer,
     pub silent: bool,
+    /// Entry-declared interactivity carried so a live-SOP step's nested
+    /// driver re-assembles MCP registries with the enclosing turn's posture
+    /// (see `ScopedAssembly::interactive`). Set from the entry's declared
+    /// interactive flag by the foreground `run` paths; every unattended
+    /// surface (daemon, channel, streamed Agent turns, tests) sets false.
+    /// Carried explicitly rather than derived from `silent`, which is about
+    /// output, not about who owns the terminal.
+    pub live_sop_interactive: bool,
     pub approval: Option<&'a ApprovalManager>,
     /// Filesystem policy for the no-vision image-marker gate; `None` on
     /// configless (test) paths. See [`ResolvedAgentExecution::security`].
@@ -305,6 +316,7 @@ impl<'a> ResolvedAgentExecution<'a> {
             tools_registry: io.tools_registry,
             observer: io.observer,
             silent: io.silent,
+            live_sop_interactive: io.live_sop_interactive,
             approval: io.approval,
             security: io.security,
             multimodal_config: io.multimodal_config,

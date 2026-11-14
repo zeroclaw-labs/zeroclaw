@@ -2191,7 +2191,14 @@ async fn connect_heartbeat_mcp_registry(
     // the "construct the registry once per worker" guarantee
     // still holds whenever the registry IS reachable — the healthy
     // case this targets.
-    match crate::tools::McpRegistry::connect_all(&servers).await {
+    // The heartbeat worker is the background runtime: it never opens a
+    // browser (design §5), so an unauthorized `oauth = true` server is
+    // skipped by the same non-fatal path as any unreachable server, with an
+    // actionable "sign in from an interactive session" error in the log.
+    let oauth_manager = zeroclaw_tools::mcp_oauth::shared_oauth_manager(config);
+    match crate::tools::McpRegistry::connect_all_with_oauth(&servers, oauth_manager.as_ref(), false)
+        .await
+    {
         Ok(registry) => Ok(Some(std::sync::Arc::new(registry))),
         Err(e) => {
             ::zeroclaw_log::record!(

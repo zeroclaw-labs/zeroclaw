@@ -1245,6 +1245,11 @@ async fn agent_turn_with_sop_reassembly(
                 tools_registry,
                 observer,
                 silent,
+                // This wrapper serves channel/daemon turns only; the entry's
+                // declared posture never reaches here, so it stays explicit
+                // false rather than an accidental `!silent` (see
+                // `ResolvedIo::live_sop_interactive`).
+                live_sop_interactive: false,
                 approval,
                 multimodal_config,
                 config,
@@ -1860,6 +1865,11 @@ async fn run_inner(
                 runtime: runtime.clone(),
                 caller_allowed: allowed_tools.as_deref(),
                 connect_mcp: true,
+                // Foreground operator entry: `agent::run` receives the
+                // entry-declared interactive posture (the CLI passes true;
+                // daemon, cron and channel callers pass false through the
+                // same parameter).
+                interactive,
                 connect_peripherals: true,
                 // A memory-free run drops the persistent memory tools so the model
                 // cannot read or write memory even though the registry is otherwise
@@ -2469,6 +2479,7 @@ async fn run_inner(
                                         tools_registry: &tools_registry,
                                         observer: observer.as_ref(),
                                         silent: !interactive,
+                                        live_sop_interactive: interactive,
                                         approval: approval_manager.as_ref(),
                                         multimodal_config: &config.multimodal,
                                         config: Some(&config),
@@ -3123,6 +3134,11 @@ async fn run_inner(
                                             tools_registry: &tools_registry,
                                             observer: observer.as_ref(),
                                             silent: true,
+                                            // One-shot turn: carries the
+                                            // same entry-declared posture as
+                                            // the session branch (false for
+                                            // unattended run() callers).
+                                            live_sop_interactive: interactive,
                                             approval: approval_manager.as_ref(),
                                             multimodal_config: &config.multimodal,
                                             config: Some(&config),
@@ -3943,6 +3959,9 @@ async fn process_message_inner(
                 runtime: runtime.clone(),
                 caller_allowed: None,
                 connect_mcp: true,
+                // Channel ingress: unattended by definition, even when the
+                // daemon runs in a foreground terminal.
+                interactive: false,
                 connect_peripherals: true,
                 exclude_memory: false,
                 acp_delivery: false,
@@ -6318,6 +6337,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -6567,6 +6587,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -7001,6 +7022,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -7088,6 +7110,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -7204,6 +7227,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -7376,6 +7400,7 @@ mod tests {
                 sop_reassembly: None,
                 capability_binding: None,
                 exec: ResolvedAgentExecution {
+                    live_sop_interactive: false,
                     model_access: ResolvedModelAccess {
                         model_provider: &model_provider,
                         provider_name: "mock-provider",
@@ -7476,6 +7501,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -7575,6 +7601,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -7659,6 +7686,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -7746,6 +7774,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -7834,6 +7863,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "scripted",
@@ -7909,6 +7939,7 @@ mod tests {
                 sop_reassembly: None,
                 capability_binding: None,
                 exec: ResolvedAgentExecution {
+                    live_sop_interactive: false,
                     model_access: ResolvedModelAccess {
                         model_provider: &model_provider,
                         provider_name: "scripted",
@@ -8107,6 +8138,7 @@ mod tests {
                 sop_reassembly: None,
                 capability_binding: None,
                 exec: ResolvedAgentExecution {
+                    live_sop_interactive: false,
                     model_access: ResolvedModelAccess {
                         model_provider: &model_provider,
                         provider_name: "scripted",
@@ -8242,6 +8274,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -8329,6 +8362,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "scripted",
@@ -8415,6 +8449,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -8586,6 +8621,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -8757,6 +8793,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -8894,6 +8931,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -9202,6 +9240,7 @@ mod tests {
                 sop_reassembly: None,
                 capability_binding: None,
                 exec: ResolvedAgentExecution {
+                    live_sop_interactive: false,
                     model_access: ResolvedModelAccess {
                         model_provider: &model_provider,
                         provider_name: "mock-provider",
@@ -9496,6 +9535,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -9651,6 +9691,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -9833,6 +9874,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -9951,6 +9993,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -10053,6 +10096,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -10147,6 +10191,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -10249,6 +10294,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -10354,6 +10400,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -10465,6 +10512,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -10568,6 +10616,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -10755,6 +10804,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -10901,6 +10951,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -11017,6 +11068,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -11119,6 +11171,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -11225,6 +11278,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -11333,6 +11387,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -11459,6 +11514,7 @@ mod tests {
                         sop_reassembly: None,
                         capability_binding: None,
                         exec: ResolvedAgentExecution {
+                            live_sop_interactive: false,
                             model_access: ResolvedModelAccess {
                                 model_provider: &model_provider,
                                 provider_name: "mock-provider",
@@ -11559,6 +11615,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -11657,6 +11714,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
@@ -11750,6 +11808,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
@@ -11841,6 +11900,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
@@ -11938,6 +11998,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
@@ -12062,6 +12123,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
@@ -12192,6 +12254,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
@@ -12310,6 +12373,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
@@ -12406,6 +12470,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -12506,6 +12571,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
@@ -12589,6 +12655,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
@@ -12673,6 +12740,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
@@ -12757,6 +12825,7 @@ mod tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
@@ -12843,6 +12912,7 @@ This is an example, not an invocation."#;
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
@@ -12933,6 +13003,7 @@ This is an example, not an invocation."#;
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
@@ -13035,6 +13106,7 @@ This is an example, not an invocation."#;
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
@@ -13121,6 +13193,7 @@ Done."#;
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
@@ -13210,6 +13283,7 @@ Done."#;
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
@@ -13297,6 +13371,7 @@ Done."#;
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
@@ -13385,6 +13460,7 @@ This is an example, not an invocation."#;
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
@@ -13530,6 +13606,7 @@ This is an example, not an invocation."#;
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
@@ -13626,6 +13703,7 @@ This is an example, not an invocation."#;
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
@@ -13725,6 +13803,7 @@ This is an example, not an invocation."#;
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
@@ -13847,6 +13926,7 @@ This is an example, not an invocation."#;
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -13982,6 +14062,7 @@ This is an example, not an invocation."#;
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -14087,6 +14168,7 @@ This is an example, not an invocation."#;
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -14203,6 +14285,7 @@ This is an example, not an invocation."#;
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
@@ -15122,6 +15205,7 @@ This is an example, not an invocation."#;
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -15240,6 +15324,7 @@ This is an example, not an invocation."#;
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -15353,6 +15438,7 @@ This is an example, not an invocation."#;
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -15466,6 +15552,7 @@ This is an example, not an invocation."#;
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -15637,6 +15724,7 @@ This is an example, not an invocation."#;
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &router,
                     provider_name: "router",
@@ -17564,6 +17652,7 @@ Let me check the result."#;
         };
         let assembled = crate::tools::scoped::ScopedToolRegistry::assemble(
             crate::tools::scoped::ScopedAssembly {
+                interactive: false,
                 config: &config,
                 agent_alias: "test",
                 security: &security,
@@ -18663,6 +18752,7 @@ Let me check the result."#;
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -18857,6 +18947,7 @@ Let me check the result."#;
                     sop_reassembly: None,
                     capability_binding: None,
                     exec: ResolvedAgentExecution {
+                        live_sop_interactive: false,
                         model_access: ResolvedModelAccess {
                             model_provider: &model_provider,
                             provider_name: "mock-provider",
@@ -18987,6 +19078,7 @@ Let me check the result."#;
                     capability_binding: None,
                     served_route_sink: None,
                     exec: ResolvedAgentExecution {
+                        live_sop_interactive: false,
                         model_access: ResolvedModelAccess {
                             model_provider: &provider,
                             provider_name: "reliable-test",
@@ -19207,6 +19299,7 @@ Let me check the result."#;
                     sop_reassembly: None,
                     capability_binding: None,
                     exec: ResolvedAgentExecution {
+                        live_sop_interactive: false,
                         model_access: ResolvedModelAccess {
                             model_provider: &provider,
                             provider_name: "reliable-test",
@@ -19316,6 +19409,7 @@ Let me check the result."#;
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "recording-provider",
@@ -19446,6 +19540,7 @@ Let me check the result."#;
                     sop_reassembly: None,
                     capability_binding: None,
                     exec: ResolvedAgentExecution {
+                        live_sop_interactive: false,
                         model_access: ResolvedModelAccess {
                             model_provider: &model_provider,
                             provider_name: "mock-provider",
@@ -19549,6 +19644,7 @@ Let me check the result."#;
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -19651,6 +19747,7 @@ Let me check the result."#;
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "anthropic.personal",
@@ -21266,6 +21363,7 @@ Let me check the result."#;
 
         let assembled = crate::tools::scoped::ScopedToolRegistry::assemble(
             crate::tools::scoped::ScopedAssembly {
+                interactive: false,
                 config: &config,
                 agent_alias: "test",
                 security: &policy,
@@ -21523,6 +21621,7 @@ Let me check the result."#;
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
@@ -21626,6 +21725,7 @@ Let me check the result."#;
                     sop_reassembly: None,
                     capability_binding: None,
                     exec: ResolvedAgentExecution {
+                        live_sop_interactive: false,
                         model_access: ResolvedModelAccess {
                             model_provider: &model_provider,
                             provider_name: "mock-provider",
@@ -21905,6 +22005,7 @@ Let me check the result."#;
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
@@ -22118,6 +22219,7 @@ Let me check the result."#;
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
@@ -22227,6 +22329,7 @@ Let me check the result."#;
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
@@ -22551,6 +22654,7 @@ Let me check the result."#;
                 sop_reassembly: None,
                 capability_binding: None,
                 exec: ResolvedAgentExecution {
+                    live_sop_interactive: false,
                     model_access: ResolvedModelAccess {
                         model_provider: &provider,
                         provider_name: "budget-provider",
@@ -22969,6 +23073,7 @@ Let me check the result."#;
                 sop_reassembly: None,
                 capability_binding: None,
                 exec: ResolvedAgentExecution {
+                    live_sop_interactive: false,
                     model_access: ResolvedModelAccess {
                         model_provider: &provider,
                         provider_name: "mock-provider",
@@ -23095,6 +23200,7 @@ Let me check the result."#;
                 sop_reassembly: None,
                 capability_binding: None,
                 exec: ResolvedAgentExecution {
+                    live_sop_interactive: false,
                     model_access: ResolvedModelAccess {
                         model_provider: if streaming {
                             &stream_provider
@@ -23371,6 +23477,7 @@ Let me check the result."#;
                 sop_reassembly: None,
                 capability_binding: None,
                 exec: ResolvedAgentExecution {
+                    live_sop_interactive: false,
                     model_access: ResolvedModelAccess {
                         model_provider: &provider,
                         provider_name: "mock-provider",

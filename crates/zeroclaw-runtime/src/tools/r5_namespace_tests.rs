@@ -138,6 +138,8 @@ async fn assemble_case(
         runtime,
         caller_allowed,
         connect_mcp: false,
+        // Namespace probes are test surfaces: unattended.
+        interactive: false,
         connect_peripherals: false,
         exclude_memory: false,
         acp_delivery: false,
@@ -920,6 +922,8 @@ async fn late_assemble(
         runtime: case.runtime.clone(),
         caller_allowed: caller,
         connect_mcp: connect,
+        // Namespace probes are test surfaces: unattended.
+        interactive: false,
         connect_peripherals: false,
         exclude_memory,
         acp_delivery: false,

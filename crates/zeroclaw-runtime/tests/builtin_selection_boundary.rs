@@ -90,6 +90,7 @@ async fn assemble_context(
     )
     .unwrap();
     ScopedToolRegistry::assemble(ScopedAssembly {
+        interactive: false,
         config,
         agent_alias: "boundary",
         security: &security,

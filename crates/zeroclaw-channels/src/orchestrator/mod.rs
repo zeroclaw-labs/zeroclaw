@@ -10500,6 +10500,7 @@ async fn process_channel_message_body(
                         temperature: thinking.effective_temperature,
                     },
                     ResolvedIo {
+                        live_sop_interactive: false,
                         tools_registry: ctx.tools_registry.as_ref(),
                         observer: notify_observer.as_ref() as &dyn Observer,
                         silent: true,
@@ -16726,6 +16727,9 @@ async fn assemble_channel_agent_tools(
             => async {
                 zeroclaw_runtime::tools::scoped::ScopedToolRegistry::assemble(
                     zeroclaw_runtime::tools::scoped::ScopedAssembly {
+                        // Channel ingress: unattended by definition, even
+                        // when the daemon runs in a foreground terminal.
+                        interactive: false,
                         config,
                         agent_alias,
                         security,

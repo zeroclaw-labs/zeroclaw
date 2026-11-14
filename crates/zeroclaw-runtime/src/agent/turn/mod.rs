@@ -1720,6 +1720,7 @@ async fn run_tool_call_loop_impl<'a>(
         tools_registry,
         observer,
         silent,
+        live_sop_interactive,
         approval,
         security,
         multimodal_config,
@@ -3803,6 +3804,11 @@ async fn run_tool_call_loop_impl<'a>(
                 tools_registry,
                 observer,
                 silent,
+                // The entry posture of the enclosing turn is carried by the
+                // driver input (`live_sop_interactive`), declared so a
+                // cross-agent SOP step's fresh MCP connections inherit the
+                // human-ownership decision rather than probing the TTY.
+                live_sop_interactive,
                 approval,
                 security,
                 multimodal_config,
@@ -4169,13 +4175,19 @@ pub(crate) async fn assemble_owned_execution(
         parent_approval,
         memory_owner,
         None,
+        false,
     )
     .await
 }
 
 /// [`assemble_owned_execution`] with the step agent's memory, provider and any
 /// source-supplied tools obtained from `capabilities`, and its provider
-/// resolved for `principal`, the enclosing turn's.
+/// resolved for `principal`, the enclosing turn's. The extra `interactive`
+/// parameter is an explicit entry-declared posture (see
+/// `ScopedAssembly::interactive`); the `too_many_arguments` allow matches the
+/// sibling `run*` entries this mirrors rather than folding the flag into an
+/// unrelated bool.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn assemble_owned_execution_with_capabilities(
     config: &zeroclaw_config::schema::Config,
     live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
@@ -4187,6 +4199,9 @@ pub(crate) async fn assemble_owned_execution_with_capabilities(
     parent_approval: Option<&crate::approval::ApprovalManager>,
     memory_owner: Option<&zeroclaw_api::memory_traits::PrincipalScope>,
     execution_admission: Option<AgentExecutionAdmission>,
+    // Entry-declared interactivity (see `ScopedAssembly::interactive`): only
+    // the foreground run paths pass true; unattended surfaces pass false.
+    interactive: bool,
 ) -> Result<OwnedAgentExecution> {
     if let Some(admission) = execution_admission.as_ref() {
         admission.revalidate().map_err(|error| {
@@ -4282,6 +4297,7 @@ pub(crate) async fn assemble_owned_execution_with_capabilities(
     // live daemon holds exclusively.
     let assembled = crate::tools::scoped::ScopedToolRegistry::assemble_prepared(
         crate::tools::scoped::ScopedAssembly {
+            interactive,
             config,
             agent_alias: alias,
             security: &security,
@@ -4431,6 +4447,10 @@ async fn drive_live_sop_actions(
     tools_registry: &crate::tools::scoped::ScopedToolRegistry,
     observer: &dyn crate::observability::Observer,
     silent: bool,
+    // Entry-declared interactivity for any MCP registry a cross-agent SOP
+    // step re-assembles here, carried from the enclosing turn's input (see
+    // `ResolvedIo::live_sop_interactive`); unattended surfaces carry false.
+    live_sop_interactive: bool,
     approval: Option<&crate::approval::ApprovalManager>,
     // The enclosing agent's filesystem policy, threaded from the turn loop's
     // execution context. Same-agent nested SOP steps run under it; a
@@ -4638,6 +4658,7 @@ async fn drive_live_sop_actions(
                                             approval,
                                             step_owner,
                                             execution_admission.clone(),
+                                            live_sop_interactive,
                                         )
                                         .await
                                     }
@@ -4653,6 +4674,7 @@ async fn drive_live_sop_actions(
                                             approval,
                                             step_owner,
                                             execution_admission.clone(),
+                                            live_sop_interactive,
                                         )
                                         .await
                                     }
@@ -4908,6 +4930,7 @@ async fn drive_live_sop_actions(
                                             tools_registry: eff_registry,
                                             observer,
                                             silent,
+                                            live_sop_interactive,
                                             approval: eff_approval,
                                             // Same-agent steps run under the
                                             // enclosing agent's policy; a
@@ -7190,6 +7213,7 @@ vision_model_provider = "custom.vision"
                     temperature: None,
                 },
                 ResolvedIo {
+                    live_sop_interactive: false,
                     tools_registry: &tools_registry,
                     observer: &observer,
                     silent: true,
@@ -8509,6 +8533,7 @@ mod sop_step_reassembly_tests {
                     temperature: None,
                 },
                 ResolvedIo {
+                    live_sop_interactive: false,
                     tools_registry: tools,
                     observer: &observer,
                     silent: true,
@@ -9260,6 +9285,8 @@ mod sop_step_reassembly_tests {
             parent_tools,
             observer,
             true,
+            // live_sop_interactive: unattended test harness
+            false,
             None,
             // security: no policy on the test path
             None,
@@ -11373,6 +11400,7 @@ mod tool_lifecycle_abandonment_tests {
             sop_reassembly: None,
             capability_binding: None,
             exec: ResolvedAgentExecution {
+                live_sop_interactive: false,
                 model_access: ResolvedModelAccess {
                     model_provider: provider,
                     provider_name: "scripted",
