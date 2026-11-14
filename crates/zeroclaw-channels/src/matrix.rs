@@ -10466,6 +10466,9 @@ mod tests {
 
         fn cfg(password: Option<&str>, user_id: Option<&str>) -> MatrixConfig {
             MatrixConfig {
+                ack_reaction_in_progress: None,
+                ack_reaction_done: None,
+                ack_reaction_error: None,
                 enabled: true,
                 homeserver: "https://m.org".into(),
                 access_token: None,

@@ -326,6 +326,9 @@ mod tests {
         config.channels.matrix.insert(
             "default".to_string(),
             MatrixConfig {
+                ack_reaction_in_progress: None,
+                ack_reaction_done: None,
+                ack_reaction_error: None,
                 enabled: true,
                 homeserver: "https://m.org".into(),
                 access_token: Some("tok".into()),
