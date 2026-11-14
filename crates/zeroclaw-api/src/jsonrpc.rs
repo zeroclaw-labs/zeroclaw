@@ -688,6 +688,58 @@ mod tests {
         assert_eq!(outbound.pending_count(), 0);
     }
 
+    #[tokio::test]
+    async fn closed_writer_request_leaves_no_pending_responder() {
+        let (tx, rx) = mpsc::channel(1);
+        let outbound = RpcOutbound::new(tx);
+        drop(rx);
+        let error = outbound.request("echo", json!({})).await.unwrap_err();
+
+        assert_eq!(error.code, error_codes::INTERNAL_ERROR);
+        assert_eq!(outbound.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_request_releases_its_responder_and_does_not_poison_next_request() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let outbound = RpcOutbound::new(tx);
+        let mut waiting = Box::pin(outbound.request("echo", json!({ "value": "first" })));
+        let queued = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::select! {
+                result = &mut waiting => panic!("request completed before its response: {result:?}"),
+                line = rx.recv() => line.unwrap(),
+            }
+        })
+        .await
+        .unwrap();
+        let request: JsonRpcRequest = serde_json::from_str(&queued).unwrap();
+        let id = request.id.unwrap();
+        assert_eq!(outbound.pending_count(), 1);
+
+        drop(waiting);
+
+        assert_eq!(outbound.pending_count(), 0);
+        assert!(!outbound.dispatch_validated_response(id.as_str().unwrap(), Ok(json!("late"))));
+
+        let (answer, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(
+                outbound.request("echo", json!({ "value": "next" })),
+                async {
+                    let queued = rx.recv().await.unwrap();
+                    let request: JsonRpcRequest = serde_json::from_str(&queued).unwrap();
+                    let id = request.id.unwrap();
+                    assert!(
+                        outbound.dispatch_validated_response(id.as_str().unwrap(), Ok(json!("ok")))
+                    );
+                }
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(answer.unwrap(), json!("ok"));
+        assert_eq!(outbound.pending_count(), 0);
+    }
+
     #[test]
     fn frame_parses_success_response() {
         let json = r#"{"jsonrpc":"2.0","id":"zc-out-5","result":{"answer":42}}"#;
