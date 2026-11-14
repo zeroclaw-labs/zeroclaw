@@ -933,6 +933,25 @@ pub fn count_image_markers(messages: &[ChatMessage]) -> usize {
     count_image_markers_with_current_turn_tool_results(messages, &current_turn_tool_indices)
 }
 
+/// Count the loadable image markers that belong to the CURRENT user turn
+/// only: markers in the latest user message plus the declared attachments of
+/// tool-result carriers in the current turn (carriers after the most recent
+/// user message). Carried-over markers from earlier turns are excluded.
+///
+/// Zero here with a positive [`count_image_markers`] means this turn carries
+/// no fresh image of its own — only stale markers remain in history — which
+/// is the signal the runtime's vision router uses to stop pinning a
+/// conversation to a configured vision fallback on later text turns.
+pub fn count_current_turn_image_markers(messages: &[ChatMessage]) -> usize {
+    let current_turn_tool_indices = current_turn_tool_result_indices(messages);
+    let current_turn_tool_images = current_turn_tool_indices
+        .iter()
+        .filter_map(|index| messages.get(*index))
+        .map(|message| message_image_marker_counts(message).0)
+        .sum::<usize>();
+    current_turn_tool_images + count_latest_user_image_markers(messages)
+}
+
 /// One non-owning pass over the messages the provider would normalize,
 /// returning `(loadable, rejected)` marker counts.
 ///
