@@ -10042,6 +10042,13 @@ impl RpcDispatcher {
             self.require_additional_grant(method, Resource::Config, verb)?;
         }
         let mut candidate = Box::new(self.ctx.config.read().clone());
+        #[cfg(any(test, feature = "test-util"))]
+        {
+            // Keep the historical typed maps available to fixture edits while
+            // also materializing the canonical connection rows needed by the
+            // registry editor's masked-secret preservation.
+            candidate = Box::new(zeroclaw_config::migration::admit_test_input(&candidate));
+        }
         editor::stage(&mut candidate, edit)
             .map_err(|error| rpc_err(INVALID_PARAMS, format!("{error:#}")))?;
         // A model can change without its connection changing. Match the real
@@ -10375,9 +10382,14 @@ impl RpcDispatcher {
                 format!("Refusing to overwrite secret `{prop}` with a masked or empty value"),
             ));
         }
-        config
-            .set_prop_persistent(prop, &value_str)
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")))
+        #[cfg(any(test, feature = "test-util"))]
+        let loaded_from = config.loaded_from.take();
+        let result = config.set_prop_persistent(prop, &value_str);
+        #[cfg(any(test, feature = "test-util"))]
+        {
+            config.loaded_from = loaded_from;
+        }
+        result.map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")))
     }
 
     fn refresh_memory_embedder(
