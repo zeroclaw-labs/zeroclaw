@@ -271,6 +271,10 @@ impl FirejailSandbox {
         // the wrapped command rather than becoming its arguments.
         firejail_cmd.args(&self.extra_args);
 
+        // End-of-options delimiter prevents arguments starting with '-'
+        // from being interpreted as firejail sandbox options.
+        firejail_cmd.arg("--");
+
         // Add the original command
         firejail_cmd.args(invocation);
         if let Some(current_dir) = current_dir {
@@ -561,6 +565,10 @@ mod tests {
         let args = args(&cmd);
 
         assert!(
+            args.contains(&"--".to_string()),
+            "end-of-options separator must be inserted"
+        );
+        assert!(
             args.contains(&"ls".to_string()),
             "original program must be passed as argument"
         );
@@ -571,6 +579,33 @@ mod tests {
         assert!(
             args.contains(&"/workspace".to_string()),
             "original args must be preserved"
+        );
+    }
+
+    #[test]
+    fn firejail_wrap_inserts_separator_before_invocation_to_prevent_option_injection() {
+        let sandbox = FirejailSandbox::for_test();
+        let mut cmd = Command::new("--join=existing-sandbox");
+        cmd.arg("--noprofile");
+        sandbox
+            .wrap_command_with_support(&mut cmd, FirejailHardeningSupport::default())
+            .unwrap();
+
+        let args = args(&cmd);
+        let separator_idx = args
+            .iter()
+            .position(|a| a == "--")
+            .expect("must contain '--' separator before invocation");
+
+        let program_idx = args
+            .iter()
+            .position(|a| a == "--join=existing-sandbox")
+            .expect("must preserve wrapped program name");
+
+        assert_eq!(
+            separator_idx + 1,
+            program_idx,
+            "'--' must immediately precede the wrapped command: {args:?}"
         );
     }
 
