@@ -1780,7 +1780,7 @@ fn conversation_history_key_in_scope(
 }
 
 /// History key with every channel's default thread semantics. Runtime paths
-/// use [`runtime_conversation_history_key`] or [`routed_conversation_key`],
+/// use `runtime_conversation_history_key` or `routed_conversation_key`,
 /// which also honor Matrix `session_scope` from live config.
 pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
     conversation_history_key_in_scope(msg, &channel_scope(msg), false)
