@@ -59,6 +59,7 @@ class TaskTransportTests(unittest.TestCase):
                  patch.object(module.subprocess, 'call', return_value=0) as execute:
                 self.assertEqual(module.client(['alias', *command]), 0)
                 argv = execute.call_args.args[0]
+                self.assertIn('ForkAfterAuthentication=no', argv)
                 delimiter = argv.index('--')
                 self.assertEqual(argv[delimiter + 1:], ['alias', *command])
 
@@ -140,6 +141,8 @@ class TaskTransportTests(unittest.TestCase):
         self.assertEqual(self.pool.acquire('same', [], 'host-a'), first)
         self.pool.acquire('other', [], 'host-b')
         self.assertEqual(len(FakeMaster.starts), 2)
+        for master in FakeMaster.starts:
+            self.assertIn('ForkAfterAuthentication=no', master.command)
         self.assertEqual(self.pool.entries['same']['active'], 2)
 
     def test_idle_timeout_30_minutes_and_active_command_not_killed(self):

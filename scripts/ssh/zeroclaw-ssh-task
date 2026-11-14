@@ -216,7 +216,7 @@ class Pool:
             if owner:
                 path = str(self.directory / key)
                 command = ['/usr/bin/setpriv', '--pdeathsig', 'TERM', self.ssh, '-M', '-N', '-S', path,
-                           '-o', 'ControlMaster=yes', '-o', 'ControlPersist=no',
+                           '-o', 'ControlMaster=yes', '-o', 'ControlPersist=no', '-o', 'ForkAfterAuthentication=no',
                            '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=12',
                            '-o', 'ConnectionAttempts=1', '-o', 'ForwardAgent=no',
                            '-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=3',
@@ -465,7 +465,7 @@ def client(args):
         # Fail closed if the master disappears. Never fall back to a new TCP
         # connection, another identity, password authentication or trust bypass.
         return subprocess.call([SSH, '-S', response['path'],
-                                '-o', 'ControlMaster=no', '-o', 'ControlPersist=no',
+                                '-o', 'ControlMaster=no', '-o', 'ControlPersist=no', '-o', 'ForkAfterAuthentication=no',
                                 '-o', 'ProxyCommand=/usr/bin/false',
                                 '-o', 'BatchMode=yes', '-o', 'ForwardAgent=no',
                                 *options, '--', host, *commands])
