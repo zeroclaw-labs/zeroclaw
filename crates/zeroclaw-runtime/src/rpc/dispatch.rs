@@ -5976,21 +5976,25 @@ impl RpcDispatcher {
     }
 
     /// Rebuild a reaped ACP session from a restorable durable row so a fresh
-    /// prompt recovers to a working session instead of hanging. Returns the live
-    /// agent on success, `Ok(None)` for missing, killed, or unreadable durable
-    /// state, and `Err` when the current principal cannot resume the persisted
+    /// prompt or `session/configure` recovers to a working session instead of
+    /// reporting the live incarnation missing. Returns the live agent on
+    /// success, `Ok(None)` for missing, killed, or unreadable durable state,
+    /// and `Err` when the current principal cannot resume the persisted
     /// agent/workspace binding.
     ///
     /// Rehydrate a durable ACP session while the caller holds `session_queue`
     /// for `sid`, covering the owner check through insertion. The owner is
-    /// judged by the scope `grants` give, which the prompt path resolves after
+    /// judged by the scope `grants` give, which the caller resolves after
     /// admission, so a caller that lost the administrator bypass while it
     /// waited cannot recover or revive another principal's session.
+    /// `method` is the RPC that owns this recovery; leases and binding checks
+    /// are judged against it, not hard-wired to `session/prompt`.
     async fn rehydrate_reaped_session_under_guard(
         &self,
         sid: &str,
         cancel_generation: Option<u64>,
         grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
+        method: Method,
     ) -> Result<Option<Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>>, JsonRpcError> {
         // The caller owns admission across durable loading, publication and
         // history/plan restoration. Do not reacquire the single permit here.
@@ -6087,7 +6091,7 @@ impl RpcDispatcher {
         {
             let config = self.ctx.config.read();
             self.authorize_session_binding(
-                Method::SessionPrompt,
+                method,
                 grants,
                 &config,
                 &data.agent_alias,
@@ -6097,7 +6101,7 @@ impl RpcDispatcher {
 
         if let Err(error) = recover_acp_checkpoint(
             self.spawn_handle(),
-            Method::SessionPrompt,
+            method,
             Arc::clone(&store),
             sid,
             data.principal_id.clone(),
@@ -6166,11 +6170,11 @@ impl RpcDispatcher {
 
         // Rebind the recovered row to the currently authorized canonical
         // workspace, not the pre-recovery row's spelling or earlier binding.
-        let current_grants = self.recheck_authority_after_admission(Method::SessionPrompt)?;
+        let current_grants = self.recheck_authority_after_admission(method)?;
         let workspace_dir = {
             let config = self.ctx.config.read();
             self.authorize_session_binding(
-                Method::SessionPrompt,
+                method,
                 current_grants.as_ref(),
                 &config,
                 &data.agent_alias,
@@ -6319,7 +6323,7 @@ impl RpcDispatcher {
         if let Err(error) = self
             .persist_seed_trim_before_notice(
                 sid,
-                Method::SessionPrompt,
+                method,
                 durable_owner.clone(),
                 seed_event.as_ref(),
             )
@@ -6366,7 +6370,7 @@ impl RpcDispatcher {
                         sid.to_string(),
                         session,
                         generation,
-                        |candidate| self.live_effect_lease(Method::SessionPrompt, candidate),
+                        |candidate| self.live_effect_lease(method, candidate),
                         |message| rpc_err(SESSION_BUSY, message),
                     )
                     .await
@@ -6379,7 +6383,7 @@ impl RpcDispatcher {
                         session,
                         None,
                         None,
-                        |candidate| self.live_effect_lease(Method::SessionPrompt, candidate),
+                        |candidate| self.live_effect_lease(method, candidate),
                         |message| rpc_err(SESSION_BUSY, message),
                     )
                     .await
@@ -6427,13 +6431,8 @@ impl RpcDispatcher {
             });
         }
         self.forward_seed_event(sid, seed_event).await;
-        self.replay_session_plan(
-            sid,
-            Method::SessionPrompt,
-            &published_agent,
-            published_generation,
-        )
-        .await?;
+        self.replay_session_plan(sid, method, &published_agent, published_generation)
+            .await?;
         self.ctx.sessions.touch(sid).await;
 
         ::zeroclaw_log::record!(
@@ -6461,7 +6460,7 @@ impl RpcDispatcher {
         let Ok(_admission) = self.ctx.sessions.session_queue.acquire(sid).await else {
             return Ok(None);
         };
-        self.rehydrate_reaped_session_under_guard(sid, None, grants)
+        self.rehydrate_reaped_session_under_guard(sid, None, grants, Method::SessionPrompt)
             .await
     }
 
@@ -6709,6 +6708,7 @@ impl RpcDispatcher {
                         sid,
                         Some(cancel_registration.generation()),
                         grants.as_ref(),
+                        Method::SessionPrompt,
                     )
                     .await
                 {
@@ -7748,6 +7748,53 @@ impl RpcDispatcher {
                     SESSION_BUSY,
                     "session generation reconciliation in progress; retry shortly",
                 ));
+            }
+        }
+
+        // A failed ACP turn drops the live incarnation (`RecoveryRequired`) so
+        // the next prompt rebuilds provider-safe history from the durable row.
+        // Zerocode `/model-provider` is `session/configure` and does not prompt,
+        // so without this restore a Code pane whose provider just rate-limited
+        // cannot switch: the row still exists, but configure only looked at
+        // the live map and returned SESSION_NOT_FOUND. Restore before taking
+        // the config writer gate — rehydration try-locks that same gate and
+        // must not park behind this handler.
+        if self.ctx.sessions.get_agent(&req.session_id).await.is_none() {
+            let admission = self
+                .ctx
+                .sessions
+                .session_queue
+                .acquire(&req.session_id)
+                .await
+                .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))?;
+            let grants = self.recheck_authority_after_admission(Method::SessionConfigure)?;
+            let rehydrated = self
+                .rehydrate_reaped_session_under_guard(
+                    &req.session_id,
+                    None,
+                    grants.as_ref(),
+                    Method::SessionConfigure,
+                )
+                .await?;
+            drop(admission);
+            if rehydrated.is_some() {
+                match self
+                    .ctx
+                    .sessions
+                    .await_pending_generation(&req.session_id, std::time::Duration::from_secs(30))
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(crate::rpc::session::WaitForProviderUpdateError::SessionNotFound) => {
+                        return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+                    }
+                    Err(crate::rpc::session::WaitForProviderUpdateError::Timeout) => {
+                        return Err(rpc_err(
+                            SESSION_BUSY,
+                            "session generation reconciliation in progress; retry shortly",
+                        ));
+                    }
+                }
             }
         }
 
@@ -15406,6 +15453,76 @@ mod tests {
             .expect("restorable ACP session must rehydrate");
         let agent = recovered.lock().await;
         assert_local_session_channels(&agent);
+    }
+
+    /// A failed Code-pane turn drops the live incarnation so the next prompt
+    /// rehydrates provider-safe history. `/model-provider` is
+    /// `session/configure` and must restore that row instead of answering
+    /// SESSION_NOT_FOUND for a session that still exists in the ACP store.
+    #[tokio::test]
+    async fn session_configure_rehydrates_reaped_acp_session_before_provider_switch() {
+        use zeroclaw_config::schema::AliasedAgentConfig;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_acp_test_config(&tmp);
+        {
+            let base = config
+                .providers
+                .models
+                .ensure("openai", "provider-b")
+                .expect("`openai` slot must exist");
+            base.api_key = Some("test-key-b".into());
+            base.model = Some("model-b".into());
+            base.uri = Some("http://127.0.0.1:2".into());
+        }
+        config.agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "openai.test-provider".into(),
+                risk_profile: "test-profile".into(),
+                ..Default::default()
+            },
+        );
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "cfg-reaped-acp";
+        dispatcher
+            .handle_session_new_for_test(&serde_json::json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("session/new should create the ACP session");
+        assert!(
+            sessions.remove(sid).await,
+            "a failed ACP turn drops the live incarnation"
+        );
+        assert!(
+            sessions.get_agent(sid).await.is_none(),
+            "configure must not depend on the dropped live map entry"
+        );
+
+        dispatcher
+            .handle_session_configure_for_test(&serde_json::json!({
+                "session_id": sid,
+                "overrides": { "model_provider": "openai.provider-b" }
+            }))
+            .await
+            .expect("session/configure must rehydrate the reaped ACP session and switch provider");
+
+        let agent = sessions
+            .get_agent(sid)
+            .await
+            .expect("the reaped ACP session must be live again");
+        let agent = agent.lock().await;
+        assert_eq!(
+            agent.resolved_route_for_test("anything").provider_name,
+            "openai.provider-b",
+            "the restored session must serve the provider selected by /model-provider"
+        );
     }
 
     /// The personality filename allowlist constrains the name, not its target.
@@ -36973,6 +37090,7 @@ mod tests {
                             sid,
                             None,
                             dispatcher.stamped_grants(),
+                            Method::SessionPrompt,
                         )
                         .await
                         .expect("an operator's rehydration is never refused")
@@ -39092,7 +39210,12 @@ mod tests {
         let _guard = sessions.session_queue.acquire(sid).await.unwrap();
         assert!(
             dispatcher
-                .rehydrate_reaped_session_under_guard(sid, None, dispatcher.stamped_grants())
+                .rehydrate_reaped_session_under_guard(
+                    sid,
+                    None,
+                    dispatcher.stamped_grants(),
+                    Method::SessionPrompt,
+                )
                 .await
                 .expect("an operator's rehydration is never refused")
                 .is_some()
@@ -39141,7 +39264,12 @@ mod tests {
         let _guard = sessions.session_queue.acquire(sid).await.unwrap();
         assert!(
             dispatcher
-                .rehydrate_reaped_session_under_guard(sid, None, dispatcher.stamped_grants())
+                .rehydrate_reaped_session_under_guard(
+                    sid,
+                    None,
+                    dispatcher.stamped_grants(),
+                    Method::SessionPrompt,
+                )
                 .await
                 .expect("an operator's rehydration is never refused")
                 .is_none(),
@@ -39961,7 +40089,12 @@ mod tests {
 
         let _session_guard = sessions.session_queue.acquire(sid).await.unwrap();
         let recovered = dispatcher
-            .rehydrate_reaped_session_under_guard(sid, None, dispatcher.stamped_grants())
+            .rehydrate_reaped_session_under_guard(
+                sid,
+                None,
+                dispatcher.stamped_grants(),
+                Method::SessionPrompt,
+            )
             .await
             .expect("an operator's rehydration is never refused")
             .expect("a reaped ACP session must rehydrate to a working agent");
@@ -40141,7 +40274,12 @@ mod tests {
         );
         let _session_guard = sessions.session_queue.acquire(sid).await.unwrap();
         let recovered = dispatcher
-            .rehydrate_reaped_session_under_guard(sid, None, dispatcher.stamped_grants())
+            .rehydrate_reaped_session_under_guard(
+                sid,
+                None,
+                dispatcher.stamped_grants(),
+                Method::SessionPrompt,
+            )
             .await
             .expect("an operator's rehydration is never refused")
             .expect("the cancellation-produced ACP row must rehydrate");
@@ -50285,7 +50423,12 @@ mod tests {
         assert!(sessions.remove(&session_id).await);
         let _session_guard = sessions.session_queue.acquire(&session_id).await.unwrap();
         let rehydrated = dispatcher
-            .rehydrate_reaped_session_under_guard(&session_id, None, dispatcher.stamped_grants())
+            .rehydrate_reaped_session_under_guard(
+                &session_id,
+                None,
+                dispatcher.stamped_grants(),
+                Method::SessionPrompt,
+            )
             .await
             .expect("an operator's rehydration is never refused");
         assert!(
