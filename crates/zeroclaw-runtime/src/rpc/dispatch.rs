@@ -41817,18 +41817,21 @@ mod tests {
         let config_path = tmp.path().join("config.toml");
         let mut cfg = make_secret_test_config(&tmp);
         cfg.secrets.encrypt = false;
+        cfg.providers.connections.insert(
+            "headers".into(),
+            serde_json::from_value(serde_json::json!({
+                "kind": "custom",
+                "uri": "http://127.0.0.1:9"
+            }))
+            .expect("custom connection accepts extra headers"),
+        );
         cfg.save().await.expect("seed the on-disk config");
         let dispatcher = make_config_set_test_dispatcher(cfg);
 
         dispatcher
             .handle_config_registry_set(&registry_edit_params(
                 &dispatcher,
-                &[
-                    "connections",
-                    "legacy.anthropic.default",
-                    "extra_headers",
-                    "X-Trace.level",
-                ],
+                &["connections", "headers", "extra_headers", "X-Trace.level"],
                 json!("existing-value"),
             ))
             .await
@@ -41845,10 +41848,8 @@ mod tests {
         let disk = std::fs::read_to_string(&config_path).unwrap();
         let reloaded: Config = toml::from_str(&disk).unwrap();
         for config in [&*dispatcher.ctx.config.read(), &reloaded] {
-            for (connection, expected) in [
-                ("legacy.anthropic.default", "existing-value"),
-                ("fresh", "fresh-value"),
-            ] {
+            for (connection, expected) in [("headers", "existing-value"), ("fresh", "fresh-value")]
+            {
                 assert_eq!(
                     config.providers.connections[connection]
                         .extra_headers()

@@ -56047,6 +56047,16 @@ impl Config {
         &self,
     ) -> Result<crate::provider_registry::ProviderRegistry, crate::provider_registry::RegistryError>
     {
+        // Downstream crate tests still construct a few historical fixtures
+        // directly in the legacy typed maps.  The test-only feature makes
+        // that construction an explicit input-boundary admission; shipped
+        // builds never reinterpret legacy state here.
+        #[cfg(feature = "test-helpers")]
+        {
+            return crate::migration::admit_test_input(self)
+                .providers
+                .canonical_registry();
+        }
         self.providers.canonical_registry()
     }
 }

@@ -358,11 +358,20 @@ pub fn routed_selection_depends_on_model_ref(
     selection_ref: &str,
     changed_model_ref: &str,
 ) -> bool {
+    // A profile edit affects every nested model materialized from that
+    // profile. Keep this comparison at the canonical reference boundary so a
+    // live session carrying `family.alias.model` is rebuilt when its shared
+    // `family.alias` connection changes; exact nested-model edits still use
+    // the graph walk below.
+    let profile_changed = changed_model_ref.split('.').count() == 2
+        && zeroclaw_config::schema::provider_profile_ref(selection_ref)
+            == zeroclaw_config::schema::provider_profile_ref(changed_model_ref);
     let inherited_selection = inherits_agent_selection(config, selection_ref)
         && config.agent(agent_alias).is_some_and(|agent| {
             selection_depends_on_model_ref(config, &agent.model_provider, changed_model_ref)
         });
-    inherited_selection
+    profile_changed
+        || inherited_selection
         || selection_depends_on_model_ref(config, selection_ref, changed_model_ref)
         || config.model_routes.iter().any(|route| {
             !route.hint.trim().is_empty()
