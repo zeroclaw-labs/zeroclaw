@@ -142,6 +142,8 @@ impl LiveConfig {
     /// Create the storage with `config` as the initial publication of a
     /// fresh epoch.
     pub fn new(config: Config) -> Self {
+        #[cfg(feature = "test-helpers")]
+        let config = crate::migration::admit_test_input(&config);
         Self {
             pair: Arc::new(RwLock::new(PublishedPair {
                 config,
