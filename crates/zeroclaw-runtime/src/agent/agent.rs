@@ -677,7 +677,10 @@ pub struct Agent {
     #[cfg(test)]
     turn_entry_pause: Option<TestTurnEntryPause>,
     /// Concrete delegate registered in this Agent's tool set. Owned sessions
-    /// bind their principal to it before delegation can construct child tools.
+    /// bind their principal to it before delegation can construct child tools,
+    /// and RPC admission binds its child builders to the caller's live
+    /// admission resolver without reconstructing a second tool or copying
+    /// authorization policy.
     pub(crate) delegate_tool: Option<Arc<crate::tools::DelegateTool>>,
 }
 
@@ -1259,7 +1262,8 @@ impl AgentBuilder {
         self
     }
 
-    /// Retain the concrete delegate for principal binding at session routing.
+    /// Retain the concrete delegate for principal binding at session routing
+    /// and for binding its child builders to live RPC admission.
     fn delegate_tool(mut self, delegate_tool: Option<Arc<crate::tools::DelegateTool>>) -> Self {
         self.delegate_tool = delegate_tool;
         self
@@ -2225,6 +2229,18 @@ impl Agent {
         self.disable_principal_unaware_nested_tools();
     }
 
+    /// Apply fresh principal grants through the same monotonic tool posture
+    /// for prompt admission and steering, including its post-write recheck.
+    pub(crate) fn apply_principal_tool_posture(&mut self, posture: crate::agent::SteeringPosture) {
+        self.narrow_to_principal_tools(posture.tool_ceiling.as_deref());
+        if posture.disable_principal_unaware_nested_tools {
+            self.disable_principal_unaware_nested_tools();
+        }
+        if posture.withhold_unrestricted_tools {
+            self.withhold_unrestricted_tools();
+        }
+    }
+
     /// The owner a cross-agent SOP step of this session re-assembles under:
     /// `Some(None)` for an unowned session, `Some(Some(scope))` for an owned
     /// one, whose step agent then runs on the owner's plane for that agent.
@@ -2261,12 +2277,7 @@ impl Agent {
                 false
             }
             crate::agent::SteeringAdmission::Admitted(posture) => {
-                if posture.tool_ceiling.is_some() {
-                    self.narrow_to_principal_tools(posture.tool_ceiling.as_deref());
-                }
-                if posture.disable_principal_unaware_nested_tools {
-                    self.disable_principal_unaware_nested_tools();
-                }
+                self.apply_principal_tool_posture(posture);
                 true
             }
         }
@@ -2357,9 +2368,61 @@ impl Agent {
         self.refresh_system_prompt();
     }
 
+    /// Bind the retained delegate's child registries to the originating RPC
+    /// credential's live authority, so a child built after that credential
+    /// loses administrator authority withholds what this Agent withholds.
+    pub(crate) fn bind_principal_admission(&self, admission: Arc<dyn Fn() -> bool + Send + Sync>) {
+        if let Some(delegate) = &self.delegate_tool {
+            delegate.set_principal_admission(admission);
+        }
+    }
+
+    /// A tool that requires an unrestricted principal does work the caller's
+    /// principal does not carry: it starts headless or scheduled runs, turns
+    /// on other agents, SOP steps, or reads and writes other principals'
+    /// sessions. A principal without operator reach holds none of them,
+    /// whatever its selectors admit. Skill aliases forward the marker and go
+    /// too. The delegate stays when this Agent holds its handle: the handle
+    /// makes every registry it builds withhold them as well. Like the
+    /// selector narrowing, this never restores a tool.
+    pub(crate) fn withhold_unrestricted_tools(&mut self) {
+        let delegate_withholds = match &self.delegate_tool {
+            Some(delegate) => {
+                delegate.withhold_unrestricted_tools();
+                true
+            }
+            None => false,
+        };
+        let held = self.tools.len();
+        self.tools.retain(|tool| {
+            (delegate_withholds && tool.name() == crate::tools::DelegateTool::NAME)
+                || !tool.requires_unrestricted_principal()
+        });
+        // This runs at prompt and steering admission; rebuild only when the
+        // tool set it lists actually changed.
+        if self.tools.len() != held {
+            self.refresh_system_prompt();
+        }
+    }
+
     #[cfg(test)]
     pub fn tool_names(&self) -> Vec<&str> {
         self.tools.iter().map(|t| t.name()).collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unrestricted_tool_names_for_test(&self) -> Vec<&str> {
+        self.tools
+            .iter()
+            .filter(|t| t.requires_unrestricted_principal())
+            .map(|t| t.name())
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_auto_save_memory_for_test(&mut self, memory: Arc<dyn Memory>) {
+        self.memory = memory;
+        self.auto_save = true;
     }
 
     #[cfg(test)]
@@ -3376,8 +3439,9 @@ impl Agent {
         };
         // Captured before `assemble` consumes the result: the concrete delegate
         // instance this registry built. `route_memory_to_principal` binds the
-        // session owner to it, and live-config regressions drive its
-        // nested-registry construction through it.
+        // session owner to it, RPC admission binds its child registries to the
+        // originating credential's live authority, and live-config regressions
+        // drive its nested-registry construction through it.
         let built_delegate_tool = all_tools_result.delegate_tool.clone();
         // Capture before `runtime` is moved into `ScopedAssembly`.
         let shell_profile = runtime.shell_profile();
@@ -6116,6 +6180,7 @@ mod tests {
 
     zeroclaw_api::mock_tool_attribution!(
         CountingTool,
+        SessionHistoryProbe,
         NamedMockTool,
         MockTool,
         SlowTool,
@@ -11245,6 +11310,39 @@ mod tests {
         }
     }
 
+    struct SessionHistoryProbe {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for SessionHistoryProbe {
+        // Like the real `sessions_history`, which reads other sessions.
+        fn requires_unrestricted_principal(&self) -> bool {
+            true
+        }
+
+        fn name(&self) -> &str {
+            "sessions_history"
+        }
+
+        fn description(&self) -> &str {
+            "probe"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "foreign transcript".into(),
+                error: None,
+            })
+        }
+    }
+
     struct CountingTool {
         calls: Arc<AtomicUsize>,
     }
@@ -11578,6 +11676,120 @@ mod tests {
             );
         }
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// A skill alias of a session-data tool and a nested executor that runs
+    /// its own tool set would each reach what the withholding removes, so
+    /// both go with the tools. The real `sessions_list` and `sessions_send`
+    /// go by their own marker; `sessions_current` stays. The delegate stays
+    /// only when the Agent holds its handle and can make its children
+    /// withhold the tools too; without the handle it goes as well.
+    #[tokio::test]
+    async fn withholding_session_data_tools_removes_aliases_and_nested_executors() {
+        let session_dir = tempfile::TempDir::new().unwrap();
+        let sessions: Arc<dyn zeroclaw_infra::session_backend::SessionBackend> =
+            Arc::new(zeroclaw_infra::session_store::SessionStore::new(session_dir.path()).unwrap());
+        let history_calls = Arc::new(AtomicUsize::new(0));
+        let history: Arc<dyn Tool> = Arc::new(SessionHistoryProbe {
+            calls: Arc::clone(&history_calls),
+        });
+        let mut skill = make_skill("peek", &["history"]);
+        skill.tools[0].kind = "builtin".to_string();
+        skill.tools[0].target = Some("sessions_history".to_string());
+        let security = Arc::new(crate::security::SecurityPolicy::default());
+        let send_security = Arc::clone(&security);
+        let build = |delegate: Option<Arc<crate::tools::DelegateTool>>,
+                     registered: Arc<dyn Tool>| {
+            let alias = crate::tools::skill_tool::SkillBuiltinTool::new(
+                "peek",
+                &skill.tools[0],
+                Arc::clone(&history),
+                HashMap::new(),
+            );
+            let pipeline = crate::tools::PipelineTool::with_access_policy(
+                zeroclaw_config::schema::PipelineConfig {
+                    enabled: true,
+                    allowed_tools: vec!["sessions_history".to_string()],
+                    ..zeroclaw_config::schema::PipelineConfig::default()
+                },
+                vec![Arc::clone(&history)],
+                None,
+            );
+            let tools: Vec<Box<dyn Tool>> = vec![
+                Box::new(crate::tools::ArcToolRef(Arc::clone(&history))),
+                Box::new(zeroclaw_tools::sessions::SessionsListTool::new(Arc::clone(
+                    &sessions,
+                ))),
+                Box::new(zeroclaw_tools::sessions::SessionsSendTool::new(
+                    Arc::clone(&sessions),
+                    Arc::clone(&send_security),
+                )),
+                Box::new(zeroclaw_tools::sessions::SessionsCurrentTool::new(
+                    Arc::clone(&sessions),
+                )),
+                Box::new(alias),
+                Box::new(pipeline),
+                Box::new(crate::tools::ArcToolRef(registered)),
+            ];
+            Agent::builder()
+                .model_provider(Box::new(MockModelProvider {
+                    responses: Mutex::new(vec![]),
+                }))
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    tools,
+                ))
+                .skills(vec![skill.clone()])
+                .delegate_tool(delegate)
+                .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+                .observer(Arc::new(crate::observability::NoopObserver {}))
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .workspace_dir(std::path::PathBuf::from("/tmp"))
+                .build()
+                .expect("agent builds")
+        };
+
+        let delegate = Arc::new(crate::tools::DelegateTool::new(
+            HashMap::new(),
+            None,
+            Arc::clone(&security),
+        ));
+        let mut agent = build(
+            Some(Arc::clone(&delegate)),
+            delegate.clone() as Arc<dyn Tool>,
+        );
+        let alias_name = crate::tools::skill_tool::composed_tool_name("peek", "history");
+        let steps = serde_json::json!({"steps": [{"tool": "sessions_history", "args": {}}]});
+        let entry_points = [
+            "sessions_history",
+            alias_name.as_str(),
+            crate::tools::PipelineTool::NAME,
+        ];
+        // Control: each entry point reaches the session-data tool.
+        for name in entry_points {
+            let outcome = agent.dispatch_tool_for_test(name, steps.clone()).await;
+            assert!(outcome.success, "{name}: {}", outcome.output);
+        }
+        assert_eq!(history_calls.load(Ordering::SeqCst), entry_points.len());
+
+        agent.withhold_unrestricted_tools();
+        let mut names = agent.tool_names();
+        names.sort_unstable();
+        assert_eq!(names, vec!["delegate", "sessions_current"]);
+        assert!(delegate.withholds_unrestricted_tools());
+        for name in entry_points {
+            let outcome = agent.dispatch_tool_for_test(name, steps.clone()).await;
+            assert!(!outcome.success, "{name}: {}", outcome.output);
+        }
+        assert_eq!(history_calls.load(Ordering::SeqCst), entry_points.len());
+
+        let unbound: Arc<dyn Tool> = Arc::new(crate::tools::DelegateTool::new(
+            HashMap::new(),
+            None,
+            security,
+        ));
+        let mut agent = build(None, unbound);
+        agent.withhold_unrestricted_tools();
+        assert_eq!(agent.tool_names(), vec!["sessions_current"]);
     }
 
     #[tokio::test]
@@ -17684,6 +17896,7 @@ mod tests {
                         crate::agent::SteeringAdmission::Admitted(crate::agent::SteeringPosture {
                             tool_ceiling: Some(Vec::new()),
                             disable_principal_unaware_nested_tools: false,
+                            withhold_unrestricted_tools: false,
                         })
                     }),
                 )
