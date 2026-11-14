@@ -26,7 +26,7 @@ env:
 
 # ── Runner selection: a checked-in label on each compile-heavy job ──────────
 # The Rust-compiling jobs below (lint, build, check, check-plugin-backends,
-# check-32bit, bench, test, test-channel-features, test-tool-features, memory-postgres-test, msrv, parallel-runtime-test,
+# check-32bit, bench, test, test-channel-features, test-tool-features, test-cli-only, memory-postgres-test, msrv, parallel-runtime-test,
 # installer-drift) and the Linux `build` matrix entry name their runner label
 # directly, so runner selection does not wait for fmt. The separate required
 # Windows jobs wait for windows-required-changes; the build matrix
@@ -182,6 +182,9 @@ jobs:
       - name: Test release tool installer mappings
         run: bash scripts/ci/install_release_tool.test.sh
 
+      - name: Test binary size safeguard
+        run: python3 scripts/ci/check_binary_size_test.py
+
       - name: Test crates.io publish ordering and preflight
         run: python3 scripts/release/publish_crates_test.py
 
@@ -190,6 +193,8 @@ jobs:
 
       - name: Test crates.io version-bump preflight trigger
         run: bash scripts/ci/crates_preflight_trigger.test.sh
+      - name: Test CLI-only artifact ratchet
+        run: bash scripts/ci/cli_only_ratchet.test.sh
 
       - name: Test apt install timeout and retry behavior
         run: bash scripts/ci/apt_install.test.sh
@@ -214,6 +219,13 @@ jobs:
       - name: Test docs stable metadata promotion
         run: python3 scripts/docs/promote_stable_test.py
 
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: '.nvmrc'
+
+      - name: Test docs version selector and root 404 redirect
+        run: node --test scripts/docs/version_selector_test.mjs scripts/docs/root_404_test.mjs
+
   relay-container-smoke-changes:
     name: Detect Relay Container Smoke changes
     # Ordering note: this detector only runs `git diff` and never compiles, so it
@@ -226,8 +238,6 @@ jobs:
       run: ${{ steps.changed.outputs.run }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          fetch-depth: 0
       - name: Detect relay container smoke changes
         id: changed
         shell: bash
@@ -238,6 +248,8 @@ jobs:
 
           case "${{ github.event_name }}" in
             pull_request)
+              # Shallow checkout: fetch only the base commit. A two-dot diff needs no merge base.
+              git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.base.sha }}"
               git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD > "$changed_files"
               ;;
             push|merge_group)
@@ -351,8 +363,6 @@ jobs:
       run: ${{ steps.changed.outputs.run }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          fetch-depth: 0
       - name: Detect targeted Windows Clippy changes
         id: changed
         shell: bash
@@ -363,6 +373,8 @@ jobs:
 
           case "${{ github.event_name }}" in
             pull_request)
+              # Shallow checkout: fetch only the base commit. A two-dot diff needs no merge base.
+              git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.base.sha }}"
               git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD > "$changed_files"
               ;;
             push|merge_group)
@@ -424,8 +436,6 @@ jobs:
       windows_service: ${{ steps.select.outputs.windows_service }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          fetch-depth: 0
       - name: Test Windows scope contracts
         run: |
           bash scripts/ci/windows_recovery_change_filter.test.sh
@@ -445,7 +455,9 @@ jobs:
           changed_files="$(mktemp)"
           metadata_file="$(mktemp)"
           if [[ "$EVENT_NAME" == pull_request ]]; then
-            if ! git diff --name-only "$BASE_SHA" HEAD > "$changed_files"; then
+            # Shallow checkout: fetch only the base commit. A two-dot diff needs no merge base.
+            if ! git fetch --no-tags --depth=1 origin "$BASE_SHA" \
+              || ! git diff --name-only "$BASE_SHA" HEAD > "$changed_files"; then
               # Discard partial evidence so it cannot authorize a skip.
               : > "$changed_files"
             fi
@@ -796,6 +808,14 @@ jobs:
             features: plugins-wasm-cranelift
             suite: smoke
             cache-key: plugins-artifact-smoke
+          # The gateway's `/plugin/{path}` ingress. `features` names the
+          # gateway feature, not a zeroclaw-plugins backend: it pulls in no
+          # wasmtime, so the leg builds a gateway-only dependency set and
+          # keeps its own key.
+          - name: plugins gateway ingress
+            features: plugins-wasm
+            suite: gateway
+            cache-key: plugins-gateway-ingress
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -824,8 +844,10 @@ jobs:
           shared-key: ${{ matrix.cache-key }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
+      # Not for the gateway leg: zeroclaw-plugins has no `plugins-wasm`
+      # feature, and that leg's tests already compile it through the gateway.
       - name: Check
-        if: steps.changed.outputs.run == 'true' && matrix.suite != 'runtime' && matrix.suite != 'smoke'
+        if: steps.changed.outputs.run == 'true' && matrix.suite != 'runtime' && matrix.suite != 'gateway' && matrix.suite != 'smoke'
         run: cargo check --locked -p zeroclaw-plugins --no-default-features --features ${{ matrix.features }}
       - name: Run plugin component tests
         if: steps.changed.outputs.run == 'true' && matrix.suite == 'components'
@@ -1372,6 +1394,21 @@ jobs:
             echo "::error::Expected the host-free expectation to fail with status 1, got $inverted."
             exit 1
           fi
+      # Guards required plugin webhook ingress coverage from issue #11003; see the bespoke gate registry in README.md.
+      # The gateway's `/plugin/{path}` ingress only compiles under its
+      # `plugins-wasm` feature, so the default-feature Test job never runs its
+      # tests. The filter is a module path: it selects every test in the
+      # handler's `plugin_webhook::tests`, not one test name.
+      - name: Run gateway plugin webhook tests
+        if: steps.changed.outputs.run == 'true' && matrix.suite == 'gateway'
+        run: cargo test --locked -p zeroclaw-gateway --features plugins-wasm --lib plugin_webhook
+      # Required, unlike the Test job's informational replay of the other
+      # golden scenarios: these pin the public `/plugin/{path}` contract
+      # (statuses, bodies, headers, and what the channel worker receives)
+      # through the real gateway listener, and are not `#[ignore]`d.
+      - name: Run gateway plugin webhook golden frames
+        if: steps.changed.outputs.run == 'true' && matrix.suite == 'gateway'
+        run: cargo test --locked -p zeroclaw-gateway --features plugins-wasm --test golden_frames plugin_webhook
 
   msrv:
     name: MSRV (declared floor)
@@ -1675,6 +1712,52 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
+  # The CLI-only build is the standard distribution without the dashboard
+  # and web gateway (`cargo generate features --selection cli-only`). No other
+  # lane builds it: this one runs the root crate's tests and clippy on that
+  # feature set and checks the artifact ratchet, so the build cannot quietly
+  # pick the gateway up again.
+  test-cli-only:
+    name: Test (CLI-only build)
+    needs: [master-debounce]
+    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 45
+    env:
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.98.0
+          components: clippy
+          # The CLI-only set enables plugins-wasm, whose tests build the tool fixture for this target.
+          targets: wasm32-wasip2
+      - uses: ./.github/actions/rust-cache
+        with:
+          use-blacksmith: 'true'
+          shared-key: cli-only
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Install test system dependencies
+        run: bash scripts/ci/apt_install.sh mold expect python3
+      - name: Install cargo-nextest
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
+      - name: Resolve the CLI-only feature set
+        id: features
+        run: |
+          list="$(cargo run --quiet --locked -p xtask --bin generate -- features --selection cli-only --target x86_64-unknown-linux-gnu)"
+          echo "list=${list}" >> "$GITHUB_OUTPUT"
+      - name: Clippy (CLI-only build)
+        run: cargo clippy --locked -p zeroclaw --all-targets --no-default-features --features "${{ steps.features.outputs.list }}" -- -D warnings
+      - name: Test (CLI-only build)
+        run: cargo nextest run --locked -p zeroclaw --no-default-features --features "${{ steps.features.outputs.list }}" --lib --bins --test component --test integration --test system --test architecture
+      - name: Artifact ratchet (CLI-only build)
+        run: |
+          cargo build --locked -p zeroclaw --bin zeroclaw --no-default-features --features "${{ steps.features.outputs.list }}"
+          bash scripts/ci/cli_only_ratchet.sh run x86_64-unknown-linux-gnu target/debug/zeroclaw
+
   memory-postgres-test:
     name: Test (PostgreSQL Memory)
     needs: [master-debounce]
@@ -1739,8 +1822,6 @@ jobs:
       scope: ${{ steps.changed.outputs.scope }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          fetch-depth: 0
       - name: Test parallel runtime scope classifier
         run: bash scripts/ci/parallel_runtime_test_scope.test.sh
       - name: Detect parallel runtime test changes
@@ -1752,6 +1833,8 @@ jobs:
           case "${{ github.event_name }}" in
             pull_request)
               changed_files="$(mktemp)"
+              # Shallow checkout: fetch only the base commit. A two-dot diff needs no merge base.
+              git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.base.sha }}"
               git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD > "$changed_files"
               if scope="$(bash scripts/ci/parallel_runtime_test_scope.sh < "$changed_files")"; then
                 echo "run=true" >> "$GITHUB_OUTPUT"
@@ -1903,8 +1986,6 @@ jobs:
       web: ${{ steps.filter.outputs.web }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          fetch-depth: 0
       - name: Classify changed paths
         id: filter
         shell: bash
@@ -1927,6 +2008,8 @@ jobs:
           esac
 
           changed="$(mktemp)"
+          # Shallow checkout: fetch only the base commit. A two-dot diff needs no merge base.
+          git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.base.sha }}"
           git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD > "$changed"
 
           emit() {
@@ -2042,6 +2125,8 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Test installer target detection
         run: bash scripts/ci/install_target_triple_test.sh
+      - name: Test installer CLI package-version parsing
+        run: bash scripts/ci/install_cli_package_version_test.sh
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.98.0
@@ -2055,6 +2140,8 @@ jobs:
         run: cargo generate installers --check
       - name: Check source-backed SOP syntax reference
         run: cargo generate sop-syntax --check
+      - name: Check the OpenRPC contract matches zeroclaw-rpc-proto
+        run: cargo generate openrpc --check
       - name: Resolve canonical all-feature selection
         id: all_features
         run: |
@@ -2104,6 +2191,9 @@ jobs:
       - name: Run SOP editor regressions
         working-directory: web
         run: npm run test:sop-editor
+      - name: Run dashboard sign-in regressions
+        working-directory: web
+        run: npm run test:auth
 
   # ── Required gate ─────────────────────────────────────────────────────────
   # Branch protection requires only this single job — internal structure
@@ -2152,7 +2242,7 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [master-debounce, fmt, history-guard, repo-structure, relay-container-smoke-changes, relay-container-smoke, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, windows-required-changes, windows-service-smoke, build, windows-build, windows-task-owner-recovery, check, check-plugin-backends, msrv, check-32bit, bench, test, test-channel-features, test-tool-features, memory-postgres-test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests, crates-preflight-changes, crates-preflight]
+    needs: [master-debounce, fmt, history-guard, repo-structure, relay-container-smoke-changes, relay-container-smoke, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, windows-required-changes, windows-service-smoke, build, windows-build, windows-task-owner-recovery, check, check-plugin-backends, msrv, check-32bit, bench, test, test-channel-features, test-tool-features, test-cli-only, memory-postgres-test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests, crates-preflight-changes, crates-preflight]
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - name: Check results
