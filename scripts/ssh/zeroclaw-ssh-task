@@ -47,7 +47,7 @@ def parse_args(args):
 
 
 def ssh_config(options, host, include_target=False):
-    p = subprocess.run([SSH, '-G', *options, host], check=True,
+    p = subprocess.run([SSH, '-G', '-o', 'ForkAfterAuthentication=no', *options, host], check=True,
                        capture_output=True, text=True, timeout=10)
     config = {}
     for line in p.stdout.splitlines():
