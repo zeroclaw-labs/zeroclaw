@@ -359,11 +359,12 @@ impl EmailChannel {
         {
             cleaned = rest;
         }
-        if cleaned.len() == subject.len() {
-            subject.to_string()
+        let trimmed = if cleaned.len() == subject.len() {
+            subject
         } else {
-            cleaned.trim_start().to_string()
-        }
+            cleaned.trim_start()
+        };
+        sanitize_header_value(trimmed)
     }
 
     fn build_parsed_email(
@@ -896,6 +897,13 @@ impl EmailChannel {
             (default_subject, message.content.as_str())
         };
 
+        let clean_subject = sanitize_header_value(subject);
+        let subject_to_use = if clean_subject.is_empty() {
+            default_subject
+        } else {
+            &clean_subject
+        };
+
         let mut builder = Message::builder()
             .from(
                 non_blank_value(self.config.from_address.as_deref())
@@ -903,17 +911,18 @@ impl EmailChannel {
                     .parse()?,
             )
             .to(message.recipient.parse()?)
-            .subject(subject);
+            .subject(subject_to_use);
         if let Some(ref reply_id) = message.in_reply_to
             && !is_synthetic_email_message_id(reply_id)
+            && let Some(wrapped) = angle_wrap_message_id(reply_id)
         {
-            builder = builder.in_reply_to(angle_wrap_message_id(reply_id));
+            builder = builder.in_reply_to(wrapped);
         }
         let references: Vec<String> = message
             .references
             .iter()
             .filter(|id| !is_synthetic_email_message_id(id))
-            .map(|id| angle_wrap_message_id(id))
+            .filter_map(|id| angle_wrap_message_id(id))
             .collect();
         if !references.is_empty() {
             builder = builder.references(references.join(" "));
@@ -999,16 +1008,41 @@ fn is_synthetic_email_message_id(value: &str) -> bool {
     value.starts_with("email-imap-") || value.starts_with("email-fallback-")
 }
 
+/// Sanitize an unstructured header value (like Subject) to prevent CRLF injection.
+/// Replaces newlines and carriage returns with spaces, collapses whitespace,
+/// and strips non-tab control characters.
+fn sanitize_header_value(val: &str) -> String {
+    let replaced: String = val
+        .chars()
+        .map(|c| if c == '\r' || c == '\n' { ' ' } else { c })
+        .filter(|c| !c.is_control() || *c == '\t')
+        .collect();
+    let mut words = replaced.split_whitespace();
+    let mut result = String::new();
+    if let Some(first) = words.next() {
+        result.push_str(first);
+        for word in words {
+            result.push(' ');
+            result.push_str(word);
+        }
+    }
+    result
+}
+
 /// Wrap a bare message-id in RFC 5322 angle brackets for `In-Reply-To` /
-/// `References` headers. `mail_parser` strips the brackets on parse and `lettre`
-/// emits these headers verbatim, so ids must be re-wrapped on the way out.
-/// Idempotent: an id that already carries brackets is left unchanged.
-fn angle_wrap_message_id(id: &str) -> String {
-    let trimmed = id.trim();
-    if trimmed.starts_with('<') && trimmed.ends_with('>') {
-        trimmed.to_string()
+/// `References` headers. Strips control characters, newlines, and whitespace
+/// to prevent SMTP header injection attacks. Returns None if the message id is empty.
+fn angle_wrap_message_id(id: &str) -> Option<String> {
+    let sanitized: String = id
+        .chars()
+        .filter(|c| !c.is_control() && !c.is_whitespace())
+        .collect();
+    let trimmed = sanitized.trim_matches(|c| c == '<' || c == '>');
+    let clean: String = trimmed.chars().filter(|c| *c != '<' && *c != '>').collect();
+    if clean.is_empty() {
+        None
     } else {
-        format!("<{trimmed}>")
+        Some(format!("<{clean}>"))
     }
 }
 
@@ -1981,16 +2015,41 @@ mod tests {
     fn angle_wrap_message_id_wraps_bare_ids_and_is_idempotent() {
         assert_eq!(
             angle_wrap_message_id("msg@example.invalid"),
-            "<msg@example.invalid>"
+            Some("<msg@example.invalid>".to_string())
         );
         assert_eq!(
             angle_wrap_message_id("<msg@example.invalid>"),
-            "<msg@example.invalid>"
+            Some("<msg@example.invalid>".to_string())
         );
         assert_eq!(
             angle_wrap_message_id("  msg@example.invalid  "),
-            "<msg@example.invalid>"
+            Some("<msg@example.invalid>".to_string())
         );
+    }
+
+    #[test]
+    fn angle_wrap_message_id_rejects_crlf_and_injectable_values() {
+        assert_eq!(
+            angle_wrap_message_id("evil@example.invalid>\r\nBcc: victim@example.invalid\r\n<dummy"),
+            Some("<evil@example.invalidBcc:victim@example.invaliddummy>".to_string())
+        );
+        assert_eq!(angle_wrap_message_id("\r\n\t  "), None);
+        assert_eq!(angle_wrap_message_id("<>"), None);
+    }
+
+    #[test]
+    fn build_email_message_sanitizes_crlf_in_subject() {
+        let channel = EmailChannel::new(
+            mailbox_identity_config(),
+            "email_test_alias",
+            empty_resolver(),
+        );
+        let mut message = SendMessage::new("body", "user@example.invalid");
+        message.subject = Some("Invoice 123\r\nBcc: evil@example.invalid\r\n".to_string());
+        let email = channel.build_email_message(&message).unwrap();
+        let wire = String::from_utf8_lossy(&email.formatted()).into_owned();
+        assert!(!wire.contains("\r\nBcc:"));
+        assert!(wire.contains("Subject: Invoice 123 Bcc: evil@example.invalid"));
     }
 
     #[tokio::test]
