@@ -1218,7 +1218,7 @@ mod tests {
 
         let no_properties = json!({ "type": "object", "required": ["zone"] });
         let fields = config_fields(&no_properties);
-        assert!(fields.fields.is_empty());
+        assert_eq!(fields.fields, Vec::<ConfigField>::new());
         assert_eq!(fields.required_unprompted, vec!["zone"]);
         assert_eq!(fields.required_undeclared, vec!["zone"]);
     }
@@ -1418,7 +1418,7 @@ mod tests {
         let installed = [installed("fresh", "0.1.0", &[PluginCapability::Tool])];
         let preview = activation_preview(&inputs(true, true, &installed, &[]));
         assert!(preview.changes_nothing());
-        assert!(preview.activated.is_empty());
+        assert_eq!(preview.activated, Vec::<ActivatedInstance>::new());
     }
 
     #[test]
@@ -1610,7 +1610,10 @@ mod tests {
             vec!["proxy/url"],
             "a name the row holds is not missing"
         );
-        assert!(unmet(&manifest_with(None), None).nonportable.is_empty());
+        assert_eq!(
+            unmet(&manifest_with(None), None).nonportable,
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -1626,7 +1629,10 @@ mod tests {
             vec!["red", "undeclared"],
             "a row holding an undeclared name does not satisfy it"
         );
-        assert!(unmet(&manifest_with(None), None).undeclared.is_empty());
+        assert_eq!(
+            unmet(&manifest_with(None), None).undeclared,
+            Vec::<String>::new()
+        );
         let no_properties = manifest_with(Some(json!({
             "type": "object",
             "additionalProperties": false,
