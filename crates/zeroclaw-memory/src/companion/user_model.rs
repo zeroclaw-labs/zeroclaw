@@ -260,6 +260,10 @@ pub struct UserModelStore {
     conn: Mutex<Connection>,
 }
 
+const OWNER_STATEMENT_SUPERSEDES_SQL: &str = "SELECT id FROM user_model_revisions
+                 WHERE semantic_key = ?1 AND valid_from_unix <= ?2
+                 ORDER BY created_at_unix DESC, id DESC LIMIT 1";
+
 impl UserModelStore {
     /// Open (or create) the store. Blocking; call outside async contexts
     /// or via `spawn_blocking`.
@@ -302,7 +306,9 @@ impl UserModelStore {
                 reviewer TEXT NOT NULL,
                 note TEXT,
                 at_unix INTEGER NOT NULL
-             );",
+             );
+             CREATE INDEX IF NOT EXISTS idx_user_model_revisions_key_created_valid
+                ON user_model_revisions (semantic_key, created_at_unix, valid_from_unix);",
         )?;
         harden_sqlite_owner_only(&db_path);
         Ok(Self {
@@ -347,9 +353,7 @@ impl UserModelStore {
         let conn = self.conn.lock();
         let supersedes: Option<String> = conn
             .query_row(
-                "SELECT id FROM user_model_revisions
-                 WHERE semantic_key = ?1 AND valid_from_unix <= ?2
-                 ORDER BY created_at_unix DESC, id DESC LIMIT 1",
+                OWNER_STATEMENT_SUPERSEDES_SQL,
                 rusqlite::params![semantic_key, now_unix],
                 |row| row.get(0),
             )
@@ -992,19 +996,8 @@ impl UserModelStore {
     }
 }
 
-// Shared by the public projection and guarded review inside its Immediate
-// transaction: expiry and owner-correction tie ordering have one query.
-fn active_heads_from_connection(
-    conn: &rusqlite::Connection,
-    as_of: u64,
-    semantic_key: Option<&str>,
-) -> Result<Vec<UserModelRevision>, rusqlite::Error> {
-    // Per key: take the newest revision that had already started at the
-    // read instant, THEN gate it on its own validity window. A key whose
-    // newest revision expired goes inactive — an older superseded
-    // revision must never resurface through the gap.
-    let mut stmt = conn.prepare(
-        "SELECT id, semantic_key, kind, statement, scope, authority, supersedes,
+const ACTIVE_HEADS_SQL: &str =
+    "SELECT id, semantic_key, kind, statement, scope, authority, supersedes,
                     valid_from_unix, valid_until_unix, source_candidate, created_at_unix
              FROM user_model_revisions r
              WHERE r.valid_from_unix <= ?1
@@ -1030,8 +1023,20 @@ fn active_heads_from_connection(
                      )
                )
                AND (r.valid_until_unix IS NULL OR r.valid_until_unix > ?1)
-             ORDER BY r.created_at_unix DESC, r.id DESC",
-    )?;
+             ORDER BY r.created_at_unix DESC, r.id DESC";
+
+// Shared by the public projection and guarded review inside its Immediate
+// transaction: expiry and owner-correction tie ordering have one query.
+fn active_heads_from_connection(
+    conn: &rusqlite::Connection,
+    as_of: u64,
+    semantic_key: Option<&str>,
+) -> Result<Vec<UserModelRevision>, rusqlite::Error> {
+    // Per key: take the newest revision that had already started at the
+    // read instant, THEN gate it on its own validity window. A key whose
+    // newest revision expired goes inactive — an older superseded
+    // revision must never resurface through the gap.
+    let mut stmt = conn.prepare(ACTIVE_HEADS_SQL)?;
     let rows = stmt.query_map(rusqlite::params![as_of, semantic_key], revision_from_row)?;
     let mut seen = std::collections::HashSet::new();
     let mut heads = Vec::new();
@@ -2901,5 +2906,507 @@ mod owner_correction_tests {
                 .iter()
                 .any(|head| head.semantic_key == "reviews.detail" && head.scope == "global")
         );
+    }
+
+    const LEGACY_UNINDEXED_SCHEMA_SQL: &str = "
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = NORMAL;
+        PRAGMA busy_timeout = 5000;
+        CREATE TABLE IF NOT EXISTS user_model_candidates (
+            id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            statement TEXT NOT NULL,
+            semantic_key TEXT NOT NULL,
+            scope TEXT NOT NULL DEFAULT 'global',
+            evidence TEXT NOT NULL DEFAULT '[]',
+            created_at_unix INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS user_model_revisions (
+            id TEXT PRIMARY KEY,
+            semantic_key TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            statement TEXT NOT NULL,
+            scope TEXT NOT NULL DEFAULT 'global',
+            authority TEXT NOT NULL,
+            supersedes TEXT,
+            valid_from_unix INTEGER NOT NULL,
+            valid_until_unix INTEGER,
+            source_candidate TEXT,
+            created_at_unix INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS user_model_review_receipts (
+            id TEXT PRIMARY KEY,
+            candidate_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            reviewer TEXT NOT NULL,
+            note TEXT,
+            at_unix INTEGER NOT NULL
+        );
+    ";
+
+    fn open_legacy_unindexed_connection(db_path: &Path) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.execute_batch(LEGACY_UNINDEXED_SCHEMA_SQL).unwrap();
+        conn
+    }
+
+    fn has_composite_revisions_index(conn: &rusqlite::Connection) -> bool {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_user_model_revisions_key_created_valid'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        count == 1
+    }
+
+    fn explain_query_plan(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        bind_as_of_and_key: bool,
+    ) -> Vec<String> {
+        let explain_sql = format!("EXPLAIN QUERY PLAN {sql}");
+        let mut stmt = conn.prepare(&explain_sql).unwrap();
+        let map_row = |row: &rusqlite::Row<'_>| row.get::<_, String>(3);
+        if bind_as_of_and_key {
+            stmt.query_map(rusqlite::params![100_i64, Option::<&str>::None], map_row)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        } else {
+            stmt.query_map(rusqlite::params!["k", 100_i64], map_row)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        }
+    }
+
+    struct ScaleMeasurement {
+        heads: Vec<UserModelRevision>,
+        fullscan_steps: i32,
+        sort_ops: i32,
+        vm_steps: i32,
+        median_ms: f64,
+    }
+
+    fn measure_active_heads_scale(
+        conn: &rusqlite::Connection,
+        as_of: u64,
+        runs: usize,
+    ) -> ScaleMeasurement {
+        let mut timings_ms = Vec::with_capacity(runs);
+        let mut latest_heads = Vec::new();
+        for _ in 0..runs {
+            let started = std::time::Instant::now();
+            latest_heads = active_heads_from_connection(conn, as_of, None).unwrap();
+            timings_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+        }
+        timings_ms.sort_by(f64::total_cmp);
+        let median_ms = timings_ms[timings_ms.len() / 2];
+
+        let mut stmt = conn.prepare(ACTIVE_HEADS_SQL).unwrap();
+        stmt.reset_status(rusqlite::StatementStatus::FullscanStep);
+        stmt.reset_status(rusqlite::StatementStatus::Sort);
+        stmt.reset_status(rusqlite::StatementStatus::VmStep);
+        let drained = stmt
+            .query_map(
+                rusqlite::params![as_of, Option::<&str>::None],
+                revision_from_row,
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(drained.len() >= latest_heads.len());
+        let fullscan_steps = stmt.get_status(rusqlite::StatementStatus::FullscanStep);
+        let sort_ops = stmt.get_status(rusqlite::StatementStatus::Sort);
+        let vm_steps = stmt.get_status(rusqlite::StatementStatus::VmStep);
+
+        ScaleMeasurement {
+            heads: latest_heads,
+            fullscan_steps,
+            sort_ops,
+            vm_steps,
+            median_ms,
+        }
+    }
+
+    fn seed_deterministic_scale_dataset(conn: &rusqlite::Connection, total_revisions: usize) {
+        assert_eq!(total_revisions % 5, 0);
+        let num_keys = total_revisions / 5;
+        let tx = conn.unchecked_transaction().unwrap();
+        {
+            let mut insert_cand = tx
+                .prepare(
+                    "INSERT INTO user_model_candidates
+                         (id, kind, statement, semantic_key, scope, evidence, created_at_unix)
+                     VALUES (?1, 'preference', ?2, ?3, ?4, ?5, ?6)",
+                )
+                .unwrap();
+            let mut insert_rev = tx
+                .prepare(
+                    "INSERT INTO user_model_revisions
+                         (id, semantic_key, kind, statement, scope, authority, supersedes,
+                          valid_from_unix, valid_until_unix, source_candidate, created_at_unix)
+                     VALUES (?1, ?2, 'preference', ?3, ?4, 'owner_ratified', ?5, ?6, ?7, ?8, ?9)",
+                )
+                .unwrap();
+
+            for key_idx in 0..num_keys {
+                let is_oc = key_idx % 10 == 0;
+                let is_expired_head = key_idx % 10 == 1;
+                let is_future_only = key_idx % 10 == 2;
+                let semantic_key = if is_oc {
+                    format!("oc.{key_idx:060x}")
+                } else {
+                    format!("scale.key.{key_idx:05}")
+                };
+                let scope = if is_oc { "session:s1" } else { "global" };
+                let cand_id = format!("cand-{key_idx:05}");
+                insert_cand
+                    .execute(rusqlite::params![
+                        cand_id,
+                        format!("candidate {key_idx}"),
+                        semantic_key,
+                        scope,
+                        evidence("nova", "s1", "style"),
+                        10_i64,
+                    ])
+                    .unwrap();
+
+                let mut prev_id: Option<String> = None;
+                for rev_idx in 0..5 {
+                    let rev_id =
+                        format!("rev-{key_idx:05}-{rev_idx}-{}", (key_idx * 7 + rev_idx) % 9);
+                    let created = if is_oc && rev_idx >= 3 {
+                        50_i64
+                    } else {
+                        10_i64 + rev_idx as i64 * 10
+                    };
+                    let valid_from = if is_future_only && rev_idx >= 3 {
+                        500_i64
+                    } else {
+                        created
+                    };
+                    let valid_until: Option<i64> = if is_expired_head && rev_idx == 4 {
+                        Some(90)
+                    } else {
+                        None
+                    };
+                    insert_rev
+                        .execute(rusqlite::params![
+                            rev_id,
+                            semantic_key,
+                            format!("statement {key_idx}-{rev_idx}"),
+                            scope,
+                            prev_id,
+                            valid_from,
+                            valid_until,
+                            cand_id,
+                            created,
+                        ])
+                        .unwrap();
+                    prev_id = Some(rev_id);
+                }
+            }
+        }
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn legacy_unindexed_db_migrates_reopens_and_preserves_projection_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("user_model.db");
+        let legacy_conn = open_legacy_unindexed_connection(&db_path);
+        assert!(
+            !has_composite_revisions_index(&legacy_conn),
+            "precondition: legacy DB has no composite index"
+        );
+        let legacy_store = UserModelStore {
+            conn: Mutex::new(legacy_conn),
+        };
+
+        // 1. Global active revision + superseded history.
+        legacy_store
+            .record_owner_statement(
+                UserModelKind::Preference,
+                "Old global preference",
+                "style.tone",
+                "global",
+                10,
+            )
+            .unwrap();
+        legacy_store
+            .record_owner_statement(
+                UserModelKind::Preference,
+                "Active global preference",
+                "style.tone",
+                "global",
+                20,
+            )
+            .unwrap();
+
+        // 2. Future-effective revision (must stay hidden at as_of=100, surface at as_of=200).
+        legacy_store
+            .record_owner_statement(
+                UserModelKind::Goal,
+                "Future goal",
+                "goal.future",
+                "global",
+                200,
+            )
+            .unwrap();
+
+        // 3. Newest revision expired -> must NOT resurrect older active revision at as_of=100.
+        legacy_store
+            .conn
+            .lock()
+            .execute(
+                "INSERT INTO user_model_revisions
+                     (id, semantic_key, kind, statement, scope, authority, supersedes,
+                      valid_from_unix, valid_until_unix, source_candidate, created_at_unix)
+                 VALUES
+                     ('exp-old', 'exp.key', 'preference', 'Older active', 'global', 'owner_authored', NULL, 10, NULL, NULL, 10),
+                     ('exp-new', 'exp.key', 'preference', 'Expired newest', 'global', 'owner_authored', 'exp-old', 20, 50, NULL, 20)",
+                [],
+            )
+            .unwrap();
+
+        // 4. Same-second oc.<60-hex> tie-breaking + cross-agent/session isolation.
+        for (statement, forced_id) in [
+            ("First tie", "zzzz"),
+            ("Second tie", "aaaa"),
+            ("Winner tie", "bbbb"),
+        ] {
+            let cand = legacy_store
+                .record_owner_correction(
+                    "nova",
+                    UserModelKind::Preference,
+                    statement,
+                    "reply.style",
+                    &evidence("nova", "session-a", "reply.style"),
+                    "session-a",
+                    30,
+                )
+                .unwrap()
+                .unwrap();
+            legacy_store
+                .review_candidate(&cand.id, ReviewAction::Accept, "operator", None, None, 40)
+                .unwrap();
+            legacy_store
+                .conn
+                .lock()
+                .execute(
+                    "UPDATE user_model_revisions SET id = ?1 WHERE source_candidate = ?2",
+                    rusqlite::params![forced_id, cand.id],
+                )
+                .unwrap();
+        }
+        let other_cand = legacy_store
+            .record_owner_correction(
+                "other-agent",
+                UserModelKind::Preference,
+                "Other agent correction",
+                "reply.style",
+                &evidence("other-agent", "session-b", "reply.style"),
+                "session-b",
+                30,
+            )
+            .unwrap()
+            .unwrap();
+        legacy_store
+            .review_candidate(
+                &other_cand.id,
+                ReviewAction::Accept,
+                "operator",
+                None,
+                None,
+                40,
+            )
+            .unwrap();
+
+        // Pending candidates left for concurrent multi-thread review after migration.
+        let mut pending_ids = Vec::new();
+        for idx in 0..4 {
+            let cand = legacy_store
+                .record_observation(
+                    UserModelKind::Habit,
+                    &format!("Concurrent observation {idx}"),
+                    &format!("concurrent.key.{idx}"),
+                    "[]",
+                    50,
+                )
+                .unwrap();
+            pending_ids.push(cand.id);
+        }
+
+        let baseline_100 = legacy_store.active_heads(Some(100)).unwrap();
+        let baseline_200 = legacy_store.active_heads(Some(200)).unwrap();
+        let baseline_nova = legacy_store
+            .active_heads_for_agent("nova", Some(100))
+            .unwrap();
+        let baseline_other = legacy_store
+            .active_heads_for_agent("other-agent", Some(100))
+            .unwrap();
+        drop(legacy_store);
+
+        // Migrate once via UserModelStore::open, then reopen a second time to verify idempotency.
+        let migrated = UserModelStore::open(dir.path()).unwrap();
+        assert!(has_composite_revisions_index(&migrated.conn.lock()));
+        drop(migrated);
+        let reopened = std::sync::Arc::new(UserModelStore::open(dir.path()).unwrap());
+        assert!(has_composite_revisions_index(&reopened.conn.lock()));
+
+        assert_eq!(reopened.active_heads(Some(100)).unwrap(), baseline_100);
+        assert_eq!(reopened.active_heads(Some(200)).unwrap(), baseline_200);
+        assert_eq!(
+            reopened.active_heads_for_agent("nova", Some(100)).unwrap(),
+            baseline_nova
+        );
+        assert_eq!(
+            reopened
+                .active_heads_for_agent("other-agent", Some(100))
+                .unwrap(),
+            baseline_other
+        );
+
+        let nova_heads = reopened.active_heads_for_agent("nova", Some(100)).unwrap();
+        assert!(nova_heads.iter().any(|h| h.statement == "Winner tie"));
+        assert!(
+            !nova_heads
+                .iter()
+                .any(|h| h.statement == "Other agent correction")
+        );
+        assert!(!nova_heads.iter().any(|h| h.semantic_key == "exp.key"));
+        assert!(!nova_heads.iter().any(|h| h.semantic_key == "goal.future"));
+
+        // Verify cross-session isolation through applicability projection.
+        let proj_a = project_applicable_heads(
+            nova_heads.clone(),
+            &ApplicabilityContext::new("nova", "cli", "session-a"),
+            1_200,
+        );
+        let proj_b = project_applicable_heads(
+            nova_heads,
+            &ApplicabilityContext::new("nova", "cli", "session-b"),
+            1_200,
+        );
+        assert!(proj_a.prompt_section.contains("Winner tie"));
+        assert!(!proj_b.prompt_section.contains("Winner tie"));
+
+        // Concurrent reviews across threads on the migrated store must all commit cleanly.
+        std::thread::scope(|scope| {
+            for (idx, cid) in pending_ids.iter().enumerate() {
+                let store_ref = std::sync::Arc::clone(&reopened);
+                scope.spawn(move || {
+                    store_ref
+                        .review_candidate(
+                            cid,
+                            ReviewAction::Accept,
+                            "operator",
+                            None,
+                            None,
+                            110 + idx as u64,
+                        )
+                        .unwrap();
+                });
+            }
+        });
+        let after_concurrent = reopened.active_heads(Some(120)).unwrap();
+        for idx in 0..4 {
+            assert!(
+                after_concurrent
+                    .iter()
+                    .any(|h| h.semantic_key == format!("concurrent.key.{idx}")),
+                "concurrently reviewed candidate {idx} must be active"
+            );
+        }
+
+        // Supersession chain on record_owner_statement still links to the active head.
+        let next_global = reopened
+            .record_owner_statement(
+                UserModelKind::Preference,
+                "Newest global preference",
+                "style.tone",
+                "global",
+                130,
+            )
+            .unwrap();
+        let prev_id = baseline_100
+            .iter()
+            .find(|h| h.semantic_key == "style.tone")
+            .map(|h| h.id.as_str());
+        assert_eq!(next_global.supersedes.as_deref(), prev_id);
+    }
+
+    #[test]
+    fn query_plan_and_scale_datasets_preserve_equivalence_and_avoid_quadratic_scans() {
+        for scale in [1_000_usize, 5_000, 10_000] {
+            let unindexed_dir = tempfile::tempdir().unwrap();
+            let unindexed_conn =
+                open_legacy_unindexed_connection(&unindexed_dir.path().join("user_model.db"));
+            assert!(!has_composite_revisions_index(&unindexed_conn));
+            seed_deterministic_scale_dataset(&unindexed_conn, scale);
+
+            let indexed_dir = tempfile::tempdir().unwrap();
+            let indexed_store = UserModelStore::open(indexed_dir.path()).unwrap();
+            let indexed_conn = indexed_store.conn.lock();
+            assert!(has_composite_revisions_index(&indexed_conn));
+            seed_deterministic_scale_dataset(&indexed_conn, scale);
+
+            let unindexed = measure_active_heads_scale(&unindexed_conn, 100, 1);
+            let indexed = measure_active_heads_scale(&indexed_conn, 100, 3);
+
+            assert_eq!(
+                indexed.heads, unindexed.heads,
+                "scale={scale}: indexed query must return exact row-for-row equivalent active heads"
+            );
+            assert!(
+                indexed.fullscan_steps * 10 < unindexed.fullscan_steps,
+                "scale={scale}: indexed FullscanStep ({}) should be >10x smaller than unindexed ({})",
+                indexed.fullscan_steps,
+                unindexed.fullscan_steps
+            );
+
+            let heads_plan = explain_query_plan(&indexed_conn, ACTIVE_HEADS_SQL, true);
+            assert!(
+                heads_plan.iter().any(|line| {
+                    line.contains("USING COVERING INDEX idx_user_model_revisions_key_created_valid")
+                }),
+                "scale={scale}: expected active_heads correlated subqueries to use covering index, got: {heads_plan:?}"
+            );
+            let owner_lookup_plan =
+                explain_query_plan(&indexed_conn, OWNER_STATEMENT_SUPERSEDES_SQL, false);
+            assert!(
+                owner_lookup_plan.iter().any(|line| {
+                    line.contains("USING INDEX idx_user_model_revisions_key_created_valid")
+                }),
+                "scale={scale}: expected owner lookup to use composite index, got: {owner_lookup_plan:?}"
+            );
+            assert!(
+                !owner_lookup_plan
+                    .iter()
+                    .any(|line| line.contains("SCAN user_model_revisions")),
+                "scale={scale}: owner lookup must not table-scan user_model_revisions: {owner_lookup_plan:?}"
+            );
+
+            println!(
+                "user_model_scale={scale} rows: heads={} unindexed(1x)={:.3}ms fullscan={} sort={} vm={} | indexed(3x-med)={:.3}ms fullscan={} sort={} vm={}",
+                unindexed.heads.len(),
+                unindexed.median_ms,
+                unindexed.fullscan_steps,
+                unindexed.sort_ops,
+                unindexed.vm_steps,
+                indexed.median_ms,
+                indexed.fullscan_steps,
+                indexed.sort_ops,
+                indexed.vm_steps,
+            );
+            if scale == 10_000 {
+                println!("active_heads_eqp={heads_plan:?}");
+                println!("owner_lookup_eqp={owner_lookup_plan:?}");
+            }
+        }
     }
 }
