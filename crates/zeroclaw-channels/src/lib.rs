@@ -106,3 +106,8 @@ pub mod whatsapp;
 pub mod whatsapp_storage;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_web;
+#[cfg(feature = "channel-xmpp")]
+pub mod xmpp;
+
+#[cfg(all(feature = "channel-xmpp", target_os = "linux"))]
+mod xmpp_omemo;

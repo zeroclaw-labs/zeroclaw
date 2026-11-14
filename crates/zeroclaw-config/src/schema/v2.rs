@@ -80,6 +80,7 @@ pub const V3_CHANNEL_TYPES: &[&str] = &[
     "nextcloud_talk",
     "email",
     "gmail_push",
+    "xmpp",
     "irc",
     "twitch",
     "lark",
