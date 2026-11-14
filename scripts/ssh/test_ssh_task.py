@@ -66,7 +66,7 @@ class TaskTransportTests(unittest.TestCase):
         with patch.dict(sys.modules, {'tomllib': None, 'tomli': None}):
             loader.exec_module(importlib.util.module_from_spec(spec))
             self.pool.acquire('legacy', [], 'legacy-host')
-            with self.assertRaisesRegex(RuntimeError, 'requires Python 3.11'):
+            with self.assertRaisesRegex(module.ScopedCredentialError, 'requires Python 3.11'):
                 module.scoped_record('scoped', {})
 
     def test_task_close_cancels_running_and_queued_vault_lookups(self):

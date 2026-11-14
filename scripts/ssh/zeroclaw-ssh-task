@@ -63,21 +63,25 @@ def ssh_config(options, host, include_target=False):
     return digest
 
 
+class ScopedCredentialError(ValueError):
+    """Diagnostic safe to return without exposing credential material."""
+
+
 def scoped_record(alias, target):
     if not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', alias):
-        raise ValueError(_('Invalid SSH credential alias'))
+        raise ScopedCredentialError(_('Invalid SSH credential alias'))
     try:
         import tomllib
     except ModuleNotFoundError:
         try:
             import tomli as tomllib
         except ModuleNotFoundError:
-            raise RuntimeError(_('Scoped SSH requires Python 3.11 or the tomli package')) from None
+            raise ScopedCredentialError(_('Scoped SSH requires Python 3.11 or the tomli package')) from None
     root = pathlib.Path(os.environ['ZEROCLAW_SSH_CREDENTIAL_DIR'])
     config = tomllib.loads((root / 'config.toml').read_text())
     stored = config.get('http_request', {}).get('scoped_credentials', {}).get(alias, '')
     if not config.get('secrets', {}).get('encrypt', True) or not stored.startswith('enc2:'):
-        raise ValueError(_('SSH credential unavailable'))
+        raise ScopedCredentialError(_('SSH credential unavailable'))
     from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
     blob = bytes.fromhex(stored[5:])
     master = bytes.fromhex((root / '.secret_key').read_text().strip())
@@ -89,7 +93,7 @@ def scoped_record(alias, target):
         and grant['username'] == target['user']
         for grant in auth.get('destinations', [])
     ):
-        raise ValueError(_('SSH credential is not authorized for this destination'))
+        raise ScopedCredentialError(_('SSH credential is not authorized for this destination'))
     revision = hashlib.sha256(stored.encode()).hexdigest()
     return revision, record.get('source', 'local'), auth['private_key']
 
@@ -398,10 +402,8 @@ def serve(directory):
                 effective, target = ssh_config(options, host, include_target=True)
                 try:
                     revision, source, value = scoped_record(alias, target)
-                except ValueError as exc:
-                    if str(exc) in ('SSH credential unavailable', 'SSH credential is not authorized for this destination'):
-                        raise
-                    raise ValueError(_('SSH credential lookup failed')) from None
+                except ScopedCredentialError:
+                    raise
                 except Exception:
                     raise ValueError(_('SSH credential lookup failed')) from None
                 key = hashlib.sha256(f'{effective}:{alias}:{revision}'.encode()).hexdigest()[:24]
