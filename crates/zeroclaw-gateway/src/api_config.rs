@@ -1339,6 +1339,14 @@ struct HttpCredentialMutation {
     name: String,
     operation: PluginTlsCredentialOperation,
     credential: Option<zeroclaw_config::schema::ScopedHttpCredential>,
+    permissions: Option<HttpCredentialPermissions>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HttpCredentialPermissions {
+    http_allowed: Option<bool>,
+    destinations: Option<Vec<zeroclaw_config::schema::SshCredentialDestination>>,
 }
 
 pub async fn list_http_credentials(
@@ -1390,10 +1398,12 @@ pub async fn list_http_credentials(
                     ScopedHttpAuth::SshKey { destinations, .. } => Some(destinations),
                     _ => None,
                 };
+                let http_allowed = record.origin.starts_with("https://")
+                    .then_some(record.http_allowed);
                 rows.push((
                     name,
                     serde_json::json!({
-                        "name": name, "origin": record.origin, "kind": kind, "source": record.source, "destinations": destinations, "header": header
+                        "name": name, "origin": record.origin, "kind": kind, "source": record.source, "destinations": destinations, "header": header, "http_allowed": http_allowed
                     }),
                 ));
             }
@@ -1443,6 +1453,67 @@ pub async fn mutate_http_credential(
             }
             let credentials = &mut config.http_request.scoped_credentials;
             let present = credentials.contains_key(&mutation.name);
+            if let Some(permissions) = mutation.permissions {
+                if mutation.credential.is_some()
+                    || !matches!(mutation.operation, PluginTlsCredentialOperation::Replace)
+                {
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
+                let Some(stored) = credentials.get(&mutation.name) else {
+                    return StatusCode::NOT_FOUND.into_response();
+                };
+                let store = SecretStore::new(dir, true);
+                let decoded = if stored.starts_with("enc2:") {
+                    store.decrypt(stored)
+                } else {
+                    Ok(stored.clone())
+                };
+                let Ok(mut record) = decoded.and_then(|value| {
+                    serde_json::from_str::<ScopedHttpCredential>(&value).map_err(Into::into)
+                }) else {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                };
+                match (
+                    &mut record.auth,
+                    permissions.http_allowed,
+                    permissions.destinations,
+                ) {
+                    (ScopedHttpAuth::SshKey { destinations, .. }, None, Some(grants))
+                        if grants.len() <= 32 && grants.iter().all(|grant| grant.is_valid()) =>
+                    {
+                        *destinations = grants
+                    }
+                    (
+                        ScopedHttpAuth::UserPassword { .. } | ScopedHttpAuth::ApiKey { .. },
+                        Some(allowed),
+                        None,
+                    ) if ScopedHttpCredential::https_origin(&record.origin).is_some() => {
+                        record.http_allowed = allowed
+                    }
+                    _ => return StatusCode::BAD_REQUEST.into_response(),
+                }
+                let Ok(ciphertext) = serde_json::to_string(&record)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|value| store.encrypt(&value))
+                else {
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                };
+                credentials.insert(mutation.name.clone(), ciphertext);
+                let path = format!("http_request.scoped_credentials.{}", mutation.name);
+                config.mark_dirty(&path);
+                let authorization = match authorize_config_write(
+                    &principal,
+                    ConfigWriteSet::default().with(path, Verb::Update),
+                    &guard,
+                ) {
+                    Ok(authorization) => authorization,
+                    Err(denied) => return denied.into_response(),
+                };
+                return match persist_and_swap(&state, authorization, config, guard).await {
+                    Ok(_) => StatusCode::NO_CONTENT.into_response(),
+                    Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                };
+            }
             let verb = match (mutation.operation, &mutation.credential, present) {
                 (PluginTlsCredentialOperation::Create, Some(_), false) => Verb::Create,
                 (PluginTlsCredentialOperation::Replace, Some(_), true) => Verb::Update,
@@ -1450,6 +1521,39 @@ pub async fn mutate_http_credential(
                 _ => return StatusCode::CONFLICT.into_response(),
             };
             if let Some(mut credential) = mutation.credential {
+                if let Some(previous) = credentials.get(&mutation.name) {
+                    let store = SecretStore::new(dir, true);
+                    let decoded = if previous.starts_with("enc2:") {
+                        store.decrypt(previous)
+                    } else {
+                        Ok(previous.clone())
+                    };
+                    let Ok(previous) = decoded.and_then(|value| {
+                        serde_json::from_str::<ScopedHttpCredential>(&value).map_err(Into::into)
+                    }) else {
+                        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    };
+                    if std::mem::discriminant(&previous.auth)
+                        != std::mem::discriminant(&credential.auth)
+                    {
+                        return StatusCode::BAD_REQUEST.into_response();
+                    }
+                    credential.http_allowed =
+                        previous.http_allowed && previous.origin == credential.origin;
+                    if let (
+                        ScopedHttpAuth::SshKey {
+                            destinations: current,
+                            ..
+                        },
+                        ScopedHttpAuth::SshKey {
+                            destinations: prior,
+                            ..
+                        },
+                    ) = (&mut credential.auth, previous.auth)
+                    {
+                        *current = prior;
+                    }
+                }
                 let destination = match &credential.auth {
                     ScopedHttpAuth::SshKey { .. } | ScopedHttpAuth::Totp { .. } => {
                         credential.origin.is_empty().then(String::new)

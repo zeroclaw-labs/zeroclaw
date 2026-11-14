@@ -9056,6 +9056,8 @@ pub struct HttpRequestConfig {
 #[serde(deny_unknown_fields)]
 pub struct ScopedHttpCredential {
     pub origin: String,
+    #[serde(default = "default_true")]
+    pub http_allowed: bool,
     #[serde(default)]
     pub source: ScopedCredentialSource,
     pub auth: ScopedHttpAuth,
@@ -9226,8 +9228,8 @@ mod scoped_credential_source_tests {
             "ldaps://directory.example.com:636",
             "kerberos://EXAMPLE.COM",
             "ad://example.com",
-            "service:Corporate directory",
-            "service:postgresql://db.example.com:5432",
+            "postgresql://db.example.com:5432",
+            "imap://mail.example.com",
         ] {
             assert_eq!(
                 ScopedHttpCredential::password_service(value).as_deref(),
@@ -9235,7 +9237,7 @@ mod scoped_credential_source_tests {
             );
         }
         for value in [
-            "ldap://directory.example.com",
+            "Corporate directory",
             "service:",
             "service:ldaps://user:password@directory.example.com",
             "ldaps://user:password@directory.example.com",
@@ -9281,22 +9283,17 @@ impl ScopedHttpCredential {
     }
 
     pub fn password_service(raw: &str) -> Option<String> {
-        if let Some(origin) = Self::https_origin(raw) {
-            return (raw.trim_end_matches('/') == origin).then_some(origin);
+        let (_, authority) = raw.split_once("://")?;
+        if authority.is_empty()
+            || authority.starts_with('/')
+            || authority.contains(['@', '\\'])
+            || raw.len() > 253
+            || raw.chars().any(|c| c.is_whitespace() || c.is_control())
+        {
+            return None;
         }
-        if let Some(service) = raw.strip_prefix("service:") {
-            let service = service.trim();
-            return (!service.is_empty()
-                && service.len() <= 253
-                && service.chars().all(|character| {
-                    character.is_alphanumeric() || " .-_:/()".contains(character)
-                }))
-            .then(|| format!("service:{service}"));
-        }
-        // Preserve records from the first version of the editor.
         let url = url::Url::parse(raw).ok()?;
-        if !matches!(url.scheme(), "ldaps" | "kerberos" | "ad")
-            || url.host_str().is_none()
+        if url.host_str().is_none()
             || !url.username().is_empty()
             || url.password().is_some()
             || url.query().is_some()
@@ -9304,6 +9301,9 @@ impl ScopedHttpCredential {
             || !matches!(url.path(), "" | "/")
         {
             return None;
+        }
+        if url.scheme() == "https" {
+            return Some(url.origin().ascii_serialization());
         }
         Some(url.as_str().trim_end_matches('/').to_owned())
     }

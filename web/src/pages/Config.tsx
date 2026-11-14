@@ -1,3 +1,4 @@
+import CredentialPermissions from "@/components/sections/CredentialPermissions";
 import HttpCredentials from "@/components/sections/HttpCredentials";
 import PluginTlsCredentials from "../components/sections/PluginTlsCredentials";
 // Schema-driven config editor (#6175). Curated section explorer
@@ -267,6 +268,11 @@ export default function Config() {
               key: "totp-credentials",
               label: t("http_credentials.totp"),
               render: () => <HttpCredentials key="totp" kind="totp" />,
+            },
+            {
+              key: "credential-permissions",
+              label: t("http_credentials.permissions"),
+              render: () => <CredentialPermissions />,
             },
           ]}
         />

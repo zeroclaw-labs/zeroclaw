@@ -483,8 +483,9 @@ impl HttpRequestTool {
         let credential: ScopedHttpCredential = serde_json::from_str(&plaintext).map_err(|_| {
             anyhow::Error::msg(scoped_credential_message("tool-http-credential-invalid"))
         })?;
-        if ScopedHttpCredential::https_origin(&target.url).as_deref()
-            != Some(credential.origin.as_str())
+        if !credential.http_allowed
+            || ScopedHttpCredential::https_origin(&target.url).as_deref()
+                != Some(credential.origin.as_str())
         {
             return Err(anyhow::Error::msg(scoped_credential_message(
                 "tool-http-credential-origin",
@@ -1361,6 +1362,7 @@ mod tests {
             dir.path(),
             ScopedHttpCredential {
                 origin: "https://example.com".into(),
+                http_allowed: true,
                 source: Default::default(),
                 auth: ScopedHttpAuth::ApiKey {
                     value: "fixture-key".into(),
@@ -1398,6 +1400,26 @@ mod tests {
         );
         assert_eq!(headers["x-api-key"], "fixture-key");
         assert!(headers["x-api-key"].is_sensitive());
+        tool.scoped_credential_fixture(
+            dir.path(),
+            ScopedHttpCredential {
+                origin: "https://example.com".into(),
+                http_allowed: false,
+                source: Default::default(),
+                auth: ScopedHttpAuth::ApiKey {
+                    value: "fixture-key".into(),
+                    header: ScopedApiKeyHeader::XApiKey,
+                },
+            },
+        );
+        headers.clear();
+        assert!(
+            tool.apply_scoped_credential(&mut headers, "TEST", &target)
+                .await
+                .is_err()
+        );
+        assert!(headers.is_empty());
+
         let mut forged = HeaderMap::new();
         forged.insert(HOST, HeaderValue::from_static("another.example.com"));
         assert!(

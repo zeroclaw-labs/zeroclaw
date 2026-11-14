@@ -23,12 +23,18 @@ const setupLinks = {
   google: "https://docs.cloud.google.com/sdk/docs/install",
 } satisfies Record<HttpCredentialSource, string>;
 
+export function parseSshDestinations(value: string) {
+  return value.split("\n").map(line => line.trim()).filter(Boolean).map(line => {
+    const match = /^([^@]+)@(?:\[([0-9a-f:.]+)\]|([^:]+))(?::(\d+))?$/i.exec(line);
+    return { username: match?.[1] ?? "", host: match?.[2] ?? match?.[3] ?? "", port: Number(match?.[4] ?? 22) };
+  });
+}
+
 export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) {
   const [catalog, setCatalog] = useState<Catalog>();
   const [editing, setEditing] = useState<HttpCredentialRow | "new" | null>(null);
   const [removing, setRemoving] = useState<HttpCredentialRow | null>(null);
   const [header, setHeader] = useState<"bearer" | "x_api_key">("bearer");
-  const [passwordTarget, setPasswordTarget] = useState<"https" | "service">("https");
   const [source, setSource] = useState<HttpCredentialSource>("local");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
@@ -63,14 +69,9 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
     const form = event.currentTarget;
     const data = new FormData(form);
     const name = editing === "new" ? String(data.get("name")) : editing.name;
-    const destination = String(data.get("origin") ?? "").trim();
-    const origin = kind === "user_password" && passwordTarget === "service" ? `service:${destination}` : destination;
+    const origin = String(data.get("origin") ?? "").trim();
     const secret = String(data.get("secret"));
-    const destinations = String(data.get("destinations") ?? "").split("\n")
-      .map(line => line.trim()).filter(Boolean).map(line => {
-        const match = /^([^@]+)@(?:\[([0-9a-f:.]+)\]|([^:]+))(?::(\d+))?$/i.exec(line);
-        return { username: match?.[1] ?? "", host: match?.[2] ?? match?.[3] ?? "", port: Number(match?.[4] ?? 22) };
-      });
+    const destinations = parseSshDestinations(String(data.get("destinations") ?? ""));
     const auth = kind === "totp"
       ? { kind, seed: source === "local" ? secret.replace(/[\s-]+/g, "").replace(/=+$/, "").toUpperCase() : secret.trim() } as const
       : kind === "ssh_key"
@@ -101,7 +102,7 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
             <p key={JSON.stringify(destination)} className="text-sm">{destination.username}@{destination.host}:{destination.port}</p>
           ))}
           <div className="flex flex-wrap gap-2">
-            <Button size="sm" disabled={disabled} onClick={() => { setRemoving(null); setHeader(row.header ?? "bearer"); setSource(row.source); setPasswordTarget(row.origin.startsWith("https://") ? "https" : "service"); setEditing(row); }}>
+            <Button size="sm" disabled={disabled} onClick={() => { setRemoving(null); setHeader(row.header ?? "bearer"); setSource(row.source); setEditing(row); }}>
               {t("plugin_tls.replace")}
             </Button>
             <Button size="sm" variant="ghost" disabled={disabled} onClick={() => { setEditing(null); setRemoving(row); }}>
@@ -110,7 +111,7 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
           </div>
         </div>
       ))}
-      <Button disabled={disabled} onClick={() => { setRemoving(null); setHeader("bearer"); setSource("local"); setPasswordTarget("https"); setEditing("new"); }}>
+      <Button disabled={disabled} onClick={() => { setRemoving(null); setHeader("bearer"); setSource("local"); setEditing("new"); }}>
         {t("http_credentials.add")}
       </Button>
       {editing && (
@@ -119,32 +120,18 @@ export default function HttpCredentials({ kind }: { kind: HttpCredentialKind }) 
             <span>{t("http_credentials.name")}</span>
             <input className={inputClass} name="name" required maxLength={64} pattern={"[A-Za-z0-9_\\-]+"} readOnly={editing !== "new"} defaultValue={editing === "new" ? "" : editing.name} />
           </label>
-          {kind === "user_password" && (
-            <div className="space-y-1">
-              <label htmlFor="credential-destination-type">{t("http_credentials.destination_type")}</label>
-              <Select id="credential-destination-type" aria-label={t("http_credentials.destination_type")}
-                value={passwordTarget} onChange={(value) => setPasswordTarget(value === "service" ? "service" : "https")}
-                options={[
-                  { value: "https", label: t("http_credentials.https_basic") },
-                  { value: "service", label: t("http_credentials.other_service") },
-                ]}
-              />
-            </div>
-          )}
-          {kind === "ssh_key" ? (
+          {kind === "ssh_key" ? editing === "new" && (
             <label className="block space-y-1">
               <span>{t("http_credentials.ssh_destinations")}</span>
               <textarea className={inputClass} name="destinations" placeholder="operator@server.example.com:22"
-                defaultValue={editing === "new" ? "" : editing.destinations?.map(d => `${d.username}@${d.host.includes(":") ? `[${d.host}]` : d.host}:${d.port}`).join("\n")}
               />
             </label>
           ) : kind !== "totp" && (
           <label className="block space-y-1">
-            <span>{t(kind === "user_password" && passwordTarget === "service" ? "http_credentials.service" : "http_credentials.origin")}</span>
-            <input key={passwordTarget} className={inputClass} name="origin"
-              type={kind === "user_password" && passwordTarget === "service" ? "text" : "url"} required maxLength={253}
-              placeholder={kind === "user_password" && passwordTarget === "service" ? "ldaps://directory.example.com:636" : "https://api.example.com"}
-              defaultValue={editing === "new" || (kind === "user_password" && editing.origin.startsWith("https://") !== (passwordTarget === "https")) ? "" : editing.origin.replace(/^service:/, "")}
+            <span>{t(kind === "user_password" ? "http_credentials.service" : "http_credentials.origin")}</span>
+            <input className={inputClass} name="origin" type="url" required maxLength={253}
+              placeholder={kind === "user_password" ? "ldaps://directory.example.com:636" : "https://api.example.com"}
+              defaultValue={editing === "new" ? "" : editing.origin.replace(/^service:/, "")}
             />
           </label>
           )}
