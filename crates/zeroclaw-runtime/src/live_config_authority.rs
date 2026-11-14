@@ -58,7 +58,12 @@ impl LiveConfigAuthority {
     /// production.
     #[cfg(test)]
     pub(crate) fn for_tests(config: Config) -> Self {
-        Self::new(config)
+        Self {
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            live: LiveConfig::new(zeroclaw_config::migration::admit_test_input(&config)),
+            agent_lifecycle: AgentLifecycleCoordinator::default(),
+            application_results: Arc::default(),
+        }
     }
 
     /// Test-only authority retaining historical typed input for RPC property
