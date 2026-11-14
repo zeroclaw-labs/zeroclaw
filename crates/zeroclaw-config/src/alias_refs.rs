@@ -277,17 +277,23 @@ pub fn delete_with_cascade(
     alias: &str,
     policy: CascadePolicy,
 ) -> Result<CascadeReport, CascadeError> {
-    match kind {
+    let report = match kind {
         AliasKind::Provider {
             category: ProviderCategory::Models,
             family,
-        } => delete_model_provider(cfg, family, alias, policy),
-        AliasKind::Provider { .. } => Err(CascadeError::NotImplemented(
-            "TTS/transcription provider delete-with-cascade is not yet implemented".to_string(),
-        )),
-        AliasKind::Agent => delete_agent(cfg, alias, policy),
-        AliasKind::Channel { channel_type } => delete_channel(cfg, channel_type, alias, policy),
+        } => delete_model_provider(cfg, family, alias, policy)?,
+        AliasKind::Provider { .. } => {
+            return Err(CascadeError::NotImplemented(
+                "TTS/transcription provider delete-with-cascade is not yet implemented".to_string(),
+            ));
+        }
+        AliasKind::Agent => delete_agent(cfg, alias, policy)?,
+        AliasKind::Channel { channel_type } => delete_channel(cfg, channel_type, alias, policy)?,
+    };
+    if report.deleted_entry.is_some() {
+        cfg.drop_secret_snapshots_in_section(&section_path(kind), alias);
     }
+    Ok(report)
 }
 
 fn delete_model_provider(
@@ -372,10 +378,29 @@ fn scrub_model_provider_refs(cfg: &mut Config, target: &str) {
     for (_ty, _al, profile) in cfg.providers.models.iter_entries_mut() {
         profile.fallback.retain(|fb| fb.trim() != target);
     }
+    let removed_model_hints: Vec<String> = cfg
+        .model_routes
+        .iter()
+        .filter(|r| r.model_provider.trim() == target)
+        .map(|r| r.hint.clone())
+        .collect();
     cfg.model_routes
         .retain(|r| r.model_provider.trim() != target);
+    for hint in &removed_model_hints {
+        cfg.drop_secret_snapshots_in_section("model_routes", hint);
+    }
+
+    let removed_embedding_hints: Vec<String> = cfg
+        .embedding_routes
+        .iter()
+        .filter(|r| r.model_provider.trim() == target)
+        .map(|r| r.hint.clone())
+        .collect();
     cfg.embedding_routes
         .retain(|r| r.model_provider.trim() != target);
+    for hint in &removed_embedding_hints {
+        cfg.drop_secret_snapshots_in_section("embedding_routes", hint);
+    }
 }
 
 fn delete_agent(
@@ -630,7 +655,8 @@ pub fn rename_with_cascade(
     let section = section_path(kind);
     // `rename_map_key` validates `new_alias` via `validate_alias_key` (whose
     // leading-underscore rule also blocks the `_deleted` marker) and refuses a
-    // collision, then swaps the entry key. `Ok(false)` = the source key is absent.
+    // collision, then swaps the entry key and rewrites secret snapshots.
+    // `Ok(false)` = the source key is absent.
     match cfg.rename_map_key(&section, old_alias, new_alias) {
         Ok(true) => {}
         Ok(false) => return Err(RenameError::NotFound(entry_path(kind, old_alias))),

@@ -937,6 +937,26 @@ pub(crate) fn sync_table(doc: &mut toml_edit::Table, new: &toml::Table) {
     }
 }
 
+fn clear_edit_item_positions(item: &mut toml_edit::Item) {
+    match item {
+        toml_edit::Item::Table(tbl) => {
+            tbl.set_position(None);
+            for (_, v) in tbl.iter_mut() {
+                clear_edit_item_positions(v);
+            }
+        }
+        toml_edit::Item::ArrayOfTables(arr) => {
+            for tbl in arr.iter_mut() {
+                tbl.set_position(None);
+                for (_, v) in tbl.iter_mut() {
+                    clear_edit_item_positions(v);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Convert a `toml::Value` into a `toml_edit::Item` for insertion into
 /// a `DocumentMut`. Tables become inline tables when small, real tables
 /// otherwise — matches `toml_edit`'s default round-trip behavior.
@@ -957,7 +977,11 @@ pub(crate) fn toml_value_to_edit_item(value: &toml::Value) -> toml_edit::Item {
         }
     };
     let doc: toml_edit::DocumentMut = serialized.parse().unwrap_or_default();
-    doc.get("__v").cloned().unwrap_or(toml_edit::Item::None)
+    let mut item = doc.get("__v").cloned().unwrap_or(toml_edit::Item::None);
+    // Drop synthetic wrapper table positions so inserted subtables inherit
+    // their parent section's relative ordering instead of sorting ahead of it.
+    clear_edit_item_positions(&mut item);
+    item
 }
 
 #[cfg(test)]

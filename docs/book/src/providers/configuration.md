@@ -44,10 +44,11 @@ Supported credential input and storage forms:
 
 1. **Inline `api_key = "..."`** in the alias entry (fine for dev, risky for checked-in configs).
 2. **1Password references**: set a secret field to `op://vault/item/field`. ZeroClaw keeps the reference in config and resolves it at runtime with `op read`, so the 1Password CLI must be installed and signed in.
-3. **Config-level secrets store**: encrypted at `~/.zeroclaw/secrets` via a local key file.
-4. **Generic env override**: `ZEROCLAW_providers__models__<type>__<alias>__api_key=...` sets `providers.models.<type>.<alias>.api_key` at startup. See [Environment variables](../reference/env-vars.md) for the full grammar.
+3. **Tachi Vault references**: set a secret field (including string arrays and secret header/env maps) to `vault:<NAME>` (`[A-Za-z_][A-Za-z0-9_.-]*`, up to 128 ASCII bytes), for example `api_key = "vault:OPENAI_OFFICIAL_API_KEY"`. ZeroClaw resolves it non-interactively at runtime via `tachi vault` (`vault status` followed by an unlocked daemon `vault lease` or Keychain-backed `vault get --reveal --json --keychain`, including offline mode when no daemon is running) and preserves the `vault:<NAME>` reference on disk across saves and renames. Tachi Vault owns the credential; a locked daemon requires macOS Keychain password storage (service `tachi-vault`, account `default`) or an explicit `tachi vault unlock` first, and offline mode (no running daemon) requires that macOS Keychain entry so `vault get --keychain` can unlock non-interactively.
+4. **Config-level secrets store**: encrypted at `~/.zeroclaw/secrets` via a local key file.
+5. **Generic env override**: `ZEROCLAW_providers__models__<type>__<alias>__api_key=...` sets `providers.models.<type>.<alias>.api_key` at startup. See [Environment variables](../reference/env-vars.md) for the full grammar.
 
-Schema-mirror env overrides win at startup. They replace the in-memory credential for that process without rewriting the stored inline, encrypted, or `op://` value on disk.
+Schema-mirror env overrides win at startup. They replace the in-memory credential for that process without rewriting the stored inline, encrypted, `op://`, or `vault:` value on disk.
 
 `zeroclaw quickstart` writes credentials to the secrets store by default. Configs you commit should not contain inline keys. For ecosystem-default names you already export in your shell (`$ANTHROPIC_API_KEY`, `$OPENROUTER_API_KEY`, …), the [env-vars reference](../reference/env-vars.md#bridging-ecosystem-default-env-vars) shows the one-line bash expansions that point a schema-mirror name at the existing value.
 

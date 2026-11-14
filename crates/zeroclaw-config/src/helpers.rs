@@ -115,11 +115,15 @@ where
             // empty prefix.
             continue;
         }
+        // Require a trailing `.` + property suffix (just like `route_hashmap_path`).
+        // Bare element paths (`rest == key`) must NOT compete for `best_len`,
+        // otherwise a sibling natural key literally named `<other>.<field>`
+        // (e.g. `fast.api_key`) steals `best_len` from `<other>` (`fast`) and
+        // turns `<other>.<field>` into a spurious `Miss`.
         if rest
             .strip_prefix(key)
             .and_then(|s| s.strip_prefix('.'))
             .is_some()
-            || rest == key
         {
             match best_len {
                 Some(len) if key.len() < len => continue,
@@ -143,13 +147,6 @@ where
         };
     }
     let idx = best_hits[0];
-    // `rest == key` means the inner suffix is empty (i.e. the path
-    // addresses the element itself, not a property on it). Treat as a
-    // miss for routing-into-properties; callers asking about the whole
-    // element use map_keys / map_key_create instead.
-    if rest.len() == key_len {
-        return VecRoute::Miss;
-    }
     let inner_suffix = &rest[key_len + 1..];
     let inner_name = if inner_prefix.is_empty() {
         inner_suffix.to_string()
@@ -672,6 +669,38 @@ pub fn kebab_to_snake(key: &str) -> String {
     key.replace('-', "_")
 }
 
+/// Percent-encode structural delimiters (`.`, `[`, `]`, `%`) inside a dynamic
+/// map key or natural key so snapshot paths remain an injective, collision-free
+/// mapping while plain alphanumeric/underscore/hyphen keys stay human-readable.
+#[must_use]
+pub fn encode_snapshot_segment(seg: &str) -> String {
+    if seg.is_empty() {
+        return "%00".to_string();
+    }
+    let mut out = String::with_capacity(seg.len());
+    for ch in seg.chars() {
+        match ch {
+            '%' => out.push_str("%25"),
+            '.' => out.push_str("%2E"),
+            '[' => out.push_str("%5B"),
+            ']' => out.push_str("%5D"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+#[must_use]
+pub fn join_snapshot_path(prefix: &str, seg: &str) -> String {
+    if prefix.is_empty() {
+        seg.to_string()
+    } else if seg.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}.{seg}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -862,6 +891,45 @@ mod tests {
             keys.iter().copied(),
         );
         assert_eq!(got, VecRoute::Miss);
+    }
+
+    #[test]
+    fn route_vec_path_bare_dotted_sibling_does_not_shadow_shorter_key_property() {
+        let keys = [(0usize, "fast"), (1, "fast.api_key")];
+        assert_eq!(
+            route_vec_path("model_routes.fast.api_key", "", "model_routes", "", keys),
+            VecRoute::Hit {
+                index: 0,
+                inner_name: "api_key".to_string(),
+            }
+        );
+        assert_eq!(
+            route_vec_path(
+                "model_routes.fast.api_key.api_key",
+                "",
+                "model_routes",
+                "",
+                keys,
+            ),
+            VecRoute::Hit {
+                index: 1,
+                inner_name: "api_key".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn encode_snapshot_segment_isolates_delimiters_without_mutating_plain_keys() {
+        assert_eq!(encode_snapshot_segment(""), "%00");
+        assert_eq!(encode_snapshot_segment("%00"), "%2500");
+        assert_eq!(encode_snapshot_segment("default"), "default");
+        assert_eq!(encode_snapshot_segment("fast.api_key"), "fast%2Eapi_key");
+        assert_eq!(encode_snapshot_segment("TOKEN[0]"), "TOKEN%5B0%5D");
+        assert_eq!(encode_snapshot_segment("100%"), "100%25");
+        assert_ne!(
+            encode_snapshot_segment("fast.api_key"),
+            format!("{}.api_key", encode_snapshot_segment("fast"))
+        );
     }
 
     #[test]

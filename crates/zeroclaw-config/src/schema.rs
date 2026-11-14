@@ -73,6 +73,285 @@ const SUPPORTED_PROXY_SERVICE_SELECTORS: &[&str] = &[
 
 // ── Top-level config ──────────────────────────────────────────────
 
+/// Bound identity recorded when a dotted leaf property path begins tracking in
+/// `dirty_paths`, `explicit_prop_dirty_paths`, `env_overridden_paths`, or
+/// `pre_override_snapshots`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackedPropIdentity {
+    pub encoded_key: String,
+    pub had_sibling_entry: bool,
+}
+
+/// Thread-safe map of snapshot metadata captured on load and synchronized whenever
+/// a full or incremental save writes updated values or references cleanly.
+#[derive(Default)]
+pub struct SharedStringMap(std::sync::RwLock<HashMap<String, String>>);
+
+/// Alias for on-disk external secret reference (`op://`, `vault:`) snapshots.
+pub type ExternalRefSnapshots = SharedStringMap;
+
+/// Alias for pre-override plaintext snapshots captured when `ZEROCLAW_*` env vars apply.
+pub type PreOverrideSnapshots = SharedStringMap;
+
+impl SharedStringMap {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(std::sync::RwLock::new(HashMap::new()))
+    }
+
+    #[must_use]
+    pub fn from_map(map: HashMap<String, String>) -> Self {
+        Self(std::sync::RwLock::new(map))
+    }
+
+    #[must_use]
+    pub fn to_map(&self) -> HashMap<String, String> {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    }
+
+    #[must_use]
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(key)
+    }
+
+    #[must_use]
+    pub fn get(&self, key: &str) -> Option<String> {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .cloned()
+    }
+
+    #[must_use]
+    pub fn keys(&self) -> std::vec::IntoIter<String> {
+        let keys: Vec<String> = self
+            .0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect();
+        keys.into_iter()
+    }
+
+    #[must_use]
+    pub fn iter(&self) -> std::vec::IntoIter<(String, String)> {
+        let entries: Vec<(String, String)> = self
+            .0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        entries.into_iter()
+    }
+
+    pub fn insert(&self, key: String, value: String) -> Option<String> {
+        self.0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key, value)
+    }
+
+    pub fn remove(&self, key: &str) -> Option<String> {
+        self.0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(key)
+    }
+
+    pub fn retain<F>(&self, f: F)
+    where
+        F: FnMut(&String, &mut String) -> bool,
+    {
+        self.0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(f);
+    }
+
+    pub fn extend<I>(&self, iter: I)
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
+        self.0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(iter);
+    }
+}
+
+impl From<HashMap<String, String>> for SharedStringMap {
+    fn from(map: HashMap<String, String>) -> Self {
+        Self::from_map(map)
+    }
+}
+
+impl Clone for SharedStringMap {
+    fn clone(&self) -> Self {
+        Self::from_map(self.to_map())
+    }
+}
+
+impl std::fmt::Debug for SharedStringMap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let guard = self
+            .0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::fmt::Debug::fmt(&*guard, f)
+    }
+}
+
+impl PartialEq for SharedStringMap {
+    fn eq(&self, other: &Self) -> bool {
+        if std::ptr::eq(self, other) {
+            return true;
+        }
+        self.to_map() == other.to_map()
+    }
+}
+
+impl Eq for SharedStringMap {}
+
+/// Thread-safe set of env-overridden property paths captured on load and
+/// synchronized whenever a full or incremental save persists edits.
+#[derive(Default)]
+pub struct SharedStringSet(std::sync::RwLock<std::collections::HashSet<String>>);
+
+/// Alias for tracked `ZEROCLAW_*` env-overridden property paths.
+pub type EnvOverriddenPaths = SharedStringSet;
+
+impl SharedStringSet {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(std::sync::RwLock::new(std::collections::HashSet::new()))
+    }
+
+    #[must_use]
+    pub fn from_set(set: std::collections::HashSet<String>) -> Self {
+        Self(std::sync::RwLock::new(set))
+    }
+
+    #[must_use]
+    pub fn to_set(&self) -> std::collections::HashSet<String> {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    }
+
+    #[must_use]
+    pub fn contains(&self, value: &str) -> bool {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(value)
+    }
+
+    #[must_use]
+    pub fn iter(&self) -> std::vec::IntoIter<String> {
+        let entries: Vec<String> = self
+            .0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect();
+        entries.into_iter()
+    }
+
+    pub fn insert(&self, value: String) -> bool {
+        self.0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(value)
+    }
+
+    pub fn remove(&self, value: &str) -> bool {
+        self.0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(value)
+    }
+
+    pub fn retain<F>(&self, f: F)
+    where
+        F: FnMut(&String) -> bool,
+    {
+        self.0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(f);
+    }
+
+    pub fn extend<I>(&self, iter: I)
+    where
+        I: IntoIterator<Item = String>,
+    {
+        self.0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(iter);
+    }
+}
+
+impl From<std::collections::HashSet<String>> for SharedStringSet {
+    fn from(set: std::collections::HashSet<String>) -> Self {
+        Self::from_set(set)
+    }
+}
+
+impl Clone for SharedStringSet {
+    fn clone(&self) -> Self {
+        Self::from_set(self.to_set())
+    }
+}
+
+impl std::fmt::Debug for SharedStringSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let guard = self
+            .0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::fmt::Debug::fmt(&*guard, f)
+    }
+}
+
+impl PartialEq for SharedStringSet {
+    fn eq(&self, other: &Self) -> bool {
+        if std::ptr::eq(self, other) {
+            return true;
+        }
+        self.to_set() == other.to_set()
+    }
+}
+
+impl Eq for SharedStringSet {}
+
 /// Top-level ZeroClaw configuration, loaded from `config.toml`.
 ///
 /// Resolution order: `ZEROCLAW_CONFIG_DIR` env → `ZEROCLAW_WORKSPACE` env → `~/.zeroclaw/config.toml`.
@@ -95,23 +374,39 @@ pub struct Config {
     /// `prop_is_env_overridden` for O(1) display-layer lookup (config list,
     /// dashboard, quickstart).
     #[serde(skip)]
-    pub env_overridden_paths: std::collections::HashSet<String>,
+    pub env_overridden_paths: EnvOverriddenPaths,
     /// Per-path snapshot of pre-override raw values, captured at apply time
     /// from the post-`decrypt_secrets` in-memory state (so secret entries
     /// hold plaintext, not the display mask). `save()` restores from this
     /// map so env-injected values never reach disk and the operator's
     /// original on-disk credentials survive any save cycle.
     #[serde(skip)]
-    pub pre_override_snapshots: std::collections::HashMap<String, String>,
-    /// Per-path snapshot of `op://` external secret references captured before
+    pub pre_override_snapshots: PreOverrideSnapshots,
+    /// Per-path snapshot of `op://` and `vault:` external secret references captured before
     /// `decrypt_secrets()` resolves them for runtime use. `save()` restores
     /// these references unless the same path was intentionally edited.
     #[serde(skip)]
-    pub onepassword_reference_snapshots: std::collections::HashMap<String, String>,
+    pub onepassword_reference_snapshots: ExternalRefSnapshots,
     /// Dotted prop-paths mutated since the last persist; drives the
     /// per-path PATCH applied by `save_dirty()`.
     #[serde(skip)]
     pub dirty_paths: std::collections::HashSet<String>,
+    /// Whole-entry `(section_path\0entry_key)` markers recorded by
+    /// `create_map_key`, `delete_map_key`, and `rename_map_key` so incremental
+    /// and full saves distinguish whole-entry deletions/renames (`fast.api_key`)
+    /// from leaf property edits on shorter sibling keys (`fast` -> `api_key`).
+    #[serde(skip)]
+    pub dirty_map_entries: std::collections::HashSet<String>,
+    /// Dotted prop-paths explicitly edited via `set_prop_persistent` or
+    /// `set_secret_persistent` since the last persist.
+    #[serde(skip)]
+    pub explicit_prop_dirty_paths: std::collections::HashSet<String>,
+    /// Canonical encoded snapshot key (`encode_prop_snapshot_key`) bound when a
+    /// leaf property path was recorded in `dirty_paths`, `explicit_prop_dirty_paths`,
+    /// `env_overridden_paths`, or `pre_override_snapshots`, preventing subsequent
+    /// map/list key mutations from silently rebinding or shadowing a tracked dotted path.
+    #[serde(skip)]
+    pub tracked_prop_identities: std::collections::HashMap<String, TrackedPropIdentity>,
     /// Security-critical sections the resilient loader reset to `Default`
     /// because the on-disk block was malformed. Non-empty = posture may be
     /// weaker than intended; exposure gating should refuse to trust the
@@ -11818,10 +12113,13 @@ impl Default for Config {
             config_path: zeroclaw_dir.join("config.toml"),
             composition: None,
             tasks: crate::tasks::TasksConfig::default(),
-            env_overridden_paths: std::collections::HashSet::new(),
-            pre_override_snapshots: std::collections::HashMap::new(),
-            onepassword_reference_snapshots: std::collections::HashMap::new(),
+            env_overridden_paths: EnvOverriddenPaths::new(),
+            pre_override_snapshots: PreOverrideSnapshots::new(),
+            onepassword_reference_snapshots: ExternalRefSnapshots::new(),
             dirty_paths: std::collections::HashSet::new(),
+            dirty_map_entries: std::collections::HashSet::new(),
+            explicit_prop_dirty_paths: std::collections::HashSet::new(),
+            tracked_prop_identities: std::collections::HashMap::new(),
             degraded_security: Vec::new(),
             degraded_sections: Vec::new(),
             retired_surface_warnings: Vec::new(),
@@ -13049,7 +13347,7 @@ impl Config {
 
             let store = crate::secrets::SecretStore::new(&zeroclaw_dir, config.secrets.encrypt);
             config.onepassword_reference_snapshots =
-                collect_onepassword_reference_snapshots(&config);
+                ExternalRefSnapshots::from_map(collect_onepassword_reference_snapshots(&config)?);
             // Decrypt all #[secret]-annotated fields via Configurable derive
             config = tokio::task::spawn_blocking(move || {
                 config.decrypt_secrets(&store)?;
@@ -13063,8 +13361,10 @@ impl Config {
             // paths and per-path pre-override snapshots so save() can mask
             // env-injected values back to the original on-disk state.
             let applied = crate::env_overrides::apply_env_overrides(&mut config)?;
-            config.env_overridden_paths = applied.paths;
-            config.pre_override_snapshots = applied.snapshots;
+            config.clear_dirty();
+            config.env_overridden_paths = EnvOverriddenPaths::from_set(applied.paths);
+            config.pre_override_snapshots = PreOverrideSnapshots::from_map(applied.snapshots);
+            config.bind_env_override_identities();
             config.retired_surface_warnings = retired_section_warnings
                 .into_iter()
                 .chain(applied.tombstone_warnings)
@@ -13119,8 +13419,10 @@ impl Config {
             }
 
             let applied = crate::env_overrides::apply_env_overrides(&mut config)?;
-            config.env_overridden_paths = applied.paths;
-            config.pre_override_snapshots = applied.snapshots;
+            config.clear_dirty();
+            config.env_overridden_paths = EnvOverriddenPaths::from_set(applied.paths);
+            config.pre_override_snapshots = PreOverrideSnapshots::from_map(applied.snapshots);
+            config.bind_env_override_identities();
             config.retired_surface_warnings = applied.tombstone_warnings;
 
             // Same boot-resilience as the load-existing branch above:
@@ -15081,6 +15383,63 @@ impl Config {
 
     pub fn mark_dirty(&mut self, path: &str) {
         self.dirty_paths.insert(path.to_string());
+        if !self.tracked_prop_identities.contains_key(path)
+            && !self.is_known_whole_entry_path(path)
+            && let Some(enc) = self.encode_prop_snapshot_key(None, path)
+        {
+            let had_sibling_entry = self.has_live_entry_at_raw_path(path);
+            self.tracked_prop_identities.insert(
+                path.to_string(),
+                TrackedPropIdentity {
+                    encoded_key: enc,
+                    had_sibling_entry,
+                },
+            );
+            self.explicit_prop_dirty_paths.insert(path.to_string());
+        }
+    }
+
+    fn has_live_entry_at_raw_path(&self, path: &str) -> bool {
+        if let Some(section) = find_natural_key_section_for_path(path) {
+            let rest = &path[section.section_path.len() + 1..];
+            return self
+                .get_map_keys(section.section_path)
+                .is_some_and(|keys| keys.iter().any(|k| k == rest));
+        }
+        if let Some(section) = find_map_key_section_for_path(path) {
+            let rest = &path[section.path.len() + 1..];
+            return self
+                .get_map_keys(section.path)
+                .is_some_and(|keys| keys.iter().any(|k| k == rest));
+        }
+        false
+    }
+
+    fn has_dirty_map_entry_at_raw_path(&self, path: &str) -> bool {
+        if let Some(section) = find_natural_key_section_for_path(path) {
+            let rest = &path[section.section_path.len() + 1..];
+            return self
+                .dirty_map_entries
+                .contains(&format!("{}\0{rest}", section.section_path));
+        }
+        if let Some(section) = find_map_key_section_for_path(path) {
+            let rest = &path[section.path.len() + 1..];
+            return self
+                .dirty_map_entries
+                .contains(&format!("{}\0{rest}", section.path));
+        }
+        false
+    }
+
+    fn is_known_whole_entry_path(&self, path: &str) -> bool {
+        let normalized = path.replace('-', "_");
+        if Self::map_key_sections()
+            .iter()
+            .any(|s| s.path == path || s.path == normalized)
+        {
+            return true;
+        }
+        self.has_dirty_map_entry_at_raw_path(path) || self.has_live_entry_at_raw_path(path)
     }
 
     /// Auto-create the parent map key for a dotted set-prop `path` when it does
@@ -15161,17 +15520,231 @@ impl Config {
 
     pub fn clear_dirty(&mut self) {
         self.dirty_paths.clear();
+        self.dirty_map_entries.clear();
+        self.explicit_prop_dirty_paths.clear();
+        let env_paths = &self.env_overridden_paths;
+        let pre_snaps = &self.pre_override_snapshots;
+        self.tracked_prop_identities
+            .retain(|k, _| env_paths.contains(k) || pre_snaps.contains_key(k));
+    }
+
+    pub(crate) fn bind_env_override_identities(&mut self) {
+        let paths: Vec<String> = self
+            .env_overridden_paths
+            .iter()
+            .chain(self.pre_override_snapshots.keys())
+            .collect();
+        for path in paths {
+            if let Some(enc) = self.encode_prop_snapshot_key(None, &path) {
+                let had_sibling_entry = self.has_live_entry_at_raw_path(&path);
+                self.tracked_prop_identities.insert(
+                    path,
+                    TrackedPropIdentity {
+                        encoded_key: enc,
+                        had_sibling_entry,
+                    },
+                );
+            }
+        }
+    }
+
+    pub(crate) fn verify_tracked_prop_identities(
+        &self,
+        resolved_dirty_props: Option<&std::collections::HashSet<String>>,
+    ) -> std::result::Result<(), String> {
+        if self.tracked_prop_identities.is_empty() {
+            return Ok(());
+        }
+        let computed_dirty_props;
+        let active_dirty_props = match resolved_dirty_props {
+            Some(props) => props,
+            None => {
+                let whole = self.effective_whole_entry_dirty_entries(None);
+                computed_dirty_props = self.collect_dirty_prop_paths(&whole);
+                &computed_dirty_props
+            }
+        };
+        let mut keys: Vec<&String> = self.tracked_prop_identities.keys().collect();
+        keys.sort();
+        for raw_path in keys {
+            let is_active = self.dirty_paths.contains(raw_path)
+                || active_dirty_props.contains(raw_path)
+                || self.explicit_prop_dirty_paths.contains(raw_path)
+                || self.env_overridden_paths.contains(raw_path)
+                || self.pre_override_snapshots.contains_key(raw_path);
+            if !is_active {
+                continue;
+            }
+            let expected = &self.tracked_prop_identities[raw_path];
+            let actual_enc = self.encode_prop_snapshot_key(None, raw_path);
+            if actual_enc.as_deref() != Some(expected.encoded_key.as_str()) {
+                return Err(format!(
+                    "Refusing config operation: tracked property `{raw_path}` rebound from \
+                     `{}` to `{}`; persist or clear pending edits before introducing \
+                     overlapping dotted keys",
+                    expected.encoded_key,
+                    actual_enc.as_deref().unwrap_or("<unresolvable>")
+                ));
+            }
+            if !expected.had_sibling_entry
+                && (self.has_live_entry_at_raw_path(raw_path)
+                    || self.has_dirty_map_entry_at_raw_path(raw_path))
+            {
+                return Err(format!(
+                    "Refusing config operation: tracked property `{raw_path}` collides with a \
+                     newly introduced section entry of the same dotted path; persist or clear \
+                     pending edits first"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_dirty_map_entry(&mut self, section_path: &str, key: &str) {
+        self.dirty_map_entries
+            .insert(format!("{section_path}\0{key}"));
+    }
+
+    fn effective_whole_entry_dirty_entries(
+        &self,
+        on_disk_table: Option<&toml::Table>,
+    ) -> Vec<(String, String)> {
+        let mut set: std::collections::BTreeSet<(String, String)> =
+            std::collections::BTreeSet::new();
+        for encoded in &self.dirty_map_entries {
+            if let Some((section, key)) = encoded.split_once('\0') {
+                let candidate_dirty = format!("{section}.{key}");
+                if self.dirty_paths.contains(&candidate_dirty) {
+                    set.insert((section.to_string(), key.to_string()));
+                }
+            }
+        }
+        for path in &self.dirty_paths {
+            if self.explicit_prop_dirty_paths.contains(path) {
+                continue;
+            }
+            if let Some(section) = find_natural_key_section_for_path(path) {
+                let rest = &path[section.section_path.len() + 1..];
+                let in_mem = self
+                    .get_map_keys(section.section_path)
+                    .is_some_and(|keys| keys.iter().any(|k| k == rest));
+                let on_disk = on_disk_table.is_some_and(|disk| {
+                    let segs: Vec<&str> = section.section_path.split('.').collect();
+                    lookup_path_in_table(disk, &segs)
+                        .and_then(toml::Value::as_array)
+                        .is_some_and(|arr| {
+                            arr.iter().any(|item| {
+                                item.as_table()
+                                    .and_then(|t| t.get(section.natural_key_field))
+                                    .and_then(toml::Value::as_str)
+                                    == Some(rest)
+                            })
+                        })
+                });
+                if in_mem || on_disk {
+                    set.insert((section.section_path.to_string(), rest.to_string()));
+                }
+                continue;
+            }
+            if let Some(section) = find_map_key_section_for_path(path) {
+                let rest = &path[section.path.len() + 1..];
+                let in_mem = self
+                    .get_map_keys(section.path)
+                    .is_some_and(|keys| keys.iter().any(|k| k == rest));
+                let on_disk = on_disk_table.is_some_and(|disk| {
+                    let segs: Vec<&str> = section.path.split('.').collect();
+                    lookup_path_in_table(disk, &segs)
+                        .and_then(toml::Value::as_table)
+                        .is_some_and(|t| t.contains_key(rest))
+                });
+                if in_mem || on_disk {
+                    set.insert((section.path.to_string(), rest.to_string()));
+                }
+            }
+        }
+        set.into_iter().collect()
+    }
+
+    fn collect_dirty_prop_paths(
+        &self,
+        whole_entries: &[(String, String)],
+    ) -> std::collections::HashSet<String> {
+        self.dirty_paths
+            .iter()
+            .filter(|path| {
+                self.explicit_prop_dirty_paths.contains(*path)
+                    || !whole_entries.iter().any(|(section, key)| {
+                        path.len() == section.len() + 1 + key.len()
+                            && path.starts_with(section.as_str())
+                            && path.as_bytes().get(section.len()) == Some(&b'.')
+                            && &path[section.len() + 1..] == key.as_str()
+                    })
+            })
+            .cloned()
+            .collect()
     }
 
     pub fn set_prop_persistent(&mut self, name: &str, value_str: &str) -> Result<()> {
+        if let Some(expected) = self.tracked_prop_identities.get(name)
+            && self.encode_prop_snapshot_key(None, name).as_deref()
+                != Some(expected.encoded_key.as_str())
+        {
+            anyhow::bail!(
+                "Refusing to mutate `{name}`: property path rebound from `{}` \
+                 after a map/list key change",
+                expected.encoded_key
+            );
+        }
+        let prior_had_sibling = self
+            .tracked_prop_identities
+            .get(name)
+            .map(|id| id.had_sibling_entry);
         self.set_prop(name, value_str)?;
-        self.mark_dirty(name);
+        self.explicit_prop_dirty_paths.insert(name.to_string());
+        self.dirty_paths.insert(name.to_string());
+        if let Some(enc) = self.encode_prop_snapshot_key(None, name) {
+            let had_sibling_entry =
+                prior_had_sibling.unwrap_or_else(|| self.has_live_entry_at_raw_path(name));
+            self.tracked_prop_identities.insert(
+                name.to_string(),
+                TrackedPropIdentity {
+                    encoded_key: enc,
+                    had_sibling_entry,
+                },
+            );
+        }
         Ok(())
     }
 
     pub fn set_secret_persistent(&mut self, name: &str, value: String) -> Result<()> {
+        if let Some(expected) = self.tracked_prop_identities.get(name)
+            && self.encode_prop_snapshot_key(None, name).as_deref()
+                != Some(expected.encoded_key.as_str())
+        {
+            anyhow::bail!(
+                "Refusing to mutate `{name}`: secret path rebound from `{}` \
+                 after a map/list key change",
+                expected.encoded_key
+            );
+        }
+        let prior_had_sibling = self
+            .tracked_prop_identities
+            .get(name)
+            .map(|id| id.had_sibling_entry);
         self.set_secret(name, value)?;
-        self.mark_dirty(name);
+        self.explicit_prop_dirty_paths.insert(name.to_string());
+        self.dirty_paths.insert(name.to_string());
+        if let Some(enc) = self.encode_prop_snapshot_key(None, name) {
+            let had_sibling_entry =
+                prior_had_sibling.unwrap_or_else(|| self.has_live_entry_at_raw_path(name));
+            self.tracked_prop_identities.insert(
+                name.to_string(),
+                TrackedPropIdentity {
+                    encoded_key: enc,
+                    had_sibling_entry,
+                },
+            );
+        }
         Ok(())
     }
 
@@ -15205,17 +15778,21 @@ impl Config {
     /// a file gets exactly one create and must then reload or use
     /// `force_save()`; `force_save()` is the explicit overwrite path.
     pub async fn save(&self) -> Result<()> {
-        self.save_impl(false).await.map(|_| ())
+        self.save_impl(false, true).await.map(|_| ())
     }
 
     /// Same as `save()`, but skips the loaded-provenance guard. Only for
     /// callers that verifiably intend to replace an existing file with a
     /// `Config` that never read it.
     pub async fn force_save(&self) -> Result<()> {
-        self.save_impl(true).await.map(|_| ())
+        self.save_impl(true, true).await.map(|_| ())
     }
 
-    async fn save_impl(&self, force: bool) -> Result<PathBuf> {
+    async fn save_impl(
+        &self,
+        force: bool,
+        validate_dirty_refs: bool,
+    ) -> Result<(PathBuf, std::collections::HashMap<String, String>)> {
         // Encrypt secrets before serialization
         let mut config_to_save = self.clone();
         // Stamp the current schema version on every write. The in-memory
@@ -15257,24 +15834,91 @@ impl Config {
             .parent()
             .context("Config path must have a parent directory")?;
         let store = crate::secrets::SecretStore::new(zeroclaw_dir, self.secrets.encrypt);
+        let existing_raw = if target_exists {
+            fs::read_to_string(&config_path).await.ok()
+        } else {
+            None
+        };
+        let on_disk_table: Option<toml::Table> = existing_raw
+            .as_deref()
+            .and_then(|s| toml::from_str::<toml::Table>(s).ok());
+        let whole_entries = self.effective_whole_entry_dirty_entries(on_disk_table.as_ref());
+        let dirty_prop_paths = self.collect_dirty_prop_paths(&whole_entries);
+        self.verify_tracked_prop_identities(Some(&dirty_prop_paths))
+            .map_err(anyhow::Error::msg)?;
+        let scope_prefixes = self.collect_dirty_scope_prefixes(&whole_entries, &dirty_prop_paths);
+        let restorable_snapshots = self.pruned_snapshots_for_restore(&scope_prefixes, false);
+        let dirty_enc_keys = self.dirty_encoded_prop_keys(&dirty_prop_paths);
 
-        // Restore env-overridden paths to their pre-override snapshots before
-        // encryption, so values supplied via `ZEROCLAW_*` env vars never reach
-        // disk. Snapshots were captured at apply time from the post-decrypt
-        // in-memory state, so secrets carry the original plaintext that
-        // `encrypt_secrets()` will re-encrypt to fresh ciphertext that
-        // decrypts back to the same value.
+        // Restore non-dirty env-overridden paths to their pre-override snapshots
+        // before encryption, so values supplied via `ZEROCLAW_*` env vars never
+        // reach disk while explicit dirty edits still persist their new value.
         if !self.pre_override_snapshots.is_empty() {
-            crate::env_overrides::mask_env_overrides_for_save(
-                &mut config_to_save,
-                &self.pre_override_snapshots,
-            )?;
+            let non_dirty_snapshots: std::collections::HashMap<String, String> = self
+                .pre_override_snapshots
+                .iter()
+                .filter(|(path, _)| {
+                    !self.is_env_path_dirty(path, &dirty_prop_paths, &dirty_enc_keys)
+                })
+                .collect();
+            if !non_dirty_snapshots.is_empty() {
+                crate::env_overrides::mask_env_overrides_for_save(
+                    &mut config_to_save,
+                    &non_dirty_snapshots,
+                )?;
+            }
+        }
+        let mut after_mask_refs = std::collections::HashMap::new();
+        config_to_save.collect_external_secret_refs(None, &mut after_mask_refs)?;
+        let mut skip_encoded_dirty: std::collections::HashSet<String> = dirty_prop_paths
+            .iter()
+            .filter_map(|raw| config_to_save.encode_prop_snapshot_key(None, raw))
+            .collect();
+        for (enc_k, ref_val) in &after_mask_refs {
+            if restorable_snapshots.get(enc_k) != Some(ref_val) {
+                skip_encoded_dirty.insert(enc_k.clone());
+            }
         }
         restore_onepassword_references_for_save(
             &mut config_to_save,
-            &self.onepassword_reference_snapshots,
-            &self.dirty_paths,
+            &restorable_snapshots,
+            &skip_encoded_dirty,
         )?;
+
+        let mut structural_refs = std::collections::HashMap::new();
+        config_to_save.collect_external_secret_refs(None, &mut structural_refs)?;
+
+        if validate_dirty_refs {
+            // `save(&self)` / `force_save(&self)` takes a shared receiver, so it
+            // validates dirty or newly introduced external references fail-closed
+            // before touching disk without mutating `self`; live runtime edits
+            // publish through `save_dirty(&mut self)`.
+            let _validated = self
+                .prepare_dirty_secret_edits(&config_path, &whole_entries, &dirty_prop_paths, false)
+                .await?;
+            let mut seen_unvalidated = std::collections::BTreeMap::new();
+            for (enc_k, ref_val) in after_mask_refs.iter().chain(structural_refs.iter()) {
+                if restorable_snapshots.get(enc_k) != Some(ref_val) {
+                    seen_unvalidated
+                        .entry(enc_k.clone())
+                        .or_insert_with(|| ref_val.clone());
+                }
+            }
+            if !seen_unvalidated.is_empty() {
+                let verify_store =
+                    crate::secrets::SecretStore::new(zeroclaw_dir, self.secrets.encrypt);
+                tokio::task::spawn_blocking(move || -> Result<()> {
+                    for (enc_k, ref_val) in seen_unvalidated {
+                        verify_store.decrypt(&ref_val).with_context(|| {
+                            format!("Failed to resolve external secret at {enc_k}")
+                        })?;
+                    }
+                    Ok(())
+                })
+                .await
+                .context("Config secret reference validation task failed")??;
+            }
+        }
 
         // Encrypt all #[secret]-annotated fields via Configurable derive
         config_to_save.encrypt_secrets(&store)?;
@@ -15300,8 +15944,7 @@ impl Config {
 
         // If an existing config file is present, sync the new values onto it
         // to preserve comments and formatting. Otherwise, use the fresh serialization.
-        let toml_str = if config_path.exists() {
-            let existing = fs::read_to_string(&config_path).await.unwrap_or_default();
+        let toml_str = if let Some(existing) = existing_raw {
             if existing.is_empty() {
                 new_toml
             } else {
@@ -15319,10 +15962,661 @@ impl Config {
         };
 
         write_config_atomically(&config_path, &toml_str).await?;
+        if validate_dirty_refs {
+            // Prune snapshots that were cleared or replaced on disk, or whose in-memory
+            // value after env-masking already holds a literal external reference rather
+            // than resolved plaintext. Synchronize env-override metadata for persisted
+            // dirty properties too so later full saves never mask back stale plaintext.
+            // Failed saves return early above without mutating state.
+            self.onepassword_reference_snapshots.retain(|k, old_ref| {
+                structural_refs.get(k) == Some(&*old_ref) && !after_mask_refs.contains_key(k)
+            });
+            self.pre_override_snapshots.retain(|path, _| {
+                !self.is_env_path_dirty(path, &dirty_prop_paths, &dirty_enc_keys)
+            });
+            self.env_overridden_paths
+                .retain(|path| !self.is_env_path_dirty(path, &dirty_prop_paths, &dirty_enc_keys));
+        }
         // Report the path actually written so `save_dirty`'s create
         // fallback can record provenance without re-resolving (the
         // resolver re-reads the environment for parentless paths).
-        Ok(config_path)
+        Ok((config_path, structural_refs))
+    }
+
+    fn dirty_encoded_prop_keys(
+        &self,
+        dirty_prop_paths: &std::collections::HashSet<String>,
+    ) -> std::collections::HashSet<String> {
+        dirty_prop_paths
+            .iter()
+            .filter_map(|p| {
+                self.tracked_prop_identities
+                    .get(p.as_str())
+                    .map(|id| id.encoded_key.clone())
+                    .or_else(|| self.encode_prop_snapshot_key(None, p))
+            })
+            .collect()
+    }
+
+    fn is_env_path_dirty(
+        &self,
+        path: &str,
+        dirty_prop_paths: &std::collections::HashSet<String>,
+        dirty_enc_keys: &std::collections::HashSet<String>,
+    ) -> bool {
+        if dirty_prop_paths.contains(path) {
+            return true;
+        }
+        if dirty_enc_keys.is_empty() {
+            return false;
+        }
+        self.tracked_prop_identities
+            .get(path)
+            .map(|id| id.encoded_key.clone())
+            .or_else(|| self.encode_prop_snapshot_key(None, path))
+            .is_some_and(|enc| dirty_enc_keys.contains(&enc))
+    }
+
+    /// Rewrite secret reference and env-override snapshot keys when an entry in
+    /// `section_path` moves from `old_key` to `new_key`, using longest-key
+    /// matching against sibling keys so overlapping prefixes (`fs` vs `fs.extra`)
+    /// never collide.
+    pub(crate) fn rename_secret_snapshots_in_section(
+        &mut self,
+        section_path: &str,
+        old_key: &str,
+        new_key: &str,
+    ) -> std::result::Result<(), String> {
+        self.record_dirty_map_entry(section_path, old_key);
+        self.record_dirty_map_entry(section_path, new_key);
+        let enc_section = encode_section_snapshot_prefix(section_path);
+        let enc_old = crate::helpers::join_snapshot_path(
+            &enc_section,
+            &crate::helpers::encode_snapshot_segment(old_key),
+        );
+        let enc_new = crate::helpers::join_snapshot_path(
+            &enc_section,
+            &crate::helpers::encode_snapshot_segment(new_key),
+        );
+        let enc_old_dot = format!("{enc_old}.");
+        let enc_old_bracket = format!("{enc_old}[");
+        let moved_refs: Vec<(String, String)> = self
+            .onepassword_reference_snapshots
+            .to_map()
+            .into_keys()
+            .filter_map(|k| {
+                if k == enc_old {
+                    Some((k, enc_new.clone()))
+                } else if let Some(tail) = k.strip_prefix(&enc_old_dot) {
+                    let new_k = format!("{enc_new}.{tail}");
+                    Some((k, new_k))
+                } else if let Some(tail) = k.strip_prefix(&enc_old_bracket) {
+                    let new_k = format!("{enc_new}[{tail}");
+                    Some((k, new_k))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let extracted_refs: Vec<(String, String)> = moved_refs
+            .into_iter()
+            .filter_map(|(old_k, new_k)| {
+                self.onepassword_reference_snapshots
+                    .remove(&old_k)
+                    .map(|val| (new_k, val))
+            })
+            .collect();
+        for (new_k, val) in extracted_refs {
+            self.onepassword_reference_snapshots.insert(new_k, val);
+        }
+
+        let mut pre_rename_keys = self.get_map_keys(section_path).unwrap_or_default();
+        pre_rename_keys.retain(|k| k != new_key);
+        if !pre_rename_keys.iter().any(|k| k == old_key) {
+            pre_rename_keys.push(old_key.to_string());
+        }
+        let old_entry_dot = format!("{section_path}.{old_key}.");
+        let new_entry = format!("{section_path}.{new_key}");
+        if self.explicit_prop_dirty_paths.contains(&new_entry) {
+            return Err(format!(
+                "Refusing rename `{old_key}` -> `{new_key}` in `{section_path}`: \
+                 dirty property `{new_entry}` collides with the target entry path"
+            ));
+        }
+        let prior_identities = self.tracked_prop_identities.clone();
+
+        // Leaf property paths always carry `.<inner_tail>` after `<section_path>.<old_key>`.
+        // Prefer canonical bound identities when recorded so a shorter sibling's leaf path
+        // is never misclassified as belonging to `old_key`.
+        let rewrite_leaf_prop_key = |key: &str| -> Option<String> {
+            if let Some(bound) = prior_identities.get(key) {
+                let bound_enc = &bound.encoded_key;
+                let belongs_to_old = bound_enc == &enc_old
+                    || bound_enc.starts_with(&enc_old_dot)
+                    || bound_enc.starts_with(&enc_old_bracket);
+                if !belongs_to_old {
+                    return None;
+                }
+                let inner_tail = key.strip_prefix(&old_entry_dot)?;
+                return Some(format!("{new_entry}.{inner_tail}"));
+            }
+            let (matched, inner_tail) = crate::helpers::route_hashmap_path(
+                key,
+                "",
+                section_path,
+                "",
+                pre_rename_keys.iter().map(String::as_str),
+            )?;
+            if matched != old_key {
+                return None;
+            }
+            Some(format!("{new_entry}.{inner_tail}"))
+        };
+
+        let moved_identities: Vec<(String, String, TrackedPropIdentity)> = self
+            .tracked_prop_identities
+            .iter()
+            .filter_map(|(raw_k, bound)| {
+                let bound_enc = &bound.encoded_key;
+                let new_enc = if bound_enc == &enc_old {
+                    enc_new.clone()
+                } else if let Some(tail) = bound_enc.strip_prefix(&enc_old_dot) {
+                    format!("{enc_new}.{tail}")
+                } else if let Some(tail) = bound_enc.strip_prefix(&enc_old_bracket) {
+                    format!("{enc_new}[{tail}")
+                } else {
+                    return None;
+                };
+                let inner_tail = raw_k.strip_prefix(&old_entry_dot)?;
+                let new_raw = format!("{new_entry}.{inner_tail}");
+                let had_sibling_entry = pre_rename_keys
+                    .iter()
+                    .any(|sk| sk != old_key && format!("{section_path}.{sk}") == new_raw);
+                Some((
+                    raw_k.clone(),
+                    new_raw,
+                    TrackedPropIdentity {
+                        encoded_key: new_enc,
+                        had_sibling_entry,
+                    },
+                ))
+            })
+            .collect();
+
+        let moved_pre_snaps: Vec<(String, String)> = self
+            .pre_override_snapshots
+            .keys()
+            .filter_map(|k| {
+                let nk = rewrite_leaf_prop_key(&k)?;
+                Some((k, nk))
+            })
+            .collect();
+        let moved_env_paths: Vec<(String, String)> = self
+            .env_overridden_paths
+            .iter()
+            .filter_map(|k| {
+                let nk = rewrite_leaf_prop_key(&k)?;
+                Some((k, nk))
+            })
+            .collect();
+        let was_explicit_prop: std::collections::HashSet<String> = self
+            .explicit_prop_dirty_paths
+            .iter()
+            .filter(|k| rewrite_leaf_prop_key(k).is_some())
+            .cloned()
+            .collect();
+        let moved_explicit_props: Vec<(String, String)> = self
+            .explicit_prop_dirty_paths
+            .iter()
+            .filter_map(|k| rewrite_leaf_prop_key(k).map(|nk| (k.clone(), nk)))
+            .collect();
+        let moved_dirty_props: Vec<(String, String, bool)> = self
+            .dirty_paths
+            .iter()
+            .filter_map(|k| {
+                let new_k = rewrite_leaf_prop_key(k)?;
+                let rest = k
+                    .strip_prefix(section_path)
+                    .and_then(|s| s.strip_prefix('.'))?;
+                let sibling_whole_entry_recorded = self
+                    .dirty_map_entries
+                    .contains(&format!("{section_path}\0{rest}"));
+                let sibling_exists = pre_rename_keys.iter().any(|sk| sk == rest);
+                if was_explicit_prop.contains(k)
+                    || (!sibling_whole_entry_recorded && !sibling_exists)
+                {
+                    Some((k.clone(), new_k, !sibling_whole_entry_recorded))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for (old_raw, _, _) in &moved_identities {
+            self.tracked_prop_identities.remove(old_raw);
+        }
+        for (_, new_raw, new_id) in moved_identities {
+            if self.tracked_prop_identities.contains_key(&new_raw) {
+                return Err(format!(
+                    "Refusing rename `{old_key}` -> `{new_key}` in `{section_path}`: \
+                     tracked property `{new_raw}` collides with an existing sibling property"
+                ));
+            }
+            self.tracked_prop_identities.insert(new_raw, new_id);
+        }
+
+        let extracted_pre_snaps: Vec<(String, String)> = moved_pre_snaps
+            .into_iter()
+            .filter_map(|(old_k, new_k)| {
+                self.pre_override_snapshots
+                    .remove(&old_k)
+                    .map(|val| (new_k, val))
+            })
+            .collect();
+        for (new_k, val) in extracted_pre_snaps {
+            if self.pre_override_snapshots.contains_key(&new_k) {
+                return Err(format!(
+                    "Refusing rename `{old_key}` -> `{new_key}` in `{section_path}`: \
+                     env-override snapshot `{new_k}` collides with an existing sibling property"
+                ));
+            }
+            self.pre_override_snapshots.insert(new_k, val);
+        }
+
+        for (old_k, _) in &moved_env_paths {
+            self.env_overridden_paths.remove(old_k);
+        }
+        for (_, new_k) in moved_env_paths {
+            if self.env_overridden_paths.contains(&new_k) {
+                return Err(format!(
+                    "Refusing rename `{old_key}` -> `{new_key}` in `{section_path}`: \
+                     env-overridden path `{new_k}` collides with an existing sibling property"
+                ));
+            }
+            self.env_overridden_paths.insert(new_k);
+        }
+
+        for (old_k, _) in &moved_explicit_props {
+            self.explicit_prop_dirty_paths.remove(old_k);
+        }
+        for (_, new_k) in moved_explicit_props {
+            if self.explicit_prop_dirty_paths.contains(&new_k) {
+                return Err(format!(
+                    "Refusing rename `{old_key}` -> `{new_key}` in `{section_path}`: \
+                     dirty property `{new_k}` collides with an existing sibling property"
+                ));
+            }
+            self.explicit_prop_dirty_paths.insert(new_k);
+        }
+
+        for (old_k, _, remove_old) in &moved_dirty_props {
+            if *remove_old {
+                self.dirty_paths.remove(old_k);
+            }
+        }
+        for (_, new_k, _) in moved_dirty_props {
+            self.dirty_paths.insert(new_k);
+        }
+
+        self.verify_tracked_prop_identities(None)
+    }
+
+    /// Remove secret reference and env-override snapshot keys under a deleted
+    /// entry in `section_path`, preserving longer sibling keys (`fs` vs `fs.extra`).
+    pub(crate) fn drop_secret_snapshots_in_section(
+        &mut self,
+        section_path: &str,
+        deleted_key: &str,
+    ) {
+        self.record_dirty_map_entry(section_path, deleted_key);
+        let enc_section = encode_section_snapshot_prefix(section_path);
+        let enc_deleted = crate::helpers::join_snapshot_path(
+            &enc_section,
+            &crate::helpers::encode_snapshot_segment(deleted_key),
+        );
+        let enc_deleted_dot = format!("{enc_deleted}.");
+        let enc_deleted_bracket = format!("{enc_deleted}[");
+        self.onepassword_reference_snapshots.retain(|k, _| {
+            k != &enc_deleted
+                && !k.starts_with(&enc_deleted_dot)
+                && !k.starts_with(&enc_deleted_bracket)
+        });
+
+        let mut pre_delete_keys = self.get_map_keys(section_path).unwrap_or_default();
+        if !pre_delete_keys.iter().any(|k| k == deleted_key) {
+            pre_delete_keys.push(deleted_key.to_string());
+        }
+        let prior_identities = self.tracked_prop_identities.clone();
+        let matches_deleted_leaf_prop = |key: &str| -> bool {
+            if let Some(bound) = prior_identities.get(key) {
+                let bound_enc = &bound.encoded_key;
+                return bound_enc == &enc_deleted
+                    || bound_enc.starts_with(&enc_deleted_dot)
+                    || bound_enc.starts_with(&enc_deleted_bracket);
+            }
+            crate::helpers::route_hashmap_path(
+                key,
+                "",
+                section_path,
+                "",
+                pre_delete_keys.iter().map(String::as_str),
+            )
+            .is_some_and(|(matched, _)| matched == deleted_key)
+        };
+        self.pre_override_snapshots
+            .retain(|k, _| !matches_deleted_leaf_prop(k));
+        self.env_overridden_paths
+            .retain(|k| !matches_deleted_leaf_prop(k));
+
+        let was_explicit_prop: std::collections::HashSet<String> = self
+            .explicit_prop_dirty_paths
+            .iter()
+            .filter(|k| matches_deleted_leaf_prop(k))
+            .cloned()
+            .collect();
+        self.explicit_prop_dirty_paths
+            .retain(|k| !matches_deleted_leaf_prop(k));
+
+        let dropped_dirty_props: Vec<(String, bool)> = self
+            .dirty_paths
+            .iter()
+            .filter_map(|k| {
+                if !matches_deleted_leaf_prop(k) {
+                    return None;
+                }
+                let rest = k
+                    .strip_prefix(section_path)
+                    .and_then(|s| s.strip_prefix('.'))?;
+                let sibling_whole_entry_recorded = self
+                    .dirty_map_entries
+                    .contains(&format!("{section_path}\0{rest}"));
+                let sibling_exists = pre_delete_keys.iter().any(|sk| sk == rest);
+                if was_explicit_prop.contains(k)
+                    || (!sibling_whole_entry_recorded && !sibling_exists)
+                {
+                    Some((k.clone(), !sibling_whole_entry_recorded))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !dropped_dirty_props.is_empty() {
+            for (old_k, remove_old) in dropped_dirty_props {
+                if remove_old {
+                    self.dirty_paths.remove(&old_k);
+                }
+            }
+            self.dirty_paths
+                .insert(format!("{section_path}.{deleted_key}"));
+        }
+        self.tracked_prop_identities.retain(|_, bound| {
+            let bound_enc = &bound.encoded_key;
+            bound_enc != &enc_deleted
+                && !bound_enc.starts_with(&enc_deleted_dot)
+                && !bound_enc.starts_with(&enc_deleted_bracket)
+        });
+    }
+
+    /// Encode a non-secret dirty path (section or sub-table prefix, or whole entry)
+    /// into the canonical snapshot key namespace used by external secret refs.
+    fn encode_dirty_scope_prefix(&self, raw_path: &str) -> Option<String> {
+        if let Some(enc) = self.encode_prop_snapshot_key(None, raw_path) {
+            return Some(enc);
+        }
+        let normalized = raw_path.replace('-', "_");
+        if Self::map_key_sections()
+            .iter()
+            .any(|s| s.path == raw_path || s.path == normalized)
+        {
+            return Some(normalized);
+        }
+        if let Some(section) = find_natural_key_section_for_path(raw_path) {
+            let nk_values = self.get_map_keys(section.section_path)?;
+            let rest = &raw_path[section.section_path.len() + 1..];
+            if !self.explicit_prop_dirty_paths.contains(raw_path)
+                && nk_values.iter().any(|k| k == rest)
+            {
+                return Some(crate::helpers::join_snapshot_path(
+                    section.section_path,
+                    &crate::helpers::encode_snapshot_segment(rest),
+                ));
+            }
+            return match crate::helpers::route_vec_path(
+                raw_path,
+                "",
+                section.section_path,
+                "",
+                nk_values.iter().enumerate().map(|(i, k)| (i, k.as_str())),
+            ) {
+                crate::helpers::VecRoute::Hit { index, inner_name } => {
+                    Some(crate::helpers::join_snapshot_path(
+                        &crate::helpers::join_snapshot_path(
+                            section.section_path,
+                            &crate::helpers::encode_snapshot_segment(&nk_values[index]),
+                        ),
+                        &inner_name.replace('-', "_"),
+                    ))
+                }
+                _ => None,
+            };
+        }
+        if let Some(section) = find_map_key_section_for_path(raw_path) {
+            let outer_keys = self.get_map_keys(section.path)?;
+            let rest = &raw_path[section.path.len() + 1..];
+            if !self.explicit_prop_dirty_paths.contains(raw_path)
+                && outer_keys.iter().any(|k| k == rest)
+            {
+                return Some(crate::helpers::join_snapshot_path(
+                    section.path,
+                    &crate::helpers::encode_snapshot_segment(rest),
+                ));
+            }
+            let (matched_key, after_first) = crate::helpers::route_hashmap_path(
+                raw_path,
+                "",
+                section.path,
+                "",
+                outer_keys.iter().map(String::as_str),
+            )?;
+            let enc_first = crate::helpers::join_snapshot_path(
+                section.path,
+                &crate::helpers::encode_snapshot_segment(matched_key),
+            );
+            let nested_map_path = format!("{}.{matched_key}", section.path);
+            if let Some(inner_keys) = self.get_map_keys(&nested_map_path) {
+                if !self.explicit_prop_dirty_paths.contains(raw_path)
+                    && inner_keys.iter().any(|ik| ik == &after_first)
+                {
+                    return Some(crate::helpers::join_snapshot_path(
+                        &enc_first,
+                        &crate::helpers::encode_snapshot_segment(&after_first),
+                    ));
+                }
+                let (inner_k, inner_tail) = crate::helpers::route_hashmap_path(
+                    &after_first,
+                    "",
+                    "",
+                    "",
+                    inner_keys.iter().map(String::as_str),
+                )?;
+                return Some(crate::helpers::join_snapshot_path(
+                    &crate::helpers::join_snapshot_path(
+                        &enc_first,
+                        &crate::helpers::encode_snapshot_segment(inner_k),
+                    ),
+                    &inner_tail.replace('-', "_"),
+                ));
+            }
+            return Some(crate::helpers::join_snapshot_path(
+                &enc_first,
+                &after_first.replace('-', "_"),
+            ));
+        }
+        Some(normalized)
+    }
+
+    fn collect_dirty_scope_prefixes(
+        &self,
+        whole_entries: &[(String, String)],
+        dirty_prop_paths: &std::collections::HashSet<String>,
+    ) -> Vec<String> {
+        let mut prefixes = Vec::new();
+        for (section, key) in whole_entries {
+            prefixes.push(crate::helpers::join_snapshot_path(
+                &encode_section_snapshot_prefix(section),
+                &crate::helpers::encode_snapshot_segment(key),
+            ));
+        }
+        for path in dirty_prop_paths {
+            if !Self::prop_is_secret(path)
+                && let Some(pfx) = self.encode_dirty_scope_prefix(path)
+            {
+                prefixes.push(pfx);
+            }
+        }
+        prefixes
+    }
+
+    /// Prune active external-reference snapshots under natural-key `List`
+    /// sections that are explicitly in scope for this save and now empty
+    /// (`keys.is_empty()`), while leaving non-empty sections intact so
+    /// unregistered natural-key mutations still fail closed.
+    fn pruned_snapshots_for_restore(
+        &self,
+        scope_prefixes: &[String],
+        full_create_fallback: bool,
+    ) -> std::collections::HashMap<String, String> {
+        let mut snaps = self.onepassword_reference_snapshots.to_map();
+        if snaps.is_empty() {
+            return snaps;
+        }
+        for section in Self::map_key_sections() {
+            if section.kind != crate::traits::MapKeyKind::List || section.natural_key.is_none() {
+                continue;
+            }
+            if !(full_create_fallback
+                || snapshot_key_covered_by_prefixes(section.path, scope_prefixes))
+            {
+                continue;
+            }
+            if self
+                .get_map_keys(section.path)
+                .is_some_and(|keys| keys.is_empty())
+            {
+                let sec_dot = format!("{}.", section.path);
+                let sec_bracket = format!("{}[", section.path);
+                snaps.retain(|k, _| {
+                    k != section.path && !k.starts_with(&sec_dot) && !k.starts_with(&sec_bracket)
+                });
+            }
+        }
+        snaps
+    }
+
+    /// Prepare live secret edits without mutating the running config. Resolve all
+    /// references structurally in %-encoded snapshot-key space before any write;
+    /// publish this candidate only after success.
+    async fn prepare_dirty_secret_edits(
+        &self,
+        config_path: &Path,
+        whole_entries: &[(String, String)],
+        dirty_prop_paths: &std::collections::HashSet<String>,
+        full_create_fallback: bool,
+    ) -> Result<(Self, std::collections::HashSet<String>, Vec<String>)> {
+        let mut masked_self = self.clone();
+        let dirty_enc_keys = self.dirty_encoded_prop_keys(dirty_prop_paths);
+        if !self.pre_override_snapshots.is_empty() {
+            let non_dirty_snapshots: std::collections::HashMap<String, String> = self
+                .pre_override_snapshots
+                .iter()
+                .filter(|(path, _)| {
+                    !self.is_env_path_dirty(path, dirty_prop_paths, &dirty_enc_keys)
+                })
+                .collect();
+            if !non_dirty_snapshots.is_empty() {
+                crate::env_overrides::mask_env_overrides_for_save(
+                    &mut masked_self,
+                    &non_dirty_snapshots,
+                )?;
+            }
+        }
+
+        let mut live_refs = std::collections::HashMap::new();
+        masked_self.collect_external_secret_refs(None, &mut live_refs)?;
+
+        let scope_prefixes = self.collect_dirty_scope_prefixes(whole_entries, dirty_prop_paths);
+        let explicit_dirty_enc_leaves: std::collections::HashSet<String> = dirty_prop_paths
+            .iter()
+            .filter(|path| Self::prop_is_secret(path))
+            .filter_map(|path| self.encode_prop_snapshot_key(None, path))
+            .collect();
+
+        let env_isolated_enc_prefixes: Vec<String> = self
+            .pre_override_snapshots
+            .keys()
+            .chain(self.env_overridden_paths.iter())
+            .filter(|path| !self.is_env_path_dirty(path, dirty_prop_paths, &dirty_enc_keys))
+            .filter_map(|path| {
+                self.tracked_prop_identities
+                    .get(path.as_str())
+                    .map(|id| id.encoded_key.clone())
+                    .or_else(|| self.encode_prop_snapshot_key(None, &path))
+            })
+            .collect();
+
+        let mut refs_to_resolve: Vec<(String, String)> = live_refs
+            .into_iter()
+            .filter(|(enc_k, _)| {
+                !snapshot_key_covered_by_prefixes(enc_k, &env_isolated_enc_prefixes)
+                    && (full_create_fallback
+                        || explicit_dirty_enc_leaves.contains(enc_k)
+                        || explicit_dirty_enc_leaves
+                            .iter()
+                            .any(|arr| is_indexed_key_for_array_path(enc_k, arr))
+                        || snapshot_key_covered_by_prefixes(enc_k, &scope_prefixes))
+            })
+            .collect();
+        refs_to_resolve.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut candidate = self.clone();
+        candidate.onepassword_reference_snapshots = ExternalRefSnapshots::from_map(
+            self.pruned_snapshots_for_restore(&scope_prefixes, full_create_fallback),
+        );
+        let dir = config_path
+            .parent()
+            .context("Config path must have a parent directory")?;
+        let store = crate::secrets::SecretStore::new(dir, self.secrets.encrypt);
+
+        tokio::task::spawn_blocking(move || {
+            let mut resolved_plaintexts = std::collections::HashMap::new();
+            let mut resolved_refs = std::collections::HashMap::new();
+            for (enc_k, reference) in refs_to_resolve {
+                let plaintext = store
+                    .decrypt(&reference)
+                    .with_context(|| format!("Failed to resolve external secret at {enc_k}"))?;
+                resolved_plaintexts.insert(enc_k.clone(), plaintext);
+                resolved_refs.insert(enc_k, reference);
+            }
+            if !resolved_plaintexts.is_empty() {
+                let empty_skip = std::collections::HashSet::new();
+                candidate.restore_external_secret_refs(None, &resolved_plaintexts, &empty_skip)?;
+            }
+            for enc_leaf in &explicit_dirty_enc_leaves {
+                candidate
+                    .onepassword_reference_snapshots
+                    .retain(|k, _| k != enc_leaf && !is_indexed_key_for_array_path(k, enc_leaf));
+            }
+            let mut skip_restore_enc_keys = explicit_dirty_enc_leaves;
+            for (enc_k, reference) in resolved_refs {
+                candidate
+                    .onepassword_reference_snapshots
+                    .insert(enc_k.clone(), reference);
+                skip_restore_enc_keys.insert(enc_k);
+            }
+            Ok((candidate, skip_restore_enc_keys, scope_prefixes))
+        })
+        .await
+        .context("Config secret edit resolution task failed")?
     }
 
     /// Incremental save: only the paths in `self.dirty_paths` are written
@@ -15338,35 +16632,84 @@ impl Config {
 
         let config_path = self.resolve_config_path_for_save().await?;
         if !config_path.exists() {
-            return match self.save_impl(false).await {
-                Ok(written) => {
+            let whole_entries = self.effective_whole_entry_dirty_entries(None);
+            let dirty_prop_paths = self.collect_dirty_prop_paths(&whole_entries);
+            self.verify_tracked_prop_identities(Some(&dirty_prop_paths))
+                .map_err(anyhow::Error::msg)?;
+            let (mut candidate, _skip_enc_keys, _scope_prefixes) = self
+                .prepare_dirty_secret_edits(&config_path, &whole_entries, &dirty_prop_paths, true)
+                .await?;
+            return match self.save_impl(false, false).await {
+                Ok((written, structural_refs)) => {
+                    candidate
+                        .onepassword_reference_snapshots
+                        .retain(|k, _| structural_refs.contains_key(k));
                     // This value just created the file; `written` is the
                     // path the full save actually wrote.
-                    self.loaded_from = Some(written);
-                    self.clear_dirty();
+                    let dirty_enc_keys = self.dirty_encoded_prop_keys(&dirty_prop_paths);
+                    candidate.pre_override_snapshots.retain(|path, _| {
+                        !self.is_env_path_dirty(path, &dirty_prop_paths, &dirty_enc_keys)
+                    });
+                    candidate.env_overridden_paths.retain(|path| {
+                        !self.is_env_path_dirty(path, &dirty_prop_paths, &dirty_enc_keys)
+                    });
+                    candidate.loaded_from = Some(written);
+                    candidate.clear_dirty();
+                    *self = candidate;
                     Ok(())
                 }
                 Err(e) => Err(e),
             };
         }
 
+        let existing = fs::read_to_string(&config_path).await.with_context(|| {
+            format!(
+                "Failed to read existing config for incremental save: {}",
+                config_path.display()
+            )
+        })?;
+        let mut doc: toml_edit::DocumentMut = existing
+            .parse()
+            .context("Failed to parse existing config for incremental save")?;
+        let on_disk_table: Option<toml::Table> = toml::from_str::<toml::Table>(&existing).ok();
+        let whole_entries = self.effective_whole_entry_dirty_entries(on_disk_table.as_ref());
+        let dirty_prop_paths = self.collect_dirty_prop_paths(&whole_entries);
+        self.verify_tracked_prop_identities(Some(&dirty_prop_paths))
+            .map_err(anyhow::Error::msg)?;
+
+        let (mut live_candidate, skip_restore_enc_keys, scope_prefixes) = self
+            .prepare_dirty_secret_edits(&config_path, &whole_entries, &dirty_prop_paths, false)
+            .await?;
+        let restorable_snapshots = self.pruned_snapshots_for_restore(&scope_prefixes, false);
         let mut config_to_save = self.clone();
         let zeroclaw_dir = config_path
             .parent()
             .context("Config path must have a parent directory")?;
         let store = crate::secrets::SecretStore::new(zeroclaw_dir, self.secrets.encrypt);
+        let dirty_enc_keys = self.dirty_encoded_prop_keys(&dirty_prop_paths);
 
         if !self.pre_override_snapshots.is_empty() {
-            crate::env_overrides::mask_env_overrides_for_save(
-                &mut config_to_save,
-                &self.pre_override_snapshots,
-            )?;
+            let non_dirty_snapshots: std::collections::HashMap<String, String> = self
+                .pre_override_snapshots
+                .iter()
+                .filter(|(path, _)| {
+                    !self.is_env_path_dirty(path, &dirty_prop_paths, &dirty_enc_keys)
+                })
+                .collect();
+            if !non_dirty_snapshots.is_empty() {
+                crate::env_overrides::mask_env_overrides_for_save(
+                    &mut config_to_save,
+                    &non_dirty_snapshots,
+                )?;
+            }
         }
         restore_onepassword_references_for_save(
             &mut config_to_save,
-            &self.onepassword_reference_snapshots,
-            &self.dirty_paths,
+            &restorable_snapshots,
+            &skip_restore_enc_keys,
         )?;
+        let mut structural_refs = std::collections::HashMap::new();
+        config_to_save.collect_external_secret_refs(None, &mut structural_refs)?;
         config_to_save.encrypt_secrets(&store)?;
 
         let full_table: toml::Table = toml::Value::try_from(&config_to_save)
@@ -15378,18 +16721,23 @@ impl Config {
             .and_then(|v| v.try_into().ok())
             .unwrap_or_default();
 
-        let existing = fs::read_to_string(&config_path).await.with_context(|| {
-            format!(
-                "Failed to read existing config for incremental save: {}",
-                config_path.display()
-            )
-        })?;
-        let mut doc: toml_edit::DocumentMut = existing
-            .parse()
-            .context("Failed to parse existing config for incremental save")?;
-
-        for path in &self.dirty_paths {
-            apply_dirty_path(doc.as_table_mut(), path, &full_table, &default_table)?;
+        for (section_path, entry_key) in &whole_entries {
+            apply_dirty_whole_entry(
+                doc.as_table_mut(),
+                section_path,
+                entry_key,
+                &full_table,
+                &default_table,
+            );
+        }
+        for path in &dirty_prop_paths {
+            apply_dirty_path(
+                doc.as_table_mut(),
+                path,
+                &full_table,
+                &default_table,
+                self.explicit_prop_dirty_paths.contains(path),
+            )?;
         }
 
         // Stamp the current schema version. An incremental save writes
@@ -15408,45 +16756,154 @@ impl Config {
         let toml_str = ensure_blank_line_before_sections(&doc.to_string());
 
         write_config_atomically(&config_path, &toml_str).await?;
-        self.clear_dirty();
+        if !scope_prefixes.is_empty() {
+            live_candidate
+                .onepassword_reference_snapshots
+                .retain(|k, _| {
+                    !snapshot_key_covered_by_prefixes(k, &scope_prefixes)
+                        || structural_refs.contains_key(k)
+                });
+        }
+        live_candidate
+            .pre_override_snapshots
+            .retain(|path, _| !self.is_env_path_dirty(path, &dirty_prop_paths, &dirty_enc_keys));
+        live_candidate
+            .env_overridden_paths
+            .retain(|path| !self.is_env_path_dirty(path, &dirty_prop_paths, &dirty_enc_keys));
+        live_candidate.clear_dirty();
+        *self = live_candidate;
         Ok(())
     }
 }
 
+fn encode_section_snapshot_prefix(section_path: &str) -> String {
+    if Config::map_key_sections()
+        .iter()
+        .any(|s| s.path == section_path)
+    {
+        return section_path.to_string();
+    }
+    if let Some(section) = find_map_key_section_for_path(section_path) {
+        let outer_key = &section_path[section.path.len() + 1..];
+        return format!(
+            "{}.{}",
+            section.path,
+            crate::helpers::encode_snapshot_segment(outer_key)
+        );
+    }
+    section_path.to_string()
+}
+
+fn is_indexed_key_for_array_path(key: &str, array_path: &str) -> bool {
+    key.strip_prefix(array_path)
+        .and_then(|rest| rest.strip_prefix('['))
+        .and_then(|rest| rest.strip_suffix(']'))
+        .is_some_and(|idx| idx.parse::<usize>().is_ok())
+}
+
+fn lookup_inner_value_in_table<'a>(
+    mut current_table: &'a toml::Table,
+    dotted: &str,
+) -> Option<&'a toml::Value> {
+    let mut rest = dotted;
+    loop {
+        if let Some(val) = current_table.get(rest) {
+            return Some(val);
+        }
+        let snake_rest = rest.replace('-', "_");
+        if let Some(val) = current_table.get(&snake_rest) {
+            return Some(val);
+        }
+        let (seg, next_rest) = rest.split_once('.')?;
+        let next_val = current_table
+            .get(seg)
+            .or_else(|| current_table.get(&seg.replace('-', "_")))?;
+        current_table = next_val.as_table()?;
+        rest = next_rest;
+    }
+}
+
+pub(crate) fn lookup_prop_value_in_table<'a>(
+    full_table: &'a toml::Table,
+    dotted: &str,
+) -> Option<&'a toml::Value> {
+    if let Some(section) = find_natural_key_section_for_path(dotted) {
+        let section_segs: Vec<&str> = section.section_path.split('.').collect();
+        let mem_array = lookup_path_in_table(full_table, &section_segs)?.as_array()?;
+        let natural_keys = mem_array.iter().enumerate().filter_map(|(idx, item)| {
+            Some((
+                idx,
+                item.as_table()?.get(section.natural_key_field)?.as_str()?,
+            ))
+        });
+        return match crate::helpers::route_vec_path(
+            dotted,
+            "",
+            section.section_path,
+            "",
+            natural_keys,
+        ) {
+            crate::helpers::VecRoute::Hit { index, inner_name } => {
+                let entry_table = mem_array.get(index)?.as_table()?;
+                lookup_inner_value_in_table(entry_table, &inner_name)
+            }
+            _ => None,
+        };
+    }
+
+    if let Some(section) = find_map_key_section_for_path(dotted) {
+        let section_segs: Vec<&str> = section.path.split('.').collect();
+        let mem_table = lookup_path_in_table(full_table, &section_segs)?.as_table()?;
+        let (key, inner) = crate::helpers::route_hashmap_path(
+            dotted,
+            "",
+            section.path,
+            "",
+            mem_table.keys().map(String::as_str),
+        )?;
+        let key_table = mem_table.get(key)?.as_table()?;
+        return lookup_inner_value_in_table(key_table, &inner).or_else(|| {
+            let (inner_key, leaf_tail) = crate::helpers::route_hashmap_path(
+                &inner,
+                "",
+                "",
+                "",
+                key_table.keys().map(String::as_str),
+            )?;
+            let nested_table = key_table.get(inner_key)?.as_table()?;
+            lookup_inner_value_in_table(nested_table, &leaf_tail)
+        });
+    }
+
+    lookup_inner_value_in_table(full_table, dotted)
+}
+
 fn collect_onepassword_reference_snapshots(
     config: &Config,
-) -> std::collections::HashMap<String, String> {
-    config
-        .prop_fields()
-        .into_iter()
-        .filter(|field| field.is_secret)
-        .filter_map(|field| {
-            let value = crate::env_overrides::raw_value_for_path(config, &field.name)?;
-            crate::secrets::SecretStore::is_onepassword_ref(&value).then_some((field.name, value))
-        })
-        .collect()
+) -> Result<std::collections::HashMap<String, String>> {
+    let mut snapshots = std::collections::HashMap::new();
+    config.collect_external_secret_refs(None, &mut snapshots)?;
+    Ok(snapshots)
+}
+
+fn snapshot_key_covered_by_prefixes(key: &str, prefixes: &[String]) -> bool {
+    prefixes.iter().any(|pfx| {
+        key == pfx
+            || key
+                .strip_prefix(pfx.as_str())
+                .is_some_and(|tail| tail.starts_with('.') || tail.starts_with('['))
+    })
 }
 
 fn restore_onepassword_references_for_save(
     config_to_save: &mut Config,
     snapshots: &std::collections::HashMap<String, String>,
-    dirty_paths: &std::collections::HashSet<String>,
+    skip_encoded_dirty: &std::collections::HashSet<String>,
 ) -> Result<()> {
-    for (path, value) in snapshots {
-        if dirty_paths.contains(path) {
-            continue;
-        }
-        if let Err(err) = config_to_save.set_prop(path, value) {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"path": path, "error": format!("{}", err)})),
-                "1Password reference save-restore failed; field retains resolved value"
-            );
-        }
+    if snapshots.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    config_to_save.restore_external_secret_refs(None, snapshots, skip_encoded_dirty)
 }
 
 /// Atomic write shared by `save()` and `save_dirty()`.
@@ -15536,6 +16993,37 @@ async fn write_config_atomically(config_path: &Path, toml_str: &str) -> Result<(
     Ok(())
 }
 
+fn apply_dirty_whole_entry(
+    root: &mut toml_edit::Table,
+    section_path: &str,
+    entry_key: &str,
+    full_table: &toml::Table,
+    default_table: &toml::Table,
+) {
+    if let Some(nk_field) = Config::map_key_sections().into_iter().find_map(|s| {
+        (s.kind == crate::traits::MapKeyKind::List && s.path == section_path)
+            .then_some(s.natural_key)
+            .flatten()
+    }) {
+        let section = NaturalKeySection {
+            section_path: Config::map_key_sections()
+                .into_iter()
+                .find(|s| s.path == section_path)
+                .map(|s| s.path)
+                .unwrap_or(""),
+            natural_key_field: nk_field,
+        };
+        if !section.section_path.is_empty() {
+            reconcile_natural_key_whole_entry(root, &section, entry_key, full_table);
+        }
+        return;
+    }
+
+    let mut segs: Vec<&str> = section_path.split('.').collect();
+    segs.push(entry_key);
+    write_or_delete_leaf(root, full_table, default_table, &segs);
+}
+
 /// Write the in-memory value at `dotted` into the doc, or delete the leaf
 /// when the value is absent or equals the schema default. Segments are
 /// kebab→snake-translated; alias keys never carry hyphens (alias rule).
@@ -15544,9 +17032,9 @@ fn apply_dirty_path(
     dotted: &str,
     full_table: &toml::Table,
     default_table: &toml::Table,
+    is_explicit_prop_edit: bool,
 ) -> Result<()> {
-    let raw: Vec<&str> = dotted.split('.').collect();
-    if raw.is_empty() {
+    if dotted.is_empty() {
         return Ok(());
     }
 
@@ -15561,8 +17049,14 @@ fn apply_dirty_path(
     // the per-field MCP editor's edits go nowhere on disk. See the
     // regression test `save_dirty_persists_mcp_server_field_via_natural_key`.
     if let Some(section) = find_natural_key_section_for_path(dotted) {
-        apply_dirty_natural_key_path(root, &section, dotted, full_table, default_table);
-        return Ok(());
+        return apply_dirty_natural_key_path(
+            root,
+            &section,
+            dotted,
+            full_table,
+            default_table,
+            is_explicit_prop_edit,
+        );
     }
 
     // `HashMap<String, T>` sections whose key is a `#[resource_key]`
@@ -15576,16 +17070,21 @@ fn apply_dirty_path(
     // Longest-match the key against the section's live keys instead —
     // same precedent as the natural-key branch above.
     if let Some(section) = find_map_key_section_for_path(dotted) {
-        return apply_dirty_map_key_path(root, &section, dotted, full_table, default_table);
+        return apply_dirty_map_key_path(
+            root,
+            &section,
+            dotted,
+            full_table,
+            default_table,
+            is_explicit_prop_edit,
+        );
     }
 
     // Resolve each segment against the in-memory table: struct fields
     // serialize as snake_case (so `input-per-mtok` → `input_per_mtok`), but
     // HashMap keys are preserved verbatim and may legitimately carry hyphens
-    // (`claude-opus-4-7`, `tts-1-hd`). Blind `s.replace('-', "_")` mangles
-    // those keys and lookup returns None, which apply_dirty_path treats as
-    // "delete this path" — silently dropping every cost.rates save.
-    let segments: Vec<String> = resolve_dirty_segments(full_table, &raw);
+    // (`claude-opus-4-7`, `tts-1-hd`) or dots (`X-My.Header`).
+    let segments = resolve_dirty_table_segments(Some(full_table), Some(root), dotted);
     let segs: Vec<&str> = segments.iter().map(String::as_str).collect();
     write_or_delete_leaf(root, full_table, default_table, &segs);
     Ok(())
@@ -15714,35 +17213,43 @@ fn find_natural_key_section_for_path(dotted: &str) -> Option<NaturalKeySection> 
 /// already written" optimization keyed on the doc shape — would
 /// break this. Preserve commutativity across the three shapes for
 /// any single (section, alias) tuple.
-fn apply_dirty_natural_key_path(
+fn lookup_array_of_tables_keys(
+    root: &toml_edit::Table,
+    parent_segs: &[&str],
+    array_key: &str,
+    natural_key_field: &str,
+) -> Vec<String> {
+    let mut cursor: &toml_edit::Table = root;
+    for seg in parent_segs {
+        let Some(next) = cursor.get(seg).and_then(toml_edit::Item::as_table) else {
+            return Vec::new();
+        };
+        cursor = next;
+    }
+    let Some(aot) = cursor
+        .get(array_key)
+        .and_then(toml_edit::Item::as_array_of_tables)
+    else {
+        return Vec::new();
+    };
+    aot.iter()
+        .filter_map(|t| t.get(natural_key_field)?.as_str().map(str::to_string))
+        .collect()
+}
+
+fn reconcile_natural_key_whole_entry(
     root: &mut toml_edit::Table,
     section: &NaturalKeySection,
-    dotted: &str,
+    alias: &str,
     full_table: &toml::Table,
-    _default_table: &toml::Table,
 ) {
-    // `dotted` is known to start with `<section_path>.` thanks to
-    // `find_natural_key_section_for_path`; split the alias and inner
-    // suffix off the tail.
-    let rest = match dotted
-        .strip_prefix(section.section_path)
-        .and_then(|s| s.strip_prefix('.'))
-    {
-        Some(r) => r,
-        None => return,
-    };
-    let (alias, inner_suffix) = match rest.split_once('.') {
-        Some((a, i)) => (a, Some(i)),
-        None => (rest, None),
-    };
     if alias.is_empty() {
         return;
     }
-
-    // Walk the in-memory serialized array at `section_path`. Each
-    // element is a `toml::Value::Table`; the alias lives in the
-    // `natural_key_field` column.
     let section_segs: Vec<&str> = section.section_path.split('.').collect();
+    let Some((array_key, parent_segs)) = section_segs.split_last() else {
+        return;
+    };
     let mem_array = lookup_path_in_table(full_table, &section_segs).and_then(|v| v.as_array());
     let mem_entry = mem_array.and_then(|arr| {
         arr.iter().find_map(|item| {
@@ -15751,126 +17258,24 @@ fn apply_dirty_natural_key_path(
             (alias_value == alias).then_some(table)
         })
     });
-
-    // The doc cursor walks the section's parent Tables (e.g. `mcp`) and
-    // arrives at the array node (`servers`). The natural-key Vec is
-    // always at the deepest segment of `section_path`; the leading
-    // segments are plain struct fields and therefore Tables on disk.
-    let Some((array_key, parent_segs)) = section_segs.split_last() else {
-        return;
-    };
-
-    // Inner-suffix path: per-field edit (case 1). Reconcile the inner
-    // sub-path on the matched doc table the same way the generic
-    // Table-shaped walker does — mem-vs-default comparison decides
-    // delete vs write — and bail out before touching the array spine
-    // if the entry doesn't exist in either memory or the doc.
-    if let Some(inner) = inner_suffix {
-        // Look up the same inner sub-path on the default-shaped element.
-        // `Config::default()` always has an empty `mcp.servers` (and no
-        // default natural-key Vec entry is non-empty), so we synthesize
-        // the default by going through the inner type's own
-        // `Default` impl via the existing `default_table` plus an
-        // alias-keyed lookup. The Vec being empty in defaults means
-        // `default_array_entry` is always `None`, which mirrors the
-        // existing HashMap behaviour: `default_val` for an alias's
-        // child is None too, because the alias key doesn't exist in
-        // `Config::default()`. Keep the comparison shape identical so
-        // the delete-on-default rule degrades the same way the HashMap
-        // path already does (i.e. it doesn't catch "field is set to
-        // its serde default"; that limitation is shared and not a
-        // regression from this fix). The `_default_table` parameter
-        // is intentionally unused for this reason — kept on the
-        // signature so the call site in `save_dirty` stays uniform
-        // with `apply_dirty_path`, which does consume it.
-
-        let inner_raw: Vec<&str> = inner.split('.').collect();
-        // Same dash-aware segment resolution the top-level Table-shaped
-        // walker uses (`apply_dirty_path` → `resolve_dirty_segments`), but
-        // rooted at the natural-key entry's own serialized table so kebab
-        // inner segments like `mcp.servers.fs.tool-timeout-secs` resolve
-        // to the snake `tool_timeout_secs` field on disk. Sharing the
-        // helper instead of forking is load-bearing: this PR exists
-        // because two parallel walks (in-memory vs on-disk) drifted apart;
-        // a forked copy here would recreate exactly that hazard, so any
-        // future fix to dash handling lands in both code paths at once.
-        let inner_segments: Vec<String> = match mem_entry {
-            Some(table) => resolve_dirty_segments(table, &inner_raw),
-            None => inner_raw.iter().map(|s| (*s).to_string()).collect(),
-        };
-        let inner_segs: Vec<&str> = inner_segments.iter().map(String::as_str).collect();
-
-        let mem_inner_val = mem_entry.and_then(|t| lookup_path_in_table(t, &inner_segs));
-
-        // mem missing → delete. mem present → write.
-        match mem_inner_val {
-            Some(value) => {
-                let entry_table = ensure_array_of_tables_entry(
-                    root,
-                    parent_segs,
-                    array_key,
-                    section.natural_key_field,
-                    alias,
-                );
-                let Some(entry_table) = entry_table else {
-                    return;
-                };
-                let mut pruned = value.clone();
-                prune_empty_leaves(&mut pruned);
-                set_path_in_doc(entry_table, &inner_segs, &pruned);
-            }
-            None => {
-                // Only walk the doc if we'd actually find something to
-                // delete; otherwise an "ambient" delete pass on a fresh
-                // alias would scribble an empty `[[mcp.servers]]` entry
-                // via `ensure_array_of_tables_entry`'s create path.
-                let Some(entry_table) = find_array_of_tables_entry_mut(
-                    root,
-                    parent_segs,
-                    array_key,
-                    section.natural_key_field,
-                    alias,
-                ) else {
-                    return;
-                };
-                delete_path_in_doc(entry_table, &inner_segs);
-            }
-        }
-        return;
-    }
-
-    // Bare-alias path (cases 2 and 3). No inner suffix → reconcile the
-    // whole element.
     match mem_entry {
         Some(entry) => {
-            // Case 2: rewrite the entire array entry from the in-memory
-            // serialization. Prunes empties so default fields don't
-            // sprawl, matching the per-field path's `prune_empty_leaves`
-            // pass.
             let mut value = toml::Value::Table(entry.clone());
             prune_empty_leaves(&mut value);
-            let entry_table = ensure_array_of_tables_entry(
+            let Some(entry_table) = ensure_array_of_tables_entry(
                 root,
                 parent_segs,
                 array_key,
                 section.natural_key_field,
                 alias,
-            );
-            let Some(entry_table) = entry_table else {
+            ) else {
                 return;
             };
-            // Replace the table's contents wholesale so removed inner
-            // fields actually disappear from disk.
-            entry_table.clear();
             if let toml::Value::Table(t) = value {
-                for (k, v) in t.into_iter() {
-                    entry_table.insert(&k, crate::migration::toml_value_to_edit_item(&v));
-                }
+                crate::migration::sync_table(entry_table, &t);
             }
         }
         None => {
-            // Case 3: alias no longer in memory → drop the matching
-            // doc entry. If no doc entry matches, no-op.
             delete_array_of_tables_entry(
                 root,
                 parent_segs,
@@ -15880,6 +17285,135 @@ fn apply_dirty_natural_key_path(
             );
         }
     }
+}
+
+fn apply_dirty_natural_key_path(
+    root: &mut toml_edit::Table,
+    section: &NaturalKeySection,
+    dotted: &str,
+    full_table: &toml::Table,
+    _default_table: &toml::Table,
+    is_explicit_prop_edit: bool,
+) -> Result<()> {
+    let rest = match dotted
+        .strip_prefix(section.section_path)
+        .and_then(|s| s.strip_prefix('.'))
+    {
+        Some(r) if !r.is_empty() => r,
+        _ => return Ok(()),
+    };
+
+    let section_segs: Vec<&str> = section.section_path.split('.').collect();
+    let Some((array_key, parent_segs)) = section_segs.split_last() else {
+        return Ok(());
+    };
+    let mem_array = lookup_path_in_table(full_table, &section_segs).and_then(|v| v.as_array());
+    let mem_keys: Vec<String> = mem_array
+        .into_iter()
+        .flat_map(|arr| arr.iter())
+        .filter_map(|item| {
+            item.as_table()?
+                .get(section.natural_key_field)?
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect();
+    let doc_keys =
+        lookup_array_of_tables_keys(root, parent_segs, array_key, section.natural_key_field);
+
+    if !is_explicit_prop_edit
+        && (mem_keys.iter().any(|k| k == rest) || doc_keys.iter().any(|k| k == rest))
+    {
+        reconcile_natural_key_whole_entry(root, section, rest, full_table);
+        return Ok(());
+    }
+
+    let (alias, inner) = match crate::helpers::route_vec_path(
+        dotted,
+        "",
+        section.section_path,
+        "",
+        mem_keys.iter().enumerate().map(|(i, k)| (i, k.as_str())),
+    ) {
+        crate::helpers::VecRoute::Hit { index, inner_name } => {
+            (mem_keys[index].clone(), inner_name)
+        }
+        crate::helpers::VecRoute::Ambiguous { key, count } => {
+            anyhow::bail!(
+                "save_dirty: natural key `{key}` is ambiguous in `{}` ({count} entries share it)",
+                section.section_path
+            );
+        }
+        crate::helpers::VecRoute::Miss => match crate::helpers::route_vec_path(
+            dotted,
+            "",
+            section.section_path,
+            "",
+            doc_keys.iter().enumerate().map(|(i, k)| (i, k.as_str())),
+        ) {
+            crate::helpers::VecRoute::Hit { index, inner_name } => {
+                (doc_keys[index].clone(), inner_name)
+            }
+            crate::helpers::VecRoute::Ambiguous { key, count } => {
+                anyhow::bail!(
+                    "save_dirty: natural key `{key}` is ambiguous in `{}` ({count} entries share it)",
+                    section.section_path
+                );
+            }
+            crate::helpers::VecRoute::Miss => return Ok(()),
+        },
+    };
+
+    let mem_entry = mem_array.and_then(|arr| {
+        arr.iter().find_map(|item| {
+            let table = item.as_table()?;
+            let alias_value = table.get(section.natural_key_field)?.as_str()?;
+            (alias_value == alias).then_some(table)
+        })
+    });
+    let inner_segments: Vec<String> = {
+        let doc_entry = find_array_of_tables_entry_mut(
+            root,
+            parent_segs,
+            array_key,
+            section.natural_key_field,
+            &alias,
+        )
+        .map(|t| t as &dyn toml_edit::TableLike);
+        resolve_dirty_table_segments(mem_entry, doc_entry, &inner)
+    };
+    let inner_segs: Vec<&str> = inner_segments.iter().map(String::as_str).collect();
+    let mem_inner_val = mem_entry.and_then(|t| lookup_path_in_table(t, &inner_segs));
+
+    match mem_inner_val {
+        Some(value) => {
+            let Some(entry_table) = ensure_array_of_tables_entry(
+                root,
+                parent_segs,
+                array_key,
+                section.natural_key_field,
+                &alias,
+            ) else {
+                return Ok(());
+            };
+            let mut pruned = value.clone();
+            prune_empty_leaves(&mut pruned);
+            set_path_in_doc(entry_table, &inner_segs, &pruned);
+        }
+        None => {
+            let Some(entry_table) = find_array_of_tables_entry_mut(
+                root,
+                parent_segs,
+                array_key,
+                section.natural_key_field,
+                &alias,
+            ) else {
+                return Ok(());
+            };
+            delete_path_in_doc(entry_table, &inner_segs);
+        }
+    }
+    Ok(())
 }
 
 /// Return the longest `MapKeyKind::Map` section whose path is a strict
@@ -15941,6 +17475,7 @@ fn apply_dirty_map_key_path(
     dotted: &str,
     full_table: &toml::Table,
     default_table: &toml::Table,
+    is_explicit_prop_edit: bool,
 ) -> Result<()> {
     let section_segs: Vec<&str> = section.path.split('.').collect();
     let remainder = &dotted[section.path.len() + 1..];
@@ -15948,23 +17483,31 @@ fn apply_dirty_map_key_path(
     let mem_table = lookup_path_in_table(full_table, &section_segs).and_then(|v| v.as_table());
     let doc_table = lookup_table_in_doc(root, &section_segs);
 
-    let keys: Vec<&str> = mem_table
+    let mem_keys: Vec<&str> = mem_table
         .into_iter()
         .flat_map(|t| t.keys().map(String::as_str))
-        .chain(doc_table.into_iter().flat_map(|t| t.iter().map(|(k, _)| k)))
         .collect();
+    let doc_keys: Vec<&str> = doc_table
+        .into_iter()
+        .flat_map(|t| t.iter().map(|(k, _)| k))
+        .collect();
+    let has_exact_entry = mem_keys.contains(&remainder) || doc_keys.contains(&remainder);
 
-    // Exact match first: a whole-entry path for key `gpt-4.1` must not be
-    // swallowed by `route_hashmap_path` matching the shorter key `gpt-4`
-    // plus a bogus inner suffix `1...`. The cost is the inverse shadow: a
-    // pathological key literally named `<other-key>.<field>` wins over a
-    // field write addressed to `<other-key>` — acceptable because the
-    // exact key is the more specific interpretation of the same bytes.
-    let key_match: Option<(&str, Option<String>)> = if keys.contains(&remainder) {
+    let key_match: Option<(&str, Option<String>)> = if !is_explicit_prop_edit && has_exact_entry {
         Some((remainder, None))
     } else {
-        crate::helpers::route_hashmap_path(dotted, "", section.path, "", keys.iter().copied())
+        crate::helpers::route_hashmap_path(dotted, "", section.path, "", mem_keys.iter().copied())
+            .or_else(|| {
+                crate::helpers::route_hashmap_path(
+                    dotted,
+                    "",
+                    section.path,
+                    "",
+                    doc_keys.iter().copied(),
+                )
+            })
             .map(|(key, inner)| (key, Some(inner)))
+            .or_else(|| has_exact_entry.then_some((remainder, None)))
     };
 
     let Some((key, inner)) = key_match else {
@@ -15980,18 +17523,13 @@ fn apply_dirty_map_key_path(
     segments.push(key.to_string());
 
     if let Some(inner) = inner {
-        // Same dash-aware segment resolution `apply_dirty_natural_key_path`
-        // uses for its inner suffix, rooted at the matched key's own
-        // serialized table so kebab inner segments (`tool-timeout-secs`)
-        // resolve to the snake struct field on disk.
         let key_table = mem_table
             .and_then(|t| t.get(key))
             .and_then(|v| v.as_table());
-        let inner_raw: Vec<&str> = inner.split('.').collect();
-        let inner_segments: Vec<String> = match key_table {
-            Some(t) => resolve_dirty_segments(t, &inner_raw),
-            None => inner_raw.iter().map(|s| (*s).to_string()).collect(),
-        };
+        let doc_key_table = doc_table
+            .and_then(|t| t.get(key))
+            .and_then(toml_edit::Item::as_table_like);
+        let inner_segments = resolve_dirty_table_segments(key_table, doc_key_table, &inner);
         segments.extend(inner_segments);
     }
 
@@ -16305,31 +17843,84 @@ fn prune_empty_leaves(value: &mut toml::Value) {
     }
 }
 
-fn resolve_dirty_segments(root: &toml::Table, raw: &[&str]) -> Vec<String> {
-    let mut out: Vec<String> = Vec::with_capacity(raw.len());
-    let mut current: Option<&toml::Value> = None;
-    for seg in raw {
-        let table_opt: Option<&toml::Table> = if out.is_empty() {
-            Some(root)
-        } else {
-            current.and_then(|v| v.as_table())
+fn resolve_dirty_table_segments(
+    mut mem_table: Option<&toml::Table>,
+    mut doc_table: Option<&dyn toml_edit::TableLike>,
+    dotted: &str,
+) -> Vec<String> {
+    if dotted.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut rest = dotted;
+    loop {
+        if let Some(t) = mem_table {
+            if t.contains_key(rest) {
+                out.push(rest.to_string());
+                return out;
+            }
+            let snake_rest = rest.replace('-', "_");
+            if t.contains_key(&snake_rest) {
+                out.push(snake_rest);
+                return out;
+            }
+        }
+        if let Some(dt) = doc_table
+            && dt.contains_key(rest)
+        {
+            out.push(rest.to_string());
+            return out;
+        }
+
+        let Some((seg, next_rest)) = rest.split_once('.') else {
+            let leaf = match mem_table {
+                Some(t) if t.contains_key(rest) => rest.to_string(),
+                Some(t) => {
+                    let snake = rest.replace('-', "_");
+                    if t.contains_key(&snake) {
+                        snake
+                    } else {
+                        rest.to_string()
+                    }
+                }
+                None => rest.to_string(),
+            };
+            out.push(leaf);
+            return out;
         };
-        let resolved = match table_opt {
-            Some(t) if t.contains_key(*seg) => (*seg).to_string(),
+
+        let resolved = match mem_table {
+            Some(t) if t.contains_key(seg) => seg.to_string(),
             Some(t) => {
                 let snake = seg.replace('-', "_");
                 if t.contains_key(&snake) {
                     snake
                 } else {
-                    (*seg).to_string()
+                    seg.to_string()
                 }
             }
-            None => (*seg).to_string(),
+            None => match doc_table {
+                Some(dt) if dt.contains_key(seg) => seg.to_string(),
+                Some(dt) => {
+                    let snake = seg.replace('-', "_");
+                    if dt.contains_key(&snake) {
+                        snake
+                    } else {
+                        seg.to_string()
+                    }
+                }
+                None => seg.to_string(),
+            },
         };
-        current = table_opt.and_then(|t| t.get(&resolved));
+        mem_table = mem_table
+            .and_then(|t| t.get(&resolved))
+            .and_then(toml::Value::as_table);
+        doc_table = doc_table
+            .and_then(|dt| dt.get(&resolved))
+            .and_then(toml_edit::Item::as_table_like);
         out.push(resolved);
+        rest = next_rest;
     }
-    out
 }
 
 fn lookup_path_in_table<'a>(root: &'a toml::Table, segs: &[&str]) -> Option<&'a toml::Value> {

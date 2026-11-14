@@ -2479,22 +2479,19 @@ pub async fn handle_migrate(State(state): State<AppState>, headers: HeaderMap) -
                     current
                         .env_overridden_paths
                         .iter()
-                        .filter(|path| operator_path(path))
-                        .cloned(),
+                        .filter(|path| operator_path(path)),
                 );
                 new_cfg.pre_override_snapshots.extend(
                     current
                         .pre_override_snapshots
                         .iter()
-                        .filter(|(path, _)| operator_path(path))
-                        .map(|(path, value)| (path.clone(), value.clone())),
+                        .filter(|(path, _)| operator_path(path)),
                 );
                 new_cfg.onepassword_reference_snapshots.extend(
                     current
                         .onepassword_reference_snapshots
                         .iter()
-                        .filter(|(path, _)| operator_path(path))
-                        .map(|(path, value)| (path.clone(), value.clone())),
+                        .filter(|(path, _)| operator_path(path)),
                 );
             }
             let backup_path = config_path.with_extension("toml.bak");
@@ -2960,10 +2957,7 @@ mod tests {
                 assert!(crate::operator_auth::require_operator(&state, &operator).is_ok());
                 let live = state.config.read();
                 assert!(live.env_overridden_paths.contains(path));
-                assert_eq!(
-                    live.pre_override_snapshots.get(path).map(String::as_str),
-                    Some("[]")
-                );
+                assert_eq!(live.pre_override_snapshots.get(path).as_deref(), Some("[]"));
                 assert!(
                     !std::fs::read_to_string(&live.config_path)
                         .unwrap()
@@ -4709,8 +4703,9 @@ mod tests {
         cfg.save().await.expect("initial save");
 
         cfg.browser.computer_use.api_key = Some("injected-via-env".into());
-        cfg.env_overridden_paths =
-            std::collections::HashSet::from(["browser.computer_use.api_key".to_string()]);
+        cfg.env_overridden_paths = zeroclaw_config::schema::EnvOverriddenPaths::from_set(
+            std::collections::HashSet::from(["browser.computer_use.api_key".to_string()]),
+        );
 
         let drift = compute_drift(&cfg).await;
         assert!(

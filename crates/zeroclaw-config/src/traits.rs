@@ -358,6 +358,21 @@ pub trait SecretField {
     /// Whether the field carries at least one non-empty inner string. Reported
     /// back through [`SecretFieldInfo::is_set`].
     fn is_set(&self) -> bool;
+
+    /// Record any external secret references (`op://` or `vault:`) under `enc_path`.
+    fn collect_external_refs(
+        &self,
+        enc_path: &str,
+        out: &mut std::collections::HashMap<String, String>,
+    );
+
+    /// Restore non-dirty external secret references under `enc_path` from `snapshots`.
+    fn restore_external_refs(
+        &mut self,
+        enc_path: &str,
+        snapshots: &std::collections::HashMap<String, String>,
+        skip_encoded_dirty: &std::collections::HashSet<String>,
+    );
 }
 
 impl SecretField for String {
@@ -379,7 +394,7 @@ impl SecretField for String {
         field: &str,
     ) -> anyhow::Result<()> {
         use anyhow::Context;
-        // `is_encrypted` also includes external secret references (`op://`):
+        // `is_encrypted` also includes external secret references (`op://` and `vault:`):
         // encryption must preserve them, while decryption resolves them for use.
         if !self.is_empty() && !crate::security::SecretStore::is_encrypted(self) {
             *self = store
@@ -405,6 +420,30 @@ impl SecretField for String {
 
     fn is_set(&self) -> bool {
         !self.is_empty()
+    }
+
+    fn collect_external_refs(
+        &self,
+        enc_path: &str,
+        out: &mut std::collections::HashMap<String, String>,
+    ) {
+        if crate::security::SecretStore::is_external_secret_ref(self) {
+            out.insert(enc_path.to_string(), self.clone());
+        }
+    }
+
+    fn restore_external_refs(
+        &mut self,
+        enc_path: &str,
+        snapshots: &std::collections::HashMap<String, String>,
+        skip_encoded_dirty: &std::collections::HashSet<String>,
+    ) {
+        if !skip_encoded_dirty.contains(enc_path)
+            && !self.is_empty()
+            && let Some(reference) = snapshots.get(enc_path)
+        {
+            self.clone_from(reference);
+        }
     }
 }
 
@@ -445,6 +484,27 @@ impl SecretField for Option<String> {
 
     fn is_set(&self) -> bool {
         self.as_ref().is_some_and(|v| !v.is_empty())
+    }
+
+    fn collect_external_refs(
+        &self,
+        enc_path: &str,
+        out: &mut std::collections::HashMap<String, String>,
+    ) {
+        if let Some(inner) = self {
+            inner.collect_external_refs(enc_path, out);
+        }
+    }
+
+    fn restore_external_refs(
+        &mut self,
+        enc_path: &str,
+        snapshots: &std::collections::HashMap<String, String>,
+        skip_encoded_dirty: &std::collections::HashSet<String>,
+    ) {
+        if let Some(inner) = self {
+            inner.restore_external_refs(enc_path, snapshots, skip_encoded_dirty);
+        }
     }
 }
 
@@ -489,6 +549,32 @@ impl SecretField for std::path::PathBuf {
     fn is_set(&self) -> bool {
         !self.as_os_str().is_empty()
     }
+
+    fn collect_external_refs(
+        &self,
+        enc_path: &str,
+        out: &mut std::collections::HashMap<String, String>,
+    ) {
+        if let Some(s) = self.to_str()
+            && crate::security::SecretStore::is_external_secret_ref(s)
+        {
+            out.insert(enc_path.to_string(), s.to_string());
+        }
+    }
+
+    fn restore_external_refs(
+        &mut self,
+        enc_path: &str,
+        snapshots: &std::collections::HashMap<String, String>,
+        skip_encoded_dirty: &std::collections::HashSet<String>,
+    ) {
+        if !skip_encoded_dirty.contains(enc_path)
+            && !self.as_os_str().is_empty()
+            && let Some(reference) = snapshots.get(enc_path)
+        {
+            *self = std::path::PathBuf::from(reference);
+        }
+    }
 }
 
 impl SecretField for Option<std::path::PathBuf> {
@@ -529,6 +615,27 @@ impl SecretField for Option<std::path::PathBuf> {
     fn is_set(&self) -> bool {
         self.as_ref().is_some_and(|v| !v.as_os_str().is_empty())
     }
+
+    fn collect_external_refs(
+        &self,
+        enc_path: &str,
+        out: &mut std::collections::HashMap<String, String>,
+    ) {
+        if let Some(inner) = self {
+            inner.collect_external_refs(enc_path, out);
+        }
+    }
+
+    fn restore_external_refs(
+        &mut self,
+        enc_path: &str,
+        snapshots: &std::collections::HashMap<String, String>,
+        skip_encoded_dirty: &std::collections::HashSet<String>,
+    ) {
+        if let Some(inner) = self {
+            inner.restore_external_refs(enc_path, snapshots, skip_encoded_dirty);
+        }
+    }
 }
 
 impl SecretField for Vec<String> {
@@ -568,6 +675,36 @@ impl SecretField for Vec<String> {
 
     fn is_set(&self) -> bool {
         !self.is_empty()
+    }
+
+    fn collect_external_refs(
+        &self,
+        enc_path: &str,
+        out: &mut std::collections::HashMap<String, String>,
+    ) {
+        for (idx, element) in self.iter().enumerate() {
+            element.collect_external_refs(&format!("{enc_path}[{idx}]"), out);
+        }
+    }
+
+    fn restore_external_refs(
+        &mut self,
+        enc_path: &str,
+        snapshots: &std::collections::HashMap<String, String>,
+        skip_encoded_dirty: &std::collections::HashSet<String>,
+    ) {
+        if skip_encoded_dirty.contains(enc_path) {
+            return;
+        }
+        for (idx, element) in self.iter_mut().enumerate() {
+            let slot_key = format!("{enc_path}[{idx}]");
+            if !skip_encoded_dirty.contains(&slot_key)
+                && !element.is_empty()
+                && let Some(reference) = snapshots.get(&slot_key)
+            {
+                element.clone_from(reference);
+            }
+        }
     }
 }
 
@@ -611,6 +748,35 @@ impl SecretField for std::collections::HashMap<String, String> {
     fn is_set(&self) -> bool {
         self.values().any(|v| !v.is_empty())
     }
+
+    fn collect_external_refs(
+        &self,
+        enc_path: &str,
+        out: &mut std::collections::HashMap<String, String>,
+    ) {
+        for (key, value) in self {
+            let ek = crate::helpers::join_snapshot_path(
+                enc_path,
+                &crate::helpers::encode_snapshot_segment(key),
+            );
+            value.collect_external_refs(&ek, out);
+        }
+    }
+
+    fn restore_external_refs(
+        &mut self,
+        enc_path: &str,
+        snapshots: &std::collections::HashMap<String, String>,
+        skip_encoded_dirty: &std::collections::HashSet<String>,
+    ) {
+        for (key, value) in self.iter_mut() {
+            let ek = crate::helpers::join_snapshot_path(
+                enc_path,
+                &crate::helpers::encode_snapshot_segment(key),
+            );
+            value.restore_external_refs(&ek, snapshots, skip_encoded_dirty);
+        }
+    }
 }
 
 impl SecretField for Option<std::collections::HashMap<String, String>> {
@@ -651,6 +817,27 @@ impl SecretField for Option<std::collections::HashMap<String, String>> {
     fn is_set(&self) -> bool {
         self.as_ref()
             .is_some_and(|m| m.values().any(|v| !v.is_empty()))
+    }
+
+    fn collect_external_refs(
+        &self,
+        enc_path: &str,
+        out: &mut std::collections::HashMap<String, String>,
+    ) {
+        if let Some(inner) = self {
+            inner.collect_external_refs(enc_path, out);
+        }
+    }
+
+    fn restore_external_refs(
+        &mut self,
+        enc_path: &str,
+        snapshots: &std::collections::HashMap<String, String>,
+        skip_encoded_dirty: &std::collections::HashSet<String>,
+    ) {
+        if let Some(inner) = self {
+            inner.restore_external_refs(enc_path, snapshots, skip_encoded_dirty);
+        }
     }
 }
 

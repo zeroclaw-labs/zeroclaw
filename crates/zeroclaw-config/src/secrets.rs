@@ -34,6 +34,8 @@ const KEY_LEN: usize = 32;
 /// ChaCha20-Poly1305 nonce length in bytes.
 const NONCE_LEN: usize = 12;
 
+const TACHI_VAULT_TIMEOUT: Duration = Duration::from_secs(10);
+
 const ONEPASSWORD_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Manages encrypted storage of secrets (API keys, tokens, etc.)
@@ -90,6 +92,7 @@ impl SecretStore {
     /// - `enc2:` prefix → ChaCha20-Poly1305 (current format)
     /// - `enc:` prefix → legacy XOR cipher (backward compatibility for migration)
     /// - `op://` prefix → resolved via 1Password CLI (`op read`)
+    /// - `vault:` prefix → resolved via Tachi Vault (`tachi vault`)
     /// - No prefix → returned as-is (plaintext config)
     ///
     /// **Warning**: Legacy `enc:` values are insecure. Use `decrypt_and_migrate` to
@@ -101,6 +104,8 @@ impl SecretStore {
             self.decrypt_legacy_xor(hex_str)
         } else if is_onepassword_ref(value) {
             resolve_onepassword_ref(value)
+        } else if is_tachi_vault_ref(value) {
+            resolve_tachi_vault_ref(value)
         } else {
             Ok(value.to_string())
         }
@@ -130,8 +135,8 @@ impl SecretStore {
             let plaintext = self.decrypt_legacy_xor(hex_str)?;
             let migrated = self.encrypt(&plaintext)?;
             Ok((plaintext, Some(migrated)))
-        } else if is_onepassword_ref(value) {
-            let plaintext = resolve_onepassword_ref(value)?;
+        } else if is_external_secret_ref(value) {
+            let plaintext = self.decrypt(value)?;
             Ok((plaintext, None))
         } else {
             // Plaintext — no migration needed
@@ -186,12 +191,22 @@ impl SecretStore {
 
     /// Check if a value is already encrypted or externally resolved.
     pub fn is_encrypted(value: &str) -> bool {
-        value.starts_with("enc2:") || value.starts_with("enc:") || is_onepassword_ref(value)
+        value.starts_with("enc2:") || value.starts_with("enc:") || is_external_secret_ref(value)
     }
 
     /// Check if a value is a 1Password external secret reference.
     pub fn is_onepassword_ref(value: &str) -> bool {
         is_onepassword_ref(value)
+    }
+
+    /// Check if a value is a Tachi Vault external secret reference.
+    pub fn is_tachi_vault_ref(value: &str) -> bool {
+        is_tachi_vault_ref(value)
+    }
+
+    /// Check if a value is resolved by an external credential owner.
+    pub fn is_external_secret_ref(value: &str) -> bool {
+        is_external_secret_ref(value)
     }
 
     /// Check if a value uses the secure `enc2:` format.
@@ -403,6 +418,302 @@ fn is_onepassword_ref(value: &str) -> bool {
     value.starts_with("op://")
 }
 
+pub fn is_tachi_vault_ref(value: &str) -> bool {
+    value.starts_with("vault:")
+}
+
+pub fn is_external_secret_ref(value: &str) -> bool {
+    is_onepassword_ref(value) || is_tachi_vault_ref(value)
+}
+
+fn validate_tachi_vault_ref(reference: &str) -> Result<&str> {
+    let name = reference.strip_prefix("vault:").unwrap_or("");
+    let bytes = name.as_bytes();
+    anyhow::ensure!(
+        (1..=128).contains(&bytes.len())
+            && matches!(bytes[0], b'A'..=b'Z' | b'a'..=b'z' | b'_')
+            && bytes[1..]
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')),
+        "Invalid Tachi Vault reference name; expected vault:[A-Za-z_][A-Za-z0-9_.-]* (1..=128 ASCII bytes)"
+    );
+    Ok(name)
+}
+
+const MAX_TACHI_VAULT_PIPE_BYTES: u64 = 64 * 1024;
+const TACHI_VAULT_LEASE_ENV: &str = "ZEROCLAW_VAULT_SECRET";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TachiVaultStatus {
+    Daemon {
+        initialized: bool,
+        locked: bool,
+        auto_unlock: bool,
+    },
+    Offline {
+        initialized: bool,
+    },
+}
+
+/// Run one non-interactive CLI step. Never attach stdout to an error, even
+/// when decoding fails: it can contain a complete or partial credential.
+fn run_tachi_vault(args: &[&str], reference: &str, deadline: Instant) -> Result<Vec<u8>> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("tachi")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                anyhow::Error::msg("Tachi CLI (`tachi`) not found. Install it to use vault: secret references in config.")
+            } else {
+                anyhow::Error::msg(format!("Failed to run Tachi CLI: {e}"))
+            }
+        })?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("Failed to capture Tachi CLI stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("Failed to capture Tachi CLI stderr")?;
+    // Drain both pipes concurrently with a fixed byte cap. Channel receives
+    // share the caller deadline so inherited pipes cannot extend the timeout.
+    let read_pipe = |pipe: Box<dyn Read + Send>| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = pipe
+                .take(MAX_TACHI_VAULT_PIPE_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .map(|_| bytes);
+            let _ = tx.send(result);
+        });
+        rx
+    };
+    let stdout_rx = read_pipe(Box::new(stdout));
+    let stderr_rx = read_pipe(Box::new(stderr));
+    let output = (|| {
+        let status = loop {
+            if let Some(status) = child
+                .try_wait()
+                .context("Failed to poll Tachi CLI process")?
+            {
+                break status;
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "Tachi CLI timed out resolving \"{reference}\" after 10s"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        let stdout = stdout_rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .context("Tachi CLI stdout reader timed out or disconnected")?
+            .context("Failed to read Tachi CLI stdout")?;
+        let stderr = stderr_rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .context("Tachi CLI stderr reader timed out or disconnected")?
+            .context("Failed to read Tachi CLI stderr")?;
+        anyhow::ensure!(
+            stdout.len() as u64 <= MAX_TACHI_VAULT_PIPE_BYTES
+                && stderr.len() as u64 <= MAX_TACHI_VAULT_PIPE_BYTES,
+            "Tachi CLI output exceeded 64 KiB limit while resolving \"{reference}\""
+        );
+        if !status.success() {
+            let reason = classify_tachi_vault_stderr(&stderr);
+            match status.code() {
+                Some(code) => anyhow::bail!(
+                    "Tachi CLI failed while resolving \"{reference}\" (exit status {code}): {reason}"
+                ),
+                None => {
+                    anyhow::bail!("Tachi CLI terminated by signal while resolving \"{reference}\"")
+                }
+            }
+        }
+        Ok(stdout)
+    })();
+    if output.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    output
+}
+
+fn classify_tachi_vault_stderr(stderr: &[u8]) -> &'static str {
+    let lower = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    if lower.contains("not found")
+        || lower.contains("no secret")
+        || lower.contains("missing")
+        || lower.contains("does not exist")
+    {
+        "requested secret entry was not found in Tachi Vault"
+    } else if lower.contains("keychain") {
+        "Tachi Vault password is not available in macOS Keychain"
+    } else if lower.contains("not initialized") {
+        "Tachi Vault is not initialized"
+    } else if lower.contains("locked") || lower.contains("unlock") || lower.contains("password") {
+        "Tachi Vault is locked or authentication failed"
+    } else if lower.contains("api_key") || lower.contains("pool") || lower.contains("lease") {
+        "entry cannot be leased as an API key"
+    } else {
+        "command exited with non-zero status"
+    }
+}
+
+fn parse_tachi_vault_status(raw: &[u8]) -> Result<TachiVaultStatus> {
+    if raw.iter().copied().find(|b| !b.is_ascii_whitespace()) == Some(b'{') {
+        let status: serde_json::Value = serde_json::from_slice(raw)
+            .map_err(|_| anyhow::Error::msg("Tachi Vault returned invalid status JSON"))?;
+        let initialized = status
+            .get("initialized")
+            .and_then(serde_json::Value::as_bool)
+            .context("Tachi Vault status missing boolean initialized")?;
+        let locked = status
+            .get("locked")
+            .and_then(serde_json::Value::as_bool)
+            .context("Tachi Vault status missing boolean locked")?;
+        let auto_unlock = status
+            .pointer("/secure_store/auto_unlock_available")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        return Ok(TachiVaultStatus::Daemon {
+            initialized,
+            locked,
+            auto_unlock,
+        });
+    }
+
+    let text = std::str::from_utf8(raw)
+        .map_err(|_| anyhow::Error::msg("Tachi Vault returned unrecognized status output"))?;
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    if lines.next() != Some("Vault status:") {
+        anyhow::bail!("Tachi Vault returned unrecognized status output");
+    }
+    for line in lines {
+        if let Some(rest) = line.strip_prefix("initialized:") {
+            return match rest.trim() {
+                "true" => Ok(TachiVaultStatus::Offline { initialized: true }),
+                "false" => Ok(TachiVaultStatus::Offline { initialized: false }),
+                _ => Err(anyhow::Error::msg(
+                    "Tachi Vault status missing boolean initialized",
+                )),
+            };
+        }
+    }
+    Err(anyhow::Error::msg(
+        "Tachi Vault status missing boolean initialized",
+    ))
+}
+
+fn resolve_tachi_vault_lease(name: &str, reference: &str, deadline: Instant) -> Result<String> {
+    let output = run_tachi_vault(
+        &[
+            "vault",
+            "lease",
+            name,
+            "--env-name",
+            TACHI_VAULT_LEASE_ENV,
+            "--stdin-password",
+            "--json",
+        ],
+        reference,
+        deadline,
+    )?;
+    let output: serde_json::Value = serde_json::from_slice(&output)
+        .map_err(|_| anyhow::Error::msg("Tachi Vault returned invalid lease JSON"))?;
+    anyhow::ensure!(
+        output.get("leased").and_then(serde_json::Value::as_bool) == Some(true),
+        "Tachi Vault did not lease the requested secret"
+    );
+    let env_pointer = format!("/env/{TACHI_VAULT_LEASE_ENV}");
+    let value = output
+        .pointer(&env_pointer)
+        .and_then(serde_json::Value::as_str)
+        .context("Tachi Vault lease response missing string value")?;
+    anyhow::ensure!(
+        !value.is_empty(),
+        "Tachi Vault returned an empty secret value"
+    );
+    Ok(value.to_string())
+}
+
+fn resolve_tachi_vault_get_keychain(
+    name: &str,
+    reference: &str,
+    deadline: Instant,
+) -> Result<String> {
+    // Always pass `--keychain` so `tachi vault get` never falls back to
+    // interactive `/dev/tty` password prompting.
+    let output = run_tachi_vault(
+        &["vault", "get", name, "--reveal", "--json", "--keychain"],
+        reference,
+        deadline,
+    )?;
+    let output: serde_json::Value = serde_json::from_slice(&output)
+        .map_err(|_| anyhow::Error::msg("Tachi Vault returned invalid secret JSON"))?;
+    anyhow::ensure!(
+        output.get("revealed").and_then(serde_json::Value::as_bool) == Some(true),
+        "Tachi Vault did not reveal the requested secret"
+    );
+    let value = output
+        .get("value")
+        .and_then(serde_json::Value::as_str)
+        .context("Tachi Vault secret response missing string value")?;
+    anyhow::ensure!(
+        !value.is_empty(),
+        "Tachi Vault returned an empty secret value"
+    );
+    Ok(value.to_string())
+}
+
+fn resolve_tachi_vault_ref(reference: &str) -> Result<String> {
+    let name = validate_tachi_vault_ref(reference)?;
+    let deadline = Instant::now() + TACHI_VAULT_TIMEOUT;
+    let status_raw = run_tachi_vault(&["vault", "status"], reference, deadline)?;
+    let status = parse_tachi_vault_status(&status_raw)?;
+    let initialized = match status {
+        TachiVaultStatus::Daemon { initialized, .. }
+        | TachiVaultStatus::Offline { initialized } => initialized,
+    };
+    anyhow::ensure!(
+        initialized,
+        "Tachi Vault is not initialized while resolving \"{reference}\" (hint: run `tachi vault init` first)"
+    );
+    match status {
+        TachiVaultStatus::Daemon {
+            locked: false,
+            auto_unlock,
+            ..
+        } => match resolve_tachi_vault_lease(name, reference, deadline) {
+            Ok(secret) => Ok(secret),
+            Err(_) if auto_unlock => resolve_tachi_vault_get_keychain(name, reference, deadline),
+            Err(lease_err) => Err(lease_err.context(format!(
+                "Tachi Vault daemon could not lease \"{reference}\" and automatic Keychain unlock is unavailable for direct store read (hint: store the vault master password in macOS Keychain under service `tachi-vault` / account `default` for non-api_key secrets)"
+            ))),
+        },
+        TachiVaultStatus::Daemon {
+            locked: true,
+            auto_unlock,
+            ..
+        } => {
+            anyhow::ensure!(
+                auto_unlock,
+                "Tachi Vault is locked and automatic Keychain unlock is unavailable while resolving \"{reference}\" (hint: run `tachi vault unlock` first, or store the vault master password in macOS Keychain under service `tachi-vault` / account `default`)"
+            );
+            resolve_tachi_vault_get_keychain(name, reference, deadline)
+        }
+        TachiVaultStatus::Offline { .. } => {
+            resolve_tachi_vault_get_keychain(name, reference, deadline)
+        }
+    }
+}
+
 fn validate_onepassword_ref(reference: &str) -> Result<()> {
     let path = reference.strip_prefix("op://").unwrap_or("");
     let mut segments = path.split('/');
@@ -564,6 +875,446 @@ mod tests {
         let mut perms = fs::metadata(&op_path).unwrap().permissions();
         perms.set_mode(0o755);
         fs::set_permissions(&op_path, perms).unwrap();
+    }
+
+    #[test]
+    fn tachi_vault_reference_classification_and_validation() {
+        for reference in [
+            "vault:OPENAI_OFFICIAL_API_KEY",
+            "vault:openai-prod.v1",
+            "vault:_a",
+            &format!("vault:{}", "A".repeat(128)),
+        ] {
+            assert!(is_tachi_vault_ref(reference));
+            assert!(SecretStore::is_tachi_vault_ref(reference));
+            assert!(is_external_secret_ref(reference));
+            assert!(SecretStore::is_external_secret_ref(reference));
+            assert!(SecretStore::is_encrypted(reference));
+            assert!(!SecretStore::needs_migration(reference));
+            assert!(!SecretStore::is_secure_encrypted(reference));
+            assert!(validate_tachi_vault_ref(reference).is_ok());
+        }
+        assert!(SecretStore::is_external_secret_ref("op://vault/item/field"));
+        for value in ["plain", "enc2:abc", "VAULT:key"] {
+            assert!(!SecretStore::is_tachi_vault_ref(value));
+            assert!(!SecretStore::is_external_secret_ref(value));
+        }
+        for reference in [
+            "vault:",
+            "vault:-flag",
+            "vault:foo/bar",
+            "vault:foo bar",
+            "vault:foo:bar",
+            "vault:0key",
+            "vault:é",
+            "vault:foo\n",
+            "not-vault:A",
+            &format!("vault:{}", "A".repeat(129)),
+        ] {
+            assert!(
+                validate_tachi_vault_ref(reference).is_err(),
+                "{reference:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_fake_tachi_script(bin_dir: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = bin_dir.join("tachi");
+        fs::write(&path, body).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
+    fn write_fake_tachi(
+        bin_dir: &Path,
+        status: &str,
+        lease_out: &str,
+        lease_exit: u8,
+        get_out: &str,
+        get_exit: u8,
+    ) {
+        let script = format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "$TACHI_TEST_CALLS"
+printf '%s\n' 'tachi: logging to synthetic-private-log-path' >&2
+if [ "$*" = 'vault status' ]; then
+  printf '%s\n' '{status}'
+  exit 0
+fi
+case "$*" in
+  'vault lease '* )
+    case "$*" in
+      *' --stdin-password'* ) ;;
+      * ) printf '%s\n' 'interactive lease forbidden' >&2; exit 99 ;;
+    esac
+    printf '%s\n' '{lease_out}'
+    if [ {lease_exit} -ne 0 ]; then printf '%s\n' 'lease refused: synthetic-stderr-secret' >&2; fi
+    exit {lease_exit}
+    ;;
+  'vault get '* )
+    case "$*" in
+      *' --keychain'* ) ;;
+      * ) printf '%s\n' 'interactive get forbidden' >&2; exit 99 ;;
+    esac
+    printf '%s\n' '{get_out}'
+    if [ {get_exit} -ne 0 ]; then printf '%s\n' 'entry missing: synthetic-stderr-secret' >&2; fi
+    exit {get_exit}
+    ;;
+esac
+printf '%s\n' 'unexpected subcommand' >&2
+exit 98
+"#
+        );
+        write_fake_tachi_script(bin_dir, &script);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tachi_vault_unlocked_and_keychain_resolution() {
+        let _guard = crate::env_overrides::env_test_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let _path = EnvValueGuard::set("PATH", tmp.path());
+        let calls = tmp.path().join("calls");
+        let _calls = EnvValueGuard::set("TACHI_TEST_CALLS", &calls);
+        let store = SecretStore::new(tmp.path(), true);
+
+        // 1. Unlocked daemon WITHOUT Keychain resolves api_key via non-interactive `vault lease`,
+        // preserving exact bytes (including trailing CR/LF) encoded inside JSON.
+        fs::write(&calls, "").unwrap();
+        write_fake_tachi(
+            tmp.path(),
+            r#"{"initialized":true,"locked":false,"secure_store":{"auto_unlock_available":false}}"#,
+            r#"{"leased":true,"env":{"ZEROCLAW_VAULT_SECRET":"synthetic-leased-secret\r\n"}}"#,
+            0,
+            "",
+            1,
+        );
+        let (secret, migrated) = store
+            .decrypt_and_migrate("vault:OPENAI_OFFICIAL_API_KEY")
+            .unwrap();
+        assert_eq!(secret, "synthetic-leased-secret\r\n");
+        assert!(migrated.is_none());
+        assert_eq!(
+            fs::read_to_string(&calls).unwrap(),
+            "vault status\nvault lease OPENAI_OFFICIAL_API_KEY --env-name ZEROCLAW_VAULT_SECRET --stdin-password --json\n"
+        );
+
+        // 2. Unlocked daemon WITH Keychain falls back to `vault get --keychain` for non-api_key entries.
+        // Outer CLI framing newlines after JSON are ignored while inner `\r\n` bytes stay intact.
+        fs::write(&calls, "").unwrap();
+        write_fake_tachi(
+            tmp.path(),
+            r#"{"initialized":true,"locked":false,"secure_store":{"auto_unlock_available":true}}"#,
+            "",
+            1,
+            r#"{"name":"BOT_TOKEN","revealed":true,"value":"synthetic-token\r\n"}"#,
+            0,
+        );
+        assert_eq!(
+            store.decrypt("vault:BOT_TOKEN").unwrap(),
+            "synthetic-token\r\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&calls).unwrap(),
+            "vault status\nvault lease BOT_TOKEN --env-name ZEROCLAW_VAULT_SECRET --stdin-password --json\nvault get BOT_TOKEN --reveal --json --keychain\n"
+        );
+
+        // 3. Locked daemon WITH Keychain resolves directly via `vault get --keychain`.
+        fs::write(&calls, "").unwrap();
+        write_fake_tachi(
+            tmp.path(),
+            r#"{"initialized":true,"locked":true,"secure_store":{"auto_unlock_available":true}}"#,
+            "",
+            1,
+            r#"{"name":"OPENAI_OFFICIAL_API_KEY","revealed":true,"value":"synthetic-keychain-secret\r\n"}"#,
+            0,
+        );
+        assert_eq!(
+            store.decrypt("vault:OPENAI_OFFICIAL_API_KEY").unwrap(),
+            "synthetic-keychain-secret\r\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&calls).unwrap(),
+            "vault status\nvault get OPENAI_OFFICIAL_API_KEY --reveal --json --keychain\n"
+        );
+
+        // 4. Secrets consisting solely of CR/LF bytes are preserved verbatim rather than treated as empty.
+        write_fake_tachi(
+            tmp.path(),
+            r#"{"initialized":true,"locked":true,"secure_store":{"auto_unlock_available":true}}"#,
+            "",
+            1,
+            r#"{"name":"CRLF_ONLY","revealed":true,"value":"\r\n"}"#,
+            0,
+        );
+        assert_eq!(store.decrypt("vault:CRLF_ONLY").unwrap(), "\r\n");
+
+        // 5. Offline plain-text status (no daemon running) resolves via `vault get --keychain`,
+        // and outer CLI CR/LF framing does not alter values without embedded newlines.
+        fs::write(&calls, "").unwrap();
+        write_fake_tachi(
+            tmp.path(),
+            "Vault status:\n  initialized: true\n  entries: 3",
+            "",
+            1,
+            "{\"name\":\"OPENAI_OFFICIAL_API_KEY\",\"revealed\":true,\"value\":\"synthetic-offline-secret\"}\r",
+            0,
+        );
+        assert_eq!(
+            store.decrypt("vault:OPENAI_OFFICIAL_API_KEY").unwrap(),
+            "synthetic-offline-secret"
+        );
+        assert_eq!(
+            fs::read_to_string(&calls).unwrap(),
+            "vault status\nvault get OPENAI_OFFICIAL_API_KEY --reveal --json --keychain\n"
+        );
+
+        // 5. Truly empty JSON secret values fail closed on both lease and keychain get.
+        write_fake_tachi(
+            tmp.path(),
+            r#"{"initialized":true,"locked":false,"secure_store":{"auto_unlock_available":false}}"#,
+            r#"{"leased":true,"env":{"ZEROCLAW_VAULT_SECRET":""}}"#,
+            0,
+            "",
+            1,
+        );
+        assert!(store.decrypt("vault:OPENAI_OFFICIAL_API_KEY").is_err());
+
+        write_fake_tachi(
+            tmp.path(),
+            r#"{"initialized":true,"locked":true,"secure_store":{"auto_unlock_available":true}}"#,
+            "",
+            1,
+            r#"{"name":"OPENAI_OFFICIAL_API_KEY","revealed":true,"value":""}"#,
+            0,
+        );
+        assert!(store.decrypt("vault:OPENAI_OFFICIAL_API_KEY").is_err());
+
+        assert!(!tmp.path().join(".secret_key").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tachi_vault_failures_are_closed_and_do_not_leak_stdout() {
+        let _guard = crate::env_overrides::env_test_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let _path = EnvValueGuard::set("PATH", tmp.path());
+        let calls = tmp.path().join("calls");
+        let _calls = EnvValueGuard::set("TACHI_TEST_CALLS", &calls);
+        let store = SecretStore::new(tmp.path(), true);
+        let locked_keychain =
+            r#"{"initialized":true,"locked":true,"secure_store":{"auto_unlock_available":true}}"#;
+        let unlocked_no_keychain =
+            r#"{"initialized":true,"locked":false,"secure_store":{"auto_unlock_available":false}}"#;
+        let cases = [
+            (
+                r#"{"initialized":false,"locked":true}"#,
+                "synthetic-stdout-secret",
+                0,
+                "synthetic-stdout-secret",
+                0,
+                "not initialized",
+                false,
+                false,
+            ),
+            (
+                "Vault status:\n  initialized: false\n  entries: 0",
+                "synthetic-stdout-secret",
+                0,
+                "synthetic-stdout-secret",
+                0,
+                "not initialized",
+                false,
+                false,
+            ),
+            (
+                r#"{"initialized":true,"locked":true}"#,
+                "synthetic-stdout-secret",
+                0,
+                "synthetic-stdout-secret",
+                0,
+                "locked",
+                false,
+                false,
+            ),
+            (
+                r#"{"initialized":true,"locked":true,"secure_store":{"auto_unlock_available":false}}"#,
+                "synthetic-stdout-secret",
+                0,
+                "synthetic-stdout-secret",
+                0,
+                "locked",
+                false,
+                false,
+            ),
+            (
+                "synthetic-stdout-secret",
+                "",
+                0,
+                "",
+                0,
+                "unrecognized status output",
+                false,
+                false,
+            ),
+            (
+                "{synthetic-stdout-secret",
+                "",
+                0,
+                "",
+                0,
+                "invalid status JSON",
+                false,
+                false,
+            ),
+            (
+                r#"{"initialized":true,"locked":"synthetic-stdout-secret"}"#,
+                "",
+                0,
+                "",
+                0,
+                "boolean locked",
+                false,
+                false,
+            ),
+            (
+                unlocked_no_keychain,
+                "synthetic-stdout-secret",
+                1,
+                "synthetic-stdout-secret",
+                0,
+                "automatic Keychain unlock is unavailable",
+                true,
+                false,
+            ),
+            (
+                unlocked_no_keychain,
+                "synthetic-stdout-secret",
+                0,
+                "",
+                0,
+                "invalid lease JSON",
+                true,
+                false,
+            ),
+            (
+                locked_keychain,
+                "",
+                1,
+                "synthetic-stdout-secret",
+                1,
+                "not found in Tachi Vault",
+                false,
+                true,
+            ),
+            (
+                locked_keychain,
+                "",
+                1,
+                "synthetic-stdout-secret",
+                0,
+                "invalid secret JSON",
+                false,
+                true,
+            ),
+            (
+                locked_keychain,
+                "",
+                1,
+                r#"{"revealed":false,"value":"synthetic-stdout-secret"}"#,
+                0,
+                "did not reveal",
+                false,
+                true,
+            ),
+            (
+                locked_keychain,
+                "",
+                1,
+                r#"{"revealed":true,"value":""}"#,
+                0,
+                "empty secret",
+                false,
+                true,
+            ),
+            (
+                unlocked_no_keychain,
+                r#"{"leased":true,"env":{"ZEROCLAW_VAULT_SECRET":""}}"#,
+                0,
+                "",
+                1,
+                "empty secret",
+                true,
+                false,
+            ),
+            (
+                locked_keychain,
+                "",
+                1,
+                r#"{"revealed":true,"value":42}"#,
+                0,
+                "missing string value",
+                false,
+                true,
+            ),
+        ];
+        for (
+            status,
+            lease_out,
+            lease_exit,
+            get_out,
+            get_exit,
+            expected,
+            lease_called,
+            get_called,
+        ) in cases
+        {
+            fs::write(&calls, "").unwrap();
+            write_fake_tachi(tmp.path(), status, lease_out, lease_exit, get_out, get_exit);
+            let error = format!("{:#}", store.decrypt("vault:TEST_KEY").unwrap_err());
+            assert!(error.contains(expected), "{error}");
+            assert!(!error.contains("synthetic-stdout-secret"), "{error}");
+            assert!(!error.contains("synthetic-stderr-secret"), "{error}");
+            assert!(!error.contains("synthetic-private-log-path"), "{error}");
+            let calls = fs::read_to_string(&calls).unwrap();
+            assert_eq!(calls.contains("vault lease"), lease_called, "{calls}");
+            assert_eq!(calls.contains("vault get"), get_called, "{calls}");
+        }
+
+        // Oversized pipe output fails closed without leaking stdout (pure sh builtins; PATH=tmp).
+        write_fake_tachi_script(
+            tmp.path(),
+            "#!/bin/sh\ns='SSSSSSSSSSSSSSSS'\ns=\"$s$s$s$s\"\ns=\"$s$s$s$s\"\ns=\"$s$s$s$s\"\ns=\"$s$s$s$s\"\ns=\"$s$s$s$s\"\ns=\"$s$s$s$s\"\nprintf '%sS' \"$s\"\n",
+        );
+        let error = format!("{:#}", store.decrypt("vault:TEST_KEY").unwrap_err());
+        assert!(error.contains("exceeded 64 KiB limit"), "{error}");
+        assert!(!error.contains("SSSS"), "{error}");
+
+        fs::remove_file(tmp.path().join("tachi")).unwrap();
+        let error = store.decrypt("vault:TEST_KEY").unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "Tachi CLI (`tachi`) not found. Install it to use vault: secret references in config."
+        );
+        assert!(!tmp.path().join(".secret_key").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tachi_vault_timeout_is_bounded() {
+        let _guard = crate::env_overrides::env_test_lock().await;
+        let tmp = TempDir::new().unwrap();
+        write_fake_op(tmp.path(), "#!/bin/sh\nexec /bin/sleep 30\n");
+        fs::rename(tmp.path().join("op"), tmp.path().join("tachi")).unwrap();
+        let _path = EnvValueGuard::set("PATH", tmp.path());
+        let store = SecretStore::new(tmp.path(), true);
+        let started = Instant::now();
+        let error = store.decrypt("vault:TEST_KEY").unwrap_err().to_string();
+        assert!(error.contains("timed out"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(15));
     }
 
     // ── SecretStore basics ─────────────────────────────────────

@@ -43,6 +43,7 @@ See [runtime internals](../agents/internals.md#repeated-tool-failure-recovery).
 | `ModelProvider::set_credential` with real 429 rotation | logs "cannot apply … Retrying with original key" | deliberate |
 | WeChat state persistence is atomic and non-blocking | blocking, non-atomic write | deliberate |
 | Portable memory kernel behind `memory-tachi` (`zeroclaw-memory/tachi`) | absent | deliberate; distinct ZeroClaw memory and companion roles |
+| `vault:<NAME>` secret references resolved from Tachi Vault and preserved on disk | `op://` only at `87461d1ac5` | deliberate; Tachi Vault owns credentials |
 | HyperMemory custom CRUD backend | absent | retired; never re-add |
 
 ### Known gaps

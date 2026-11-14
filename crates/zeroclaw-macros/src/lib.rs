@@ -207,6 +207,10 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
 
     let mut secret_terminal_pushes: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut secret_terminal_recurse: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut ext_ref_collect_ops: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut ext_ref_restore_ops: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut nested_encode_prop_snapshot_key: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut dynamic_secret_map_encode_prop_snapshot_key: Vec<proc_macro2::TokenStream> = Vec::new();
 
     for field in fields {
         let field_ident = field.ident.as_ref().expect("Named field must have ident");
@@ -275,6 +279,30 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     #full_name_lit,
                 )?;
             });
+            if !is_nested {
+                let field_seg_lit = &field_name_kebab;
+                ext_ref_collect_ops.push(quote! {
+                    {
+                        let enc_field = crate::config::join_snapshot_path(&__my_base, #field_seg_lit);
+                        crate::traits::SecretField::collect_external_refs(
+                            &self.#field_ident,
+                            &enc_field,
+                            out,
+                        );
+                    }
+                });
+                ext_ref_restore_ops.push(quote! {
+                    {
+                        let enc_field = crate::config::join_snapshot_path(&__my_base, #field_seg_lit);
+                        crate::traits::SecretField::restore_external_refs(
+                            &mut self.#field_ident,
+                            &enc_field,
+                            snapshots,
+                            skip_encoded_dirty,
+                        );
+                    }
+                });
+            }
 
             let is_option = is_option_type(&field.ty);
             let shape_ty = extract_option_inner(&field.ty).unwrap_or(&field.ty);
@@ -368,6 +396,21 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         .is_some_and(|key| !key.is_empty())
                     {
                         return true;
+                    }
+                });
+                let field_seg_lit = &field_name_kebab;
+                dynamic_secret_map_encode_prop_snapshot_key.push(quote! {
+                    if let Some(key) = name
+                        .strip_prefix(#full_name_lit)
+                        .and_then(|s| s.strip_prefix('.'))
+                        .filter(|key| !key.is_empty())
+                    {
+                        let field_mount =
+                            crate::config::join_snapshot_path(&__my_base, #field_seg_lit);
+                        return Some(crate::config::join_snapshot_path(
+                            &field_mount,
+                            &crate::config::encode_snapshot_segment(key),
+                        ));
                     }
                 });
             }
@@ -520,6 +563,137 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         for inner_map in self.#field_ident.values_mut() {
                             for inner in inner_map.values_mut() {
                                 inner.decrypt_secrets(store)?;
+                            }
+                        }
+                    });
+                    ext_ref_collect_ops.push(quote! {
+                        {
+                            let section_base =
+                                crate::config::join_snapshot_path(&__my_base, #field_name_lit);
+                            let mut section_out = std::collections::HashMap::new();
+                            for (outer_key, inner_map) in &self.#field_ident {
+                                let type_base = crate::config::join_snapshot_path(
+                                    &section_base,
+                                    &crate::config::encode_snapshot_segment(outer_key),
+                                );
+                                for (inner_key, inner) in inner_map {
+                                    let alias_mount = crate::config::join_snapshot_path(
+                                        &type_base,
+                                        &crate::config::encode_snapshot_segment(inner_key),
+                                    );
+                                    inner.collect_external_secret_refs(
+                                        Some(&alias_mount),
+                                        &mut section_out,
+                                    )?;
+                                }
+                            }
+                            if !section_out.is_empty() {
+                                for (outer_key, inner_map) in &self.#field_ident {
+                                    if outer_key.trim().is_empty()
+                                        || inner_map.keys().any(|ik| ik.trim().is_empty())
+                                    {
+                                        return Err(anyhow::Error::msg(format!(
+                                            "Refusing to resolve external secret reference in \
+                                             `{section_base}` while an empty map key exists"
+                                        )));
+                                    }
+                                }
+                                out.extend(section_out);
+                            }
+                        }
+                    });
+                    ext_ref_restore_ops.push(quote! {
+                        {
+                            let section_base =
+                                crate::config::join_snapshot_path(&__my_base, #field_name_lit);
+                            let section_dot = format!("{section_base}.");
+                            let section_bracket = format!("{section_base}[");
+                            if snapshots.keys().any(|k| {
+                                k == &section_base
+                                    || k.starts_with(&section_dot)
+                                    || k.starts_with(&section_bracket)
+                            }) {
+                                for (outer_key, inner_map) in &self.#field_ident {
+                                    if outer_key.trim().is_empty()
+                                        || inner_map.keys().any(|ik| ik.trim().is_empty())
+                                    {
+                                        return Err(anyhow::Error::msg(format!(
+                                            "Refusing to save `{section_base}` with empty map key \
+                                             while external secret reference is active"
+                                        )));
+                                    }
+                                }
+                            }
+                            for (outer_key, inner_map) in &mut self.#field_ident {
+                                let type_base = crate::config::join_snapshot_path(
+                                    &section_base,
+                                    &crate::config::encode_snapshot_segment(outer_key),
+                                );
+                                for (inner_key, inner) in inner_map {
+                                    let alias_mount = crate::config::join_snapshot_path(
+                                        &type_base,
+                                        &crate::config::encode_snapshot_segment(inner_key),
+                                    );
+                                    inner.restore_external_secret_refs(
+                                        Some(&alias_mount),
+                                        snapshots,
+                                        skip_encoded_dirty,
+                                    )?;
+                                }
+                            }
+                        }
+                    });
+                    nested_encode_prop_snapshot_key.push(quote! {
+                        {
+                            let path_prefix = if Self::configurable_prefix().is_empty() {
+                                #field_name_lit.to_string()
+                            } else {
+                                format!("{}.{}", Self::configurable_prefix(), #field_name_lit)
+                            };
+                            if let Some(rest) = name
+                                .strip_prefix(&path_prefix)
+                                .and_then(|s| s.strip_prefix('.'))
+                            {
+                                let section_base =
+                                    crate::config::join_snapshot_path(&__my_base, #field_name_lit);
+                                let mut matches: Vec<(&str, &str)> = self.#field_ident
+                                    .keys()
+                                    .filter_map(|k| {
+                                        rest.strip_prefix(k.as_str())
+                                            .and_then(|after| after.strip_prefix('.'))
+                                            .map(|after| (k.as_str(), after))
+                                    })
+                                    .collect();
+                                matches.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+                                for (outer_key, after_outer) in matches {
+                                    let Some((inner_key, inner_suffix)) =
+                                        after_outer.split_once('.')
+                                    else {
+                                        continue;
+                                    };
+                                    let inner_prefix = <#inner_ty>::configurable_prefix();
+                                    let inner_name = if inner_prefix.is_empty() {
+                                        inner_suffix.to_string()
+                                    } else {
+                                        format!("{inner_prefix}.{inner_suffix}")
+                                    };
+                                    if let Some(inner_map) = self.#field_ident.get(outer_key)
+                                        && let Some(inner) = inner_map.get(inner_key)
+                                    {
+                                        let alias_mount = crate::config::join_snapshot_path(
+                                            &crate::config::join_snapshot_path(
+                                                &section_base,
+                                                &crate::config::encode_snapshot_segment(outer_key),
+                                            ),
+                                            &crate::config::encode_snapshot_segment(inner_key),
+                                        );
+                                        if let Some(hit) = inner
+                                            .encode_prop_snapshot_key(Some(&alias_mount), &inner_name)
+                                        {
+                                            return Some(hit);
+                                        }
+                                    }
+                                }
                             }
                         }
                     });
@@ -861,6 +1035,84 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                             inner.decrypt_secrets(store)?;
                         }
                     });
+                    ext_ref_collect_ops.push(quote! {
+                        {
+                            let section_base =
+                                crate::config::join_snapshot_path(&__my_base, #field_name_lit);
+                            let mut section_out = std::collections::HashMap::new();
+                            for (hm_key, inner) in &self.#field_ident {
+                                let entry_mount = crate::config::join_snapshot_path(
+                                    &section_base,
+                                    &crate::config::encode_snapshot_segment(hm_key),
+                                );
+                                inner.collect_external_secret_refs(
+                                    Some(&entry_mount),
+                                    &mut section_out,
+                                )?;
+                            }
+                            if !section_out.is_empty() {
+                                if self.#field_ident.keys().any(|k| k.trim().is_empty()) {
+                                    return Err(anyhow::Error::msg(format!(
+                                        "Refusing to resolve external secret reference in \
+                                         `{section_base}` while an empty map key exists"
+                                    )));
+                                }
+                                out.extend(section_out);
+                            }
+                        }
+                    });
+                    ext_ref_restore_ops.push(quote! {
+                        {
+                            let section_base =
+                                crate::config::join_snapshot_path(&__my_base, #field_name_lit);
+                            let section_dot = format!("{section_base}.");
+                            let section_bracket = format!("{section_base}[");
+                            if snapshots.keys().any(|k| {
+                                k == &section_base
+                                    || k.starts_with(&section_dot)
+                                    || k.starts_with(&section_bracket)
+                            }) && self.#field_ident.keys().any(|k| k.trim().is_empty())
+                            {
+                                return Err(anyhow::Error::msg(format!(
+                                    "Refusing to save `{section_base}` with empty map key while \
+                                     external secret reference is active"
+                                )));
+                            }
+                            for (hm_key, inner) in &mut self.#field_ident {
+                                let entry_mount = crate::config::join_snapshot_path(
+                                    &section_base,
+                                    &crate::config::encode_snapshot_segment(hm_key),
+                                );
+                                inner.restore_external_secret_refs(
+                                    Some(&entry_mount),
+                                    snapshots,
+                                    skip_encoded_dirty,
+                                )?;
+                            }
+                        }
+                    });
+                    nested_encode_prop_snapshot_key.push(quote! {
+                        if let Some((hm_key, inner_name)) = crate::config::route_hashmap_path(
+                            name,
+                            Self::configurable_prefix(),
+                            #field_name_lit,
+                            <#value_ty>::configurable_prefix(),
+                            self.#field_ident.keys().map(String::as_str),
+                        ) && let Some(inner) = self.#field_ident.get(hm_key)
+                        {
+                            let section_base =
+                                crate::config::join_snapshot_path(&__my_base, #field_name_lit);
+                            let entry_mount = crate::config::join_snapshot_path(
+                                &section_base,
+                                &crate::config::encode_snapshot_segment(hm_key),
+                            );
+                            if let Some(hit) =
+                                inner.encode_prop_snapshot_key(Some(&entry_mount), &inner_name)
+                            {
+                                return Some(hit);
+                            }
+                        }
+                    });
                     nested_prop_is_secret.push(quote! {
                         {
                             let key_prefix = if Self::configurable_prefix().is_empty() {
@@ -979,7 +1231,11 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         });
                     });
                     let validate_create = if is_resource_key {
-                        quote! {}
+                        quote! {
+                            if map_key.trim().is_empty() {
+                                return Err("resource key must not be empty".to_string());
+                            }
+                        }
                     } else {
                         quote! { crate::config::validate_alias_key(map_key).map_err(|e| e)?; }
                     };
@@ -1035,7 +1291,11 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
 
                     // rename_map_key for single-level HashMap.
                     let validate_rename = if is_resource_key {
-                        quote! {}
+                        quote! {
+                            if new_key.trim().is_empty() {
+                                return Err("resource key must not be empty".to_string());
+                            }
+                        }
                     } else {
                         quote! { crate::config::validate_alias_key(new_key).map_err(|e| e)?; }
                     };
@@ -1189,6 +1449,68 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     secret_terminal_recurse.push(quote! {
                         out.extend(<#inner_ty_tokens>::secret_field_terminals());
                     });
+                    ext_ref_collect_ops.push(quote! {
+                        if let Some(inner) = &self.#field_ident {
+                            let child_default_prefix = <#inner_ty_tokens>::configurable_prefix();
+                            let child_mount = if child_default_prefix == Self::configurable_prefix() {
+                                __my_base.clone()
+                            } else if let Some(child_leaf) = child_default_prefix
+                                .strip_prefix(Self::configurable_prefix())
+                                .and_then(|s| s.strip_prefix('.'))
+                            {
+                                crate::config::join_snapshot_path(&__my_base, child_leaf)
+                            } else if Self::configurable_prefix().is_empty() {
+                                crate::config::join_snapshot_path(&__my_base, child_default_prefix)
+                            } else {
+                                child_default_prefix.to_string()
+                            };
+                            inner.collect_external_secret_refs(Some(&child_mount), out)?;
+                        }
+                    });
+                    ext_ref_restore_ops.push(quote! {
+                        if let Some(inner) = &mut self.#field_ident {
+                            let child_default_prefix = <#inner_ty_tokens>::configurable_prefix();
+                            let child_mount = if child_default_prefix == Self::configurable_prefix() {
+                                __my_base.clone()
+                            } else if let Some(child_leaf) = child_default_prefix
+                                .strip_prefix(Self::configurable_prefix())
+                                .and_then(|s| s.strip_prefix('.'))
+                            {
+                                crate::config::join_snapshot_path(&__my_base, child_leaf)
+                            } else if Self::configurable_prefix().is_empty() {
+                                crate::config::join_snapshot_path(&__my_base, child_default_prefix)
+                            } else {
+                                child_default_prefix.to_string()
+                            };
+                            inner.restore_external_secret_refs(
+                                Some(&child_mount),
+                                snapshots,
+                                skip_encoded_dirty,
+                            )?;
+                        }
+                    });
+                    nested_encode_prop_snapshot_key.push(quote! {
+                        if let Some(inner) = &self.#field_ident {
+                            let child_default_prefix = <#inner_ty_tokens>::configurable_prefix();
+                            let child_mount = if child_default_prefix == Self::configurable_prefix() {
+                                __my_base.clone()
+                            } else if let Some(child_leaf) = child_default_prefix
+                                .strip_prefix(Self::configurable_prefix())
+                                .and_then(|s| s.strip_prefix('.'))
+                            {
+                                crate::config::join_snapshot_path(&__my_base, child_leaf)
+                            } else if Self::configurable_prefix().is_empty() {
+                                crate::config::join_snapshot_path(&__my_base, child_default_prefix)
+                            } else {
+                                child_default_prefix.to_string()
+                            };
+                            if let Some(hit) =
+                                inner.encode_prop_snapshot_key(Some(&child_mount), name)
+                            {
+                                return Some(hit);
+                            }
+                        }
+                    });
 
                     // Recurse: pull the inner type's map_key_sections + create_map_key.
                     map_key_recurse.push(quote! {
@@ -1277,6 +1599,12 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 let create_dup_check = if let Some(nk_field) = &natural_key_field {
                     let nk_field_lit = nk_field.clone();
                     quote! {
+                        if map_key.trim().is_empty() {
+                            return Err(format!(
+                                "natural key `{}` must not be empty in `{expected}`",
+                                #nk_field_lit
+                            ));
+                        }
                         let inner_prefix = <#vec_inner_ty>::configurable_prefix();
                         let nk_path = if inner_prefix.is_empty() {
                             #nk_field_lit.to_string()
@@ -1389,6 +1717,12 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                 format!("{prefix}.{}", #vec_field_name_lit)
                             };
                             if section_path == expected {
+                                if new_key.trim().is_empty() {
+                                    return Err(format!(
+                                        "natural key `{}` must not be empty in `{expected}`",
+                                        #nk_field_lit
+                                    ));
+                                }
                                 let inner_prefix = <#vec_inner_ty>::configurable_prefix();
                                 let nk_path = if inner_prefix.is_empty() {
                                     #nk_field_lit.to_string()
@@ -1596,6 +1930,206 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                             }
                         }
                     });
+                    ext_ref_collect_ops.push(quote! {
+                        {
+                            let section_base =
+                                crate::config::join_snapshot_path(&__my_base, #vec_field_name_lit);
+                            let inner_prefix = <#vec_inner_ty>::configurable_prefix();
+                            let nk_path = if inner_prefix.is_empty() {
+                                #nk_field_lit.to_string()
+                            } else {
+                                format!("{inner_prefix}.{}", #nk_field_lit)
+                            };
+                            let nk_values: Vec<String> = self.#field_ident
+                                .iter()
+                                .map(|e| e.get_prop(&nk_path).unwrap_or_default())
+                                .collect();
+                            let mut section_out = std::collections::HashMap::new();
+                            for (idx, inner) in self.#field_ident.iter().enumerate() {
+                                let nk = &nk_values[idx];
+                                let entry_mount = crate::config::join_snapshot_path(
+                                    &section_base,
+                                    &crate::config::encode_snapshot_segment(nk),
+                                );
+                                let mut sub_out = std::collections::HashMap::new();
+                                inner.collect_external_secret_refs(Some(&entry_mount), &mut sub_out)?;
+                                if !sub_out.is_empty() {
+                                    if nk.trim().is_empty() {
+                                        return Err(anyhow::Error::msg(format!(
+                                            "Refusing to resolve external secret reference in \
+                                             `{section_base}` entry #{idx} with empty `{}` natural key",
+                                            #nk_field_lit
+                                        )));
+                                    }
+                                    if nk_values.iter().filter(|k| *k == nk).count() > 1 {
+                                        return Err(anyhow::Error::msg(format!(
+                                            "Refusing to resolve external secret reference in \
+                                             `{section_base}` with duplicate `{}` natural key `{nk}`",
+                                            #nk_field_lit
+                                        )));
+                                    }
+                                    section_out.extend(sub_out);
+                                }
+                            }
+                            if !section_out.is_empty() {
+                                for (idx, nk) in nk_values.iter().enumerate() {
+                                    if nk.trim().is_empty() {
+                                        return Err(anyhow::Error::msg(format!(
+                                            "Refusing to resolve external secret reference in \
+                                             `{section_base}` while entry #{idx} has empty `{}` natural key",
+                                            #nk_field_lit
+                                        )));
+                                    }
+                                    if nk_values.iter().filter(|k| *k == nk).count() > 1 {
+                                        return Err(anyhow::Error::msg(format!(
+                                            "Refusing to resolve external secret reference in \
+                                             `{section_base}` while duplicate `{}` natural key `{nk}` exists",
+                                            #nk_field_lit
+                                        )));
+                                    }
+                                }
+                                out.extend(section_out);
+                            }
+                        }
+                    });
+                    ext_ref_restore_ops.push(quote! {
+                        {
+                            let section_base =
+                                crate::config::join_snapshot_path(&__my_base, #vec_field_name_lit);
+                            let inner_prefix = <#vec_inner_ty>::configurable_prefix();
+                            let nk_path = if inner_prefix.is_empty() {
+                                #nk_field_lit.to_string()
+                            } else {
+                                format!("{inner_prefix}.{}", #nk_field_lit)
+                            };
+                            let nk_values: Vec<String> = self.#field_ident
+                                .iter()
+                                .map(|e| e.get_prop(&nk_path).unwrap_or_default())
+                                .collect();
+                            let section_dot = format!("{section_base}.");
+                            let section_bracket = format!("{section_base}[");
+                            let section_has_any_snapshot = snapshots.keys().any(|k| {
+                                k == &section_base
+                                    || k.starts_with(&section_dot)
+                                    || k.starts_with(&section_bracket)
+                            });
+                            if section_has_any_snapshot {
+                                for (idx, nk) in nk_values.iter().enumerate() {
+                                    if nk.trim().is_empty() {
+                                        return Err(anyhow::Error::msg(format!(
+                                            "Refusing to save `{section_base}` entry #{idx} with \
+                                             empty `{}` natural key while external secret reference is active",
+                                            #nk_field_lit
+                                        )));
+                                    }
+                                    if nk_values.iter().filter(|k| *k == nk).count() > 1 {
+                                        return Err(anyhow::Error::msg(format!(
+                                            "Refusing to save `{section_base}` with duplicate `{}` \
+                                             natural key `{nk}` while external secret reference is active",
+                                            #nk_field_lit
+                                        )));
+                                    }
+                                }
+                                let live_mounts: Vec<String> = nk_values
+                                    .iter()
+                                    .map(|nk| {
+                                        crate::config::join_snapshot_path(
+                                            &section_base,
+                                            &crate::config::encode_snapshot_segment(nk),
+                                        )
+                                    })
+                                    .collect();
+                                for snap_k in snapshots.keys() {
+                                    let in_section = snap_k == &section_base
+                                        || snap_k.starts_with(&section_dot)
+                                        || snap_k.starts_with(&section_bracket);
+                                    if !in_section {
+                                        continue;
+                                    }
+                                    let matches_live = live_mounts.iter().any(|mount| {
+                                        snap_k == mount
+                                            || snap_k
+                                                .strip_prefix(mount.as_str())
+                                                .is_some_and(|tail| {
+                                                    tail.starts_with('.') || tail.starts_with('[')
+                                                })
+                                    });
+                                    if !matches_live {
+                                        return Err(anyhow::Error::msg(format!(
+                                            "Refusing to save `{section_base}`: external secret \
+                                             reference snapshot `{snap_k}` no longer matches any \
+                                             live `{}` natural key; use rename_map_key or delete_map_key",
+                                            #nk_field_lit
+                                        )));
+                                    }
+                                }
+                            }
+                            for (idx, inner) in self.#field_ident.iter_mut().enumerate() {
+                                let nk = &nk_values[idx];
+                                if nk.trim().is_empty() {
+                                    continue;
+                                }
+                                let entry_mount = crate::config::join_snapshot_path(
+                                    &section_base,
+                                    &crate::config::encode_snapshot_segment(nk),
+                                );
+                                inner.restore_external_secret_refs(
+                                    Some(&entry_mount),
+                                    snapshots,
+                                    skip_encoded_dirty,
+                                )?;
+                            }
+                        }
+                    });
+                    nested_encode_prop_snapshot_key.push(quote! {
+                        {
+                            let inner_prefix = <#vec_inner_ty>::configurable_prefix();
+                            let nk_path = if inner_prefix.is_empty() {
+                                #nk_field_lit.to_string()
+                            } else {
+                                format!("{inner_prefix}.{}", #nk_field_lit)
+                            };
+                            let nk_values: Vec<String> = self.#field_ident
+                                .iter()
+                                .map(|e| e.get_prop(&nk_path).unwrap_or_default())
+                                .collect();
+                            if let crate::config::VecRoute::Hit { index, inner_name } =
+                                crate::config::route_vec_path(
+                                    name,
+                                    Self::configurable_prefix(),
+                                    #vec_field_name_lit,
+                                    <#vec_inner_ty>::configurable_prefix(),
+                                    nk_values.iter().enumerate().map(|(i, s)| (i, s.as_str())),
+                                )
+                            {
+                                let section_base =
+                                    crate::config::join_snapshot_path(&__my_base, #vec_field_name_lit);
+                                let entry_mount = crate::config::join_snapshot_path(
+                                    &section_base,
+                                    &crate::config::encode_snapshot_segment(&nk_values[index]),
+                                );
+                                return self.#field_ident[index]
+                                    .encode_prop_snapshot_key(Some(&entry_mount), &inner_name);
+                            }
+                        }
+                    });
+                } else {
+                    ext_ref_collect_ops.push(quote! {
+                        {
+                            let section_base =
+                                crate::config::join_snapshot_path(&__my_base, #vec_field_name_lit);
+                            for inner in &self.#field_ident {
+                                let mut sub_out = std::collections::HashMap::new();
+                                inner.collect_external_secret_refs(Some(&section_base), &mut sub_out)?;
+                                if !sub_out.is_empty() {
+                                    return Err(anyhow::Error::msg(format!(
+                                        "Refusing to resolve external secret reference in unkeyed \
+                                         list section `{section_base}`"
+                                    )));
+                                }
+                            }
+                        }
+                    });
                 }
             } else {
                 let plain_field_name_lit = snake_to_kebab(&field_ident.to_string());
@@ -1734,7 +2268,91 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                             }
                         }
                     });
+                    ext_ref_collect_ops.push(quote! {
+                        self.#field_ident.collect_external_secret_refs(Some(&__my_base), out)?;
+                    });
+                    ext_ref_restore_ops.push(quote! {
+                        self.#field_ident.restore_external_secret_refs(
+                            Some(&__my_base),
+                            snapshots,
+                            skip_encoded_dirty,
+                        )?;
+                    });
+                    nested_encode_prop_snapshot_key.push(quote! {
+                        {
+                            let outer_prefix = Self::configurable_prefix();
+                            let inner_prefix = <#field_ty>::configurable_prefix();
+                            let leaf = if outer_prefix.is_empty() {
+                                Some(name)
+                            } else {
+                                name.strip_prefix(outer_prefix).and_then(|s| s.strip_prefix('.'))
+                            };
+                            if let Some(leaf) = leaf {
+                                let inner_name = if inner_prefix.is_empty() {
+                                    leaf.to_string()
+                                } else {
+                                    format!("{inner_prefix}.{leaf}")
+                                };
+                                if let Some(hit) = self.#field_ident
+                                    .encode_prop_snapshot_key(Some(&__my_base), &inner_name)
+                                {
+                                    return Some(hit);
+                                }
+                            }
+                        }
+                    });
                 } else {
+                    ext_ref_collect_ops.push(quote! {
+                        {
+                            let nested_mount = crate::config::join_snapshot_path(
+                                &__my_base,
+                                #plain_field_name_lit,
+                            );
+                            self.#field_ident.collect_external_secret_refs(
+                                Some(&nested_mount),
+                                out,
+                            )?;
+                        }
+                    });
+                    ext_ref_restore_ops.push(quote! {
+                        {
+                            let nested_mount = crate::config::join_snapshot_path(
+                                &__my_base,
+                                #plain_field_name_lit,
+                            );
+                            self.#field_ident.restore_external_secret_refs(
+                                Some(&nested_mount),
+                                snapshots,
+                                skip_encoded_dirty,
+                            )?;
+                        }
+                    });
+                    nested_encode_prop_snapshot_key.push(quote! {
+                        {
+                            let inner_prefix = <#field_ty>::configurable_prefix();
+                            let nested_prefix = if Self::configurable_prefix().is_empty() {
+                                #plain_field_name_lit.to_string()
+                            } else {
+                                format!("{}.{}", Self::configurable_prefix(), #plain_field_name_lit)
+                            };
+                            if let Some(leaf) = name
+                                .strip_prefix(&nested_prefix)
+                                .and_then(|s| s.strip_prefix('.'))
+                            {
+                                let inner_name = if inner_prefix.is_empty() {
+                                    leaf.to_string()
+                                } else {
+                                    format!("{inner_prefix}.{leaf}")
+                                };
+                                let nested_mount = crate::config::join_snapshot_path(
+                                    &__my_base,
+                                    #plain_field_name_lit,
+                                );
+                                return self.#field_ident
+                                    .encode_prop_snapshot_key(Some(&nested_mount), &inner_name);
+                            }
+                        }
+                    });
                     // ── Nested property delegation (non-Option, non-flatten) ──
                     nested_prop_fields.push(quote! {
                         {
@@ -2024,6 +2642,47 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
     }
 
     let prefix_lit = &prefix;
+    let pre_mutate_snapshot = if struct_name == "Config" && prefix.is_empty() {
+        quote! {
+            let __prev_self = self.clone();
+        }
+    } else {
+        quote! {}
+    };
+    let post_create_hook = if struct_name == "Config" && prefix.is_empty() {
+        quote! {
+            if matches!(res, Ok(true)) {
+                self.record_dirty_map_entry(section_path, map_key);
+                if let Err(e) = self.verify_tracked_prop_identities(None) {
+                    *self = __prev_self;
+                    return Err(e);
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+    let post_delete_hook = if struct_name == "Config" && prefix.is_empty() {
+        quote! {
+            if matches!(res, Ok(true)) {
+                self.drop_secret_snapshots_in_section(section_path, map_key);
+            }
+        }
+    } else {
+        quote! {}
+    };
+    let post_rename_hook = if struct_name == "Config" && prefix.is_empty() {
+        quote! {
+            if matches!(res, Ok(true)) {
+                if let Err(e) = self.rename_secret_snapshots_in_section(section_path, map_key, new_key) {
+                    *self = __prev_self;
+                    return Err(e);
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
 
     let expanded = quote! {
         impl #struct_name {
@@ -2060,6 +2719,67 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 #(#decrypt_ops)*
                 #(#nested_decrypt)*
                 Ok(())
+            }
+
+            /// Record external secret references (`op://` and `vault:`) across this
+            /// struct and nested children under canonical collision-free snapshot keys.
+            pub fn collect_external_secret_refs(
+                &self,
+                mount_prefix: Option<&str>,
+                out: &mut std::collections::HashMap<String, String>,
+            ) -> anyhow::Result<()> {
+                let __my_base: String = match mount_prefix {
+                    Some(mp) => mp.to_string(),
+                    None => Self::configurable_prefix().to_string(),
+                };
+                let _ = (&__my_base, &out);
+                #(#ext_ref_collect_ops)*
+                Ok(())
+            }
+
+            /// Restore non-dirty external secret references directly onto struct fields.
+            pub fn restore_external_secret_refs(
+                &mut self,
+                mount_prefix: Option<&str>,
+                snapshots: &std::collections::HashMap<String, String>,
+                skip_encoded_dirty: &std::collections::HashSet<String>,
+            ) -> anyhow::Result<()> {
+                let __my_base: String = match mount_prefix {
+                    Some(mp) => mp.to_string(),
+                    None => Self::configurable_prefix().to_string(),
+                };
+                let _ = (&__my_base, snapshots, skip_encoded_dirty);
+                #(#ext_ref_restore_ops)*
+                Ok(())
+            }
+
+            /// Resolve a property path to its canonical encoded snapshot key using the
+            /// exact same routing rules as [`Self::set_prop`].
+            #[must_use]
+            pub fn encode_prop_snapshot_key(
+                &self,
+                mount_prefix: Option<&str>,
+                name: &str,
+            ) -> Option<String> {
+                let __my_base: String = match mount_prefix {
+                    Some(mp) => mp.to_string(),
+                    None => Self::configurable_prefix().to_string(),
+                };
+                let _ = &__my_base;
+                #(#nested_encode_prop_snapshot_key)*
+                #(#dynamic_secret_map_encode_prop_snapshot_key)*
+                const KNOWN: &[&str] = &[#(#prop_names),*];
+                if KNOWN.contains(&name) {
+                    let leaf = if Self::configurable_prefix().is_empty() {
+                        name
+                    } else {
+                        name.strip_prefix(Self::configurable_prefix())
+                            .and_then(|s| s.strip_prefix('.'))
+                            .unwrap_or(name)
+                    };
+                    return Some(crate::config::join_snapshot_path(&__my_base, leaf));
+                }
+                None
             }
 
             /// Set a secret field by its full dotted name, dispatching to nested children.
@@ -2189,13 +2909,18 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 section_path: &str,
                 map_key: &str,
             ) -> Result<bool, String> {
-                #(#create_map_key_arms)*
-                #(#create_map_key_recurse)*
-                Err(format!(
-                    "no map-keyed/list section at `{}` in `{}`",
-                    section_path,
-                    Self::configurable_prefix(),
-                ))
+                #pre_mutate_snapshot
+                let res = (|| -> Result<bool, String> {
+                    #(#create_map_key_arms)*
+                    #(#create_map_key_recurse)*
+                    Err(format!(
+                        "no map-keyed/list section at `{}` in `{}`",
+                        section_path,
+                        Self::configurable_prefix(),
+                    ))
+                })();
+                #post_create_hook
+                res
             }
 
             pub fn delete_map_key(
@@ -2203,13 +2928,17 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 section_path: &str,
                 map_key: &str,
             ) -> Result<bool, String> {
-                #(#delete_map_key_arms)*
-                #(#delete_map_key_recurse)*
-                Err(format!(
-                    "no map-keyed/list section at `{}` in `{}`",
-                    section_path,
-                    Self::configurable_prefix(),
-                ))
+                let res = (|| -> Result<bool, String> {
+                    #(#delete_map_key_arms)*
+                    #(#delete_map_key_recurse)*
+                    Err(format!(
+                        "no map-keyed/list section at `{}` in `{}`",
+                        section_path,
+                        Self::configurable_prefix(),
+                    ))
+                })();
+                #post_delete_hook
+                res
             }
 
             pub fn rename_map_key(
@@ -2218,13 +2947,18 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 map_key: &str,
                 new_key: &str,
             ) -> Result<bool, String> {
-                #(#rename_map_key_arms)*
-                #(#rename_map_key_recurse)*
-                Err(format!(
-                    "no map-keyed/list section at `{}` in `{}`",
-                    section_path,
-                    Self::configurable_prefix(),
-                ))
+                #pre_mutate_snapshot
+                let res = (|| -> Result<bool, String> {
+                    #(#rename_map_key_arms)*
+                    #(#rename_map_key_recurse)*
+                    Err(format!(
+                        "no map-keyed/list section at `{}` in `{}`",
+                        section_path,
+                        Self::configurable_prefix(),
+                    ))
+                })();
+                #post_rename_hook
+                res
             }
         }
 

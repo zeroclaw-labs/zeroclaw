@@ -307,17 +307,13 @@ fn resolve_path(tail: &str, config: &mut Config) -> Result<String> {
 }
 
 pub(crate) fn raw_value_for_path(source: &Config, path: &str) -> Option<String> {
-    let table = toml::Value::try_from(source).ok()?;
-    let mut current: &toml::Value = &table;
-    for segment in path.split('.') {
-        let tbl = current.as_table()?;
-        current = match tbl.get(segment) {
-            Some(v) => v,
-            None => tbl.get(&segment.replace('-', "_"))?,
-        };
-    }
+    let toml::Value::Table(full_table) = toml::Value::try_from(source).ok()? else {
+        return None;
+    };
+    let current = crate::schema::lookup_prop_value_in_table(&full_table, path)?;
     Some(match current {
         toml::Value::String(s) => s.clone(),
+        toml::Value::Array(_) => serde_json::to_string(current).ok()?,
         other => other.to_string(),
     })
 }

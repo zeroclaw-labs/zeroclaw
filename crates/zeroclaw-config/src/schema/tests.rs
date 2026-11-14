@@ -1901,10 +1901,13 @@ async fn config_toml_roundtrip() {
         sop: SopConfig::default(),
         shell_tool: ShellToolConfig::default(),
         escalation: EscalationConfig::default(),
-        env_overridden_paths: std::collections::HashSet::new(),
-        pre_override_snapshots: std::collections::HashMap::new(),
-        onepassword_reference_snapshots: std::collections::HashMap::new(),
+        env_overridden_paths: EnvOverriddenPaths::new(),
+        pre_override_snapshots: PreOverrideSnapshots::new(),
+        onepassword_reference_snapshots: ExternalRefSnapshots::new(),
         dirty_paths: std::collections::HashSet::new(),
+        dirty_map_entries: std::collections::HashSet::new(),
+        explicit_prop_dirty_paths: std::collections::HashSet::new(),
+        tracked_prop_identities: std::collections::HashMap::new(),
     };
     // ModelProvider fields are now resolved directly — no cache needed.
 
@@ -2725,10 +2728,13 @@ async fn config_save_and_load_tmpdir() {
         sop: SopConfig::default(),
         shell_tool: ShellToolConfig::default(),
         escalation: EscalationConfig::default(),
-        env_overridden_paths: std::collections::HashSet::new(),
-        pre_override_snapshots: std::collections::HashMap::new(),
-        onepassword_reference_snapshots: std::collections::HashMap::new(),
+        env_overridden_paths: EnvOverriddenPaths::new(),
+        pre_override_snapshots: PreOverrideSnapshots::new(),
+        onepassword_reference_snapshots: ExternalRefSnapshots::new(),
         dirty_paths: std::collections::HashSet::new(),
+        dirty_map_entries: std::collections::HashSet::new(),
+        explicit_prop_dirty_paths: std::collections::HashSet::new(),
+        tracked_prop_identities: std::collections::HashMap::new(),
     };
 
     // ModelProvider fields are now resolved directly — no cache needed.
@@ -8041,10 +8047,10 @@ async fn prop_is_env_overridden_reflects_env_overridden_paths() {
 
     // Populate the field directly (the same set that
     // `apply_env_overrides` returns from `load_or_init`).
-    cfg.env_overridden_paths = std::collections::HashSet::from([
+    cfg.env_overridden_paths = EnvOverriddenPaths::from_set(std::collections::HashSet::from([
         "channels.telegram.api_base_url".to_string(),
         "gateway.request_timeout_secs".to_string(),
-    ]);
+    ]));
 
     // True for paths in the list, false for anything else.
     assert!(cfg.prop_is_env_overridden("channels.telegram.api_base_url"));
@@ -8248,9 +8254,11 @@ async fn env_override_save_cycle_preserves_on_disk_secret() {
     // `ZEROCLAW_providers__models__anthropic__default__api_key=...`
     // set in the environment.
     let env_value = "sk-ant-from-env-DIFFERENT";
-    reloaded.env_overridden_paths = std::collections::HashSet::from([api_key_path.to_string()]);
-    reloaded.pre_override_snapshots =
-        std::collections::HashMap::from([(api_key_path.to_string(), original_secret.to_string())]);
+    reloaded.env_overridden_paths =
+        EnvOverriddenPaths::from_set(std::collections::HashSet::from([api_key_path.to_string()]));
+    reloaded.pre_override_snapshots = PreOverrideSnapshots::from_map(
+        std::collections::HashMap::from([(api_key_path.to_string(), original_secret.to_string())]),
+    );
     reloaded.set_prop(api_key_path, env_value).unwrap();
 
     // Save again. With the pre-fix code path, this is the moment the
@@ -8287,6 +8295,1990 @@ async fn env_override_save_cycle_preserves_on_disk_secret() {
         Some(original_secret),
         "original on-disk secret must survive an env-override + save cycle",
     );
+}
+
+#[cfg(unix)]
+fn tachi_vault_fixture(reference: &str, slow: bool) -> (TempDir, Vec<EnvValueGuard>) {
+    let dir = TempDir::new().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let script = format!(
+        r#"#!/bin/sh
+if [ "$*" = 'vault status' ]; then
+  printf '%s\n' '{{"initialized":true,"locked":true,"secure_store":{{"auto_unlock_available":true}}}}'
+  exit 0
+fi
+if [ "$*" = 'vault get OPENAI_OFFICIAL_API_KEY --reveal --json --keychain' ]; then
+  {}
+  printf '%s\n' '{{"name":"OPENAI_OFFICIAL_API_KEY","revealed":true,"value":"synthetic-vault-secret"}}'
+  exit 0
+fi
+exit 65
+"#,
+        if slow { "/bin/sleep 1" } else { ":" }
+    );
+    let fake = write_fake_op(&bin, &script);
+    std::fs::rename(fake, bin.join("tachi")).unwrap();
+    // A fake op uses the same synthetic plaintext for parity live-edit checks.
+    write_fake_op(&bin, "#!/bin/sh\nprintf '%s\\n' 'synthetic-op-secret'\n");
+    let guards = vec![
+        EnvValueGuard::set("PATH", &bin),
+        EnvValueGuard::set("HOME", dir.path()),
+        EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", dir.path()),
+        EnvValueGuard::remove("ZEROCLAW_WORKSPACE"),
+        EnvValueGuard::set("ZEROCLAW_DATA_DIR", dir.path().join("workspace")),
+    ];
+    std::fs::write(
+        dir.path().join("config.toml"),
+        format!(
+            r#"schema_version = 3
+[providers.models.openai.default]
+model = "gpt-5"
+api_key = "{reference}"
+"#
+        ),
+    )
+    .unwrap();
+    (dir, guards)
+}
+
+#[cfg(unix)]
+#[test]
+async fn config_load_resolves_tachi_vault_ref_and_save_preserves_reference() {
+    let _lock = env_override_lock().await;
+    let (dir, _guards) = tachi_vault_fixture("vault:OPENAI_OFFICIAL_API_KEY", false);
+    let mut config = Config::load_or_init().await.unwrap();
+    let path = "providers.models.openai.default.api_key";
+    assert_eq!(
+        crate::env_overrides::raw_value_for_path(&config, path).as_deref(),
+        Some("synthetic-vault-secret")
+    );
+    config.save().await.unwrap();
+    config
+        .set_prop_persistent("providers.models.openai.default.model", "gpt-5-mini")
+        .unwrap();
+    config.save_dirty().await.unwrap();
+    let raw = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    assert!(raw.contains("vault:OPENAI_OFFICIAL_API_KEY"));
+    assert!(!raw.contains("synthetic-vault-secret"));
+    assert!(!raw.contains("enc2:"));
+    assert!(!dir.path().join(".secret_key").exists());
+}
+
+#[cfg(unix)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "test asserts Tokio worker responsiveness"
+)]
+#[test(flavor = "multi_thread", worker_threads = 1)]
+async fn tachi_vault_reference_load_does_not_block_runtime_worker() {
+    let _lock = env_override_lock().await;
+    let (_dir, _guards) = tachi_vault_fixture("vault:OPENAI_OFFICIAL_API_KEY", true);
+    let started = std::time::Instant::now();
+    let task = tokio::spawn(Config::load_or_init());
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(started.elapsed() < std::time::Duration::from_millis(500));
+    let config = task.await.unwrap().unwrap();
+    assert_eq!(
+        crate::env_overrides::raw_value_for_path(
+            &config,
+            "providers.models.openai.default.api_key"
+        )
+        .as_deref(),
+        Some("synthetic-vault-secret")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+async fn dirty_tachi_vault_secret_edit_replaces_reference_and_subsequent_full_save_stays_replaced()
+{
+    let _lock = env_override_lock().await;
+    let (dir, _guards) = tachi_vault_fixture("vault:OPENAI_OFFICIAL_API_KEY", false);
+    let path = "providers.models.openai.default.api_key";
+    for replacement in ["synthetic-direct-replacement", ""] {
+        let mut config = Config::load_or_init().await.unwrap();
+        config.set_prop_persistent(path, replacement).unwrap();
+        config.save_dirty().await.unwrap();
+        assert!(!config.onepassword_reference_snapshots.contains_key(path));
+        config.save().await.unwrap();
+        let raw = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(!raw.contains("vault:"));
+        assert!(!raw.contains("synthetic-direct-replacement"));
+        let mut stored: Config = toml::from_str(&raw).unwrap();
+        stored
+            .decrypt_secrets(&crate::secrets::SecretStore::new(dir.path(), true))
+            .unwrap();
+        assert_eq!(
+            crate::env_overrides::raw_value_for_path(&stored, path).unwrap_or_default(),
+            replacement
+        );
+        // Restore the reference to exercise clearing a loaded external field too.
+        config
+            .set_prop_persistent(path, "vault:OPENAI_OFFICIAL_API_KEY")
+            .unwrap();
+        config.save_dirty().await.unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+async fn dirty_edit_to_tachi_vault_reference_persists_ref_and_resolves_in_memory() {
+    let _lock = env_override_lock().await;
+    let (dir, _guards) = tachi_vault_fixture("synthetic-original", false);
+    let path = "providers.models.openai.default.api_key";
+    let mut config = Config::load_or_init().await.unwrap();
+    for (reference, plaintext) in [
+        ("vault:OPENAI_OFFICIAL_API_KEY", "synthetic-vault-secret"),
+        ("op://vault/item/field", "synthetic-op-secret"),
+    ] {
+        config.set_prop_persistent(path, reference).unwrap();
+        config.save_dirty().await.unwrap();
+        assert_eq!(
+            crate::env_overrides::raw_value_for_path(&config, path).as_deref(),
+            Some(plaintext)
+        );
+        assert_eq!(
+            config.onepassword_reference_snapshots.get(path).as_deref(),
+            Some(reference)
+        );
+        assert!(config.dirty_paths.is_empty());
+        config.save().await.unwrap();
+        let raw = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(raw.contains(reference));
+        assert!(!raw.contains(plaintext));
+        assert!(!raw.contains("enc2:"));
+    }
+    assert!(!dir.path().join(".secret_key").exists());
+}
+
+#[cfg(unix)]
+#[test]
+async fn dirty_tachi_vault_reference_failure_preserves_disk_and_pending_live_state() {
+    let _lock = env_override_lock().await;
+    let (dir, _guards) = tachi_vault_fixture("vault:OPENAI_OFFICIAL_API_KEY", false);
+    let path = "providers.models.openai.default.api_key";
+    let mut config = Config::load_or_init().await.unwrap();
+    let original = std::fs::read(dir.path().join("config.toml")).unwrap();
+    for reference in ["vault:-invalid", "vault:MISSING_KEY", "op://invalid"] {
+        config.set_prop_persistent(path, reference).unwrap();
+        let snapshots = config.onepassword_reference_snapshots.clone();
+        assert!(config.save_dirty().await.is_err());
+        assert!(config.save().await.is_err());
+        assert_eq!(
+            std::fs::read(dir.path().join("config.toml")).unwrap(),
+            original
+        );
+        assert_eq!(config.onepassword_reference_snapshots, snapshots);
+        assert_eq!(
+            crate::env_overrides::raw_value_for_path(&config, path).as_deref(),
+            Some(reference)
+        );
+        assert!(config.dirty_paths.contains(path));
+    }
+    assert!(!dir.path().join(".secret_key").exists());
+}
+
+#[cfg(unix)]
+#[test]
+async fn dirty_tachi_vault_reference_create_fallback_resolves_in_memory() {
+    let _lock = env_override_lock().await;
+    let (dir, _guards) = tachi_vault_fixture("synthetic-original", false);
+    let path = "providers.models.openai.default.api_key";
+    let mut config = Config::load_or_init().await.unwrap();
+    std::fs::remove_file(dir.path().join("config.toml")).unwrap();
+    config
+        .set_prop_persistent(path, "vault:OPENAI_OFFICIAL_API_KEY")
+        .unwrap();
+    config.save_dirty().await.unwrap();
+    assert_eq!(
+        crate::env_overrides::raw_value_for_path(&config, path).as_deref(),
+        Some("synthetic-vault-secret")
+    );
+    config.save().await.unwrap();
+    let raw = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    assert!(raw.contains("vault:OPENAI_OFFICIAL_API_KEY"));
+    assert!(!raw.contains("synthetic-vault-secret"));
+    assert!(!dir.path().join(".secret_key").exists());
+}
+
+#[cfg(unix)]
+#[test]
+async fn tachi_vault_env_override_plus_dirty_edit_never_leaks_vault_secret_to_disk() {
+    let _lock = env_override_lock().await;
+    let (dir, mut guards) = tachi_vault_fixture("vault:OPENAI_OFFICIAL_API_KEY", false);
+    std::fs::write(
+        dir.path().join("config.toml"),
+        r#"schema_version = 3
+
+[secrets]
+encrypt = false
+
+[providers.models.openai.default]
+model = "gpt-5"
+api_key = "vault:OPENAI_OFFICIAL_API_KEY"
+"#,
+    )
+    .unwrap();
+    guards.push(EnvValueGuard::set(
+        "ZEROCLAW_providers__models__openai__default__api_key",
+        "synthetic-env-override",
+    ));
+
+    let path = "providers.models.openai.default.api_key";
+    for replacement in ["synthetic-operator-replacement", ""] {
+        std::fs::write(
+            dir.path().join("config.toml"),
+            r#"schema_version = 3
+
+[secrets]
+encrypt = false
+
+[providers.models.openai.default]
+model = "gpt-5"
+api_key = "vault:OPENAI_OFFICIAL_API_KEY"
+"#,
+        )
+        .unwrap();
+        let mut config = Config::load_or_init().await.unwrap();
+        assert_eq!(
+            crate::env_overrides::raw_value_for_path(&config, path).as_deref(),
+            Some("synthetic-env-override")
+        );
+
+        config.set_prop_persistent(path, replacement).unwrap();
+        config.save_dirty().await.unwrap();
+        let raw_dirty = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(!raw_dirty.contains("synthetic-vault-secret"), "{raw_dirty}");
+        assert!(!raw_dirty.contains("synthetic-env-override"), "{raw_dirty}");
+        assert!(!raw_dirty.contains("vault:"), "{raw_dirty}");
+        assert!(!config.env_overridden_paths.contains(path));
+        assert!(!config.pre_override_snapshots.contains_key(path));
+
+        // Follow-up full `save()` must also keep the replacement rather than
+        // resurrecting the pre-override resolved Vault secret.
+        config.save().await.unwrap();
+        let raw_full = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(!raw_full.contains("synthetic-vault-secret"), "{raw_full}");
+        assert!(!raw_full.contains("synthetic-env-override"), "{raw_full}");
+        let stored: Config = toml::from_str(&raw_full).unwrap();
+        assert_eq!(
+            crate::env_overrides::raw_value_for_path(&stored, path).unwrap_or_default(),
+            replacement
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+async fn tachi_vault_collection_and_natural_key_secrets_roundtrip_and_resolve() {
+    let _lock = env_override_lock().await;
+    let (dir, _guards) = tachi_vault_fixture("vault:OPENAI_OFFICIAL_API_KEY", false);
+    std::fs::write(
+        dir.path().join("config.toml"),
+        r#"schema_version = 3
+
+[gateway]
+paired_tokens = ["vault:OPENAI_OFFICIAL_API_KEY", "plain-paired"]
+
+[reliability]
+api_keys = ["vault:OPENAI_OFFICIAL_API_KEY"]
+
+[[mcp.servers]]
+name = "primary"
+command = "npx"
+
+[mcp.servers.env]
+API_TOKEN = "vault:OPENAI_OFFICIAL_API_KEY"
+TOKEN = "plain-sibling"
+"TOKEN[0]" = "vault:OPENAI_OFFICIAL_API_KEY"
+"#,
+    )
+    .unwrap();
+
+    let mut config = Config::load_or_init().await.unwrap();
+    assert_eq!(
+        config.gateway.paired_tokens,
+        vec!["synthetic-vault-secret", "plain-paired"]
+    );
+    assert_eq!(config.reliability.api_keys, vec!["synthetic-vault-secret"]);
+    assert_eq!(
+        config.mcp.servers[0]
+            .env
+            .get("API_TOKEN")
+            .map(String::as_str),
+        Some("synthetic-vault-secret")
+    );
+    assert_eq!(
+        config.mcp.servers[0]
+            .env
+            .get("TOKEN[0]")
+            .map(String::as_str),
+        Some("synthetic-vault-secret")
+    );
+
+    // Full save preserves element-level `vault:` references and bracketed map keys (`TOKEN[0]`),
+    // while encrypting plain siblings.
+    config.save().await.unwrap();
+    let raw = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    assert!(!raw.contains("synthetic-vault-secret"), "{raw}");
+    assert!(!raw.contains("plain-paired"), "{raw}");
+    assert!(!raw.contains("plain-sibling"), "{raw}");
+    let saved_raw: Config = toml::from_str(&raw).unwrap();
+    assert_eq!(
+        saved_raw.gateway.paired_tokens[0],
+        "vault:OPENAI_OFFICIAL_API_KEY"
+    );
+    assert!(saved_raw.gateway.paired_tokens[1].starts_with("enc2:"));
+    assert_eq!(
+        saved_raw.reliability.api_keys,
+        vec!["vault:OPENAI_OFFICIAL_API_KEY"]
+    );
+    assert_eq!(
+        saved_raw.mcp.servers[0]
+            .env
+            .get("API_TOKEN")
+            .map(String::as_str),
+        Some("vault:OPENAI_OFFICIAL_API_KEY")
+    );
+    assert_eq!(
+        saved_raw.mcp.servers[0]
+            .env
+            .get("TOKEN[0]")
+            .map(String::as_str),
+        Some("vault:OPENAI_OFFICIAL_API_KEY")
+    );
+    assert!(
+        saved_raw.mcp.servers[0]
+            .env
+            .get("TOKEN")
+            .is_some_and(|v| v.starts_with("enc2:"))
+    );
+
+    // Editing scalar sibling `TOKEN` must never evict bracketed `TOKEN[0]`'s `vault:` snapshot.
+    config
+        .set_prop_persistent("mcp.servers.primary.env.TOKEN", "updated-sibling")
+        .unwrap();
+    config.save_dirty().await.unwrap();
+    config.save().await.unwrap();
+    let raw_tok = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    assert!(!raw_tok.contains("synthetic-vault-secret"), "{raw_tok}");
+    assert!(!raw_tok.contains("updated-sibling"), "{raw_tok}");
+    let saved_tok: Config = toml::from_str(&raw_tok).unwrap();
+    assert_eq!(
+        saved_tok.mcp.servers[0]
+            .env
+            .get("TOKEN[0]")
+            .map(String::as_str),
+        Some("vault:OPENAI_OFFICIAL_API_KEY")
+    );
+
+    // Live edit on a StringArray secret resolves elements in memory and preserves refs on disk.
+    config
+        .set_prop_persistent(
+            "reliability.api_keys",
+            r#"["op://vault/item/field", "plain-second"]"#,
+        )
+        .unwrap();
+    config.save_dirty().await.unwrap();
+    assert_eq!(
+        config.reliability.api_keys,
+        vec!["synthetic-op-secret", "plain-second"]
+    );
+    config.save().await.unwrap();
+    let raw_after = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    assert!(!raw_after.contains("synthetic-op-secret"), "{raw_after}");
+    assert!(!raw_after.contains("plain-second"), "{raw_after}");
+    let saved_after: Config = toml::from_str(&raw_after).unwrap();
+    assert_eq!(saved_after.reliability.api_keys[0], "op://vault/item/field");
+    assert!(saved_after.reliability.api_keys[1].starts_with("enc2:"));
+
+    // Non-aliased natural-key rename (`mcp.servers`) rewrites external secret snapshots too.
+    assert!(
+        config
+            .rename_map_key("mcp.servers", "primary", "secondary")
+            .unwrap()
+    );
+    config.mark_dirty("mcp.servers.primary");
+    config.mark_dirty("mcp.servers.secondary");
+    config.save_dirty().await.unwrap();
+    let raw_renamed = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    assert!(
+        !raw_renamed.contains("synthetic-vault-secret"),
+        "{raw_renamed}"
+    );
+    let saved_renamed: Config = toml::from_str(&raw_renamed).unwrap();
+    assert_eq!(saved_renamed.mcp.servers[0].name, "secondary");
+    assert_eq!(
+        saved_renamed.mcp.servers[0]
+            .env
+            .get("API_TOKEN")
+            .map(String::as_str),
+        Some("vault:OPENAI_OFFICIAL_API_KEY")
+    );
+
+    // Invalid element ref in a StringArray fails closed without mutating disk or live state.
+    let disk_before_fail = std::fs::read(dir.path().join("config.toml")).unwrap();
+    config
+        .set_prop_persistent("reliability.api_keys", r#"["vault:-invalid"]"#)
+        .unwrap();
+    assert!(config.save_dirty().await.is_err());
+    assert_eq!(
+        std::fs::read(dir.path().join("config.toml")).unwrap(),
+        disk_before_fail
+    );
+}
+
+#[cfg(unix)]
+#[test]
+async fn tachi_vault_provider_alias_rename_preserves_external_reference() {
+    let _lock = env_override_lock().await;
+    let (dir, _guards) = tachi_vault_fixture("vault:OPENAI_OFFICIAL_API_KEY", false);
+    let mut config = Config::load_or_init().await.unwrap();
+
+    let kind = crate::alias_refs::AliasKind::Provider {
+        category: crate::alias_refs::ProviderCategory::Models,
+        family: "openai".to_string(),
+    };
+    let report =
+        crate::alias_refs::rename_with_cascade(&mut config, &kind, "default", "primary").unwrap();
+    for dirty in &report.dirty_paths {
+        config.mark_dirty(dirty);
+    }
+    config.save_dirty().await.unwrap();
+    assert_eq!(
+        crate::env_overrides::raw_value_for_path(
+            &config,
+            "providers.models.openai.primary.api_key"
+        )
+        .as_deref(),
+        Some("synthetic-vault-secret")
+    );
+
+    config.save().await.unwrap();
+    let raw = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    assert!(raw.contains("[providers.models.openai.primary]"), "{raw}");
+    assert!(!raw.contains("[providers.models.openai.default]"), "{raw}");
+    assert!(raw.contains("vault:OPENAI_OFFICIAL_API_KEY"), "{raw}");
+    assert!(!raw.contains("synthetic-vault-secret"), "{raw}");
+    assert!(!raw.contains("enc2:"), "{raw}");
+}
+
+#[cfg(unix)]
+#[test]
+async fn tachi_vault_overlapping_keys_route_cascade_and_route_env_override() {
+    let _lock = env_override_lock().await;
+    let (dir, mut guards) = tachi_vault_fixture("vault:OPENAI_OFFICIAL_API_KEY", false);
+    std::fs::write(
+        dir.path().join("config.toml"),
+        r#"schema_version = 3
+
+[providers.models.openai.keep]
+model = "gpt-5"
+
+[providers.models.openai.dropme]
+model = "gpt-5"
+api_key = "vault:OPENAI_OFFICIAL_API_KEY"
+
+[[model_routes]]
+hint = "fast"
+model_provider = "openai.dropme"
+model = "gpt-5-mini"
+api_key = "vault:OPENAI_OFFICIAL_API_KEY"
+
+[[model_routes]]
+hint = "backup"
+model_provider = "openai.keep"
+model = "gpt-5-nano"
+api_key = "plain-route-secret"
+
+[[mcp.servers]]
+name = "fs"
+command = "npx"
+
+[mcp.servers.env]
+API_TOKEN = "vault:OPENAI_OFFICIAL_API_KEY"
+
+[[mcp.servers]]
+name = "fs.extra"
+command = "npx"
+
+[mcp.servers.env]
+API_TOKEN = "vault:OPENAI_OFFICIAL_API_KEY"
+"#,
+    )
+    .unwrap();
+    guards.push(EnvValueGuard::set(
+        "ZEROCLAW_model_routes__fast__api_key",
+        "synthetic-route-env",
+    ));
+
+    let mut config = Config::load_or_init().await.unwrap();
+    assert_eq!(
+        config.model_routes[0].api_key.as_deref(),
+        Some("synthetic-route-env")
+    );
+
+    // 1. Natural-key route env override preserves `vault:` on disk across full save.
+    config.save().await.unwrap();
+    let raw_initial = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    assert!(
+        !raw_initial.contains("synthetic-route-env"),
+        "{raw_initial}"
+    );
+    assert!(
+        !raw_initial.contains("synthetic-vault-secret"),
+        "{raw_initial}"
+    );
+    let parsed_initial: Config = toml::from_str(&raw_initial).unwrap();
+    assert_eq!(
+        parsed_initial.model_routes[0].api_key.as_deref(),
+        Some("vault:OPENAI_OFFICIAL_API_KEY")
+    );
+
+    // 2. Overlapping natural keys (`fs` vs `fs.extra`): renaming and deleting `fs`
+    // must never strip or migrate `fs.extra`'s `vault:` snapshot.
+    assert!(
+        config
+            .rename_map_key("mcp.servers", "fs", "fs_main")
+            .unwrap()
+    );
+    assert!(config.delete_map_key("mcp.servers", "fs_main").unwrap());
+    config.mark_dirty("mcp.servers.fs");
+    config.mark_dirty("mcp.servers.fs_main");
+    config.save_dirty().await.unwrap();
+    config.save().await.unwrap();
+    let raw_mcp = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    assert!(!raw_mcp.contains("synthetic-vault-secret"), "{raw_mcp}");
+    let parsed_mcp: Config = toml::from_str(&raw_mcp).unwrap();
+    assert_eq!(parsed_mcp.mcp.servers.len(), 1);
+    assert_eq!(parsed_mcp.mcp.servers[0].name, "fs.extra");
+    assert_eq!(
+        parsed_mcp.mcp.servers[0]
+            .env
+            .get("API_TOKEN")
+            .map(String::as_str),
+        Some("vault:OPENAI_OFFICIAL_API_KEY")
+    );
+
+    // 3. Provider cascade delete drops scrubbed `model_routes.fast` snapshots so
+    // renaming `backup` -> `fast` keeps its encrypted direct key instead of stale `vault:`.
+    let kind = crate::alias_refs::AliasKind::Provider {
+        category: crate::alias_refs::ProviderCategory::Models,
+        family: "openai".to_string(),
+    };
+    let report = crate::alias_refs::delete_with_cascade(
+        &mut config,
+        &kind,
+        "dropme",
+        crate::alias_refs::CascadePolicy::RefuseOnHard,
+    )
+    .unwrap();
+    for dirty in report.dirty_paths() {
+        config.mark_dirty(&dirty);
+    }
+    config.save_dirty().await.unwrap();
+
+    assert!(
+        config
+            .rename_map_key("model_routes", "backup", "fast")
+            .unwrap()
+    );
+    config.mark_dirty("model_routes.backup");
+    config.mark_dirty("model_routes.fast");
+    config.save_dirty().await.unwrap();
+    let raw_final = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    let parsed_final: Config = toml::from_str(&raw_final).unwrap();
+    assert_eq!(parsed_final.model_routes.len(), 1);
+    assert_eq!(parsed_final.model_routes[0].hint, "fast");
+    assert!(
+        parsed_final.model_routes[0]
+            .api_key
+            .as_deref()
+            .is_some_and(|v| v.starts_with("enc2:")),
+        "{raw_final}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+async fn tachi_vault_dotted_natural_key_field_overlap_and_ambiguous_rejection() {
+    let _lock = env_override_lock().await;
+    let (dir, _guards) = tachi_vault_fixture("vault:OPENAI_OFFICIAL_API_KEY", false);
+    std::fs::write(
+        dir.path().join("config.toml"),
+        r#"
+schema_version = 3
+
+[secrets]
+encrypt = false
+
+[providers.models.openai.default]
+model = "gpt-5"
+
+[[model_routes]]
+hint = "fast"
+provider = "openai.default"
+model = "gpt-5-mini"
+api_key = "vault:OPENAI_OFFICIAL_API_KEY"
+
+[[model_routes]]
+hint = "fast.api_key"
+provider = "openai.default"
+model = "gpt-5-nano"
+api_key = "op://vault/item/field"
+
+[[mcp.servers]]
+name = "fs"
+command = "npx"
+
+[mcp.servers.env]
+TOKEN = "vault:OPENAI_OFFICIAL_API_KEY"
+
+[[mcp.servers]]
+name = "fs.env"
+command = "npx"
+
+[[mcp.servers]]
+name = "a"
+command = "npx"
+
+[mcp.servers.env]
+"env.TOKEN" = "vault:OPENAI_OFFICIAL_API_KEY"
+
+[[mcp.servers]]
+name = "a.env"
+command = "npx"
+
+[mcp.servers.env]
+TOKEN = "plain-other"
+"#,
+    )
+    .unwrap();
+
+    let mut config = Config::load_or_init().await.unwrap();
+    assert_eq!(
+        config.model_routes[0].api_key.as_deref(),
+        Some("synthetic-vault-secret")
+    );
+    assert_eq!(
+        config.model_routes[1].api_key.as_deref(),
+        Some("synthetic-op-secret")
+    );
+    assert_eq!(
+        config.mcp.servers[0].env.get("TOKEN").map(String::as_str),
+        Some("synthetic-vault-secret")
+    );
+    assert_eq!(
+        config.mcp.servers[2]
+            .env
+            .get("env.TOKEN")
+            .map(String::as_str),
+        Some("synthetic-vault-secret")
+    );
+
+    // 1. Editing `mcp.servers.a.env.env.TOKEN` routes to `a.env`'s `TOKEN` and must
+    // persist directly via incremental `save_dirty()` (before any full `save()`) without
+    // evicting `a`'s `"env.TOKEN"` `vault:` snapshot, even with `secrets.encrypt = false`.
+    config
+        .set_prop_persistent("mcp.servers.a.env.env.TOKEN", "updated-plain")
+        .unwrap();
+    config.save_dirty().await.unwrap();
+
+    for step in ["after_save_dirty", "after_full_save"] {
+        if step == "after_full_save" {
+            config.save().await.unwrap();
+        }
+        let raw = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(!raw.contains("synthetic-vault-secret"), "{step}: {raw}");
+        assert!(!raw.contains("synthetic-op-secret"), "{step}: {raw}");
+        let parsed: Config = toml::from_str(&raw).unwrap();
+        assert_eq!(
+            parsed.model_routes[0].api_key.as_deref(),
+            Some("vault:OPENAI_OFFICIAL_API_KEY"),
+            "{step}"
+        );
+        assert_eq!(
+            parsed.model_routes[1].api_key.as_deref(),
+            Some("op://vault/item/field"),
+            "{step}"
+        );
+        assert_eq!(
+            parsed.mcp.servers[0].env.get("TOKEN").map(String::as_str),
+            Some("vault:OPENAI_OFFICIAL_API_KEY"),
+            "{step}"
+        );
+        assert_eq!(
+            parsed.mcp.servers[2]
+                .env
+                .get("env.TOKEN")
+                .map(String::as_str),
+            Some("vault:OPENAI_OFFICIAL_API_KEY"),
+            "{step}"
+        );
+        assert_eq!(
+            parsed.mcp.servers[3].env.get("TOKEN").map(String::as_str),
+            Some("updated-plain"),
+            "{step}"
+        );
+    }
+
+    // 2. Whole-entry delete of `hint = "fast.api_key"` marks `"model_routes.fast.api_key"`
+    // dirty (`api_config.rs:handle_delete_map_key`). Neither `save_dirty()` nor `save()`
+    // may misread that whole-entry marker as a secret edit on `hint = "fast"`.
+    let pre_delete_disk = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    assert!(
+        config
+            .delete_map_key("model_routes", "fast.api_key")
+            .unwrap()
+    );
+    config.mark_dirty("model_routes.fast.api_key");
+
+    let mut dirty_writer_cfg = config.clone();
+    dirty_writer_cfg.save_dirty().await.unwrap();
+    let raw_dirty_del = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    assert!(
+        !raw_dirty_del.contains("synthetic-vault-secret"),
+        "{raw_dirty_del}"
+    );
+    assert!(
+        !raw_dirty_del.contains("synthetic-op-secret"),
+        "{raw_dirty_del}"
+    );
+    let parsed_dirty_del: Config = toml::from_str(&raw_dirty_del).unwrap();
+    assert_eq!(parsed_dirty_del.model_routes.len(), 1);
+    assert_eq!(parsed_dirty_del.model_routes[0].hint, "fast");
+    assert_eq!(
+        parsed_dirty_del.model_routes[0].api_key.as_deref(),
+        Some("vault:OPENAI_OFFICIAL_API_KEY")
+    );
+
+    // Restore pre-delete file and verify full `save()` with the same pending whole-entry
+    // dirty marker also preserves `fast`'s `vault:` reference without leaking plaintext.
+    std::fs::write(dir.path().join("config.toml"), &pre_delete_disk).unwrap();
+    config.save().await.unwrap();
+    let raw_full_del = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    assert!(
+        !raw_full_del.contains("synthetic-vault-secret"),
+        "{raw_full_del}"
+    );
+    let parsed_full_del: Config = toml::from_str(&raw_full_del).unwrap();
+    assert_eq!(parsed_full_del.model_routes.len(), 1);
+    assert_eq!(parsed_full_del.model_routes[0].hint, "fast");
+    assert_eq!(
+        parsed_full_del.model_routes[0].api_key.as_deref(),
+        Some("vault:OPENAI_OFFICIAL_API_KEY")
+    );
+    config.clear_dirty();
+
+    // 3. Empty/whitespace natural keys are rejected on create/rename, and direct struct
+    // mutation to an empty natural key fails closed on both `save()` and `save_dirty()`.
+    assert!(config.create_map_key("mcp.servers", "").is_err());
+    assert!(config.create_map_key("mcp.servers", "   ").is_err());
+    assert!(config.rename_map_key("mcp.servers", "fs", "").is_err());
+    assert!(config.rename_map_key("mcp.servers", "fs", "   ").is_err());
+
+    for bad_direct_name in ["", "fs.env", "unregistered_direct"] {
+        let mut tampered = config.clone();
+        tampered.mcp.servers[0].name = bad_direct_name.to_string();
+        tampered.mark_dirty("mcp.servers");
+        assert!(
+            tampered.save().await.is_err(),
+            "direct name={bad_direct_name:?}"
+        );
+        assert!(
+            tampered.save_dirty().await.is_err(),
+            "direct name={bad_direct_name:?}"
+        );
+        let raw_after_tamper = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(
+            !raw_after_tamper.contains("synthetic-vault-secret"),
+            "{raw_after_tamper}"
+        );
+    }
+
+    // 4. Same-batch secret edit followed by `rename_map_key` must migrate dirty prop
+    // tracking so invalid references still fail closed and valid edits are not clobbered
+    // by the old reference snapshot.
+    let mut bad_batch = config.clone();
+    bad_batch
+        .set_prop_persistent("model_routes.fast.api_key", "vault:-invalid")
+        .unwrap();
+    assert!(
+        bad_batch
+            .rename_map_key("model_routes", "fast", "fast.v2")
+            .unwrap()
+    );
+    bad_batch.mark_dirty("model_routes.fast");
+    bad_batch.mark_dirty("model_routes.fast.v2");
+    assert!(bad_batch.save().await.is_err());
+    assert!(bad_batch.save_dirty().await.is_err());
+
+    let mut good_batch = config.clone();
+    good_batch
+        .set_prop_persistent("model_routes.fast.api_key", "op://vault/item/field")
+        .unwrap();
+    assert!(
+        good_batch
+            .rename_map_key("model_routes", "fast", "fast.v2")
+            .unwrap()
+    );
+    good_batch.mark_dirty("model_routes.fast");
+    good_batch.mark_dirty("model_routes.fast.v2");
+    good_batch.save_dirty().await.unwrap();
+    assert_eq!(good_batch.model_routes[0].hint, "fast.v2");
+    assert_eq!(
+        good_batch.model_routes[0].api_key.as_deref(),
+        Some("synthetic-op-secret")
+    );
+    let raw_good_batch = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    assert!(!raw_good_batch.contains("synthetic-op-secret"));
+    assert!(!raw_good_batch.contains("synthetic-vault-secret"));
+    let parsed_good_batch: Config = toml::from_str(&raw_good_batch).unwrap();
+    assert_eq!(parsed_good_batch.model_routes[0].hint, "fast.v2");
+    assert_eq!(
+        parsed_good_batch.model_routes[0].api_key.as_deref(),
+        Some("op://vault/item/field")
+    );
+
+    // 5. Deleting or renaming a dotted sibling (`hint = "fast.api_key"`) must never drop
+    // or migrate the shorter sibling's (`hint = "fast"`) `ZEROCLAW_*` env-override snapshot.
+    std::fs::write(
+        dir.path().join("config.toml"),
+        r#"
+schema_version = 3
+
+[secrets]
+encrypt = false
+
+[providers.models.openai.default]
+model = "gpt-5"
+
+[[model_routes]]
+hint = "fast"
+provider = "openai.default"
+model = "gpt-5-mini"
+api_key = "disk-inline-key"
+
+[[model_routes]]
+hint = "fast.api_key"
+provider = "openai.default"
+model = "gpt-5-nano"
+"#,
+    )
+    .unwrap();
+    {
+        let _route_env = EnvValueGuard::set(
+            "ZEROCLAW_model_routes__fast__api_key",
+            "env-secret-override",
+        );
+        let mut env_cfg = Config::load_or_init().await.unwrap();
+        assert_eq!(
+            env_cfg.model_routes[0].api_key.as_deref(),
+            Some("env-secret-override")
+        );
+
+        let mut env_rename_cfg = env_cfg.clone();
+        assert!(
+            env_rename_cfg
+                .rename_map_key("model_routes", "fast.api_key", "slow")
+                .unwrap()
+        );
+        env_rename_cfg.mark_dirty("model_routes.fast.api_key");
+        env_rename_cfg.mark_dirty("model_routes.slow");
+        env_rename_cfg.save_dirty().await.unwrap();
+        env_rename_cfg.save().await.unwrap();
+        let raw_env_rename = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(
+            !raw_env_rename.contains("env-secret-override"),
+            "{raw_env_rename}"
+        );
+
+        std::fs::write(
+            dir.path().join("config.toml"),
+            r#"
+schema_version = 3
+
+[secrets]
+encrypt = false
+
+[providers.models.openai.default]
+model = "gpt-5"
+
+[[model_routes]]
+hint = "fast"
+provider = "openai.default"
+model = "gpt-5-mini"
+api_key = "disk-inline-key"
+
+[[model_routes]]
+hint = "fast.api_key"
+provider = "openai.default"
+model = "gpt-5-nano"
+"#,
+        )
+        .unwrap();
+        assert!(
+            env_cfg
+                .delete_map_key("model_routes", "fast.api_key")
+                .unwrap()
+        );
+        env_cfg.mark_dirty("model_routes.fast.api_key");
+        env_cfg.save_dirty().await.unwrap();
+        env_cfg.save().await.unwrap();
+        let raw_env_del = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(
+            !raw_env_del.contains("env-secret-override"),
+            "{raw_env_del}"
+        );
+        let parsed_env_del: Config = toml::from_str(&raw_env_del).unwrap();
+        assert_eq!(
+            parsed_env_del.model_routes[0].api_key.as_deref(),
+            Some("disk-inline-key")
+        );
+    }
+
+    // 6. Env-only external reference (`ZEROCLAW_* = "vault:..."`) must never be persisted
+    // on `save()` over the existing on-disk credential.
+    {
+        let _route_env = EnvValueGuard::set(
+            "ZEROCLAW_model_routes__fast__api_key",
+            "vault:OPENAI_OFFICIAL_API_KEY",
+        );
+        let env_ref_cfg = Config::load_or_init().await.unwrap();
+        env_ref_cfg.save().await.unwrap();
+        let raw_env_ref = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(
+            !raw_env_ref.contains("vault:OPENAI_OFFICIAL_API_KEY"),
+            "{raw_env_ref}"
+        );
+        let parsed_env_ref: Config = toml::from_str(&raw_env_ref).unwrap();
+        assert_eq!(
+            parsed_env_ref.model_routes[0].api_key.as_deref(),
+            Some("disk-inline-key")
+        );
+    }
+
+    // 7. Overlapping chained paths (`token` and `"env.token"` on MCP server `a`) renamed
+    // `a -> a.env` must migrate two-phase without HashMap/HashSet iteration-order clobber.
+    std::fs::write(
+        dir.path().join("config.toml"),
+        r#"
+schema_version = 3
+
+[secrets]
+encrypt = false
+
+[[mcp.servers]]
+name = "a"
+command = "npx"
+
+[mcp.servers.env]
+token = "vault:OPENAI_OFFICIAL_API_KEY"
+"env.token" = "op://vault/item/field"
+"#,
+    )
+    .unwrap();
+    let mut chained_cfg = Config::load_or_init().await.unwrap();
+    chained_cfg.pre_override_snapshots.insert(
+        "mcp.servers.a.env.token".to_string(),
+        "disk-a-1".to_string(),
+    );
+    chained_cfg.pre_override_snapshots.insert(
+        "mcp.servers.a.env.env.token".to_string(),
+        "disk-a-2".to_string(),
+    );
+    chained_cfg
+        .env_overridden_paths
+        .insert("mcp.servers.a.env.token".to_string());
+    chained_cfg
+        .env_overridden_paths
+        .insert("mcp.servers.a.env.env.token".to_string());
+    chained_cfg
+        .set_prop_persistent("mcp.servers.a.env.token", "edited-1")
+        .unwrap();
+    chained_cfg
+        .set_prop_persistent("mcp.servers.a.env.env.token", "edited-2")
+        .unwrap();
+    assert!(
+        chained_cfg
+            .rename_map_key("mcp.servers", "a", "a.env")
+            .unwrap()
+    );
+    assert_eq!(
+        chained_cfg
+            .pre_override_snapshots
+            .get("mcp.servers.a.env.env.token")
+            .as_deref(),
+        Some("disk-a-1")
+    );
+    assert_eq!(
+        chained_cfg
+            .pre_override_snapshots
+            .get("mcp.servers.a.env.env.env.token")
+            .as_deref(),
+        Some("disk-a-2")
+    );
+    assert!(
+        chained_cfg
+            .explicit_prop_dirty_paths
+            .contains("mcp.servers.a.env.env.token")
+    );
+    assert!(
+        chained_cfg
+            .explicit_prop_dirty_paths
+            .contains("mcp.servers.a.env.env.env.token")
+    );
+    chained_cfg.mark_dirty("mcp.servers.a");
+    chained_cfg.mark_dirty("mcp.servers.a.env");
+    chained_cfg.save_dirty().await.unwrap();
+    let raw_chained = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    let parsed_chained: Config = toml::from_str(&raw_chained).unwrap();
+    assert_eq!(
+        parsed_chained.mcp.servers[0]
+            .env
+            .get("token")
+            .map(String::as_str),
+        Some("edited-1")
+    );
+    assert_eq!(
+        parsed_chained.mcp.servers[0]
+            .env
+            .get("env.token")
+            .map(String::as_str),
+        Some("edited-2")
+    );
+
+    // 8. Renaming `b -> a.env` or creating `a.env` after editing `a.env["env.token"]`
+    // (`mcp.servers.a.env.env.token`) must fail closed without rebinding the tracked
+    // dirty path onto `a.env`'s `env["token"]` or leaking `b`'s resolved secret.
+    std::fs::write(
+        dir.path().join("config.toml"),
+        r#"
+schema_version = 3
+
+[secrets]
+encrypt = false
+
+[[mcp.servers]]
+name = "a"
+command = "npx"
+
+[mcp.servers.env]
+"env.token" = "vault:OPENAI_OFFICIAL_API_KEY"
+
+[[mcp.servers]]
+name = "b"
+command = "uvx"
+
+[mcp.servers.env]
+token = "op://vault/item/field"
+"#,
+    )
+    .unwrap();
+    let mut rebind_cfg = Config::load_or_init().await.unwrap();
+    rebind_cfg
+        .set_prop_persistent("mcp.servers.a.env.env.token", "vault:-invalid")
+        .unwrap();
+    assert!(
+        rebind_cfg
+            .rename_map_key("mcp.servers", "b", "a.env")
+            .is_err()
+    );
+    assert_eq!(rebind_cfg.mcp.servers[1].name, "b");
+    assert!(rebind_cfg.create_map_key("mcp.servers", "a.env").is_err());
+    assert_eq!(rebind_cfg.mcp.servers.len(), 2);
+    assert!(rebind_cfg.save_dirty().await.is_err());
+    assert!(rebind_cfg.save().await.is_err());
+
+    let mut direct_rebind = rebind_cfg.clone();
+    direct_rebind.mcp.servers[1].name = "a.env".to_string();
+    direct_rebind.mark_dirty("mcp.servers.b");
+    direct_rebind.mark_dirty("mcp.servers.a.env");
+    assert!(direct_rebind.save_dirty().await.is_err());
+    assert!(direct_rebind.save().await.is_err());
+    let raw_rebind = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    assert!(
+        !raw_rebind.contains("synthetic-vault-secret")
+            && !raw_rebind.contains("synthetic-op-secret")
+            && !raw_rebind.contains("vault:-invalid"),
+        "{raw_rebind}"
+    );
+
+    // 9. Direct Rust mutation + `mark_dirty("mcp.servers.a.env.env.token")` followed by
+    // introducing an exact-name whole entry `"a.env.env.token"` (via `create_map_key`,
+    // `rename_map_key`, or direct struct push) must fail closed without dropping the leaf
+    // dirty path or writing an unvalidated reference.
+    let mut mark_dirty_shadow = Config::load_or_init().await.unwrap();
+    mark_dirty_shadow.mcp.servers[0]
+        .env
+        .insert("env.token".to_string(), "vault:-invalid".to_string());
+    mark_dirty_shadow.mark_dirty("mcp.servers.a.env.env.token");
+    assert!(
+        mark_dirty_shadow
+            .create_map_key("mcp.servers", "a.env.env.token")
+            .is_err()
+    );
+    assert_eq!(mark_dirty_shadow.mcp.servers.len(), 2);
+    assert!(
+        mark_dirty_shadow
+            .rename_map_key("mcp.servers", "b", "a.env.env.token")
+            .is_err()
+    );
+    assert_eq!(mark_dirty_shadow.mcp.servers[1].name, "b");
+    assert!(mark_dirty_shadow.save_dirty().await.is_err());
+    assert!(mark_dirty_shadow.save().await.is_err());
+
+    let mut direct_push_shadow = mark_dirty_shadow.clone();
+    direct_push_shadow.mcp.servers.push(McpServerConfig {
+        name: "a.env.env.token".to_string(),
+        command: "node".to_string(),
+        ..Default::default()
+    });
+    direct_push_shadow.mark_dirty("mcp.servers.a.env.env.token");
+    assert!(direct_push_shadow.save_dirty().await.is_err());
+    assert!(direct_push_shadow.save().await.is_err());
+    let raw_shadow = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    assert!(
+        !raw_shadow.contains("synthetic-vault-secret")
+            && !raw_shadow.contains("synthetic-op-secret")
+            && !raw_shadow.contains("vault:-invalid"),
+        "{raw_shadow}"
+    );
+
+    // 10. Section-level `mark_dirty("model_routes")` (e.g. `alias_refs` updating `provider`)
+    // preserves `vault:` snapshots on disk and resolved secrets in memory without leaking plaintext.
+    std::fs::write(
+        dir.path().join("config.toml"),
+        r#"
+schema_version = 3
+
+[secrets]
+encrypt = false
+
+[[model_routes]]
+hint = "fast"
+provider = "openai.default"
+model = "gpt-5"
+api_key = "vault:OPENAI_OFFICIAL_API_KEY"
+"#,
+    )
+    .unwrap();
+    let mut section_dirty_cfg = Config::load_or_init().await.unwrap();
+    section_dirty_cfg.model_routes[0].model_provider = "openai.renamed".to_string();
+    section_dirty_cfg.mark_dirty("model_routes");
+    section_dirty_cfg.save_dirty().await.unwrap();
+    assert_eq!(
+        section_dirty_cfg.model_routes[0].api_key.as_deref(),
+        Some("synthetic-vault-secret")
+    );
+    let raw_sec_dirty = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    assert!(
+        raw_sec_dirty.contains("openai.renamed")
+            && raw_sec_dirty.contains("vault:OPENAI_OFFICIAL_API_KEY")
+            && !raw_sec_dirty.contains("synthetic-vault-secret"),
+        "{raw_sec_dirty}"
+    );
+
+    // 11. Duplicate or empty natural/map keys anywhere in a section carrying an external
+    // secret reference fail closed on load, even when the ref lives on a sibling entry.
+    for bad_toml in [
+        r#"
+schema_version = 3
+[[model_routes]]
+hint = "dup"
+provider = "openai.default"
+model = "gpt-5"
+api_key = "vault:OPENAI_OFFICIAL_API_KEY"
+[[model_routes]]
+hint = "dup"
+provider = "openai.default"
+model = "gpt-5"
+"#,
+        r#"
+schema_version = 3
+[[model_routes]]
+hint = ""
+provider = "openai.default"
+model = "gpt-5"
+api_key = "vault:OPENAI_OFFICIAL_API_KEY"
+"#,
+        r#"
+schema_version = 3
+[[mcp.servers]]
+name = "a"
+command = "npx"
+[mcp.servers.env]
+TOKEN = "vault:OPENAI_OFFICIAL_API_KEY"
+[[mcp.servers]]
+name = ""
+command = "uvx"
+"#,
+        r#"
+schema_version = 3
+[[mcp.servers]]
+name = "a"
+command = "npx"
+[mcp.servers.env]
+TOKEN = "vault:OPENAI_OFFICIAL_API_KEY"
+[[mcp.servers]]
+name = "dup"
+command = "uvx"
+[[mcp.servers]]
+name = "dup"
+command = "node"
+"#,
+        r#"
+schema_version = 3
+[providers.models.openai.default]
+api_key = "vault:OPENAI_OFFICIAL_API_KEY"
+[providers.models.openai.""]
+model = "gpt-5"
+"#,
+    ] {
+        std::fs::write(dir.path().join("config.toml"), bad_toml).unwrap();
+        assert!(
+            Config::load_or_init().await.is_err(),
+            "expected section-wide key invariant failure for:\n{bad_toml}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+async fn tachi_vault_whole_section_and_entry_dirty_expands_refs_and_isolates_env() {
+    let _lock = env_override_lock().await;
+    let (dir, _guards) = tachi_vault_fixture("vault:OPENAI_OFFICIAL_API_KEY", false);
+    let config_path = dir.path().join("config.toml");
+    std::fs::remove_file(&config_path).unwrap();
+
+    // 1. Missing-file create fallback with section dirty `model_routes` carrying an
+    // invalid `vault:-invalid` reference must fail closed without creating disk state.
+    let mut missing_cfg = Config {
+        config_path: config_path.clone(),
+        data_dir: dir.path().join("workspace"),
+        ..Config::default()
+    };
+    missing_cfg.secrets.encrypt = false;
+    missing_cfg.model_routes.push(ModelRouteConfig {
+        hint: "fast".to_string(),
+        model_provider: "openai.default".to_string(),
+        model: "gpt-5-mini".to_string(),
+        api_key: Some("vault:-invalid".to_string()),
+    });
+    missing_cfg.mark_dirty("model_routes");
+    assert!(missing_cfg.save_dirty().await.is_err());
+    assert!(!config_path.exists());
+
+    // 2. Valid `vault:OPENAI_OFFICIAL_API_KEY` under `mark_dirty("model_routes")` creates
+    // disk with the external reference and resolves plaintext in live memory.
+    missing_cfg.model_routes[0].api_key = Some("vault:OPENAI_OFFICIAL_API_KEY".to_string());
+    missing_cfg.save_dirty().await.unwrap();
+    assert_eq!(
+        missing_cfg.model_routes[0].api_key.as_deref(),
+        Some("synthetic-vault-secret")
+    );
+    let raw_created = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        raw_created.contains("vault:OPENAI_OFFICIAL_API_KEY")
+            && !raw_created.contains("synthetic-vault-secret"),
+        "{raw_created}"
+    );
+
+    // 3. Replacing that route's external ref under section dirty `mark_dirty("model_routes")`
+    // persists the new reference on disk, updates the snapshot, and resolves plaintext live.
+    missing_cfg.model_routes[0].api_key = Some("op://vault/item/field".to_string());
+    missing_cfg.mark_dirty("model_routes");
+    missing_cfg.save_dirty().await.unwrap();
+    assert_eq!(
+        missing_cfg.model_routes[0].api_key.as_deref(),
+        Some("synthetic-op-secret")
+    );
+    assert_eq!(
+        missing_cfg
+            .onepassword_reference_snapshots
+            .get("model_routes.fast.api_key")
+            .as_deref(),
+        Some("op://vault/item/field")
+    );
+    let raw_replaced = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        raw_replaced.contains("op://vault/item/field")
+            && !raw_replaced.contains("synthetic-op-secret")
+            && !raw_replaced.contains("vault:OPENAI_OFFICIAL_API_KEY"),
+        "{raw_replaced}"
+    );
+
+    // 4. Whole-entry dirty (`mark_dirty("providers.models.openai.default")`) fails closed
+    // on `vault:-bad` and persists/resolves valid `vault:OPENAI_OFFICIAL_API_KEY`.
+    missing_cfg.providers.models.openai.insert(
+        "default".to_string(),
+        OpenAIModelProviderConfig {
+            base: ModelProviderConfig {
+                model: Some("gpt-5.4".to_string()),
+                api_key: Some("vault:-bad".to_string()),
+                ..Default::default()
+            },
+        },
+    );
+    missing_cfg.mark_dirty("providers.models.openai.default");
+    let pre_provider_disk = std::fs::read_to_string(&config_path).unwrap();
+    assert!(missing_cfg.save_dirty().await.is_err());
+    assert_eq!(
+        std::fs::read_to_string(&config_path).unwrap(),
+        pre_provider_disk
+    );
+
+    missing_cfg
+        .providers
+        .models
+        .openai
+        .get_mut("default")
+        .unwrap()
+        .base
+        .api_key = Some("vault:OPENAI_OFFICIAL_API_KEY".to_string());
+    missing_cfg.save_dirty().await.unwrap();
+    assert_eq!(
+        missing_cfg
+            .providers
+            .models
+            .openai
+            .get("default")
+            .and_then(|p| p.base.api_key.as_deref()),
+        Some("synthetic-vault-secret")
+    );
+    let raw_provider = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        raw_provider.contains("vault:OPENAI_OFFICIAL_API_KEY")
+            && !raw_provider.contains("synthetic-vault-secret"),
+        "{raw_provider}"
+    );
+
+    // 5. Deleting all entries under section dirty `mark_dirty("model_routes")` succeeds on both
+    // `save_dirty()` and `save()` and prunes stale external reference snapshots cleanly.
+    missing_cfg.model_routes.clear();
+    missing_cfg.mark_dirty("model_routes");
+    missing_cfg.save_dirty().await.unwrap();
+    assert!(
+        !missing_cfg
+            .onepassword_reference_snapshots
+            .contains_key("model_routes.fast.api_key")
+    );
+    missing_cfg.mark_dirty("model_routes");
+    missing_cfg.save().await.unwrap();
+
+    // 6. Env-override isolation under `mark_dirty("model_routes")`: an env-overridden
+    // sibling route must keep its pre-override disk value and must NEVER leak or get
+    // absorbed into `onepassword_reference_snapshots` when editing another route.
+    std::fs::write(
+        &config_path,
+        r#"
+schema_version = 3
+
+[secrets]
+encrypt = false
+
+[[model_routes]]
+hint = "env_only"
+provider = "openai.default"
+model = "gpt-5-nano"
+api_key = "disk-inline"
+
+[[model_routes]]
+hint = "editable"
+provider = "openai.default"
+model = "gpt-5-mini"
+"#,
+    )
+    .unwrap();
+    let _env_guard = EnvValueGuard::set(
+        "ZEROCLAW_model_routes__env_only__api_key",
+        "vault:OPENAI_OFFICIAL_API_KEY",
+    );
+    let mut env_cfg = Config::load_or_init().await.unwrap();
+    assert_eq!(
+        env_cfg.model_routes[0].api_key.as_deref(),
+        Some("vault:OPENAI_OFFICIAL_API_KEY")
+    );
+    assert!(
+        !env_cfg
+            .onepassword_reference_snapshots
+            .contains_key("model_routes.env_only.api_key")
+    );
+    env_cfg.model_routes[1].api_key = Some("op://vault/item/field".to_string());
+    env_cfg.mark_dirty("model_routes");
+    env_cfg.save_dirty().await.unwrap();
+    assert!(
+        !env_cfg
+            .onepassword_reference_snapshots
+            .contains_key("model_routes.env_only.api_key")
+    );
+    assert_eq!(
+        env_cfg.model_routes[1].api_key.as_deref(),
+        Some("synthetic-op-secret")
+    );
+    let raw_env = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        raw_env.contains("disk-inline")
+            && !raw_env.contains("vault:OPENAI_OFFICIAL_API_KEY")
+            && raw_env.contains("op://vault/item/field")
+            && !raw_env.contains("synthetic-op-secret"),
+        "{raw_env}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+async fn tachi_vault_direct_save_fails_closed_on_unmarked_invalid_ref() {
+    let _lock = env_override_lock().await;
+    let (dir, _guards) = tachi_vault_fixture("vault:OPENAI_OFFICIAL_API_KEY", false);
+    std::fs::write(
+        dir.path().join("config.toml"),
+        r#"
+schema_version = 3
+
+[secrets]
+encrypt = false
+
+[[model_routes]]
+hint = "fast"
+provider = "openai.default"
+model = "gpt-5-mini"
+api_key = "vault:OPENAI_OFFICIAL_API_KEY"
+"#,
+    )
+    .unwrap();
+
+    let mut cfg = Config::load_or_init().await.unwrap();
+    let before_disk = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    cfg.model_routes[0].api_key = Some("vault:-invalid".to_string());
+    assert!(cfg.save().await.is_err());
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("config.toml")).unwrap(),
+        before_disk
+    );
+}
+
+#[cfg(unix)]
+#[test]
+async fn tachi_vault_paired_tokens_per_slot_append_and_empty_clear_no_leak() {
+    let _lock = env_override_lock().await;
+    let (dir, _guards) = tachi_vault_fixture("vault:OPENAI_OFFICIAL_API_KEY", false);
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+schema_version = 3
+
+[secrets]
+encrypt = false
+
+[gateway]
+paired_tokens = ["vault:OPENAI_OFFICIAL_API_KEY"]
+"#,
+    )
+    .unwrap();
+
+    let mut cfg = Config::load_or_init().await.unwrap();
+    assert_eq!(cfg.gateway.paired_tokens, vec!["synthetic-vault-secret"]);
+
+    // 1. Unmarked append + save(): slot [1] failing invalid ref fails closed without touching disk.
+    let mut bad_unmarked = cfg.clone();
+    bad_unmarked
+        .gateway
+        .paired_tokens
+        .push("vault:-invalid".to_string());
+    assert!(bad_unmarked.save().await.is_err());
+    let disk_after_bad = std::fs::read_to_string(&config_path).unwrap();
+    assert!(!disk_after_bad.contains("vault:-invalid"));
+    assert!(!disk_after_bad.contains("synthetic-vault-secret"));
+
+    // 2. Unmarked append + save(): slot [0] must keep its vault: snapshot on disk (never leak
+    // plaintext), while new slot [1] persists its op:// reference.
+    let mut good_unmarked = cfg.clone();
+    good_unmarked
+        .gateway
+        .paired_tokens
+        .push("op://vault/item/field".to_string());
+    good_unmarked.save().await.unwrap();
+    let raw_unmarked = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        raw_unmarked.contains("vault:OPENAI_OFFICIAL_API_KEY")
+            && raw_unmarked.contains("op://vault/item/field")
+            && !raw_unmarked.contains("synthetic-vault-secret")
+            && !raw_unmarked.contains("synthetic-op-secret"),
+        "{raw_unmarked}"
+    );
+
+    // Reload clean [vault:OPENAI_OFFICIAL_API_KEY] fixture to test section-dirty save_dirty().
+    std::fs::write(
+        &config_path,
+        r#"
+schema_version = 3
+
+[secrets]
+encrypt = false
+
+[gateway]
+paired_tokens = ["vault:OPENAI_OFFICIAL_API_KEY"]
+"#,
+    )
+    .unwrap();
+    cfg = Config::load_or_init().await.unwrap();
+
+    // 3. Section-dirty invalid append fails closed without partial write or memory mutation.
+    cfg.gateway.paired_tokens.push("vault:-invalid".to_string());
+    cfg.mark_dirty("gateway");
+    assert!(cfg.save_dirty().await.is_err());
+    let disk_before_good_dirty = std::fs::read_to_string(&config_path).unwrap();
+    assert!(!disk_before_good_dirty.contains("vault:-invalid"));
+    assert!(!disk_before_good_dirty.contains("synthetic-vault-secret"));
+
+    // 4. Section-dirty valid append resolves [1] live and preserves [0]'s vault: snapshot on disk.
+    cfg.gateway.paired_tokens[1] = "op://vault/item/field".to_string();
+    cfg.mark_dirty("gateway");
+    cfg.save_dirty().await.unwrap();
+    assert_eq!(
+        cfg.gateway.paired_tokens,
+        vec![
+            "synthetic-vault-secret".to_string(),
+            "synthetic-op-secret".to_string()
+        ]
+    );
+    assert_eq!(
+        cfg.onepassword_reference_snapshots
+            .get("gateway.paired_tokens[0]")
+            .as_deref(),
+        Some("vault:OPENAI_OFFICIAL_API_KEY")
+    );
+    assert_eq!(
+        cfg.onepassword_reference_snapshots
+            .get("gateway.paired_tokens[1]")
+            .as_deref(),
+        Some("op://vault/item/field")
+    );
+    let raw_dirty = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        raw_dirty.contains("vault:OPENAI_OFFICIAL_API_KEY")
+            && raw_dirty.contains("op://vault/item/field")
+            && !raw_dirty.contains("synthetic-vault-secret")
+            && !raw_dirty.contains("synthetic-op-secret"),
+        "{raw_dirty}"
+    );
+
+    // 5. Popping slot [1] under `mark_dirty("gateway")` prunes snapshot [1] while keeping [0].
+    cfg.gateway.paired_tokens.pop();
+    cfg.mark_dirty("gateway");
+    cfg.save_dirty().await.unwrap();
+    assert!(
+        !cfg.onepassword_reference_snapshots
+            .contains_key("gateway.paired_tokens[1]")
+    );
+    assert_eq!(
+        cfg.onepassword_reference_snapshots
+            .get("gateway.paired_tokens[0]")
+            .as_deref(),
+        Some("vault:OPENAI_OFFICIAL_API_KEY")
+    );
+
+    // 6. Clearing slot [0] to empty string under `mark_dirty("gateway")` does not resurrect
+    // the old `vault:` snapshot on disk.
+    cfg.gateway.paired_tokens[0].clear();
+    cfg.mark_dirty("gateway");
+    cfg.save_dirty().await.unwrap();
+    let raw_cleared_slot = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        !raw_cleared_slot.contains("vault:OPENAI_OFFICIAL_API_KEY"),
+        "{raw_cleared_slot}"
+    );
+    assert!(
+        !cfg.onepassword_reference_snapshots
+            .contains_key("gateway.paired_tokens[0]")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+async fn tachi_vault_dotted_mcp_sibling_collision_fails_closed_and_resolves_structurally() {
+    let _lock = env_override_lock().await;
+    let (dir, _guards) = tachi_vault_fixture("vault:OPENAI_OFFICIAL_API_KEY", false);
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+schema_version = 3
+
+[secrets]
+encrypt = false
+
+[[mcp.servers]]
+name = "a"
+command = "npx"
+
+[mcp.servers.env]
+"env.TOKEN" = "disk-a"
+
+[[mcp.servers]]
+name = "a.env"
+command = "uvx"
+
+[mcp.servers.env]
+TOKEN = "disk-a-env"
+"#,
+    )
+    .unwrap();
+
+    let mut cfg = Config::load_or_init().await.unwrap();
+
+    // 1. Mutating server "a"'s env["env.TOKEN"] to `vault:-invalid` must fail closed under
+    // `mark_dirty("mcp.servers")`, `mark_dirty("mcp.servers.a")`, and `save()`, never letting
+    // dotted prop_fields collisions with sibling server "a.env"'s `env["TOKEN"]` bypass checks.
+    for dirty_target in [Some("mcp.servers"), Some("mcp.servers.a"), None] {
+        let mut attempt = cfg.clone();
+        attempt.mcp.servers[0]
+            .env
+            .insert("env.TOKEN".to_string(), "vault:-invalid".to_string());
+        if let Some(path) = dirty_target {
+            attempt.mark_dirty(path);
+            assert!(
+                attempt.save_dirty().await.is_err(),
+                "dirty_target={path} should fail closed on vault:-invalid"
+            );
+        } else {
+            assert!(attempt.save().await.is_err());
+        }
+        let disk = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!disk.contains("vault:-invalid"), "{disk}");
+    }
+
+    // 2. Setting valid `vault:OPENAI_OFFICIAL_API_KEY` on server "a"'s env["env.TOKEN"] under
+    // `mark_dirty("mcp.servers")` must resolve onto server "a" without touching sibling "a.env".
+    cfg.mcp.servers[0].env.insert(
+        "env.TOKEN".to_string(),
+        "vault:OPENAI_OFFICIAL_API_KEY".to_string(),
+    );
+    cfg.mark_dirty("mcp.servers");
+    cfg.save_dirty().await.unwrap();
+    assert_eq!(
+        cfg.mcp.servers[0].env.get("env.TOKEN").map(String::as_str),
+        Some("synthetic-vault-secret")
+    );
+    assert_eq!(
+        cfg.mcp.servers[1].env.get("TOKEN").map(String::as_str),
+        Some("disk-a-env")
+    );
+    assert_eq!(
+        cfg.onepassword_reference_snapshots
+            .get("mcp.servers.a.env.env%2ETOKEN")
+            .as_deref(),
+        Some("vault:OPENAI_OFFICIAL_API_KEY")
+    );
+    assert!(
+        !cfg.onepassword_reference_snapshots
+            .contains_key("mcp.servers.a%2Eenv.env.TOKEN")
+    );
+    let parsed_after: Config =
+        toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    assert_eq!(
+        parsed_after.mcp.servers[0]
+            .env
+            .get("env.TOKEN")
+            .map(String::as_str),
+        Some("vault:OPENAI_OFFICIAL_API_KEY")
+    );
+    assert_eq!(
+        parsed_after.mcp.servers[1]
+            .env
+            .get("TOKEN")
+            .map(String::as_str),
+        Some("disk-a-env")
+    );
+
+    // 2b. Replacing server "a"'s env["env.TOKEN"] under whole-entry dirty
+    // `mark_dirty("mcp.servers.a")` updates server "a" and keeps sibling "a.env" untouched.
+    cfg.mcp.servers[0]
+        .env
+        .insert("env.TOKEN".to_string(), "op://vault/item/field".to_string());
+    cfg.mark_dirty("mcp.servers.a");
+    cfg.save_dirty().await.unwrap();
+    assert_eq!(
+        cfg.mcp.servers[0].env.get("env.TOKEN").map(String::as_str),
+        Some("synthetic-op-secret")
+    );
+    assert_eq!(
+        cfg.onepassword_reference_snapshots
+            .get("mcp.servers.a.env.env%2ETOKEN")
+            .as_deref(),
+        Some("op://vault/item/field")
+    );
+    let parsed_entry_dirty: Config =
+        toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    assert_eq!(
+        parsed_entry_dirty.mcp.servers[0]
+            .env
+            .get("env.TOKEN")
+            .map(String::as_str),
+        Some("op://vault/item/field")
+    );
+    assert_eq!(
+        parsed_entry_dirty.mcp.servers[1]
+            .env
+            .get("TOKEN")
+            .map(String::as_str),
+        Some("disk-a-env")
+    );
+
+    // 3. Clearing server "a"'s env["env.TOKEN"] to "" under `mark_dirty("mcp.servers")` does not
+    // resurrect the old `vault:` reference on disk or keep a stale snapshot.
+    cfg.mcp.servers[0]
+        .env
+        .insert("env.TOKEN".to_string(), String::new());
+    cfg.mark_dirty("mcp.servers");
+    cfg.save_dirty().await.unwrap();
+    let parsed_cleared: Config =
+        toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    assert_ne!(
+        parsed_cleared.mcp.servers[0]
+            .env
+            .get("env.TOKEN")
+            .map(String::as_str),
+        Some("vault:OPENAI_OFFICIAL_API_KEY")
+    );
+    assert!(
+        !cfg.onepassword_reference_snapshots
+            .contains_key("mcp.servers.a.env.env%2ETOKEN")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+async fn tachi_vault_full_save_prunes_stale_snapshots_and_creates_nested_mcp_subtable() {
+    let _lock = env_override_lock().await;
+    let (dir, _guards) = tachi_vault_fixture("vault:OPENAI_OFFICIAL_API_KEY", false);
+    let config_path = dir.path().join("config.toml");
+
+    // 1. Standalone `save()` after clearing a resolved `paired_tokens` slot must prune the stale
+    // snapshot so a subsequent `mark_dirty("gateway") + save_dirty()` with `new-token` never
+    // resurrects the old `vault:` reference on disk.
+    std::fs::write(
+        &config_path,
+        r#"
+schema_version = 3
+
+[secrets]
+encrypt = false
+
+[gateway]
+paired_tokens = ["vault:OPENAI_OFFICIAL_API_KEY"]
+"#,
+    )
+    .unwrap();
+    let mut cfg = Config::load_or_init().await.unwrap();
+    assert_eq!(cfg.gateway.paired_tokens, vec!["synthetic-vault-secret"]);
+    cfg.gateway.paired_tokens[0].clear();
+    cfg.save().await.unwrap();
+    assert!(
+        !cfg.onepassword_reference_snapshots
+            .contains_key("gateway.paired_tokens[0]")
+    );
+    let raw_after_clear = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        !raw_after_clear.contains("vault:OPENAI_OFFICIAL_API_KEY"),
+        "{raw_after_clear}"
+    );
+
+    cfg.gateway.paired_tokens[0] = "new-token".to_string();
+    cfg.mark_dirty("gateway");
+    cfg.save_dirty().await.unwrap();
+    assert_eq!(cfg.gateway.paired_tokens, vec!["new-token"]);
+    let raw_reassigned = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        raw_reassigned.contains("new-token")
+            && !raw_reassigned.contains("vault:OPENAI_OFFICIAL_API_KEY"),
+        "{raw_reassigned}"
+    );
+
+    // 2. Standalone `model_routes.clear(); mark_dirty("model_routes"); save(); clear_dirty(); save()`
+    // on a fresh loaded Config (without calling `save_dirty()` first) must prune snapshots on the
+    // first `save()` so the subsequent `save()` does not fail or resurrect references.
+    std::fs::write(
+        &config_path,
+        r#"
+schema_version = 3
+
+[secrets]
+encrypt = false
+
+[[model_routes]]
+hint = "fast"
+provider = "openai.default"
+model = "gpt-5-mini"
+api_key = "vault:OPENAI_OFFICIAL_API_KEY"
+"#,
+    )
+    .unwrap();
+    let mut routes_cfg = Config::load_or_init().await.unwrap();
+    assert!(
+        routes_cfg
+            .onepassword_reference_snapshots
+            .contains_key("model_routes.fast.api_key")
+    );
+    routes_cfg.model_routes.clear();
+    routes_cfg.mark_dirty("model_routes");
+    routes_cfg.save().await.unwrap();
+    assert!(
+        !routes_cfg
+            .onepassword_reference_snapshots
+            .contains_key("model_routes.fast.api_key")
+    );
+    routes_cfg.clear_dirty();
+    routes_cfg.save().await.unwrap();
+    let raw_routes_cleared = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        !raw_routes_cleared.contains("model_routes")
+            && !raw_routes_cleared.contains("vault:OPENAI_OFFICIAL_API_KEY"),
+        "{raw_routes_cleared}"
+    );
+
+    // 3. Replacing a provider secret via `set_prop_persistent` + standalone `save()` (plus
+    // `force_save()` coverage) must prune the superseded snapshot and avoid resurrection.
+    std::fs::write(
+        &config_path,
+        r#"
+schema_version = 3
+
+[secrets]
+encrypt = false
+
+[providers.models.openai.default]
+model = "gpt-5.4"
+api_key = "vault:OPENAI_OFFICIAL_API_KEY"
+"#,
+    )
+    .unwrap();
+    let mut prop_cfg = Config::load_or_init().await.unwrap();
+    prop_cfg
+        .set_prop_persistent(
+            "providers.models.openai.default.api_key",
+            "replacement-plain",
+        )
+        .unwrap();
+    prop_cfg.save().await.unwrap();
+    assert!(
+        !prop_cfg
+            .onepassword_reference_snapshots
+            .contains_key("providers.models.openai.default.api_key")
+    );
+    prop_cfg.clear_dirty();
+    prop_cfg.force_save().await.unwrap();
+    let raw_replaced = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        raw_replaced.contains("replacement-plain")
+            && !raw_replaced.contains("vault:OPENAI_OFFICIAL_API_KEY"),
+        "{raw_replaced}"
+    );
+
+    // 4. Adding a new `[mcp.servers.env]` subtable to an existing `[[mcp.servers]]` entry that
+    // previously had no `env` table under `mark_dirty("mcp.servers.no_env") + save_dirty()` must
+    // emit valid TOML with `[mcp.servers.env]` positioned under its parent entry.
+    std::fs::write(
+        &config_path,
+        r#"
+schema_version = 3
+
+[secrets]
+encrypt = false
+
+[[mcp.servers]]
+name = "no_env"
+command = "npx"
+"#,
+    )
+    .unwrap();
+    let mut mcp_cfg = Config::load_or_init().await.unwrap();
+    mcp_cfg.mcp.servers[0].env.insert(
+        "API_TOKEN".to_string(),
+        "vault:OPENAI_OFFICIAL_API_KEY".to_string(),
+    );
+    mcp_cfg.mark_dirty("mcp.servers.no_env");
+    mcp_cfg.save_dirty().await.unwrap();
+    assert_eq!(
+        mcp_cfg.mcp.servers[0]
+            .env
+            .get("API_TOKEN")
+            .map(String::as_str),
+        Some("synthetic-vault-secret")
+    );
+    let raw_mcp = std::fs::read_to_string(&config_path).unwrap();
+    let parsed_mcp: Config = toml::from_str(&raw_mcp).expect(&raw_mcp);
+    assert_eq!(
+        parsed_mcp.mcp.servers[0]
+            .env
+            .get("API_TOKEN")
+            .map(String::as_str),
+        Some("vault:OPENAI_OFFICIAL_API_KEY")
+    );
+
+    // 5. Env-overridden Vault field explicitly replaced via `set_prop_persistent` and persisted
+    // with standalone `save()` (before `clear_dirty()` + `force_save()` + `save()`) must sync
+    // `pre_override_snapshots` and `env_overridden_paths` alongside `onepassword_reference_snapshots`
+    // so subsequent full saves never mask stale plaintext back onto disk (both encrypt=false/true).
+    for encrypt in [false, true] {
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+schema_version = 3
+
+[secrets]
+encrypt = {encrypt}
+
+[providers.models.openai.default]
+model = "gpt-5.4"
+api_key = "vault:OPENAI_OFFICIAL_API_KEY"
+"#
+            ),
+        )
+        .unwrap();
+        let _env_guard = EnvValueGuard::set(
+            "ZEROCLAW_providers__models__openai__default__api_key",
+            "synthetic-env-override",
+        );
+        let path = "providers.models.openai.default.api_key";
+        let mut env_cfg = Config::load_or_init().await.unwrap();
+        assert!(env_cfg.prop_is_env_overridden(path));
+        assert!(env_cfg.pre_override_snapshots.contains_key(path));
+        assert!(env_cfg.onepassword_reference_snapshots.contains_key(path));
+
+        env_cfg
+            .set_prop_persistent(path, "replacement-plain")
+            .unwrap();
+        env_cfg.save().await.unwrap();
+        assert!(!env_cfg.onepassword_reference_snapshots.contains_key(path));
+        assert!(!env_cfg.pre_override_snapshots.contains_key(path));
+        assert!(!env_cfg.env_overridden_paths.contains(path));
+        assert!(!env_cfg.prop_is_env_overridden(path));
+
+        env_cfg.clear_dirty();
+        env_cfg.force_save().await.unwrap();
+        env_cfg.save().await.unwrap();
+
+        let raw_after = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !raw_after.contains("synthetic-vault-secret")
+                && !raw_after.contains("synthetic-env-override")
+                && !raw_after.contains("vault:OPENAI_OFFICIAL_API_KEY"),
+            "encrypt={encrypt}: {raw_after}"
+        );
+        let mut parsed_after: Config = toml::from_str(&raw_after).unwrap();
+        parsed_after
+            .decrypt_secrets(&crate::secrets::SecretStore::new(dir.path(), encrypt))
+            .unwrap();
+        assert_eq!(
+            crate::env_overrides::raw_value_for_path(&parsed_after, path).as_deref(),
+            Some("replacement-plain")
+        );
+    }
 }
 
 #[cfg(unix)]
