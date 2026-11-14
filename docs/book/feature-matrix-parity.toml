@@ -111,14 +111,6 @@ hermes = "supported"
 openclaw = "none"
 hermes = "none"
 
-[channels.twitch]
-openclaw = "supported"
-hermes = "none"
-
-[channels.irc]
-openclaw = "supported"
-hermes = "supported"
-
 [channels.lark]
 openclaw = "supported"
 hermes = "supported"

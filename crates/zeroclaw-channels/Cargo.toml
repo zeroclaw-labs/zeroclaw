@@ -193,7 +193,6 @@ channels-full = [
   "channel-discord",
   "channel-git",
   "channel-imessage",
-  "channel-irc",
   "channel-lark",
   "channel-line",
   "channel-linq",
@@ -207,7 +206,6 @@ channels-full = [
   "channel-reddit",
   "channel-signal",
   "channel-slack",
-  "channel-twitch",
   "channel-twitter",
   "channel-voice-call",
   "channel-wecom",
@@ -255,8 +253,6 @@ channel-discord = ["ws-transport"]
 channel-slack = ["ws-transport"]
 channel-signal = ["dep:mime_guess"]
 channel-mattermost = ["ws-transport"]
-channel-irc = ["tls-client"]
-channel-twitch = ["channel-irc"]
 channel-imessage = ["dep:rusqlite"]
 channel-dingtalk = ["ws-transport"]
 channel-qq = ["ws-transport"]

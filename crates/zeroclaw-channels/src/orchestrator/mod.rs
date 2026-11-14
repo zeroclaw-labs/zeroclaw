@@ -29,8 +29,6 @@ pub use crate::git::GitChannel;
 pub use crate::gmail_push::GmailPushChannel;
 #[cfg(feature = "channel-imessage")]
 pub use crate::imessage::IMessageChannel;
-#[cfg(feature = "channel-irc")]
-pub use crate::irc::IrcChannel;
 #[cfg(feature = "channel-lark")]
 pub use crate::lark::LarkChannel;
 #[cfg(feature = "channel-line")]
@@ -57,8 +55,6 @@ pub use crate::signal::SignalChannel;
 pub use crate::slack::SlackChannel;
 pub use crate::transcription;
 pub use crate::tts::{TtsManager, TtsProvider};
-#[cfg(feature = "channel-twitch")]
-pub use crate::twitch::TwitchChannel;
 #[cfg(feature = "channel-twitter")]
 pub use crate::twitter::TwitterChannel;
 #[cfg(feature = "channel-voice-call")]
@@ -3405,9 +3401,10 @@ fn is_agent_scope_authorized(
 }
 
 /// Canonical peer-username form used by the agent-scope gate. Inbound
-/// channels (Telegram: `Self::normalize_identity`; IRC: `Match::CaseInsensitive`;
-/// Matrix: same) already collapse the inbound sender into a stripped /
-/// case-folded identity before calling `allowlist::is_user_allowed`. The
+/// channels (Telegram: `Self::normalize_identity`; Matrix:
+/// `Match::CaseInsensitive`) already collapse the inbound sender into a
+/// stripped / case-folded identity before calling
+/// `allowlist::is_user_allowed`. The
 /// gate must apply the same shape to the configured `external_peers`
 /// list so an operator's `"@user_1"` / `"user_1"` / `"@Alice"` entries
 /// all match the same channel-normalized sender identity.
@@ -6142,7 +6139,7 @@ fn is_partial_protocol_tag_open(rest: &str) -> bool {
 /// delivered response never keeps: reasoning traces, and — because native
 /// tool-call providers interleave narration with protocol — raw
 /// `<tool_call>` / `<tool_result>` envelopes. Final replies are cleaned by
-/// [`sanitize_channel_response_for_format_with_leak_detection`], but drafts
+/// [`sanitize_channel_response_with_leak_detection`], but drafts
 /// never reach it: `update_draft` posts straight to the channel transport, so
 /// a leaked envelope stays on screen until the final edit replaces it, and
 /// remains visible indefinitely if the turn fails first.
@@ -6444,7 +6441,6 @@ async fn run_draft_updater(
     outbound_channel: String,
     rx: tokio::sync::mpsc::Receiver<zeroclaw_runtime::agent::loop_::DraftEvent>,
 ) {
-    let content_format = outbound_content_format_for_channel(&outbound_channel);
     run_draft_updater_with_leak_detection(
         channel,
         reply_target,
@@ -6452,7 +6448,6 @@ async fn run_draft_updater(
         known_tool_names,
         Arc::new(Mutex::new(String::new())),
         leak_detection,
-        content_format,
         turn_flush_narration,
         outbound_hooks,
         outbound_channel,
@@ -6471,7 +6466,6 @@ async fn run_draft_updater_with_leak_detection(
     known_tool_names: HashSet<String>,
     streamed_text: Arc<Mutex<String>>,
     leak_detection: zeroclaw_config::schema::LeakDetectionConfig,
-    content_format: OutboundContentFormat,
     turn_flush_narration: bool,
     outbound_hooks: Option<Arc<zeroclaw_runtime::hooks::HookRunner>>,
     outbound_channel: String,
@@ -6573,7 +6567,6 @@ async fn run_draft_updater_with_leak_detection(
                 let visible = redact_channel_outbound_leaks(
                     &sanitize_streaming_draft_text(&accumulated, &known_tool_names),
                     &leak_detection,
-                    content_format,
                 );
                 // Keep the exact visible frame used for MultiMessage offsets;
                 // retaining the raw accumulation here could reintroduce a
@@ -6673,42 +6666,10 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
     )
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OutboundContentFormat {
-    Markdown,
-    PlainText,
-}
-
-fn outbound_content_format_for_channel(channel: &str) -> OutboundContentFormat {
-    let channel_type = channel
-        .split_once('.')
-        .map_or(channel, |(channel_type, _)| channel_type);
-    if channel_type.eq_ignore_ascii_case("irc") || channel_type.eq_ignore_ascii_case("twitch") {
-        OutboundContentFormat::PlainText
-    } else {
-        OutboundContentFormat::Markdown
-    }
-}
-
-#[cfg(test)]
 fn sanitize_channel_response_with_leak_detection(
     response: &str,
     tools: &[Box<dyn Tool>],
     leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
-) -> String {
-    sanitize_channel_response_for_format_with_leak_detection(
-        response,
-        tools,
-        leak_detection,
-        OutboundContentFormat::Markdown,
-    )
-}
-
-fn sanitize_channel_response_for_format_with_leak_detection(
-    response: &str,
-    tools: &[Box<dyn Tool>],
-    leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
-    content_format: OutboundContentFormat,
 ) -> String {
     let known_tool_names: HashSet<String> = tools
         .iter()
@@ -6738,7 +6699,7 @@ fn sanitize_channel_response_for_format_with_leak_detection(
     // Strip leading narration lines that announce tool usage
     let sanitized = strip_tool_narration(&stripped_json);
 
-    redact_channel_outbound_leaks(&sanitized, leak_detection, content_format)
+    redact_channel_outbound_leaks(&sanitized, leak_detection)
 }
 
 /// Apply the same outbound security/operator boundary the final reply crosses to
@@ -6802,7 +6763,6 @@ async fn apply_multi_message_narration_policy(
         prior_tail,
         &outbound,
         leak_detection,
-        outbound_content_format_for_channel(channel),
     ))
 }
 
@@ -6924,7 +6884,6 @@ async fn flush_completed_narration_turn(
 fn redact_channel_outbound_leaks(
     content: &str,
     leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
-    content_format: OutboundContentFormat,
 ) -> String {
     if !leak_detection.enabled {
         return content.to_string();
@@ -6932,7 +6891,7 @@ fn redact_channel_outbound_leaks(
     // Scan for credential leaks before returning to caller. Format-specific
     // outbound layers identify parsed destinations that must remain intact and
     // pass only byte ranges to the format-agnostic detector.
-    let protected_spans = channel_outbound_protected_spans(content, content_format);
+    let protected_spans = channel_outbound_protected_spans(content);
     match zeroclaw_runtime::security::LeakDetector::with_config(leak_detection)
         .scan_with_protected_spans(content, &protected_spans)
     {
@@ -6970,10 +6929,9 @@ fn redact_channel_outbound_leaks_with_prior_context(
     prior_tail: &str,
     content: &str,
     leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
-    content_format: OutboundContentFormat,
 ) -> String {
     // First redact secrets contained entirely within this turn.
-    let self_redacted = redact_channel_outbound_leaks(content, leak_detection, content_format);
+    let self_redacted = redact_channel_outbound_leaks(content, leak_detection);
     if !leak_detection.enabled || prior_tail.is_empty() {
         return self_redacted;
     }
@@ -6981,8 +6939,7 @@ fn redact_channel_outbound_leaks_with_prior_context(
     // `prior_tail` is already-delivered narration, so on its own it holds no
     // complete secret; a change here means one spans the boundary.
     let combined = format!("{prior_tail}{self_redacted}");
-    let combined_redacted =
-        redact_channel_outbound_leaks(&combined, leak_detection, content_format);
+    let combined_redacted = redact_channel_outbound_leaks(&combined, leak_detection);
     if combined_redacted == combined {
         return self_redacted;
     }
@@ -7022,10 +6979,7 @@ fn longest_common_char_suffix<'b>(a: &str, b: &'b str) -> &'b str {
     &b[split..]
 }
 
-fn channel_outbound_protected_spans(
-    content: &str,
-    content_format: OutboundContentFormat,
-) -> Vec<Range<usize>> {
+fn channel_outbound_protected_spans(content: &str) -> Vec<Range<usize>> {
     let mut spans = Vec::new();
     // A file URI is a file reference even when punctuation inside it looks
     // like query syntax; protect it for every outbound text format.
@@ -7036,16 +6990,11 @@ fn channel_outbound_protected_spans(
     {
         collect_raw_file_uri_spans(content, &mut spans);
     }
-    match content_format {
-        OutboundContentFormat::Markdown => {
-            if content.contains("](")
-                || content.contains("]:")
-                || (content.contains('<') && content.contains("://"))
-            {
-                collect_markdown_link_destination_spans(content, &mut spans);
-            }
-        }
-        OutboundContentFormat::PlainText => {}
+    if content.contains("](")
+        || content.contains("]:")
+        || (content.contains('<') && content.contains("://"))
+    {
+        collect_markdown_link_destination_spans(content, &mut spans);
     }
     spans
 }
@@ -10244,7 +10193,6 @@ async fn process_channel_message_body(
                     .collect();
                 let streamed_draft_text = Arc::clone(&streamed_draft_text);
                 let leak_detection = ctx.prompt_config.security.leak_detection.clone();
-                let content_format = outbound_content_format_for_channel(&msg.channel);
                 Some(zeroclaw_spawn::spawn!(async move {
                     let _lease = draft_lease;
                     run_draft_updater_with_leak_detection(
@@ -10254,7 +10202,6 @@ async fn process_channel_message_body(
                         known_tool_names,
                         streamed_draft_text,
                         leak_detection,
-                        content_format,
                         turn_flush_narration,
                         outbound_hooks,
                         outbound_channel,
@@ -10888,11 +10835,10 @@ async fn process_channel_message_body(
                 }
             }
 
-            let sanitized_response = sanitize_channel_response_for_format_with_leak_detection(
+            let sanitized_response = sanitize_channel_response_with_leak_detection(
                 &outbound_response,
                 ctx.tools_registry.as_ref(),
                 &ctx.prompt_config.security.leak_detection,
-                outbound_content_format_for_channel(&msg.channel),
             );
             let mut delivered_response =
                 if sanitized_response.is_empty() && !outbound_response.trim().is_empty() {
@@ -13174,7 +13120,7 @@ impl std::fmt::Display for UnknownChannelId {
             f,
             "Unknown channel '{channel_id}'. Supported: telegram, discord, slack, mattermost, \
             signal, matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, wecom_ws, nextcloud_talk, \
-            linq, email, gmail_push, git, irc, twitter, mochat, imessage, line, voice-call"
+            linq, email, gmail_push, git, twitter, mochat, imessage, line, voice-call"
         )
     }
 }
@@ -13831,64 +13777,6 @@ fn build_channel_by_id(
         #[cfg(not(feature = "channel-email"))]
         "gmail_push" | "gmail-push" => {
             anyhow::bail!("Gmail Push channel requires the `channel-email` feature");
-        }
-        #[cfg(feature = "channel-irc")]
-        "irc" => {
-            let irc_cfg = config
-                .channels
-                .irc
-                .get("default")
-                .context("IRC channel is not configured")?;
-            let alias = "default".to_string();
-            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
-                let cfg_arc = config_arc.clone();
-                let alias = alias.clone();
-                Arc::new(move || cfg_arc.read().channel_external_peers("irc", &alias))
-            };
-            Ok(Arc::new(IrcChannel::new(crate::irc::IrcChannelConfig {
-                server: irc_cfg.server.clone(),
-                port: irc_cfg.port,
-                nickname: irc_cfg.nickname.clone(),
-                username: irc_cfg.username.clone(),
-                channels: irc_cfg.channels.clone(),
-                alias,
-                peer_resolver,
-                server_password: irc_cfg.server_password.clone(),
-                nickserv_password: irc_cfg.nickserv_password.clone(),
-                sasl_password: irc_cfg.sasl_password.clone(),
-                verify_tls: irc_cfg.verify_tls.unwrap_or(true),
-                mention_only: irc_cfg.mention_only,
-            })))
-        }
-        #[cfg(not(feature = "channel-irc"))]
-        "irc" => {
-            anyhow::bail!("IRC channel requires the `channel-irc` feature");
-        }
-        #[cfg(feature = "channel-twitch")]
-        "twitch" => {
-            let tw_cfg = config
-                .channels
-                .twitch
-                .get("default")
-                .context("Twitch channel is not configured")?;
-            let alias = "default".to_string();
-            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
-                let cfg_arc = config_arc.clone();
-                let alias = alias.clone();
-                Arc::new(move || cfg_arc.read().channel_external_peers("twitch", &alias))
-            };
-            Ok(Arc::new(TwitchChannel::new(
-                tw_cfg.bot_username.clone(),
-                tw_cfg.oauth_token.clone(),
-                tw_cfg.channels.clone(),
-                tw_cfg.mention_only,
-                alias,
-                peer_resolver,
-            )))
-        }
-        #[cfg(not(feature = "channel-twitch"))]
-        "twitch" => {
-            anyhow::bail!("Twitch channel requires the `channel-twitch` feature");
         }
         #[cfg(feature = "channel-twitter")]
         "twitter" => {
@@ -15476,50 +15364,6 @@ fn collect_configured_channels_with_authority(
         );
     }
 
-    #[cfg(feature = "channel-irc")]
-    for (alias, irc) in &config.channels.irc {
-        if !active_channel_aliases.contains(&format!("irc.{alias}")) {
-            continue;
-        }
-        if !irc.enabled {
-            continue;
-        }
-        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
-            let cfg_arc = config_arc.clone();
-            let alias = alias.clone();
-            Arc::new(move || cfg_arc.read().channel_external_peers("irc", &alias))
-        };
-        channels.push(ConfiguredChannel {
-            display_name: "IRC",
-            alias: Some(alias.clone()),
-            channel: Arc::new(IrcChannel::new(crate::irc::IrcChannelConfig {
-                server: irc.server.clone(),
-                port: irc.port,
-                nickname: irc.nickname.clone(),
-                username: irc.username.clone(),
-                channels: irc.channels.clone(),
-                alias: alias.clone(),
-                peer_resolver,
-                server_password: irc.server_password.clone(),
-                nickserv_password: irc.nickserv_password.clone(),
-                sasl_password: irc.sasl_password.clone(),
-                verify_tls: irc.verify_tls.unwrap_or(true),
-                mention_only: irc.mention_only,
-            })),
-        });
-    }
-
-    #[cfg(not(feature = "channel-irc"))]
-    if !config.channels.irc.is_empty() {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-            "IRC channel is configured but this build was compiled without \
-             `channel-irc`; skipping IRC."
-        );
-    }
-
     #[cfg(feature = "channel-amqp")]
     for (alias, amqp) in &config.channels.amqp {
         if !active_channel_aliases.contains(&format!("amqp.{alias}")) {
@@ -15582,44 +15426,6 @@ fn collect_configured_channels_with_authority(
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
             "AMQP channel is configured but this build was compiled without \
              `channel-amqp`; skipping AMQP."
-        );
-    }
-
-    #[cfg(feature = "channel-twitch")]
-    for (alias, tw) in &config.channels.twitch {
-        if !active_channel_aliases.contains(&format!("twitch.{alias}")) {
-            continue;
-        }
-        if !tw.enabled {
-            continue;
-        }
-        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
-            let cfg_arc = config_arc.clone();
-            let alias = alias.clone();
-            Arc::new(move || cfg_arc.read().channel_external_peers("twitch", &alias))
-        };
-        channels.push(ConfiguredChannel {
-            display_name: "Twitch",
-            alias: Some(alias.clone()),
-            channel: Arc::new(TwitchChannel::new(
-                tw.bot_username.clone(),
-                tw.oauth_token.clone(),
-                tw.channels.clone(),
-                tw.mention_only,
-                alias.clone(),
-                peer_resolver,
-            )),
-        });
-    }
-
-    #[cfg(not(feature = "channel-twitch"))]
-    if !config.channels.twitch.is_empty() {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-            "Twitch channel is configured but this build was compiled without \
-             `channel-twitch`; skipping Twitch."
         );
     }
 
@@ -17904,11 +17710,7 @@ pub async fn deliver_announcement(
 ) -> anyhow::Result<()> {
     use zeroclaw_api::channel::SendMessage;
 
-    let safe_output = redact_channel_outbound_leaks(
-        output,
-        &config.security.leak_detection,
-        outbound_content_format_for_channel(channel),
-    );
+    let safe_output = redact_channel_outbound_leaks(output, &config.security.leak_detection);
     let safe_output = ensure_nonempty_channel_reply(safe_output, output, channel, target);
 
     let make_msg = |s: &str| SendMessage::new(s, target).in_thread(thread_id.clone());
@@ -44684,28 +44486,28 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[test]
     fn agent_scope_gate_matches_case_insensitive_sender() {
-        // Inbound IRC and Matrix use `Match::CaseInsensitive`; the
+        // Inbound Matrix uses `Match::CaseInsensitive`; the
         // gate's ASCII-lowercase normalization must produce the same
         // outcome so a configured `"Alice"` matches an inbound `"alice"`.
         let tmp = tempfile::TempDir::new().unwrap();
         let mut groups = std::collections::HashMap::new();
         groups.insert(
-            "irc_admins".into(),
-            peer_group("irc.freenode", &["Alice"], true),
+            "matrix_admins".into(),
+            peer_group("matrix.home", &["Alice"], true),
         );
         let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
 
         assert!(
             is_agent_scope_authorized(
                 &ctx,
-                &agent_scope_msg_with_channel("alice", "irc", "freenode")
+                &agent_scope_msg_with_channel("alice", "matrix", "home")
             ),
-            "configured `Alice` must match an inbound `alice` sender (RFC 2812 case-insensitive)"
+            "configured `Alice` must match an inbound `alice` sender"
         );
         assert!(
             is_agent_scope_authorized(
                 &ctx,
-                &agent_scope_msg_with_channel("ALICE", "irc", "freenode")
+                &agent_scope_msg_with_channel("ALICE", "matrix", "home")
             ),
             "configured `Alice` must match an inbound `ALICE` sender"
         );
@@ -54902,7 +54704,7 @@ This is an example JSON object for profile settings."#;
         let outbound = format!("Recorded {target}.");
 
         // The entropy-protected span is still computed correctly...
-        let spans = channel_outbound_protected_spans(&outbound, OutboundContentFormat::Markdown);
+        let spans = channel_outbound_protected_spans(&outbound);
         assert_eq!(
             spans
                 .iter()
@@ -54931,7 +54733,7 @@ This is an example JSON object for profile settings."#;
         let target = "file:///tmp/report.md?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
         let outbound = format!("Recorded path={target}.");
 
-        let spans = channel_outbound_protected_spans(&outbound, OutboundContentFormat::Markdown);
+        let spans = channel_outbound_protected_spans(&outbound);
         assert_eq!(
             spans
                 .iter()
@@ -54958,7 +54760,7 @@ This is an example JSON object for profile settings."#;
         let target = "file:///tmp/report.md?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
         let outbound = format!(r#"{{"uri":"{target}"}}"#);
 
-        let spans = channel_outbound_protected_spans(&outbound, OutboundContentFormat::Markdown);
+        let spans = channel_outbound_protected_spans(&outbound);
         assert_eq!(
             spans
                 .iter()
@@ -54980,37 +54782,16 @@ This is an example JSON object for profile settings."#;
     }
 
     #[test]
-    fn plain_text_leak_guard_preserves_raw_file_uri_filenames() {
+    fn leak_guard_preserves_raw_file_uri_filenames() {
         let target = "file:///home/zeroclaw/.zeroclaw/agents/mission-orchestrator/workspace/tasks/inbox/2026-07-02-11-26-plan-b-for-something-useful.md";
         let outbound = format!("Recorded {target}.");
 
         let result = redact_channel_outbound_leaks(
             &outbound,
             &zeroclaw_config::schema::LeakDetectionConfig::default(),
-            OutboundContentFormat::PlainText,
         );
 
         assert_eq!(result, outbound);
-    }
-
-    #[test]
-    fn irc_family_outbound_format_is_plain_text() {
-        assert_eq!(
-            outbound_content_format_for_channel("irc.default"),
-            OutboundContentFormat::PlainText
-        );
-        assert_eq!(
-            outbound_content_format_for_channel("twitch.default"),
-            OutboundContentFormat::PlainText
-        );
-        assert_eq!(
-            outbound_content_format_for_channel("twitch"),
-            OutboundContentFormat::PlainText
-        );
-        assert_eq!(
-            outbound_content_format_for_channel("telegram.default"),
-            OutboundContentFormat::Markdown
-        );
     }
 
     #[test]
@@ -55034,7 +54815,6 @@ This is an example JSON object for profile settings."#;
         let result = redact_channel_outbound_leaks(
             input,
             &zeroclaw_config::schema::LeakDetectionConfig::default(),
-            OutboundContentFormat::Markdown,
         );
 
         assert_eq!(result, input);
@@ -55048,7 +54828,6 @@ This is an example JSON object for profile settings."#;
         let result = redact_channel_outbound_leaks(
             &input,
             &zeroclaw_config::schema::LeakDetectionConfig::default(),
-            OutboundContentFormat::Markdown,
         );
 
         assert!(
@@ -55435,7 +55214,7 @@ Done."#;
 
     // ── Streaming draft scratchpad sanitization ───────────────────────────
     //
-    // Drafts bypass `sanitize_channel_response_for_format_with_leak_detection`
+    // Drafts bypass `sanitize_channel_response_with_leak_detection`
     // entirely (`update_draft` posts straight to the transport), so these pin
     // the draft boundary to the same preservation contract as final delivery.
 
@@ -55823,7 +55602,6 @@ Done."#;
             no_tools(),
             Arc::clone(&streamed_text),
             zeroclaw_config::schema::LeakDetectionConfig::default(),
-            OutboundContentFormat::Markdown,
             false,
             None,
             String::new(),
@@ -55903,7 +55681,6 @@ Done."#;
             no_tools(),
             Arc::clone(&streamed_text),
             zeroclaw_config::schema::LeakDetectionConfig::default(),
-            OutboundContentFormat::Markdown,
             false,
             None,
             String::new(),
@@ -55993,7 +55770,6 @@ Done."#;
             no_tools(),
             Arc::clone(&streamed_text),
             zeroclaw_config::schema::LeakDetectionConfig::default(),
-            OutboundContentFormat::Markdown,
             false,
             None,
             String::new(),
@@ -56064,7 +55840,6 @@ Done."#;
             no_tools(),
             Arc::clone(&streamed_text),
             zeroclaw_config::schema::LeakDetectionConfig::default(),
-            OutboundContentFormat::Markdown,
             false,
             None,
             String::new(),
@@ -56135,7 +55910,6 @@ Done."#;
                 no_tools(),
                 Arc::clone(&streamed),
                 zeroclaw_config::schema::LeakDetectionConfig::default(),
-                OutboundContentFormat::Markdown,
                 false,
                 None,
                 String::new(),
@@ -56247,7 +56021,6 @@ Done."#;
                 no_tools(),
                 Arc::clone(&streamed),
                 zeroclaw_config::schema::LeakDetectionConfig::default(),
-                OutboundContentFormat::Markdown,
                 false,
                 None,
                 String::new(),
@@ -56363,7 +56136,6 @@ Done."#;
             no_tools(),
             Arc::clone(&streamed),
             zeroclaw_config::schema::LeakDetectionConfig::default(),
-            OutboundContentFormat::Markdown,
             false,
             None,
             String::new(),
@@ -56514,7 +56286,6 @@ Done."#;
             no_tools(),
             Arc::clone(&streamed),
             zeroclaw_config::schema::LeakDetectionConfig::default(),
-            OutboundContentFormat::Markdown,
             false,
             None,
             String::new(),
@@ -56601,7 +56372,6 @@ Done."#;
             no_tools(),
             Arc::clone(&streamed),
             zeroclaw_config::schema::LeakDetectionConfig::default(),
-            OutboundContentFormat::Markdown,
             false,
             None,
             String::new(),
@@ -57520,8 +57290,6 @@ Done."#;
             "nextcloud_talk",
             "gmail-push",
             "gmail_push",
-            "irc",
-            "twitch",
             "dingtalk",
             "wecom",
             "wecom_ws",

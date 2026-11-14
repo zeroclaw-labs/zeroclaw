@@ -6,28 +6,10 @@ Broadcast / social-feed integrations. These differ from chat channels in two way
 
 ## Twitch
 
-Twitch chat is a thin adapter over IRC. Build it with `--features channel-twitch` or include it through `--features channels-full`; the lean default build does not include it.
-
-Configure `enabled`, `bot_username`, `oauth_token`, and the channels to join under a Twitch alias. `mention_only` is optional and defaults to `false`. A minimal instance looks like this:
-
-```toml
-[channels.twitch.default]
-enabled = true
-bot_username = "zeroclaw_bot"
-oauth_token = "replace-with-twitch-token"
-channels = ["zeroclaw_channel"]
-mention_only = true
-
-[peer_groups.twitch_default]
-channel = "twitch.default"
-external_peers = ["zeroclaw_user"]
-```
-
-- **Auth:** use a Twitch user access token for the bot account with [`chat:read` and `chat:edit`](https://dev.twitch.tv/docs/chat/irc/#authenticating-with-the-twitch-irc-server). After configuring the [Twitch CLI](https://dev.twitch.tv/docs/cli/token-command/), generate it while signed in as that account with `twitch token -u -s 'chat:read chat:edit'`, then store it through a protected config surface. ZeroClaw trims the value and adds the required `oauth:` prefix when it is omitted.
-- **Channels:** entries in `channels` may include the leading `#`; ZeroClaw adds it when missing and normalizes channel names to lowercase.
-- **Inbound and outbound:** channel messages are answered in the same channel. `mention_only = true` ignores channel messages that do not mention `bot_username`. If Twitch delivers a non-channel IRC `PRIVMSG` to the bot login, ZeroClaw replies to that sender; the adapter does not configure a separate whisper transport.
-- **Formatting:** Twitch replies use plain text and are split to fit IRC frames. Markdown formatting is not preserved.
-- **Rate limits:** the adapter writes IRC `PRIVMSG` frames directly and has no Twitch-specific rate limiter or HTTP `429` backoff. Keep the agent's posting cadence within Twitch Chat limits and throttle bursty workflows at their source.
+Twitch chat is a [plugin channel](./overview.md#plugin-channels): install the
+`twitch` package from the plugin registry instead of building it in. See the
+[`twitch` plugin guide](https://github.com/zeroclaw-labs/zeroclaw-plugins/tree/main/plugins/twitch) for the token, configuration, rate
+limits, and moving a former `[channels.twitch.<alias>]` instance.
 
 ## Bluesky (AT Protocol)
 
@@ -88,4 +70,4 @@ Bots on public social networks attract adversarial input. Two precautions:
 
 ## Rate limits
 
-Rate-limit handling differs by channel. Twitch writes IRC `PRIVMSG` frames directly and has no adapter-specific limiter. If you hit persistent rate-limiting, throttle the agent's posting cadence at the source rather than relying on per-channel streaming knobs (none of these channels expose draft-update intervals; their schema is intentionally minimal).
+Rate-limit handling differs by channel. If you hit persistent rate-limiting, throttle the agent's posting cadence at the source rather than relying on per-channel streaming knobs (none of these channels expose draft-update intervals; their schema is intentionally minimal).

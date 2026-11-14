@@ -752,20 +752,6 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             subject: None,
             ..Default::default()
         },
-        "irc" => ChannelMessage {
-            id: "irc_1".into(),
-            sender: "coolnick".into(),
-            reply_target: "#zeroclaw".into(),
-            content: "hi".into(),
-            channel: "irc".into(),
-            channel_alias: None,
-            timestamp: 1700000000,
-            thread_ts: None,
-            interruption_scope_id: None,
-            attachments: vec![],
-            subject: None,
-            ..Default::default()
-        },
         "email" => ChannelMessage {
             id: "email_1".into(),
             sender: "alice@example.com".into(),
@@ -915,7 +901,6 @@ const ALL_PLATFORMS: &[&str] = &[
     "discord",
     "slack",
     "imessage",
-    "irc",
     "email",
     "signal",
     "mattermost",
@@ -969,7 +954,6 @@ fn channel_platforms_have_distinct_sender_and_reply_target() {
     let channel_based = [
         "discord",
         "slack",
-        "irc",
         "mattermost",
         "dingtalk",
         "qq",
@@ -1290,7 +1274,6 @@ async fn multi_channel_listen_produces_channel_tagged_messages() {
         MatrixTestChannel::new("telegram"),
         MatrixTestChannel::new("discord"),
         MatrixTestChannel::new("slack"),
-        MatrixTestChannel::new("irc"),
         MatrixTestChannel::new("email"),
     ];
 
@@ -1324,7 +1307,6 @@ async fn capability_matrix_spec() {
         "signal",
         "email",
         "imessage",
-        "irc",
         "whatsapp",
         "mattermost",
         "cli",

@@ -197,6 +197,22 @@ pub const RETIRED_KEYS: &[RetiredKey] = &[
         reason: RETIRED_WATI,
         reason_id: "cli-config-retired-reason-wati",
     },
+    // The IRC and Twitch channels moved out of the binary into the `irc` and
+    // `twitch` plugins. A section left behind would configure nothing, and
+    // its encrypted credentials cannot be moved to a plugin instance's row,
+    // so the reason names the plugin and its install and bind commands.
+    RetiredKey {
+        retired_in: 4,
+        path: &["channels", "irc"],
+        reason: RETIRED_IRC,
+        reason_id: "cli-config-retired-reason-irc",
+    },
+    RetiredKey {
+        retired_in: 4,
+        path: &["channels", "twitch"],
+        reason: RETIRED_TWITCH,
+        reason_id: "cli-config-retired-reason-twitch",
+    },
     // Spellings no schema field reads, so serde would ignore them silently.
     // Twitter and Reddit stay channels (`[channels.twitter.<alias>]`,
     // `[channels.reddit.<alias>]`) and Notion stays the top-level `[notion]`
@@ -380,6 +396,16 @@ const RETIRED_GLOBAL_TRANSCRIPTION: &str = "there is no global default transcrip
 
 const RETIRED_WATI: &str = "WATI support was removed; migrate to `[channels.whatsapp.<alias>]` \
      using the Cloud API or WhatsApp Web, then revoke the unused WATI API token";
+
+const RETIRED_IRC: &str = "the built-in IRC channel moved to the `irc` plugin; run \
+     `zeroclaw plugin install irc` and `zeroclaw plugin bind irc --channel-alias <alias>`, set \
+     its config and passwords again, and replace `irc.<alias>` with `plugin.<alias>` in agent \
+     channels and peer groups";
+
+const RETIRED_TWITCH: &str = "the built-in Twitch channel moved to the `twitch` plugin; run \
+     `zeroclaw plugin install twitch` and `zeroclaw plugin bind twitch --channel-alias <alias> \
+     --egress declared`, set its config and OAuth token again, and replace `twitch.<alias>` \
+     with `plugin.<alias>` in agent channels and peer groups";
 
 const INERT_AGENT_TUNABLE: &str = "agent-inline runtime tunables are no longer read; runtime \
      profiles are authoritative, so set this key on the agent's \
@@ -7639,6 +7665,19 @@ mention_only = false
         (
             "channels_config.wati",
             "[channels_config.wati]\napi_token = \"x\"\n",
+        ),
+        ("channels.irc", "[channels.irc]\nserver = \"x\"\n"),
+        (
+            "channels_config.irc",
+            "[channels_config.irc]\nserver = \"x\"\n",
+        ),
+        (
+            "channels.twitch",
+            "[channels.twitch]\nbot_username = \"x\"\n",
+        ),
+        (
+            "channels_config.twitch",
+            "[channels_config.twitch]\nbot_username = \"x\"\n",
         ),
         ("twitter", "[twitter]\nbearer_token = \"x\"\n"),
         ("reddit", "[reddit]\nclient_id = \"x\"\n"),
