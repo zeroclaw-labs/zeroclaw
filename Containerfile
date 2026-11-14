@@ -4,7 +4,7 @@
 # Alpine, no core-llvm-libgcc, no external deps for the GCC runtime.
 
 # ── Stage: config-gen (generate default config template) ────
-FROM docker.io/stagex/pallet-rust@sha256:abe9b95c93a5afa271f69fcd5eb18c8cd405fe5df6491a63c9418e3a170573dc AS config-gen
+FROM docker.io/stagex/pallet-rust@sha256:4f12174acd7ccab9506e20a986c556cd5837dbd0ce616abf3031bcaaaa365590 AS config-gen
 
 # Default config template consumed by build/build-fat. Single source of truth
 # so operators get a working config on first run without migration overhead.
@@ -41,7 +41,7 @@ EOF
 FROM docker.io/stagex/pallet-nodejs@sha256:5c96b25c18713976497a21c770057f2179c5014c5a025a02d2df9041d8f861f6 AS nodejs
 
 # ── Stage: web-build (web dashboard via xtask + npm build) ──
-FROM docker.io/stagex/pallet-rust@sha256:abe9b95c93a5afa271f69fcd5eb18c8cd405fe5df6491a63c9418e3a170573dc AS web-build
+FROM docker.io/stagex/pallet-rust@sha256:4f12174acd7ccab9506e20a986c556cd5837dbd0ce616abf3031bcaaaa365590 AS web-build
 
 WORKDIR /src
 COPY . .
@@ -97,7 +97,7 @@ EOF
 # Single source of truth for "what passes" in the deterministic StageX
 # musl environment. Used by CI and developers as a pre-push gate.
 # Does NOT depend on web-build (creates a stub for compilation).
-FROM docker.io/stagex/pallet-rust@sha256:abe9b95c93a5afa271f69fcd5eb18c8cd405fe5df6491a63c9418e3a170573dc AS check
+FROM docker.io/stagex/pallet-rust@sha256:4f12174acd7ccab9506e20a986c556cd5837dbd0ce616abf3031bcaaaa365590 AS check
 
 WORKDIR /src
 COPY . .
@@ -152,7 +152,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
 EOF
 
 # ── Stage: build (zeroclaw + zerocode, default channels) ────
-FROM docker.io/stagex/pallet-rust@sha256:abe9b95c93a5afa271f69fcd5eb18c8cd405fe5df6491a63c9418e3a170573dc AS build
+FROM docker.io/stagex/pallet-rust@sha256:4f12174acd7ccab9506e20a986c556cd5837dbd0ce616abf3031bcaaaa365590 AS build
 
 WORKDIR /src
 # No `.git` in the build context (`.dockerignore`); the commit is passed in here.
@@ -220,7 +220,7 @@ COPY --from=web-build /src/web/dist /rootfs/usr/share/zeroclawlabs/web/dist
 # The upstream StageX bundle still contains an incident root. Materialize only
 # the filtered bundle and aliases: copying its original per-root files would
 # let native consumers or update-ca-certificates restore the distrusted roots.
-FROM docker.io/stagex/pallet-rust@sha256:abe9b95c93a5afa271f69fcd5eb18c8cd405fe5df6491a63c9418e3a170573dc AS ca-bundle
+FROM docker.io/stagex/pallet-rust@sha256:4f12174acd7ccab9506e20a986c556cd5837dbd0ce616abf3031bcaaaa365590 AS ca-bundle
 COPY --from=docker.io/stagex/core-ca-certificates@sha256:fe24a3809eba30972b64ddd8b611a6494bebea7631f805d795cec4241f5a11c6 /etc/ssl/certs/ca-certificates.crt /tmp/source-ca.crt
 COPY dev/ci/filter-emudhra-ca-bundle.sh /tmp/filter-emudhra-ca-bundle.sh
 RUN mkdir -p /rootfs/etc/ssl/certs /rootfs/etc/ssl1.1 \
@@ -252,7 +252,7 @@ ENTRYPOINT ["/usr/bin/zeroclaw"]
 CMD ["daemon"]
 
 # ── Stage: build-fat (zeroclaw + zerocode, all channels) ────
-FROM docker.io/stagex/pallet-rust@sha256:abe9b95c93a5afa271f69fcd5eb18c8cd405fe5df6491a63c9418e3a170573dc AS build-fat
+FROM docker.io/stagex/pallet-rust@sha256:4f12174acd7ccab9506e20a986c556cd5837dbd0ce616abf3031bcaaaa365590 AS build-fat
 
 WORKDIR /src
 # No `.git` in the build context (`.dockerignore`); the commit is passed in here.
