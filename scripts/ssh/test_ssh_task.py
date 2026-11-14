@@ -3,6 +3,7 @@ import importlib.machinery
 import importlib.util
 import pathlib
 import io
+import sys
 import threading
 import time
 import tempfile
@@ -60,6 +61,58 @@ class TaskTransportTests(unittest.TestCase):
                 argv = execute.call_args.args[0]
                 delimiter = argv.index('--')
                 self.assertEqual(argv[delimiter + 1:], ['alias', *command])
+
+    def test_missing_toml_modules_only_affect_scoped_credentials(self):
+        with patch.dict(sys.modules, {'tomllib': None, 'tomli': None}):
+            loader.exec_module(importlib.util.module_from_spec(spec))
+            self.pool.acquire('legacy', [], 'legacy-host')
+            with self.assertRaisesRegex(RuntimeError, 'requires Python 3.11'):
+                module.scoped_record('scoped', {})
+
+    def test_task_close_cancels_running_and_queued_vault_lookups(self):
+        started = threading.Event()
+
+        class SlowLookup:
+            returncode = None
+
+            def __init__(self, command, **kwargs):
+                if command[0] != 'bao':
+                    raise AssertionError('unexpected process')
+                started.set()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def poll(self):
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+            def communicate(self, timeout):
+                time.sleep(timeout)
+                raise module.subprocess.TimeoutExpired('bao', timeout)
+
+        with patch.object(module.subprocess, 'Popen', side_effect=SlowLookup) as spawn, \
+             concurrent.futures.ThreadPoolExecutor(max_workers=2) as workers:
+            credential = ('open_bao', 'secret/test/key')
+            first = workers.submit(self.pool.acquire, 'first', [], 'host-a', credential)
+            self.assertTrue(started.wait(2))
+            second = workers.submit(self.pool.acquire, 'second', [], 'host-b', credential)
+            deadline = time.monotonic() + 2
+            while 'second' not in self.pool.entries and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertIn('second', self.pool.entries)
+            start = time.monotonic()
+            self.pool.close()
+            self.assertLess(time.monotonic() - start, 2)
+            for result in (first, second):
+                with self.assertRaisesRegex(RuntimeError, 'connection failed'):
+                    result.result(timeout=2)
+            spawn.assert_called_once()
 
     def test_scoped_signer_is_retired_before_master_is_leased(self):
         signer = object()

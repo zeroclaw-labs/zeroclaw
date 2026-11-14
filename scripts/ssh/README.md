@@ -45,11 +45,38 @@ pool lock while waiting for the network; other keys and task shutdown proceed.
 
 ## Trust and credentials
 
-Use the existing SSH agent and configured public identity selection, including
-an operator's vault-backed agent if present. The adapter does not read a vault,
-copy a private key, change host-key trust, forward the agent or grant remote
-permissions. Identity, trust, forwarding and multiplexing overrides are refused.
-The operator remains responsible for target authorization and tool approvals.
+### Existing SSH agent
+
+The default mode uses existing SSH agent and public identity configuration. It
+does not require any Python packages or vault CLI. Leave
+`ZEROCLAW_SSH_DEFAULT_CREDENTIAL` unset to retain this mode by default.
+
+### Scoped credential catalog
+
+Scoped mode requires Python 3.11 or Python 3.10 with `tomli`, and the Python
+`cryptography` package. Install them for the interpreter that runs the helper.
+OpenBao credentials additionally require the `bao` CLI on the service PATH and
+a service identity permitted to read the configured KV field over verified TLS.
+
+1. Use Storage → Secrets to register an SSH key or an OpenBao KV field reference
+   and authorize its resolved SSH hostname, port and login. Use strict known-host
+   verification and provision the expected host key for the service account.
+2. Set `ZEROCLAW_SSH_CREDENTIAL_DIR` in the daemon environment to its protected
+   configuration directory containing `config.toml` and `.secret_key`.
+3. Use `ssh --credential ALIAS HOST COMMAND` through the managed PATH wrapper.
+   Optionally set `ZEROCLAW_SSH_DEFAULT_CREDENTIAL=ALIAS` to select it by default.
+
+The helper checks the grant before each lease. A private signing socket exists
+during master authentication and is retired before the first command can acquire
+the transport. The helper does not write the SSH private key to disk and refuses
+identity, trust, forwarding and multiplex overrides. The task's SSH masters close
+when it ends, and a running OpenBao lookup is cancelled during shutdown.
+
+The standalone Python helper uses gettext for its diagnostic messages. Optional
+compiled `zeroclaw-ssh-task.mo` catalogs can be installed in the system locale
+directory or under `ZEROCLAW_SSH_LOCALE_DIR` using standard gettext layout.
+English is the fallback. The operator remains responsible for target authorization
+and tool approvals.
 
 Remote exit codes, stdin and stdout are preserved. A shell pipeline may still
 mask its left-hand command's status; capture the SSH status before filtering
