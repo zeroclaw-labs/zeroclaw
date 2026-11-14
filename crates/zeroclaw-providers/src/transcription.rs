@@ -2532,7 +2532,7 @@ mod tests {
     ///    asserting the list does not contain `transcription` asserts
     ///    the absence of that named log event at its source.
     #[tokio::test]
-    async fn local_whisper_config_init_preserves_transcription_section() {
+    async fn local_whisper_config_init_preserves_provider_entry() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let config_path = tmp.path().join("config.toml");
 
@@ -2558,11 +2558,14 @@ mod tests {
             config_path: config_path.clone(),
             ..zeroclaw_config::schema::Config::default()
         };
-        let initialized = config.init_defaults(Some("transcription.local_whisper"));
+        let created = config
+            .create_map_key("providers.transcription.local_whisper", "default")
+            .expect("provider map-key surface must create a local whisper alias");
         assert!(
-            initialized.contains(&"transcription.local_whisper"),
-            "scaffold must report the section initialized, got: {initialized:?}"
+            created,
+            "the default provider alias should be newly created"
         );
+        let initialized = vec!["providers.transcription.local_whisper.default".to_string()];
 
         // Persist through the production dirty/save path, mirroring the
         // CLI handler (mark each initialized section dirty, then save).
@@ -2582,13 +2585,16 @@ mod tests {
             .expect("transcription.enabled must be settable");
         config
             .set_prop_persistent(
-                "transcription.local_whisper.url",
+                "providers.transcription.local_whisper.default.uri",
                 "http://127.0.0.1:9999/v1/transcribe",
             )
-            .expect("transcription.local_whisper.url must be settable");
+            .expect("provider uri must be settable");
         config
-            .set_prop_persistent("transcription.local_whisper.bearer_token", "test-token")
-            .expect("transcription.local_whisper.bearer_token must be settable");
+            .set_prop_persistent(
+                "providers.transcription.local_whisper.default.bearer_token",
+                "test-token",
+            )
+            .expect("provider bearer_token must be settable");
         config
             .save_dirty()
             .await
@@ -2600,9 +2606,11 @@ mod tests {
         let salvage = zeroclaw_config::migration::migrate_to_current_salvaged(&contents);
 
         assert!(
-            !salvage.dropped.iter().any(|path| path == "transcription"),
-            "resilient load must not drop `transcription` (the dropped_config WARN), \
-             dropped: {:?}",
+            !salvage
+                .dropped
+                .iter()
+                .any(|path| path.starts_with("providers.transcription")),
+            "resilient load must not drop the provider entry, dropped: {:?}",
             salvage.dropped
         );
         assert!(
@@ -2619,16 +2627,17 @@ mod tests {
             "transcription.enabled must survive the scaffold→persist→resilient-load cycle"
         );
         let local = loaded
+            .providers
             .transcription
             .local_whisper
-            .as_ref()
-            .expect("transcription.local_whisper must survive the resilient load");
+            .get("default")
+            .expect("provider entry must survive the resilient load");
         assert_eq!(local.max_audio_bytes, 25 * 1024 * 1024);
         assert_eq!(local.timeout_secs, 300);
-        assert_eq!(local.url, "http://127.0.0.1:9999/v1/transcribe");
+        assert_eq!(local.uri, "http://127.0.0.1:9999/v1/transcribe");
 
-        let provider = LocalWhisperProvider::from_config("local_whisper", local)
-            .expect("resilient-loaded local_whisper config must be loadable by from_config");
+        let provider = LocalWhisperProvider::from_typed_config("default", local)
+            .expect("resilient-loaded local_whisper config must be loadable");
         assert_eq!(provider.max_audio_bytes, 25 * 1024 * 1024);
         assert_eq!(provider.timeout_secs, 300);
     }
