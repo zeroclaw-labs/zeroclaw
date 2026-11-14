@@ -90,6 +90,19 @@ pub(crate) fn parse_attachment_markers(message: &str) -> (String, Vec<DiscordAtt
     (cleaned.trim().to_string(), attachments)
 }
 
+/// [`parse_attachment_markers`] when `inline_attachments` is on. Off, the
+/// content is kept as written and no marker is taken from it.
+pub(crate) fn split_attachment_markers(
+    content: &str,
+    inline_attachments: bool,
+) -> (String, Vec<DiscordAttachment>) {
+    if inline_attachments {
+        parse_attachment_markers(content)
+    } else {
+        (content.to_string(), Vec::new())
+    }
+}
+
 const EMBED_TAG: &str = "[EMBED:";
 
 /// Author-supplied embed shape, deserialized from the `[EMBED:{json}]` payload.

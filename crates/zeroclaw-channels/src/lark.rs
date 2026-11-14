@@ -2886,7 +2886,11 @@ impl Channel for LarkChannel {
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let mut token = self.get_tenant_access_token().await?;
         let url = self.send_message_url(&message.recipient);
-        let (text_content, raw_markers) = super::util::parse_attachment_markers(&message.content);
+        let (text_content, raw_markers) = if message.inline_attachments {
+            super::util::parse_attachment_markers(&message.content)
+        } else {
+            (message.content.clone(), Vec::new())
+        };
         let markers = raw_markers
             .into_iter()
             .filter_map(|(kind, target)| lark_outgoing_media_from_marker(kind, target))
@@ -7329,6 +7333,82 @@ mod tests {
         let content_json: serde_json::Value =
             serde_json::from_str(content).expect("image content should parse as JSON");
         assert_eq!(content_json["image_key"].as_str(), Some("img_test_key"));
+    }
+
+    /// With inline attachments off, markers reach the chat as card text:
+    /// nothing is resolved or uploaded, so a marker that would be refused
+    /// does not fail the send either.
+    #[tokio::test]
+    async fn lark_send_without_inline_attachments_sends_markers_as_text() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(workspace.path().join("photo.png"), b"\x89PNG\r\n\x1a\n")
+            .expect("write image");
+        let config = zeroclaw_config::schema::LarkConfig {
+            enabled: true,
+            use_feishu: false,
+            app_id: "cli_test_app_id".to_string(),
+            app_secret: "test_app_secret".to_string(),
+            approval_timeout_secs: 300,
+            ..Default::default()
+        };
+
+        for (content, workspace_dir) in [
+            (
+                "caption [IMAGE:photo.png]",
+                Some(workspace.path().to_path_buf()),
+            ),
+            (
+                "see [FILE:file:///etc/passwd] and [DOCUMENT:../escape.txt]",
+                None,
+            ),
+        ] {
+            let mock_server = wiremock::MockServer::start().await;
+            mount_lark_token_and_send_mocks(&mock_server, "chat_id").await;
+            for upload_path in ["/im/v1/images", "/im/v1/files"] {
+                Mock::given(method("POST"))
+                    .and(path(upload_path))
+                    .respond_with(ResponseTemplate::new(500))
+                    .expect(0)
+                    .mount(&mock_server)
+                    .await;
+            }
+
+            let mut ch = LarkChannel::from_config(&config, "test_alias", resolver_from(vec![]));
+            if let Some(dir) = workspace_dir {
+                ch = ch.with_workspace_dir(dir);
+            }
+            ch.api_base_override = Some(mock_server.uri());
+
+            let message =
+                SendMessage::new(content, "oc_test_chat_id").with_inline_attachments(false);
+            Channel::send(&ch, &message)
+                .await
+                .unwrap_or_else(|err| panic!("{content}: {err}"));
+
+            let requests = mock_server
+                .received_requests()
+                .await
+                .expect("mock server should record requests");
+            let send_bodies = requests
+                .iter()
+                .filter(|request| request.url.path() == "/im/v1/messages")
+                .map(|request| {
+                    serde_json::from_slice::<serde_json::Value>(&request.body)
+                        .expect("send body should be valid JSON")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(send_bodies.len(), 1, "{content}: {send_bodies:?}");
+            assert_eq!(send_bodies[0]["msg_type"].as_str(), Some("interactive"));
+            assert!(
+                send_bodies[0]["content"]
+                    .as_str()
+                    .is_some_and(|card| card.contains(content)),
+                "{content}: {send_bodies:?}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -1141,25 +1141,43 @@ impl SlackChannel {
         })
     }
 
+    /// Refuse an attachment Slack's upload flow would reject. `send` checks the
+    /// whole list before posting the text, so a refused file never leaves the
+    /// text delivered on its own.
+    fn ensure_outbound_attachment_uploadable(attachment: &MediaAttachment) -> anyhow::Result<()> {
+        if attachment.data.len() > SLACK_OUTBOUND_ATTACHMENT_MAX_BYTES {
+            anyhow::bail!(i18n::get_required_cli_string_with_args(
+                "channel-slack-error-attachment-too-large",
+                &[
+                    ("limit", &SLACK_OUTBOUND_ATTACHMENT_MAX_BYTES.to_string()),
+                    ("file", &attachment.file_name),
+                ],
+            ));
+        }
+        if attachment.data.is_empty() {
+            anyhow::bail!(i18n::get_required_cli_string_with_args(
+                "channel-slack-error-attachment-empty",
+                &[("file", &attachment.file_name)],
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_outbound_attachments_uploadable(
+        attachments: &[MediaAttachment],
+    ) -> anyhow::Result<()> {
+        attachments
+            .iter()
+            .try_for_each(Self::ensure_outbound_attachment_uploadable)
+    }
+
     async fn upload_outbound_attachment(
         &self,
         channel_id: &str,
         thread_ts: Option<&str>,
         attachment: &MediaAttachment,
     ) -> anyhow::Result<()> {
-        if attachment.data.len() > SLACK_OUTBOUND_ATTACHMENT_MAX_BYTES {
-            anyhow::bail!(
-                "Slack outbound attachment exceeds {} bytes: {}",
-                SLACK_OUTBOUND_ATTACHMENT_MAX_BYTES,
-                attachment.file_name
-            );
-        }
-        if attachment.data.is_empty() {
-            anyhow::bail!(
-                "Slack outbound attachment is empty: {}",
-                attachment.file_name
-            );
-        }
+        Self::ensure_outbound_attachment_uploadable(attachment)?;
 
         let file_name = Self::sanitize_attachment_filename(&attachment.file_name)
             .unwrap_or_else(|| "attachment.bin".to_string());
@@ -5294,12 +5312,26 @@ impl Channel for SlackChannel {
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let thread_ts = self.outbound_thread_ts(message);
+        // Explicit attachments must all be delivered, so a list Slack would
+        // truncate is refused before anything is posted. They lead the list,
+        // so the per-message cap in `upload_outbound_attachments` can only
+        // drop marker-derived files after them.
+        if message.attachments.len() > SLACK_ATTACHMENT_MAX_FILES_PER_MESSAGE {
+            anyhow::bail!(i18n::get_required_cli_string_with_args(
+                "channel-slack-error-too-many-attachments",
+                &[
+                    ("limit", &SLACK_ATTACHMENT_MAX_FILES_PER_MESSAGE.to_string()),
+                    ("count", &message.attachments.len().to_string()),
+                ],
+            ));
+        }
         let mut outbound_attachments = message.attachments.clone();
 
         // Detect Block Kit payloads produced by the `/config` command.
         let body = if let Some(blocks_json) =
             message.content.strip_prefix(crate::util::BLOCK_KIT_PREFIX)
         {
+            Self::ensure_outbound_attachments_uploadable(&outbound_attachments)?;
             let blocks: serde_json::Value = serde_json::from_str(blocks_json)
                 .context("invalid Block Kit JSON in runtime command response")?;
             let mut body = serde_json::json!({
@@ -5312,10 +5344,15 @@ impl Channel for SlackChannel {
             }
             body
         } else {
-            let (cleaned_content, markers) = parse_outbound_attachment_markers(&message.content);
+            let (cleaned_content, markers) = if message.inline_attachments {
+                parse_outbound_attachment_markers(&message.content)
+            } else {
+                (message.content.clone(), Vec::new())
+            };
             for marker in &markers {
                 outbound_attachments.push(self.resolve_outbound_attachment_marker(marker).await?);
             }
+            Self::ensure_outbound_attachments_uploadable(&outbound_attachments)?;
 
             if cleaned_content.trim().is_empty() && !outbound_attachments.is_empty() {
                 self.upload_outbound_attachments(
@@ -5410,6 +5447,11 @@ impl Channel for SlackChannel {
         }
 
         Ok(())
+    }
+
+    /// Outbound attachments are uploaded to the conversation after the text.
+    fn supports_outbound_attachments(&self) -> bool {
+        true
     }
 
     fn supports_draft_updates(&self) -> bool {
@@ -6278,7 +6320,7 @@ impl Channel for SlackChannel {
                 .map(|_| ())
                 .map_err(anyhow::Error::from)
         } else {
-            self.send(&SendMessage::new(
+            self.send(&crate::util::approval_prompt_message(
                 crate::util::build_yesno_approval_prompt(
                     &token,
                     &request.tool_name,
@@ -7694,6 +7736,240 @@ mod tests {
                 .contains("files.completeUploadExternal failed: complete_failed"),
             "unexpected error: {err}"
         );
+    }
+
+    /// With inline attachments off, a file marker is posted as literal text
+    /// and never resolved or uploaded, even when it is the whole message or
+    /// names a file that does not exist.
+    #[tokio::test]
+    async fn send_without_inline_attachments_posts_markers_as_text() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let attachment_path = tmp.path().join("report.txt");
+        tokio::fs::write(&attachment_path, b"report-bytes")
+            .await
+            .unwrap();
+        let missing_path = tmp.path().join("missing.txt");
+
+        for content in [
+            format!("Done [FILE:{}]", attachment_path.display()),
+            format!("[FILE:{}]", attachment_path.display()),
+            format!("[IMAGE:{}]", missing_path.display()),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat.postMessage"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "ts": "1710000000.000100",
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let ch = test_slack_channel(&server, tmp.path());
+            let msg = SendMessage::new(content.clone(), "C123").with_inline_attachments(false);
+
+            SlackChannel::send(&ch, &msg).await.unwrap();
+
+            let requests = server.received_requests().await.unwrap();
+            let post = requests
+                .iter()
+                .find(|req| req.url.path() == "/chat.postMessage")
+                .expect("chat.postMessage should be called");
+            let post_body: serde_json::Value = serde_json::from_slice(&post.body).unwrap();
+            assert_eq!(post_body["text"], content.as_str());
+            assert!(
+                requests.iter().all(|req| {
+                    req.url.path() != "/files.getUploadURLExternal"
+                        && req.url.path() != "/files.completeUploadExternal"
+                }),
+                "{content}: nothing may be uploaded"
+            );
+        }
+    }
+
+    /// With inline attachments off, explicit attachments are still uploaded
+    /// and a marker beside them stays in the text.
+    #[tokio::test]
+    async fn send_without_inline_attachments_still_uploads_explicit_attachments() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let marker_path = tmp.path().join("marker.txt");
+        tokio::fs::write(&marker_path, b"marker-bytes")
+            .await
+            .unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/chat.postMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "ts": "1710000000.000100",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mock_slack_upload_flow(
+            &server,
+            "F_EXPLICIT",
+            "/upload/explicit",
+            200,
+            serde_json::json!({"ok": true}),
+        )
+        .await;
+
+        let ch = test_slack_channel(&server, tmp.path());
+        let content = format!("See [FILE:{}]", marker_path.display());
+        let msg = SendMessage::new(content.clone(), "C123")
+            .with_attachments(vec![MediaAttachment {
+                file_name: "explicit.txt".to_string(),
+                data: b"explicit-bytes".to_vec(),
+                mime_type: Some("text/plain".to_string()),
+                marker: None,
+            }])
+            .with_inline_attachments(false);
+
+        SlackChannel::send(&ch, &msg).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let post = requests
+            .iter()
+            .find(|req| req.url.path() == "/chat.postMessage")
+            .expect("chat.postMessage should be called");
+        let post_body: serde_json::Value = serde_json::from_slice(&post.body).unwrap();
+        assert_eq!(post_body["text"], content.as_str());
+
+        let get_upload = requests
+            .iter()
+            .find(|req| req.url.path() == "/files.getUploadURLExternal")
+            .expect("getUploadURLExternal should be called");
+        let get_upload_body = String::from_utf8_lossy(&get_upload.body);
+        assert!(get_upload_body.contains("filename=explicit.txt"));
+        assert!(!get_upload_body.contains("marker.txt"));
+    }
+
+    /// The polling-mode approval prompt quotes the tool's arguments, so a file
+    /// marker in them is posted as text and the file is never uploaded before
+    /// the call is decided.
+    #[tokio::test]
+    async fn polling_approval_prompt_keeps_file_markers_from_arguments_as_text() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let attachment_path = tmp.path().join("secret.txt");
+        tokio::fs::write(&attachment_path, b"secret-bytes")
+            .await
+            .unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/chat.postMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "ts": "1710000000.000100",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let ch = test_slack_channel(&server, tmp.path()).with_approval_timeout_secs(0);
+        let marker = format!("[FILE:{}]", attachment_path.display());
+        let request = ChannelApprovalRequest {
+            tool_name: "send_via".to_string(),
+            arguments_summary: format!("body: {marker}"),
+            raw_arguments: None,
+            position: None,
+        };
+
+        ch.request_approval_attributed("C123", &request)
+            .await
+            .expect("the prompt is delivered and the request then times out");
+
+        let requests = server.received_requests().await.unwrap();
+        let post = requests
+            .iter()
+            .find(|req| req.url.path() == "/chat.postMessage")
+            .expect("the approval prompt should be posted");
+        let post_body: serde_json::Value = serde_json::from_slice(&post.body).unwrap();
+        let text = post_body["text"].as_str().unwrap_or_default();
+        assert!(
+            text.contains(&marker),
+            "the marker must stay in the prompt text: {text:?}"
+        );
+        assert!(
+            requests.iter().all(|req| {
+                req.url.path() != "/files.getUploadURLExternal"
+                    && req.url.path() != "/files.completeUploadExternal"
+            }),
+            "an approval prompt must not upload files named in its arguments"
+        );
+    }
+
+    /// An explicit attachment list Slack cannot deliver in full fails the send
+    /// before the text is posted or any file is uploaded.
+    #[tokio::test]
+    async fn send_refuses_undeliverable_explicit_attachments_before_posting() {
+        use wiremock::MockServer;
+
+        let attachment = |name: &str, data: Vec<u8>| MediaAttachment {
+            file_name: name.to_string(),
+            data,
+            mime_type: Some("text/plain".to_string()),
+            marker: None,
+        };
+        let too_many: Vec<MediaAttachment> = (0..=SLACK_ATTACHMENT_MAX_FILES_PER_MESSAGE)
+            .map(|i| attachment(&format!("f{i}.txt"), b"bytes".to_vec()))
+            .collect();
+        // The English rendering of each refusal, as the agent and user see it.
+        let cases = [
+            (
+                too_many,
+                "Slack accepts at most 8 attachments per message; got 9".to_string(),
+            ),
+            (
+                vec![
+                    attachment("ok.txt", b"bytes".to_vec()),
+                    attachment("empty.txt", Vec::new()),
+                ],
+                "Slack outbound attachment is empty: empty.txt".to_string(),
+            ),
+            (
+                vec![attachment(
+                    "big.bin",
+                    vec![0; SLACK_OUTBOUND_ATTACHMENT_MAX_BYTES + 1],
+                )],
+                format!(
+                    "Slack outbound attachment exceeds {SLACK_OUTBOUND_ATTACHMENT_MAX_BYTES} bytes: big.bin"
+                ),
+            ),
+        ];
+
+        for (attachments, expected) in cases {
+            let server = MockServer::start().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let ch = test_slack_channel(&server, tmp.path());
+            let msg = SendMessage::new("see attached", "C123").with_attachments(attachments);
+
+            let err = SlackChannel::send(&ch, &msg)
+                .await
+                .expect_err("an undeliverable attachment list must fail the send");
+            assert_eq!(err.to_string(), expected);
+            let requests = server.received_requests().await.unwrap();
+            assert!(
+                requests.is_empty(),
+                "nothing may be posted or uploaded, got {:?}",
+                requests
+                    .iter()
+                    .map(|req| req.url.path().to_string())
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]
