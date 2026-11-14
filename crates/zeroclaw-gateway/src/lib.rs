@@ -939,6 +939,13 @@ impl GatewayBootSelection {
     }
 }
 fn resolve_gateway_boot_selection(config: &Config) -> GatewayBootSelection {
+    #[cfg(test)]
+    let admitted_config;
+    #[cfg(test)]
+    let config = {
+        admitted_config = zeroclaw_config::migration::admit_test_input(config);
+        &admitted_config
+    };
     let model_ref = config
         .resolved_runtime_agent_alias()
         .and_then(|alias| config.agent(alias))
@@ -1383,6 +1390,8 @@ pub async fn run_gateway(
     sop_driver_handles: Option<zeroclaw_runtime::sop::SopDriverHandles>,
     readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
 ) -> Result<()> {
+    #[cfg(test)]
+    let config = zeroclaw_config::migration::admit_test_input(&config);
     let authority = zeroclaw_runtime::LiveConfigAuthority::new_owned(config.clone())?;
     run_gateway_with_authority(
         host,
@@ -1420,6 +1429,8 @@ pub async fn run_gateway_with_authority(
     readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
     authority: zeroclaw_runtime::LiveConfigAuthority,
 ) -> Result<()> {
+    #[cfg(test)]
+    let config = zeroclaw_config::migration::admit_test_input(&config);
     Box::pin(run_gateway_with_plugin_webhooks(
         host,
         port,

@@ -346,7 +346,12 @@ fn asr_definition(
         .filter(|value| {
             value
                 .as_str()
-                .map(|value| !value.trim().is_empty())
+                .map(|value| {
+                    let value = value.trim();
+                    !value.is_empty()
+                        && reqwest::Url::parse(value)
+                            .is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+                })
                 .unwrap_or(!value.is_null())
         })
     {

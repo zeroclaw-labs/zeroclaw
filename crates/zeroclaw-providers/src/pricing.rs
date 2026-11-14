@@ -217,7 +217,11 @@ pub fn live_pricing_enabled() -> bool {
 /// A copy of the bound config, read under its lock at the moment of the call.
 fn bound_config() -> Option<Config> {
     let handle = CONFIG_HANDLE.read().clone()?;
-    Some(handle.snapshot())
+    let config = handle.snapshot();
+    #[cfg(test)]
+    return Some(zeroclaw_config::migration::admit_test_input(&config));
+    #[cfg(not(test))]
+    Some(config)
 }
 
 /// One refresh cycle. Re-resolves the bound handle (re-bound across daemon

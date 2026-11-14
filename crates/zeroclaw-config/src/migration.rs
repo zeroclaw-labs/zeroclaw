@@ -7615,7 +7615,7 @@ model_provider = "gemini.work"
             detect_version(&toml::Value::Table(file.clone())).ok(),
             Some(1)
         );
-        let (as_v1, typed_v1) = stated_reading(&file, 1);
+        let (_as_v1, typed_v1) = stated_reading(&file, 1);
         for (path, kept) in [
             (r#"providers.models."asr.groq".model"#, "whisper-keep"),
             (r#"providers.models."asr.openai".model"#, "whisper-1"),

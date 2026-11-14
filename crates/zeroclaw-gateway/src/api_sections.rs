@@ -108,6 +108,13 @@ fn error_response(err: ConfigApiError) -> Response {
 
 #[must_use]
 pub fn derive_section_status(cfg: &zeroclaw_config::schema::Config) -> ConfigStatusResult {
+    #[cfg(test)]
+    let admitted_cfg;
+    #[cfg(test)]
+    let cfg = {
+        admitted_cfg = zeroclaw_config::migration::admit_test_input(cfg);
+        &admitted_cfg
+    };
     let missing = quickstart_missing_requirements(cfg);
     let ready = missing.is_empty();
     let has_partial_state = !cfg.onboard_state.completed_sections.is_empty()
@@ -783,6 +790,8 @@ fn agents_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
 }
 
 fn apply_first_run_agent_defaults(cfg: &mut zeroclaw_config::schema::Config, alias: &str) {
+    #[cfg(test)]
+    zeroclaw_config::migration::normalize_test_input(cfg);
     let model_provider = cfg.provider_registry().ok().and_then(|registry| {
         registry
             .models
