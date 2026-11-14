@@ -7,6 +7,8 @@ the same. Concurrent calls use separate channels over a matching connection.
 Streamed steering rounds retain the same owner and cached failures. The task owner
 closes its helper pipe on success, error or cancellation; the helper closes all
 masters. Masters also receive a Linux parent-death signal if the helper dies.
+The helper forces foreground operation for both masters and command clients,
+including when a host alias enables SSH backgrounding.
 
 The idle watchdog defaults to 1800 seconds. It expires a connection only when
 no command leases are active. A running command is not idle merely because it
@@ -42,6 +44,10 @@ temporary directory. No private keys are written there; it contains control
 sockets and readiness state. Connection stderr is drained continuously into an
 8 KiB in-memory tail, not an unbounded file. Connecting one key does not hold the
 pool lock while waiting for the network; other keys and task shutdown proceed.
+
+When a turn owns a host SSH broker, the built-in shell refuses commands under
+an OS sandbox, including ordinary non-SSH commands. Unrelated turns without
+a broker remain governed by the configured sandbox policy.
 
 ## Trust and credentials
 
