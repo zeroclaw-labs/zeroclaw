@@ -101,6 +101,20 @@ pub async fn enroll_via_relay(relay: &crate::client::RelayDial, config_dir: &Pat
     cache_confirmed_response(config_dir, &trust.ca_chain_pem, &resp, &key_pem)
 }
 
+/// Bootstrap device admission after OIDC sign-in. The already-verified gateway
+/// HTTPS transport (not a pairing code or provisional enrollment TLS) conveys
+/// the daemon CA and signs this device's locally generated CSR.
+pub(crate) async fn enroll_with_oidc(
+    gateway: &crate::oidc_enroll::GatewayEnrollment,
+    alias: &str,
+    token: &str,
+    config_dir: &Path,
+) -> Result<()> {
+    let (csr, key) = software_csr("zerocode")?;
+    let response: EnrollResponse = gateway.certificate(alias, token, &csr).await?;
+    cache_materials(config_dir, &response, &key)
+}
+
 fn prepare_enrollment_request() -> Result<(String, String, zeroize::Zeroizing<String>)> {
     let code = prompt_line("Enter the daemon enrollment pairing code: ")?;
     let code = code.trim().to_string();

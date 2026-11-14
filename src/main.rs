@@ -121,6 +121,67 @@ use std::sync::Arc;
 #[cfg(feature = "agent-runtime")]
 use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
 
+/// Localized, operator-facing text for one config migration notice about the
+/// config file at `path`. Printed on stderr: the matching WARN record is
+/// hidden without `-v`, and these report config the operator wrote being
+/// dropped, moved, or read under an assumed schema version.
+fn migration_notice_text(notice: &crate::config::migration::MigrationNotice, path: &str) -> String {
+    use crate::config::migration::MigrationNotice;
+    match notice {
+        MigrationNotice::AssumedV1 => ta(
+            "cli-config-migration-assumed-v1",
+            &[("path", path)],
+            format!(
+                "warning: {path} has no `schema_version`, so it was read as schema V1 and migrated from there. The V1 migration reshapes sections written for a newer version: provider entries can end up nested one level too deep, and channel sections are merged into a `default` alias. If this file was written for a newer ZeroClaw, add `schema_version` at the top with the version it was written for (restore the `.backup` copy first if `zeroclaw config migrate` already rewrote it)."
+            ),
+        ),
+        MigrationNotice::InferredV3 => ta(
+            "cli-config-migration-inferred-v3",
+            &[("path", path)],
+            format!(
+                "warning: {path} has no `schema_version`, but its sections are in the V3 format, so it was read as schema V3 and migrated from there. Run `zeroclaw config migrate` to write the current `schema_version` into the file."
+            ),
+        ),
+        MigrationNotice::Removed { path: key, reason } => {
+            let reason = retirement_reason_text(reason);
+            ta(
+                "cli-config-retired-key-removed",
+                &[("key", key), ("path", path), ("reason", &reason)],
+                format!("warning: dropped retired config key `{key}` from {path}: {reason}"),
+            )
+        }
+        MigrationNotice::IgnoredEnvOverride { variable, reason } => {
+            let reason = retirement_reason_text(reason);
+            ta(
+                "cli-config-env-override-retired",
+                &[("variable", variable), ("reason", &reason)],
+                format!("warning: ignored `{variable}`, which sets a retired config key: {reason}"),
+            )
+        }
+        MigrationNotice::Lowered { path: key, reason } => {
+            let reason = match crate::config::migration::capped_reason_id(reason) {
+                Some(id) => t(id, reason),
+                None => reason.to_string(),
+            };
+            ta(
+                "cli-config-capped-key-lowered",
+                &[("key", key), ("path", path), ("reason", &reason)],
+                format!("warning: lowered config key `{key}` in {path} to its maximum: {reason}"),
+            )
+        }
+    }
+}
+
+/// A retirement reason in the operator's locale. Notices carry the English
+/// reason, which logs keep; the CLI catalogue holds each one under the Fluent
+/// id its `RETIRED_KEYS` entry names.
+fn retirement_reason_text(reason: &str) -> String {
+    match crate::config::migration::retirement_reason_id(reason) {
+        Some(id) => t(id, reason),
+        None => reason.to_string(),
+    }
+}
+
 /// Resolve a `cli-*` Fluent key for CLI output. Routes through the runtime
 /// i18n catalogue under `agent-runtime` (default + CI/release); without that
 /// feature the runtime crate is absent, so the English `fallback` is used.
@@ -2180,7 +2241,7 @@ async fn run_quickstart_cli(
                     "{}",
                     t(
                         "cli-quickstart-cancelled",
-                        "Quickstart cancelled. No config written."
+                        "Quickstart cancelled. Nothing was configured."
                     )
                 );
                 return Ok(());
@@ -7554,6 +7615,55 @@ fn ca_key_protection_from_env() -> zeroclaw_tls::CaKeyProtection {
     zeroclaw_tls::CaKeyProtection::from_env()
 }
 
+/// The relay bridge's half of `[relay.dashboard]`: the origin the relay
+/// serves this daemon's dashboard at, from the registration key's label, and
+/// the ingress its connections are handed to. `None` when it is off.
+///
+/// Logs the address and the redirect URI to register with the identity
+/// provider, and warns that this one relay route is not end-to-end.
+#[cfg(feature = "agent-runtime")]
+fn relay_dashboard_bridge(
+    dashboard: &zeroclaw_config::schema::RelayDashboardConfig,
+    signing_key_pkcs8: &[u8],
+    ingress: zeroclaw_runtime::relay_dashboard::DashboardIngress,
+) -> Result<Option<zeroclaw_runtime::relay::DashboardBridge>> {
+    if !dashboard.enabled {
+        return Ok(None);
+    }
+    if cfg!(not(feature = "gateway")) {
+        bail!(qta("cli-relay-dashboard-no-gateway", &[]));
+    }
+    let label = zeroclaw_runtime::relay::dashboard_label(signing_key_pkcs8)?;
+    let origin = zeroclaw_runtime::relay_dashboard::DashboardOrigin::new(
+        &format!("{label}.{}", dashboard.domain),
+        dashboard.port,
+    )
+    .with_context(|| qta("cli-relay-dashboard-bad-origin", &[]))?;
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            ::serde_json::json!({
+                "dashboard": format!("{}/", origin.origin()),
+                "redirect_uri": format!("{}/oidc/callback", origin.origin()),
+            })
+        ),
+        "relay dashboard: serving the dashboard through the relay. This route is NOT \
+         end-to-end: the relay ends the browser's TLS, so its operator can read and change \
+         this dashboard's traffic, including session cookies, and act as a signed-in user, \
+         with an administrator's session as an administrator. Administer this daemon over a \
+         direct connection or zerocode. Native clients through the relay stay end-to-end. \
+         Register redirect_uri exactly with the identity provider, and list this daemon in \
+         the relay's [dashboard] allow."
+    );
+    Ok(Some(zeroclaw_runtime::relay::DashboardBridge {
+        ingress,
+        origin,
+        // Inside the bridge's 256: enough for a few browsers (about six
+        // connections each), and never all of the native clients' slots.
+        max_conns: 64,
+    }))
+}
+
 /// Resolve the WSS mTLS policy without conflating the auto-CA and BYO-CA modes.
 ///
 /// The WSS plane is always mTLS. `enabled` controls only whether the configured
@@ -9862,27 +9972,36 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
         };
         eprintln!("{warning}");
     }
-    for section in &config.retired_wati_config_sections {
-        let fallback = format!(
-            "warning: retired WATI channel config section '{section}' is ignored because WATI support was removed. Migrate to '[channels.whatsapp.<alias>]' using the Cloud API or WhatsApp Web, then revoke the unused WATI API token."
-        );
-        eprintln!(
-            "{}",
-            ta(
-                "cli-config-section-retired-wati",
-                &[("section", section)],
-                &fallback,
-            )
-        );
-    }
-    if config.retired_node_transport_config {
-        eprintln!(
-            "{}",
-            t(
-                "cli-config-section-retired-node-transport",
-                "warning: retired `[node_transport]` config is ignored because the legacy HMAC node transport was removed. Delete the section from config.toml."
-            )
-        );
+    // `config migrate` reports the same notices itself, as changes it wrote.
+    let reports_own_migration = matches!(
+        &cli.command,
+        Commands::Config {
+            config_command: ConfigCommands::Migrate { .. }
+        }
+    );
+    if !reports_own_migration && !config.migration_notices.is_empty() {
+        let path = config.config_path.display().to_string();
+        for notice in &config.migration_notices {
+            eprintln!("{}", migration_notice_text(notice, &path));
+        }
+        // Only a change to the file can be written; an ignored environment
+        // variable or a kept reference is for the operator to fix.
+        if config
+            .migration_notices
+            .iter()
+            .any(crate::config::migration::MigrationNotice::changes_file)
+        {
+            eprintln!(
+                "{}",
+                ta(
+                    "cli-config-migration-pending",
+                    &[("path", &path)],
+                    format!(
+                        "warning: these changes apply to this run only. Run `zeroclaw config migrate` to write them to {path}."
+                    ),
+                )
+            );
+        }
     }
     #[cfg(feature = "agent-runtime")]
     observability::runtime_trace::init_from_config(&config.observability, &config.data_dir);
@@ -10778,8 +10897,13 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     _ => None,
                 };
 
+                // Where the relay bridge hands a relay-served dashboard's browser
+                // connections to the gateway (`[relay.dashboard]`): in process,
+                // so they never arrive as loopback peers.
+                let dashboard_ingress = zeroclaw_runtime::relay_dashboard::DashboardIngress::new();
                 #[cfg(feature = "gateway")]
                 registry.register_gateway(Box::new({
+                    let dashboard_ingress = dashboard_ingress.clone();
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
                     let sop_dh = sop_driver_supervisor
@@ -10800,7 +10924,24 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                         let sop_audit = sop_a.clone();
                         let sop_driver_handles = sop_dh.clone();
                         let plugin_webhooks = Arc::clone(&plugin_webhooks);
+                        // Only a generation whose config serves the dashboard
+                        // through the relay takes its connections.
+                        let dashboard_ingress = config
+                            .relay
+                            .dashboard
+                            .enabled
+                            .then(|| dashboard_ingress.clone());
                         Box::pin(async move {
+                            let supervision = zeroclaw_gateway::GatewaySupervision::new(
+                                ready_tx,
+                                plugin_webhooks,
+                                authority,
+                                sop_driver_handles,
+                            );
+                            let supervision = match dashboard_ingress {
+                                Some(ingress) => supervision.with_dashboard_ingress(ingress),
+                                None => supervision,
+                            };
                             Box::pin(zeroclaw_gateway::run_gateway_with_plugin_webhooks(
                                 &host,
                                 port,
@@ -10812,12 +10953,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                                 sop_engine,
                                 sop_audit,
                                 daemon_authority,
-                                zeroclaw_gateway::GatewaySupervision::new(
-                                    ready_tx,
-                                    plugin_webhooks,
-                                    authority,
-                                    sop_driver_handles,
-                                ),
+                                supervision,
                             ))
                             .await
                         })
@@ -11072,6 +11208,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 // inner mTLS terminates; it never decrypts anything.
                 registry.register_relay(Box::new(move |ctx, cancel, _client_count| {
                     let enroll_bridge_ports_for_bridge = enroll_bridge_ports_for_bridge.clone();
+                    let dashboard_ingress = dashboard_ingress.clone();
                     Box::pin(async move {
                         let (relay_cfg, wss_cfg, enroll_cfg, data_dir) = {
                             let cfg = ctx.config.read();
@@ -11129,6 +11266,11 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                         } else {
                             relay_cfg.relay_host.clone()
                         };
+                        let dashboard = relay_dashboard_bridge(
+                            &relay_cfg.dashboard,
+                            &signing_key_pkcs8,
+                            dashboard_ingress,
+                        )?;
                         // Rotation is permitted only for an auto-minted id (a
                         // pinned [relay].node_id is fixed).
                         let rotation_allowed = relay_cfg.node_id.trim().is_empty();
@@ -11161,6 +11303,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                             data_dir: data_dir.clone(),
                             node_id_rotation_days,
                             rotation_allowed,
+                            dashboard,
                         };
                         zeroclaw_runtime::relay::run_relay_bridge(bridge_cfg, cancel).await
                     })
@@ -13152,7 +13295,12 @@ Add pricing to the active provider profile or supply a catalog entry."
                             let envelope = serde_json::json!({
                                 "migrated": true,
                                 "backup_path": report.backup_path.display().to_string(),
+                                "version_backup_path": report
+                                    .version_backup_path
+                                    .as_ref()
+                                    .map(|path| path.display().to_string()),
                                 "schema_version": to,
+                                "notices": report.notices,
                             });
                             println!("{}", serde_json::to_string_pretty(&envelope)?);
                         } else {
@@ -13164,10 +13312,26 @@ Add pricing to the active provider profile or supply a catalog entry."
                                     "Backed up to"
                                 )
                             );
+                            if let Some(kept) = &report.version_backup_path {
+                                let kept = kept.display().to_string();
+                                let from = report.from_version.to_string();
+                                println!(
+                                    "{}",
+                                    ta(
+                                        "cli-config-kept-original",
+                                        &[("version", &from), ("path", &kept)],
+                                        "Kept the schema V{$version} original as {$path}, readable only by you. It is never replaced, and it still holds any secrets the migration removed; delete it once you no longer need to go back to an older ZeroClaw."
+                                    )
+                                );
+                            }
                             println!(
                                 "Migrated {} to schema version {to}.",
                                 config.config_path.display()
                             );
+                            let path = config.config_path.display().to_string();
+                            for notice in &report.notices {
+                                eprintln!("{}", migration_notice_text(notice, &path));
+                            }
                         }
                     }
                     None => {
@@ -17667,6 +17831,59 @@ mod tests {
         }
     }
 
+    /// Every retirement reason a migration notice can show has its text in
+    /// every locale the CLI ships.
+    #[test]
+    fn every_retirement_reason_is_in_every_cli_locale() {
+        let locales: [(&str, &str); 5] = [
+            (
+                "en",
+                include_str!("../crates/zeroclaw-runtime/locales/en/cli.ftl"),
+            ),
+            (
+                "es",
+                include_str!("../crates/zeroclaw-runtime/locales/es/cli.ftl"),
+            ),
+            (
+                "fr",
+                include_str!("../crates/zeroclaw-runtime/locales/fr/cli.ftl"),
+            ),
+            (
+                "ja",
+                include_str!("../crates/zeroclaw-runtime/locales/ja/cli.ftl"),
+            ),
+            (
+                "zh-CN",
+                include_str!("../crates/zeroclaw-runtime/locales/zh-CN/cli.ftl"),
+            ),
+        ];
+        for key in crate::config::migration::RETIRED_KEYS {
+            for (locale, cli_ftl) in locales {
+                let entry = format!("{} = ", key.reason_id);
+                assert!(
+                    cli_ftl.lines().any(|line| line.starts_with(&entry)),
+                    "{locale}: missing `{}` for {:?}",
+                    key.reason_id,
+                    key.path
+                );
+            }
+        }
+        // Lowered values: each reason, and the notice line that carries it.
+        let capped = crate::config::migration::CAPPED_KEYS
+            .iter()
+            .map(|key| key.reason_id)
+            .chain(["cli-config-capped-key-lowered"]);
+        for id in capped {
+            for (locale, cli_ftl) in locales {
+                let entry = format!("{id} = ");
+                assert!(
+                    cli_ftl.lines().any(|line| line.starts_with(&entry)),
+                    "{locale}: missing `{id}`"
+                );
+            }
+        }
+    }
+
     #[cfg(feature = "agent-runtime")]
     #[test]
     fn quickstart_selector_rejects_widths_that_erase_action_labels() {
@@ -18684,6 +18901,39 @@ mod tests {
             }
             other => panic!("expected ACP command, got {other:?}"),
         }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn relay_dashboard_no_gateway_error_resolves_to_its_catalogue_text() {
+        assert_eq!(
+            qta("cli-relay-dashboard-no-gateway", &[]),
+            "[relay.dashboard] is enabled, but this build has no gateway to serve the dashboard. \
+             Use a build with the `gateway` feature, or disable [relay.dashboard]."
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "agent-runtime", feature = "gateway"))]
+    fn relay_dashboard_bad_origin_error_resolves_to_its_catalogue_text() {
+        let key = ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+            .expect("generate an Ed25519 key");
+        let dashboard = zeroclaw_config::schema::RelayDashboardConfig {
+            enabled: true,
+            domain: "not a domain".into(),
+            port: 443,
+        };
+        let Err(error) = relay_dashboard_bridge(
+            &dashboard,
+            key.as_ref(),
+            zeroclaw_runtime::relay_dashboard::DashboardIngress::new(),
+        ) else {
+            panic!("a domain that is not a DNS name must not form a dashboard origin");
+        };
+        assert_eq!(
+            error.to_string(),
+            "[relay.dashboard] domain and port must form the dashboard's HTTPS origin"
+        );
     }
 
     #[test]

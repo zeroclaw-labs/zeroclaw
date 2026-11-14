@@ -873,6 +873,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_enrollment_locks_out_with_a_zero_lockout_in_config() {
+        // Direct-class enrollment has its own listener and no request rate
+        // limiter, so the guard's per-peer lockout is the only bound on
+        // guessing. Startup keeps a config that fails validation, so a
+        // `lockout_secs = 0` can reach the daemon's guard; the peer must
+        // still be locked out after the attempt limit.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.pairing_dashboard.lockout_secs = 0;
+        let live = zeroclaw_config::live::LiveConfig::new(config);
+        let pairing = PairingGuard::new(true, &[], PairingCodePolicy::default())
+            .with_live_limits(zeroclaw_config::pairing::PairingLimits::live(live.handle()));
+        let server = test_server(pairing, None);
+        let wrong = || EnrollRequest {
+            pairing_code: "not-the-code".into(),
+            csr_pem: String::new(),
+        };
+
+        for i in 0..5 {
+            let err = server
+                .process(&wrong(), "203.0.113.7", PeerClass::Direct)
+                .await
+                .unwrap_err();
+            assert_eq!(err.0, 401, "attempt {i}: {}", err.1);
+        }
+        let err = server
+            .process(&wrong(), "203.0.113.7", PeerClass::Direct)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.0, 429,
+            "the sixth wrong code must meet the lockout: {}",
+            err.1
+        );
+    }
+
+    #[tokio::test]
     async fn enrollment_redeems_codes_from_the_shared_pairing_authority() {
         // The daemon hands enrollment its canonical pairing guard, so a code
         // the gateway minted must enroll, and enrolling must neither pair a

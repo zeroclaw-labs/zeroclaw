@@ -702,6 +702,47 @@ impl AcpSessionStore {
 
     /// Delete a session ONLY if `owner_principal_id` matches the stored
     /// owner, in one predicated statement (RFC 7141 atomic ownership).
+    /// Run a synchronous disclosure while the canonical row owner is held.
+    pub fn with_session_owner<R>(
+        &self,
+        session_uuid: &str,
+        effect: impl FnOnce(Option<&str>) -> Result<R>,
+    ) -> Result<R> {
+        let conn = self.conn.lock();
+        let owner = Self::effect_owner(&conn, session_uuid)?;
+        effect(owner.as_deref())
+    }
+
+    fn effect_owner(conn: &Connection, session_uuid: &str) -> Result<Option<String>> {
+        Ok(conn
+            .query_row(
+                "SELECT principal_id FROM acp_sessions WHERE session_uuid = ?1",
+                params![session_uuid],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Exact-owner deletion with a caller-owned guard at the write boundary.
+    pub fn delete_session_authorized<G>(
+        &self,
+        session_uuid: &str,
+        expected_owner: Option<&str>,
+        authorize: impl FnOnce(Option<&str>) -> Result<G>,
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let owner = Self::effect_owner(&tx, session_uuid)?;
+        let _authority = authorize(owner.as_deref())?;
+        let rows = tx.execute(
+            "DELETE FROM acp_sessions WHERE session_uuid = ?1 AND principal_id IS ?2",
+            params![session_uuid, expected_owner],
+        )?;
+        tx.commit()?;
+        Ok(rows > 0)
+    }
+
     /// Child-row cleanup follows the same cascade as [`Self::delete_session`].
     pub fn delete_session_owned(
         &self,
@@ -761,7 +802,22 @@ impl AcpSessionStore {
         session_uuid: &str,
         interaction_surface: &str,
     ) -> Result<String> {
-        let conn = self.conn.lock();
+        self.bind_interaction_surface_if_unset_authorized(session_uuid, interaction_surface, |_| {
+            Ok(())
+        })
+    }
+
+    /// Run authorization after the store write lock; retain its guard through commit.
+    pub fn bind_interaction_surface_if_unset_authorized<G>(
+        &self,
+        session_uuid: &str,
+        interaction_surface: &str,
+        authorize: impl FnOnce(Option<&str>) -> Result<G>,
+    ) -> Result<String> {
+        let mut locked = self.conn.lock();
+        let conn = locked.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let owner = Self::effect_owner(&conn, session_uuid)?;
+        let _authority = authorize(owner.as_deref())?;
         conn.execute(
             "UPDATE acp_sessions
              SET interaction_surface = ?1
@@ -769,12 +825,15 @@ impl AcpSessionStore {
             params![interaction_surface, session_uuid],
         )
         .context("Failed to bind ACP session interaction surface")?;
-        conn.query_row(
-            "SELECT interaction_surface FROM acp_sessions WHERE session_uuid = ?1",
-            params![session_uuid],
-            |row| row.get(0),
-        )
-        .with_context(|| format!("unknown session_uuid: {session_uuid}"))
+        let value = conn
+            .query_row(
+                "SELECT interaction_surface FROM acp_sessions WHERE session_uuid = ?1",
+                params![session_uuid],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("unknown session_uuid: {session_uuid}"))?;
+        conn.commit()?;
+        Ok(value)
     }
 
     /// Load session metadata and full message history for restore.
@@ -1998,11 +2057,24 @@ impl AcpSessionStore {
         turn_id: &str,
         messages: &[ConversationMessage],
     ) -> Result<()> {
+        self.begin_turn_checkpoint_authorized(session_uuid, turn_id, messages, |_| Ok(()))
+    }
+
+    /// Run authorization after the store write lock; retain its guard through commit.
+    pub fn begin_turn_checkpoint_authorized<G>(
+        &self,
+        session_uuid: &str,
+        turn_id: &str,
+        messages: &[ConversationMessage],
+        authorize: impl FnOnce(Option<&str>) -> Result<G>,
+    ) -> Result<()> {
         let mut conn = self.conn.lock();
         let session_id = Self::session_id(&conn, session_uuid)?;
         let tx = conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("Failed to begin ACP turn checkpoint transaction")?;
+        let owner = Self::effect_owner(&tx, session_uuid)?;
+        let _authority = authorize(owner.as_deref())?;
         tx.execute(
             "INSERT INTO acp_turn_checkpoints (session_id, turn_id) VALUES (?1, ?2)",
             params![session_id, turn_id],
@@ -2148,11 +2220,28 @@ impl AcpSessionStore {
         retained_messages: &[ConversationMessage],
         breadcrumb: bool,
     ) -> Result<()> {
+        self.persist_retained_context_seed_authorized(
+            session_uuid,
+            retained_messages,
+            breadcrumb,
+            |_| Ok(()),
+        )
+    }
+
+    pub fn persist_retained_context_seed_authorized<G>(
+        &self,
+        session_uuid: &str,
+        retained_messages: &[ConversationMessage],
+        breadcrumb: bool,
+        authorize: impl FnOnce(Option<&str>) -> Result<G>,
+    ) -> Result<()> {
         let mut conn = self.conn.lock();
         let session_id = Self::session_id(&conn, session_uuid)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("Failed to begin retained seed context transaction")?;
+        let owner = Self::effect_owner(&tx, session_uuid)?;
+        let _authority = authorize(owner.as_deref())?;
         let retained = Self::bounded_transcript_messages(retained_messages);
         let record = RetainedContextRecord {
             messages: Self::without_hidden_reasoning(&Self::provider_safe_history(&retained)),
@@ -2408,11 +2497,29 @@ impl AcpSessionStore {
         interruption_marker: &str,
         owner_principal_id: Option<&str>,
     ) -> Result<bool> {
+        self.recover_turn_checkpoint_for_owner_authorized(
+            session_uuid,
+            interruption_marker,
+            owner_principal_id,
+            |_| Ok(()),
+        )
+    }
+
+    /// Run authorization after the store write lock; retain its guard through commit.
+    pub fn recover_turn_checkpoint_for_owner_authorized<G>(
+        &self,
+        session_uuid: &str,
+        interruption_marker: &str,
+        owner_principal_id: Option<&str>,
+        authorize: impl FnOnce(Option<&str>) -> Result<G>,
+    ) -> Result<bool> {
         let now = Utc::now().to_rfc3339();
         let mut conn = self.conn.lock();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("Failed to begin ACP turn checkpoint recovery")?;
+        let owner = Self::effect_owner(&tx, session_uuid)?;
+        let _authority = authorize(owner.as_deref())?;
         let session_id = tx
             .query_row(
                 "SELECT id FROM acp_sessions
@@ -3017,11 +3124,27 @@ impl AcpSessionStore {
         session_uuid: &str,
         owner_principal_id: Option<&str>,
     ) -> Result<AcpSessionKillTransition> {
+        self.mark_session_killed_atomic_for_owner_authorized(
+            session_uuid,
+            owner_principal_id,
+            |_| Ok(()),
+        )
+    }
+
+    /// Run authorization after the store write lock; retain its guard through commit.
+    pub fn mark_session_killed_atomic_for_owner_authorized<G>(
+        &self,
+        session_uuid: &str,
+        owner_principal_id: Option<&str>,
+        authorize: impl FnOnce(Option<&str>) -> Result<G>,
+    ) -> Result<AcpSessionKillTransition> {
         let now = Utc::now().to_rfc3339();
         let mut conn = self.conn.lock();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("Failed to begin ACP session kill transition")?;
+        let owner = Self::effect_owner(&tx, session_uuid)?;
+        let _authority = authorize(owner.as_deref())?;
         let rows = tx
             .execute(
                 "UPDATE acp_sessions
@@ -3440,6 +3563,127 @@ fn parse_ts(s: &str, field: &'static str, session_uuid: &str) -> DateTime<Utc> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn guarded_effects_reauthorize_after_store_lock_without_partial_writes() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        fn snapshot(store: &AcpSessionStore) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+            let conn = store.conn.lock();
+            [
+                "acp_sessions",
+                "acp_messages",
+                "acp_tool_calls",
+                "acp_session_events",
+                "acp_turn_checkpoints",
+                "acp_turn_checkpoint_events",
+            ]
+            .iter()
+            .map(|table| {
+                let mut stmt = conn
+                    .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                    .unwrap();
+                let count = stmt.column_count();
+                stmt.query_map([], |row| (0..count).map(|i| row.get(i)).collect())
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+            })
+            .collect()
+        }
+        for effect in ["begin", "recover", "kill", "delete", "surface", "seed"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let store = Arc::new(AcpSessionStore::new(tmp.path()).unwrap());
+            store
+                .create_session("s", "test", "/tmp", Some("user:bob"))
+                .unwrap();
+            store
+                .append_turn(
+                    "s",
+                    &[ConversationMessage::Chat(ChatMessage::user("retained"))],
+                )
+                .unwrap();
+            if effect != "begin" {
+                store
+                    .begin_turn_checkpoint(
+                        "s",
+                        "old-turn",
+                        &[ConversationMessage::Chat(ChatMessage::user("pending"))],
+                    )
+                    .unwrap();
+            }
+            let before = snapshot(&store);
+            let allowed = Arc::new(AtomicBool::new(true));
+            let entered = Arc::new(AtomicBool::new(false));
+            let lock = store.conn.lock();
+            let (started, waiting) = std::sync::mpsc::channel();
+            let worker_store = Arc::clone(&store);
+            let worker_allowed = Arc::clone(&allowed);
+            let worker_entered = Arc::clone(&entered);
+            let worker = std::thread::spawn(move || {
+                started.send(()).unwrap();
+                let authorize = |owner: Option<&str>| -> anyhow::Result<()> {
+                    worker_entered.store(true, Ordering::SeqCst);
+                    assert_eq!(owner, Some("user:bob"));
+                    if !worker_allowed.load(Ordering::SeqCst) {
+                        return Err(anyhow::Error::msg("current authority denied"));
+                    }
+                    Ok(())
+                };
+                match effect {
+                    "begin" => worker_store.begin_turn_checkpoint_authorized(
+                        "s",
+                        "new-turn",
+                        &[],
+                        authorize,
+                    ),
+                    "recover" => worker_store
+                        .recover_turn_checkpoint_for_owner_authorized(
+                            "s",
+                            "interrupted",
+                            Some("user:bob"),
+                            authorize,
+                        )
+                        .map(|_| ()),
+                    "kill" => worker_store
+                        .mark_session_killed_atomic_for_owner_authorized(
+                            "s",
+                            Some("user:bob"),
+                            authorize,
+                        )
+                        .map(|_| ()),
+                    "delete" => worker_store
+                        .delete_session_authorized("s", Some("user:bob"), authorize)
+                        .map(|_| ()),
+                    "surface" => worker_store
+                        .bind_interaction_surface_if_unset_authorized("s", "code", authorize)
+                        .map(|_| ()),
+                    _ => worker_store.persist_retained_context_seed_authorized(
+                        "s",
+                        &[],
+                        false,
+                        authorize,
+                    ),
+                }
+            });
+            waiting.recv().unwrap();
+            assert!(
+                !entered.load(Ordering::SeqCst),
+                "{effect}: authorization must wait for the storage boundary"
+            );
+            allowed.store(false, Ordering::SeqCst);
+            drop(lock);
+            assert!(worker.join().unwrap().is_err(), "{effect}");
+            assert!(entered.load(Ordering::SeqCst));
+            assert_eq!(
+                snapshot(&store),
+                before,
+                "{effect}: denied mutation must leave row, checkpoint and events byte-for-byte unchanged"
+            );
+        }
+    }
+
     use super::*;
     use tempfile::TempDir;
     use zeroclaw_api::model_provider::{
