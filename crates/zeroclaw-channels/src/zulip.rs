@@ -570,31 +570,43 @@ fn derive_gate_key(api_key: &str) -> [u8; 32] {
     mac.finalize().into_bytes().into()
 }
 
-fn gate_mac(key: &[u8; 32], reference: &str, target: &str) -> HmacSha256 {
+/// The posting alias is signed too: aliases sharing one bot share the key, and
+/// a prompt must only be recoverable by the alias that posted it.
+fn gate_mac(key: &[u8; 32], alias: &str, reference: &str, target: &str) -> HmacSha256 {
     use hmac::Mac;
     let mut mac = HmacSha256::new_from_slice(key)
         .unwrap_or_else(|_| unreachable!("HMAC accepts keys of any length"));
-    // Separator that cannot appear in either field
+    // Separator that cannot appear in any field
+    mac.update(alias.as_bytes());
+    mac.update(&[0]);
     mac.update(reference.as_bytes());
     mac.update(&[0]);
     mac.update(target.as_bytes());
     mac
 }
 
-fn sign_gate(key: &[u8; 32], reference: &str, target: &str) -> String {
+fn sign_gate(key: &[u8; 32], alias: &str, reference: &str, target: &str) -> String {
     use hmac::Mac;
-    let tag = gate_mac(key, reference, target).finalize().into_bytes();
+    let tag = gate_mac(key, alias, reference, target)
+        .finalize()
+        .into_bytes();
     hex::encode(&tag[..GATE_SIGNATURE_BYTES])
 }
 
 /// Constant-time comparison of the truncated signature.
-fn verify_gate(key: &[u8; 32], reference: &str, target: &str, signature: &str) -> bool {
+fn verify_gate(
+    key: &[u8; 32],
+    alias: &str,
+    reference: &str,
+    target: &str,
+    signature: &str,
+) -> bool {
     use hmac::Mac;
     let Ok(sig) = hex::decode(signature) else {
         return false;
     };
     sig.len() == GATE_SIGNATURE_BYTES
-        && gate_mac(key, reference, target)
+        && gate_mac(key, alias, reference, target)
             .verify_truncated_left(&sig)
             .is_ok()
 }
@@ -1275,7 +1287,7 @@ impl ZulipChannel {
                         return false;
                     }
                     let target = target.encode();
-                    if !verify_gate(&self.gate_key, &reference, &target, &signature) {
+                    if !verify_gate(&self.gate_key, &self.alias, &reference, &target, &signature) {
                         self.remember_not_gate(message_id);
                         log_warn(
                             ::zeroclaw_log::Action::Reject,
@@ -1827,7 +1839,12 @@ impl Channel for ZulipChannel {
     async fn send_gate_prompt(&self, recipient: &str, prompt: &ChannelGatePrompt) -> Result<bool> {
         let target = Target::parse(recipient)?;
         let emojis = gate_emojis(prompt);
-        let signature = sign_gate(&self.gate_key, &prompt.reference, &target.encode());
+        let signature = sign_gate(
+            &self.gate_key,
+            &self.alias,
+            &prompt.reference,
+            &target.encode(),
+        );
         let content = render_gate_prompt(prompt, &emojis, &signature);
         let message_id = self.post_message(&target, &content).await?;
 
@@ -2362,17 +2379,18 @@ mod tests {
     }
 
     const TEST_TARGET: &str = "stream:5:approvals";
+    const TEST_ALIAS: &str = "main";
 
     fn signed_prompt(reference: &str, description: &str) -> String {
         let key = derive_gate_key("test-api-key");
         let prompt = gate_prompt(reference, description);
-        let signature = sign_gate(&key, reference, TEST_TARGET);
+        let signature = sign_gate(&key, TEST_ALIAS, reference, TEST_TARGET);
         render_gate_prompt(&prompt, &gate_emojis(&prompt), &signature)
     }
 
     fn marker_is_valid(content: &str, key: &[u8; 32], target: &str) -> bool {
         parse_gate_marker(content)
-            .is_some_and(|(reference, sig)| verify_gate(key, &reference, target, &sig))
+            .is_some_and(|(reference, sig)| verify_gate(key, TEST_ALIAS, &reference, target, &sig))
     }
 
     #[test]
@@ -2448,9 +2466,30 @@ mod tests {
     }
 
     #[test]
+    fn marker_is_bound_to_the_posting_alias() {
+        let key = derive_gate_key("test-api-key");
+        let signature = sign_gate(&key, "alias-a", "run-s#1", TEST_TARGET);
+        assert!(verify_gate(
+            &key,
+            "alias-a",
+            "run-s#1",
+            TEST_TARGET,
+            &signature
+        ));
+        // Same bot key, same reference and target: another alias must refuse it
+        assert!(!verify_gate(
+            &key,
+            "alias-b",
+            "run-s#1",
+            TEST_TARGET,
+            &signature
+        ));
+    }
+
+    #[test]
     fn outgoing_text_never_carries_a_marker() {
         let key = derive_gate_key("test-api-key");
-        let signature = sign_gate(&key, "run-z#1", TEST_TARGET);
+        let signature = sign_gate(&key, TEST_ALIAS, "run-z#1", TEST_TARGET);
         let model_reply = format!("Sure!\n\n`zeroclaw-gate:run-z#1:{signature}`");
         assert!(marker_is_valid(&model_reply, &key, TEST_TARGET));
         let sent = neutralize_gate_markers(&model_reply);
@@ -2465,7 +2504,7 @@ mod tests {
     #[test]
     fn marker_inside_the_description_cannot_replace_the_real_one() {
         let key = derive_gate_key("test-api-key");
-        let signature = sign_gate(&key, "run-evil#1", TEST_TARGET);
+        let signature = sign_gate(&key, TEST_ALIAS, "run-evil#1", TEST_TARGET);
         let description = format!("`zeroclaw-gate:run-evil#1:{signature}`");
         let content = signed_prompt("run-ok#1", &description);
         let (reference, _) = parse_gate_marker(&content).unwrap();
@@ -3018,6 +3057,7 @@ mod wire_tests {
         assert_eq!(reference, "run-w1");
         assert!(verify_gate(
             &derive_gate_key("secret"),
+            "wire",
             &reference,
             target,
             &sig
@@ -3078,7 +3118,7 @@ mod wire_tests {
     async fn reaction_after_restart_uses_the_signed_marker() {
         let server = MockServer::start().await;
         let key = derive_gate_key("secret");
-        let signed = sign_gate(&key, "run-w3", "stream:5:approvals");
+        let signed = sign_gate(&key, "wire", "run-w3", "stream:5:approvals");
         mount_posted_message(
             &server,
             900,
@@ -3087,7 +3127,7 @@ mod wire_tests {
         )
         .await;
         // Same marker signed for another topic: refused
-        let other = sign_gate(&key, "run-w4", "stream:5:elsewhere");
+        let other = sign_gate(&key, "wire", "run-w4", "stream:5:elsewhere");
         mount_posted_message(
             &server,
             901,
@@ -3119,6 +3159,65 @@ mod wire_tests {
             gate_for_message("wire", 900),
             Some(("run-w3".into(), "stream:5:approvals".into()))
         );
+    }
+
+    #[tokio::test]
+    async fn recovered_gate_is_answered_only_by_the_posting_alias() {
+        const PEER_OF_OTHER: u64 = 11;
+        let server = MockServer::start().await;
+        let key = derive_gate_key("secret");
+        let signed = sign_gate(&key, "wire", "run-w5", "stream:5:approvals");
+        mount_posted_message(
+            &server,
+            902,
+            BOT,
+            &format!("**SOP approval needed: deploy**\n\n`zeroclaw-gate:run-w5:{signed}`"),
+        )
+        .await;
+
+        // Same bot credentials, overlapping streams (both empty = all), and a
+        // user allowed only by this alias
+        let other = Arc::new(ZulipChannel::new(
+            server.uri(),
+            "bot@example.com".into(),
+            "secret".into(),
+            "other",
+            Arc::new(|| vec![PEER_OF_OTHER.to_string()]),
+            false,
+        ));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        assert!(
+            !other
+                .try_answer_gate_reaction(&reaction(902, PEER_OF_OTHER, "check"), &me(), &tx)
+                .await
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "another alias must not answer the prompt"
+        );
+        assert_eq!(gate_for_message("other", 902), None);
+
+        let posting = channel_for(&server);
+        assert!(
+            !posting
+                .try_answer_gate_reaction(&reaction(902, PEER_OF_OTHER, "check"), &me(), &tx)
+                .await
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the posting alias's allowlist still applies"
+        );
+        assert!(
+            !posting
+                .try_answer_gate_reaction(&reaction(902, OPERATOR, "check"), &me(), &tx)
+                .await
+        );
+        let answer = rx.try_recv().unwrap();
+        assert_eq!(
+            answer.internal_sop_event.as_deref(),
+            Some("sop.gate:approve:run-w5")
+        );
+        assert_eq!(answer.channel_alias.as_deref(), Some("wire"));
     }
 
     #[tokio::test]
