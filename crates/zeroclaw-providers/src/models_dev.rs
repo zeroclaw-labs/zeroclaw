@@ -162,7 +162,7 @@ const MAX_PLAUSIBLE_CONTEXT_WINDOW: u64 = 100_000_000;
 
 /// Reject zero and absurd values so a malformed catalog entry can't widen an
 /// agent's trim budget past anything the model could actually accept.
-fn sane_context_window(raw: u64) -> Option<usize> {
+pub(crate) fn sane_context_window(raw: u64) -> Option<usize> {
     if raw == 0 || raw > MAX_PLAUSIBLE_CONTEXT_WINDOW {
         return None;
     }
