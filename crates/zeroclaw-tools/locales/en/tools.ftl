@@ -17,6 +17,8 @@ tool-browser-delegate = Delegate browser-based tasks to a browser-capable CLI fo
 
 tool-browser-open = Open an approved HTTPS URL in the system browser. Security constraints: allowlist-only domains, no local/private hosts, no scraping.
 
+tool-canvas-snapshot-empty = Canvas '{ $canvas_id }' has no content: it was never rendered or has been cleared, so nothing is displayed. Render it again to show something.
+
 tool-channel-room = Create rooms and invite users through an active channel. Provide a channel key such as 'matrix.default', action 'create_room' or 'invite_user', and the action-specific room fields.
 tool-channel-room-param-action = Room-management action to perform.
 tool-channel-room-param-channel = Active channel key such as 'matrix.default'.
