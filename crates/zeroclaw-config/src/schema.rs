@@ -18125,6 +18125,19 @@ pub struct MatrixConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub interrupt_on_new_message: bool,
+    /// Optional Matrix user ID of the operator to notify when an inbound
+    /// message is turned away by the sender allowlist (e.g.
+    /// `"@operator:example.org"`). When set, the channel delivers a short
+    /// heads-up DM naming the sender, the source room, and a bounded preview
+    /// of the turned-away message, plus an authorization hint. Blank values
+    /// behave as unset. Unlike the Telegram owner notice there is no
+    /// sender-echo guard: Matrix sends no public stub to the turned-away
+    /// sender, so the notice is the only signal — an operator testing from an
+    /// unauthorized MXID still receives it. Notices are throttled to one per
+    /// (sender, room) pair per 5 minutes.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub owner_user_id: Option<String>,
     /// Streaming mode for progressive response delivery.
     /// `"off"` (default): single final message. `"partial"`: edit-in-place draft.
     /// `"single_message"`: progress draft plus separate final message.
