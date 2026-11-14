@@ -56053,11 +56053,13 @@ impl Config {
         // builds never reinterpret legacy state here.
         #[cfg(feature = "test-helpers")]
         {
-            return crate::migration::admit_test_input(self)
+            crate::migration::admit_test_input(self)
                 .providers
-                .canonical_registry();
+                .canonical_registry()
         }
         #[cfg(not(feature = "test-helpers"))]
-        self.providers.canonical_registry()
+        {
+            self.providers.canonical_registry()
+        }
     }
 }
