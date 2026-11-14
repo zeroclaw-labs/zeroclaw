@@ -56057,6 +56057,7 @@ impl Config {
                 .providers
                 .canonical_registry();
         }
+        #[cfg(not(feature = "test-helpers"))]
         self.providers.canonical_registry()
     }
 }
