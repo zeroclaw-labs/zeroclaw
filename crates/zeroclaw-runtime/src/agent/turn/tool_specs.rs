@@ -21,13 +21,21 @@ impl IterationToolSpecs {
     pub(crate) fn exceeds_single_tool_round(
         &self,
         response: &zeroclaw_providers::ChatResponse,
-        strict_tool_parsing: bool,
+        text_tool_calls_disabled: bool,
+        extract_text_reasoning: bool,
     ) -> bool {
-        exceeds_single_tool_round(
+        let text_tool_calls = zeroclaw_providers::response::count_text_tool_calls(
             response.text_or_empty(),
+            zeroclaw_api::TextExtraction {
+                reasoning: extract_text_reasoning,
+                tool_calls: !text_tool_calls_disabled,
+            },
+        );
+        exceeds_single_tool_round(
             response.tool_calls.len(),
             !self.tool_specs.is_empty(),
-            strict_tool_parsing,
+            text_tool_calls_disabled,
+            text_tool_calls,
         )
     }
 
@@ -47,24 +55,39 @@ impl IterationToolSpecs {
             .native_tool_calling
             && !self.request_tool_specs().is_empty();
     }
+
+    pub(crate) fn validate_tool_protocol(
+        &self,
+        model_provider: &dyn ModelProvider,
+        model: &str,
+    ) -> Result<()> {
+        // Reliable selects its candidate after the runtime builds one prompt
+        // and one tool request. Until that boundary can rebuild both for each
+        // candidate, mixed transports cannot safely serve a tool-bearing turn.
+        if !self.request_tool_specs().is_empty()
+            && model_provider.has_mixed_native_tool_support_for_model(model)
+        {
+            return Err(anyhow::Error::msg(crate::i18n::get_required_cli_string(
+                "turn-mixed-tool-protocols-unsupported",
+            )));
+        }
+        Ok(())
+    }
 }
 
 pub(super) fn exceeds_single_tool_round(
-    text: &str,
     native_calls: usize,
     has_tools: bool,
-    strict_tool_parsing: bool,
+    text_tool_calls_disabled: bool,
+    text_tool_calls: usize,
 ) -> bool {
     if native_calls > 0 {
         return native_calls > 1;
     }
-    if !has_tools || strict_tool_parsing {
+    if !has_tools || text_tool_calls_disabled {
         return false;
     }
-    let text = zeroclaw_tool_call_parser::strip_think_tags(text);
-    let text = zeroclaw_tool_call_parser::strip_trailing_terminal_markers(&text);
-    !zeroclaw_tool_call_parser::looks_like_tool_protocol_example(&text)
-        && zeroclaw_tool_call_parser::parse_tool_calls(&text).1.len() > 1
+    text_tool_calls > 1
 }
 
 pub(crate) fn build_iteration_tool_specs(
@@ -124,20 +147,16 @@ pub(crate) fn build_iteration_tool_specs(
             .cloned()
             .collect::<Vec<_>>()
     });
-    let use_native_tools = model_provider
-        .capabilities_for_model(model)
-        .native_tool_calling
-        && !exposed_tool_specs
-            .as_deref()
-            .unwrap_or(&tool_specs)
-            .is_empty();
-
-    Ok(IterationToolSpecs {
+    let mut specs = IterationToolSpecs {
         tool_specs,
         exposed_tool_specs,
         known_tool_names,
-        use_native_tools,
-    })
+        use_native_tools: false,
+    };
+    // Hooks may select another route. Schema assembly must remain possible
+    // even when the provisional default cannot serve the final tool request.
+    specs.refresh_native_tool_mode(model_provider, model);
+    Ok(specs)
 }
 
 #[cfg(test)]
@@ -388,5 +407,56 @@ mod tests {
             !specs.use_native_tools,
             "active provider must decide whether this turn uses native tool transport"
         );
+    }
+
+    #[test]
+    fn mixed_fallback_rejects_tools_before_dispatch_but_allows_scalar_calls() {
+        let mixed = zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "mixed",
+            vec![
+                (
+                    "native".into(),
+                    Box::new(NativeToolsProvider) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "text".into(),
+                    Box::new(PromptToolsProvider) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            0,
+        );
+        let tool = Box::new(CountingTool::new(
+            "read_file",
+            Arc::new(AtomicUsize::new(0)),
+        ));
+        let mut specs = build_iteration_tool_specs(&mixed, "test-model", &[tool], &[], None)
+            .expect("provisional schema assembly must allow a later hook route selection");
+        let error = specs
+            .validate_tool_protocol(&mixed, "test-model")
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            crate::i18n::get_required_cli_string("turn-mixed-tool-protocols-unsupported")
+        );
+        let scalar = build_iteration_tool_specs(&mixed, "test-model", &[], &[], None).unwrap();
+        assert!(scalar.validate_tool_protocol(&mixed, "test-model").is_ok());
+
+        specs.refresh_native_tool_mode(&NativeToolsProvider, "test-model");
+        assert!(
+            specs
+                .validate_tool_protocol(&NativeToolsProvider, "test-model")
+                .is_ok()
+        );
+
+        // Recheck after hooks or vision routing change the selected provider.
+        let tool = Box::new(CountingTool::new(
+            "read_file",
+            Arc::new(AtomicUsize::new(0)),
+        ));
+        let specs =
+            build_iteration_tool_specs(&NativeToolsProvider, "test-model", &[tool], &[], None)
+                .unwrap();
+        assert!(specs.validate_tool_protocol(&mixed, "test-model").is_err());
     }
 }

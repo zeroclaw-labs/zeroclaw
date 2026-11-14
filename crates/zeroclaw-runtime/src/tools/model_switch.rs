@@ -6,6 +6,7 @@ use serde_json::json;
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
+use zeroclaw_tools::llm_task::ModelConfigResolver;
 
 #[cfg(test)]
 type ModelCatalogResolver = std::sync::Arc<
@@ -33,50 +34,37 @@ where
     }
 }
 
-fn configured_model_provider_profiles(config: &Config) -> Vec<String> {
-    let mut profiles = config
-        .providers
-        .models
-        .iter_entries()
-        .map(|(family, alias, _profile)| format!("{family}.{alias}"))
-        .collect::<Vec<_>>();
-    profiles.sort();
-    profiles
+fn configured_models(config: &Config) -> Vec<String> {
+    config
+        .provider_registry()
+        .map(|registry| {
+            registry
+                .models
+                .into_iter()
+                .filter(|(_, model)| {
+                    model.capability() == zeroclaw_api::capability::Capability::Chat
+                })
+                .map(|(reference, _)| reference.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
-fn resolve_model_provider_profile_ref(config: &Config, raw: &str) -> Result<String, String> {
+/// Model references are opaque keys, including every dot in the TOML key.
+fn resolve_model_ref(config: &Config, raw: &str) -> Result<(String, Option<String>), String> {
     let raw = raw.trim();
-    let Some((family, alias)) = raw.split_once('.') else {
-        return Err(format!(
-            "model_provider must be a dotted `<type>.<alias>` provider profile reference, got `{raw}`"
-        ));
-    };
-    let family = family.trim();
-    let alias = alias.trim();
-    if family.is_empty() || alias.is_empty() {
-        return Err(format!(
-            "model_provider must be a dotted `<type>.<alias>` provider profile reference, got `{raw}`"
-        ));
-    }
-
-    if config.providers.models.find(family, alias).is_none() {
-        let available = configured_model_provider_profiles(config);
-        let available = if available.is_empty() {
-            "no configured provider profiles".to_string()
-        } else {
-            available.join(", ")
-        };
-        return Err(format!(
-            "model_provider `{raw}` is not a configured provider profile. Add a [providers.models.{family}.{alias}] entry or use one of: {available}"
-        ));
-    }
-
-    Ok(format!("{family}.{alias}"))
+    let registry = config
+        .provider_registry()
+        .map_err(|error| error.to_string())?;
+    let resolved = registry
+        .resolve_chat(&zeroclaw_config::provider_registry::ModelRef::from(raw))
+        .map_err(|error| error.to_string())?;
+    Ok((raw.to_owned(), resolved.upstream_model().map(str::to_owned)))
 }
 
 pub struct ModelSwitchTool {
     security: Arc<SecurityPolicy>,
-    config: Arc<Config>,
+    config: ModelConfigResolver,
     #[cfg(test)]
     catalog_resolver: Option<ModelCatalogResolver>,
 }
@@ -87,6 +75,15 @@ impl ModelSwitchTool {
     pub const NAME: &'static str = "model_switch";
 
     pub fn new(security: Arc<SecurityPolicy>, config: Arc<Config>) -> Self {
+        #[cfg(test)]
+        let config = Arc::new(zeroclaw_config::migration::admit_test_input(&config));
+        Self::with_config_resolver(security, Arc::new(move || Arc::clone(&config)))
+    }
+
+    pub fn with_config_resolver(
+        security: Arc<SecurityPolicy>,
+        config: ModelConfigResolver,
+    ) -> Self {
         Self {
             security,
             config,
@@ -103,7 +100,7 @@ impl Tool for ModelSwitchTool {
     }
 
     fn description(&self) -> &str {
-        "Request a runtime model switch using a configured provider profile plus provider-local model. Use 'get' to see the pending switch, 'list_model_providers' to see provider families, 'list_models' to see common models for a provider profile, or 'set' with a dotted provider profile ref such as 'openai.default'. The switch is runtime/session state and does not write config."
+        "Request a runtime model switch using an exact configured model reference. Use 'get' to see the pending switch, 'list_model_providers' to see configured model references and available provider kinds, 'list_models' to query upstream model IDs through a configured model's connection, or 'set' with a model reference such as 'chat.fast'. The switch is runtime/session state and does not write config."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -113,15 +110,15 @@ impl Tool for ModelSwitchTool {
                 "action": {
                     "type": "string",
                     "enum": ["get", "set", "list_model_providers", "list_models"],
-                    "description": "Action to perform: get pending switch state, set a runtime provider-profile/model switch, list available provider families, or list common models for a provider profile"
+                    "description": "Action to perform: get pending switch state, set an exact model switch, list configured model references and provider kinds, or query upstream model IDs through a configured model's connection"
                 },
                 "model_provider": {
                     "type": "string",
-                    "description": "Dotted provider profile reference (e.g., 'openai.default', 'anthropic.sonnet', 'ollama.local'). Required for 'set' and 'list_models' actions."
+                    "description": "Exact configured model reference (for example, 'chat.fast'). Required for 'set' and 'list_models' actions."
                 },
                 "model": {
                     "type": "string",
-                    "description": "Model ID (e.g., 'gpt-4o', 'claude-sonnet-4-6'). Required for 'set' action."
+                    "description": "Optional provider-local model override. Usually omit this when the model reference already selects a model."
                 }
             },
             "required": ["action"]
@@ -171,13 +168,14 @@ impl ModelSwitchTool {
             success: true,
             output: serde_json::to_string_pretty(&json!({
                 "pending_switch": pending,
-                "note": "To switch models, use action 'set' with dotted <type>.<alias> model_provider and model parameters"
+                "note": "To switch models, use action 'set' with an exact configured model_provider reference"
             }))?.into(),
             error: None,
         })
     }
 
     fn handle_set(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
+        let config = (self.config)();
         let model_provider = args.get("model_provider").and_then(|v| v.as_str());
 
         let model_provider = match model_provider {
@@ -193,36 +191,25 @@ impl ModelSwitchTool {
 
         let model = args.get("model").and_then(|v| v.as_str());
 
-        let model = match model {
-            Some(m) => m,
-            None => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some("Missing 'model' parameter for 'set' action".to_string()),
-                });
-            }
-        };
-
-        let model_provider = match resolve_model_provider_profile_ref(&self.config, model_provider)
-        {
-            Ok(model_provider) => model_provider,
+        let (model_provider, derived_model) = match resolve_model_ref(&config, model_provider) {
+            Ok(resolved) => resolved,
             Err(error) => {
                 let known_model_providers = zeroclaw_providers::list_model_providers();
-                let configured_profiles = configured_model_provider_profiles(&self.config);
+                let configured_model_refs = configured_models(&config);
                 return Ok(ToolResult {
-                    success: false,
-                    output: serde_json::to_string_pretty(&json!({
-                        "provider_ref_shape": "<type>.<alias>",
-                        "available_provider_families": known_model_providers.iter().map(|p| p.name).collect::<Vec<_>>(),
-                        "configured_provider_profiles": configured_profiles
-                    }))?.into(),
-                    error: Some(error),
-                });
+                        success: false,
+                        output: serde_json::to_string_pretty(&json!({
+                            "provider_ref_shape": "exact TOML model key",
+                            "available_provider_families": known_model_providers.iter().map(|p| p.name).collect::<Vec<_>>(),
+                            "configured_models": configured_model_refs
+                        }))?.into(),
+                        error: Some(error),
+                    });
             }
         };
 
-        if !crate::agent::turn::model_switch_provider_allowed(&model_provider) {
+        let policy_ref = model_provider.clone();
+        if !crate::agent::turn::model_switch_provider_allowed(&policy_ref) {
             return Ok(ToolResult {
                 success: false,
                 output: serde_json::to_string_pretty(&json!({
@@ -236,7 +223,26 @@ impl ModelSwitchTool {
             });
         }
 
-        let model = model.trim();
+        // Explicit upstream `model` wins; otherwise resolve the exact configured model key.
+        let model = match model
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string)
+            .or(derived_model)
+        {
+            Some(m) => m,
+            None => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(crate::i18n::get_required_cli_string(
+                        "cli-model-switch-model-required",
+                    )),
+                });
+            }
+        };
+
+        let model = model.trim().to_string();
         if model.is_empty() {
             return Ok(ToolResult {
                 success: false,
@@ -259,9 +265,9 @@ impl ModelSwitchTool {
 
         let switch_state = current_model_switch_state()?;
         match switch_state.lock() {
-            Ok(mut state) => *state = Some((model_provider.clone(), model.to_string())),
+            Ok(mut state) => *state = Some((model_provider.clone(), model.clone())),
             Err(poisoned) => {
-                *poisoned.into_inner() = Some((model_provider.clone(), model.to_string()));
+                *poisoned.into_inner() = Some((model_provider.clone(), model.clone()));
             }
         }
 
@@ -279,8 +285,8 @@ impl ModelSwitchTool {
 
     fn handle_list_providers(&self) -> anyhow::Result<ToolResult> {
         let providers_list = zeroclaw_providers::list_model_providers();
-        let configured_profiles = configured_model_provider_profiles(&self.config);
-        let configured_count = configured_profiles.len();
+        let configured_model_refs = configured_models(&(self.config)());
+        let configured_count = configured_model_refs.len();
 
         let model_providers: Vec<serde_json::Value> = providers_list
             .iter()
@@ -298,36 +304,52 @@ impl ModelSwitchTool {
             output: serde_json::to_string_pretty(&json!({
                 "model_providers": model_providers,
                 "count": model_providers.len(),
-                "configured_provider_profiles": configured_profiles,
+                "configured_models": configured_model_refs,
                 "configured_count": configured_count,
-                "provider_ref_shape": "<type>.<alias>",
-                "example": "Use action 'set' with a dotted provider profile ref such as 'openai.default'"
-            }))?.into(),
+                "provider_ref_shape": "exact TOML model key",
+                "example": "Use action 'set' with an exact model reference such as 'chat.fast'"
+            }))?
+            .into(),
             error: None,
         })
     }
 
-    async fn resolve_catalog(&self, provider_ref: &str) -> anyhow::Result<Vec<String>> {
+    async fn resolve_catalog(
+        &self,
+        config: Arc<Config>,
+        provider_ref: &str,
+    ) -> anyhow::Result<Vec<String>> {
         #[cfg(test)]
         if let Some(resolver) = &self.catalog_resolver {
             return resolver(provider_ref.to_string()).await;
         }
 
-        let family = provider_ref
-            .split_once('.')
-            .map_or(provider_ref, |(family, _)| family);
-        let provider =
-            zeroclaw_providers::create_model_provider_from_ref(&self.config, provider_ref)?;
+        let registry = config.provider_registry()?;
+        let family = registry
+            .resolve_chat(&zeroclaw_config::provider_registry::ModelRef::from(
+                provider_ref,
+            ))?
+            .selection
+            .connection
+            .kind()
+            .to_owned();
+        let reference = provider_ref.to_owned();
+        let provider = zeroclaw_providers::model::build_nonblocking(move || {
+            zeroclaw_providers::model::build_raw_provider(&config, &reference, Default::default())
+                .map(|resolved| resolved.provider)
+        })
+        .await?;
         let live_result = zeroclaw_providers::ProviderDispatch::from_ref(&*provider)
             .list_models()
             .await;
         fallback_if_model_listing_unsupported(live_result, || {
-            zeroclaw_providers::catalog::list_models_for_family(family)
+            zeroclaw_providers::catalog::list_models_for_family(&family)
         })
         .await
     }
 
     async fn handle_list_models(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
+        let config = (self.config)();
         let model_provider = args.get("model_provider").and_then(|v| v.as_str());
 
         let model_provider = match model_provider {
@@ -343,27 +365,34 @@ impl ModelSwitchTool {
             }
         };
 
-        let model_provider = match resolve_model_provider_profile_ref(&self.config, model_provider)
-        {
-            Ok(model_provider) => model_provider,
+        let model_provider = match resolve_model_ref(&config, model_provider) {
+            Ok((model_provider, _derived_model)) => model_provider,
             Err(error) => {
                 return Ok(ToolResult {
                     success: false,
                     output: serde_json::to_string_pretty(&json!({
-                        "provider_ref_shape": "<type>.<alias>",
-                        "configured_provider_profiles": configured_model_provider_profiles(&self.config)
-                    }))?.into(),
+                        "provider_ref_shape": "exact TOML model key",
+                        "configured_models": configured_models(&config)
+                    }))?
+                    .into(),
                     error: Some(error),
                 });
             }
         };
-        let provider_family = model_provider
-            .split_once('.')
-            .map(|(family, _alias)| family)
-            .unwrap_or(model_provider.as_str());
-        let provider_family = provider_family.to_lowercase();
+        let registry = config.provider_registry()?;
+        let provider_family = registry
+            .resolve_chat(&zeroclaw_config::provider_registry::ModelRef::from(
+                model_provider.as_str(),
+            ))?
+            .selection
+            .connection
+            .kind()
+            .to_owned();
 
-        let models: Vec<String> = match self.resolve_catalog(&model_provider).await {
+        let models: Vec<String> = match self
+            .resolve_catalog(Arc::clone(&config), &model_provider)
+            .await
+        {
             Ok(live) => live,
             Err(error) => {
                 let error = zeroclaw_providers::sanitize_api_error(&error.to_string());
@@ -376,21 +405,18 @@ impl ModelSwitchTool {
                             "provider_family": provider_family,
                             "error": error.to_string(),
                         })),
-                    "model_switch list_models: configured profile catalog failed"
+                    "model_switch list_models: configured model catalog failed"
                 );
                 return Ok(ToolResult {
                     success: false,
                     output: serde_json::to_string_pretty(&json!({
                         "model_provider": model_provider,
-                        "configured_provider_profiles": configured_model_provider_profiles(&self.config),
+                        "configured_models": configured_models(&config),
                     }))?
                     .into(),
                     error: Some(crate::i18n::get_required_cli_string_with_args(
                         "model-switch-catalog-failed",
-                        &[
-                            ("provider", &model_provider),
-                            ("error", &error),
-                        ],
+                        &[("provider", &model_provider), ("error", &error)],
                     )),
                 });
             }
@@ -402,7 +428,7 @@ impl ModelSwitchTool {
                 output: serde_json::to_string_pretty(&json!({
                     "model_provider": model_provider,
                     "models": [],
-                    "note": "No common models listed for this model_provider family. Check model_provider documentation for available models."
+                    "note": "No upstream models were listed for the selected configured model's connection. Check the provider documentation for available model IDs."
                 }))?.into(),
                 error: None,
             });
@@ -413,7 +439,7 @@ impl ModelSwitchTool {
             output: serde_json::to_string_pretty(&json!({
                 "model_provider": model_provider,
                 "models": models,
-                "example": "Use action 'set' with this model_provider and a model ID to switch"
+                "example": "Use action 'set' with this exact model_provider reference; optionally provide an upstream model ID override"
             }))?
             .into(),
             error: None,
@@ -456,6 +482,89 @@ mod tests {
         state.lock().unwrap().clone()
     }
 
+    #[tokio::test]
+    async fn effort_allowlist_preserves_nested_switches_and_rejects_other_profiles() {
+        let mut config = test_config();
+        config
+            .providers
+            .models
+            .ensure("custom", "edge.local")
+            .unwrap()
+            .models
+            .insert(
+                "selected".into(),
+                zeroclaw_config::schema::ModelEntryConfig {
+                    id: Some("selected-id".into()),
+                    ..Default::default()
+                },
+            );
+        let tool = ModelSwitchTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
+        );
+        let state = Arc::new(std::sync::Mutex::new(None));
+        crate::agent::turn::scope_model_switch_provider_allowlist(
+            Some(Arc::new(std::collections::HashSet::from([
+                "custom.edge.local.selected".to_string(),
+            ]))),
+            scope_model_switch_state(Arc::clone(&state), async {
+                let accepted = tool
+                    .handle_set(&json!({"model_provider": "custom.edge.local.selected"}))
+                    .unwrap();
+                assert!(accepted.success, "{:?}", accepted.error);
+                let rejected = tool
+                    .handle_set(&json!({"model_provider": "openai.default", "model": "other"}))
+                    .unwrap();
+                assert!(!rejected.success);
+                assert!(rejected.error.is_some());
+            }),
+        )
+        .await;
+        assert_eq!(
+            pending_switch(&state),
+            Some(("custom.edge.local.selected".into(), "selected-id".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn set_uses_the_admitted_model_generation() {
+        let generation = Arc::new(parking_lot::RwLock::new(Arc::new(test_config())));
+        let source = Arc::clone(&generation);
+        let tool = ModelSwitchTool::with_config_resolver(
+            Arc::new(SecurityPolicy::default()),
+            Arc::new(move || Arc::clone(&source.read())),
+        );
+        let mut next = (**generation.read()).clone();
+        next.providers
+            .models
+            .ensure("custom", "added")
+            .unwrap()
+            .models
+            .insert(
+                "selected".into(),
+                zeroclaw_config::schema::ModelEntryConfig {
+                    id: Some("new-model".into()),
+                    ..Default::default()
+                },
+            );
+        *generation.write() = Arc::new(zeroclaw_config::migration::admit_test_input(&next));
+        let state = Arc::new(std::sync::Mutex::new(None));
+        scope_model_switch_state(Arc::clone(&state), async {
+            let result = tool
+                .execute(json!({
+                    "action": "set", "model_provider": "custom.added.selected"
+                }))
+                .await
+                .unwrap();
+            assert!(result.success, "{:?}", result.error);
+        })
+        .await;
+        assert_eq!(
+            pending_switch(&state),
+            Some(("custom.added.selected".into(), "new-model".into()))
+        );
+    }
+
     async fn with_switch_state<T>(f: impl FnOnce(ModelSwitchCallback) -> T) -> T {
         let state = Arc::new(std::sync::Mutex::new(None));
         scope_model_switch_state(Arc::clone(&state), async move { f(state) }).await
@@ -492,7 +601,7 @@ mod tests {
                     .error
                     .as_deref()
                     .unwrap_or_default()
-                    .contains("dotted `<type>.<alias>`"),
+                    .contains("model does not exist"),
                 "unexpected error: {:?}",
                 result.error
             );
@@ -583,7 +692,7 @@ mod tests {
                     .error
                     .as_deref()
                     .unwrap_or_default()
-                    .contains("configured provider profile"),
+                    .contains("model does not exist"),
                 "unexpected error: {:?}",
                 result.error
             );
@@ -612,25 +721,107 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_result_tells_the_model_to_finish_the_task_in_the_same_reply() {
-        with_switch_state(|_state| {
-            let result = tool()
+    async fn set_preserves_three_segment_ref_and_derives_model_id() {
+        let mut config = test_config();
+        config
+            .providers
+            .models
+            .ensure("openai", "default")
+            .unwrap()
+            .models
+            .insert(
+                "reasoning".to_string(),
+                zeroclaw_config::schema::ModelEntryConfig {
+                    id: Some("gpt-5.3-mini".to_string()),
+                    ..Default::default()
+                },
+            );
+        let tool = ModelSwitchTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
+        );
+
+        with_switch_state(|state| {
+            let result = tool
                 .handle_set(&json!({
-                    "model_provider": "custom.local",
-                    "model": "local-model"
+                    "model_provider": "openai.default.reasoning"
                 }))
                 .expect("set should return a tool result");
-            assert!(result.success, "unexpected error: {:?}", result.error);
 
-            let payload: serde_json::Value =
-                serde_json::from_str(&result.output.to_string()).expect("set output is JSON");
-            let note = payload["note"].as_str().expect("set output carries a note");
-            // A model that reads "switch requested" as a stopping point ends the
-            // turn with a promise, and nothing runs between turns.
-            assert!(note.contains("continue the user's task now"), "{note}");
-            assert!(note.contains("in this reply"), "{note}");
-            assert!(note.contains("nothing runs between turns"), "{note}");
-            assert!(note.contains("does not write persisted config"), "{note}");
+            assert!(result.success, "unexpected error: {:?}", result.error);
+            // The pending switch must keep the full three-segment ref —
+            // collapsing it to `openai.default` would lose the selected model
+            // entry on the rebuild path.
+            assert_eq!(
+                pending_switch(&state),
+                Some((
+                    "openai.default.reasoning".to_string(),
+                    "gpt-5.3-mini".to_string()
+                ))
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn set_rejects_unknown_nested_model_alias() {
+        with_switch_state(|state| {
+            let result = tool()
+                .handle_set(&json!({
+                    "model_provider": "openai.default.missing",
+                    "model": "gpt-4o"
+                }))
+                .expect("set should return a tool result");
+
+            assert!(!result.success);
+            assert!(
+                result
+                    .error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("openai.default.missing"),
+                "unexpected error: {:?}",
+                result.error
+            );
+            assert_eq!(pending_switch(&state), None);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn set_explicit_model_wins_over_nested_entry_id() {
+        let mut config = test_config();
+        config
+            .providers
+            .models
+            .ensure("openai", "default")
+            .unwrap()
+            .models
+            .insert(
+                "fast".to_string(),
+                zeroclaw_config::schema::ModelEntryConfig {
+                    id: Some("gpt-4o-mini".to_string()),
+                    ..Default::default()
+                },
+            );
+        let tool = ModelSwitchTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
+        );
+
+        with_switch_state(|state| {
+            let result = tool
+                .handle_set(&json!({
+                    "model_provider": "openai.default.fast",
+                    "model": "gpt-4o"
+                }))
+                .expect("set should return a tool result");
+
+            assert!(result.success, "unexpected error: {:?}", result.error);
+            assert_eq!(
+                pending_switch(&state),
+                Some(("openai.default.fast".to_string(), "gpt-4o".to_string()))
+            );
         })
         .await;
     }
@@ -685,11 +876,14 @@ mod tests {
             .models
             .ensure("hailo_ollama", "edge")
             .unwrap();
-        let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()), Arc::new(config))
-            .with_catalog_resolver(|provider_ref| async move {
-                assert_eq!(provider_ref, "hailo_ollama.edge");
-                Ok(vec!["edge-model".to_string()])
-            });
+        let tool = ModelSwitchTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
+        )
+        .with_catalog_resolver(|provider_ref| async move {
+            assert_eq!(provider_ref, "hailo_ollama.edge");
+            Ok(vec!["edge-model".to_string()])
+        });
 
         let result = tool
             .handle_list_models(&json!({ "model_provider": "hailo_ollama.edge" }))
@@ -798,7 +992,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()), Arc::new(config));
+        let tool = ModelSwitchTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
+        );
 
         let result = tool
             .handle_list_models(&json!({ "model_provider": "ollama.local" }))
@@ -851,7 +1048,10 @@ mod tests {
         // No `with_catalog_resolver`: this must go through the production
         // `resolve_catalog` -> `ProviderDispatch::from_ref(...).list_models()`
         // call, not the `#[cfg(test)]` resolver shortcut.
-        let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()), Arc::new(config));
+        let tool = ModelSwitchTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
+        );
 
         let _writer_guard = zeroclaw_log::__private_test_writer_lock();
         let _hook_guard = zeroclaw_log::__private_test_hook_lock();
@@ -908,10 +1108,13 @@ mod tests {
             .models
             .ensure("hailo_ollama", "edge")
             .unwrap();
-        let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()), Arc::new(config))
-            .with_catalog_resolver(|_provider_ref| async {
-                anyhow::bail!("configured catalog denied request")
-            });
+        let tool = ModelSwitchTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
+        )
+        .with_catalog_resolver(|_provider_ref| async {
+            anyhow::bail!("configured catalog denied request")
+        });
 
         let result = tool
             .handle_list_models(&json!({ "model_provider": "hailo_ollama.edge" }))
@@ -919,7 +1122,7 @@ mod tests {
             .expect("list_models should return a tool result");
         assert!(
             !result.success,
-            "configured profile errors must not become empty success"
+            "configured model errors must not become empty success"
         );
         assert!(
             result
@@ -1027,7 +1230,7 @@ mod tests {
             .models
             .ensure("hailo_ollama", "log_error")
             .unwrap();
-        let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()), Arc::new(config))
+        let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()), Arc::new(zeroclaw_config::migration::admit_test_input(&config)))
             .with_catalog_resolver(|_provider_ref| async {
                 anyhow::bail!(
                     "GET https://{USER}:{PASSWORD}@api.example.com/v1/models?signature={SIGNATURE} failed"
@@ -1074,7 +1277,7 @@ mod tests {
                     let is_catalog_failure = value
                         .get("message")
                         .and_then(|v| v.as_str())
-                        .map(|s| s.contains("configured profile catalog failed"))
+                        .map(|s| s.contains("configured model catalog failed"))
                         .unwrap_or(false);
                     let is_hailo = value
                         .get("attributes")

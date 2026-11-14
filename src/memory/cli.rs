@@ -60,7 +60,7 @@ fn create_memory_with_embedder(config: &Config) -> Result<Box<dyn Memory>> {
     if matches!(classify_memory_backend(&backend), MemoryBackendKind::None) {
         bail!("Memory backend is 'none' (disabled). No entries to manage.");
     }
-    create_memory_from_config(config, None)
+    create_memory_from_config(config)
 }
 
 async fn handle_reindex(config: &Config) -> Result<()> {

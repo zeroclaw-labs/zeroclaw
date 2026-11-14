@@ -27,6 +27,7 @@ pub mod platform;
 pub mod policy;
 pub mod presets;
 pub mod provider_aliases;
+pub mod provider_registry;
 pub mod providers;
 pub mod scattered_types;
 pub mod schema;

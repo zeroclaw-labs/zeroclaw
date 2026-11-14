@@ -28,6 +28,7 @@ import type { AgentSummary } from '@/lib/agents';
 import { Badge } from '@/components/ui';
 import { t } from '@/lib/i18n';
 import { formatRelative, formatUsd } from '@/lib/format';
+import { entityConfigPath } from '@/lib/entityLinks';
 import EntityLink from './EntityLink';
 
 export interface AgentDrawerProps {
@@ -153,7 +154,7 @@ export default function AgentDrawer({
                   kind="model-provider"
                   id={agent.modelProvider}
                   className="block text-xs truncate font-mono text-pc-text-muted hover:text-pc-text-secondary hover:underline"
-                  title={`${t('agent.open_config_prefix')}providers.models.${agent.modelProvider}${t('agent.open_config_suffix')}`}
+                  title={`${t('agent.open_config_prefix')}${entityConfigPath('model-provider', agent.modelProvider)}${t('agent.open_config_suffix')}`}
                 >
                   {agent.modelProvider}
                 </EntityLink>

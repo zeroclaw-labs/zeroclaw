@@ -94,23 +94,27 @@ provider_max_tokens = 4096
 "User-Agent" = "ZeroClaw-V1-Test/1.0"
 "#;
     let cfg = migrate_to_current(raw).expect("V1 globals migrate");
-    let entry = cfg
-        .providers
-        .models
-        .find("openai", "default")
-        .expect("openai.default synthesized from V1 default_provider");
-    assert_eq!(entry.api_key.as_deref(), Some("sk-fold-target"));
+    let registry = cfg.provider_registry().unwrap();
+    let resolved = registry.resolve_chat(&"openai.default".into()).unwrap();
+    let connection = resolved.selection.connection;
+    assert_eq!(connection.api_key(), Some("sk-fold-target"));
     assert_eq!(
-        entry.uri.as_deref(),
-        Some("https://api.fold.test/v1/chat/completions"),
-        "V1 api_url + api_path merged into the per-provider entry's uri"
+        connection.uri(),
+        Some("https://api.fold.test/v1/chat/completions")
     );
-    assert_eq!(entry.model.as_deref(), Some("gpt-4o-mini"));
-    assert_eq!(entry.temperature, Some(0.5));
-    assert_eq!(entry.timeout_secs, Some(90));
-    assert_eq!(entry.max_tokens, Some(4096));
+    assert_eq!(resolved.upstream_model(), Some("gpt-4o-mini"));
+    use zeroclaw_config::provider_registry::Override;
+    assert_eq!(resolved.options.temperature, Some(Override::Set(0.5)));
+    assert!(
+        matches!(resolved.request_timeout_secs, Some(Override::Set(value)) if value.get() == 90)
+    );
+    assert_eq!(resolved.options.max_tokens, Some(Override::Set(4096)));
     assert_eq!(
-        entry.extra_headers.get("User-Agent").map(String::as_str),
+        connection
+            .extra_headers()
+            .unwrap()
+            .get("User-Agent")
+            .map(String::as_str),
         Some("ZeroClaw-V1-Test/1.0")
     );
 }
@@ -877,17 +881,15 @@ fn t14b2_per_agent_timeout_secs_folds_onto_model_provider_entry() {
         .agents
         .get("complex_agent")
         .expect("agents.complex_agent present");
-    let (provider_type, provider_alias) = agent
-        .model_provider
-        .split_once('.')
-        .expect("agents.complex_agent.model_provider is <type>.<alias>");
-    let entry = cfg
-        .providers
-        .models
-        .find(provider_type, provider_alias)
-        .expect("model_providers entry exists for complex_agent's brain");
+    let registry = cfg.provider_registry().unwrap();
+    let entry = registry
+        .resolve_chat(&agent.model_provider.as_str().into())
+        .expect("the agent's canonical chat model exists");
     assert_eq!(
-        entry.timeout_secs,
+        entry
+            .request_timeout_secs
+            .and_then(|value| value.into_option())
+            .map(std::num::NonZeroU64::get),
         Some(180),
         "V2 agent timeout_secs must land on the agent's model_provider, not runtime_profile"
     );
@@ -1003,16 +1005,16 @@ fn agent_synthesized_into_runtime_profiles_default() {
 #[test]
 fn cost_prices_dropped_not_folded() {
     let cfg = v3_config();
-    let anth = cfg
-        .providers
-        .models
-        .find("anthropic", "default")
-        .expect("anthropic.default exists");
+    let registry = cfg.provider_registry().unwrap();
+    let anth = registry.models.get("anthropic.default").unwrap();
+    let zeroclaw_config::provider_registry::ModelDefinition::Chat(anth) = anth else {
+        panic!("fixture must contain a chat model");
+    };
     assert!(
-        anth.pricing.is_empty(),
+        anth.metadata.pricing.is_none(),
         "V2 cost.prices entries must be dropped on migration; \
          got pricing entries on anthropic.default: {:?}",
-        anth.pricing.keys().collect::<Vec<_>>()
+        anth.metadata.pricing
     );
 
     // The migrated config also must not carry [cost.prices.*] anywhere.
@@ -1374,18 +1376,20 @@ api_key = "sk-zai-test"
 "#;
     let cfg =
         migrate_to_current(raw).expect("migration succeeds despite colon-URL default_provider");
-    let entry = cfg
-        .providers
-        .models
-        .find("anthropic", "custom")
-        .expect("V2 anthropic-custom synonym must fold under model_providers.anthropic.custom");
+    let registry = cfg.provider_registry().unwrap();
+    let entry = registry
+        .selection(
+            &"anthropic.custom".into(),
+            zeroclaw_api::capability::Capability::Chat,
+        )
+        .unwrap();
     assert_eq!(
-        entry.uri.as_deref(),
+        entry.connection.uri(),
         Some("https://api.z.ai/api/anthropic"),
         "the URL portion of the V2 colon-URL form must land in uri on the alias entry"
     );
-    assert_eq!(entry.model.as_deref(), Some("claude-sonnet-4"));
-    assert_eq!(entry.api_key.as_deref(), Some("sk-zai-test"));
+    assert_eq!(entry.model.upstream_model(), Some("claude-sonnet-4"));
+    assert_eq!(entry.connection.api_key(), Some("sk-zai-test"));
 }
 
 #[test]
@@ -1396,17 +1400,19 @@ default_model = "local-model"
 "#;
     let cfg =
         migrate_to_current(raw).expect("migration succeeds for plain `custom:` colon-URL form");
-    let entry = cfg
-        .providers
-        .models
-        .find("custom", "default")
-        .expect("V3 outer key must be `custom`, not the raw colon-URL");
+    let registry = cfg.provider_registry().unwrap();
+    let entry = registry
+        .selection(
+            &"custom.default".into(),
+            zeroclaw_api::capability::Capability::Chat,
+        )
+        .unwrap();
     assert_eq!(
-        entry.uri.as_deref(),
+        entry.connection.uri(),
         Some("http://localhost:8080/v1"),
         "the URL portion of the V2 colon-URL form must land in uri"
     );
-    assert_eq!(entry.model.as_deref(), Some("local-model"));
+    assert_eq!(entry.model.upstream_model(), Some("local-model"));
 }
 
 #[test]
@@ -1489,7 +1495,7 @@ group_id = "dm"
 }
 
 #[test]
-fn v2_model_routes_provider_field_renamed_to_model_provider() {
+fn v2_model_routes_materialize_canonical_model_refs() {
     let raw = r#"
 schema_version = 2
 
@@ -1517,18 +1523,79 @@ model_provider = "openai.default"
         .find(|r| r.hint == "vision")
         .expect("vision route");
     assert_eq!(
-        vision.model_provider, "openai.default",
-        "bare V2 `provider = openai` must be promoted to dotted V3 `openai.default`"
+        vision.model_ref, "route.vision",
+        "V2 route model becomes a canonical V4 model"
     );
-    assert_eq!(vision.model, "gpt-4-vision");
+    assert_eq!(vision.effective_model(&cfg), "gpt-4-vision");
 
     let fast = cfg
         .model_routes
         .iter()
         .find(|r| r.hint == "fast")
         .expect("fast route");
-    assert_eq!(fast.model_provider, "groq.default");
-    assert_eq!(fast.model, "llama-3.1-8b-instant");
+    assert_eq!(fast.model_ref, "route.fast");
+    assert_eq!(fast.effective_model(&cfg), "llama-3.1-8b-instant");
+}
+
+#[test]
+fn v3_route_migration_preserves_bare_provider_with_explicit_model() {
+    let cfg = migrate_to_current(
+        r#"
+schema_version = 3
+[[model_routes]]
+hint = "fast"
+model_provider = "openai"
+model = "gpt-4o-mini"
+api_key = "fixture-key"
+"#,
+    )
+    .unwrap();
+    let route = &cfg.model_routes[0];
+    assert_eq!(route.model_ref, "route.fast");
+    assert_eq!(route.effective_model(&cfg), "gpt-4o-mini");
+    let registry = cfg.provider_registry().unwrap();
+    let model = registry
+        .resolve_chat(&route.model_ref.as_str().into())
+        .unwrap();
+    assert_eq!(model.selection.connection.kind(), "openai");
+    assert_eq!(model.selection.connection.api_key(), Some("fixture-key"));
+}
+
+#[test]
+fn v3_route_migration_preserves_dotted_profile_and_model_aliases() {
+    let cfg = migrate_to_current(
+        r#"
+schema_version = 3
+[providers.models.custom."prod.us"]
+uri = "http://127.0.0.1:1/v1"
+api_key = "fixture-key"
+temperature = 0.8
+[providers.models.custom."prod.us".models."fast.v2"]
+id = "wire-model"
+temperature = 0.2
+context_window = 8192
+[[model_routes]]
+hint = "coding.v2"
+model_provider = "custom.prod.us.fast.v2"
+"#,
+    )
+    .unwrap();
+    let route = &cfg.model_routes[0];
+    assert_eq!(route.model_ref, "route.coding.v2");
+    let registry = cfg.provider_registry().unwrap();
+    let resolved = registry
+        .resolve_chat(&route.model_ref.as_str().into())
+        .unwrap();
+    assert_eq!(resolved.upstream_model(), Some("wire-model"));
+    let model = serde_json::to_value(
+        cfg.providers
+            .models
+            .canonical_model(&route.model_ref.as_str().into())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(model["options"]["temperature"], 0.2);
+    assert_eq!(model["metadata"]["context_window"], 8192);
 }
 
 #[test]
@@ -1555,12 +1622,15 @@ model_provider = "openai.default"
         .iter()
         .find(|r| r.hint == "semantic")
         .expect("semantic route");
-    assert_eq!(
-        semantic.model_provider, "openai.default",
-        "bare V2 `provider = openai` must be promoted to dotted V3 `openai.default`"
-    );
-    assert_eq!(semantic.model, "text-embedding-3-small");
-    assert_eq!(semantic.dimensions, Some(1536));
+    let registry = cfg.provider_registry().unwrap();
+    let model = registry
+        .resolve_embedding(&semantic.model_provider.as_str().into())
+        .unwrap();
+    assert_eq!(model.model, "text-embedding-3-small");
+    assert_eq!(model.dimensions, Some(1536));
+    assert_eq!(model.selection.connection.kind(), "openai");
+    assert!(semantic.model.is_empty());
+    assert!(semantic.dimensions.is_none());
 }
 
 #[test]
@@ -1590,8 +1660,8 @@ model_provider = "openai.default"
         .find(|r| r.hint == "vision")
         .expect("vision route");
     assert_eq!(
-        vision.model_provider, "openai.default",
-        "bare model_provider value is promoted to dotted form regardless of source field name"
+        vision.model_ref, "route.vision",
+        "V2 route model becomes a canonical V4 model regardless of source field name"
     );
 }
 
@@ -2805,7 +2875,7 @@ fn lookup_dotted<'a>(value: &'a toml::Value, path: &str) -> Option<&'a toml::Val
 }
 
 #[test]
-fn get_prop_resolves_model_field_for_typed_provider_alias() {
+fn migrated_aliases_resolve_through_canonical_model_references() {
     use zeroclaw_config::schema::Config;
     let raw = r#"
 schema_version = 4
@@ -2818,24 +2888,19 @@ max_tokens = 25000
 model = "claude-sonnet-4-6"
 "#;
     let cfg: Config = toml::from_str(raw).expect("parse");
-    let glados_model = cfg
-        .get_prop("providers.models.anthropic.glados.model")
-        .expect("get_prop must resolve for typed provider alias .model field");
-    let clamps_model = cfg
-        .get_prop("providers.models.anthropic.clamps.model")
-        .expect("get_prop must resolve for the other alias too");
-    eprintln!("glados.model = {glados_model:?}");
-    eprintln!("clamps.model = {clamps_model:?}");
-    assert_eq!(glados_model, "claude-opus-4-7");
-    assert_eq!(clamps_model, "claude-sonnet-4-6");
+    assert_eq!(
+        cfg.resolve_model_id("anthropic.glados").as_deref(),
+        Some("claude-opus-4-7")
+    );
+    assert_eq!(
+        cfg.resolve_model_id("anthropic.clamps").as_deref(),
+        Some("claude-sonnet-4-6")
+    );
+    assert!(cfg.providers.models.anthropic.is_empty());
 }
 
 #[test]
-fn prop_fields_includes_providers_models_alias_model_path() {
-    // The gateway's /api/config/prop handler does lookup_prop_field(&config, &path).
-    // lookup_prop_field walks Config::prop_fields() and finds a matching entry.
-    // If the model path isn't in prop_fields(), the gateway returns 404 and
-    // the frontend's resolveModelToProviderType walk silently drops the alias.
+fn migrated_alias_is_exposed_by_registry_instead_of_legacy_property_paths() {
     use zeroclaw_config::schema::Config;
     let raw = r#"
 schema_version = 4
@@ -2844,17 +2909,16 @@ schema_version = 4
 model = "claude-opus-4-7"
 "#;
     let cfg: Config = toml::from_str(raw).expect("parse");
-    let want = "providers.models.anthropic.glados.model";
-    let all = cfg.prop_fields();
-    let found = all.iter().any(|f| f.name == want);
-    if !found {
-        let candidates: Vec<String> = all
+    let registry = zeroclaw_config::provider_registry::editor::snapshot(&cfg).unwrap();
+    assert_eq!(
+        registry["models"]["anthropic.glados"]["model"],
+        "claude-opus-4-7"
+    );
+    assert!(
+        cfg.prop_fields()
             .iter()
-            .filter(|f| f.name.contains("anthropic.glados"))
-            .map(|f| f.name.clone())
-            .collect();
-        panic!("prop_fields() missing `{want}` — candidates: {candidates:?}",);
-    }
+            .all(|field| !field.name.starts_with("providers.models.anthropic.glados."))
+    );
 }
 
 #[test]
@@ -2872,8 +2936,8 @@ model = "claude-opus-4-7"
     );
     assert_eq!(
         cfg.get_map_keys("providers.models.anthropic"),
-        Some(vec!["glados".to_string()]),
-        "the per-type slot IS a map keyed by alias",
+        Some(vec![]),
+        "retired input slots are empty after admission",
     );
 }
 
@@ -2953,7 +3017,7 @@ api_key = "sk-openai-lead"
             agent.runtime_profile
         );
         assert!(
-            cfg.model_provider_for_agent(alias).is_some(),
+            cfg.resolve_model_id(&agent.model_provider).is_some(),
             "agent `{alias}` references model_provider `{}` which does not resolve",
             agent.model_provider
         );

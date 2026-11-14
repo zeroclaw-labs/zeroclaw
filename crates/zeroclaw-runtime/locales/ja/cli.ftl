@@ -492,6 +492,7 @@ cli-sop-ws-subsystem-disabled = SOP サブシステムは有効ではありま�
 cli-sop-create-hint = {"  "}作成: mkdir -p <shared>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}その後 SOP.toml と SOP.md を追加します
 cli-sop-loaded-header = 読み込み済みの SOP ({$count}):
+cli-sop-decision-model-not-configured = [decision] モデル '{ $model }' が [providers.models] の decision モデルに設定されていません。実行は最も厳格なモードにフォールバックします
 cli-sop-none-to-validate = 検証する SOP が見つかりません。
 cli-sop-valid = ✅ {$name} — 有効
 cli-sop-deleted = SOP を削除しました: {$name}
@@ -851,6 +852,7 @@ cli-status-config = 設定:      {$v}
 cli-status-provider-indent = {"   "}ModelProvider:      {$family}.{$alias}
 cli-status-provider = 🤖 ModelProvider:      {$family}.{$alias}
 cli-status-model = {"   "}モデル:         {$model}
+cli-status-model-entry = {"   "}モデル [{$alias}]：{$model}
 cli-status-observability = 📊 可観測性:  {$v}
 cli-status-trace-storage = 🧾 トレースストレージ:  {$mode} ({$path})
 cli-status-agents = 🛡️  エージェント:        {$v}
@@ -949,6 +951,8 @@ cli-config-capped-key-lowered = 警告: {$path} の設定キー `{$key}` を上�
 cli-config-capped-reason-pairing-code-ttl = ペアリングコードを使用できるのは最長 600 秒（10 分）です
 cli-config-retired-reason-nevis = Nevis IAM 連携は削除されました。代わりに `[oidc.<alias>]` と `[users]`、`[permission_profiles]` を設定してください
 cli-config-retired-reason-agent-tunable = エージェント内のランタイム調整値は読み込まれなくなりました。ランタイムプロファイルが優先されるため、このキーはエージェントの `[runtime_profiles.<profile>]` に設定してください
+cli-config-retired-reason-text-tool-parsing = テキスト内のツール呼び出し解析はチャットモデルごとに設定します。`strict_tool_parsing = true` の代わりに `options.extract_text_tool_calls = false` を使用してください
+cli-config-retired-reason-profile-fallback = プロファイル単位のフォールバックリストは V4 で削除されました。正確なキーを使う `[providers.fallback]` グラフを使用し、各ターゲットを完全なモデル参照として定義してください
 cli-config-retired-reason-summary-model = プロバイダーを持たない旧来のモデル ID は読み込まれていませんでした。`summary_provider` に置き換えられています（コンテキスト圧縮自体は現在ランタイムに実装されていません）
 cli-config-retired-reason-node-transport = 旧来の HMAC ノードトランスポートは削除されました
 cli-config-retired-reason-wati = WATI のサポートは削除されました。Cloud API または WhatsApp Web を使って `[channels.whatsapp.<alias>]` に移行し、使わなくなった WATI の API トークンを失効させてください
@@ -1196,7 +1200,7 @@ channel-runtime-set-provider-init-failed =
     詳細: { $error }
 channel-runtime-effort-routing-invalid = ⚠️ エフォートルーティングの設定が無効です。設定済みのローカルおよびクラウドルートを確認してください。
 channel-runtime-provider-ambiguous = ModelProvider `{ $family }` には設定済みエイリアスが複数あります。`/models { $family }.<alias>` で指定してください: { $list }
-channel-runtime-provider-no-alias = `{ $provider }` に対応する設定済み provider エントリがありません。`[providers.models.{ $provider }]`（api_key/uri を含む）を追加するか、設定済み provider を選択してください。`/models` で有効な項目を確認できます。
+channel-runtime-provider-no-alias = `{ $provider }` に対応する設定済みモデルエントリがありません。`[providers.connections."<connection>"]` に接続、`[providers.models."<model-ref>"]` にモデルを追加するか、設定済みモデルを選択してください。`/models` で有効な項目を確認できます。
 channel-runtime-provider-unknown = 不明な model_provider `{ $provider }` です。`/models` で有効な model_provider を一覧表示してください。
 channel-runtime-scoped-model-empty = モデル ID は空にできません。`/model --user|--agent <model-id>` を使用してください。
 channel-runtime-scoped-model-switched = **{ $scope }** スコープのモデルを `{ $model }`（model_provider: `{ $provider }`）に設定しました。セッション内のみ有効で、再起動するとリセットされます。
@@ -1217,7 +1221,6 @@ channel-runtime-fallback-footer =
     モデル切り替え: /models
 channel-runtime-model-fallback-redacted = ⚡ 要求されたモデルが利用できなかったため、代替モデルがこの応答を生成しました。
 delegate-provider-fallback-warning = 警告: 委譲されたエージェントは、プロバイダーのフォールバックによって復旧しました。プロバイダーの障害の詳細はログに記録され、この結果からは省略されています。
-turn-tool-protocol-strict-mixed-error = 厳格なツール解析では、native-tool と text-only の候補が混在するフォールバックチェーンを実行できません。到達可能なすべての候補が同じツールプロトコルを使用するよう設定するか、strict_tool_parsing を false に設定してください。
 delegate-provider-fallback-header = [エージェント '{ $agent }' (要求: { $requested_provider }/{ $requested_model }; 提供: { $actual_provider }/{ $actual_model })]
 delegate-provider-fallback-header-agentic = [エージェント '{ $agent }' (要求: { $requested_provider }/{ $requested_model }; 提供: { $actual_provider }/{ $actual_model }, agentic)]
 cli-alias-list-empty = ({$section} の下にエントリがありません)
@@ -1379,3 +1382,14 @@ channel-approval-opt-allow-always = 常に許可
 channel-approval-opt-reject = 拒否
 channel-approval-opt-reject-with-edit = 編集して拒否
 tool-git-operations-error-docker-runtime-write-unsupported = Git の書き込みコマンドは Docker ランタイムでは利用できません。コンテナ内に閉じ込めることができないためです。
+
+# Named model selection diagnostics.
+cli-model-switch-invalid-reference = model_provider は `<type>.<alias>` または `<type>.<alias>.<model>` 形式のプロバイダープロファイル参照である必要があります。指定値: `{ $provider_ref }`
+cli-model-switch-no-profiles = 設定済みのプロバイダープロファイルはありません
+cli-model-switch-profile-missing = model_provider `{ $provider_ref }` は設定済みのプロファイルではありません。[providers.models.{ $family }.{ $alias }] を追加するか、次を使用してください: { $available }
+cli-model-switch-model-id-missing = モデルエントリー `{ $provider_ref }` に `id` がなく、プロファイルにも `model` がありません
+cli-model-switch-entry-missing = model_provider `{ $provider_ref }` はモデル `{ $model_alias }` を指定していますが、[providers.models.{ $family }.{ $alias }.models.{ $model_alias }] は設定されていません
+cli-model-switch-model-required = 'set' 操作に 'model' パラメーターがありません（`<type>.<alias>.<model>` 形式の model_provider 参照も使用できます）
+cli-doctor-nested-model = { $provider_ref }: モデル: { $model }（エントリー { $model_alias }）
+cli-doctor-nested-model-id-missing = { $provider_ref }: エントリー { $model_alias } にモデル ID がありません（エントリーの `id` またはプロファイルの `model` を設定してください）
+cli-doctor-temperature-out-of-range = { $provider_ref }: temperature { $temperature } は範囲外です（有効範囲: 0.0–2.0）

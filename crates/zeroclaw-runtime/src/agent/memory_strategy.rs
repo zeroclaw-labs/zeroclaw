@@ -62,4 +62,24 @@ impl MemoryStrategy for DefaultMemoryStrategy {
         // exposes per-action counters.
         zeroclaw_memory::hygiene::run_if_due(&self.memory_config, &self.workspace_dir)
     }
+
+    async fn consolidate_turn_with_sampling(
+        &self,
+        user_message: &str,
+        assistant_response: &str,
+        provider: &dyn ModelProvider,
+        model: &str,
+        sampling: zeroclaw_api::model_provider::CallSampling,
+    ) -> anyhow::Result<()> {
+        zeroclaw_memory::consolidation::consolidate_turn_with_sampling(
+            provider,
+            model,
+            sampling,
+            self.memory.as_ref(),
+            &self.memory_config,
+            user_message,
+            assistant_response,
+        )
+        .await
+    }
 }

@@ -15,11 +15,7 @@ use crate::observability::ObserverEvent;
 use std::time::Instant;
 use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_providers::{ChatMessage, ChatResponse, ToolCall};
-use zeroclaw_tool_call_parser::{
-    ParsedToolCall, build_native_assistant_history_from_parsed_calls,
-    looks_like_tool_protocol_example, parse_tool_calls, strip_think_tags,
-    strip_trailing_terminal_markers,
-};
+use zeroclaw_tool_call_parser::{ParsedToolCall, build_native_assistant_history_from_parsed_calls};
 
 /// Build assistant history entry in JSON format for native tool-call APIs.
 /// `convert_messages` in the OpenRouter model_provider parses this JSON to reconstruct
@@ -201,48 +197,17 @@ pub(crate) async fn interpret_chat_response(
 ) -> InterpretedResponse {
     let resp_input_tokens = resp.usage.as_ref().and_then(|u| u.input_tokens);
 
-    let response_text = strip_think_tags(resp.text_or_empty());
-    // Strip trailing terminal markers (`<eom>`, `<|eom|>`) from non-streaming responses.
-    // Handles stacked markers with arbitrary whitespace between them.
-    let response_text = strip_trailing_terminal_markers(&response_text);
-    // First try native structured tool calls (OpenAI-format).
-    // Fall back to text-based parsing (XML tags, markdown blocks,
-    // GLM format) only if the model_provider returned no native calls —
-    // this ensures we support both native and prompt-guided models.
-    let mut calls: Vec<ParsedToolCall> = if specs.tool_specs.is_empty() {
-        Vec::new()
-    } else {
-        resp.tool_calls
-            .iter()
-            .map(|call| ParsedToolCall {
-                name: call.name.clone(),
-                arguments: serde_json::from_str::<serde_json::Value>(&call.arguments)
-                    .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
-                tool_call_id: Some(call.id.clone()),
-            })
-            .collect()
-    };
-    let mut parsed_text = String::new();
-
-    if calls.is_empty()
-        && !specs.tool_specs.is_empty()
-        && !ctx.strict_tool_parsing
-        && !looks_like_tool_protocol_example(&response_text)
-    {
-        let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
-        let filtered_calls: Vec<ParsedToolCall> = fallback_calls
-            .into_iter()
-            .filter(|call| {
-                specs
-                    .known_tool_names
-                    .contains(&call.name.to_ascii_lowercase())
-            })
-            .collect();
-        if !fallback_text.is_empty() && !filtered_calls.is_empty() {
-            parsed_text = fallback_text;
-        }
-        calls = filtered_calls;
-    }
+    let interpreted = zeroclaw_providers::response::interpret_response(
+        &resp,
+        zeroclaw_api::TextExtraction {
+            reasoning: ctx.extract_text_reasoning,
+            tool_calls: !ctx.text_tool_calls_disabled,
+        },
+        &specs.known_tool_names,
+    );
+    let response_text = interpreted.text;
+    let parsed_text = interpreted.parsed_text;
+    let mut calls = interpreted.calls;
 
     for call in &mut calls {
         if let Some(spec) = specs.tool_specs.iter().find(|spec| spec.name == call.name) {
@@ -250,7 +215,7 @@ pub(crate) async fn interpret_chat_response(
         }
     }
 
-    let parse_issue = if ctx.strict_tool_parsing {
+    let parse_issue = if ctx.text_tool_calls_disabled {
         None
     } else if specs.tool_specs.is_empty() {
         // Knob-gated (embedders return model text verbatim); a live stream
@@ -600,7 +565,7 @@ mod argument_preservation_tests {
             provider_name: "test.provider",
             model: "test-model",
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
-            temperature: None,
+            temperature: None.into(),
             approval: None,
             channel_name: "",
             channel_reply_target: None,
@@ -610,7 +575,8 @@ mod argument_preservation_tests {
             hooks: None,
             dedup_exempt_tools: &[],
             pacing: &pacing,
-            strict_tool_parsing: false,
+            text_tool_calls_disabled: false,
+            extract_text_reasoning: true,
             channel: None,
             agent_alias: None,
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
@@ -807,16 +773,21 @@ mod argument_preservation_tests {
         let expected = json!({
             "action": "upsert_scenario",
             "hint": "coding",
-            "model_provider": "openai",
-            "model": "test-model"
+            "model_ref": "chat.test-model"
         });
         for native in [true, false] {
             let workspace = tempfile::tempdir().unwrap();
-            let config = zeroclaw_config::schema::Config {
+            let mut config = zeroclaw_config::schema::Config {
                 config_path: workspace.path().join("config.toml"),
                 data_dir: workspace.path().join("data"),
                 ..zeroclaw_config::schema::Config::default()
             };
+            zeroclaw_config::migration::bind_test_route_model(
+                &mut config,
+                "chat.test-model",
+                "test-model",
+                None,
+            );
             config.save().await.unwrap();
             let tool = ModelRoutingConfigTool::new(
                 Arc::new(config.clone()),
@@ -847,8 +818,7 @@ mod argument_preservation_tests {
             assert_eq!(saved.model_routes.len(), 1);
             let route = &saved.model_routes[0];
             assert_eq!(route.hint, "coding");
-            assert_eq!(route.model_provider, "openai");
-            assert_eq!(route.model, "test-model");
+            assert_eq!(route.model_ref, "chat.test-model");
         }
     }
 
@@ -990,7 +960,7 @@ mod cost_usd_regression_tests {
                 model_context_window_source:
                     zeroclaw_config::schema::ModelContextWindowSource::Configured,
             },
-            temperature: None,
+            temperature: None.into(),
             approval: None,
             channel_name: "",
             channel_reply_target: None,
@@ -1000,7 +970,8 @@ mod cost_usd_regression_tests {
             hooks: None,
             dedup_exempt_tools: &dedup_exempt_tools,
             pacing: &pacing,
-            strict_tool_parsing: false,
+            text_tool_calls_disabled: false,
+            extract_text_reasoning: true,
             channel: None,
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
             agent_alias: None,
@@ -1136,7 +1107,7 @@ mod cost_usd_regression_tests {
             provider_name: "requested.provider",
             model: "requested-model",
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
-            temperature: None,
+            temperature: None.into(),
             approval: None,
             channel_name: "",
             channel_reply_target: None,
@@ -1146,7 +1117,8 @@ mod cost_usd_regression_tests {
             hooks: None,
             dedup_exempt_tools: &dedup_exempt_tools,
             pacing: &pacing,
-            strict_tool_parsing: false,
+            text_tool_calls_disabled: false,
+            extract_text_reasoning: true,
             channel: None,
             agent_alias: None,
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
@@ -1216,7 +1188,7 @@ mod cost_usd_regression_tests {
             provider_name,
             model,
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
-            temperature: None,
+            temperature: zeroclaw_api::model_provider::CallSampling::Explicit(None),
             approval: None,
             channel_name: "rpc",
             channel_reply_target: None,
@@ -1226,13 +1198,76 @@ mod cost_usd_regression_tests {
             hooks: None,
             dedup_exempt_tools: &[],
             pacing,
-            strict_tool_parsing: false,
+            text_tool_calls_disabled: false,
+            extract_text_reasoning: true,
             channel: None,
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
             agent_alias: Some("test_agent"),
             turn_id,
             serving_provider_name: None,
             serving_model: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn text_extraction_switches_are_independent_and_leave_native_calls_enabled() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let specs = IterationToolSpecs {
+            tool_specs: vec![crate::tools::ToolSpec::new(
+                "shell",
+                "shell",
+                serde_json::json!({"type": "object"}),
+            )],
+            exposed_tool_specs: None,
+            known_tool_names: HashSet::from(["shell".to_string()]),
+            use_native_tools: true,
+        };
+        for reasoning in [false, true] {
+            for tool_calls in [false, true] {
+                for native in [false, true] {
+                    let mut ctx = estimate_test_ctx(&tx, &pacing, "test", "model", "extraction");
+                    ctx.extract_text_reasoning = reasoning;
+                    ctx.text_tool_calls_disabled = !tool_calls;
+                    let text = "<think>reasoning</think>Answer\n<tool_call>{\"name\":\"shell\",\"arguments\":{}}</tool_call>";
+                    let response = ChatResponse {
+                        text: Some(text.to_string()),
+                        tool_calls: if native {
+                            vec![ToolCall {
+                                id: "native-call".into(),
+                                name: "shell".into(),
+                                arguments: "{}".into(),
+                                extra_content: None,
+                            }]
+                        } else {
+                            vec![]
+                        },
+                        usage: None,
+                        reasoning_content: Some("native reasoning".into()),
+                    };
+                    let interpreted = interpret_chat_response(
+                        &ctx,
+                        "test",
+                        "model",
+                        response,
+                        &[],
+                        &specs,
+                        false,
+                        0,
+                        false,
+                    )
+                    .await;
+                    assert_eq!(interpreted.response_text.contains("<think>"), !reasoning);
+                    assert_eq!(
+                        interpreted.tool_calls.len(),
+                        usize::from(native || tool_calls)
+                    );
+                    assert!(!interpreted.parse_issue_detected);
+                    if !reasoning && !native && tool_calls {
+                        assert!(interpreted.parsed_text.contains("<think>reasoning</think>"));
+                    }
+                }
+            }
         }
     }
 

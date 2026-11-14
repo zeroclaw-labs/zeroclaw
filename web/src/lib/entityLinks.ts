@@ -1,5 +1,5 @@
-// Resolves an entity reference (agent alias, channel composite, model
-// provider composite, profile / bundle alias) to its `/config/...` edit
+// Resolves an entity reference (agent alias, channel composite, exact
+// model key, profile / bundle alias) to its `/config/...` edit
 // surface. The route shape follows `Section::shape()` in
 // `crates/zeroclaw-config/src/sections.rs`:
 //
@@ -9,12 +9,12 @@
 //
 // Adding a new entity kind is one row in `ENTITY_SECTION`.
 
-type Shape = 'alias' | 'typed' | 'picker';
+type Shape = 'alias' | 'typed' | 'picker' | 'registry';
 
 const ENTITY_SECTION = {
   agent:               { section: 'agents',           shape: 'alias'  },
   channel:             { section: 'channels',         shape: 'typed'  },
-  'model-provider':    { section: 'providers.models', shape: 'typed'  },
+  'model-provider':    { section: 'providers.registry', shape: 'registry' },
   'memory-backend':    { section: 'memory',           shape: 'picker' },
   'risk-profile':      { section: 'risk_profiles',    shape: 'alias'  },
   'runtime-profile':   { section: 'runtime_profiles', shape: 'alias'  },
@@ -30,6 +30,7 @@ export type EntityKind = keyof typeof ENTITY_SECTION;
 export function entityConfigPath(kind: EntityKind, id: string): string {
   const { section, shape } = ENTITY_SECTION[kind];
   if (shape === 'picker') return `/config/${section}`;
+  if (shape === 'registry') return `/config/${section}?model=${encodeURIComponent(id)}`;
   if (shape === 'typed') {
     const dot = id.indexOf('.');
     if (dot > 0) {

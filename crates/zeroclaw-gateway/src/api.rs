@@ -304,12 +304,10 @@ pub(crate) fn agent_model(config: &Config, alias: &str) -> Option<AgentModel> {
     } else {
         Some(agent.model_provider.as_str().to_string())
     };
-    let resolved = config.resolved_model_provider_for_agent(alias);
-    let model = resolved
-        .as_ref()
-        .and_then(|(_, _, cfg)| cfg.model.clone())
+    let model = config
+        .resolve_model_id(agent.model_provider.as_str())
         .unwrap_or_default();
-    let temperature = resolved.as_ref().and_then(|(_, _, cfg)| cfg.temperature);
+    let temperature = config.resolve_model_temperature(agent.model_provider.as_str());
     Some(AgentModel {
         provider_ref,
         model,
@@ -372,12 +370,15 @@ pub async fn handle_api_status(
                 (provider_ref, model, temperature, backend)
             }
             None => (
-                config
-                    .providers
-                    .models
-                    .iter_entries()
-                    .next()
-                    .map(|(ty, alias, _)| format!("{ty}.{alias}")),
+                config.provider_registry().ok().and_then(|registry| {
+                    registry
+                        .models
+                        .iter()
+                        .find(|(_, model)| {
+                            model.capability() == zeroclaw_api::capability::Capability::Chat
+                        })
+                        .map(|(reference, _)| reference.to_string())
+                }),
                 state.model.clone(),
                 state.temperature,
                 state.mem.name().to_string(),
@@ -1063,7 +1064,16 @@ pub async fn handle_api_doctor(
     }
 
     let config = state.config.read().clone();
-    let results = zeroclaw_runtime::doctor::diagnose(&config);
+    let results = match zeroclaw_runtime::doctor::diagnose_nonblocking(&config).await {
+        Ok(results) => results,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": error.to_string()})),
+            )
+                .into_response();
+        }
+    };
 
     let ok_count = results
         .iter()
@@ -1106,19 +1116,14 @@ async fn resolve_memory_handle(
             )})),
         ));
     }
-    let api_key = config
-        .resolved_model_provider_for_agent(alias)
-        .and_then(|(_, _, cfg)| cfg.api_key.clone());
-    zeroclaw_memory::create_memory_for_agent(&config, alias, api_key.as_deref())
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(
-                    serde_json::json!({"error": format!("Failed to build per-agent memory: {e:#}")}),
-                ),
-            )
-        })
+    zeroclaw_memory::create_memory_for_agent(&config, alias)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to build per-agent memory: {e:#}")})),
+        )
+    })
 }
 
 /// GET /api/memory — list or search memory entries
@@ -2488,6 +2493,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn test_state(config: zeroclaw_config::schema::Config) -> AppState {
+        let config = zeroclaw_config::migration::admit_test_input(&config);
         let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
         AppState {
             config: state_authority.live_handle(),
@@ -2622,6 +2628,42 @@ pub(crate) mod tests {
                 "base_url": "http://10.0.0.2:42617/peer",
             }])
         );
+    }
+
+    #[test]
+    fn agent_model_resolves_canonical_model_and_preset_for_status_consumers() {
+        let mut config = Config {
+            providers: toml::from_str(
+                r#"
+[connections."gateway.prod"]
+kind = "custom"
+uri = "https://example.test/v1"
+[model_presets."chat.defaults"]
+capability = "chat"
+options = { temperature = 0.35 }
+[models."chat.fast.us"]
+capability = "chat"
+provider = "gateway.prod"
+model = "upstream-chat-model"
+preset = "chat.defaults"
+"#,
+            )
+            .unwrap(),
+            ..Config::default()
+        };
+        config.agents.insert(
+            "support".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: "chat.fast.us".into(),
+                ..Default::default()
+            },
+        );
+
+        let model = agent_model(&config, "support").unwrap();
+        assert_eq!(model.provider_ref.as_deref(), Some("chat.fast.us"));
+        assert_eq!(model.model, "upstream-chat-model");
+        assert_eq!(model.temperature, Some(0.35));
+        assert!(agent_model(&config, "missing").is_none());
     }
 
     #[tokio::test]

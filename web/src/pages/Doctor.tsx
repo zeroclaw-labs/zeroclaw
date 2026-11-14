@@ -18,67 +18,35 @@ import { t } from '@/lib/i18n';
 
 type Severity = DiagResult['severity'];
 
-/**
- * A remediable config entity parsed out of a diagnostic message, paired with
- * its deep-link. The same parse drives both the inline "fix in a modal" flow
- * (via `prefix`, which FieldForm fetches its fields under) and the "Open
- * config" / "Open full page →" deep-link (`href`).
- *  - `prefix` — dotted config entity prefix, e.g. `providers.models.openai.ss`
- *               or `channels.discord.gnosis`.
- *  - `href`   — the in-app route to the full config page for that entity
- *               (carries `?tab=model` for model findings).
- *  - `label`  — the action label ("Open config").
- */
+/** Provider diagnostics edit the whole registry atomically; diagnostic prose
+ * cannot safely be split into model keys, connection keys, and field paths. */
 interface RemediationTarget {
   prefix: string;
+  entity: string;
   href: string;
   label: string;
 }
 
-/**
- * Best-effort remediation TARGET for a diagnostic. `DiagResult` carries no
- * per-finding target, so we PARSE a config entity out of the message (config
- * diagnostics are phrased "<type>.<alias>: <problem>", e.g.
- * "openai.ss: no model configured", "discord.gnosis: …") and resolve both the
- * editable entity prefix and its deep-link. Returns `null` when no parseable
- * entity is present (the caller then falls back to the coarse `/config` link).
- *  - parsed model finding   → prefix `providers.models.<type>.<alias>`,
- *                             href `/config/providers.models/<type>/<alias>[?tab=model]`
- *  - parsed channel finding → prefix `channels.<type>.<alias>`,
- *                             href `/config/channels/<type>/<alias>`
- */
 function remediationTarget(result: DiagResult): RemediationTarget | null {
   if (result.severity === 'ok') return null;
   const msg = result.message;
-  // Leading "<type>.<alias>" entity reference, if present.
-  const m = msg.match(/^\s*([a-z0-9_-]+)\.([a-z0-9_-]+)\b/i);
-  if (!m || !m[1] || !m[2]) return null;
-  const rawType = m[1];
-  const rawAlias = m[2];
-  const type = encodeURIComponent(rawType);
-  const alias = encodeURIComponent(rawAlias);
-  // Check the channel branch FIRST: a channel finding may legitimately mention
-  // "provider"/"model" in its prose (e.g. "discord.gnosis: no provider bound"),
-  // and the broader provider/model match below would otherwise misroute it to
-  // providers.models.*. `\bchannel\b` is the strongest signal, so it wins.
-  if (/\bchannel\b/i.test(msg)) {
+  // Preserve channel remediation even when its message mentions a model.
+  const channel = msg.match(/^\s*([a-z0-9_-]+)\.([a-z0-9_-]+)\b/i);
+  if (channel?.[1] && channel[2] && /\bchannel\b/i.test(msg)) {
+    const reference = `${channel[1]}.${channel[2]}`;
     return {
-      prefix: `channels.${rawType}.${rawAlias}`,
-      href: `/config/channels/${type}/${alias}`,
+      prefix: `channels.${reference}`,
+      entity: reference,
+      href: `/config/channels/${encodeURIComponent(channel[1])}/${encodeURIComponent(channel[2])}`,
       label: t('doctor.open_config'),
     };
   }
-  // `provider` is word-bounded so it doesn't match inside unrelated words; the
-  // alternatives stay loose enough to catch the real model/api-key phrasings.
-  if (/\bmodel\b|api[\s_-]?key|\bprovider\b/i.test(msg)) {
-    // A "no model configured" finding belongs on the Model tab; api-key /
-    // connection issues default to the Connection tab (no ?tab needed). The
-    // dotted entity prefix FieldForm edits uses dots throughout; the href uses
-    // a slash after the section so Config's router can split type/alias.
-    const tab = /\bmodel\b/i.test(msg) ? '?tab=model' : '';
+  if (/^providers(?:\.|$)/.test(result.category)
+      || (result.category === 'config' && /\bmodel(?:_provider)?\b|api[\s_-]?key|\bprovider\b/i.test(msg))) {
     return {
-      prefix: `providers.models.${rawType}.${rawAlias}`,
-      href: `/config/providers.models/${type}/${alias}${tab}`,
+      prefix: 'providers.registry',
+      entity: 'providers',
+      href: '/config/providers.registry',
       label: t('doctor.open_config'),
     };
   }
@@ -356,7 +324,7 @@ export default function Doctor() {
       <DoctorFixModal
         open={fixTarget !== null}
         prefix={fixTarget?.prefix ?? ''}
-        entity={fixTarget?.prefix.split('.').slice(-2).join('.') ?? ''}
+        entity={fixTarget?.entity ?? ''}
         href={fixTarget?.href ?? ''}
         onClose={() => setFixTarget(null)}
       />

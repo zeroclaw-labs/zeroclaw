@@ -37,8 +37,7 @@ use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
 use zeroclaw_config::providers::{ChannelRef, ModelProviderRef};
 use zeroclaw_config::schema::{
-    AliasedAgentConfig, AnthropicModelProviderConfig, Config, PluginChannelConfig,
-    PluginEntryConfig, RiskProfileConfig,
+    AliasedAgentConfig, Config, PluginChannelConfig, PluginEntryConfig, RiskProfileConfig,
 };
 use zeroclaw_plugins::PluginCapability;
 use zeroclaw_plugins::host::PluginHost;
@@ -211,9 +210,16 @@ fn activation_config(deployment: &Deployment, alias: &str, url: &str, grant: &Gr
     config
         .risk_profiles
         .insert("default".to_string(), RiskProfileConfig::default());
-    config.providers.models.anthropic.insert(
-        "default".to_string(),
-        AnthropicModelProviderConfig::default(),
+    config.providers.connections.insert(
+        "anthropic".into(),
+        serde_json::from_value(serde_json::json!({"kind":"anthropic"})).unwrap(),
+    );
+    config.providers.models.insert_canonical_model(
+        "anthropic.default".into(),
+        serde_json::from_value(serde_json::json!({
+            "capability":"chat", "provider":"anthropic", "model":"claude-test"
+        }))
+        .unwrap(),
     );
     config.channels.plugin.insert(
         alias.to_string(),

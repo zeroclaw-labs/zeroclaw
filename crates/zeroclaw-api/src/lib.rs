@@ -2,10 +2,14 @@
 
 pub mod a2a_wire;
 pub mod agent;
+pub mod asr;
 pub mod attribution;
+pub mod capability;
 pub mod channel;
 pub mod conversation_binding;
+pub mod decision;
 pub mod elicitation;
+pub mod embedding;
 pub mod grants;
 pub mod hook;
 pub mod ingress;
@@ -28,9 +32,23 @@ pub mod schema;
 pub mod session_keys;
 pub mod tool;
 pub mod tool_carrier;
+pub mod tts;
 pub mod turn_stop;
 pub mod vad;
 pub mod webhook;
+
+use std::sync::Arc;
+
+/// Admitted model policy for extracting protocol data embedded in text.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TextExtraction {
+    pub reasoning: bool,
+    pub tool_calls: bool,
+}
+
+/// Resolver over the admitted configuration generation. No provider keeps a
+/// second copy of model parsing policy.
+pub type TextExtractionResolver = Arc<dyn Fn(&str) -> TextExtraction + Send + Sync>;
 
 tokio::task_local! {
     /// Current thread/sender ID for per-sender rate limiting.
@@ -54,4 +72,31 @@ tokio::task_local! {
     /// Native extended thinking parameters, set by the outer orchestration
     /// functions and read by `run_tool_call_loop` when building `ChatRequest`.
     pub static NATIVE_THINKING_OVERRIDE: Option<crate::model_provider::NativeThinkingParams>;
+
+    /// Per-call response parsing policy. The runtime admits this from the
+    /// selected Config generation; provider/reliability code reads it while
+    /// classifying a response and never stores a config snapshot.
+    pub static TEXT_EXTRACTION_RESOLVER:
+        Option<TextExtractionResolver>;
+}
+
+pub async fn scope_text_extraction<F>(
+    resolver: Option<TextExtractionResolver>,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    TEXT_EXTRACTION_RESOLVER.scope(resolver, future).await
+}
+
+pub fn text_extraction_for(model: &str) -> TextExtraction {
+    TEXT_EXTRACTION_RESOLVER
+        .try_with(|resolver| {
+            resolver
+                .as_ref()
+                .map(|resolve| resolve(model))
+                .unwrap_or_default()
+        })
+        .unwrap_or_default()
 }

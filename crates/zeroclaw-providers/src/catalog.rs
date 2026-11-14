@@ -305,52 +305,47 @@ pub async fn model_catalog_with_config_result(
     Option<std::collections::HashMap<String, zeroclaw_api::model_provider::ModelPricing>>,
     bool,
 )> {
-    let resolved = config.and_then(|cfg| cfg.providers.models.find_by_name(model_provider));
-    let api_key = resolved
-        .as_ref()
-        .and_then(|(_family, _alias, base)| base.api_key.clone());
-    // Honor a configured custom endpoint so proxied / self-hosted OpenAI-compatible
-    // deployments list from their own `/models` rather than the family default.
-    let api_url = resolved.as_ref().and_then(|(_family, _alias, base)| {
-        base.uri
-            .as_deref()
-            .map(str::trim)
-            .filter(|u| !u.is_empty())
-            .map(ToString::to_string)
+    let canonical_ref = zeroclaw_config::provider_registry::ModelRef::from(model_provider.trim());
+    let canonical_family = config.and_then(|cfg| {
+        let registry = cfg.provider_registry().ok()?;
+        registry
+            .resolve_chat(&canonical_ref)
+            .ok()
+            .map(|resolved| resolved.selection.connection.kind().to_owned())
     });
-    // `create_model_provider` and the chat-catalog ranker expect a bare family
-    // name, not a dotted ref. Prefer the family `find_by_name` resolved; when it
-    // could not (no config / unknown alias) strip any `<family>.<alias>` suffix
-    // ourselves so a dotted selector still constructs.
-    let family: &str = resolved
-        .as_ref()
-        .map(|(family, _alias, _base)| *family)
-        .unwrap_or_else(|| {
-            model_provider
-                .split_once('.')
-                .map_or(model_provider, |(f, _)| f)
-        });
-
-    let configured_profile = resolved.is_some();
-    let has_dotted_profile_shape = model_provider
-        .split_once('.')
-        .is_some_and(|(family, _)| !family.contains(':'));
-    if has_dotted_profile_shape && !configured_profile {
-        anyhow::bail!(
-            "configured provider profile `{model_provider}` does not exist; expected `<type>.<alias>` from providers.models"
-        );
+    let family = canonical_family.as_deref().unwrap_or_else(|| {
+        model_provider.split_once(':').map_or_else(
+            || {
+                model_provider
+                    .split_once('.')
+                    .map_or(model_provider, |(family, _)| family)
+            },
+            |(family, _)| family,
+        )
+    });
+    let configured_profile = canonical_family.is_some();
+    if model_provider.contains('.') && !configured_profile {
+        anyhow::bail!("configured model `{model_provider}` does not exist");
     }
 
     // A configured alias is the canonical source for provider construction:
     // it owns its endpoint, credential, headers, and typed runtime options.
     // Bare-family requests retain the public-catalog fallback below.
-    let handle = match (config, resolved.as_ref()) {
-        (Some(config), Some((resolved_family, resolved_alias, _))) => {
-            let canonical_ref = format!("{resolved_family}.{resolved_alias}");
-            crate::create_model_provider_from_ref(config, &canonical_ref)
-        }
-        _ => crate::create_model_provider_with_url(family, api_key.as_deref(), api_url.as_deref()),
-    };
+    let configured = config
+        .filter(|_| configured_profile)
+        .map(|config| Box::new(config.clone()));
+    let reference = model_provider.to_owned();
+    let family_for_build = family.to_owned();
+    let handle = crate::model::build_nonblocking(move || match configured {
+        Some(config) => crate::model::build_raw_provider(
+            &config,
+            &reference,
+            crate::model::ProviderOverrides::default(),
+        )
+        .map(|binding| binding.provider),
+        None => crate::create_model_provider(&family_for_build, None, &Default::default()),
+    })
+    .await;
 
     let live_models = match handle {
         Ok(handle) => match crate::ProviderDispatch::from_ref(&*handle)
@@ -450,6 +445,37 @@ mod tests {
             missing.is_empty(),
             "catalog_source_for is missing entries for: {missing:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn canonical_catalog_preserves_exact_key_and_connection_auth() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(header("authorization", "Bearer catalog-test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "upstream-model"}],
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let config = zeroclaw_config::schema::Config {
+            providers: serde_json::from_value(serde_json::json!({
+                "connections": {"gateway.prod": {
+                    "kind": "custom", "uri": format!("{}/v1", server.uri()),
+                    "auth": {"mode": "api_key", "api_key": "catalog-test-key"},
+                }},
+                "models": {"chat.fast.us": {"capability": "chat", "provider": "gateway.prod", "model": "upstream-model"}},
+            })).unwrap(),
+            ..Default::default()
+        };
+        let (models, _, live) = model_catalog_with_config_result(Some(&config), "chat.fast.us")
+            .await
+            .unwrap();
+        assert!(live);
+        assert_eq!(models, vec!["upstream-model"]);
     }
 
     #[tokio::test]

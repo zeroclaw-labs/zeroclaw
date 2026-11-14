@@ -23,6 +23,9 @@ pub struct GeminiModelProvider {
     /// `[providers.models.gemini.<alias>]` config-key alias.
     alias: String,
     auth: Option<GeminiAuth>,
+    /// Optional API base supplied by the selected connection, including its
+    /// protocol prefix (`/v1beta` for API keys or `/v1internal` for OAuth).
+    api_url: Option<String>,
     oauth_project: Arc<tokio::sync::Mutex<Option<String>>>,
     oauth_project_seed: Option<String>,
     oauth_cred_paths: Vec<PathBuf>,
@@ -289,10 +292,6 @@ const GOOGLE_TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 /// See: <https://github.com/google-gemini/gemini-cli/issues/19200>
 const CLOUDCODE_PA_ENDPOINT: &str = "https://cloudcode-pa.googleapis.com/v1internal";
 
-/// loadCodeAssist endpoint for resolving the project ID.
-const LOAD_CODE_ASSIST_ENDPOINT: &str =
-    "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
-
 /// A `loadCodeAssist` project reference: a bare id string, or an object
 /// carrying `id` / `projectId`. Google returns either shape depending on
 /// whether the account already has an onboarded project.
@@ -529,6 +528,7 @@ async fn refresh_gemini_cli_token_async(
 pub struct GeminiBuilder {
     alias: String,
     api_key: Option<String>,
+    api_url: Option<String>,
     auth_service: Option<AuthService>,
     profile_override: Option<String>,
     oauth_project_seed: Option<String>,
@@ -537,6 +537,15 @@ pub struct GeminiBuilder {
 }
 
 impl GeminiBuilder {
+    /// Override the API base for generation and credential/project probes.
+    /// OAuth token refresh continues to use Google's authentication service.
+    pub fn api_url(mut self, api_url: Option<&str>) -> Self {
+        self.api_url = api_url
+            .and_then(GeminiModelProvider::normalize_non_empty)
+            .map(|url| url.trim_end_matches('/').to_owned());
+        self
+    }
+
     /// Explicit API key (from `[providers.models.gemini.<alias>] api_key`).
     /// When set (and non-empty after trimming), takes precedence over every
     /// OAuth path.
@@ -635,6 +644,7 @@ impl GeminiBuilder {
         GeminiModelProvider {
             alias: self.alias,
             auth,
+            api_url: self.api_url,
             oauth_project: Arc::new(tokio::sync::Mutex::new(None)),
             oauth_project_seed: self.oauth_project_seed,
             oauth_cred_paths,
@@ -662,6 +672,7 @@ impl GeminiModelProvider {
         GeminiBuilder {
             alias: alias.to_string(),
             api_key: None,
+            api_url: None,
             auth_service: None,
             profile_override: None,
             oauth_project_seed: None,
@@ -898,16 +909,18 @@ impl GeminiModelProvider {
         model.strip_prefix("models/").unwrap_or(model).to_string()
     }
 
-    fn build_generate_content_url(model: &str, auth: &GeminiAuth) -> String {
+    fn build_generate_content_url(&self, model: &str, auth: &GeminiAuth) -> String {
         match auth {
             GeminiAuth::OAuthToken(_) | GeminiAuth::ManagedOAuth => {
                 // OAuth tokens are scoped for the internal Code Assist API.
                 // The model is passed in the request body, not the URL path.
-                format!("{CLOUDCODE_PA_ENDPOINT}:generateContent")
+                let base = self.api_url.as_deref().unwrap_or(CLOUDCODE_PA_ENDPOINT);
+                format!("{base}:generateContent")
             }
             _ => {
                 let model_name = Self::format_model_name(model);
-                format!("{BASE_URL}/{model_name}:generateContent")
+                let base = self.api_url.as_deref().unwrap_or(BASE_URL);
+                format!("{base}/{model_name}:generateContent")
             }
         }
     }
@@ -938,7 +951,10 @@ impl GeminiModelProvider {
         // Call loadCodeAssist
         let client = self.http_client();
         let response = client
-            .post(LOAD_CODE_ASSIST_ENDPOINT)
+            .post(format!(
+                "{}:loadCodeAssist",
+                self.api_url.as_deref().unwrap_or(CLOUDCODE_PA_ENDPOINT)
+            ))
             .bearer_auth(token)
             .json(&serde_json::json!({
                 "cloudaicompanionProject": project_seed_for_request,
@@ -1048,7 +1064,10 @@ impl GeminiModelProvider {
     fn build_api_key_probe_request(&self, key: &str) -> anyhow::Result<reqwest::RequestBuilder> {
         Ok(self
             .http_client()
-            .get(format!("{BASE_URL}/models"))
+            .get(format!(
+                "{}/models",
+                self.api_url.as_deref().unwrap_or(BASE_URL)
+            ))
             .header(GOOGLE_API_KEY_HEADER, Self::sensitive_api_key_header(key)?))
     }
 
@@ -1252,7 +1271,7 @@ impl GeminiModelProvider {
             },
         };
 
-        let url = Self::build_generate_content_url(model, auth);
+        let url = self.build_generate_content_url(model, auth);
 
         let mut response = self
             .build_generate_content_request(
@@ -1445,7 +1464,13 @@ impl GeminiModelProvider {
 impl ModelProvider for GeminiModelProvider {
     // ── ModelProvider-family defaults ──
     fn default_base_url(&self) -> Option<&str> {
-        Some(BASE_URL)
+        Some(self.api_url.as_deref().unwrap_or_else(|| {
+            if self.auth.as_ref().is_some_and(GeminiAuth::is_oauth) {
+                CLOUDCODE_PA_ENDPOINT
+            } else {
+                BASE_URL
+            }
+        }))
     }
 
     fn capabilities(&self) -> zeroclaw_api::model_provider::ProviderCapabilities {
@@ -1625,6 +1650,7 @@ mod tests {
         GeminiModelProvider {
             alias: "test".to_string(),
             auth,
+            api_url: None,
             oauth_project: Arc::new(tokio::sync::Mutex::new(None)),
             oauth_project_seed: None,
             oauth_cred_paths: Vec::new(),
@@ -1634,6 +1660,49 @@ mod tests {
             oauth_client_id: None,
             oauth_client_secret: None,
         }
+    }
+
+    #[tokio::test]
+    async fn configured_oauth_gateway_receives_discovery_and_generation() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/proxy/v1internal:loadCodeAssist"))
+            .and(header("authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "cloudaicompanionProject": "test-project"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/proxy/v1internal:generateContent"))
+            .and(header("authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "response": {"candidates": [{"content": {"parts": [{"text": "oauth gateway reply"}]}}]}
+            })))
+            .expect(1).mount(&server).await;
+        let mut provider = GeminiModelProvider::builder("gateway.prod")
+            .api_key(Some("test-key"))
+            .api_url(Some(&format!("{}/proxy/v1internal/", server.uri())))
+            .build();
+        provider.auth = Some(GeminiAuth::OAuthToken(Arc::new(tokio::sync::Mutex::new(
+            OAuthTokenState {
+                access_token: "test-token".into(),
+                refresh_token: None,
+                client_id: None,
+                client_secret: None,
+                expiry_millis: Some(i64::MAX),
+            },
+        ))));
+        assert_eq!(
+            provider
+                .chat_with_system(None, "ping", "gemini-test", None)
+                .await
+                .unwrap(),
+            "oauth gateway reply"
+        );
     }
 
     #[test]
@@ -1863,7 +1932,7 @@ mod tests {
     #[test]
     fn api_key_url_excludes_credential() {
         let auth = GeminiAuth::ExplicitKey("api-key-123".into());
-        let url = GeminiModelProvider::build_generate_content_url("gemini-2.0-flash", &auth);
+        let url = test_model_provider(None).build_generate_content_url("gemini-2.0-flash", &auth);
         assert!(url.ends_with(":generateContent"));
         assert!(!url.contains("api-key-123"));
         assert!(!url.contains("?key="));
@@ -1872,7 +1941,7 @@ mod tests {
     #[test]
     fn oauth_url_uses_internal_endpoint() {
         let auth = test_oauth_auth("ya29.test-token");
-        let url = GeminiModelProvider::build_generate_content_url("gemini-2.0-flash", &auth);
+        let url = test_model_provider(None).build_generate_content_url("gemini-2.0-flash", &auth);
         assert!(url.starts_with("https://cloudcode-pa.googleapis.com/v1internal"));
         assert!(url.ends_with(":generateContent"));
         assert!(!url.contains("generativelanguage.googleapis.com"));
@@ -1882,7 +1951,7 @@ mod tests {
     #[test]
     fn api_key_url_uses_public_endpoint() {
         let auth = GeminiAuth::ExplicitKey("api-key-123".into());
-        let url = GeminiModelProvider::build_generate_content_url("gemini-2.0-flash", &auth);
+        let url = test_model_provider(None).build_generate_content_url("gemini-2.0-flash", &auth);
         assert!(url.contains("generativelanguage.googleapis.com/v1beta"));
         assert!(url.contains("models/gemini-2.0-flash"));
     }
@@ -1891,7 +1960,7 @@ mod tests {
     fn oauth_request_uses_bearer_auth_header() {
         let model_provider = test_model_provider(Some(test_oauth_auth("ya29.mock-token")));
         let auth = test_oauth_auth("ya29.mock-token");
-        let url = GeminiModelProvider::build_generate_content_url("gemini-2.0-flash", &auth);
+        let url = test_model_provider(None).build_generate_content_url("gemini-2.0-flash", &auth);
         let body = GenerateContentRequest {
             contents: vec![Content {
                 role: Some("user".into()),
@@ -1931,7 +2000,7 @@ mod tests {
     fn oauth_request_wraps_payload_in_request_envelope() {
         let model_provider = test_model_provider(Some(test_oauth_auth("ya29.mock-token")));
         let auth = test_oauth_auth("ya29.mock-token");
-        let url = GeminiModelProvider::build_generate_content_url("gemini-2.0-flash", &auth);
+        let url = test_model_provider(None).build_generate_content_url("gemini-2.0-flash", &auth);
         let body = GenerateContentRequest {
             contents: vec![Content {
                 role: Some("user".into()),
@@ -1975,7 +2044,7 @@ mod tests {
         let model_provider =
             test_model_provider(Some(GeminiAuth::ExplicitKey("api-key-123".into())));
         let auth = GeminiAuth::ExplicitKey("api-key-123".into());
-        let url = GeminiModelProvider::build_generate_content_url("gemini-2.0-flash", &auth);
+        let url = test_model_provider(None).build_generate_content_url("gemini-2.0-flash", &auth);
         let body = GenerateContentRequest {
             contents: vec![Content {
                 role: Some("user".into()),
@@ -2545,6 +2614,7 @@ mod tests {
         let model_provider = GeminiModelProvider {
             alias: "test".to_string(),
             auth: Some(GeminiAuth::ManagedOAuth),
+            api_url: None,
             oauth_project: Arc::new(tokio::sync::Mutex::new(None)),
             oauth_project_seed: None,
             oauth_cred_paths: Vec::new(),

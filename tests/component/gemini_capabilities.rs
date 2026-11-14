@@ -1,10 +1,10 @@
 //! Gemini model_provider capabilities and contract tests.
 
-use zeroclaw::providers::create_model_provider_with_url;
+use zeroclaw::providers::create_model_provider;
 use zeroclaw::providers::traits::ModelProvider;
 
 fn gemini_model_provider() -> Box<dyn ModelProvider> {
-    create_model_provider_with_url("gemini", Some("test-key"), None)
+    create_model_provider("gemini", Some("test-key"), &Default::default())
         .expect("Gemini model_provider should resolve with test key")
 }
 

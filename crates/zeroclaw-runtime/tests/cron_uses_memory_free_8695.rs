@@ -63,6 +63,7 @@ async fn config_with_planted_memory(provider_uri: &str, workspace_dir: &std::pat
         base.api_key = Some("test-key".to_string());
         base.model = Some("test-model".to_string());
         base.uri = Some(provider_uri.to_string());
+        base.native_tools = Some(true);
     }
     let mut agents = HashMap::new();
     agents.insert(

@@ -47,6 +47,30 @@ pub(crate) fn normalize_grapheme_cursor(text: &str, cursor: usize) -> usize {
     text.len()
 }
 
+/// Move one logical line while keeping the grapheme column when possible.
+pub(crate) fn adjacent_line_cursor(text: &str, cursor: usize, down: bool) -> usize {
+    let cursor = normalize_grapheme_cursor(text, cursor);
+    let start = text[..cursor].rfind('\n').map_or(0, |index| index + 1);
+    let column = text[start..cursor].graphemes(true).count();
+    let target = if down {
+        let Some(end) = text[cursor..].find('\n') else {
+            return cursor;
+        };
+        cursor + end + 1
+    } else {
+        if start == 0 {
+            return cursor;
+        }
+        text[..start - 1].rfind('\n').map_or(0, |index| index + 1)
+    };
+    let line = text[target..].split('\n').next().unwrap_or_default();
+    target
+        + line
+            .grapheme_indices(true)
+            .nth(column)
+            .map_or(line.len(), |(index, _)| index)
+}
+
 fn previous_safe_cursor(text: &str, cursor: usize) -> usize {
     let cursor = cursor.min(text.len());
     if text.is_char_boundary(cursor) {
@@ -114,6 +138,16 @@ pub(crate) fn next_word_boundary(text: &str, cursor: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multiline_navigation_preserves_unicode_columns_and_clamps_short_lines() {
+        let text = "a👩‍👩b\n中文\nlast";
+        let first = "a👩‍👩".len();
+        let second = "a👩‍👩b\n中文".len();
+        assert_eq!(adjacent_line_cursor(text, first, true), second);
+        assert_eq!(adjacent_line_cursor(text, second, false), first);
+        assert_eq!(adjacent_line_cursor(text, text.len(), true), text.len());
+    }
 
     #[test]
     fn word_boundaries_cross_words_whitespace_and_punctuation() {

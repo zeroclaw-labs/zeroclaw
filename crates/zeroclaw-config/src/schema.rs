@@ -144,7 +144,8 @@ pub enum CronJobClaim<'a> {
 /// Top-level ZeroClaw configuration, loaded from `config.toml`.
 ///
 /// Resolution order: `ZEROCLAW_CONFIG_DIR` env → `ZEROCLAW_WORKSPACE` env → `~/.zeroclaw/config.toml`.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[zeroclaw_macros::normalize_config_input(crate::migration::provider_inputs::normalize)]
+#[derive(Debug, Clone, Serialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[field_metadata = "crate::setup::annotate_fields"]
 pub struct Config {
@@ -158,10 +159,11 @@ pub struct Config {
     /// Path to config.toml - computed from home, not serialized
     #[serde(skip)]
     pub config_path: PathBuf,
-    /// Dotted prop-paths overridden by `ZEROCLAW_*` env vars at load time.
+    /// Property identities overridden by `ZEROCLAW_*` env vars at load time.
+    /// Canonical registry identities are escaped JSON pointers.
     /// Populated by `apply_env_overrides`; consulted by `save()` to mask the
     /// env-injected values back to disk-or-default before encryption, and by
-    /// `prop_is_env_overridden` for O(1) display-layer lookup (config list,
+    /// `prop_is_env_overridden` for display-layer lookup (config list,
     /// dashboard, quickstart).
     #[serde(skip)]
     pub env_overridden_paths: std::collections::HashSet<String>,
@@ -216,12 +218,13 @@ pub struct Config {
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
 
-    /// All configured provider profiles, grouped by category under a
-    /// single `[providers]` root. Categories today: `models`, `tts`,
-    /// `transcription`. Shape: `[providers.<category>.<type>.<alias>]`,
-    /// e.g. `[providers.models.anthropic.default]`,
-    /// `[providers.tts.openai.default]`,
-    /// `[providers.transcription.groq.default]`.
+    /// All configured provider connections and capability model identities
+    /// under one `[providers]` root. New configuration uses exact-key tables
+    /// such as `[providers.connections."gateway.prod"]`,
+    /// `[providers.models."chat.main"]`, `[providers.model_presets."chat.fast"]`
+    /// and `[providers.fallback]`. The typed `tts`/`transcription` maps remain
+    /// only as V4 input adapters; deserialization empties them before any
+    /// consumer receives Config.
     #[serde(default)]
     #[nested]
     pub providers: crate::providers::Providers,
@@ -572,10 +575,9 @@ pub struct Config {
     #[nested]
     pub risk_profiles: HashMap<String, RiskProfileConfig>,
 
-    /// Named typed-decision models (`[decision_models.<alias>]`): TypeSafe Jev,
-    /// a self-hosted Laya, or any custom System One endpoint. An SOP selects
-    /// one by alias in its `[decision] model` field; an alias that is not
-    /// configured makes that SOP dispatch fail-closed.
+    /// Historical decision input, projected into the canonical provider
+    /// registry during configuration admission. Runtime consumers use only
+    /// `providers.models` entries with capability `decision`.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub decision_models: HashMap<String, SopDecisionModelConfig>,
@@ -884,6 +886,34 @@ impl WireApi {
     }
 }
 
+/// Wire protocol used by a typed decision model.
+///
+/// `openai_decisions` is OpenAI's dedicated Decisions API (`POST
+/// /v1/decisions`). OpenAI-compatible gateways and local servers can expose
+/// the same contract. `system_one` keeps the existing Jev / Laya contract
+/// available for legacy decision entries. Chat Completions and Responses are
+/// chat wire APIs and are intentionally represented by [`WireApi`] instead.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionWireApi {
+    #[serde(rename = "openai_decisions")]
+    OpenAiDecisions,
+    SystemOne,
+}
+
+impl DecisionWireApi {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAiDecisions => "openai_decisions",
+            Self::SystemOne => "system_one",
+        }
+    }
+}
+
 /// Policy for images a native tool-result carrier declared in its
 /// `attachments` array.
 #[derive(
@@ -931,6 +961,191 @@ pub enum AuthMode {
     /// OAuth flow — credential resolution defers to the family runtime impl
     /// (typically reading a vendor-specific token cache or env var).
     OAuth,
+}
+
+/// One selectable model hosted by a single provider profile.
+///
+/// Lives under `[providers.models.<family>.<alias>.models.<model_alias>]`. A
+/// model entry carries only model-side request tuning; it inherits the
+/// enclosing provider profile's connection state (`api_key`, `uri`,
+/// `extra_headers`, `tls_ca_cert_path`, `wire_api`, `kind`). Every field left
+/// unset falls back to the enclosing `ModelProviderConfig`'s value of the same
+/// name, so a model entry only overrides what differs from the provider
+/// default. This lets one provider account (one credential + endpoint) serve
+/// several models, each addressable via a three-segment reference
+/// `<family>.<alias>.<model_alias>`.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models"]
+pub struct ModelEntryConfig {
+    /// Model identifier sent with each request (the provider catalog id, e.g.
+    /// `gpt-4o`, `claude-sonnet-4-5`). When unset, the enclosing provider
+    /// profile's `model` field is used.
+    #[tab(Model)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Sampling temperature for this model. Overrides the provider profile's
+    /// `temperature` when set.
+    #[tab(Model)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    /// Hard cap on response length in tokens for this model. Overrides the
+    /// provider profile's `max_tokens` when set.
+    #[tab(Model)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    /// Context window size (max input tokens) for this model. Overrides the
+    /// provider profile's `context_window` when set.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<usize>,
+    /// Enable or disable chain-of-thought thinking for this model. Overrides
+    /// the provider profile's `think` when set.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub think: Option<bool>,
+    /// Override vision (image input) capability for this model. Overrides the
+    /// provider profile's `vision` when set.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision: Option<bool>,
+    /// Override native tool calling for this model. Overrides the provider
+    /// profile's `native_tools` when set.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_tools: Option<bool>,
+    /// Whether stored assistant reasoning is replayed for this model. Overrides
+    /// the provider profile's `replay_assistant_reasoning` when set.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_assistant_reasoning: Option<bool>,
+    /// Extra JSON parameters merged into request bodies for this model.
+    /// Overrides the provider profile's `provider_extra` when set.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_extra: Option<serde_json::Value>,
+    /// `chat_template_kwargs` forwarded for this model. Overrides the provider
+    /// profile's value when set.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_template_kwargs: Option<serde_json::Value>,
+}
+
+/// Result of resolving a model_provider reference against the config.
+///
+/// Produced by [`Config::resolve_model_selection`]. Borrows the provider
+/// profile and (when one was selected) the model entry from the config, and
+/// carries the provider-local model id to send with requests.
+#[derive(Debug, Clone)]
+pub struct ModelSelection<'a> {
+    /// Provider family key, e.g. `"openai"`.
+    pub family: &'static str,
+    /// Provider alias within the family, e.g. `"default"`.
+    pub alias: &'a str,
+    /// The resolved provider profile (connection + legacy model fields).
+    pub entry: &'a ModelProviderConfig,
+    /// The selected model entry, when the profile has a `models` map and one
+    /// was selected. `None` for the legacy single-model path.
+    pub model_entry: Option<&'a ModelEntryConfig>,
+    /// The selected model alias, when a model entry was selected.
+    pub model_alias: Option<String>,
+    /// Provider-local model id to send. `None` when neither the model entry's
+    /// `id` nor the profile's `model` is set (caller may supply an override).
+    pub model_id: Option<String>,
+}
+
+/// Exact configured model reference and effective upstream model id.
+///
+/// References are opaque registry keys: dots have no structural meaning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelIdentity {
+    pub model_ref: crate::provider_registry::ModelRef,
+    /// Effective upstream model id, after any caller-supplied override.
+    pub model_id: String,
+}
+
+impl ModelIdentity {
+    #[must_use]
+    pub fn new(
+        model_ref: impl Into<crate::provider_registry::ModelRef>,
+        model_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            model_ref: model_ref.into(),
+            model_id: model_id.into(),
+        }
+    }
+
+    /// Full model reference used for attribution and model selection.
+    #[must_use]
+    pub fn provider_ref(&self) -> String {
+        self.model_ref.to_string()
+    }
+}
+
+impl ModelSelection<'_> {
+    /// Model-side sampling takes precedence over the enclosing profile.
+    #[must_use]
+    pub fn temperature(&self) -> Option<f64> {
+        self.model_entry
+            .and_then(|entry| entry.temperature)
+            .or(self.entry.temperature)
+    }
+
+    /// Configured capacity, preserving the distinction between unset and a
+    /// compatibility fallback used for budget arithmetic.
+    #[must_use]
+    pub fn configured_context_window(&self) -> Option<usize> {
+        self.model_entry
+            .and_then(|entry| entry.context_window)
+            .or(self.entry.context_window)
+    }
+
+    /// Owned identity of this selection, for "did the model change"
+    /// comparisons. `model_override` (when set) replaces the resolved model
+    /// id, mirroring how callers layer an explicit model over
+    /// [`Self::model_id`].
+    #[must_use]
+    pub fn identity(&self, model_override: Option<&str>) -> ModelIdentity {
+        let model_id = model_override
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string)
+            .or_else(|| self.model_id.clone())
+            .unwrap_or_default();
+        let profile = format!("{}.{}", self.family, self.alias);
+        let reference = self
+            .model_alias
+            .as_ref()
+            .map_or_else(|| profile.clone(), |alias| format!("{profile}.{alias}"));
+        ModelIdentity::new(reference, model_id)
+    }
+}
+
+/// Canonical chat-model inventory shared by CLI status and Doctor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfiguredModelEntry {
+    /// Exact key in `providers.models`.
+    pub model_ref: String,
+    /// Exact key in `providers.connections`.
+    pub connection_id: String,
+    pub model_id: Option<String>,
+}
+
+/// Extract the `(family, alias)` provider-profile pair from a model_provider
+/// reference. Accepts both the two-segment `<family>.<alias>` form and the
+/// three-segment `<family>.<alias>.<model_alias>` form (the model alias is
+/// ignored — provider lookup only needs the profile). Returns `None` when the
+/// reference has no `.` separator.
+#[must_use]
+pub fn provider_profile_ref(model_provider_ref: &str) -> Option<(&str, &str)> {
+    let mut parts = model_provider_ref.splitn(3, '.');
+    let family = parts.next()?;
+    let alias = parts.next()?;
+    if family.is_empty() || alias.is_empty() {
+        return None;
+    }
+    Some((family, alias))
 }
 
 /// Prompt-cache entry lifetime to request for this provider's Anthropic
@@ -984,25 +1199,6 @@ pub struct ModelProviderConfig {
     #[tab(Model)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Ordered list of other provider aliases to try when every model on this
-    /// alias has failed. Each entry is a dotted `<type>.<alias>` reference into
-    /// `providers.models` and resolves with its own credentials, endpoint, and
-    /// model. A fallback never inherits this alias's key. The walk is
-    /// depth-first: this alias's models are exhausted first, then each fallback
-    /// alias is descended in turn (applying its own `fallback_models` and
-    /// `fallback`). Empty means no provider-level fallback.
-    #[tab(Model)]
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub fallback: Vec<crate::providers::ModelProviderRef>,
-    /// Ordered alternate models to try on THIS provider before falling over to
-    /// the `fallback` aliases. Same endpoint, key, and headers as the primary
-    /// `model`. Only the model identifier changes. Use this when a provider
-    /// serves a backup model (e.g. a smaller or older variant) that should be
-    /// tried before leaving the provider entirely. Empty means only `model` is
-    /// tried.
-    #[tab(Model)]
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub fallback_models: Vec<String>,
     /// Sampling temperature passed to the model. Lower values (0.0–0.3) give
     /// deterministic, near-verbatim output, which fits code, routing, summarization.
     /// Higher values (0.7–1.2) give more varied output, which fits open-ended chat.
@@ -1210,6 +1406,16 @@ pub struct ModelProviderConfig {
     #[tab(Connection)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_ca_cert_path: Option<String>,
+    /// Models hosted by this provider profile, keyed by model alias. Each entry
+    /// shares this profile's credential and endpoint but carries its own model
+    /// id and model-side tuning, and is addressable as
+    /// `<family>.<alias>.<model_alias>`. When empty, the profile behaves as
+    /// before: a single model selected via the `model` field above. See
+    /// `ModelEntryConfig`.
+    #[tab(Model)]
+    #[nested]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub models: HashMap<String, ModelEntryConfig>,
 }
 
 // ── Per-family model model_provider configs ────────────────────────────
@@ -1392,8 +1598,8 @@ pub struct AnthropicModelProviderConfig {
     /// must differ from the requested model, and must be permitted fallback
     /// targets for it (e.g. `claude-fable-5` → `["claude-opus-4-8"]`; a
     /// non-permitted entry is rejected by the API). Applies to non-streaming
-    /// requests only. Distinct from the generic `fallback_models`, which
-    /// ZeroClaw itself retries client-side after an error. Empty (the default)
+    /// requests only. Distinct from the client-side `[providers.fallback]`
+    /// graph, which ZeroClaw retries after an error. Empty (the default)
     /// sends no fallback parameter and no beta value.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub server_fallback_models: Vec<String>,
@@ -1785,16 +1991,8 @@ mod crusoe_tests {
 model = "deepseek-ai/DeepSeek-V4-Flash"
 "#;
         let config: Config = toml::from_str(toml).expect("crusoe alias deserializes");
-        let alias = config
-            .providers
-            .models
-            .crusoe
-            .get("default")
-            .expect("crusoe.default present");
-        assert_eq!(
-            alias.base.model.as_deref(),
-            Some("deepseek-ai/DeepSeek-V4-Flash")
-        );
+        let alias = config.resolve_model_id("crusoe.default").unwrap();
+        assert_eq!(Some(alias.as_str()), Some("deepseek-ai/DeepSeek-V4-Flash"));
     }
 }
 
@@ -3890,7 +4088,6 @@ pub struct ResolvedRuntime {
     pub context_compact_ratio: Option<f64>,
     pub parallel_tools: bool,
     pub tool_dispatcher: String,
-    pub strict_tool_parsing: bool,
     pub tool_call_dedup_exempt: Vec<String>,
     pub tool_filter_groups: Vec<ToolFilterGroup>,
     pub max_system_prompt_chars: usize,
@@ -4084,7 +4281,6 @@ impl Default for ResolvedRuntime {
             context_compact_ratio: None,
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
-            strict_tool_parsing: false,
             tool_call_dedup_exempt: Vec::new(),
             tool_filter_groups: Vec::new(),
             max_system_prompt_chars: default_max_system_prompt_chars(),
@@ -4487,11 +4683,54 @@ pub struct ChannelAliasInfo {
 
 impl Config {
     /// Resolve the configured alias values valid for an [`crate::traits::AliasSource`].
-    /// Two-tier sources return dotted `<type>.<alias>` keys; flat sources
-    /// return bare alias keys. The single resolver every surface uses for
+    /// Provider sources return exact canonical model keys; other sources
+    /// return their section's alias keys. The single resolver every surface uses for
     /// `PropKind::AliasRef` pickers and validation.
     #[must_use]
     pub fn resolve_alias_source(&self, source: crate::traits::AliasSource) -> Vec<String> {
+        if matches!(
+            source,
+            crate::traits::AliasSource::TtsProviders
+                | crate::traits::AliasSource::TranscriptionProviders
+        ) {
+            let capability = if source == crate::traits::AliasSource::TtsProviders {
+                zeroclaw_api::capability::Capability::Tts
+            } else {
+                zeroclaw_api::capability::Capability::Asr
+            };
+            let mut refs = Vec::new();
+            if let Ok(registry) = self.provider_registry() {
+                refs.extend(
+                    registry
+                        .models
+                        .iter()
+                        .filter(|(_, model)| model.capability() == capability)
+                        .map(|(name, _)| name.to_string()),
+                );
+            }
+            refs.sort();
+            refs.dedup();
+            return refs;
+        }
+        // Model references have dynamic keys containing literal dots. Build
+        // them from the typed maps, never from flattened property paths.
+        if source == crate::traits::AliasSource::ModelProviders {
+            let mut refs = Vec::new();
+            if let Ok(registry) = self.provider_registry() {
+                refs.extend(
+                    registry
+                        .models
+                        .iter()
+                        .filter(|(_, model)| {
+                            model.capability() == zeroclaw_api::capability::Capability::Chat
+                        })
+                        .map(|(model_ref, _)| model_ref.to_string()),
+                );
+            }
+            refs.sort();
+            refs.dedup();
+            return refs;
+        }
         let section = source.section_path();
         if source.is_two_tier() {
             let prefix = format!("{section}.");
@@ -4518,22 +4757,97 @@ impl Config {
         }
     }
 
-    /// Return the first concrete `model` string available for use as a
-    /// default: the model declared by the first entry that has one. Entries
-    /// are visited in macro slot order, then sorted alias order within each
-    /// slot, as implemented by
-    /// [`ModelProviders::first_entry_with_model`](crate::providers::ModelProviders::first_entry_with_model).
-    /// Returns `None` only when no model-provider entry has any model
-    /// configured at all.
+    /// Return the first concrete model id available for use as a default.
+    /// Only admitted canonical chat models are considered.
     #[must_use]
     pub fn resolve_default_model(&self) -> Option<String> {
-        self.providers
+        let registry = self.provider_registry().ok()?;
+        registry
             .models
-            .first_entry_with_model()
-            .and_then(|(_, _, base)| base.model.as_deref())
+            .values()
+            .filter(|model| model.capability() == zeroclaw_api::capability::Capability::Chat)
+            .find_map(|model| {
+                model
+                    .upstream_model()
+                    .map(str::trim)
+                    .filter(|model| !model.is_empty())
+                    .map(str::to_owned)
+            })
+    }
+
+    /// Resolve an upstream model ID from the admitted exact-key registry.
+    /// Model keys are never split on `.`.
+    #[must_use]
+    pub fn resolve_model_id(&self, model_ref: &str) -> Option<String> {
+        let registry = self.provider_registry().ok()?;
+        let resolved = registry
+            .resolve_chat(&crate::provider_registry::ModelRef::from(model_ref.trim()))
+            .ok()?;
+        resolved
+            .upstream_model()
             .map(str::trim)
-            .filter(|m| !m.is_empty())
-            .map(ToString::to_string)
+            .filter(|model| !model.is_empty())
+            .map(str::to_owned)
+    }
+
+    /// Resolve model-owned text extraction after API/preset/model overlays.
+    /// All admitted selections share the same provider defaults.
+    /// Exact keys containing dots are resolved without splitting them.
+    #[must_use]
+    pub fn model_text_extraction(
+        &self,
+        model_ref: &str,
+    ) -> crate::provider_registry::TextExtraction {
+        self.provider_registry()
+            .ok()
+            .and_then(|registry| {
+                registry
+                    .resolve_chat(&crate::provider_registry::ModelRef::from(model_ref.trim()))
+                    .ok()
+                    .map(|chat| chat.text_extraction())
+            })
+            .unwrap_or_default()
+    }
+
+    /// Resolve a model's configured temperature from the projected canonical
+    /// registry. Explicit Clear means the
+    /// request omits temperature and therefore resolves to `None`.
+    #[must_use]
+    pub fn resolve_model_temperature(&self, model_ref: &str) -> Option<f64> {
+        let registry = self.provider_registry().ok()?;
+        let resolved = registry
+            .resolve_chat(&crate::provider_registry::ModelRef::from(model_ref.trim()))
+            .ok()?;
+        resolved
+            .options
+            .temperature
+            .as_ref()
+            .and_then(|value| match value {
+                crate::provider_registry::Override::Set(value) => Some(*value),
+                crate::provider_registry::Override::Clear => None,
+            })
+    }
+
+    /// Test whether a reference names an exact-key model in the canonical
+    /// registry. Canonical references are never split on `.` and are kept
+    /// separate from the legacy family/alias maps so consumers can choose the
+    /// correct resolution path without losing credentials or other legacy
+    /// provider fields.
+    #[must_use]
+    pub fn is_canonical_model_ref(&self, model_ref: &str) -> bool {
+        self.provider_registry().is_ok_and(|registry| {
+            registry
+                .models
+                .contains_key(&crate::provider_registry::ModelRef::from(model_ref.trim()))
+        })
+    }
+
+    /// Test whether a reference names a canonical model or a legacy model
+    /// profile/entry. Callers that only need admission should use this instead
+    /// of destructuring the legacy `ModelSelection` type.
+    #[must_use]
+    pub fn is_configured_model_ref(&self, model_ref: &str) -> bool {
+        self.is_canonical_model_ref(model_ref)
     }
 
     /// Resolve the risk profile for an explicit agent alias.
@@ -4752,9 +5066,17 @@ impl Config {
     /// for budget arithmetic.
     #[must_use]
     pub fn configured_model_context_window(&self, agent_alias: &str) -> Option<usize> {
-        // Provider config (config.toml) is the source of truth for this value.
-        self.resolved_model_provider_for_agent(agent_alias)
-            .and_then(|(_, _, provider_config)| provider_config.context_window)
+        let agent = self.agent(agent_alias)?;
+        let registry = self.provider_registry().ok()?;
+        let selection = registry
+            .resolve_chat(&crate::provider_registry::ModelRef::from(
+                agent.model_provider.as_str(),
+            ))
+            .ok()?;
+        match selection.selection.model {
+            crate::provider_registry::ModelDefinition::Chat(model) => model.metadata.context_window,
+            _ => None,
+        }
     }
 
     /// Returns the model's context window size (max input tokens).
@@ -4778,10 +5100,9 @@ impl Config {
             };
         };
         let model = self
-            .model_provider_for_agent(agent_alias)
-            .and_then(|provider| provider.model.as_deref())
+            .resolve_model_id(agent.model_provider.as_str())
             .unwrap_or_default();
-        self.resolved_model_context_window_for_route(agent.model_provider.as_str(), model)
+        self.resolved_model_context_window_for_route(agent.model_provider.as_str(), &model)
     }
 
     /// Resolve model capacity for the provider alias and model selected for a
@@ -4807,37 +5128,44 @@ impl Config {
         model_provider_ref: &str,
         selected_model: &str,
     ) -> ResolvedModelContextWindow {
-        let configured =
-            model_provider_ref
-                .split_once('.')
-                .and_then(|(provider_type, provider_alias)| {
-                    self.providers.models.find(provider_type, provider_alias)
-                });
-        let selected_model = selected_model.trim();
-        let configured_model = configured
-            .and_then(|provider| provider.model.as_deref())
-            .map(str::trim)
-            .filter(|model| !model.is_empty());
-
-        let configured_window = configured
-            .filter(|_| {
-                selected_model.is_empty()
-                    || configured_model.is_none()
-                    || configured_model == Some(selected_model)
-            })
-            .and_then(|provider| provider.context_window)
-            .filter(|window| *window > 0);
-
-        configured_window.map_or(
-            ResolvedModelContextWindow {
-                tokens: UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
-                source: ModelContextWindowSource::CompatibilityFallback,
-            },
-            |tokens| ResolvedModelContextWindow {
-                tokens,
-                source: ModelContextWindowSource::Configured,
-            },
-        )
+        if let Ok(registry) = self.provider_registry()
+            && let Ok(selection) = registry.resolve_chat(&crate::provider_registry::ModelRef::from(
+                model_provider_ref.trim(),
+            ))
+        {
+            let configured_window = match selection.selection.model {
+                crate::provider_registry::ModelDefinition::Chat(model) => {
+                    let resolved_model = model
+                        .model
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
+                    if selected_model.trim().is_empty()
+                        || resolved_model.is_none()
+                        || resolved_model == Some(selected_model.trim())
+                    {
+                        model.metadata.context_window
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            return configured_window.map_or(
+                ResolvedModelContextWindow {
+                    tokens: UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
+                    source: ModelContextWindowSource::CompatibilityFallback,
+                },
+                |tokens| ResolvedModelContextWindow {
+                    tokens,
+                    source: ModelContextWindowSource::Configured,
+                },
+            );
+        }
+        ResolvedModelContextWindow {
+            tokens: UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
+            source: ModelContextWindowSource::CompatibilityFallback,
+        }
     }
 
     /// Resolve one route's capacity and proactive budget from their canonical
@@ -4849,8 +5177,20 @@ impl Config {
         model_provider_ref: &str,
         selected_model: &str,
     ) -> ResolvedContextLimits {
+        // Legacy bare-family overrides inherit the agent's selected model and
+        // tuning. Recover that source at use time, while keeping the physical
+        // provider/billing family independent. Explicit different model IDs
+        // must not borrow the inherited model's capacity.
+        let capacity_ref = self
+            .agent(agent_alias)
+            .filter(|_| !model_provider_ref.contains('.'))
+            .filter(|agent| {
+                self.resolve_model_id(&agent.model_provider).as_deref()
+                    == Some(selected_model.trim())
+            })
+            .map_or(model_provider_ref, |agent| agent.model_provider.as_str());
         let model_context_window =
-            self.resolved_model_context_window_for_route(model_provider_ref, selected_model);
+            self.resolved_model_context_window_for_route(capacity_ref, selected_model);
         let mut runtime = ResolvedRuntime {
             max_context_tokens: self.effective_max_context_tokens(agent_alias),
             model_context_window: model_context_window.tokens,
@@ -4871,33 +5211,19 @@ impl Config {
     /// of the agent-alias variant when the live provider identity is
     /// known (e.g., from `Agent.attribution_fields().1` or
     /// `SessionOverrides.model_provider`). Returns `None` when the
-    /// ref is unparseable, the entry has no `context_window`, or the
-    /// served model does not match the entry's configured primary
-    /// `model`, so the wire omission path preserves absence (no 32k
-    /// stub leak) and fallback/vision/override models never borrow
-    /// another model's capacity.
+    /// ref is unparseable, the selected profile or nested entry has no
+    /// `context_window`, or the served model cannot be matched to that
+    /// selection, so the wire omission path preserves absence (no 32k stub
+    /// leak) and fallback/vision/override models never borrow another model's
+    /// capacity.
     #[must_use]
     pub fn model_provider_context_window_opt(
         &self,
         provider_ref: &str,
         model: &str,
     ) -> Option<usize> {
-        let (type_key, alias_key) = provider_ref.split_once('.')?;
-        let (_, _, cfg) = self
-            .providers
-            .models
-            .iter_entries()
-            .find(|(ty, al, _)| *ty == type_key && *al == alias_key)?;
-        let configured = cfg
-            .model
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())?;
-        let served = model.trim();
-        if served.is_empty() || configured != served {
-            return None;
-        }
-        cfg.context_window
+        let resolved = self.resolved_model_context_window_for_route(provider_ref, model);
+        (resolved.source == ModelContextWindowSource::Configured).then_some(resolved.tokens)
     }
 
     #[must_use]
@@ -4999,7 +5325,6 @@ impl Config {
             ..ResolvedRuntime::default()
         };
         if let Some(profile) = self.runtime_profile_for_agent(agent_alias) {
-            resolved.strict_tool_parsing = profile.strict_tool_parsing;
             resolved.thinking = profile.thinking.clone();
             resolved.history_pruning = profile.history_pruning.clone();
             resolved.eval = profile.eval.clone();
@@ -5030,43 +5355,42 @@ impl Config {
             .unwrap_or(self.skills.prompt_injection_mode)
     }
 
-    /// Resolve an agent's `model_provider` reference (`"<type>.<alias>"`) to
-    /// its concrete `ModelProviderConfig` entry. Returns `None` when the
-    /// agent doesn't exist, the reference is unparseable, or the
-    /// `<type>.<alias>` pair doesn't resolve in `providers.models`.
-    ///
-    /// This is the lookup the orchestrator uses to build per-agent
-    /// model_provider runtime options via explicit `<type>.<alias>`
-    /// resolution — there is no concept of a "first" or "default"
-    /// provider. The matching split logic lives in
-    /// `crates/zeroclaw-runtime/src/tools/delegate.rs::resolve_brain` for
-    /// the delegation path; this helper exposes the same contract for the
-    /// channel-server startup path.
+    /// Enumerate canonical chat models in deterministic exact-key order.
+    /// CLI status and Doctor share this view. A filter matches the complete
+    /// model reference, complete connection ID, or connection kind.
     #[must_use]
-    pub fn model_provider_for_agent(&self, agent_alias: &str) -> Option<&ModelProviderConfig> {
-        let agent = self.agents.get(agent_alias)?;
-        let (type_key, alias_key) = agent.model_provider.split_once('.')?;
-        self.providers.models.find(type_key, alias_key)
-    }
-
-    /// Resolve `(provider_type, provider_alias, &ModelProviderConfig)` for an
-    /// agent. Same lookup as `model_provider_for_agent` but also returns the
-    /// `'static` type key that downstream provider factories
-    /// (`create_routed_model_provider_with_options`, etc.) need. Returns
-    /// `None` when the agent has no `model_provider` set, when the reference
-    /// is unparseable, or when the resolved entry has been deleted from
-    /// `providers.models`.
-    #[must_use]
-    pub fn resolved_model_provider_for_agent(
+    pub fn configured_model_entries(
         &self,
-        agent_alias: &str,
-    ) -> Option<(&'static str, &str, &ModelProviderConfig)> {
-        let agent = self.agents.get(agent_alias)?;
-        let (type_key, alias_key) = agent.model_provider.split_once('.')?;
-        self.providers
+        provider_override: Option<&str>,
+    ) -> Vec<ConfiguredModelEntry> {
+        let Ok(registry) = self.provider_registry() else {
+            return Vec::new();
+        };
+        let filter = provider_override
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        registry
             .models
-            .iter_entries()
-            .find(|(ty, al, _)| *ty == type_key && *al == alias_key)
+            .iter()
+            .filter_map(|(reference, model)| {
+                if model.capability() != zeroclaw_api::capability::Capability::Chat {
+                    return None;
+                }
+                let connection = registry.connections.get(model.provider())?;
+                if filter.is_some_and(|filter| {
+                    filter != reference.as_str()
+                        && filter != model.provider().as_str()
+                        && filter != connection.kind()
+                }) {
+                    return None;
+                }
+                Some(ConfiguredModelEntry {
+                    model_ref: reference.to_string(),
+                    connection_id: model.provider().to_string(),
+                    model_id: model.upstream_model().map(str::to_owned),
+                })
+            })
+            .collect()
     }
 
     /// Reverse-lookup the agent alias that owns a configured channel
@@ -5676,6 +6000,14 @@ fn default_transcription_model() -> String {
     "whisper-large-v3-turbo".into()
 }
 
+fn is_default_transcription_api_url(value: &str) -> bool {
+    value == default_transcription_api_url()
+}
+
+fn is_default_transcription_model(value: &str) -> bool {
+    value == default_transcription_model()
+}
+
 fn default_transcription_max_duration_secs() -> u64 {
     120
 }
@@ -5714,10 +6046,16 @@ pub struct TranscriptionConfig {
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_key: Option<String>,
     /// Whisper API endpoint URL (Groq transcription provider).
-    #[serde(default = "default_transcription_api_url")]
+    #[serde(
+        default = "default_transcription_api_url",
+        skip_serializing_if = "is_default_transcription_api_url"
+    )]
     pub api_url: String,
     /// Whisper model name (Groq transcription provider).
-    #[serde(default = "default_transcription_model")]
+    #[serde(
+        default = "default_transcription_model",
+        skip_serializing_if = "is_default_transcription_model"
+    )]
     pub model: String,
     /// Optional language hint (ISO-639-1, e.g. "en", "ru") for Groq transcription provider.
     #[serde(default)]
@@ -12941,6 +13279,12 @@ pub struct MemoryConfig {
     /// Source of embedding vectors for semantic search. `none` = keyword-only retrieval (no API calls, no vector cost); `openai` = OpenAI's embedding API; `custom:URL` = any OpenAI-compatible embedding endpoint (LiteLLM, local gateway, etc.).
     #[serde(default = "default_embedding_provider")]
     pub embedding_provider: String,
+    /// Canonical logical model reference from `[providers.models]`. When set,
+    /// the embedding connection, upstream model, credential, and dimensions
+    /// are resolved from the provider registry; the legacy provider/model
+    /// fields are accepted only by input migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_model_ref: Option<String>,
     /// Embedding model identifier — must match a model your chosen embedding model_provider serves (e.g. `text-embedding-3-small` for OpenAI). Changing this invalidates existing embeddings: the change is detected at startup and stale vectors are cleared automatically; run `zeroclaw memory reindex` to re-embed (or set `auto_reindex_on_identity_change`).
     #[serde(default = "default_embedding_model")]
     pub embedding_model: String,
@@ -13561,6 +13905,7 @@ impl Default for MemoryConfig {
             daily_retention_days: default_zero_retention(),
             core_retention_days: default_zero_retention(),
             embedding_provider: default_embedding_provider(),
+            embedding_model_ref: None,
             embedding_model: default_embedding_model(),
             embedding_dimensions: default_embedding_dims(),
             auto_reindex_on_identity_change: false,
@@ -15201,7 +15546,6 @@ pub struct RuntimeProfileConfig {
     /// the system-prompt builder and the `read_skill` tool-registration gate
     /// consult so they always agree on the effective mode.
     pub prompt_injection_mode: Option<SkillsPromptInjectionMode>,
-    pub strict_tool_parsing: bool,
     #[nested]
     pub thinking: crate::scattered_types::ThinkingConfig,
     #[nested]
@@ -15245,7 +15589,6 @@ impl Default for RuntimeProfileConfig {
             keep_tool_context_turns: None,
             memory_recall_limit: None,
             prompt_injection_mode: None,
-            strict_tool_parsing: false,
             thinking: crate::scattered_types::ThinkingConfig::default(),
             history_pruning: crate::scattered_types::HistoryPrunerConfig::default(),
             eval: crate::scattered_types::EvalConfig::default(),
@@ -15627,18 +15970,16 @@ impl Default for SchedulerConfig {
 
 // ── Model routing ────────────────────────────────────────────────
 
-/// Route a task hint to a specific model_provider + model.
+/// Route a task hint to one canonical model reference.
 ///
 /// ```toml
 /// [[model_routes]]
 /// hint = "reasoning"
-/// model_provider = "openrouter.default"
-/// model = "anthropic/claude-opus-4-20250514"
+/// model_ref = "chat.reasoning"
 ///
 /// [[model_routes]]
 /// hint = "fast"
-/// model_provider = "groq.low-latency"
-/// model = "llama-3.3-70b-versatile"
+/// model_ref = "chat.fast"
 /// ```
 ///
 /// Usage: pass `hint:reasoning` as the model parameter to route the request.
@@ -15646,6 +15987,7 @@ impl Default for SchedulerConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "model_routes"]
 #[application = "model_provider_refresh"]
+#[serde(deny_unknown_fields)]
 pub struct ModelRouteConfig {
     /// Task hint name (e.g. "reasoning", "fast", "code", "summarize")
     /// `#[serde(default)]` lets the `create_map_key` macro default-construct
@@ -15653,22 +15995,21 @@ pub struct ModelRouteConfig {
     /// are rejected by `Config::validate()`.
     #[serde(default)]
     pub hint: String,
-    /// Dotted provider profile ref to route to (must resolve to `providers.models.<type>.<alias>`)
+    /// Exact canonical model reference (must resolve to a key in
+    /// `[providers.models]`). Dots are part of the TOML key and are never
+    /// interpreted as path separators.
     /// `#[serde(default)]` is required for `Default` + `create_map_key` construction.
     /// Empty strings are rejected by `Config::validate()`.
     #[serde(default)]
-    pub model_provider: String,
-    /// Provider-local model identifier to use with that provider profile
-    /// `#[serde(default)]` is required for `Default` + `create_map_key` construction.
-    /// Empty strings are rejected by `Config::validate()`.
-    #[serde(default)]
-    pub model: String,
-    /// Optional API key override for this route's model provider
-    #[serde(default)]
-    #[secret]
-    #[credential_class = "encrypted_secret"]
-    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub api_key: Option<String>,
+    pub model_ref: String,
+}
+
+impl ModelRouteConfig {
+    /// Resolve the upstream model id owned by the referenced canonical model.
+    /// Empty means the route is incomplete or the model has no upstream id.
+    pub fn effective_model(&self, config: &Config) -> String {
+        config.resolve_model_id(&self.model_ref).unwrap_or_default()
+    }
 }
 
 // ── Model cache (shared between CLI refresh and channel reader) ──
@@ -15689,14 +16030,12 @@ pub struct ModelCacheEntry {
 
 // ── Embedding routing ───────────────────────────────────────────
 
-/// Route an embedding hint to a specific model_provider + model.
+/// Route an embedding hint to an exact embedding model reference.
 ///
 /// ```toml
 /// [[embedding_routes]]
 /// hint = "semantic"
-/// model_provider = "openai.embeddings"
-/// model = "text-embedding-3-small"
-/// dimensions = 1536
+/// model_provider = "embedding.semantic"
 ///
 /// [memory]
 /// embedding_model = "hint:semantic"
@@ -15711,21 +16050,22 @@ pub struct EmbeddingRouteConfig {
     /// are rejected by `Config::validate()`.
     #[serde(default)]
     pub hint: String,
-    /// Dotted embedding-capable provider profile ref
+    /// Exact embedding model reference. The compatibility reader also accepts
+    /// a legacy provider profile with separate `model` and `dimensions` fields.
     /// `#[serde(default)]` is required for `Default` + `create_map_key` construction.
     /// Empty strings are rejected by `Config::validate()`.
     #[serde(default)]
     pub model_provider: String,
-    /// Provider-local embedding model identifier to use with that provider profile
+    /// Legacy provider-local model identifier. Ignored for exact model references.
     /// `#[serde(default)]` is required for `Default` + `create_map_key` construction.
-    /// Empty strings are rejected by `Config::validate()`.
-    #[serde(default)]
+    /// Required only for legacy provider profile references.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub model: String,
-    /// Optional embedding dimension override for this route
-    #[serde(default)]
+    /// Legacy dimension override. Exact model references use their metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dimensions: Option<usize>,
     /// Optional API key override for this route's model_provider
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[secret]
     #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
@@ -23368,6 +23708,97 @@ impl Config {
         out
     }
 
+    /// Return unknown leaves inside canonical model option patches. The
+    /// options patch structs intentionally ignore unrecognized leaves so a
+    /// typo cannot abort an otherwise valid config; the startup loader calls
+    /// this scanner once to make that loss visible. It operates on TOML
+    /// tables directly, preserving quoted dotted registry keys as one key.
+    pub fn unknown_canonical_option_fields(raw_toml: &str) -> Vec<String> {
+        fn key_segment(key: &str) -> String {
+            toml_edit::Key::new(key).to_string()
+        }
+        fn scan_options(
+            options: Option<&toml::Value>,
+            capability: &str,
+            path: &str,
+            out: &mut Vec<String>,
+        ) {
+            let Some(options) = options.and_then(toml::Value::as_table) else {
+                return;
+            };
+            let known = crate::provider_registry::option_fields(capability);
+            for field in options
+                .keys()
+                .filter(|field| !known.contains(&field.as_str()))
+            {
+                out.push(format!("{path}.options.{}", key_segment(field)));
+            }
+        }
+
+        let Ok(raw) = raw_toml.parse::<toml::Table>() else {
+            return Vec::new();
+        };
+        let Some(providers) = raw.get("providers").and_then(toml::Value::as_table) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+
+        if let Some(models) = providers.get("models").and_then(toml::Value::as_table) {
+            for (model_ref, model) in models {
+                let Some(model) = model.as_table() else {
+                    continue;
+                };
+                let Some(capability) = model.get("capability").and_then(toml::Value::as_str) else {
+                    continue;
+                };
+                let path = format!("providers.models.{}", key_segment(model_ref));
+                scan_options(model.get("options"), capability, &path, &mut out);
+            }
+        }
+        if let Some(presets) = providers
+            .get("model_presets")
+            .and_then(toml::Value::as_table)
+        {
+            for (preset_name, value) in presets {
+                let Some(preset_table) = value.as_table() else {
+                    continue;
+                };
+                let Some(capability) = preset_table.get("capability").and_then(toml::Value::as_str)
+                else {
+                    continue;
+                };
+                let path = format!("providers.model_presets.{}", key_segment(preset_name));
+                scan_options(preset_table.get("options"), capability, &path, &mut out);
+            }
+        }
+        if let Some(connections) = providers.get("connections").and_then(toml::Value::as_table) {
+            for (connection_name, value) in connections {
+                let Some(connection_table) = value.as_table() else {
+                    continue;
+                };
+                let Some(api) = connection_table.get("api").and_then(toml::Value::as_table) else {
+                    continue;
+                };
+                for (capability, api_value) in api {
+                    let path = format!(
+                        "providers.connections.{}.api.{}",
+                        key_segment(connection_name),
+                        key_segment(capability)
+                    );
+                    scan_options(
+                        api_value.as_table().and_then(|table| table.get("options")),
+                        capability,
+                        &path,
+                        &mut out,
+                    );
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
     /// Return extra-nested model-provider alias tables that look like a
     /// misplaced provider config, e.g.
     /// `[providers.models.zai.default.default]`.
@@ -23439,10 +23870,22 @@ impl Config {
     }
 
     /// Returns `true` if `path` was populated by a `ZEROCLAW_*` env-var
-    /// override at load time. O(1) HashSet lookup; safe to call per row in
-    /// list-rendering paths (`config list`, dashboard, quickstart).
+    /// override at load time. Canonical registry overrides use JSON pointers
+    /// internally; dotted display paths are derived from those same identities.
     pub fn prop_is_env_overridden(&self, path: &str) -> bool {
         self.env_overridden_paths.contains(path)
+            || self
+                .env_overridden_paths
+                .iter()
+                .filter(|key| key.starts_with("/providers/"))
+                .any(|key| {
+                    key.trim_start_matches('/')
+                        .split('/')
+                        .map(|segment| segment.replace("~1", "/").replace("~0", "~"))
+                        .collect::<Vec<_>>()
+                        .join(".")
+                        == path
+                })
     }
 
     pub async fn load_or_init() -> Result<Self> {
@@ -23669,6 +24112,15 @@ impl Config {
                     "Unknown config key ignored: \"\". Check config.toml for typos or deprecated options."
                 );
             }
+            for path in Self::unknown_canonical_option_fields(&contents) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"path": path})),
+                    "Unknown canonical model option ignored; check the capability option name"
+                );
+            }
             // Unknown provider families are dropped by serde, so an alias
             // created under a typo'd or unsupported family silently vanishes
             // on reload while agents.*.model_provider still references it.
@@ -23744,7 +24196,7 @@ impl Config {
 
             let store = crate::secrets::SecretStore::new(&zeroclaw_dir, config.secrets.encrypt);
             config.onepassword_reference_snapshots =
-                collect_onepassword_reference_snapshots(&config);
+                collect_onepassword_reference_snapshots(&config)?;
             // Decrypt all #[secret]-annotated fields via Configurable derive
             config = tokio::task::spawn_blocking(move || {
                 config.decrypt_secrets(&store)?;
@@ -23865,7 +24317,7 @@ impl Config {
             .parent()
             .context("config path must have a parent directory")?;
         let store = crate::secrets::SecretStore::new(zeroclaw_dir, config.secrets.encrypt);
-        config.onepassword_reference_snapshots = collect_onepassword_reference_snapshots(&config);
+        config.onepassword_reference_snapshots = collect_onepassword_reference_snapshots(&config)?;
         config = tokio::task::spawn_blocking(move || {
             config.decrypt_secrets(&store)?;
             Ok::<_, anyhow::Error>(config)
@@ -23936,7 +24388,6 @@ impl Config {
     pub fn collect_warnings(&self) -> Vec<crate::validation_warnings::ValidationWarning> {
         let mut warnings = Vec::new();
         self.collect_codex_cli_extra_arg_warnings(&mut warnings);
-        self.collect_fallback_warnings(&mut warnings);
         self.collect_server_fallback_model_warnings(&mut warnings);
         self.collect_a2a_exposed_skills_warnings(&mut warnings);
         self.collect_memory_semantic_search_warnings(&mut warnings);
@@ -23952,24 +24403,6 @@ impl Config {
         }
         for (alias, em) in &self.channels.email {
             warnings.extend(validate_email_smtp_semantics(alias, em));
-        }
-        // `wire_api` is only honored by bring-your-own-endpoint families; on a
-        // branded family with a fixed wire protocol it is silently ignored.
-        // Surface that so an operator who sets it on, e.g., `mistral` learns it
-        // has no effect instead of debugging unexpected runtime behavior.
-        for (family, alias, entry) in self.providers.models.iter_entries() {
-            if entry.wire_api.is_some() && !crate::provider_aliases::family_honors_wire_api(family)
-            {
-                warnings.push(crate::validation_warnings::ValidationWarning::new(
-                    "wire_api_not_supported_for_family",
-                    format!(
-                        "wire_api is set on `{family}.{alias}` but the `{family}` family has a \
-                         fixed wire protocol and ignores it. wire_api only takes effect on the \
-                         openai, llamacpp, and custom (openai-compatible) families."
-                    ),
-                    format!("providers.models.{family}.{alias}.wire_api"),
-                ));
-            }
         }
         // `security.audit` is the certificate issuance and renewal trail, and
         // nothing else: `AuditLogger::log_command_event` has no production
@@ -24155,8 +24588,7 @@ impl Config {
                 "memory.search_mode is {search_mode:?} on sqlite memory, but no effective \
                  embedding provider is configured; vector search is skipped and \
                  recall falls back to keyword-only behavior. Configure \
-                 memory.embedding_provider or a valid memory.embedding_model \
-                 hint route, or set memory.search_mode = \"bm25\"."
+                 memory.embedding_model_ref, or set memory.search_mode = \"bm25\"."
             ),
             "memory.search_mode",
         ));
@@ -24172,49 +24604,26 @@ impl Config {
     }
 
     fn memory_has_effective_embedder(&self) -> bool {
-        let fallback = || Self::memory_embedding_settings_have_effective_embedder(&self.memory);
-        let Some(hint) = self
+        let Some(model_ref) = self
             .memory
-            .embedding_model
-            .strip_prefix("hint:")
+            .embedding_model_ref
+            .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
         else {
-            return fallback();
+            return false;
         };
-
-        let Some(route) = self
-            .embedding_routes
-            .iter()
-            .find(|route| route.hint.trim() == hint)
-        else {
-            return fallback();
-        };
-
-        if Self::embedding_route_has_effective_embedder(route, self.memory.embedding_dimensions) {
-            return true;
-        }
-        fallback()
-    }
-
-    fn memory_embedding_settings_have_effective_embedder(memory: &MemoryConfig) -> bool {
-        let provider = memory.embedding_provider.trim();
-        !provider.is_empty()
-            && !provider.eq_ignore_ascii_case("none")
-            && memory.embedding_dimensions > 0
-    }
-
-    fn embedding_route_has_effective_embedder(
-        route: &EmbeddingRouteConfig,
-        fallback_dimensions: usize,
-    ) -> bool {
-        let provider = route.model_provider.trim();
-        let model = route.model.trim();
-        let dimensions = route.dimensions.unwrap_or(fallback_dimensions);
-        !provider.is_empty()
-            && !provider.eq_ignore_ascii_case("none")
-            && !model.is_empty()
-            && dimensions > 0
+        self.provider_registry().is_ok_and(|registry| {
+            registry
+                .resolve_embedding(&model_ref.into())
+                .is_ok_and(|resolved| {
+                    !resolved.model.trim().is_empty()
+                        && resolved
+                            .dimensions
+                            .unwrap_or(self.memory.embedding_dimensions)
+                            > 0
+                })
+        })
     }
 
     /// Surface the A2A `exposed_skills` filter that can never resolve a skill.
@@ -24344,63 +24753,6 @@ impl Config {
         }
     }
 
-    /// Surface non-fatal issues in per-alias `fallback` chains: dangling refs
-    /// (a fallback naming an alias that is not configured) and cycles (a
-    /// fallback path that loops back onto itself). Both are warn-and-skip — the
-    /// chain still loads and runs with the offending edge pruned at build time.
-    fn collect_fallback_warnings(
-        &self,
-        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
-    ) {
-        for (family, alias, cfg) in self.providers.models.iter_entries() {
-            self.collect_fallback_model_warnings(family, alias, cfg, warnings);
-            if cfg.fallback.is_empty() {
-                continue;
-            }
-            let root = format!("{family}.{alias}");
-            let mut visited: Vec<String> = vec![root.clone()];
-            self.walk_fallback(&root, &cfg.fallback, &mut visited, 1, warnings);
-        }
-    }
-
-    /// Surface `fallback_models` entries the build path silently skips: blank
-    /// entries and entries that duplicate the alias's primary `model`. The skip
-    /// itself is safe, but without a warning an operator never learns that a
-    /// listed fallback model is doing nothing.
-    fn collect_fallback_model_warnings(
-        &self,
-        family: &str,
-        alias: &str,
-        cfg: &ModelProviderConfig,
-        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
-    ) {
-        let Some(primary) = cfg.model.as_deref() else {
-            return;
-        };
-        for (i, model) in cfg.fallback_models.iter().enumerate() {
-            let path = format!("providers.models.{family}.{alias}.fallback_models[{i}]");
-            if model.trim().is_empty() {
-                warnings.push(crate::validation_warnings::ValidationWarning::new(
-                    "empty_fallback_model",
-                    format!(
-                        "fallback_models entry {i} on {family}.{alias} is empty; \
-                         it is skipped at runtime"
-                    ),
-                    path,
-                ));
-            } else if model == primary {
-                warnings.push(crate::validation_warnings::ValidationWarning::new(
-                    "fallback_model_duplicates_primary",
-                    format!(
-                        "fallback_models entry {model:?} on {family}.{alias} duplicates the \
-                         primary model; it is skipped at runtime"
-                    ),
-                    path,
-                ));
-            }
-        }
-    }
-
     /// Surface `server_fallback_models` entries the Anthropic request builder
     /// drops before sending: blank entries and entries that duplicate the
     /// alias's primary `model` (the requested model can never be its own
@@ -24413,87 +24765,31 @@ impl Config {
         &self,
         warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
     ) {
-        for (alias, cfg) in &self.providers.models.anthropic {
-            let primary = cfg.base.model.as_deref();
-            for (i, model) in cfg.server_fallback_models.iter().enumerate() {
+        let Ok(registry) = self.provider_registry() else {
+            return;
+        };
+        for (reference, model) in &registry.models {
+            let crate::provider_registry::ModelDefinition::Chat(chat) = model else {
+                continue;
+            };
+            let Some(crate::provider_registry::ChatModelExtra::Anthropic(extra)) = &chat.extra
+            else {
+                continue;
+            };
+            let primary = chat.model.as_deref();
+            for (i, model) in extra.server_fallback_models.iter().enumerate() {
                 let path =
-                    format!("providers.models.anthropic.{alias}.server_fallback_models[{i}]");
+                    format!("providers.models.{reference}.extra.server_fallback_models[{i}]");
                 if model.trim().is_empty() {
                     warnings.push(crate::validation_warnings::ValidationWarning::new(
                         crate::validation_warnings::EMPTY_SERVER_FALLBACK_MODEL,
-                        format!(
-                            "server_fallback_models entry {i} on anthropic.{alias} is empty; \
-                             it is dropped before the request is sent"
-                        ),
-                        path,
-                    ));
+                        format!("server_fallback_models entry {i} on {reference} is empty; it is dropped before the request is sent"), path));
                 } else if primary == Some(model.as_str()) {
                     warnings.push(crate::validation_warnings::ValidationWarning::new(
                         crate::validation_warnings::SERVER_FALLBACK_MODEL_DUPLICATES_PRIMARY,
-                        format!(
-                            "server_fallback_models entry {model:?} on anthropic.{alias} \
-                             duplicates the primary model; it is dropped before the request is sent"
-                        ),
-                        path,
-                    ));
+                        format!("server_fallback_models entry {model:?} on {reference} duplicates the primary model; it is dropped before the request is sent"), path));
                 }
             }
-        }
-    }
-
-    fn walk_fallback(
-        &self,
-        from: &str,
-        refs: &[crate::providers::ModelProviderRef],
-        visited: &mut Vec<String>,
-        depth: usize,
-        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
-    ) {
-        if depth > crate::providers::MAX_FALLBACK_DEPTH {
-            warnings.push(crate::validation_warnings::ValidationWarning::new(
-                "max_fallback_depth_exceeded",
-                format!(
-                    "fallback chain from {from} exceeds the maximum depth of {}; \
-                     deeper links are pruned at runtime",
-                    crate::providers::MAX_FALLBACK_DEPTH
-                ),
-                format!("providers.models.{from}.fallback"),
-            ));
-            return;
-        }
-        for (i, fallback_ref) in refs.iter().enumerate() {
-            let raw = fallback_ref.as_str().trim();
-            if raw.is_empty() {
-                continue;
-            }
-            let path = format!("providers.models.{from}.fallback[{i}]");
-            let Some((family, alias, cfg)) = self.providers.models.find_by_name(raw) else {
-                warnings.push(crate::validation_warnings::ValidationWarning::new(
-                    "dangling_fallback_ref",
-                    format!(
-                        "fallback {raw:?} on {from} does not resolve to a configured \
-                         providers.models entry; this fallback link is skipped at runtime"
-                    ),
-                    path,
-                ));
-                continue;
-            };
-            let resolved = format!("{family}.{alias}");
-            if visited.iter().any(|v| v == &resolved) {
-                warnings.push(crate::validation_warnings::ValidationWarning::new(
-                    "fallback_cycle",
-                    format!(
-                        "fallback {raw:?} on {from} closes a cycle \
-                         ({} -> {resolved}); the cycle edge is pruned at runtime",
-                        visited.join(" -> ")
-                    ),
-                    path,
-                ));
-                continue;
-            }
-            visited.push(resolved.clone());
-            self.walk_fallback(&resolved, &cfg.fallback, visited, depth + 1, warnings);
-            visited.pop();
         }
     }
 
@@ -25351,13 +25647,12 @@ impl Config {
             );
         }
 
-        // Model routes
+        // Loaded Config owns canonical definitions. Validation and construction
+        // resolve the same complete model keys without legacy profile fallbacks.
+        let model_registry = self.provider_registry()?;
         for (i, route) in self.model_routes.iter().enumerate() {
-            let required = crate::setup::route_required_fields(
-                &route.hint,
-                &route.model_provider,
-                &route.model,
-            );
+            let required = crate::setup::route_required_fields(&route.hint, &route.model_ref);
+            let model_ref = route.model_ref.trim();
             if required.hint.missing {
                 validation_bail!(
                     RequiredFieldEmpty,
@@ -25365,51 +25660,43 @@ impl Config {
                     "model_routes[{i}].hint must not be empty"
                 );
             }
-            let mp = route.model_provider.trim();
-            if required.model_provider.missing {
+            if required.model_ref.missing {
                 validation_bail!(
                     RequiredFieldEmpty,
-                    format!("model_routes[{i}].model_provider"),
-                    "model_routes[{i}].model_provider must not be empty"
+                    format!("model_routes[{i}].model_ref"),
+                    "model_routes[{i}].model_ref must not be empty"
                 );
             }
-            // Route refs are dotted `<type>.<alias>` and must resolve to a
-            // configured `[providers.models.<type>.<alias>]` entry. Unresolved
-            // routes are dropped at runtime construction; rejecting them here
-            // keeps that drift visible at config-load time.
-            match mp.split_once('.') {
-                Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
-                    if self.providers.models.find(ty, inner).is_none() {
-                        validation_bail!(
-                            DanglingReference,
-                            format!("model_routes[{i}].model_provider"),
-                            "model_routes[{i}].model_provider = {mp:?} but providers.models.{ty}.{inner} is not configured",
-                        );
-                    }
-                }
-                _ => validation_bail!(
+            let model_key = crate::provider_registry::ModelRef::from(model_ref);
+            let Some(model) = model_registry.models.get(&model_key) else {
+                validation_bail!(
+                    DanglingReference,
+                    format!("model_routes[{i}].model_ref"),
+                    "model_routes[{i}].model_ref = {model_ref:?} does not resolve to a canonical providers.models entry"
+                );
+            };
+            if model.capability() != zeroclaw_api::capability::Capability::Chat {
+                validation_bail!(
                     InvalidFormat,
-                    format!("model_routes[{i}].model_provider"),
-                    "model_routes[{i}].model_provider must be dotted form `<type>.<alias>` (got {mp:?})",
-                ),
+                    format!("model_routes[{i}].model_ref"),
+                    "model_routes[{i}].model_ref = {model_ref:?} must reference a chat model"
+                );
             }
-            if required.model.missing {
+            if model
+                .upstream_model()
+                .is_none_or(|model| model.trim().is_empty())
+            {
                 validation_bail!(
                     RequiredFieldEmpty,
-                    format!("model_routes[{i}].model"),
-                    "model_routes[{i}].model must not be empty"
+                    format!("model_routes[{i}].model_ref"),
+                    "model_routes[{i}].model_ref = {model_ref:?} must reference a chat model with a model id"
                 );
             }
         }
 
         // Embedding routes
         for (i, route) in self.embedding_routes.iter().enumerate() {
-            let required = crate::setup::route_required_fields(
-                &route.hint,
-                &route.model_provider,
-                &route.model,
-            );
-            if required.hint.missing {
+            if route.hint.trim().is_empty() {
                 validation_bail!(
                     RequiredFieldEmpty,
                     format!("embedding_routes[{i}].hint"),
@@ -25417,113 +25704,29 @@ impl Config {
                 );
             }
             let mp = route.model_provider.trim();
-            if required.model_provider.missing {
+            if mp.is_empty() {
                 validation_bail!(
                     RequiredFieldEmpty,
                     format!("embedding_routes[{i}].model_provider"),
                     "embedding_routes[{i}].model_provider must not be empty"
                 );
             }
-            // Embedding routes resolve against the same model-provider map;
-            // there is no separate `providers.embeddings` typed section.
-            match mp.split_once('.') {
-                Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
-                    if self.providers.models.find(ty, inner).is_none() {
-                        validation_bail!(
-                            DanglingReference,
-                            format!("embedding_routes[{i}].model_provider"),
-                            "embedding_routes[{i}].model_provider = {mp:?} but providers.models.{ty}.{inner} is not configured",
-                        );
-                    }
-                }
-                _ => validation_bail!(
+            let Some(model) = model_registry
+                .models
+                .get(&crate::provider_registry::ModelRef::from(mp))
+            else {
+                validation_bail!(
+                    DanglingReference,
+                    format!("embedding_routes[{i}].model_provider"),
+                    "embedding_routes[{i}].model_provider = {mp:?} does not resolve to a configured model",
+                );
+            };
+            if model.capability() != zeroclaw_api::capability::Capability::Embedding {
+                validation_bail!(
                     InvalidFormat,
                     format!("embedding_routes[{i}].model_provider"),
-                    "embedding_routes[{i}].model_provider must be dotted form `<type>.<alias>` (got {mp:?})",
-                ),
-            }
-            if required.model.missing {
-                validation_bail!(
-                    RequiredFieldEmpty,
-                    format!("embedding_routes[{i}].model"),
-                    "embedding_routes[{i}].model must not be empty"
+                    "embedding_routes[{i}].model_provider = {mp:?} must reference an embedding model",
                 );
-            }
-        }
-
-        for (type_key, alias_key, profile) in self.providers.models.iter_entries() {
-            let profile_name = format!("{type_key}.{alias_key}");
-
-            let has_uri = profile
-                .uri
-                .as_deref()
-                .map(str::trim)
-                .is_some_and(|value| !value.is_empty());
-
-            // Entries created by migration from top-level fields use the
-            // model_provider type+alias as the map key and may not have
-            // explicit `uri` (the model_provider factory resolves the
-            // family's default endpoint via `ModelEndpoint`). An entry
-            // with no identifying information at all is almost always an
-            // in-progress quickstart state — the user picked the model
-            // provider but hasn't filled anything in yet. Warn but don't
-            // bail; the runtime falls back to family-default endpoint at
-            // use time, and a chat against the unconfigured model
-            // provider fails with a clear error then.
-            let has_api_key = profile
-                .api_key
-                .as_deref()
-                .is_some_and(|v| !v.trim().is_empty());
-            let has_model = profile
-                .model
-                .as_deref()
-                .is_some_and(|v| !v.trim().is_empty());
-            if !has_uri && !has_api_key && !has_model {
-                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": profile_name, "profile_name": profile_name})), "providers.models. is empty (no uri / api_key / model). \
-                     Skipping at runtime; run `zeroclaw quickstart` (or use the dashboard) \
-                     to make this model_provider usable.");
-                continue;
-            }
-
-            if let Some(uri) = profile.uri.as_deref().map(str::trim)
-                && !uri.is_empty()
-            {
-                let parsed = reqwest::Url::parse(uri).with_context(|| {
-                    format!("providers.models.{profile_name}.uri is not a valid URL")
-                })?;
-                if !matches!(parsed.scheme(), "http" | "https") {
-                    anyhow::bail!("providers.models.{profile_name}.uri must use http/https");
-                }
-            }
-
-            if let Some(temp) = profile.temperature {
-                validate_temperature(temp).map_err(|e| {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "profile": profile_name,
-                                "temperature": temp,
-                                "error": format!("{}", e),
-                            })),
-                        "providers.models.<alias>.temperature rejected"
-                    );
-                    anyhow::Error::msg(format!("providers.models.{profile_name}.temperature: {e}"))
-                })?;
-            }
-
-            for (key, value) in &profile.pricing {
-                if value.is_nan() {
-                    anyhow::bail!(
-                        "providers.models.{profile_name}.pricing.{key}: value must not be NaN"
-                    );
-                }
-                if *value < 0.0 {
-                    anyhow::bail!(
-                        "providers.models.{profile_name}.pricing.{key}: value must be >= 0.0 (got {value})"
-                    );
-                }
             }
         }
 
@@ -25558,27 +25761,29 @@ impl Config {
             );
         }
 
-        // Ollama cloud-routing safety checks
-        for (alias, cfg) in &self.providers.models.ollama {
-            let entry = &cfg.base;
-            if !entry
-                .model
-                .as_deref()
-                .is_some_and(|model| model.trim().ends_with(":cloud"))
+        // Preserve Ollama cloud credential/endpoint checks for each complete
+        // model selection, including formerly nested model entries.
+        for (reference, model) in &model_registry.models {
+            let connection = &model_registry.connections[model.provider()];
+            if connection.kind() != "ollama"
+                || !model
+                    .upstream_model()
+                    .is_some_and(|model| model.trim().ends_with(":cloud"))
             {
                 continue;
             }
-
-            if is_local_ollama_endpoint(entry.uri.as_deref()) {
+            if is_local_ollama_endpoint(connection.uri()) {
                 anyhow::bail!(
-                    "providers.models.ollama.{alias}.model uses ':cloud', but uri is local or unset. Set uri to a remote Ollama endpoint (for example https://ollama.com)."
+                    "providers.models.{reference}.model uses ':cloud', but its connection uri is local or unset. Set a remote Ollama endpoint on providers.connections.{}.",
+                    model.provider(),
                 );
             }
-            if is_official_ollama_cloud_endpoint(entry.uri.as_deref())
-                && !has_ollama_cloud_credential(entry.api_key.as_deref())
+            if is_official_ollama_cloud_endpoint(connection.uri())
+                && !has_ollama_cloud_credential(connection.api_key())
             {
                 anyhow::bail!(
-                    "providers.models.ollama.{alias}.model uses ':cloud', but no API key is configured. Set api_key on [providers.models.ollama.{alias}] (or via the schema-mirror grammar: ZEROCLAW_providers__models__ollama__{alias}__api_key=<value>)."
+                    "providers.models.{reference}.model uses ':cloud', but no API key is configured on providers.connections.{}.",
+                    model.provider(),
                 );
             }
         }
@@ -25996,26 +26201,23 @@ impl Config {
             if value.is_empty() {
                 continue;
             }
-            match value.split_once('.') {
-                Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
-                    let exists = self
-                        .get_map_keys(&format!("providers.models.{ty}"))
-                        .is_some_and(|keys| keys.iter().any(|k| k == inner));
-                    if !exists {
-                        validation_bail!(
-                            DanglingReference,
-                            format!(
-                                "runtime_profiles.{palias}.context_compression.summary_provider"
-                            ),
-                            "runtime_profiles.{palias}.context_compression.summary_provider = {value:?} but providers.models.{ty}.{inner} is not configured",
-                        );
-                    }
-                }
-                _ => validation_bail!(
+            let path = format!("runtime_profiles.{palias}.context_compression.summary_provider");
+            let Some(model) = model_registry
+                .models
+                .get(&crate::provider_registry::ModelRef::from(value))
+            else {
+                validation_bail!(
+                    DanglingReference,
+                    path,
+                    "{path} = {value:?} does not resolve to a configured model"
+                );
+            };
+            if model.capability() != zeroclaw_api::capability::Capability::Chat {
+                validation_bail!(
                     InvalidFormat,
-                    format!("runtime_profiles.{palias}.context_compression.summary_provider"),
-                    "runtime_profiles.{palias}.context_compression.summary_provider must be dotted form `<type>.<alias>` (got {value:?})",
-                ),
+                    path,
+                    "{path} = {value:?} must reference a chat model"
+                );
             }
         }
 
@@ -26028,41 +26230,31 @@ impl Config {
         for alias in agent_aliases {
             let agent = &self.agents[alias];
 
-            // model_provider: mandatory, dotted `<type>.<inner>` ref into
-            // model_providers.<type>.<inner>.
+            // Primary selection is one complete chat model key.
             let mp = agent.model_provider.trim();
             if mp.is_empty() {
                 validation_bail!(
                     RequiredFieldEmpty,
                     format!("agents.{alias}.model_provider"),
-                    "agents.{alias}.model_provider must reference a configured model model_provider (e.g. \"anthropic.default\")",
+                    "agents.{alias}.model_provider must reference a configured chat model"
                 );
             }
-            match mp.split_once('.') {
-                Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
-                    if !crate::providers::ModelProviders::slot_names().contains(&ty) {
-                        validation_bail!(
-                            DanglingReference,
-                            format!("agents.{alias}.model_provider"),
-                            "agents.{alias}.model_provider = {mp:?} but {ty:?} is not a known provider family; check [providers.models.<family>.<alias>] in config.toml (valid families: `zeroclaw providers`)",
-                        );
-                    }
-                    let exists = self
-                        .get_map_keys(&format!("providers.models.{ty}"))
-                        .is_some_and(|keys| keys.iter().any(|k| k == inner));
-                    if !exists {
-                        validation_bail!(
-                            DanglingReference,
-                            format!("agents.{alias}.model_provider"),
-                            "agents.{alias}.model_provider = {mp:?} but [providers.models.{ty}.{inner}] is not configured",
-                        );
-                    }
-                }
-                _ => validation_bail!(
+            let Some(model) = model_registry
+                .models
+                .get(&crate::provider_registry::ModelRef::from(mp))
+            else {
+                validation_bail!(
+                    DanglingReference,
+                    format!("agents.{alias}.model_provider"),
+                    "agents.{alias}.model_provider = {mp:?} does not resolve to a configured model"
+                );
+            };
+            if model.capability() != zeroclaw_api::capability::Capability::Chat {
+                validation_bail!(
                     InvalidFormat,
                     format!("agents.{alias}.model_provider"),
-                    "agents.{alias}.model_provider must be dotted form `<type>.<alias>` (got {mp:?})",
-                ),
+                    "agents.{alias}.model_provider = {mp:?} must reference a chat model"
+                );
             }
 
             // channels: each entry is a dotted `<type>.<inner>` ref into
@@ -26096,55 +26288,48 @@ impl Config {
                 }
             }
 
-            // Per-agent provider refs that resolve into the typed provider
-            // sections. Empty = no preference for that category (no TTS / no
-            // STT for this agent), which is valid. Non-empty values must
-            // match a configured `[providers.<category>.<type>.<alias>]`
-            // entry, fail loud with the dangling ref otherwise.
-            // there is no global default-X-provider concept — every consumer
-            // either picks a configured alias or opts out entirely.
-            let typed_provider_refs: &[(&str, &str, &str)] = &[
-                ("providers.tts", "tts_provider", agent.tts_provider.trim()),
+            // Optional capability selections use the same exact-key lookup.
+            use zeroclaw_api::capability::Capability;
+            for (field, value, expected) in [
+                ("tts_provider", agent.tts_provider.trim(), Capability::Tts),
                 (
-                    "providers.transcription",
                     "transcription_provider",
                     agent.transcription_provider.trim(),
+                    Capability::Asr,
                 ),
-                // New field:
                 (
-                    "providers.models",
                     "classifier_provider",
                     agent.classifier_provider.trim(),
+                    Capability::Chat,
                 ),
-                // Agent-level context-compression summarizer override.
                 (
-                    "providers.models",
                     "summary_provider",
                     agent.summary_provider.trim(),
+                    Capability::Chat,
                 ),
-            ];
-            for (section_prefix, field, value) in typed_provider_refs {
+            ] {
                 if value.is_empty() {
                     continue;
                 }
-                match value.split_once('.') {
-                    Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
-                        let exists = self
-                            .get_map_keys(&format!("{section_prefix}.{ty}"))
-                            .is_some_and(|keys| keys.iter().any(|k| k == inner));
-                        if !exists {
-                            validation_bail!(
-                                DanglingReference,
-                                format!("agents.{alias}.{field}"),
-                                "agents.{alias}.{field} = {value:?} but {section_prefix}.{ty}.{inner} is not configured",
-                            );
-                        }
-                    }
-                    _ => validation_bail!(
+                let path = format!("agents.{alias}.{field}");
+                let Some(model) = model_registry
+                    .models
+                    .get(&crate::provider_registry::ModelRef::from(value))
+                else {
+                    validation_bail!(
+                        DanglingReference,
+                        path,
+                        "{path} = {value:?} does not resolve to a configured model"
+                    );
+                };
+                if model.capability() != expected {
+                    validation_bail!(
                         InvalidFormat,
-                        format!("agents.{alias}.{field}"),
-                        "agents.{alias}.{field} must be dotted form `<type>.<alias>` (got {value:?})",
-                    ),
+                        path,
+                        "{path} = {value:?} references capability {:?}, expected {:?}",
+                        model.capability(),
+                        expected
+                    );
                 }
             }
 
@@ -26799,6 +26984,13 @@ impl Config {
     }
 
     pub fn set_prop_persistent(&mut self, name: &str, value_str: &str) -> Result<()> {
+        // A programmatically assembled Config is also used by migration and
+        // fixture builders before it has a loaded file provenance. Keep that
+        // construction surface available; persisted interactive edits are
+        // checked once the config has been admitted from disk.
+        if self.loaded_from.is_some() {
+            reject_retired_provider_edit_path(self, name)?;
+        }
         self.reject_ambiguous_persistent_map_key_path(name)?;
         self.set_prop(name, value_str)?;
         self.mark_dirty(name);
@@ -26806,6 +26998,9 @@ impl Config {
     }
 
     pub fn set_secret_persistent(&mut self, name: &str, value: String) -> Result<()> {
+        if self.loaded_from.is_some() {
+            reject_retired_provider_edit_path(self, name)?;
+        }
         self.reject_ambiguous_persistent_map_key_path(name)?;
         self.set_secret(name, value)?;
         self.mark_dirty(name);
@@ -27170,6 +27365,28 @@ impl Config {
     }
 }
 
+/// Reject a retired flattened provider profile path at an interactive edit
+/// boundary. Historical tables remain deserializable so V3→V4 admission can
+/// project them into the canonical registry; runtime editors must use the
+/// exact-key registry document.
+pub fn reject_retired_provider_edit_path(config: &Config, name: &str) -> Result<()> {
+    if [
+        "providers.models.",
+        "providers.tts.",
+        "providers.transcription.",
+        "decision_models.",
+    ]
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
+        && config.provider_registry().is_ok()
+    {
+        anyhow::bail!(
+            "retired provider profile path `{name}`; edit the canonical provider registry instead"
+        );
+    }
+    Ok(())
+}
+
 /// What a save may do with the config file already on disk.
 #[derive(Debug, PartialEq, Eq)]
 enum OnDiskConfig {
@@ -27222,7 +27439,9 @@ async fn prepare_on_disk_config_for_save(
         keep_pre_upgrade_backup(config_path, version).await?;
     }
     Ok(
-        if version < crate::migration::FIRST_RETIREMENT_ONLY_VERSION {
+        if version < crate::migration::FIRST_RETIREMENT_ONLY_VERSION
+            || crate::migration::provider_inputs::document_needs_migration(&value)
+        {
             OnDiskConfig::NeedsStructuralMigration
         } else {
             OnDiskConfig::Editable
@@ -27312,8 +27531,8 @@ fn builtin_tool_selection_value(config: &Config) -> toml::Value {
 
 fn collect_onepassword_reference_snapshots(
     config: &Config,
-) -> std::collections::HashMap<String, String> {
-    config
+) -> Result<std::collections::HashMap<String, String>> {
+    let mut snapshots: std::collections::HashMap<_, _> = config
         .prop_fields()
         .into_iter()
         .filter(|field| field.is_secret)
@@ -27321,7 +27540,15 @@ fn collect_onepassword_reference_snapshots(
             let value = crate::env_overrides::raw_value_for_path(config, &field.name)?;
             crate::secrets::SecretStore::is_onepassword_ref(&value).then_some((field.name, value))
         })
-        .collect()
+        .collect();
+    for (id, connection) in &config.providers.connections {
+        let pointer = format!(
+            "/providers/connections/{}",
+            id.as_str().replace('~', "~0").replace('/', "~1")
+        );
+        snapshots.extend(connection.onepassword_references(&pointer)?);
+    }
+    Ok(snapshots)
 }
 
 fn restore_onepassword_references_for_save(
@@ -27331,6 +27558,11 @@ fn restore_onepassword_references_for_save(
 ) -> Result<()> {
     for (path, value) in snapshots {
         if dirty_paths.contains(path) {
+            continue;
+        }
+        if path.starts_with("/providers/") {
+            crate::provider_registry::env_input::set(config_to_save, path, value, false)
+                .context("restore provider external secret reference before save")?;
             continue;
         }
         if let Err(err) = config_to_save.set_prop(path, value) {
@@ -27584,6 +27816,18 @@ fn apply_dirty_path(
 ) -> Result<()> {
     let raw: Vec<&str> = dotted.split('.').collect();
     if raw.is_empty() {
+        return Ok(());
+    }
+
+    // `http_request.secrets` is a dynamic string map whose keys are TOML
+    // strings, not dotted property paths.  Preserve the complete suffix as
+    // one key so `X-Foo.bar` is edited/deleted exactly as TOML parsed it.
+    if let Some(key) = dotted
+        .strip_prefix("http_request.secrets.")
+        .filter(|key| !key.is_empty())
+    {
+        let segs = ["http_request", "secrets", key];
+        write_or_delete_leaf(root, full_table, default_table, &segs);
         return Ok(());
     }
 
@@ -29070,6 +29314,14 @@ impl HasPropKind for serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    // Historical fixtures cross the same input boundary as loaded configuration
+    // before exercising validation. No legacy registry path exists in production.
+    fn validate_provider_input_fixture(input: &Config) -> anyhow::Result<()> {
+        let mut config = input.clone();
+        crate::migration::provider_inputs::normalize(&mut config)?;
+        config.validate()
+    }
+
     #[::core::prelude::v1::test]
     fn config_application_semantic_changed_paths_detects_unmasked_credentials() {
         let mut previous = Config::default();
@@ -29179,11 +29431,11 @@ mod tests {
         let mut previous = Config::default();
         previous.model_routes.push(ModelRouteConfig {
             hint: "fast".into(),
-            model: "old-model".into(),
+
             ..ModelRouteConfig::default()
         });
         let mut candidate = previous.clone();
-        candidate.model_routes[0].model = "new-model".into();
+        candidate.model_routes[0].model_ref = "chat.new-model".into();
         candidate.gateway.paired_tokens.push("test-token".into());
         assert_eq!(
             Config::semantic_changed_paths(&previous, &candidate).unwrap(),
@@ -30204,32 +30456,19 @@ mod tests {
 
     #[::core::prelude::v1::test]
     fn context_limits_follow_selected_provider_alias_and_model() {
-        use std::collections::HashMap;
-
-        use super::{
-            AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig,
-            RuntimeProfileConfig,
+        let mut cfg = Config {
+            providers: serde_json::from_value(serde_json::json!({
+            "connections": {"gateway": {"kind": "custom", "uri": "https://example.invalid/v1"}},
+            "models": {
+                "custom.large": {"capability": "chat", "provider": "gateway", "model": "large-model", "metadata": {"context_window": 200_000}},
+                "custom.small": {"capability": "chat", "provider": "gateway", "model": "small-model", "metadata": {"context_window": 8_000}},
+                "custom.backup": {"capability": "chat", "provider": "gateway", "metadata": {"context_window": 8_000}},
+                "custom.multi": {"capability": "chat", "provider": "gateway", "model": "legacy-model", "metadata": {"context_window": 100_000}},
+                "custom.multi.fast": {"capability": "chat", "provider": "gateway", "model": "nested-fast-model", "metadata": {"context_window": 16_000}}
+            }
+            })).unwrap(),
+            ..Config::default()
         };
-
-        let mut providers = HashMap::new();
-        for (alias, model, context_window) in [
-            ("large", "large-model", 200_000),
-            ("small", "small-model", 8_000),
-        ] {
-            providers.insert(
-                alias.to_string(),
-                CustomModelProviderConfig {
-                    base: ModelProviderConfig {
-                        model: Some(model.to_string()),
-                        context_window: Some(context_window),
-                        ..ModelProviderConfig::default()
-                    },
-                },
-            );
-        }
-
-        let mut cfg = Config::default();
-        cfg.providers.models.custom = providers;
         cfg.runtime_profiles.insert(
             "ratio".to_string(),
             RuntimeProfileConfig {
@@ -30266,6 +30505,36 @@ mod tests {
             super::ModelContextWindowSource::CompatibilityFallback
         );
         assert_eq!(unknown_override.context_token_budget, 28_800);
+
+        // A fallback alias may deliberately leave `model` unset so it can
+        // serve the model requested from the primary while retaining its own
+        // endpoint metadata. Its capacity still belongs to that accepted
+        // alias and must not degrade to the compatibility fallback.
+        let unpinned_fallback =
+            cfg.resolved_context_limits_for_route("coder", "custom.backup", "large-model");
+        assert_eq!(unpinned_fallback.model_context_window, 8_000);
+        assert_eq!(unpinned_fallback.context_token_budget, 7_200);
+
+        cfg.agents.get_mut("coder").unwrap().model_provider = "custom.multi.fast".into();
+
+        let nested = cfg.resolved_context_limits_for_route(
+            "coder",
+            "custom.multi.fast",
+            "nested-fast-model",
+        );
+        assert_eq!(nested.model_context_window, 16_000);
+        assert_eq!(nested.context_token_budget, 14_400);
+
+        assert_eq!(cfg.effective_model_context_window("coder"), 16_000);
+        assert_eq!(
+            cfg.model_provider_context_window_opt("custom.multi.fast", "nested-fast-model"),
+            Some(16_000)
+        );
+        assert_eq!(
+            cfg.model_provider_context_window_opt("custom.multi", "nested-fast-model"),
+            None,
+            "a different exact model reference must not borrow another model's capacity"
+        );
     }
 
     /// The whole point of splitting the accessor: an operator-facing caller
@@ -30273,12 +30542,13 @@ mod tests {
     /// `usize` cannot express.
     #[::core::prelude::v1::test]
     fn configured_context_window_reports_unset_distinctly_from_the_fallback() {
-        let mut cfg = super::Config::default();
-        cfg.providers
-            .models
-            .ensure("ollama", "local")
-            .expect("known model provider type")
-            .model = Some("qwen3".to_string());
+        let mut cfg = super::Config {
+            providers: serde_json::from_value(serde_json::json!({
+            "connections": {"local": {"kind": "ollama"}},
+            "models": {"ollama.local": {"capability": "chat", "provider": "local", "model": "qwen3"}}
+            })).unwrap(),
+            ..Default::default()
+        };
         cfg.agents.insert(
             "coder".to_string(),
             super::AliasedAgentConfig {
@@ -30298,11 +30568,16 @@ mod tests {
 
         // Explicitly configuring the same numeric value remains distinguishable
         // from the fallback.
-        cfg.providers
+        let crate::provider_registry::ModelDefinition::Chat(model) = cfg
+            .providers
             .models
-            .ensure("ollama", "local")
-            .expect("known model provider type")
-            .context_window = Some(super::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK);
+            .canonical_models
+            .get_mut(&crate::provider_registry::ModelRef::from("ollama.local"))
+            .unwrap()
+        else {
+            panic!("fixture model must be chat");
+        };
+        model.metadata.context_window = Some(super::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK);
         assert_eq!(
             cfg.configured_model_context_window("coder"),
             Some(super::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK)
@@ -35091,7 +35366,14 @@ auto_save = true
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed = parse_test_config(&toml_str);
 
-        assert_eq!(parsed.providers.models.len(), config.providers.models.len());
+        assert_eq!(
+            parsed.provider_registry().unwrap().models.len(),
+            crate::migration::admit_test_input(&config)
+                .provider_registry()
+                .unwrap()
+                .models
+                .len()
+        );
         assert_eq!(parsed.observability.backend, ObservabilityBackend::Log);
         assert_eq!(
             parsed.observability.log_persistence,
@@ -35446,7 +35728,8 @@ auto_approve = ["weather", "file_read"]
 default_temperature = 0.7
 provider_timeout_secs = 300
 "#;
-        let parsed = crate::migration::migrate_to_current(raw).expect("migration succeeds");
+        let parsed =
+            crate::migration::migrated_provider_input_fixture(raw).expect("migration succeeds");
         assert_eq!(
             parsed
                 .providers
@@ -35469,7 +35752,8 @@ default_temperature = 0.7
 User-Agent = "MyApp/1.0"
 X-Title = "zeroclaw"
 "#;
-        let parsed = crate::migration::migrate_to_current(raw).expect("migration succeeds");
+        let parsed =
+            crate::migration::migrated_provider_input_fixture(raw).expect("migration succeeds");
         let headers = &parsed
             .providers
             .models
@@ -35687,7 +35971,6 @@ reasoning_effort = "turbo"
         assert_eq!(cfg.resolved.max_history_messages, 50);
         assert!(!cfg.resolved.parallel_tools);
         assert_eq!(cfg.resolved.tool_dispatcher, "auto");
-        assert!(!cfg.resolved.strict_tool_parsing);
         assert!(cfg.precheck.enabled);
         assert_eq!(cfg.precheck.timeout_secs, 5);
     }
@@ -35745,7 +36028,6 @@ max_tool_iterations = 20
 max_history_messages = 80
 parallel_tools = true
 tool_dispatcher = "xml"
-strict_tool_parsing = true
 "#;
         let parsed = parse_test_config(raw);
         let agent = parsed
@@ -35754,7 +36036,6 @@ strict_tool_parsing = true
             .expect("[agents.default] parses into agents map");
         assert_eq!(agent.resolved.max_tool_iterations, 10);
         assert_eq!(agent.resolved.tool_dispatcher, "auto");
-        assert!(!agent.resolved.strict_tool_parsing);
     }
 
     #[test]
@@ -36534,25 +36815,20 @@ default_temperature = 0.7
 
         let contents = tokio::fs::read_to_string(&config_path).await.unwrap();
         let loaded = crate::migration::migrate_to_current(&contents).unwrap();
-        let entry = &loaded
-            .providers
-            .models
-            .find("openrouter", "default")
-            .expect("entry exists");
+        let registry = loaded.provider_registry().unwrap();
+        let resolved = registry.resolve_chat(&"openrouter.default".into()).unwrap();
+        let entry = resolved.selection.connection;
         assert!(
             entry
-                .api_key
-                .as_deref()
+                .api_key()
                 .is_some_and(crate::secrets::SecretStore::is_encrypted)
         );
         let store = crate::secrets::SecretStore::new(&dir, true);
-        let decrypted = store.decrypt(entry.api_key.as_deref().unwrap()).unwrap();
+        let decrypted = store.decrypt(entry.api_key().unwrap()).unwrap();
         assert_eq!(decrypted, "sk-roundtrip");
-        assert_eq!(entry.model.as_deref(), Some("test-model"));
+        assert_eq!(resolved.upstream_model(), Some("test-model"));
         assert!(
-            entry
-                .temperature
-                .is_some_and(|t| (t - 0.9).abs() < f64::EPSILON)
+            matches!(resolved.options.temperature, Some(crate::provider_registry::Override::Set(t)) if (t - 0.9).abs() < f64::EPSILON)
         );
 
         let _ = fs::remove_dir_all(&dir).await;
@@ -36571,20 +36847,17 @@ default_temperature = 0.7
             config_path: dir.join("config.toml"),
             ..Default::default()
         };
-        config.providers.models.anthropic.insert(
-            "default".to_string(),
-            AnthropicModelProviderConfig {
-                base: ModelProviderConfig {
-                    api_key: Some("root-credential".into()),
-                    extra_headers: HashMap::from([(
-                        "Authorization".to_string(),
-                        "Bearer provider-header-credential".to_string(),
-                    )]),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        );
+        config.providers = serde_json::from_value(serde_json::json!({
+            "connections": {"primary": {
+                "kind": "openai",
+                "auth": {"mode": "api_key", "api_key": "root-credential"},
+                "extra_headers": {"Authorization": "Bearer provider-header-credential"}
+            }},
+            "models": {"chat.primary": {
+                "capability": "chat", "provider": "primary", "model": "gpt-test"
+            }}
+        }))
+        .unwrap();
         // ModelProvider fields are now resolved directly — no cache needed.
         config.composio.api_key = Some("composio-credential".into());
         config.browser.computer_use.api_key = Some("browser-credential".into());
@@ -36729,18 +37002,17 @@ default_temperature = 0.7
 
         let root_encrypted = stored
             .providers
-            .models
-            .find("anthropic", "default")
-            .and_then(|e| e.api_key.as_deref())
+            .connections
+            .get("primary")
+            .and_then(|connection| connection.api_key())
             .unwrap();
         assert!(crate::secrets::SecretStore::is_encrypted(root_encrypted));
         assert_eq!(store.decrypt(root_encrypted).unwrap(), "root-credential");
 
-        let provider_header = stored
-            .providers
-            .models
-            .find("anthropic", "default")
-            .and_then(|e| e.extra_headers.get("Authorization"))
+        let provider_header = stored.providers.connections["primary"]
+            .extra_headers()
+            .unwrap()
+            .get("Authorization")
             .unwrap();
         assert!(crate::secrets::SecretStore::is_encrypted(provider_header));
         assert_eq!(
@@ -36789,12 +37061,8 @@ default_temperature = 0.7
             "anysearch-credential"
         );
 
-        let worker_provider = stored
-            .providers
-            .models
-            .find("openrouter", "worker")
-            .unwrap();
-        let worker_encrypted = worker_provider.api_key.as_deref().unwrap();
+        let worker_provider = &stored.providers.connections["legacy.openrouter.worker"];
+        let worker_encrypted = worker_provider.api_key().unwrap();
         assert!(crate::secrets::SecretStore::is_encrypted(worker_encrypted));
         assert_eq!(store.decrypt(worker_encrypted).unwrap(), "agent-credential");
 
@@ -38643,7 +38911,8 @@ wire_api = "responses"
 requires_openai_auth = true
 "#;
 
-        let parsed = crate::migration::migrate_to_current(raw).expect("migration succeeds");
+        let parsed =
+            crate::migration::migrated_provider_input_fixture(raw).expect("migration succeeds");
         assert!(
             parsed
                 .providers
@@ -38731,11 +39000,7 @@ model = "primary-model"
         let config: Config = toml::from_str(toml_in).expect("parse toml");
 
         assert_eq!(
-            config
-                .providers
-                .models
-                .find("openrouter", "default")
-                .and_then(|e| e.model.as_deref()),
+            config.resolve_model_id("openrouter.default").as_deref(),
             Some("primary-model"),
         );
 
@@ -38756,7 +39021,10 @@ model = "primary-model"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
         // Empty config: no model anywhere -> None (caller errors loudly).
-        assert_eq!(config.resolve_default_model(), None);
+        assert_eq!(
+            crate::migration::admit_test_input(&config).resolve_default_model(),
+            None
+        );
 
         // Add an entry without a model -> still None.
         config
@@ -38764,7 +39032,10 @@ model = "primary-model"
             .models
             .anthropic
             .insert("default".into(), AnthropicModelProviderConfig::default());
-        assert_eq!(config.resolve_default_model(), None);
+        assert_eq!(
+            crate::migration::admit_test_input(&config).resolve_default_model(),
+            None
+        );
 
         // Add an entry with a model -> first-available wins.
         config.providers.models.together.insert(
@@ -38777,7 +39048,9 @@ model = "primary-model"
             },
         );
         assert_eq!(
-            config.resolve_default_model().as_deref(),
+            crate::migration::admit_test_input(&config)
+                .resolve_default_model()
+                .as_deref(),
             Some("tertiary-model"),
         );
 
@@ -38792,7 +39065,11 @@ model = "primary-model"
             },
         );
         // resolve_default_model returns the first non-empty model across all model_providers.
-        assert!(config.resolve_default_model().is_some());
+        assert!(
+            crate::migration::admit_test_input(&config)
+                .resolve_default_model()
+                .is_some()
+        );
 
         // Two aliases in one family: the pick is deterministic (slot order,
         // then alias order), not HashMap iteration order.
@@ -38814,7 +39091,199 @@ model = "primary-model"
                 },
             },
         );
-        assert_eq!(config.resolve_default_model().as_deref(), Some("aaa-model"),);
+        assert_eq!(
+            crate::migration::admit_test_input(&config)
+                .resolve_default_model()
+                .as_deref(),
+            Some("aaa-model"),
+        );
+    }
+
+    /// A profile whose only model ids live under the nested `models` subtable
+    /// must still count for `resolve_default_model` — the gateway and WS
+    /// onboarding use it to decide whether any model is configured at all.
+    #[test]
+    async fn resolve_default_model_accepts_nested_only_profile() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        config.providers.models.openrouter.insert(
+            "default".to_string(),
+            OpenRouterModelProviderConfig {
+                base: ModelProviderConfig {
+                    // Profile-level `model` stays empty; the ids are nested.
+                    model: None,
+                    models: HashMap::from([(
+                        "default".to_string(),
+                        ModelEntryConfig {
+                            id: Some("or-nested-model".to_string()),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                },
+            },
+        );
+        assert_eq!(
+            crate::migration::admit_test_input(&config)
+                .resolve_default_model()
+                .as_deref(),
+            Some("or-nested-model"),
+        );
+    }
+
+    #[test]
+    async fn model_route_effective_model_resolves_exact_model_keys() {
+        let mut config = Config::default();
+        for (reference, model) in [
+            ("chat.gateway.prod", "reasoning-id"),
+            ("chat.gateway", "fast-id"),
+        ] {
+            crate::migration::bind_test_route_model(&mut config, reference, model, None);
+        }
+        for (reference, expected) in [
+            ("chat.gateway.prod", "reasoning-id"),
+            ("chat.gateway", "fast-id"),
+            ("chat.gateway.missing", ""),
+            ("", ""),
+        ] {
+            let route = ModelRouteConfig {
+                hint: "reasoning".into(),
+                model_ref: reference.into(),
+            };
+            assert_eq!(route.effective_model(&config), expected);
+        }
+        assert!(
+            toml::from_str::<ModelRouteConfig>(
+                "hint='x'\nmodel_ref='chat.gateway'\nmodel='override'"
+            )
+            .is_err()
+        );
+        assert!(
+            toml::from_str::<ModelRouteConfig>("hint='x'\nmodel_ref='chat.gateway'\napi_key='key'")
+                .is_err()
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn validate_accepts_nested_only_route_with_implicit_model() {
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "gateway".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("sk-test".to_string()),
+                    models: HashMap::from([(
+                        "fast".to_string(),
+                        ModelEntryConfig {
+                            id: Some("gpt-nested".to_string()),
+                            temperature: Some(0.2),
+                            context_window: Some(16_384),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                },
+            },
+        );
+        config.model_routes.push(ModelRouteConfig {
+            hint: "fast".to_string(),
+            model_ref: "openai.gateway.fast".to_string(),
+        });
+        crate::migration::normalize_test_input(&mut config);
+        assert!(
+            validate_provider_input_fixture(&config).is_ok(),
+            "a nested model id makes an omitted route model unambiguous: {:?}",
+            validate_provider_input_fixture(&config).err()
+        );
+        assert_eq!(
+            config.model_routes[0].effective_model(&config),
+            "gpt-nested"
+        );
+        crate::migration::bind_test_route_model(&mut config, "chat.other", "other-id", None);
+        config
+            .validate()
+            .expect("projected routes also work beside explicit models");
+    }
+
+    #[::core::prelude::v1::test]
+    fn validate_rejects_malformed_nested_model_entries() {
+        let config_with = |entry: ModelEntryConfig, profile_model: Option<&str>| {
+            let mut config = Config::default();
+            config.providers.models.openai.insert(
+                "gateway".to_string(),
+                OpenAIModelProviderConfig {
+                    base: ModelProviderConfig {
+                        api_key: Some("sk-test".to_string()),
+                        model: profile_model.map(str::to_string),
+                        models: HashMap::from([("fast".to_string(), entry)]),
+                        ..Default::default()
+                    },
+                },
+            );
+            config
+        };
+        let assert_error_path = |config: Config, expected: &str| {
+            let error = validate_provider_input_fixture(&config)
+                .expect_err("malformed nested model entry must fail validation")
+                .to_string();
+            assert!(
+                error.contains(expected),
+                "validation error should name {expected}, got: {error}"
+            );
+        };
+
+        assert!(
+            validate_provider_input_fixture(&config_with(ModelEntryConfig::default(), None))
+                .is_ok(),
+            "an unpinned model may receive its upstream ID from an invocation override"
+        );
+        assert_error_path(
+            config_with(
+                ModelEntryConfig {
+                    id: Some("  ".to_string()),
+                    ..Default::default()
+                },
+                Some("profile-model"),
+            ),
+            "model",
+        );
+        assert_error_path(
+            config_with(
+                ModelEntryConfig {
+                    id: Some("gpt-nested".to_string()),
+                    temperature: Some(f64::NAN),
+                    ..Default::default()
+                },
+                None,
+            ),
+            "temperature",
+        );
+        assert_error_path(
+            config_with(
+                ModelEntryConfig {
+                    id: Some("gpt-nested".to_string()),
+                    context_window: Some(0),
+                    ..Default::default()
+                },
+                None,
+            ),
+            "context_window",
+        );
+
+        let inherited = config_with(
+            ModelEntryConfig {
+                id: None,
+                temperature: Some(0.4),
+                context_window: Some(8_192),
+                ..Default::default()
+            },
+            Some("profile-model"),
+        );
+        assert!(
+            validate_provider_input_fixture(&inherited).is_ok(),
+            "an omitted nested id inherits the profile model: {:?}",
+            validate_provider_input_fixture(&inherited).err()
+        );
     }
 
     #[test]
@@ -38854,16 +39323,15 @@ model = "primary-model"
             .await
             .unwrap();
         let parsed = parse_test_config(&saved);
-        assert!(
-            (parsed
-                .providers
-                .models
-                .find("anthropic", "default")
-                .and_then(|e| e.temperature)
-                .unwrap_or(0.7)
-                - 0.5)
-                .abs()
-                < f64::EPSILON
+        assert_eq!(
+            parsed
+                .provider_registry()
+                .unwrap()
+                .resolve_chat(&"anthropic.default".into())
+                .unwrap()
+                .options
+                .temperature,
+            Some(crate::provider_registry::Override::Set(0.5))
         );
 
         // SAFETY: test-only, single-threaded test runner.
@@ -38973,10 +39441,10 @@ model = "primary-model"
             },
         );
 
-        let error = config.validate().expect_err("expected validation to fail");
-        assert!(error.to_string().contains(
-            "providers.models.ollama.default.model uses ':cloud', but uri is local or unset"
-        ));
+        let error =
+            validate_provider_input_fixture(&config).expect_err("expected validation to fail");
+        assert!(error.to_string().contains(":cloud"), "{error:#}");
+        assert!(error.to_string().contains("uri"), "{error:#}");
     }
 
     #[test]
@@ -38996,7 +39464,7 @@ model = "primary-model"
             },
         );
 
-        let result = config.validate();
+        let result = validate_provider_input_fixture(&config);
         assert!(result.is_ok(), "expected validation to pass: {result:?}");
     }
 
@@ -39017,7 +39485,8 @@ model = "primary-model"
             },
         );
 
-        let error = config.validate().expect_err("expected validation to fail");
+        let error =
+            validate_provider_input_fixture(&config).expect_err("expected validation to fail");
         assert!(error.to_string().contains(
             "providers.models.ollama.default.model uses ':cloud', but no API key is configured"
         ));
@@ -39042,7 +39511,7 @@ model = "primary-model"
             },
         );
 
-        let result = config.validate();
+        let result = validate_provider_input_fixture(&config);
         assert!(result.is_ok(), "expected validation to pass: {result:?}");
     }
 
@@ -39074,7 +39543,8 @@ model = "primary-model"
             },
         );
 
-        let error = config.validate().expect_err("expected validation to fail");
+        let error =
+            validate_provider_input_fixture(&config).expect_err("expected validation to fail");
         assert!(error.to_string().contains(
             "providers.models.ollama.cloud.model uses ':cloud', but no API key is configured"
         ));
@@ -39712,10 +40182,11 @@ default_model = "legacy-model"
         assert_eq!(config.config_path, legacy_config_path);
         assert_eq!(
             config
-                .providers
-                .models
-                .find("openrouter", "default")
-                .and_then(|e| e.model.as_deref()),
+                .provider_registry()
+                .unwrap()
+                .resolve_chat(&"openrouter.default".into())
+                .unwrap()
+                .upstream_model(),
             Some("legacy-model")
         );
 
@@ -39832,10 +40303,11 @@ default_model = "persisted-profile"
         assert_eq!(config.config_path, config_path);
         assert_eq!(
             config
-                .providers
-                .models
-                .find("openrouter", "default")
-                .and_then(|e| e.model.as_deref()),
+                .provider_registry()
+                .unwrap()
+                .resolve_chat(&"openrouter.default".into())
+                .unwrap()
+                .upstream_model(),
             Some("persisted-profile")
         );
         assert!(logs.contains("Config loaded"), "{logs}");
@@ -40394,7 +40866,7 @@ runtime_profile = "default"
                 },
             },
         );
-        let err = config.validate().unwrap_err();
+        let err = validate_provider_input_fixture(&config).unwrap_err();
         assert!(
             err.to_string().contains("temperature"),
             "expected temperature validation error, got: {err}"
@@ -40414,7 +40886,7 @@ runtime_profile = "default"
                 },
             },
         );
-        let err = config.validate().unwrap_err();
+        let err = validate_provider_input_fixture(&config).unwrap_err();
         assert!(
             err.to_string().contains("temperature"),
             "expected temperature validation error, got: {err}"
@@ -40433,7 +40905,7 @@ runtime_profile = "default"
                 },
             },
         );
-        assert!(config.validate().is_ok());
+        assert!(validate_provider_input_fixture(&config).is_ok());
     }
 
     #[cfg(feature = "tool-jira")]
@@ -42397,7 +42869,7 @@ group_policy = "disabled"
     }
 
     /// A dynamic secret map (`#[secret] HashMap<String, String>`, e.g.
-    /// `extra_headers`) treats its whole non-empty suffix as ONE opaque
+    /// `http_request.secrets`) treats its whole non-empty suffix as ONE opaque
     /// key — `set_prop` stores the literal `"X-Foo.bar"`. The dirty
     /// writer must not re-split that key at dots into `X-Foo` → `bar`,
     /// or `write_or_delete_leaf` finds nothing, takes the delete branch,
@@ -42410,8 +42882,7 @@ group_policy = "disabled"
 
         let seed = format!(
             "schema_version = {}\n\n\
-             [providers.models.openai.fresh]\n\
-             model = \"gpt-4o\"\n",
+             [http_request.secrets]\n",
             crate::migration::CURRENT_SCHEMA_VERSION
         );
         std::fs::write(&config_path, &seed).unwrap();
@@ -42421,21 +42892,16 @@ group_policy = "disabled"
             ..Default::default()
         };
         config.secrets.encrypt = false;
-        config
-            .create_map_key("providers.models.openai", "fresh")
-            .expect("seed the alias");
 
-        let path = "providers.models.openai.fresh.extra_headers.X-Foo.bar";
+        let path = "http_request.secrets.X-Foo.bar";
         config
             .set_prop_persistent(path, "header-value")
             .expect("a dotted dynamic secret-map key must be insertable");
         assert_eq!(
             config
-                .providers
-                .models
-                .openai
-                .get("fresh")
-                .and_then(|p| p.base.extra_headers.get("X-Foo.bar"))
+                .http_request
+                .secrets
+                .get("X-Foo.bar")
                 .map(String::as_str),
             Some("header-value"),
             "precondition: set_prop stores ONE literal HashMap key"
@@ -42448,11 +42914,9 @@ group_policy = "disabled"
             .unwrap_or_else(|e| panic!("rewritten config must reparse: {e}\n---\n{written}"));
         assert_eq!(
             reloaded
-                .providers
-                .models
-                .openai
-                .get("fresh")
-                .and_then(|p| p.base.extra_headers.get("X-Foo.bar"))
+                .http_request
+                .secrets
+                .get("X-Foo.bar")
                 .map(String::as_str),
             Some("header-value"),
             "a dotted dynamic secret-map key must round-trip through disk as the \
@@ -42470,9 +42934,7 @@ group_policy = "disabled"
 
         let seed = format!(
             "schema_version = {}\n\n\
-             [providers.models.openai.fresh]\n\
-             model = \"gpt-4o\"\n\n\
-             [providers.models.openai.fresh.extra_headers]\n\
+             [http_request.secrets]\n\
              \"X-Foo.bar\" = \"header-value\"\n",
             crate::migration::CURRENT_SCHEMA_VERSION
         );
@@ -42482,25 +42944,12 @@ group_policy = "disabled"
         config.config_path = config_path.clone();
         config.secrets.encrypt = false;
         assert!(
-            config
-                .providers
-                .models
-                .openai
-                .get("fresh")
-                .is_some_and(|p| p.base.extra_headers.contains_key("X-Foo.bar")),
+            config.http_request.secrets.contains_key("X-Foo.bar"),
             "precondition: seeded dotted header key must load"
         );
 
-        config
-            .providers
-            .models
-            .openai
-            .get_mut("fresh")
-            .unwrap()
-            .base
-            .extra_headers
-            .remove("X-Foo.bar");
-        config.mark_dirty("providers.models.openai.fresh.extra_headers.X-Foo.bar");
+        config.http_request.secrets.remove("X-Foo.bar");
+        config.mark_dirty("http_request.secrets.X-Foo.bar");
         config.save_dirty().await.expect("save_dirty must succeed");
 
         let written = std::fs::read_to_string(&config_path).unwrap();
@@ -43363,10 +43812,11 @@ group_policy = "disabled"
     }
 
     #[test]
-    async fn collect_warnings_flags_wire_api_on_fixed_protocol_family() {
+    async fn collect_warnings_preserves_explicit_compatible_wire_api() {
         let mut config = Config::default();
         suppress_semantic_memory_warning(&mut config);
-        // mistral has a fixed wire protocol and ignores wire_api.
+        // Canonical compatible connections pass the selected wire API into
+        // runtime construction, including families that once ignored it.
         config
             .providers
             .models
@@ -43381,15 +43831,15 @@ group_policy = "disabled"
             .unwrap()
             .wire_api = Some(WireApi::Responses);
 
-        let warnings = config.collect_warnings();
-        assert_eq!(warnings.len(), 1, "exactly the mistral entry should warn");
-        let w = &warnings[0];
-        assert_eq!(w.code, "wire_api_not_supported_for_family");
-        assert_eq!(w.path, "providers.models.mistral.primary.wire_api");
-        assert!(
-            !warnings.iter().any(|w| w.path.contains("custom.vllm")),
-            "custom honors wire_api and must not warn",
-        );
+        let config = crate::migration::admit_test_input(&config);
+        assert!(config.collect_warnings().is_empty());
+        let registry = config.provider_registry().unwrap();
+        for reference in ["mistral.primary", "custom.vllm"] {
+            assert_eq!(
+                registry.resolve_chat(&reference.into()).unwrap().wire_api,
+                Some(WireApi::Responses)
+            );
+        }
     }
 
     // The certificate issuance and renewal trail is written through this
@@ -43592,8 +44042,16 @@ enabled = false
         let parsed = parse_test_config(&toml_str);
 
         assert!(parsed.transcription.enabled);
-        assert_eq!(parsed.transcription.language.as_deref(), Some("en"));
+        assert_eq!(parsed.transcription.language, None);
         assert_eq!(parsed.transcription.model, "whisper-large-v3-turbo");
+        let registry = parsed.provider_registry().unwrap();
+        let asr = registry
+            .resolve_asr(&crate::provider_registry::ModelRef::from("asr.groq"))
+            .expect("legacy transcription input must be projected to the canonical ASR model");
+        assert_eq!(
+            asr.options.language,
+            Some(crate::provider_registry::Override::Set("en".to_owned()))
+        );
     }
 
     #[test]
@@ -45122,7 +45580,7 @@ channel = "notion"
         let control =
             toml::Value::try_from(crate::migration::migrate_to_current(flat).unwrap()).unwrap();
         assert_eq!(
-            control["providers"]["models"]["openai"]["default"]["extra_headers"]["X-Trace"]
+            control["providers"]["connections"]["legacy.openai.default"]["extra_headers"]["X-Trace"]
                 .as_str(),
             Some("keep")
         );
@@ -45145,7 +45603,7 @@ channel = "notion"
             )
             .unwrap();
             assert_eq!(
-                stated["providers"]["models"]["openai"][alias]["model"].as_str(),
+                stated["providers"]["models"][format!("openai.{alias}")]["model"].as_str(),
                 Some("keep-model"),
                 "{alias}"
             );
@@ -45604,12 +46062,13 @@ channel = "notion"
             .await;
             let loaded = crate::migration::migrate_to_current(&raw).unwrap();
             assert_eq!(
-                loaded.transcription.api_key.as_deref(),
+                loaded.providers.connections["legacy.asr.section.groq"].api_key(),
                 Some("groq-key-global")
             );
             let alias = toml::Value::try_from(&loaded).unwrap();
             assert_eq!(
-                alias["providers"]["transcription"]["groq"]["default"]["api_key"].as_str(),
+                alias["providers"]["connections"]["legacy.asr.groq.default"]["auth"]["api_key"]
+                    .as_str(),
                 Some("groq-key-alias")
             );
         }
@@ -46579,7 +47038,9 @@ channel = "notion"
                     case.spellings[0], case.spellings[1], case.read_at
                 );
                 let single = format!("schema_version = {version}\n\n{}", case.single);
-                match crate::migration::migrate_to_current(&single) {
+                // This checks the historical spelling adapter. Canonical
+                // admission relocates provider fields after that adapter.
+                match crate::migration::migrated_provider_input_fixture(&single) {
                     Ok(config) if typed_at(&config, &case.read_at).as_ref() == Some(value) => {}
                     Ok(config) => {
                         failures.push(format!(
@@ -48844,18 +49305,21 @@ stream_tool_arguments = [
         loaded.data_dir = config.data_dir.clone();
         let store = crate::secrets::SecretStore::new(dir.path(), loaded.secrets.encrypt);
         loaded.decrypt_secrets(&store).unwrap();
-        let loaded_provider = loaded
-            .providers
-            .models
-            .find("custom", alias)
-            .expect("typed custom slot entry must round-trip through save/load");
-        assert_eq!(loaded_provider.api_key.as_deref(), Some("sk-test-custom"));
+        let registry = loaded.provider_registry().unwrap();
+        let resolved = registry
+            .resolve_chat(&format!("custom.{alias}").as_str().into())
+            .unwrap();
+        let loaded_provider = resolved.selection.connection;
+        assert_eq!(loaded_provider.api_key(), Some("sk-test-custom"));
         assert_eq!(
-            loaded_provider.uri.as_deref(),
+            loaded_provider.uri(),
             Some("https://api.example.invalid/v1")
         );
-        assert_eq!(loaded_provider.model.as_deref(), Some("local-large"));
-        assert_eq!(loaded_provider.temperature, Some(0.2));
+        assert_eq!(resolved.upstream_model(), Some("local-large"));
+        assert_eq!(
+            resolved.options.temperature,
+            Some(crate::provider_registry::Override::Set(0.2))
+        );
     }
 
     #[test]
@@ -48909,10 +49373,9 @@ stream_tool_arguments = [
         assert_eq!(
             reloaded
                 .providers
-                .models
-                .anthropic
-                .get("default")
-                .and_then(|c| c.base.api_key.as_deref()),
+                .connections
+                .get("legacy.anthropic.default")
+                .and_then(|connection| connection.api_key()),
             Some(original_secret),
             "baseline: original secret round-trips through one save/reload cycle",
         );
@@ -48923,12 +49386,20 @@ stream_tool_arguments = [
         // `ZEROCLAW_providers__models__anthropic__default__api_key=...`
         // set in the environment.
         let env_value = "sk-ant-from-env-DIFFERENT";
-        reloaded.env_overridden_paths = std::collections::HashSet::from([api_key_path.to_string()]);
-        reloaded.pre_override_snapshots = std::collections::HashMap::from([(
-            api_key_path.to_string(),
-            original_secret.to_string(),
-        )]);
-        reloaded.set_prop(api_key_path, env_value).unwrap();
+        let canonical_path = "/providers/connections/legacy.anthropic.default/auth/api_key";
+        let saved =
+            crate::provider_registry::env_input::snapshot(&reloaded, canonical_path).unwrap();
+        reloaded.env_overridden_paths.insert(canonical_path.into());
+        reloaded
+            .pre_override_snapshots
+            .insert(canonical_path.into(), saved);
+        crate::provider_registry::env_input::set(
+            &mut reloaded,
+            canonical_path,
+            &serde_json::to_string(env_value).unwrap(),
+            false,
+        )
+        .unwrap();
 
         // Save again. With the pre-fix code path, this is the moment the
         // disk file got corrupted with the encrypted display mask.
@@ -48957,12 +49428,50 @@ stream_tool_arguments = [
         assert_eq!(
             after
                 .providers
-                .models
-                .anthropic
-                .get("default")
-                .and_then(|c| c.base.api_key.as_deref()),
+                .connections
+                .get("legacy.anthropic.default")
+                .and_then(|connection| connection.api_key()),
             Some(original_secret),
             "original on-disk secret must survive an env-override + save cycle",
+        );
+    }
+
+    #[test]
+    async fn canonical_external_secret_snapshots_round_trip_exact_connection_keys() {
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "providers": {
+                "connections": {"prod.us/~key": {
+                    "kind": "custom", "uri": "https://example.test/v1",
+                    "auth": {"mode": "api_key", "api_key": "op://test/api/key"},
+                    "extra_headers": {"X-Private/Auth": "op://test/header/key"}
+                }},
+                "models": {"chat.main": {"capability": "chat", "provider": "prod.us/~key", "model": "test-model"}}
+            }
+        })).unwrap();
+        let snapshots = collect_onepassword_reference_snapshots(&config).unwrap();
+        assert_eq!(snapshots.len(), 2);
+        assert!(snapshots.contains_key("/providers/connections/prod.us~1~0key/auth/api_key"));
+        assert!(
+            snapshots.contains_key(
+                "/providers/connections/prod.us~1~0key/extra_headers/X-Private~1Auth"
+            )
+        );
+        let mut raw = serde_json::to_value(&config.providers).unwrap();
+        raw["connections"]["prod.us/~key"]["auth"]["api_key"] = "resolved-api-fixture".into();
+        raw["connections"]["prod.us/~key"]["extra_headers"]["X-Private/Auth"] =
+            "resolved-header-fixture".into();
+        config.providers = serde_json::from_value(raw).unwrap();
+        restore_onepassword_references_for_save(&mut config, &snapshots, &Default::default())
+            .unwrap();
+        assert_eq!(
+            config.providers.connections["prod.us/~key"].api_key(),
+            Some("op://test/api/key")
+        );
+        assert_eq!(
+            config.providers.connections["prod.us/~key"]
+                .extra_headers()
+                .unwrap()["X-Private/Auth"],
+            "op://test/header/key"
         );
     }
 
@@ -49011,10 +49520,9 @@ api_key = "op://zeroclaw/provider/openai-api-key"
         assert_eq!(
             config
                 .providers
-                .models
-                .openai
-                .get("default")
-                .and_then(|entry| entry.base.api_key.as_deref()),
+                .connections
+                .get("legacy.openai.default")
+                .and_then(|connection| connection.api_key()),
             Some("sk-proj-from-onepassword"),
             "runtime config uses resolved 1Password secret"
         );
@@ -49092,10 +49600,9 @@ api_key = "op://zeroclaw/provider/openai-api-key"
         assert_eq!(
             config
                 .providers
-                .models
-                .openai
-                .get("default")
-                .and_then(|entry| entry.base.api_key.as_deref()),
+                .connections
+                .get("legacy.openai.default")
+                .and_then(|connection| connection.api_key()),
             Some("sk-proj-from-onepassword")
         );
     }
@@ -49137,12 +49644,17 @@ api_key = "op://zeroclaw/provider/openai-api-key"
         .unwrap();
 
         let mut config = Config::load_or_init().await.unwrap();
-        config
-            .set_prop_persistent(
-                "providers.models.openai.default.api_key",
-                "sk-proj-new-direct-key",
-            )
-            .unwrap();
+        crate::provider_registry::editor::update(&mut config, |registry| {
+            let connection = registry
+                .connections
+                .get_mut("legacy.openai.default")
+                .unwrap();
+            let mut value = serde_json::to_value(&*connection)?;
+            value["auth"]["api_key"] = "sk-proj-new-direct-key".into();
+            *connection = serde_json::from_value(value)?;
+            Ok(())
+        })
+        .unwrap();
         config.save_dirty().await.unwrap();
 
         let raw_after = std::fs::read_to_string(&config_path).unwrap();
@@ -49158,10 +49670,9 @@ api_key = "op://zeroclaw/provider/openai-api-key"
         let stored: Config = toml::from_str(&raw_after).unwrap();
         let encrypted = stored
             .providers
-            .models
-            .openai
-            .get("default")
-            .and_then(|entry| entry.base.api_key.as_deref())
+            .connections
+            .get("legacy.openai.default")
+            .and_then(|connection| connection.api_key())
             .unwrap();
         let store = crate::secrets::SecretStore::new(dir.path(), true);
         assert_eq!(store.decrypt(encrypted).unwrap(), "sk-proj-new-direct-key");
@@ -50000,13 +50511,11 @@ model_provider = "zai.default"
 risk_profile = "default"
 "#;
         let parsed: Config = toml::from_str(raw).expect("extra nesting must not fail parse");
-        let provider = parsed
-            .providers
-            .models
-            .find("zai", "default")
-            .expect("outer alias is still present");
+        let registry = parsed.provider_registry().unwrap();
+        let provider = registry.resolve_chat(&"zai.default".into()).unwrap();
         assert!(
-            provider.model.is_none() && provider.api_key.is_none(),
+            provider.upstream_model().is_none()
+                && provider.selection.connection.api_key().is_none(),
             "precondition: serde silently drops the nested model/api_key"
         );
         parsed
@@ -50154,23 +50663,10 @@ model = "gpt-4o"
         let written = std::fs::read_to_string(&config_path).unwrap();
         let reloaded: Config = toml::from_str(&written)
             .unwrap_or_else(|e| panic!("rewritten config must reparse: {e}\n---\n{written}"));
-        assert!(
-            reloaded
-                .providers
-                .models
-                .find("openai", "myalias")
-                .is_some(),
-            "created alias must survive save_dirty + reload; got:\n{written}"
-        );
-        assert_eq!(
-            reloaded
-                .providers
-                .models
-                .find("openai", "myalias")
-                .and_then(|e| e.wire_api),
-            Some(WireApi::Responses),
-            "default wire_api must survive save_dirty + reload; got:\n{written}"
-        );
+        let registry = reloaded.provider_registry().unwrap();
+        let resolved = registry.resolve_chat(&"openai.myalias".into()).unwrap();
+        assert_eq!(resolved.wire_api, Some(WireApi::Responses));
+        assert!(reloaded.providers.models.openai.is_empty());
     }
 
     #[test]
@@ -50673,7 +51169,7 @@ allowed_users = []
     ///
     /// Mirrors the production boundary of
     /// `local_whisper_config_init_preserves_transcription_section`
-    /// (crates/zeroclaw-channels/src/transcription.rs) but drives a bare
+    /// (crates/zeroclaw-providers/src/transcription.rs) but drives a bare
     /// full init instead of an exact-prefix one.
     #[test]
     async fn config_init_full_produces_strict_roundtrippable_config() {
@@ -50867,6 +51363,10 @@ allowed_users = []
         );
 
         for field in &fields {
+            // Each edit is an independent transaction. Config admission may
+            // retire initialized historical input tables, so one edit must
+            // not change the starting surface for the next field's check.
+            let mut config = config.clone();
             // get_prop must not panic or error
             let get_result = config.get_prop(&field.name);
             assert!(
@@ -51101,9 +51601,7 @@ allowed_users = []
         // prop_fields with EncryptedSecret classification (from #[secret]).
         config.model_routes.push(ModelRouteConfig {
             hint: "reasoning".into(),
-            model_provider: "openai.default".into(),
-            model: "gpt-4".into(),
-            api_key: None,
+            model_ref: "openai.default".into(),
         });
         config.embedding_routes.push(EmbeddingRouteConfig {
             hint: "semantic".into(),
@@ -51119,10 +51617,7 @@ allowed_users = []
                 .find(|field| field.name == name)
                 .and_then(|field| field.credential_class)
         };
-        assert_eq!(
-            nested_class_for("model_routes.reasoning.api_key"),
-            Some(crate::config::CredentialSurfaceClass::EncryptedSecret)
-        );
+        assert_eq!(nested_class_for("model_routes.reasoning.api_key"), None);
         assert_eq!(
             nested_class_for("embedding_routes.semantic.api_key"),
             Some(crate::config::CredentialSurfaceClass::EncryptedSecret)
@@ -51786,9 +52281,11 @@ allowed_users = []
             .insert("default".to_string(), RiskProfileConfig::default());
 
         // Anthropic model provider (mandatory for the agent).
-        config.providers.models.anthropic.insert(
-            "default".to_string(),
-            AnthropicModelProviderConfig::default(),
+        crate::migration::bind_test_route_model(
+            &mut config,
+            "anthropic.default",
+            "test-model",
+            None,
         );
 
         // A configured Telegram channel the agent can reference. Just
@@ -52711,7 +53208,7 @@ allowed_users = []
         assert!(
             msg.contains("classifier_provider")
                 && msg.contains("does-not-exist")
-                && msg.contains("providers.models.custom.does-not-exist is not configured"),
+                && msg.contains("does not resolve to a configured model"),
             "expected DanglingReference error mentioning field + alias + section, got: {msg}"
         );
     }
@@ -52739,7 +53236,8 @@ allowed_users = []
         let msg = format!("{:#}", cfg.validate().expect_err("missing alias must fail"));
         assert!(
             msg.contains("summary_provider")
-                && msg.contains("providers.models.custom.does-not-exist is not configured"),
+                && msg.contains("custom.does-not-exist")
+                && msg.contains("does not resolve to a configured model"),
             "expected DanglingReference for agent summary_provider, got: {msg}"
         );
     }
@@ -52773,7 +53271,8 @@ allowed_users = []
         );
         assert!(
             msg.contains("runtime_profiles.fast.context_compression.summary_provider")
-                && msg.contains("providers.models.custom.nope is not configured"),
+                && msg.contains("custom.nope")
+                && msg.contains("does not resolve to a configured model"),
             "expected DanglingReference for profile summary_provider, got: {msg}"
         );
     }
@@ -54086,6 +54585,7 @@ group_policy = "all"
             dimensions: Some(1536),
             api_key: None,
         });
+        crate::migration::normalize_test_input(&mut config);
         config.validate().expect("hint route should validate");
 
         assert!(
@@ -54273,186 +54773,6 @@ group_policy = "all"
         );
     }
 
-    fn provider_entry_with_fallback(fallback: &[&str]) -> OpenAIModelProviderConfig {
-        OpenAIModelProviderConfig {
-            base: ModelProviderConfig {
-                model: Some("gpt-4o".to_string()),
-                fallback: fallback
-                    .iter()
-                    .map(|s| crate::providers::ModelProviderRef::new(*s))
-                    .collect(),
-                ..Default::default()
-            },
-        }
-    }
-
-    #[test]
-    async fn fallback_warns_on_dangling_ref() {
-        let mut config = Config::default();
-        suppress_semantic_memory_warning(&mut config);
-        config.providers.models.openai.insert(
-            "primary".to_string(),
-            provider_entry_with_fallback(&["openai.ghost"]),
-        );
-
-        let warnings = config.collect_warnings();
-        assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0].code, "dangling_fallback_ref");
-        assert_eq!(
-            warnings[0].path,
-            "providers.models.openai.primary.fallback[0]"
-        );
-    }
-
-    #[test]
-    async fn fallback_no_warning_when_ref_resolves() {
-        let mut config = Config::default();
-        suppress_semantic_memory_warning(&mut config);
-        config.providers.models.openai.insert(
-            "primary".to_string(),
-            provider_entry_with_fallback(&["openai.backup"]),
-        );
-        config
-            .providers
-            .models
-            .openai
-            .insert("backup".to_string(), provider_entry_with_fallback(&[]));
-
-        assert!(config.collect_warnings().is_empty());
-    }
-
-    #[test]
-    async fn fallback_warns_on_two_node_cycle() {
-        let mut config = Config::default();
-        suppress_semantic_memory_warning(&mut config);
-        config
-            .providers
-            .models
-            .openai
-            .insert("a".to_string(), provider_entry_with_fallback(&["openai.b"]));
-        config
-            .providers
-            .models
-            .openai
-            .insert("b".to_string(), provider_entry_with_fallback(&["openai.a"]));
-
-        let cycle_warnings: Vec<_> = config
-            .collect_warnings()
-            .into_iter()
-            .filter(|w| w.code == "fallback_cycle")
-            .collect();
-        assert!(
-            !cycle_warnings.is_empty(),
-            "a->b->a must surface at least one fallback_cycle warning"
-        );
-    }
-
-    #[test]
-    async fn fallback_self_reference_is_a_cycle() {
-        let mut config = Config::default();
-        suppress_semantic_memory_warning(&mut config);
-        config.providers.models.openai.insert(
-            "loop".to_string(),
-            provider_entry_with_fallback(&["openai.loop"]),
-        );
-
-        let warnings = config.collect_warnings();
-        assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0].code, "fallback_cycle");
-    }
-
-    #[test]
-    async fn fallback_empty_ref_is_skipped() {
-        let mut config = Config::default();
-        suppress_semantic_memory_warning(&mut config);
-        config
-            .providers
-            .models
-            .openai
-            .insert("primary".to_string(), provider_entry_with_fallback(&[""]));
-
-        assert!(config.collect_warnings().is_empty());
-    }
-
-    #[test]
-    async fn fallback_warns_when_chain_exceeds_max_depth() {
-        let mut config = Config::default();
-        suppress_semantic_memory_warning(&mut config);
-        let n = crate::providers::MAX_FALLBACK_DEPTH + 2;
-        for i in 0..n {
-            let next = if i + 1 < n {
-                vec![format!("openai.a{}", i + 1)]
-            } else {
-                vec![]
-            };
-            let refs: Vec<&str> = next.iter().map(String::as_str).collect();
-            config
-                .providers
-                .models
-                .openai
-                .insert(format!("a{i}"), provider_entry_with_fallback(&refs));
-        }
-
-        let depth_warnings: Vec<_> = config
-            .collect_warnings()
-            .into_iter()
-            .filter(|w| w.code == "max_fallback_depth_exceeded")
-            .collect();
-        assert!(
-            !depth_warnings.is_empty(),
-            "a chain deeper than MAX_FALLBACK_DEPTH must surface a max_fallback_depth_exceeded warning"
-        );
-    }
-
-    #[test]
-    async fn fallback_models_warns_on_empty_entry() {
-        let mut config = Config::default();
-        suppress_semantic_memory_warning(&mut config);
-        let mut entry = provider_entry_with_fallback(&[]);
-        entry.base.fallback_models = vec!["".to_string()];
-        config
-            .providers
-            .models
-            .openai
-            .insert("primary".to_string(), entry);
-
-        let warnings = config.collect_warnings();
-        assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0].code, "empty_fallback_model");
-    }
-
-    #[test]
-    async fn fallback_models_warns_on_duplicate_of_primary() {
-        let mut config = Config::default();
-        suppress_semantic_memory_warning(&mut config);
-        let mut entry = provider_entry_with_fallback(&[]);
-        entry.base.fallback_models = vec!["gpt-4o".to_string()];
-        config
-            .providers
-            .models
-            .openai
-            .insert("primary".to_string(), entry);
-
-        let warnings = config.collect_warnings();
-        assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0].code, "fallback_model_duplicates_primary");
-    }
-
-    #[test]
-    async fn fallback_models_distinct_entries_do_not_warn() {
-        let mut config = Config::default();
-        suppress_semantic_memory_warning(&mut config);
-        let mut entry = provider_entry_with_fallback(&[]);
-        entry.base.fallback_models = vec!["gpt-4o-mini".to_string()];
-        config
-            .providers
-            .models
-            .openai
-            .insert("primary".to_string(), entry);
-
-        assert!(config.collect_warnings().is_empty());
-    }
-
     #[test]
     async fn empty_server_fallback_model_warns() {
         let mut config = Config::default();
@@ -54466,12 +54786,12 @@ group_policy = "all"
             },
         );
 
-        let warnings = config.collect_warnings();
+        let warnings = crate::migration::admit_test_input(&config).collect_warnings();
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].code, "empty_server_fallback_model");
         assert_eq!(
             warnings[0].path,
-            "providers.models.anthropic.primary.server_fallback_models[0]"
+            "providers.models.anthropic.primary.extra.server_fallback_models[0]"
         );
     }
 
@@ -54490,7 +54810,7 @@ group_policy = "all"
             },
         );
 
-        let warnings = config.collect_warnings();
+        let warnings = crate::migration::admit_test_input(&config).collect_warnings();
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].code, "server_fallback_model_duplicates_primary");
     }
@@ -54510,15 +54830,16 @@ group_policy = "all"
             },
         );
 
-        assert!(config.collect_warnings().is_empty());
+        assert!(
+            crate::migration::admit_test_input(&config)
+                .collect_warnings()
+                .is_empty()
+        );
     }
 
     fn delegate_roster_config() -> Config {
         let mut cfg = Config::default();
-        cfg.providers.models.ollama.insert(
-            "default".to_string(),
-            crate::schema::OllamaModelProviderConfig::default(),
-        );
+        crate::migration::bind_test_route_model(&mut cfg, "ollama.default", "test-model", None);
         cfg.risk_profiles
             .insert("shared".to_string(), RiskProfileConfig::default());
         cfg.risk_profiles
@@ -54984,6 +55305,17 @@ model_provider = \"ollama.default\"
         let mut skipped_unsettable = 0usize;
 
         for field in &fields {
+            if matches!(
+                field.name.as_str(),
+                "memory.embedding_provider" | "memory.embedding_model"
+            ) || field.name.starts_with("transcription.")
+                && matches!(
+                    field.name.rsplit('.').next(),
+                    Some("model" | "api_url" | "language" | "initial_prompt")
+                )
+            {
+                continue;
+            }
             if field.is_secret {
                 continue;
             }
@@ -55104,6 +55436,501 @@ model_provider = \"ollama.default\"
         assert!(agent.is_dispatchable());
     }
 
+    #[::core::prelude::v1::test]
+    fn dotted_profile_validation_keeps_the_configured_alias() {
+        let mut config = Config::default();
+        config
+            .risk_profiles
+            .insert("default".into(), RiskProfileConfig::default());
+        config
+            .providers
+            .models
+            .ensure("openai", "edge")
+            .unwrap()
+            .model = Some("prefix-model".into());
+        config
+            .providers
+            .models
+            .ensure("openai", "edge.v2")
+            .unwrap()
+            .model = Some("dotted-model".into());
+        config.agents.insert(
+            "worker".into(),
+            AliasedAgentConfig {
+                model_provider: "openai.edge.v2".into(),
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        validate_provider_input_fixture(&config).unwrap();
+        let config = crate::migration::admit_test_input(&config);
+        assert_eq!(config.providers.models.openai.len(), 2);
+        assert!(
+            config
+                .providers
+                .models
+                .canonical_models
+                .contains_key(&crate::provider_registry::ModelRef::from("openai.edge.v2"))
+        );
+        assert_eq!(
+            config.resolve_model_id("openai.edge.v2").as_deref(),
+            Some("dotted-model")
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn resolve_model_selection_covers_all_paths() {
+        let raw = r#"
+schema_version = 4
+
+[providers.models.openai.gw]
+uri = "https://gw.internal/v1"
+model = "legacy-id"
+
+[providers.models.openai.gw.models.fast]
+id = "gpt-4o-mini"
+temperature = 0.3
+
+[providers.models.openai.gw.models.big]
+id = "gpt-4o"
+
+[providers.models.anthropic.solo]
+uri = "https://api.anthropic.com"
+
+[providers.models.anthropic.solo.models.only]
+id = "claude-sonnet-4-5"
+
+[providers.models.groq.legacy]
+model = "llama-3.3-70b"
+"#;
+        let mut config: Config = crate::migration::migrated_provider_input_fixture(raw).unwrap();
+
+        // Existing provider aliases may contain dots. An exact configured
+        // alias takes precedence over interpreting its suffix as a nested
+        // model selector.
+        let dotted = config
+            .providers
+            .models
+            .ensure("openrouter", "glm-5.2")
+            .expect("known provider family");
+        dotted.model = Some("glm-5.2".to_string());
+        dotted.context_window = Some(1_000_000);
+        let sel = config
+            .resolve_model_selection("openrouter.glm-5.2")
+            .expect("exact dotted alias resolves");
+        assert_eq!(sel.alias, "glm-5.2");
+        assert_eq!(sel.model_alias, None);
+        assert_eq!(sel.model_id.as_deref(), Some("glm-5.2"));
+
+        // Three-segment: selects the named entry and its id.
+        let sel = config.resolve_model_selection("openai.gw.fast").unwrap();
+        assert_eq!(sel.model_id.as_deref(), Some("gpt-4o-mini"));
+        assert_eq!(sel.model_alias.as_deref(), Some("fast"));
+        assert_eq!(sel.model_entry.and_then(|e| e.temperature), Some(0.3));
+
+        // Three-segment, unknown model alias → None.
+        assert!(config.resolve_model_selection("openai.gw.nope").is_none());
+
+        // Two-segment with multiple entries and no `default` → legacy `model`.
+        let sel = config.resolve_model_selection("openai.gw").unwrap();
+        assert_eq!(sel.model_id.as_deref(), Some("legacy-id"));
+        assert!(sel.model_entry.is_none());
+
+        // Two-segment with a sole entry → that entry.
+        let sel = config.resolve_model_selection("anthropic.solo").unwrap();
+        assert_eq!(sel.model_id.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(sel.model_alias.as_deref(), Some("only"));
+
+        // Two-segment legacy profile, no models subtable → entry `model`.
+        let sel = config.resolve_model_selection("groq.legacy").unwrap();
+        assert_eq!(sel.model_id.as_deref(), Some("llama-3.3-70b"));
+        assert!(sel.model_entry.is_none());
+
+        // Unparseable / missing profile → None.
+        assert!(config.resolve_model_selection("openai").is_none());
+        assert!(config.resolve_model_selection("openai.absent").is_none());
+    }
+
+    #[::core::prelude::v1::test]
+    fn model_identity_distinguishes_real_and_equivalent_switches() {
+        let raw = r#"
+schema_version = 4
+
+[providers.models.openai.gw]
+uri = "https://gw.internal/v1"
+
+[providers.models.openai.gw.models.default]
+id = "gpt-4o-mini"
+
+[providers.models.openai.gw.models.cheap]
+id = "gpt-4o-mini"
+
+[providers.models.openai.gw.models.big]
+id = "gpt-4o"
+"#;
+        let config: Config = crate::migration::migrated_provider_input_fixture(raw).unwrap();
+
+        // A two-segment ref naming the profile's default entry and the
+        // three-segment ref naming it explicitly are the same model: a
+        // switch between them must be a no-op, not a rebuild.
+        let two = config.resolve_model_selection("openai.gw").unwrap();
+        let three = config.resolve_model_selection("openai.gw.default").unwrap();
+        assert_eq!(two.identity(None), three.identity(None));
+
+        // Two entries that happen to share a model id are different models:
+        // the entry name is part of the identity, so switching between them
+        // rebuilds (their tuning overlays may differ).
+        let cheap = config.resolve_model_selection("openai.gw.cheap").unwrap();
+        assert_ne!(three.identity(None), cheap.identity(None));
+
+        // An explicit model override replaces the resolved id.
+        let overridden = three.identity(Some("custom-id"));
+        assert_eq!(overridden.model_id, "custom-id");
+        assert_ne!(overridden, three.identity(None));
+    }
+
+    #[::core::prelude::v1::test]
+    fn configured_model_entries_enumerates_nested_and_legacy_profiles() {
+        let raw = r#"
+schema_version = 4
+
+[providers.models.openai.gw]
+uri = "https://gw.internal/v1"
+model = "legacy-fallback"
+
+[providers.models.openai.gw.models.cheap]
+id = "gpt-4o-mini"
+
+[providers.models.openai.gw.models.big]
+id = "gpt-4o"
+
+[providers.models.groq.legacy]
+model = "llama-3.3-70b"
+"#;
+        let config: Config = toml::from_str(raw).unwrap();
+
+        // The compatibility boundary projects exact model keys, sorted by
+        // reference, including the profile's selected/default model.
+        let all = config.configured_model_entries(None);
+        let refs: Vec<&str> = all.iter().map(|e| e.model_ref.as_str()).collect();
+        assert_eq!(
+            refs,
+            vec![
+                "groq.legacy",
+                "openai.gw",
+                "openai.gw.big",
+                "openai.gw.cheap"
+            ]
+        );
+        let cheap = &all[3];
+        assert_eq!(cheap.connection_id, "legacy.openai.gw");
+        assert_eq!(cheap.model_id.as_deref(), Some("gpt-4o-mini"));
+        let legacy = &all[0];
+        assert_eq!(legacy.model_id.as_deref(), Some("llama-3.3-70b"));
+
+        // An entry without an id falls back to the profile-level model.
+        let raw_no_id = r#"
+schema_version = 4
+
+[providers.models.openai.gw]
+model = "legacy-fallback"
+
+[providers.models.openai.gw.models.bare]
+temperature = 0.3
+"#;
+        let config: Config = toml::from_str(raw_no_id).unwrap();
+        let all = config.configured_model_entries(None);
+        assert_eq!(
+            all[0].model_id.as_deref(),
+            Some("legacy-fallback"),
+            "an id-less entry inherits the profile-level model"
+        );
+
+        // The filter narrows by full ref or bare family, matching the doctor
+        // commands.
+        let config: Config = toml::from_str(raw).unwrap();
+        assert_eq!(config.configured_model_entries(Some("openai.gw")).len(), 1);
+        assert_eq!(
+            config
+                .configured_model_entries(Some("legacy.openai.gw"))
+                .len(),
+            3
+        );
+        let selected = config.configured_model_entries(Some("openai.gw.cheap"));
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].model_ref, "openai.gw.cheap");
+        assert_eq!(config.configured_model_entries(Some("groq")).len(), 1);
+        assert!(
+            config
+                .configured_model_entries(Some("anthropic.missing"))
+                .is_empty()
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn validate_accepts_and_rejects_three_segment_agent_refs() {
+        let base = r#"
+schema_version = 4
+
+[providers.models.openai.gw]
+api_key = "sk-x"
+
+[providers.models.openai.gw.models.fast]
+id = "gpt-4o-mini"
+
+[risk_profiles.default]
+level = "supervised"
+
+[runtime_profiles.default]
+"#;
+        // Valid three-segment ref resolves and validates.
+        let ok = format!(
+            "{base}\n[agents.a]\nmodel_provider = \"openai.gw.fast\"\nrisk_profile = \"default\"\nruntime_profile = \"default\"\n"
+        );
+        let cfg: Config = toml::from_str(&ok).unwrap();
+        assert!(
+            cfg.validate().is_ok(),
+            "three-segment ref to a configured model entry must validate: {:?}",
+            cfg.validate().err()
+        );
+
+        // Dangling model alias → validation error.
+        let bad = format!(
+            "{base}\n[agents.a]\nmodel_provider = \"openai.gw.nope\"\nrisk_profile = \"default\"\nruntime_profile = \"default\"\n"
+        );
+        let cfg: Config = toml::from_str(&bad).unwrap();
+        let err = cfg
+            .validate()
+            .expect_err("dangling model alias must fail validation")
+            .to_string();
+        assert!(
+            err.contains("openai.gw.nope"),
+            "error should name the missing model entry, got: {err}"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn validate_accepts_three_segment_classifier_and_summary_refs() {
+        // classifier_provider / summary_provider (agent + profile) point into
+        // providers.models and must accept a three-segment `<type>.<alias>.<model>`
+        // ref, validating the named model entry — same as model_provider.
+        let base = r#"
+schema_version = 4
+
+[providers.models.openai.gw]
+api_key = "sk-x"
+
+[providers.models.openai.gw.models.fast]
+id = "gpt-4o-mini"
+
+[risk_profiles.default]
+level = "supervised"
+
+[runtime_profiles.default]
+"#;
+        let ok = format!(
+            "{base}\n[agents.a]\nmodel_provider = \"openai.gw.fast\"\nclassifier_provider = \"openai.gw.fast\"\nsummary_provider = \"openai.gw.fast\"\nrisk_profile = \"default\"\nruntime_profile = \"default\"\n"
+        );
+        let cfg: Config = toml::from_str(&ok).unwrap();
+        assert!(
+            cfg.validate().is_ok(),
+            "three-segment classifier/summary refs must validate: {:?}",
+            cfg.validate().err()
+        );
+
+        // Profile-level context_compression.summary_provider, three-segment.
+        let ok_profile = format!(
+            "{base}\ncontext_compression.summary_provider = \"openai.gw.fast\"\n[agents.a]\nmodel_provider = \"openai.gw.fast\"\nrisk_profile = \"default\"\nruntime_profile = \"default\"\n"
+        );
+        let cfg: Config = toml::from_str(&ok_profile).unwrap();
+        assert!(
+            cfg.validate().is_ok(),
+            "three-segment profile summary_provider must validate: {:?}",
+            cfg.validate().err()
+        );
+
+        // Dangling model alias in a three-segment classifier ref → error.
+        let bad = format!(
+            "{base}\n[agents.a]\nmodel_provider = \"openai.gw.fast\"\nclassifier_provider = \"openai.gw.nope\"\nrisk_profile = \"default\"\nruntime_profile = \"default\"\n"
+        );
+        let cfg: Config = toml::from_str(&bad).unwrap();
+        let err = cfg
+            .validate()
+            .expect_err("dangling classifier model alias must fail")
+            .to_string();
+        assert!(
+            err.contains("openai.gw.nope"),
+            "error should name the missing model entry, got: {err}"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn validate_route_provider_ref_segment_contracts() {
+        // Model routes select nested models through a three-segment ref.
+        let base = r#"
+schema_version = 4
+
+[providers.models.openai.gw]
+api_key = "sk-x"
+
+[providers.models.openai.gw.models.fast]
+id = "gpt-4o-mini"
+
+[providers.models.openai.gw.models.embed]
+id = "text-embedding-3-small"
+
+[risk_profiles.default]
+level = "supervised"
+
+[runtime_profiles.default]
+
+[providers.connections."gateway.prod"]
+kind = "openai"
+[providers.models."openai.gw.fast"]
+capability = "chat"
+provider = "gateway.prod"
+model = "gpt-4o-mini"
+
+[[model_routes]]
+hint = "deep"
+model_ref = "openai.gw.fast"
+
+[agents.a]
+model_provider = "openai.gw.fast"
+risk_profile = "default"
+runtime_profile = "default"
+"#;
+        let cfg: Config = toml::from_str(base).unwrap();
+        assert!(
+            cfg.validate().is_ok(),
+            "three-segment model route refs must validate: {:?}",
+            cfg.validate().err()
+        );
+
+        // Dangling model alias in a route → error naming the missing entry.
+        let bad = base.replace(
+            "model_ref = \"openai.gw.fast\"",
+            "model_ref = \"openai.gw.nope\"",
+        );
+        let cfg: Config = toml::from_str(&bad).unwrap();
+        let err = cfg
+            .validate()
+            .expect_err("dangling route model alias must fail")
+            .to_string();
+        assert!(
+            err.contains("model_routes[0].model_ref"),
+            "error should name the missing model entry, got: {err}"
+        );
+
+        // Embedding routes keep the model id in their separate `model` field,
+        // so a two-segment provider profile ref is the supported form.
+        let two_segment_embedding = format!(
+            "{base}\n[[embedding_routes]]\nhint = \"sem\"\nmodel_provider = \"openai.gw\"\nmodel = \"text-embedding-3-small\"\n"
+        );
+        let cfg: Config = toml::from_str(&two_segment_embedding).unwrap();
+        assert!(
+            cfg.validate().is_ok(),
+            "two-segment embedding route refs must validate: {:?}",
+            cfg.validate().err()
+        );
+
+        let three_segment_embedding = two_segment_embedding.replace(
+            "model_provider = \"openai.gw\"",
+            "model_provider = \"openai.gw.embed\"",
+        );
+        let cfg: Config = toml::from_str(&three_segment_embedding).unwrap();
+        cfg.validate()
+            .expect("a dotted canonical embedding model reference is valid");
+    }
+
+    #[::core::prelude::v1::test]
+    fn models_subtable_map_key_crud_reaches_third_level() {
+        // The nested `models` subtable
+        // (`providers.models.<type>.<alias>.models.<model_alias>`) must be
+        // fully manageable through the generic map-key machinery the web
+        // UI / RPC use — list, create, rename, delete — not just readable
+        // via get_prop on already-present entries.
+        let raw = r#"
+schema_version = 4
+[providers.models.openai.gw]
+model = "legacy"
+[providers.models.openai.gw.models.fast]
+id = "gpt-4o-mini"
+"#;
+        let mut cfg: Config = crate::migration::migrated_provider_input_fixture(raw).unwrap();
+        let sub = "providers.models.openai.gw.models";
+
+        // list existing sub-entries
+        assert_eq!(
+            cfg.get_map_keys(sub),
+            Some(vec!["fast".to_string()]),
+            "get_map_keys must list the subtable entry"
+        );
+
+        // create a new sub-entry, then set + read a field on it
+        assert_eq!(
+            cfg.create_map_key(sub, "cheap"),
+            Ok(true),
+            "create_map_key must add a subtable entry"
+        );
+        cfg.set_prop(&format!("{sub}.cheap.id"), "gpt-3-5")
+            .expect("set_prop on a freshly-created subtable entry");
+        assert_eq!(
+            cfg.get_prop(&format!("{sub}.cheap.id")).ok(),
+            Some("gpt-3-5".to_string()),
+            "the created entry's id must round-trip"
+        );
+        let mut keys = cfg.get_map_keys(sub).unwrap();
+        keys.sort();
+        assert_eq!(keys, vec!["cheap".to_string(), "fast".to_string()]);
+
+        // rename
+        assert_eq!(cfg.rename_map_key(sub, "fast", "quick"), Ok(true));
+        let mut keys = cfg.get_map_keys(sub).unwrap();
+        keys.sort();
+        assert_eq!(keys, vec!["cheap".to_string(), "quick".to_string()]);
+
+        // delete
+        assert_eq!(cfg.delete_map_key(sub, "cheap"), Ok(true));
+        assert_eq!(cfg.get_map_keys(sub), Some(vec!["quick".to_string()]));
+
+        // creating a subtable entry validates the alias key (non-resource-key map)
+        assert!(
+            cfg.create_map_key(sub, "Bad Alias").is_err(),
+            "invalid alias key must be rejected"
+        );
+
+        // Regression guard: the alias level itself still lists profiles, and an
+        // unrelated single-level map is unaffected.
+        assert_eq!(
+            cfg.get_map_keys("providers.models.openai"),
+            Some(vec!["gw".to_string()]),
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn models_subtable_empty_lists_and_serializes_clean() {
+        // A profile with no models subtable: get_map_keys returns Some([]) (the
+        // section exists, it's just empty), and serialization emits no empty
+        // `[...models]` table header.
+        let raw = r#"
+schema_version = 4
+[providers.models.openai.gw]
+model = "gpt-4o"
+"#;
+        let cfg: Config = crate::migration::migrated_provider_input_fixture(raw).unwrap();
+        assert_eq!(
+            cfg.get_map_keys("providers.models.openai.gw.models"),
+            Some(vec![]),
+            "empty subtable must list as Some([]), not None"
+        );
+        let out = toml::to_string_pretty(&cfg).unwrap();
+        assert!(
+            !out.contains("gw.models]") && !out.contains(".gw.models\n"),
+            "empty models map must not emit a table header:\n{out}"
+        );
+    }
+
     fn effort_routing_config() -> super::Config {
         let mut config = super::Config::default();
         for alias in ["local", "cloud"] {
@@ -55113,19 +55940,21 @@ model_provider = \"ollama.default\"
                 .ensure("custom", alias)
                 .expect("custom provider entry");
             entry.model = Some(format!("{alias}-model"));
+            crate::migration::bind_test_route_model(
+                &mut config,
+                &format!("custom.{alias}"),
+                &format!("{alias}-model"),
+                None,
+            );
         }
         config.model_routes = vec![
             super::ModelRouteConfig {
                 hint: "local".into(),
-                model_provider: "custom.local".into(),
-                model: "local-model".into(),
-                api_key: None,
+                model_ref: "custom.local".into(),
             },
             super::ModelRouteConfig {
                 hint: "cloud".into(),
-                model_provider: "custom.cloud".into(),
-                model: "cloud-model".into(),
-                api_key: None,
+                model_ref: "custom.cloud".into(),
             },
         ];
         config.runtime_profiles.insert(
@@ -55202,11 +56031,37 @@ model_provider = \"ollama.default\"
 
         let mut duplicate_route = effort_routing_config();
         let mut final_local_route = duplicate_route.model_routes[0].clone();
-        final_local_route.model_provider = "custom.cloud".into();
-        final_local_route.model = "final-local-model".into();
+        final_local_route.model_ref = "custom.cloud".into();
         duplicate_route.model_routes.push(final_local_route);
         duplicate_route
             .validate()
             .expect("legacy duplicate route hints remain valid");
+    }
+}
+
+impl Config {
+    /// Resolve the canonical provider/model registry for one admission. The
+    /// returned view is rebuilt from the current config and must not be stored
+    /// as a second long-lived configuration snapshot.
+    pub fn provider_registry(
+        &self,
+    ) -> Result<crate::provider_registry::ProviderRegistry, crate::provider_registry::RegistryError>
+    {
+        // Downstream crate tests still construct a few historical fixtures
+        // directly in the legacy typed maps.  The test-only feature makes
+        // that construction an explicit input-boundary admission; shipped
+        // builds never reinterpret legacy state here.
+        #[cfg(feature = "test-helpers")]
+        {
+            if let Ok(admitted) = crate::migration::try_admit_test_input(self) {
+                admitted.providers.canonical_registry()
+            } else {
+                self.providers.canonical_registry()
+            }
+        }
+        #[cfg(not(feature = "test-helpers"))]
+        {
+            self.providers.canonical_registry()
+        }
     }
 }

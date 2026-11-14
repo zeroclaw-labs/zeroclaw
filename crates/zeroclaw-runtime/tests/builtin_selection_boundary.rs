@@ -65,29 +65,25 @@ async fn assemble_context(
     });
     let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::new());
     let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new("boundary"));
-    let built = zeroclaw_runtime::tools::all_tools_with_runtime(
-        Arc::new(config.clone()),
-        &security,
-        &RiskProfileConfig::default(),
-        "boundary",
-        Arc::clone(&runtime),
-        memory,
-        None,
-        None,
-        &config.browser,
-        &config.http_request,
-        &config.web_fetch,
-        &workspace,
-        &config.agents,
-        None,
-        config,
-        None,
-        false,
-        None,
-        None,
-        None,
-        None,
-    )
+    let built = {
+        let registry_config = Arc::new(config.clone());
+        let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
+            Arc::clone(&runtime);
+        let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = memory;
+        let registry_request = zeroclaw_runtime::composition::ToolRequest {
+            config: &registry_config,
+            agent_alias: "boundary",
+            security: &security,
+            runtime: &registry_runtime,
+            memory: &registry_memory,
+        };
+        let registry_inputs =
+            zeroclaw_runtime::composition::NativeRecipeInputs::new(&registry_request, &workspace);
+        zeroclaw_runtime::tools::build_native_registry(
+            registry_inputs,
+            &RiskProfileConfig::default(),
+        )
+    }
     .unwrap();
     ScopedToolRegistry::assemble(ScopedAssembly {
         config,

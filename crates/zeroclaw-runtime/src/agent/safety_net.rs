@@ -46,8 +46,7 @@ fn mem_none(workspace: &Path) -> Arc<dyn Memory> {
         ..zeroclaw_config::schema::MemoryConfig::default()
     };
     Arc::from(
-        zeroclaw_memory::create_memory(&cfg, workspace, None)
-            .expect("memory creation should succeed"),
+        zeroclaw_memory::create_memory(&cfg, workspace).expect("memory creation should succeed"),
     )
 }
 
@@ -590,7 +589,7 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
                 provider_name: "mock",
                 model: "mock-model",
                 dispatch_model: "mock-model",
-                temperature: None,
+                temperature: None.into(),
             },
             crate::agent::loop_::ResolvedIo {
                 tools_registry: &tools_registry,
@@ -610,7 +609,7 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
                 excluded_tools: &[],
                 dedup_exempt_tools: &[],
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 30_000,
                 keep_tool_context_turns: 2,
@@ -1007,7 +1006,7 @@ async fn safety_net_task_locals_probe_per_entry_path() {
                         provider_name: "mock",
                         model: "mock-model",
                         dispatch_model: "mock-model",
-                        temperature: None,
+                        temperature: None.into(),
                     },
                     crate::agent::loop_::ResolvedIo {
                         tools_registry: &tools_registry,
@@ -1027,7 +1026,7 @@ async fn safety_net_task_locals_probe_per_entry_path() {
                         excluded_tools: &[],
                         dedup_exempt_tools: &[],
                         pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                        strict_tool_parsing: false,
+                        text_tool_calls_disabled: false,
                         parallel_tools: false,
                         max_tool_result_chars: 30_000,
                         keep_tool_context_turns: 2,
@@ -2824,7 +2823,7 @@ async fn safety_net_narration_reaches_both_draft_and_event_channels_once() {
                 provider_name: "mock",
                 model: "mock-model",
                 dispatch_model: "mock-model",
-                temperature: None,
+                temperature: None.into(),
             },
             crate::agent::loop_::ResolvedIo {
                 tools_registry: &tools_registry,
@@ -2844,7 +2843,7 @@ async fn safety_net_narration_reaches_both_draft_and_event_channels_once() {
                 excluded_tools: &[],
                 dedup_exempt_tools: &[],
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 30_000,
                 keep_tool_context_turns: 2,
@@ -3299,12 +3298,16 @@ async fn usage_event_coherent_tuple_in_turn_model_switch() {
 
         // The model route forces credential resolution to look up provider B's
         // config entry (api_key/uri) instead of falling back to the primary's.
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut cfg,
+            "anthropic.provider-b",
+            "claude-3-opus",
+            None,
+        );
         cfg.model_routes
             .push(zeroclaw_config::schema::ModelRouteConfig {
                 hint: "matrix-switch".into(),
-                model_provider: "anthropic.provider-b".into(),
-                model: "claude-3-opus".into(),
-                api_key: None,
+                model_ref: "anthropic.provider-b".into(),
             });
 
         let cfg_arc = Arc::new(cfg.clone());
@@ -3482,12 +3485,16 @@ async fn usage_by_provider_breakdown_after_in_turn_model_switch() {
         .pricing
         .insert("claude-3-opus.cached_input".into(), 0.0);
 
+    zeroclaw_config::migration::bind_test_route_model(
+        &mut cfg,
+        "anthropic.provider-b",
+        "claude-3-opus",
+        None,
+    );
     cfg.model_routes
         .push(zeroclaw_config::schema::ModelRouteConfig {
             hint: "req-b2-switch".into(),
-            model_provider: "anthropic.provider-b".into(),
-            model: "claude-3-opus".into(),
-            api_key: None,
+            model_ref: "anthropic.provider-b".into(),
         });
 
     let cfg_arc = Arc::new(cfg.clone());
@@ -4027,7 +4034,7 @@ async fn poisoned_model_switch_callback_still_raises_model_switch_requested() {
                 provider_name: "mock",
                 model: "mock-model",
                 dispatch_model: "mock-model",
-                temperature: None,
+                temperature: None.into(),
             },
             ResolvedIo {
                 tools_registry: &tools_registry,
@@ -4047,7 +4054,7 @@ async fn poisoned_model_switch_callback_still_raises_model_switch_requested() {
                 excluded_tools: &[],
                 dedup_exempt_tools: &[],
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 30_000,
                 keep_tool_context_turns: 2,

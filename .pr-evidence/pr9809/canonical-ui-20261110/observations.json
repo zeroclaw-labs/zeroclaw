@@ -1,0 +1,31 @@
+{
+  "viewportDesktop": [
+    1280,
+    900
+  ],
+  "viewportMobile": [
+    390,
+    844
+  ],
+  "locale": "en-US",
+  "backend": "isolated synthetic API fixtures; no real credentials",
+  "checks": [
+    "production bundle rendered in Chrome",
+    "select exact dotted key",
+    "clear and select single-part key",
+    "registry link opens Models tab preserving exact key",
+    "Azure resource required before staging new model",
+    "model costs without a unique reference open the Models tab",
+    "no browser page errors"
+  ],
+  "screenshots": [
+    "quickstart-azure-required.png",
+    "quickstart-desktop.png",
+    "quickstart-mobile.png",
+    "quickstart-selected.png",
+    "registry-desktop.png",
+    "registry-mobile.png"
+  ],
+  "web_tree": "a7e3f4bd91888d56633d5077a8a57e46a317ec0b",
+  "bundle_index_sha256": "be7712aa1e4a6154367e231effd8ad7d04d98ed2f7e48cf2da9a578fa59d1c22"
+}

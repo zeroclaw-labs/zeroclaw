@@ -519,7 +519,13 @@ pub fn section_for_path(path: &str) -> Option<Section> {
 
 pub fn section_has_signal(cfg: &crate::schema::Config, section: Section) -> bool {
     match section {
-        Section::ModelProviders => !cfg.providers.models.is_empty(),
+        Section::ModelProviders => {
+            !cfg.providers.models.is_empty()
+                || cfg
+                    .providers
+                    .models
+                    .has_canonical_capability(zeroclaw_api::capability::Capability::Chat)
+        }
         Section::Channels => cfg.prop_fields().iter().any(|f| {
             f.name
                 .strip_prefix("channels.")

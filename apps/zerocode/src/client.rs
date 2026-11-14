@@ -2390,6 +2390,25 @@ impl RpcClient {
 
     // ── Typed config helpers ─────────────────────────────────────
 
+    pub async fn provider_registry(&self) -> Result<Value> {
+        self.call("config/provider-registry", serde_json::json!({}))
+            .await
+    }
+
+    pub async fn set_provider_registry(
+        &self,
+        expected: &Value,
+        registry: &Value,
+    ) -> Result<Option<crate::wire::PublishedConfigRevision>> {
+        let result: ConfigSetResult = self
+            .call(
+                "config/provider-registry-set",
+                serde_json::json!({ "expected": expected, "registry": registry }),
+            )
+            .await?;
+        Ok(result.revision)
+    }
+
     pub async fn config_list(&self, prefix: Option<&str>) -> Result<Vec<ConfigFieldEntry>> {
         let result: ConfigListResult = self
             .call(method::CONFIG_LIST, serde_json::json!({ "prefix": prefix }))

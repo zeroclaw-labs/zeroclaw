@@ -67,12 +67,12 @@ pub async fn handle_catalog_models(
     State(state): State<AppState>,
     Query(q): Query<ModelsQuery>,
 ) -> Response {
-    let local = zeroclaw_runtime::quickstart::model_provider_is_local(&q.model_provider);
     let catalog_provider_ref = q.catalog_provider_ref();
     // Snapshot config so the catalog resolves the alias credential and can reach
     // the native /models endpoint (surfacing new native-only models that the
     // models.dev snapshot may not carry yet) instead of silently falling back.
     let cfg = state.config.read().clone();
+    let local = zeroclaw_runtime::quickstart::model_reference_is_local(&cfg, &catalog_provider_ref);
     let (models, pricing, live) =
         match zeroclaw_runtime::quickstart::model_catalog_with_config_result(
             Some(&cfg),
@@ -108,10 +108,21 @@ fn error_response(err: ConfigApiError) -> Response {
 
 #[must_use]
 pub fn derive_section_status(cfg: &zeroclaw_config::schema::Config) -> ConfigStatusResult {
+    #[cfg(test)]
+    let admitted_cfg;
+    #[cfg(test)]
+    let cfg = {
+        admitted_cfg = zeroclaw_config::migration::admit_test_input(cfg);
+        &admitted_cfg
+    };
     let missing = quickstart_missing_requirements(cfg);
     let ready = missing.is_empty();
     let has_partial_state = !cfg.onboard_state.completed_sections.is_empty()
-        || cfg.providers.models.iter_entries().next().is_some()
+        || cfg
+            .provider_registry()
+            .is_ok_and(|registry| !registry.models.is_empty())
+        || !cfg.providers.connections.is_empty()
+        || !cfg.providers.model_presets.is_empty()
         || !cfg.risk_profiles.is_empty()
         || !cfg.runtime_profiles.is_empty()
         || !cfg.agents.is_empty();
@@ -133,7 +144,12 @@ pub fn derive_section_status(cfg: &zeroclaw_config::schema::Config) -> ConfigSta
 
 fn quickstart_missing_requirements(cfg: &zeroclaw_config::schema::Config) -> Vec<String> {
     let mut missing = Vec::new();
-    if cfg.providers.models.iter_entries().next().is_none() {
+    if !cfg.provider_registry().is_ok_and(|registry| {
+        registry
+            .models
+            .values()
+            .any(|model| model.capability() == zeroclaw_api::capability::Capability::Chat)
+    }) {
         missing.push("Add a model provider.".to_string());
     }
     if cfg.agents.is_empty() {
@@ -171,18 +187,11 @@ fn quickstart_agent_missing_requirements(
     let model_ref = agent.model_provider.trim();
     if model_ref.is_empty() {
         missing.push(format!("Set a model provider for agent `{alias}`."));
-    } else if let Some((family, _, provider)) = cfg.resolved_model_provider_for_agent(alias) {
-        let has_model = provider
-            .model
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|m| !m.is_empty());
-        if !has_model {
+    } else if cfg.is_canonical_model_ref(model_ref) {
+        if cfg.resolve_model_id(model_ref).is_none() {
             missing.push(format!("Choose a model for model provider `{model_ref}`."));
-        } else if !model_provider_alias_usable(
-            provider,
-            zeroclaw_runtime::quickstart::model_provider_is_local(family),
-        ) {
+        } else if !zeroclaw_providers::model::selection_auth_ready(cfg, model_ref).unwrap_or(false)
+        {
             missing.push(format!(
                 "Set credential/auth for model provider `{model_ref}`."
             ));
@@ -325,6 +334,7 @@ pub async fn handle_sections(State(state): State<AppState>) -> Response {
     for s in zeroclaw_config::sections::QUICKSTART_SECTIONS {
         roots.insert(s.as_str().to_string());
     }
+    zeroclaw_runtime::rpc::types::project_provider_editor_sections(&mut roots);
 
     // Drop bare parent-segment entries when a dotted child is present
     // — `providers` is phantom once `providers.models` etc. are listed.
@@ -339,8 +349,8 @@ pub async fn handle_sections(State(state): State<AppState>) -> Response {
     let mut ordered: Vec<String> = roots.into_iter().collect();
     ordered.sort_by(|a, b| {
         match (
-            zeroclaw_config::sections::section_index_for_key(a),
-            zeroclaw_config::sections::section_index_for_key(b),
+            zeroclaw_runtime::rpc::types::config_editor_section_index(a),
+            zeroclaw_runtime::rpc::types::config_editor_section_index(b),
         ) {
             (Some(ai), Some(bi)) => ai.cmp(&bi),
             (Some(_), None) => std::cmp::Ordering::Less,
@@ -352,6 +362,9 @@ pub async fn handle_sections(State(state): State<AppState>) -> Response {
     let sections: Vec<ConfigSectionEntry> = ordered
         .into_iter()
         .map(|key| {
+            if key == "providers.registry" {
+                return zeroclaw_runtime::rpc::types::provider_registry_section(&cfg);
+            }
             let wizard = zeroclaw_config::sections::Section::from_key(&key);
             let has_picker = match wizard {
                 Some(w) => !matches!(
@@ -487,12 +500,34 @@ fn picker_items_for(
     use zeroclaw_config::sections::Section;
     match section {
         Section::ModelProviders => PickerDispatch::Items(providers_picker(cfg)),
-        // TTS / transcription share the typed-family two-tier shape. Each
-        // family enumerates its picker via `schema_walk_picker(<family>)`
-        // — the same machinery channels uses, so no per-section catalog
-        // table to drift.
-        Section::TtsProviders | Section::TranscriptionProviders => {
-            PickerDispatch::Items(schema_walk_picker(cfg, section.as_str()))
+        Section::TtsProviders | Section::TranscriptionProviders | Section::DecisionModels => {
+            let capability = if matches!(section, Section::TtsProviders) {
+                zeroclaw_api::capability::Capability::Tts
+            } else if matches!(section, Section::DecisionModels) {
+                zeroclaw_api::capability::Capability::Decision
+            } else {
+                zeroclaw_api::capability::Capability::Asr
+            };
+            let items = cfg
+                .provider_registry()
+                .map(|registry| {
+                    registry
+                        .models
+                        .iter()
+                        .filter(|(_, model)| model.capability() == capability)
+                        .map(|(reference, model)| PickerItem {
+                            key: reference.to_string(),
+                            label: reference.to_string(),
+                            description: registry
+                                .connections
+                                .get(model.provider())
+                                .map(|connection| connection.kind().to_owned()),
+                            badge: Some("configured".to_owned()),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            PickerDispatch::Items(items)
         }
         Section::Memory => PickerDispatch::Items(memory_picker(cfg)),
         Section::Channels => PickerDispatch::Items(schema_walk_picker(cfg, "channels")),
@@ -505,7 +540,6 @@ fn picker_items_for(
         // HashMap. Generic walker covers every section whose schema is
         // `<section>.<alias>` (operator-named keys, no closed kind set).
         Section::PeerGroups
-        | Section::DecisionModels
         | Section::Cron
         | Section::McpServers
         | Section::McpBundles
@@ -540,15 +574,32 @@ fn providers_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
 }
 
 fn any_usable_model_provider(cfg: &zeroclaw_config::schema::Config) -> bool {
-    cfg.providers
-        .models
-        .iter_entries()
-        .any(|(family, _, base)| {
-            model_provider_alias_usable(
-                base,
-                zeroclaw_runtime::quickstart::model_provider_is_local(family),
-            )
-        })
+    cfg.provider_registry().is_ok_and(|registry| {
+        registry
+            .models
+            .values()
+            .any(|model| canonical_chat_model_usable(model, &registry))
+    })
+}
+
+fn canonical_chat_model_usable(
+    model: &zeroclaw_config::provider_registry::ModelDefinition,
+    registry: &zeroclaw_config::provider_registry::ProviderRegistry,
+) -> bool {
+    use zeroclaw_api::capability::Capability;
+    model.capability() == Capability::Chat
+        && model
+            .upstream_model()
+            .is_some_and(|value| !value.trim().is_empty())
+        && registry
+            .connections
+            .get(model.provider())
+            .is_some_and(|connection| {
+                connection.supports(Capability::Chat)
+                    && (connection.has_secrets()
+                        || connection.uses_openai_codex_auth()
+                        || zeroclaw_runtime::quickstart::model_provider_is_local(connection.kind()))
+            })
 }
 
 fn provider_type_badge(
@@ -556,44 +607,29 @@ fn provider_type_badge(
     family: &str,
     local: bool,
 ) -> Option<String> {
-    let mut has_alias = false;
-    let mut has_usable_alias = false;
-    for (ty, _, base) in cfg.providers.models.iter_entries() {
-        if ty != family {
-            continue;
-        }
-        has_alias = true;
-        if model_provider_alias_usable(base, local) {
-            has_usable_alias = true;
-        }
-    }
-    if has_usable_alias {
-        Some("configured".to_string())
-    } else if has_alias {
-        Some("needs setup".to_string())
-    } else {
+    let _ = local;
+    let registry = cfg.provider_registry().ok()?;
+    let models: Vec<_> = registry
+        .models
+        .values()
+        .filter(|model| {
+            model.capability() == zeroclaw_api::capability::Capability::Chat
+                && registry
+                    .connections
+                    .get(model.provider())
+                    .is_some_and(|connection| connection.kind() == family)
+        })
+        .collect();
+    if models
+        .iter()
+        .any(|model| canonical_chat_model_usable(model, &registry))
+    {
+        Some("configured".to_owned())
+    } else if models.is_empty() {
         None
+    } else {
+        Some("needs setup".to_owned())
     }
-}
-
-fn model_provider_alias_usable(
-    base: &zeroclaw_config::schema::ModelProviderConfig,
-    local: bool,
-) -> bool {
-    let has_model = base
-        .model
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|model| !model.is_empty());
-    if !has_model {
-        return false;
-    }
-    base.api_key
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|key| !key.is_empty())
-        || base.requires_openai_auth
-        || local
 }
 
 fn storage_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
@@ -754,12 +790,15 @@ fn agents_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
 }
 
 fn apply_first_run_agent_defaults(cfg: &mut zeroclaw_config::schema::Config, alias: &str) {
-    let model_provider = cfg
-        .providers
-        .models
-        .iter_entries()
-        .next()
-        .map(|(ty, alias, _)| format!("{ty}.{alias}"));
+    #[cfg(test)]
+    zeroclaw_config::migration::normalize_test_input(cfg);
+    let model_provider = cfg.provider_registry().ok().and_then(|registry| {
+        registry
+            .models
+            .iter()
+            .find(|(_, model)| model.capability() == zeroclaw_api::capability::Capability::Chat)
+            .map(|(reference, _)| reference.to_string())
+    });
     let risk_profile = first_alias(cfg.risk_profiles.keys());
     let runtime_profile = first_alias(cfg.runtime_profiles.keys());
 
@@ -929,6 +968,15 @@ async fn select_section(
     };
 
     let (fields_prefix, created) = match section_enum {
+        Section::DecisionModels => {
+            return error_response(
+                ConfigApiError::new(
+                    ConfigApiCode::ValidationFailed,
+                    "configure decision models in the provider registry",
+                )
+                .with_path("providers.registry"),
+            );
+        }
         Section::ModelProviders | Section::TtsProviders | Section::TranscriptionProviders => {
             let family = section_enum.as_str();
             let created = working
@@ -984,7 +1032,6 @@ async fn select_section(
         }
         Section::Agents
         | Section::PeerGroups
-        | Section::DecisionModels
         | Section::Cron
         | Section::McpServers
         | Section::McpBundles
@@ -1246,19 +1293,20 @@ mod tests {
             zeroclaw_config::migration::CURRENT_SCHEMA_VERSION
         );
 
-        let provider = cfg
-            .providers
-            .models
-            .ollama
-            .get("default")
-            .expect("Ollama default provider must exist");
-        assert_eq!(provider.base.model.as_deref(), Some("llama3.2"));
+        let registry = cfg.provider_registry().expect("canonical registry");
+        let model = registry
+            .resolve_chat(&"ollama.default".into())
+            .expect("Ollama default model must exist");
+        assert_eq!(model.upstream_model(), Some("llama3.2"));
         assert_eq!(
-            provider.base.uri.as_deref(),
+            model.selection.connection.uri(),
             Some("http://host.docker.internal:11434")
         );
-        assert_eq!(provider.base.api_key, None);
-        assert_eq!(provider.base.temperature, Some(0.7));
+        assert_eq!(model.selection.connection.api_key(), None);
+        assert_eq!(
+            model.options.temperature,
+            Some(zeroclaw_config::provider_registry::Override::Set(0.7))
+        );
 
         let agent = cfg.agents.get("default").expect("default agent must exist");
         assert!(agent.enabled);
@@ -1347,9 +1395,13 @@ mod tests {
 
     #[test]
     fn build_agent_options_returns_every_configured_alias() {
-        let mut cfg = zeroclaw_config::schema::Config::default();
-        cfg.create_map_key("providers.models.anthropic", "default")
-            .unwrap();
+        let mut cfg = zeroclaw_config::schema::Config {
+            providers: serde_json::from_value(serde_json::json!({
+                "connections": {"gateway.prod": {"kind": "custom"}},
+                "models": {"chat.fast.us": {"capability": "chat", "provider": "gateway.prod", "model": "upstream"}},
+            })).unwrap(),
+            ..Default::default()
+        };
         cfg.create_map_key("risk_profiles", "alpha_risk").unwrap();
         cfg.create_map_key("runtime_profiles", "alpha_runtime")
             .unwrap();
@@ -1361,7 +1413,7 @@ mod tests {
 
         let resp = build_agent_options(&cfg);
 
-        assert_eq!(resp.model_providers, vec!["anthropic.default".to_string()]);
+        assert_eq!(resp.model_providers, vec!["chat.fast.us".to_string()]);
         assert_eq!(resp.risk_profiles, vec!["alpha_risk".to_string()]);
         assert_eq!(resp.runtime_profiles, vec!["alpha_runtime".to_string()]);
         assert_eq!(resp.skill_bundles, vec!["alpha_skills".to_string()]);
@@ -1409,8 +1461,16 @@ mod tests {
         assert!(resp.needs_quickstart);
         assert_eq!(resp.reason, "fresh_install");
 
-        cfg.create_map_key("providers.models.anthropic", "default")
-            .unwrap();
+        cfg.providers = toml::from_str(
+            r#"
+[connections.gateway]
+kind = "anthropic"
+[models."anthropic.default"]
+capability = "chat"
+provider = "gateway"
+"#,
+        )
+        .unwrap();
         let resp = derive_section_status(&cfg);
         assert!(
             resp.needs_quickstart,
@@ -1449,8 +1509,15 @@ mod tests {
                 .any(|m| m == "Choose a model for model provider `anthropic.default`.")
         );
 
-        cfg.set_prop("providers.models.anthropic.default.model", "claude-sonnet")
-            .unwrap();
+        let zeroclaw_config::provider_registry::ModelDefinition::Chat(model) = cfg
+            .providers
+            .models
+            .canonical_model_mut(&"anthropic.default".into())
+            .unwrap()
+        else {
+            panic!("fixture must contain a chat model");
+        };
+        model.model = Some("claude-sonnet".into());
         let resp = derive_section_status(&cfg);
         assert!(
             resp.needs_quickstart,
@@ -1462,8 +1529,13 @@ mod tests {
                 .any(|m| m == "Set credential/auth for model provider `anthropic.default`.")
         );
 
-        cfg.set_prop("providers.models.anthropic.default.api_key", "sk-test")
-            .unwrap();
+        cfg.providers.connections.insert(
+            "gateway".into(),
+            serde_json::from_value(serde_json::json!({
+                "kind": "anthropic", "auth": {"mode": "api_key", "api_key": "sk-test"}
+            }))
+            .unwrap(),
+        );
         let resp = derive_section_status(&cfg);
         assert!(!resp.needs_quickstart);
         assert_eq!(resp.reason, "has_dispatchable_agent");
@@ -1638,6 +1710,43 @@ mod tests {
     }
 
     #[test]
+    fn provider_registry_chat_readiness_does_not_require_legacy_profiles() {
+        let mut cfg = empty_cfg();
+        cfg.providers = toml::from_str(
+            r#"
+[connections."gateway.prod"]
+kind = "custom"
+auth = { mode = "api_key", api_key = "test-key" }
+[models."chat.fast.us"]
+capability = "chat"
+provider = "gateway.prod"
+model = "upstream-model"
+"#,
+        )
+        .unwrap();
+        assert!(any_usable_model_provider(&cfg));
+        assert_eq!(
+            provider_type_badge(&cfg, "custom", false).as_deref(),
+            Some("configured"),
+            "the provider picker derives readiness from canonical models"
+        );
+        assert!(
+            !quickstart_missing_requirements(&cfg)
+                .iter()
+                .any(|message| message == "Add a model provider.")
+        );
+        assert!(zeroclaw_config::sections::section_has_signal(
+            &cfg,
+            zeroclaw_config::sections::Section::ModelProviders
+        ));
+        cfg.providers.models = Default::default();
+        assert!(
+            derive_section_status(&cfg).has_partial_state,
+            "a saved connection is still partial setup state"
+        );
+    }
+
+    #[test]
     fn handle_sections_derives_every_top_level_field_from_schema() {
         // Regression: the section list must be schema-driven, not the old
         // hardcoded 6. Adding a new top-level field to `Config` should make
@@ -1697,6 +1806,15 @@ mod tests {
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let result: ConfigSectionsResult = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result.sections[0].key, "providers.registry");
+        for retired in [
+            "providers.models",
+            "providers.tts",
+            "providers.transcription",
+            "decision_models",
+        ] {
+            assert!(!result.sections.iter().any(|section| section.key == retired));
+        }
         let cron = result
             .sections
             .iter()

@@ -22,7 +22,7 @@ pub(crate) struct ResolvedVisionProvider {
 /// the direct factory.
 #[derive(Clone, Copy)]
 pub(crate) struct VisionProviderSource<'a> {
-    pub(crate) source: &'a dyn crate::composition::ProviderSource,
+    pub(crate) source: &'a Arc<dyn crate::composition::ProviderSource>,
     pub(crate) agent_alias: &'a str,
     pub(crate) principal: Option<&'a zeroclaw_api::principal::PrincipalId>,
 }
@@ -34,7 +34,7 @@ impl<'a> VisionProviderSource<'a> {
         agent_alias: &'a str,
     ) -> Self {
         Self {
-            source: binding.capabilities.providers.as_ref(),
+            source: &binding.capabilities.providers,
             agent_alias,
             principal: binding.principal.as_ref(),
         }
@@ -45,19 +45,7 @@ impl<'a> VisionProviderSource<'a> {
 /// vision factory reports it: `None` for a bare family, a colon ref, an alias
 /// with no configured entry, or an entry without a model.
 fn configured_route_model(config: &Config, provider_ref: &str) -> Option<String> {
-    let (family, alias) = provider_ref.split_once('.')?;
-    if family.contains(':') {
-        return None;
-    }
-    config
-        .providers
-        .models
-        .find(family, alias)?
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .map(ToString::to_string)
+    config.resolve_model_id(provider_ref)
 }
 
 /// The exact `file_read` read ledger for one image-marker path: the
@@ -121,9 +109,10 @@ pub(crate) async fn resolve_vision_provider_with_allowed_refs(
         && !model_provider.capabilities_for_model(dispatch_model).vision
     {
         if let Some(ref vp) = multimodal_config.vision_model_provider {
+            let policy_ref = vp.clone();
             let provider_allowed = allowed_provider_refs.map_or_else(
-                || zeroclaw_providers::reliable::provider_ref_allowed_for_turn(vp),
-                |allowed| allowed.contains(vp),
+                || zeroclaw_providers::reliable::provider_ref_allowed_for_turn(&policy_ref),
+                |allowed| allowed.contains(&policy_ref),
             );
             if !provider_allowed {
                 ::zeroclaw_log::record!(
@@ -144,7 +133,7 @@ pub(crate) async fn resolve_vision_provider_with_allowed_refs(
             // Resolve the configured vision provider through the alias-aware
             // factory so its per-alias `vision` override and typed config
             // (endpoint URI, credentials) are honored - the legacy
-            // `create_model_provider(vp, None)` passed `config = None` and could
+            // `create_model_provider(vp, None, &Default::default())` passed `config = None` and could
             // not see them, so a text-family alias forced to `vision = true`
             // for this route would have been ignored. `config` is `None` only on
             // configless (test-builder) agents - every production agent/loop path
@@ -159,34 +148,41 @@ pub(crate) async fn resolve_vision_provider_with_allowed_refs(
                 .as_deref()
                 .map(str::trim)
                 .filter(|model| !model.is_empty());
-            let (vp_instance, alias_model) = match (vision_source, config) {
-                (Some(vision_source), Some(config)) => {
-                    let alias_model = configured_route_model(config, vp);
-                    let requested_model = configured_vision_model
-                        .map(ToString::to_string)
-                        .or_else(|| alias_model.clone())
-                        .unwrap_or_else(|| model.to_string());
-                    vision_source
-                        .source
-                        .vision_model_provider(&crate::composition::ProviderRequest {
-                            config,
-                            agent_alias: vision_source.agent_alias,
-                            provider_ref: Some(vp),
-                            model: Some(&requested_model),
-                            principal: vision_source.principal,
-                        })
-                        .map(|provider| (Box::new(provider) as Box<dyn ModelProvider>, alias_model))
+            let route_ref = vp.clone();
+            let requested_model = configured_vision_model.map(str::to_owned);
+            let fallback_model = model.to_string();
+            let owned_config = config.map(|config| Arc::new(config.clone()));
+            let source = vision_source.map(|source| {
+                (
+                    Arc::clone(source.source),
+                    source.agent_alias.to_owned(),
+                    source.principal.cloned(),
+                )
+            });
+            let (vp_instance, alias_model) = zeroclaw_providers::model::build_nonblocking(move || {
+                match (source, owned_config) {
+                    (Some((source, agent_alias, principal)), Some(config)) => {
+                        let alias_model = configured_route_model(&config, &route_ref);
+                        let requested_model = requested_model.as_deref()
+                            .or(alias_model.as_deref()).unwrap_or(&fallback_model);
+                        source.vision_model_provider(&crate::composition::ProviderRequest {
+                            config: &config, agent_alias: &agent_alias,
+                            provider_ref: Some(&route_ref), model: Some(requested_model),
+                            principal: principal.as_ref(),
+                        }).map(|provider| (Box::new(provider) as Box<dyn ModelProvider>, alias_model))
+                    }
+                    (Some(_), None) => Err(anyhow::Error::msg(
+                        "a turn built from a provider source has no config to resolve its vision route",
+                    )),
+                    (None, Some(config)) => zeroclaw_providers::model::build_raw_provider(
+                        &config, &route_ref, zeroclaw_providers::model::ProviderOverrides {
+                            model: requested_model.as_deref(), ..Default::default()
+                        },
+                    ).map(|resolved| (resolved.provider, resolved.model)),
+                    (None, None) => zeroclaw_providers::create_model_provider(&route_ref, None, &Default::default())
+                        .map(|provider| (provider, None)),
                 }
-                (Some(_), None) => Err(anyhow::Error::msg(
-                    "a turn built from a provider source has no config to resolve its vision route",
-                )),
-                (None, Some(config)) => {
-                    zeroclaw_providers::create_model_provider_from_ref_with_model(config, vp)
-                        .map(|resolved| (resolved.provider, resolved.model))
-                }
-                (None, None) => zeroclaw_providers::create_model_provider(vp, None)
-                    .map(|provider| (provider, None)),
-            }
+            }).await
             .map_err(|error| {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -663,8 +659,7 @@ mod tests {
     /// (llama.cpp) is forced `vision = false` on its alias. With config threaded,
     /// the route builds it through the alias-aware factory, so the forced-off
     /// provider is honored as non-vision and the capability error surfaces -
-    /// proving the alias flag is read (the legacy `create_model_provider(vp,
-    /// None)` path ignored it entirely).
+    /// proving the alias flag is read (the legacy `create_model_provider(vp, /// None, &Default::default())` path ignored it entirely).
     #[tokio::test]
     async fn resolve_vision_provider_honors_configured_alias_vision_override() {
         use zeroclaw_config::schema::{Config, MultimodalConfig};

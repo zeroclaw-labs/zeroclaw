@@ -39,6 +39,10 @@ The kernel ABI. Defines the core public traits, including:
 - `Tool`: agent-callable capabilities
 - `Memory`: conversation storage and retrieval
 - `Observer`: typed metrics/observability sink
+- `AsrProvider`, `TtsProvider`, `EmbeddingProvider`, and `DecisionModel`: provider-neutral
+  capability contracts used by the runtime, memory, and channel consumers
+- `Capability`: the shared provider-surface identifier used by config and provider
+  resolution
 
 The runtime depends only on these traits, not on concrete implementations. This is what makes provider/channel/tool additions a matter of implementing a trait rather than patching the core.
 
@@ -58,9 +62,16 @@ All LLM client implementations plus the routing and retry wrappers. See [Model P
 
 Structure:
 
-- `traits.rs`: re-exports from `zeroclaw-api` plus provider-internal helpers
+- `traits.rs`: model-provider contracts re-exported from `zeroclaw-api` plus
+  provider-internal helpers
 - `anthropic.rs`, `openai.rs`, `ollama.rs`, …: one file per native provider
 - `compatible.rs`: a single OpenAI-compatible implementation reused by 20+ providers (Groq, Mistral, xAI, Venice, etc.)
+- `tts.rs`, `transcription.rs`, `embedding.rs`, `decision.rs`: capability
+  factories and vendor adapters. Shared OpenAI-compatible wire construction
+  consumes resolved transport settings; vendor-specific adapters own only their
+  protocol fields and authentication details.
+- `transport.rs`: the common resolved HTTP transport used by capability
+  adapters. Consumers never rebuild provider URLs, credentials, or headers.
 - `router.rs`: hint-based per-call model route selection
 - `reliable.rs`: retry / backoff / cooldown and ordered model-provider fallback wrapper
 - `streaming.rs`: SSE parsing, token estimation, tool-call deltas
@@ -69,7 +80,9 @@ Structure:
 
 30+ messaging integrations. See [Channels → Overview](../channels/overview.md) for the catalogue.
 
-All channels implement the `Channel` trait from `zeroclaw-api`. Each is feature-gated, a minimal build includes only the channels you compile in.
+All channels implement the `Channel` trait from `zeroclaw-api`. Each is feature-gated, a minimal build includes only the channels you compile in. Channels consume
+provider managers through `zeroclaw-providers`; they do not own speech or decision
+provider implementations.
 
 The `orchestrator/` submodule handles message streaming, draft updates, multi-message splits, and the ACP server.
 
@@ -98,7 +111,8 @@ Each tool is registered via factory and described to the model via Fluent-locali
 
 Conversation memory and retrieval. SQLite is the default backend; PostgreSQL is available behind `--features memory-postgres` for multi-instance deployments that need a shared, concurrent-write store. Optional:
 
-- Embedding backends (OpenAI, Ollama, local)
+- Embedding consumers and identity reconciliation; concrete embedding providers
+  live in `zeroclaw-providers`
 - Vector retrieval over stored conversations (pgvector when on PostgreSQL)
 - Memory consolidation (summaries, fact extraction)
 

@@ -138,14 +138,7 @@ fn target_memory_backend(config: &Config) -> Result<Box<dyn Memory>> {
 /// embedding-route handling, so `migrate openclaw --reindex` is equivalent to
 /// running the standalone reindex command right after the import.
 fn reindex_memory_backend(config: &Config) -> Result<Box<dyn Memory>> {
-    zeroclaw_memory::create_memory_with_storage_and_routes(
-        &config.memory,
-        &config.embedding_routes,
-        config.resolve_active_storage(),
-        &config.data_dir,
-        None,
-        Some(&config.providers.models),
-    )
+    zeroclaw_memory::create_memory_from_config(config)
 }
 
 fn collect_source_entries(
@@ -607,6 +600,62 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].key, "reindex_key");
+    }
+
+    #[tokio::test]
+    async fn migration_reindex_uses_the_canonical_embedding_model() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let target = TempDir::new().unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .and(body_partial_json(
+                serde_json::json!({"model": "embedding-test"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"embedding": [0.1, 0.2], "index": 0}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = test_config(target.path());
+        config.providers = toml::from_str(&format!(
+            r#"
+[connections."embedding.gateway.prod"]
+kind = "custom"
+uri = "{}/v1"
+[models."embedding.search.prod"]
+capability = "embedding"
+provider = "embedding.gateway.prod"
+model = "embedding-test"
+[models."embedding.search.prod".metadata]
+dimensions = 2
+"#,
+            server.uri()
+        ))
+        .unwrap();
+        config.memory.embedding_provider = "none".into();
+        config.memory.embedding_model_ref = Some("embedding.search.prod".into());
+        let imported = SqliteMemory::new("test", target.path()).unwrap();
+        imported
+            .store("imported", "historical content", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        drop(imported);
+
+        let memory = reindex_memory_backend(&config).unwrap();
+        assert_eq!(memory.reindex().await.unwrap(), 1);
+        let conn = Connection::open(target.path().join("memory/brain.db")).unwrap();
+        let embedded: bool = conn
+            .query_row(
+                "SELECT embedding IS NOT NULL FROM memories WHERE key = 'imported'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(embedded);
     }
 
     #[tokio::test]

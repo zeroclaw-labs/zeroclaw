@@ -33,6 +33,9 @@ pub struct OpenAiModelProvider {
     credential: Option<String>,
     max_tokens: Option<u32>,
     timeout_secs: u64,
+    timeout_disabled: bool,
+    read_timeout_secs: Option<u64>,
+    read_timeout_disabled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -73,11 +76,11 @@ impl ResponseMessage {
     }
 }
 
-/// String-only completions have no native tool-call escape hatch. An empty or
-/// reasoning-only result is therefore a typed terminal failure, not a valid
-/// string result for direct callers that do not use the structured chat API.
+/// Check the wire result without interpreting model-specific text syntax.
+/// Reliable normalizes it using the configured candidate reference; the
+/// upstream model ID is not a configuration key.
 fn require_terminal_text(content: String) -> anyhow::Result<String> {
-    if zeroclaw_api::model_provider::strip_think_tags(&content).is_empty() {
+    if content.trim().is_empty() {
         return Err(anyhow::Error::new(
             zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
         ));
@@ -245,6 +248,9 @@ pub struct OpenAiBuilder {
     single_tool_rounds_supported: bool,
     max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
+    timeout_disabled: bool,
+    read_timeout_secs: Option<u64>,
+    read_timeout_disabled: bool,
 }
 
 impl OpenAiBuilder {
@@ -290,6 +296,23 @@ impl OpenAiBuilder {
         self
     }
 
+    pub(crate) fn without_timeout(mut self) -> Self {
+        self.timeout_disabled = true;
+        self
+    }
+
+    pub(crate) fn read_timeout_secs(mut self, secs: u64) -> Self {
+        if secs > 0 {
+            self.read_timeout_secs = Some(secs);
+        }
+        self
+    }
+
+    pub(crate) fn without_read_timeout(mut self) -> Self {
+        self.read_timeout_disabled = true;
+        self
+    }
+
     pub fn build(self) -> OpenAiModelProvider {
         OpenAiModelProvider {
             alias: self.alias,
@@ -299,6 +322,9 @@ impl OpenAiBuilder {
             credential: self.credential,
             max_tokens: self.max_tokens,
             timeout_secs: self.timeout_secs.unwrap_or(120),
+            timeout_disabled: self.timeout_disabled,
+            read_timeout_secs: self.read_timeout_secs,
+            read_timeout_disabled: self.read_timeout_disabled,
         }
     }
 }
@@ -315,6 +341,9 @@ impl OpenAiModelProvider {
             single_tool_rounds_supported: false,
             max_tokens: None,
             timeout_secs: None,
+            timeout_disabled: false,
+            read_timeout_secs: None,
+            read_timeout_disabled: false,
         }
     }
 
@@ -466,11 +495,20 @@ impl OpenAiModelProvider {
     }
 
     fn http_client(&self) -> Client {
-        zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
+        let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+        if !self.timeout_disabled {
+            builder = builder.timeout(std::time::Duration::from_secs(self.timeout_secs));
+        }
+        if !self.read_timeout_disabled
+            && let Some(read_timeout) = self.read_timeout_secs
+        {
+            builder = builder.read_timeout(std::time::Duration::from_secs(read_timeout));
+        }
+        let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+            builder,
             "model_provider.openai",
-            self.timeout_secs,
-            10,
-        )
+        );
+        builder.build().unwrap_or_else(|_| Client::new())
     }
 }
 
@@ -883,24 +921,24 @@ fn extract_responses_api_tool_calls(body: &ResponsesApiBody) -> Vec<ProviderTool
 
 /// Drive a Responses API SSE connection to completion, emitting events on `tx`.
 /// `request_builder` must already have URL, auth headers, `Accept: text/event-stream`,
-/// and the JSON body attached. `idle_timeout` is the streaming client's
-/// read-idle bound; it names the bound that fired in timeout errors, including
-/// whether `timeout_secs` can raise it. Sends `StreamEvent::Final` on clean
-/// stream end.
+/// and the JSON body attached. `timeouts` describes the same deadlines used by
+/// that client, so errors identify the setting that fired. Sends
+/// `StreamEvent::Final` on clean stream end.
 pub(crate) async fn run_responses_sse(
     request_builder: reqwest::RequestBuilder,
     tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
     count_tokens: bool,
-    idle_timeout: super::StreamIdleBound,
+    timeouts: super::StreamTimeouts,
 ) {
+    let timeouts = timeouts.start();
     let http_response = match request_builder.send().await {
         Ok(r) => r,
         Err(err) => {
             let _ = tx
                 .send(Err(if err.is_connect() {
-                    StreamError::ConnectFailed(super::stream_idle_error_message(&err, idle_timeout))
+                    StreamError::ConnectFailed(timeouts.error_message(&err))
                 } else {
-                    StreamError::ModelProvider(super::stream_idle_error_message(&err, idle_timeout))
+                    StreamError::ModelProvider(timeouts.error_message(&err))
                 }))
                 .await;
             return;
@@ -939,7 +977,7 @@ pub(crate) async fn run_responses_sse(
             Some(Err(err)) => {
                 let _ = tx
                     .send(Err(StreamError::ModelProvider(
-                        super::stream_idle_error_message(&err, idle_timeout),
+                        timeouts.error_message(&err),
                     )))
                     .await;
                 return;
@@ -1020,14 +1058,15 @@ pub struct OpenAiResponsesModelProvider {
     credential: Option<String>,
     max_tokens: Option<u32>,
     reasoning_effort: Option<String>,
-    /// HTTP request timeout in seconds for non-streaming LLM API calls.
-    /// Streaming SSE calls use `streaming_client`, which sets no overall
-    /// timeout (long-running responses aren't killed mid-stream) and derives
-    /// its read-idle bound as `max(300 s, timeout_secs)` via
-    /// `stream_idle_timeout`: the 300 s floor applies when this field is
-    /// unset or lower, and a higher value raises the idle bound to match.
+    /// HTTP total deadline. The default applies to non-streaming calls;
+    /// streaming applies it only when explicitly configured. Read-idle
+    /// protection is configured separately by canonical API options.
     /// Default: 120 (matches `OpenAiCompatibleModelProvider`).
     timeout_secs: u64,
+    timeout_configured: bool,
+    timeout_disabled: bool,
+    read_timeout_secs: Option<u64>,
+    read_timeout_disabled: bool,
     extra_headers: std::collections::HashMap<String, String>,
 }
 
@@ -1049,6 +1088,9 @@ pub struct OpenAiResponsesBuilder {
     max_tokens: Option<u32>,
     reasoning_effort: Option<String>,
     timeout_secs: Option<u64>,
+    timeout_disabled: bool,
+    read_timeout_secs: Option<u64>,
+    read_timeout_disabled: bool,
     extra_headers: std::collections::HashMap<String, String>,
 }
 
@@ -1085,7 +1127,7 @@ impl OpenAiResponsesBuilder {
         self
     }
 
-    /// Override the non-streaming HTTP request timeout. Values of 0 are
+    /// Override the total HTTP request timeout, including streaming. Values of 0 are
     /// ignored (the default 120 s is kept) so a stray `Some(0)` from
     /// config cannot silently disable the safety timeout — same guard
     /// applied by [`OpenAiBuilder::timeout_secs`],
@@ -1095,6 +1137,23 @@ impl OpenAiResponsesBuilder {
         if secs > 0 {
             self.timeout_secs = Some(secs);
         }
+        self
+    }
+
+    pub(crate) fn without_timeout(mut self) -> Self {
+        self.timeout_disabled = true;
+        self
+    }
+
+    pub(crate) fn read_timeout_secs(mut self, secs: u64) -> Self {
+        if secs > 0 {
+            self.read_timeout_secs = Some(secs);
+        }
+        self
+    }
+
+    pub(crate) fn without_read_timeout(mut self) -> Self {
+        self.read_timeout_disabled = true;
         self
     }
 
@@ -1127,6 +1186,10 @@ impl OpenAiResponsesBuilder {
             max_tokens: self.max_tokens,
             reasoning_effort: self.reasoning_effort,
             timeout_secs: self.timeout_secs.unwrap_or(120),
+            timeout_configured: self.timeout_secs.is_some(),
+            timeout_disabled: self.timeout_disabled,
+            read_timeout_secs: self.read_timeout_secs,
+            read_timeout_disabled: self.read_timeout_disabled,
             extra_headers: self.extra_headers,
         }
     }
@@ -1144,6 +1207,9 @@ impl OpenAiResponsesModelProvider {
             max_tokens: None,
             reasoning_effort: None,
             timeout_secs: None,
+            timeout_disabled: false,
+            read_timeout_secs: None,
+            read_timeout_disabled: false,
             extra_headers: std::collections::HashMap::new(),
         }
     }
@@ -1245,9 +1311,15 @@ impl OpenAiResponsesModelProvider {
 
     fn http_client(&self) -> Client {
         let default_headers = self.build_default_headers();
-        let mut builder = Client::builder()
-            .timeout(std::time::Duration::from_secs(self.timeout_secs))
-            .connect_timeout(std::time::Duration::from_secs(10));
+        let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+        if !self.timeout_disabled {
+            builder = builder.timeout(std::time::Duration::from_secs(self.timeout_secs));
+        }
+        if !self.read_timeout_disabled
+            && let Some(read_timeout) = self.read_timeout_secs
+        {
+            builder = builder.read_timeout(std::time::Duration::from_secs(read_timeout));
+        }
         if !default_headers.is_empty() {
             builder = builder.default_headers(default_headers);
         }
@@ -1273,11 +1345,29 @@ impl OpenAiResponsesModelProvider {
         format!("{base}/models")
     }
 
+    fn streaming_timeouts(&self) -> super::StreamTimeouts {
+        super::StreamTimeouts {
+            request: (self.timeout_configured && !self.timeout_disabled)
+                .then(|| std::time::Duration::from_secs(self.timeout_secs)),
+            read: (!self.read_timeout_disabled).then(|| {
+                self.read_timeout_secs.map_or_else(
+                    || super::stream_idle_timeout(self.timeout_secs),
+                    |secs| super::StreamIdleBound::Read(std::time::Duration::from_secs(secs)),
+                )
+            }),
+        }
+    }
+
     fn streaming_client(&self) -> Client {
         let default_headers = self.build_default_headers();
-        let mut builder = Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .read_timeout(super::stream_idle_timeout(self.timeout_secs).duration());
+        let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+        let timeouts = self.streaming_timeouts();
+        if let Some(timeout) = timeouts.request {
+            builder = builder.timeout(timeout);
+        }
+        if let Some(timeout) = timeouts.read {
+            builder = builder.read_timeout(timeout.duration());
+        }
         if !default_headers.is_empty() {
             builder = builder.default_headers(default_headers);
         }
@@ -1521,7 +1611,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         let reasoning_effort = self.reasoning_effort.clone();
         let max_tokens = self.max_tokens;
         let client = self.streaming_client();
-        let idle_timeout = super::stream_idle_timeout(self.timeout_secs);
+        let timeouts = self.streaming_timeouts();
         let alias = ::zeroclaw_log::debug_enabled().then(|| self.alias.clone());
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
@@ -1579,7 +1669,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
             }
             let request_builder = request_builder.json(&req);
 
-            run_responses_sse(request_builder, &tx, count_tokens, idle_timeout).await;
+            run_responses_sse(request_builder, &tx, count_tokens, timeouts).await;
         });
 
         let guard = AbortOnDrop::new(handle.abort_handle());
@@ -1820,6 +1910,39 @@ mod tool_round_policy_tests {
         policy: Option<ToolRoundPolicy>,
         tool_shape: u8,
     ) -> serde_json::Value {
+        wire_body_with_sampling(wire, streaming, policy, tool_shape, None).await
+    }
+
+    #[tokio::test]
+    async fn selected_sampling_and_single_tool_round_policy_reach_the_same_wire_call() {
+        use zeroclaw_api::model_provider::CallSampling;
+        for streaming in [false, true] {
+            let sampled = wire_body_with_sampling(
+                0,
+                streaming,
+                Some(ToolRoundPolicy::Single),
+                2,
+                Some(CallSampling::for_selection(Some(0.9), |reference| {
+                    Some(if reference == "openai.fixture.selected" {
+                        0.2
+                    } else {
+                        0.9
+                    })
+                })),
+            )
+            .await;
+            assert_eq!(sampled["temperature"], 0.2);
+            assert_eq!(sampled["parallel_tool_calls"], false);
+        }
+    }
+
+    async fn wire_body_with_sampling(
+        wire: u8,
+        streaming: bool,
+        policy: Option<ToolRoundPolicy>,
+        tool_shape: u8,
+        sampling: Option<zeroclaw_api::model_provider::CallSampling>,
+    ) -> serde_json::Value {
         let captured = Arc::new(Mutex::new(None));
         let capture = Arc::clone(&captured);
         let path = match wire {
@@ -1885,6 +2008,24 @@ mod tool_round_policy_tests {
         let provider: Box<dyn ModelProvider> = Box::new(
             crate::vision_override::VisionOverrideProvider::new(Box::new(provider), true),
         );
+        let provider: Box<dyn ModelProvider> = if sampling.is_some() {
+            Box::new(crate::reliable::ReliableModelProvider::new_with_entries(
+                "reliable",
+                vec![
+                    crate::reliable::ReliableModelProviderEntry::new_with_candidate(
+                        "fixture",
+                        "openai.fixture",
+                        "openai.fixture",
+                        provider,
+                    )
+                    .with_selection_ref("openai.fixture.selected"),
+                ],
+                0,
+                1,
+            ))
+        } else {
+            provider
+        };
         let provider: Box<dyn ModelProvider> = if wire == 0 && streaming {
             Box::new(crate::router::RouterModelProvider::new(
                 "synthetic",
@@ -1923,15 +2064,23 @@ mod tool_round_policy_tests {
         };
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             if streaming {
-                let mut stream = match policy {
-                    Some(policy) => dispatch.stream_chat_with_tool_round_policy(
+                let mut stream = match (policy, sampling) {
+                    (Some(policy), Some(sampling)) => dispatch
+                        .stream_chat_with_sampling_and_tool_round_policy(
+                            request,
+                            "ignored",
+                            sampling,
+                            StreamOptions::new(true),
+                            policy,
+                        ),
+                    (Some(policy), None) => dispatch.stream_chat_with_tool_round_policy(
                         request,
                         "ignored",
                         None,
                         StreamOptions::new(true),
                         policy,
                     ),
-                    None => {
+                    (None, _) => {
                         dispatch.stream_chat(request, "ignored", None, StreamOptions::new(true))
                     }
                 };
@@ -1944,12 +2093,18 @@ mod tool_round_policy_tests {
                 }
                 assert!(final_seen);
             } else {
-                match policy {
-                    Some(policy) => dispatch
+                match (policy, sampling) {
+                    (Some(policy), Some(sampling)) => dispatch
+                        .chat_with_sampling_and_tool_round_policy(
+                            request, "ignored", sampling, policy,
+                        )
+                        .await
+                        .unwrap(),
+                    (Some(policy), None) => dispatch
                         .chat_with_tool_round_policy(request, "ignored", None, policy)
                         .await
                         .unwrap(),
-                    None => dispatch.chat(request, "ignored", None).await.unwrap(),
+                    (None, _) => dispatch.chat(request, "ignored", None).await.unwrap(),
                 };
             }
         })
@@ -2252,7 +2407,7 @@ mod tests {
                 request,
                 &tx,
                 false,
-                crate::StreamIdleBound::Fixed(crate::STREAM_IDLE_TIMEOUT),
+                crate::StreamIdleBound::Fixed(crate::STREAM_IDLE_TIMEOUT).into(),
             ),
         )
         .await
@@ -2929,14 +3084,15 @@ mod tests {
     }
 
     #[test]
-    fn string_completion_rejects_empty_and_think_only_text() {
-        for text in ["", "  \n", "<think>internal reasoning</think>"] {
+    fn string_completion_rejects_only_unconditionally_empty_text() {
+        for text in ["", "  \n"] {
             let error = require_terminal_text(text.to_string())
                 .expect_err("a string-only semantic-empty completion must fail");
             assert!(error.chain().any(|cause| {
                 cause.is::<zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion>()
             }));
         }
+        assert!(require_terminal_text("<think>internal reasoning</think>".to_string()).is_ok());
     }
 
     #[test]
@@ -2945,6 +3101,111 @@ mod tests {
             require_terminal_text("final answer".to_string()).unwrap(),
             "final answer"
         );
+    }
+
+    #[tokio::test]
+    async fn responses_streaming_client_keeps_total_and_idle_deadlines_independent() {
+        use axum::{Router, body::Body, routing::post};
+        use futures_util::StreamExt as _;
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new().route(
+            "/responses",
+            post(|| async {
+                let first = futures_util::stream::once(async {
+                    Ok::<_, std::convert::Infallible>(
+                        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"first\"}\n\n",
+                    )
+                });
+                let second = futures_util::stream::once(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+                    Ok::<_, std::convert::Infallible>(
+                        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"second\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n",
+                    )
+                });
+                Body::from_stream(first.chain(second))
+            }),
+        );
+        let server =
+            zeroclaw_spawn::spawn!(async move { axum::serve(listener, app).await.unwrap() });
+        for deadline in [
+            "inherit",
+            "finite",
+            "clear",
+            "idle",
+            "read_before_total",
+            "total_without_read",
+        ] {
+            let mut builder = OpenAiResponsesModelProvider::builder("test")
+                .api_url(&url)
+                .credential(Some("fixture-key"));
+            if deadline != "inherit" {
+                builder = builder.timeout_secs(if deadline == "read_before_total" {
+                    3
+                } else {
+                    1
+                });
+            }
+            if matches!(deadline, "clear" | "idle") {
+                builder = builder.without_timeout();
+            }
+            builder = if deadline == "finite" {
+                builder.read_timeout_secs(3)
+            } else if matches!(deadline, "idle" | "read_before_total") {
+                builder.read_timeout_secs(1)
+            } else {
+                builder.without_read_timeout()
+            };
+            let provider = builder.build();
+            let messages = [crate::traits::ChatMessage::user("hi")];
+            let mut stream = provider.stream_chat(
+                crate::traits::ChatRequest::new(&messages),
+                "gpt-test",
+                None,
+                crate::traits::StreamOptions::new(true),
+            );
+            let mut text = String::new();
+            let mut error = None;
+            let mut saw_final = false;
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while let Some(event) = stream.next().await {
+                    match event {
+                        Ok(StreamEvent::TextDelta(chunk)) => text.push_str(&chunk.delta),
+                        Ok(StreamEvent::Final) => saw_final = true,
+                        Err(cause) => error = Some(cause.to_string()),
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("stream must complete or report its configured deadline");
+            match deadline {
+                "finite" | "total_without_read" => {
+                    let message = error.expect("total deadline must expire");
+                    assert!(message.contains("request_timeout_secs"), "{message}");
+                    assert!(!message.contains("no data from provider"), "{message}");
+                    assert!(!message.contains("read_timeout_secs"), "{message}");
+                    assert!(!saw_final);
+                }
+                "idle" | "read_before_total" => {
+                    let message = error.expect("read deadline must expire");
+                    assert!(
+                        message.contains("no data from provider for 1s"),
+                        "{message}"
+                    );
+                    assert!(message.contains("read_timeout_secs"), "{message}");
+                    assert!(!message.contains("request_timeout_secs"), "{message}");
+                    assert!(!saw_final);
+                }
+                _ => {
+                    assert!(error.is_none(), "{deadline}: {error:?}");
+                    assert_eq!(text, "firstsecond");
+                    assert!(saw_final);
+                }
+            }
+        }
+        server.abort();
     }
 
     #[test]
@@ -3780,7 +4041,7 @@ mod tests {
                 request,
                 &tx,
                 false,
-                crate::StreamIdleBound::Configurable(crate::STREAM_IDLE_TIMEOUT),
+                crate::StreamIdleBound::Read(std::time::Duration::from_millis(100)).into(),
             ),
         )
         .await
@@ -3797,7 +4058,7 @@ mod tests {
             Ok(_) => panic!("expected an error from the stalled Responses stream"),
         };
         assert!(
-            message.contains("no data from provider for 300s"),
+            message.contains("no data from provider for 0.1s"),
             "idle message must name the bound that fired: {message}"
         );
         assert!(
@@ -3805,7 +4066,7 @@ mod tests {
             "idle message must name the idle timeout: {message}"
         );
         assert!(
-            message.contains("raise timeout_secs above 300s"),
+            message.contains("increase read_timeout_secs"),
             "idle message must name the knob that raises the bound: {message}"
         );
     }

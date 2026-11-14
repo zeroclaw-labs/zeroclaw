@@ -8,23 +8,33 @@ Why "model" provider? We use the phrase "model provider" consistently, there are
 
 ## Configuration shape
 
-Providers are typed by family, addressed as `providers.models.<type>.<alias>`. `<type>` is a canonical family slot (see the [Catalog](./catalog.md#all-slots) for every slot). There is one slot per vendor, with no synonyms: `azure_openai`, `azure-openai`, and `claude` (for Anthropic) are not accepted.
+Providers are reusable connections, addressed by an exact name under
+`providers.connections`. Models are independent named entries under
+`providers.models`; each model points at one connection and declares its
+capability and model identifier. A model reference is an opaque key, so dots
+inside a name are preserved and never interpreted as path separators. See the
+[configuration guide](./configuration.md#canonical-connections-and-models) for
+the complete shape.
 
-`<alias>` is your operator-assigned instance name, and you can define **as many aliases per type as you want**. Run several profiles of the same vendor family side by side: same `type`, different aliases, each with its own key, model, and settings. For example, two Anthropic accounts as `anthropic.personal` and `anthropic.work` (each with its own `api_key` and `model`), where an agent picks one with `model_provider = "anthropic.personal"` (or `"anthropic.work"`). Add and edit these through the surfaces below, not by hand:
+Connections can be reused by any number of model entries, and model names are
+opaque exact keys. Add and edit registry entries through the registry API or
+the Web/Zerocode provider editor. The old family/profile tables are accepted
+only while loading and migrating an older configuration file.
 
-{{#config-where providers.models}}
+See [Configuration](./configuration.md) for the full schema and [Catalog](./catalog.md) for provider capabilities.
 
-See [Configuration](./configuration.md) for the full schema and [Catalog](./catalog.md) for a worked example per family.
-
-## Per-agent dispatch: there are no global defaults
+## Per-agent dispatch
 
 A provider entry on its own does nothing. To use it, an agent references it by `model_provider` (along with a `risk_profile` and optional `runtime_profile`). `risk_profile` and `runtime_profile` reference independent alias maps, so their names need not match. `Config::validate()` fails loud at startup if any reference doesn't resolve. Every callsite picks a configured alias or opts out; there is no global "default provider" or "default model" knob.
 
 For multi-agent deployments, give each agent its own `model_provider`. Channels that ingest messages bind to one agent at a time via the agent's `channels` list; see [Channels](../channels/overview.md) for the full picture.
 
-## Per-agent voice (TTS) and transcription
+## Speech models
 
-Voice synthesis and speech-to-text follow the same pattern: a typed-family provider entry, then a per-agent reference. There are no global TTS or transcription selector fields. Each agent that wants voice sets its own routing.
+Voice synthesis and speech-to-text use the same reusable connection/model
+registry. Define a `tts` or `asr` model with an exact model reference and point
+the agent or channel at that reference. There are no global TTS or
+transcription selector fields; each consumer chooses its own capability model.
 
 ## Where to next
 

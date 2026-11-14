@@ -2436,31 +2436,28 @@ mod tests {
         let mut config = builtin_deferral_config(true);
         config.tools.optional.push("memory_export".into());
         let security = Arc::new(SecurityPolicy::default());
-        let mut built = tools::all_tools_with_runtime_context(
-            Arc::new(config.clone()),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "default",
-            Arc::new(crate::platform::NativeRuntime::new()),
-            Arc::clone(&original),
-            None,
-            None,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &security.workspace_dir,
-            &config.agents,
-            None,
-            &config,
-            None,
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        let mut built = {
+            let registry_config = Arc::new(config.clone());
+            let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
+                Arc::new(crate::platform::NativeRuntime::new());
+            let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> =
+                Arc::clone(&original);
+            let registry_request = crate::composition::ToolRequest {
+                config: &registry_config,
+                agent_alias: "default",
+                security: &security,
+                runtime: &registry_runtime,
+                memory: &registry_memory,
+            };
+            let registry_inputs = crate::composition::NativeRecipeInputs::new(
+                &registry_request,
+                &security.workspace_dir,
+            );
+            crate::tools::build_native_registry(
+                registry_inputs,
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )
+        }
         .unwrap();
         built.tools.retain(|tool| tool.name() == "memory_export");
         let mut assembled = assemble_builtin_catalog(&config, &security, built, None, false).await;
@@ -2696,31 +2693,28 @@ mod tests {
             always: false,
             location: None,
         };
-        let built = tools::all_tools_with_runtime_context(
-            Arc::new(config.clone()),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "default",
-            Arc::new(crate::platform::NativeRuntime::new()),
-            Arc::clone(&original),
-            None,
-            None,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &security.workspace_dir,
-            &config.agents,
-            None,
-            &config,
-            None,
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        let built = {
+            let registry_config = Arc::new(config.clone());
+            let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
+                Arc::new(crate::platform::NativeRuntime::new());
+            let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> =
+                Arc::clone(&original);
+            let registry_request = crate::composition::ToolRequest {
+                config: &registry_config,
+                agent_alias: "default",
+                security: &security,
+                runtime: &registry_runtime,
+                memory: &registry_memory,
+            };
+            let registry_inputs = crate::composition::NativeRecipeInputs::new(
+                &registry_request,
+                &security.workspace_dir,
+            );
+            crate::tools::build_native_registry(
+                registry_inputs,
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )
+        }
         .unwrap();
         let parent = Arc::clone(built.delegate_handle.as_ref().unwrap());
         let before = parent.read().clone();

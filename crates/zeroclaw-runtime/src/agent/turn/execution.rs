@@ -29,7 +29,8 @@ pub struct ResolvedModelAccess<'a> {
     /// Selector sent to `model_provider`. Routed providers may require a
     /// `hint:<name>` selector even though `model` records the resolved model.
     pub dispatch_model: &'a str,
-    pub temperature: Option<f64>,
+    /// Explicit invocation override plus thinking adjustment; Config owns defaults.
+    pub temperature: zeroclaw_providers::temperature::Temperature,
 }
 
 /// Owned per-attempt usage summary for a finished `run_model_query` call.
@@ -79,6 +80,20 @@ impl ResolvedModelAccess<'_> {
         request: ChatRequest<'_>,
         settled_out: &mut Vec<SettledAttemptSummary>,
     ) -> anyhow::Result<ChatResponse> {
+        self.run_model_query_with_sampling(
+            request,
+            settled_out,
+            self.temperature.resolve(None, self.provider_name).into(),
+        )
+        .await
+    }
+
+    pub async fn run_model_query_with_sampling(
+        &self,
+        request: ChatRequest<'_>,
+        settled_out: &mut Vec<SettledAttemptSummary>,
+        sampling: zeroclaw_api::model_provider::CallSampling,
+    ) -> anyhow::Result<ChatResponse> {
         // Fail closed before spending a provider call when the enclosing turn's
         // cost budget is already exhausted. No-op when unscoped.
         crate::agent::turn::provider_call::enforce_tool_loop_budget()?;
@@ -114,7 +129,11 @@ impl ResolvedModelAccess<'_> {
             .scope(with_exact_dispatch_route(
                 self.provider_name.to_string(),
                 self.model.to_string(),
-                dispatcher.chat(request, self.dispatch_model, self.temperature),
+                dispatcher.chat_with_sampling(
+                    request,
+                    self.dispatch_model,
+                    sampling,
+                ),
             ))
             .await;
         if result.is_ok() {
@@ -130,11 +149,20 @@ impl ResolvedModelAccess<'_> {
             .map(|route| (route.provider_ref().to_string(), route.model().to_string()))
             .unwrap_or_else(|| (self.provider_name.to_string(), self.model.to_string()));
         match result {
-            Ok(response) => {
+            Ok(mut response) => {
                 // A terminal response without final text or tools was billed
                 // but cannot be accepted. Keep it out of context-window fill
                 // and successful response telemetry before returning its typed
                 // cause to every one-shot caller.
+                zeroclaw_providers::response::normalize_response(
+                    &mut response,
+                    zeroclaw_api::text_extraction_for(
+                        accepted_route
+                            .as_ref()
+                            .and_then(|route| route.selection_ref())
+                            .unwrap_or(&served_provider),
+                    ),
+                );
                 if response.is_semantically_empty_terminal() {
                     crate::agent::cost::settle_provider_attempts(attempts, None);
                     extend_rejected_summaries(settled_out, attempts);
@@ -234,7 +262,7 @@ pub struct ResolvedAgentExecution<'a> {
     /// Loop-detection / ignore-tools / timing policy.
     pub pacing: &'a PacingConfig,
     /// Reject malformed tool-call protocol.
-    pub strict_tool_parsing: bool,
+    pub text_tool_calls_disabled: bool,
     /// Allow concurrent tool execution.
     pub parallel_tools: bool,
     /// Truncation limit for tool outputs.
@@ -284,7 +312,7 @@ pub struct ResolvedRuntimeKnobs<'a> {
     pub excluded_tools: &'a [String],
     pub dedup_exempt_tools: &'a [String],
     pub pacing: &'a PacingConfig,
-    pub strict_tool_parsing: bool,
+    pub text_tool_calls_disabled: bool,
     pub parallel_tools: bool,
     pub max_tool_result_chars: usize,
     pub keep_tool_context_turns: usize,
@@ -316,7 +344,7 @@ impl<'a> ResolvedAgentExecution<'a> {
             activated_tools: io.activated_tools,
             model_switch_callback: io.model_switch_callback,
             pacing: runtime.pacing,
-            strict_tool_parsing: runtime.strict_tool_parsing,
+            text_tool_calls_disabled: runtime.text_tool_calls_disabled,
             parallel_tools: runtime.parallel_tools,
             max_tool_result_chars: runtime.max_tool_result_chars,
             keep_tool_context_turns: runtime.keep_tool_context_turns,
@@ -483,7 +511,7 @@ mod run_model_query_tests {
             provider_name: "custom",
             model: "test-model",
             dispatch_model: "test-model",
-            temperature: None,
+            temperature: None.into(),
         }
     }
 
@@ -493,7 +521,7 @@ mod run_model_query_tests {
             provider_name: "custom",
             model: "test-model",
             dispatch_model: "test-model",
-            temperature: None,
+            temperature: None.into(),
         }
     }
 
@@ -577,7 +605,7 @@ mod run_model_query_tests {
                     provider_name: "reliable",
                     model: "test-model",
                     dispatch_model: "test-model",
-                    temperature: None,
+                    temperature: None.into(),
                 }
                 .run_model_query(
                     ChatRequest {
@@ -638,7 +666,7 @@ mod run_model_query_tests {
                     provider_name: "reliable",
                     model: "test-model",
                     dispatch_model: "test-model",
-                    temperature: None,
+                    temperature: None.into(),
                 }
                 .run_model_query(
                     ChatRequest {
@@ -755,6 +783,72 @@ mod run_model_query_tests {
     }
 
     #[tokio::test]
+    async fn run_model_query_uses_the_successful_fallbacks_text_policy() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        for (model, text) in [
+            ("primary", "<think>private</think>"),
+            ("backup", "<think>literal</think>"),
+        ] {
+            Mock::given(method("POST"))
+                .and(body_partial_json(serde_json::json!({"model":model})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices":[{"message":{"role":"assistant", "content":text},"finish_reason":"stop"}]
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let mut config = zeroclaw_config::schema::Config {
+            providers: toml::from_str(&format!(
+                r#"
+[connections.gateway]
+kind = "custom"
+uri = "{}/v1"
+capabilities = ["chat"]
+[models."chat.primary"]
+capability = "chat"
+provider = "gateway"
+model = "primary"
+options = {{ extract_text_reasoning = true }}
+[models."chat.backup"]
+capability = "chat"
+provider = "gateway"
+model = "backup"
+options = {{ extract_text_reasoning = false }}
+[fallback]
+"chat.primary" = ["chat.backup"]
+"#,
+                server.uri()
+            ))
+            .unwrap(),
+            ..Default::default()
+        };
+        config.reliability.provider_retries = 0;
+        let built =
+            zeroclaw_providers::model::build_model(&config, "default", "chat.primary", None)
+                .unwrap();
+        let messages = [ChatMessage::user("hi")];
+        let access = ResolvedModelAccess {
+            model_provider: built.provider(),
+            provider_name: "chat.primary",
+            model: "primary",
+            dispatch_model: "primary",
+            temperature: None.into(),
+        };
+        let response = zeroclaw_api::scope_text_extraction(
+            Some(Arc::new(move |reference| {
+                config.model_text_extraction(reference)
+            })),
+            access.run_model_query(ChatRequest::new(&messages), &mut Vec::new()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.text.as_deref(), Some("<think>literal</think>"));
+    }
+
+    #[tokio::test]
     async fn run_model_query_rejects_direct_semantic_empty_text_before_accepted_accounting() {
         let messages = [ChatMessage::user("hi")];
         for text in ["", " \n\t", "<think>internal reasoning</think>"] {
@@ -775,17 +869,26 @@ mod run_model_query_tests {
             let turn_usage = Arc::clone(&ctx.turn_usage);
             let error = TOOL_LOOP_COST_TRACKING_CONTEXT
                 .scope(Some(ctx), async {
-                    direct_access(&provider)
-                        .run_model_query(
+                    // Opt this injected fixture into reasoning extraction;
+                    // unconfigured calls preserve text syntax by default.
+                    zeroclaw_api::scope_text_extraction(
+                        Some(std::sync::Arc::new(|_: &str| {
+                            zeroclaw_api::TextExtraction {
+                                reasoning: true,
+                                tool_calls: false,
+                            }
+                        })),
+                        direct_access(&provider).run_model_query(
                             ChatRequest {
                                 messages: &messages,
                                 tools: None,
                                 thinking: None,
                             },
                             &mut Vec::new(),
-                        )
-                        .await
-                        .expect_err("direct semantic-empty response must fail")
+                        ),
+                    )
+                    .await
+                    .expect_err("direct semantic-empty response must fail")
                 })
                 .await;
 

@@ -82,7 +82,7 @@ use crate::stream_guard::AbortOnDrop;
 use std::borrow::Cow;
 
 /// Maximum silence between body reads for Anthropic SSE streams.
-const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+pub(crate) const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 pub struct AnthropicModelProvider {
     /// `[providers.models.anthropic.<alias>]` config-key alias.
@@ -92,6 +92,11 @@ pub struct AnthropicModelProvider {
     single_tool_rounds_supported: bool,
     max_tokens: u32,
     timeout_secs: u64,
+    /// Whether the total deadline was explicitly selected rather than defaulted.
+    timeout_configured: bool,
+    timeout_disabled: bool,
+    read_timeout_secs: Option<u64>,
+    read_timeout_disabled: bool,
     /// Opt-in Anthropic server-side fallback targets, sent as the native
     /// `fallbacks` parameter (plus the server-side-fallback beta) on
     /// non-streaming requests only. Empty means requests are byte-identical to
@@ -670,6 +675,9 @@ pub struct AnthropicBuilder {
     single_tool_rounds_supported: bool,
     max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
+    timeout_disabled: bool,
+    read_timeout_secs: Option<u64>,
+    read_timeout_disabled: bool,
     server_fallback_models: Vec<String>,
     cache_ttl: Option<CacheTtl>,
 }
@@ -712,6 +720,23 @@ impl AnthropicBuilder {
         self
     }
 
+    pub(crate) fn without_timeout(mut self) -> Self {
+        self.timeout_disabled = true;
+        self
+    }
+
+    pub(crate) fn read_timeout_secs(mut self, secs: u64) -> Self {
+        if secs > 0 {
+            self.read_timeout_secs = Some(secs);
+        }
+        self
+    }
+
+    pub(crate) fn without_read_timeout(mut self) -> Self {
+        self.read_timeout_disabled = true;
+        self
+    }
+
     /// Opt-in Anthropic server-side fallback targets, threaded through to the
     /// native `fallbacks` request parameter on non-streaming calls. Defaults to
     /// an empty vec, which leaves requests byte-identical to today.
@@ -739,6 +764,10 @@ impl AnthropicBuilder {
             timeout_secs: self
                 .timeout_secs
                 .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
+            timeout_configured: self.timeout_secs.is_some(),
+            timeout_disabled: self.timeout_disabled,
+            read_timeout_secs: self.read_timeout_secs,
+            read_timeout_disabled: self.read_timeout_disabled,
             server_fallback_models: self.server_fallback_models,
             cache_ttl: self.cache_ttl.unwrap_or_default(),
             schema_cache: zeroclaw_api::schema::SchemaCleanCache::new(),
@@ -757,6 +786,9 @@ impl AnthropicModelProvider {
             single_tool_rounds_supported: false,
             max_tokens: None,
             timeout_secs: None,
+            timeout_disabled: false,
+            read_timeout_secs: None,
+            read_timeout_disabled: false,
             server_fallback_models: Vec::new(),
             cache_ttl: None,
         }
@@ -2436,20 +2468,34 @@ impl AnthropicModelProvider {
     }
 
     fn http_client(&self) -> Client {
-        zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
+        let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+        if !self.timeout_disabled {
+            builder = builder.timeout(std::time::Duration::from_secs(self.timeout_secs));
+        }
+        if let Some(read_timeout) = self.read_timeout_secs {
+            builder = builder.read_timeout(std::time::Duration::from_secs(read_timeout));
+        }
+        let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+            builder,
             "model_provider.anthropic",
-            self.timeout_secs,
-            10,
-        )
+        );
+        builder.build().unwrap_or_else(|_| Client::new())
     }
 
-    /// Streaming requests have no whole-request deadline. Header acquisition
-    /// and buffered error bodies are bounded separately, while successful SSE
-    /// bodies use the shared byte-idle timeout.
+    /// Streaming defaults to no total deadline. An explicit deadline covers
+    /// headers and the complete body; read-idle protection is independent.
     fn streaming_http_client(&self) -> Result<Client, reqwest::Error> {
-        let builder = Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .read_timeout(STREAM_IDLE_TIMEOUT);
+        let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+        if self.timeout_configured && !self.timeout_disabled {
+            builder = builder.timeout(std::time::Duration::from_secs(self.timeout_secs));
+        }
+        let builder = if self.read_timeout_disabled {
+            builder
+        } else if let Some(read_timeout) = self.read_timeout_secs {
+            builder.read_timeout(std::time::Duration::from_secs(read_timeout))
+        } else {
+            builder.read_timeout(STREAM_IDLE_TIMEOUT)
+        };
         let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
             builder,
             "model_provider.anthropic",
@@ -3496,7 +3542,6 @@ impl ModelProvider for AnthropicModelProvider {
         };
         let url = format!("{}/v1/messages", self.base_url);
         let is_oauth = Self::is_setup_token(&credential);
-        let phase_timeout = std::time::Duration::from_secs(self.timeout_secs);
         let requested_model = model.to_string();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
@@ -3532,9 +3577,9 @@ impl ModelProvider for AnthropicModelProvider {
                 req = req.header("anthropic-beta", beta_features);
             }
 
-            let response = match tokio::time::timeout(phase_timeout, req.send()).await {
-                Ok(Ok(r)) => r,
-                Ok(Err(e)) => {
+            let response = match req.send().await {
+                Ok(r) => r,
+                Err(e) => {
                     // Tag the transport's verdict at the send site: a connect
                     // failure gets the typed variant Reliable reads for its
                     // recovery exception (the variant's doc carries the
@@ -3548,27 +3593,14 @@ impl ModelProvider for AnthropicModelProvider {
                     let _ = tx.send(Err(error)).await;
                     return;
                 }
-                Err(_) => {
-                    let _ = tx
-                        .send(Err(StreamError::Http(format!(
-                            "streaming response headers not received within {}s",
-                            phase_timeout.as_secs()
-                        ))))
-                        .await;
-                    return;
-                }
             };
 
             if !response.status().is_success() {
                 let status = response.status();
-                let error = match tokio::time::timeout(phase_timeout, response.text()).await {
-                    Ok(Ok(body)) => body,
-                    Ok(Err(error)) => format!("error response body read failed: {error}"),
-                    Err(_) => format!(
-                        "error response body not received within {}s",
-                        phase_timeout.as_secs()
-                    ),
-                };
+                let error = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|error| format!("error response body read failed: {error}"));
                 let _ = tx
                     .send(Err(StreamError::HttpStatus {
                         status: status.as_u16(),
@@ -4134,7 +4166,7 @@ data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\"
     }
 
     #[tokio::test]
-    async fn successful_stream_can_outlive_configured_request_timeout() {
+    async fn streaming_total_deadline_is_independent_of_read_progress() {
         use axum::{Router, response::IntoResponse, routing::post};
         use futures_util::StreamExt as _;
 
@@ -4164,46 +4196,59 @@ data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\"
                 .await
                 .expect("serve Anthropic SSE test");
         });
-        let provider = AnthropicModelProvider::builder("test")
-            .credential(Some("test-key"))
-            .base_url(&format!("http://{addr}"))
-            .timeout_secs(1)
-            .build();
-        let messages = vec![ChatMessage::user("hi")];
-        let mut stream = provider.stream_chat(
-            ProviderChatRequest {
-                messages: &messages,
-                tools: None,
-                thinking: None,
-            },
-            "claude-haiku-4-5",
-            None,
-            StreamOptions {
-                enabled: true,
-                count_tokens: false,
-            },
-        );
-        let mut text = String::new();
-        let mut saw_final = false;
-
-        tokio::time::timeout(std::time::Duration::from_secs(4), async {
-            while let Some(event) = stream.next().await {
-                match event.expect("successful SSE stream must not fail") {
-                    StreamEvent::TextDelta(chunk) => text.push_str(&chunk.delta),
-                    StreamEvent::Final => {
-                        saw_final = true;
-                        break;
-                    }
-                    _ => {}
-                }
+        for deadline in ["inherit", "finite", "clear"] {
+            let mut builder = AnthropicModelProvider::builder("test")
+                .credential(Some("test-key"))
+                .base_url(&format!("http://{addr}"));
+            if deadline != "inherit" {
+                builder = builder.timeout_secs(1);
             }
-        })
-        .await
-        .expect("successful stream must finish after exceeding the request timeout");
+            if deadline == "clear" {
+                builder = builder.without_timeout();
+            }
+            let provider = builder.build();
+            let messages = vec![ChatMessage::user("hi")];
+            let mut stream = provider.stream_chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "claude-haiku-4-5",
+                None,
+                StreamOptions {
+                    enabled: true,
+                    count_tokens: false,
+                },
+            );
+            let mut text = String::new();
+            let mut saw_final = false;
+            let mut failed = false;
 
+            tokio::time::timeout(std::time::Duration::from_secs(4), async {
+                while let Some(event) = stream.next().await {
+                    match event {
+                        Ok(StreamEvent::TextDelta(chunk)) => text.push_str(&chunk.delta),
+                        Ok(StreamEvent::Final) => {
+                            saw_final = true;
+                            break;
+                        }
+                        Err(_) => {
+                            failed = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("successful stream must finish after exceeding the request timeout");
+
+            assert_eq!(text, "hi");
+            assert_eq!(saw_final, deadline != "finite", "{deadline}");
+            assert_eq!(failed, deadline == "finite", "{deadline}");
+        }
         server.abort();
-        assert_eq!(text, "hi");
-        assert!(saw_final, "message_stop must emit Final");
     }
 
     #[tokio::test]

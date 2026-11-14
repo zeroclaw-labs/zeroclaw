@@ -7,33 +7,23 @@ use crate::traits::{ConfigFieldSetup, PropFieldInfo};
 
 pub(crate) struct RouteRequiredFields {
     pub hint: ConfigFieldSetup,
-    pub model_provider: ConfigFieldSetup,
-    pub model: ConfigFieldSetup,
+    pub model_ref: ConfigFieldSetup,
 }
 
 impl RouteRequiredFields {
-    fn into_fields(self) -> [(&'static str, ConfigFieldSetup); 3] {
-        [
-            ("hint", self.hint),
-            ("model_provider", self.model_provider),
-            ("model", self.model),
-        ]
+    fn into_fields(self) -> [(&'static str, ConfigFieldSetup); 2] {
+        [("hint", self.hint), ("model_ref", self.model_ref)]
     }
 }
 
 /// The route validation contract, shared with field introspection.
-pub(crate) fn route_required_fields(
-    hint: &str,
-    model_provider: &str,
-    model: &str,
-) -> RouteRequiredFields {
+pub(crate) fn route_required_fields(hint: &str, model_ref: &str) -> RouteRequiredFields {
     let required = |value: &str| ConfigFieldSetup {
         missing: value.trim().is_empty(),
     };
     RouteRequiredFields {
         hint: required(hint),
-        model_provider: required(model_provider),
-        model: required(model),
+        model_ref: required(model_ref),
     }
 }
 
@@ -52,35 +42,7 @@ pub fn tts_api_key(config: &TtsProviderConfig) -> Option<&str> {
 /// field requirement view, not a provider readiness or authentication check.
 pub fn annotate_fields(config: &Config, fields: &mut [PropFieldInfo]) {
     let mut requirements: HashMap<String, VecDeque<ConfigFieldSetup>> = HashMap::new();
-    let routes = config
-        .model_routes
-        .iter()
-        .enumerate()
-        .map(|(index, route)| {
-            (
-                "model_routes",
-                index,
-                &route.hint,
-                &route.model_provider,
-                &route.model,
-            )
-        })
-        .chain(
-            config
-                .embedding_routes
-                .iter()
-                .enumerate()
-                .map(|(index, route)| {
-                    (
-                        "embedding_routes",
-                        index,
-                        &route.hint,
-                        &route.model_provider,
-                        &route.model,
-                    )
-                }),
-        );
-    for (section, index, hint, provider, model) in routes {
+    let mut add_route_requirements = |section: &str, index: usize, hint: &str, model_ref: &str| {
         // Match the natural-key Vec traversal in Configurable exactly:
         // aliases retain whitespace and dots, and only an empty hint
         // uses the synthetic unnamed path. The hint itself is hidden
@@ -88,9 +50,9 @@ pub fn annotate_fields(config: &Config, fields: &mut [PropFieldInfo]) {
         let alias = if hint.is_empty() {
             format!("<unnamed-{index}>")
         } else {
-            hint.clone()
+            hint.to_string()
         };
-        for (name, setup) in route_required_fields(hint, provider, model).into_fields() {
+        for (name, setup) in route_required_fields(hint, model_ref).into_fields() {
             if name != "hint" {
                 requirements
                     .entry(format!("{section}.{alias}.{name}"))
@@ -98,15 +60,36 @@ pub fn annotate_fields(config: &Config, fields: &mut [PropFieldInfo]) {
                     .push_back(setup);
             }
         }
+    };
+    for (index, route) in config.model_routes.iter().enumerate() {
+        add_route_requirements("model_routes", index, &route.hint, &route.model_ref);
     }
-    for (family, alias, provider) in config.providers.tts.iter_entries() {
-        if matches!(family, "openai" | "elevenlabs" | "google") {
-            requirements
-                .entry(format!("providers.tts.{family}.{alias}.api_key"))
-                .or_default()
-                .push_back(ConfigFieldSetup {
-                    missing: tts_api_key(provider).is_none(),
-                });
+    for (index, route) in config.embedding_routes.iter().enumerate() {
+        let alias = if route.hint.is_empty() {
+            format!("<unnamed-{index}>")
+        } else {
+            route.hint.clone()
+        };
+        for (name, setup) in [
+            (
+                "hint",
+                ConfigFieldSetup {
+                    missing: route.hint.trim().is_empty(),
+                },
+            ),
+            (
+                "model_provider",
+                ConfigFieldSetup {
+                    missing: route.model_provider.trim().is_empty(),
+                },
+            ),
+        ] {
+            if name != "hint" {
+                requirements
+                    .entry(format!("embedding_routes.{alias}.{name}"))
+                    .or_default()
+                    .push_back(setup);
+            }
         }
     }
     for field in fields {
@@ -125,7 +108,7 @@ pub fn annotate_fields(config: &Config, fields: &mut [PropFieldInfo]) {
 mod tests {
     use super::*;
     use crate::api_error::{ConfigApiCode, ConfigApiError};
-    use crate::schema::{EmbeddingRouteConfig, ModelRouteConfig, OpenAIModelProviderConfig};
+    use crate::schema::{EmbeddingRouteConfig, ModelRouteConfig};
     use crate::traits::ConfigFieldEntry;
 
     fn field_entries(config: &Config) -> Vec<ConfigFieldEntry> {
@@ -137,81 +120,33 @@ mod tests {
     }
 
     #[test]
-    fn field_setup_serializes_typed_cloud_key_status_without_secret_values() {
-        let mut config = Config::default();
-        for section in [
-            "providers.tts.openai",
-            "providers.tts.elevenlabs",
-            "providers.tts.google",
-            "providers.tts.edge",
-            "providers.tts.piper",
-            "providers.models.openai",
-        ] {
-            config.create_map_key(section, "setup_test").unwrap();
-            config
-                .set_prop(&format!("{section}.setup_test.api_key"), " \t ")
-                .unwrap();
-        }
-        config
-            .create_map_key("providers.tts.openai", "configured")
-            .unwrap();
-        config
-            .set_prop(
-                "providers.tts.openai.configured.api_key",
-                " synthetic-tts-key ",
-            )
-            .unwrap();
-        let json = serde_json::json!({"fields": field_entries(&config)});
-        let fields = json["fields"].as_array().unwrap();
-        for family in ["openai", "elevenlabs", "google"] {
-            let path = format!("providers.tts.{family}.setup_test.api_key");
-            let field = fields.iter().find(|field| field["path"] == path).unwrap();
-            // Display masking treats a whitespace secret as populated. Setup
-            // status must come from the typed key contract instead.
-            assert_eq!(field["populated"], true);
-            assert_eq!(field["setup"]["missing"], true);
-            assert!(field.get("value").is_none());
-        }
-        let configured = fields
-            .iter()
-            .find(|field| field["path"] == "providers.tts.openai.configured.api_key")
-            .unwrap();
-        assert_eq!(configured["setup"]["missing"], false);
-        assert!(!json.to_string().contains("synthetic-tts-key"));
-        for field in fields.iter().filter(|field| {
-            let path = field["path"].as_str().unwrap();
-            path.starts_with("providers.models.")
-                || path.starts_with("providers.tts.edge.")
-                || path.starts_with("providers.tts.piper.")
-        }) {
-            assert!(field.get("setup").is_none(), "{}", field["path"]);
-        }
-        // Older daemon output decodes as unknown, rather than optional or ready.
-        let legacy: ConfigFieldEntry = serde_json::from_value(
-            fields
-                .iter()
-                .find(|field| field["path"] == "providers.models.openai.setup_test.api_key")
-                .unwrap()
-                .clone(),
-        )
-        .unwrap();
-        assert!(legacy.setup.is_none());
+    fn canonical_provider_secrets_use_the_registry_editor_surface() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "providers": {
+                "connections": {"speech.prod": {"kind":"openai", "auth": {
+                    "mode":"api_key", "api_key":"synthetic-tts-key"
+                }}},
+                "models": {"voice.en": {"capability":"tts", "provider":"speech.prod", "model":"tts-1"}}
+            }
+        })).unwrap();
+        let document = crate::provider_registry::editor::snapshot(&config).unwrap();
+        assert!(!document.to_string().contains("synthetic-tts-key"));
+        assert!(document["models"].get("voice.en").is_some());
+        assert!(config.providers.tts.is_empty());
     }
 
     #[test]
     fn route_setup_follows_natural_key_paths_and_each_typed_entry() {
         let mut config = Config::default();
-        for (hint, provider, model) in [
-            ("reasoning.deep", " \t ", "model"),
-            ("reasoning.deep", "openai.default", " \n "),
-            ("", "", ""),
-            (" spaced ", "openai.default", "model"),
+        for (hint, model_ref) in [
+            ("reasoning.deep", " \t "),
+            ("reasoning.deep", "chat.default"),
+            ("", ""),
+            (" spaced ", "chat.default"),
         ] {
             config.model_routes.push(ModelRouteConfig {
                 hint: hint.into(),
-                model_provider: provider.into(),
-                model: model.into(),
-                ..Default::default()
+                model_ref: model_ref.into(),
             });
         }
         config.embedding_routes.push(EmbeddingRouteConfig {
@@ -229,13 +164,21 @@ mod tests {
                 .collect()
         };
         assert_eq!(
-            missing("model_routes.reasoning.deep.model_provider"),
+            missing("model_routes.reasoning.deep.model_ref"),
             [true, false]
         );
-        assert_eq!(missing("model_routes.reasoning.deep.model"), [false, true]);
-        assert_eq!(missing("model_routes.<unnamed-2>.model"), [true]);
-        assert_eq!(missing("model_routes. spaced .model"), [false]);
-        assert_eq!(missing("embedding_routes.semantic.v2.model"), [true]);
+        assert_eq!(missing("model_routes.<unnamed-2>.model_ref"), [true]);
+        assert_eq!(missing("model_routes. spaced .model_ref"), [false]);
+        assert_eq!(
+            missing("embedding_routes.semantic.v2.model_provider"),
+            [false]
+        );
+        assert!(
+            fields
+                .iter()
+                .filter(|field| field.path == "embedding_routes.semantic.v2.model")
+                .all(|field| field.setup.is_none())
+        );
         assert!(
             fields
                 .iter()
@@ -246,80 +189,77 @@ mod tests {
     }
 
     #[test]
-    fn route_validation_preserves_error_order_codes_messages_and_resolution() {
-        for section in ["model_routes", "embedding_routes"] {
-            for (hint, provider, model, code, leaf, message) in [
-                (
-                    " \t ",
-                    "",
-                    "",
-                    ConfigApiCode::RequiredFieldEmpty,
-                    "hint",
-                    "hint must not be empty",
-                ),
-                (
-                    "route",
-                    " \n ",
-                    "",
-                    ConfigApiCode::RequiredFieldEmpty,
-                    "model_provider",
-                    "model_provider must not be empty",
-                ),
-                (
-                    "route",
-                    "openai",
-                    "",
-                    ConfigApiCode::InvalidFormat,
-                    "model_provider",
-                    "model_provider must be dotted form `<type>.<alias>` (got \"openai\")",
-                ),
-                (
-                    "route",
-                    "openai.missing",
-                    "",
-                    ConfigApiCode::DanglingReference,
-                    "model_provider",
-                    "model_provider = \"openai.missing\" but providers.models.openai.missing is not configured",
-                ),
-                (
-                    "route",
-                    " openai.default ",
-                    " \t ",
-                    ConfigApiCode::RequiredFieldEmpty,
-                    "model",
-                    "model must not be empty",
-                ),
-            ] {
-                let mut config = Config::default();
-                config
-                    .providers
-                    .models
-                    .openai
-                    .insert("default".into(), OpenAIModelProviderConfig::default());
-                if section == "model_routes" {
-                    config.model_routes.push(ModelRouteConfig {
-                        hint: hint.into(),
-                        model_provider: provider.into(),
-                        model: model.into(),
-                        ..Default::default()
-                    });
-                } else {
-                    config.embedding_routes.push(EmbeddingRouteConfig {
-                        hint: hint.into(),
-                        model_provider: provider.into(),
-                        model: model.into(),
-                        ..Default::default()
-                    });
-                }
-                let error = config.validate().unwrap_err();
-                let error = error.downcast_ref::<ConfigApiError>().unwrap();
-                assert_eq!(error.code, code);
-                assert_eq!(
-                    error.path.as_deref(),
-                    Some(format!("{section}[0].{leaf}").as_str())
-                );
-                assert_eq!(error.message, format!("{section}[0].{message}"));
-            }
+    fn model_route_requires_a_canonical_chat_model() {
+        let mut config = Config::default();
+        config.model_routes.push(ModelRouteConfig {
+            hint: "reasoning".into(),
+            model_ref: "chat.prod.v2".into(),
+        });
+        let error = config.validate().unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ConfigApiError>().unwrap().code,
+            ConfigApiCode::DanglingReference
+        );
+        crate::migration::bind_test_route_model(&mut config, "chat.prod.v2", "reasoning", None);
+        config.validate().unwrap();
+        config.providers.models.insert_canonical_model("embedding.prod".into(), serde_json::from_value(serde_json::json!({"capability":"embedding", "provider":"test.chat.prod.v2", "model":"embed"})).unwrap());
+        config.model_routes[0].model_ref = "embedding.prod".into();
+        let error = config.validate().unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ConfigApiError>().unwrap().code,
+            ConfigApiCode::InvalidFormat
+        );
+    }
+
+    #[test]
+    fn embedding_route_validation_uses_exact_models_and_preserves_error_order() {
+        for (hint, reference, code, leaf) in [
+            (" ", "", ConfigApiCode::RequiredFieldEmpty, "hint"),
+            (
+                "route",
+                " ",
+                ConfigApiCode::RequiredFieldEmpty,
+                "model_provider",
+            ),
+            (
+                "route",
+                "openai",
+                ConfigApiCode::DanglingReference,
+                "model_provider",
+            ),
+            (
+                "route",
+                "missing.model",
+                ConfigApiCode::DanglingReference,
+                "model_provider",
+            ),
+            (
+                "route",
+                "chat.default",
+                ConfigApiCode::InvalidFormat,
+                "model_provider",
+            ),
+        ] {
+            let mut config: Config = serde_json::from_value(serde_json::json!({
+                "providers": {"connections":{"gateway":{"kind":"openai"}},
+                    "models":{"chat.default":{"capability":"chat", "provider":"gateway", "model":"chat"},
+                        "embedding.default":{"capability":"embedding", "provider":"gateway", "model":"embed"}}}
+            })).unwrap();
+            config.embedding_routes.push(EmbeddingRouteConfig {
+                hint: hint.into(),
+                model_provider: reference.into(),
+                ..Default::default()
+            });
+            let error = config.validate().unwrap_err();
+            let error = error.downcast_ref::<ConfigApiError>().unwrap();
+            assert_eq!(error.code, code);
+            assert_eq!(
+                error.path.as_deref(),
+                Some(format!("embedding_routes[0].{leaf}").as_str())
+            );
+            config.embedding_routes[0].hint = "semantic.v1".into();
+            config.embedding_routes[0].model_provider = "embedding.default".into();
+            config.validate().unwrap();
         }
     }
 }

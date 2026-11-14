@@ -1255,54 +1255,23 @@ async fn run_agent_job_inner(
         sop_step_scope: None,
         ..crate::agent::loop_::AgentRunOverrides::default()
     };
-    let temperature = config
-        .model_provider_for_agent(agent_alias)
-        .and_then(|e| e.temperature);
     let run_result = match job.session_target {
-        SessionTarget::Main | SessionTarget::Isolated => match capabilities {
-            Some(capabilities) => {
-                Box::pin(
-                    crate::agent::run_with_capabilities(
-                        config.clone(),
-                        capabilities.clone(),
-                        None,
-                        agent_alias,
-                        Some(prefixed_prompt),
-                        None,
-                        model_override,
-                        temperature,
-                        vec![],
-                        false,
-                        Some(session_path.clone()),
-                        job.allowed_tools.clone(),
-                        zeroclaw_api::ingress::TurnOrigin::Cron,
-                        run_overrides,
-                    )
-                    .instrument(subagent_span),
-                )
+        SessionTarget::Main | SessionTarget::Isolated => {
+            let mut request = crate::agent::AgentRunRequest::new(agent_alias);
+            request.message = Some(prefixed_prompt);
+            request.model.model = model_override.as_deref();
+            request.session_state_file = Some(session_path.clone());
+            request.allowed_tools = job.allowed_tools.clone();
+            request.origin = zeroclaw_api::ingress::TurnOrigin::Cron;
+            request.capabilities =
+                capabilities.map(|capabilities| crate::composition::BoundCapabilities {
+                    capabilities: capabilities.clone(),
+                    principal: None,
+                });
+            crate::agent::run_with_request(Arc::new(config.clone()), request, run_overrides)
+                .instrument(subagent_span)
                 .await
-            }
-            None => {
-                Box::pin(
-                    crate::agent::run(
-                        config.clone(),
-                        agent_alias,
-                        Some(prefixed_prompt),
-                        None,
-                        model_override,
-                        temperature,
-                        vec![],
-                        false,
-                        Some(session_path.clone()),
-                        job.allowed_tools.clone(),
-                        zeroclaw_api::ingress::TurnOrigin::Cron,
-                        run_overrides,
-                    )
-                    .instrument(subagent_span),
-                )
-                .await
-            }
-        },
+        }
     };
 
     match run_result {
@@ -2776,7 +2745,7 @@ mod tests {
             .get_mut(TEST_AGENT)
             .unwrap()
             .max_context_tokens = Some(0);
-        let security = test_security(&config);
+        let security = test_security(&zeroclaw_config::migration::admit_test_input(&config));
         let mut job = test_job("");
         job.job_type = JobType::Agent;
         job.prompt = Some("private-context-prompt ".repeat(256));
@@ -2789,8 +2758,14 @@ mod tests {
             ..Default::default()
         };
 
-        let (success, output) =
-            Box::pin(run_agent_job(&config, &security, TEST_AGENT, &job, None)).await;
+        let (success, output) = Box::pin(run_agent_job(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            &security,
+            TEST_AGENT,
+            &job,
+            None,
+        ))
+        .await;
         assert!(!success);
         let expected = crate::i18n::get_required_cli_string("turn-context-window-exceeded-error");
         assert_eq!(output, expected);
@@ -2800,9 +2775,14 @@ mod tests {
             CronDeliveryContext::GatewayManual,
             CronDeliveryContext::RpcManual,
         ] {
-            let outcome =
-                deliver_and_classify_run_result(&config, &job, success, output.clone(), context)
-                    .await;
+            let outcome = deliver_and_classify_run_result(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                &job,
+                success,
+                output.clone(),
+                context,
+            )
+            .await;
             assert!(!outcome.success);
             assert_eq!(outcome.status, "error");
             assert_eq!(outcome.output, expected);
@@ -2901,7 +2881,7 @@ mod tests {
         config.risk_profiles.get_mut(TEST_AGENT).unwrap().level =
             crate::security::AutonomyLevel::Full;
 
-        let mut security = test_security(&config);
+        let mut security = test_security(&zeroclaw_config::migration::admit_test_input(&config));
         let scheduler_workspace = tmp.path().join("scheduler-owned-workspace");
         std::fs::create_dir_all(&scheduler_workspace).unwrap();
         let workspace_marker = "CRON_SCHEDULER_WORKSPACE_MARKER";
@@ -2924,7 +2904,7 @@ mod tests {
         let authority = crate::LiveConfigAuthority::new(config.clone());
         let admission = Some(authority.execution_capability().admit(TEST_AGENT).unwrap());
         let (success, output) = Box::pin(execute_job_with_retry(
-            &config,
+            &zeroclaw_config::migration::admit_test_input(&config),
             &security,
             TEST_AGENT,
             &job,
@@ -2938,7 +2918,7 @@ mod tests {
         assert_eq!(output, "done");
 
         let sequential = Box::pin(run_agent_job(
-            &config,
+            &zeroclaw_config::migration::admit_test_input(&config),
             &security,
             TEST_AGENT,
             &job,
@@ -2951,10 +2931,29 @@ mod tests {
             sequential.1
         );
 
+        let admitted_config = zeroclaw_config::migration::admit_test_input(&config);
         let (concurrent_a, concurrent_b, concurrent_c) = tokio::join!(
-            run_agent_job(&config, &security, TEST_AGENT, &job, admission.clone()),
-            run_agent_job(&config, &security, TEST_AGENT, &job, admission.clone()),
-            run_agent_job(&config, &security, TEST_AGENT, &job, admission.clone()),
+            run_agent_job(
+                &admitted_config,
+                &security,
+                TEST_AGENT,
+                &job,
+                admission.clone()
+            ),
+            run_agent_job(
+                &admitted_config,
+                &security,
+                TEST_AGENT,
+                &job,
+                admission.clone()
+            ),
+            run_agent_job(
+                &admitted_config,
+                &security,
+                TEST_AGENT,
+                &job,
+                admission.clone()
+            ),
         );
         for result in [concurrent_a, concurrent_b, concurrent_c] {
             assert!(result.0, "concurrent cron agent run failed: {:?}", result.1);
@@ -3000,7 +2999,7 @@ mod tests {
         let mut job = test_job("");
         job.job_type = JobType::Agent;
         job.prompt = Some("Say hello".into());
-        let security = test_security(&config);
+        let security = test_security(&zeroclaw_config::migration::admit_test_input(&config));
         let providers = Arc::new(RecordingProviders::default());
         let memory = Arc::new(RecordingMemory::default());
         let capabilities = recording_capabilities(
@@ -3010,7 +3009,7 @@ mod tests {
         );
 
         let (success, output) = Box::pin(run_agent_job_with_capabilities(
-            &config,
+            &zeroclaw_config::migration::admit_test_input(&config),
             &capabilities,
             &security,
             TEST_AGENT,

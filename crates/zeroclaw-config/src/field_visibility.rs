@@ -18,19 +18,28 @@ pub fn memory_backend_excludes(backend: &str) -> Vec<&'static str> {
 }
 
 pub fn excluded_paths(cfg: &Config, prefix: &str) -> Vec<String> {
+    let mut excluded = vec![
+        // These tables remain deserializable only so V3 input can be projected
+        // into the canonical registry. They are not an editable/listed
+        // configuration surface after admission.
+        "providers.models.".to_string(),
+        "providers.tts.".to_string(),
+        "providers.transcription.".to_string(),
+        "decision_models.".to_string(),
+    ];
     if prefix == "memory" || prefix.is_empty() {
         let backend = if cfg.memory.backend.is_empty() {
             "sqlite"
         } else {
             cfg.memory.backend.as_str()
         };
-        return memory_backend_excludes(backend)
-            .into_iter()
-            .map(|leaf| format!("memory.{leaf}"))
-            .collect();
+        excluded.extend(
+            memory_backend_excludes(backend)
+                .into_iter()
+                .map(|leaf| format!("memory.{leaf}")),
+        );
     }
-
-    Vec::new()
+    excluded
 }
 
 /// Test whether `path` is one of the excluded entries returned from
@@ -83,6 +92,9 @@ mod tests {
         let paths = excluded_paths(&cfg, "memory");
         assert!(paths.iter().any(|p| p == "memory.qdrant."));
         assert!(paths.iter().any(|p| p == "memory.postgres."));
+        assert!(paths.iter().any(|p| p == "providers.models."));
+        assert!(paths.iter().any(|p| p == "providers.tts."));
+        assert!(paths.iter().any(|p| p == "providers.transcription."));
     }
 
     #[test]

@@ -1,6 +1,159 @@
 # Provider Configuration
 
-Every model provider lives at `[providers.models.<type>.<alias>]`. `<type>` is a canonical family slot (see the [Catalog](./catalog.md#all-slots) for every slot with its endpoint). `<alias>` is your operator-assigned instance name, pick any descriptive name (`home`, `work`, `cn`, `gpt5`, ...).
+The canonical layout separates reusable connections from logical models. A
+model reference is an exact TOML key, so a name such as `chat.gateway.prod`
+keeps both dots as part of the reference. The older family/alias layout below
+remains the migration reference for existing V4 files. Historical field and
+reference decoding lives in `zeroclaw-config`; provider, runtime, CLI, tools,
+Doctor, and UI consumers receive exact model references from its registry view.
+
+The dashboard and Zerocode expose a **Provider registry** configuration section
+for connections, capability models, presets, and fallback routes. The dashboard
+edits each registry in a separate JSON tab; Zerocode edits the complete JSON
+document (Enter inserts a newline; Ctrl+S saves). All registries are validated
+and saved together, preserving exact names such as `chat.gateway.prod`.
+For inherited options, omit a field to inherit its value; use the JSON string
+`"null"` to explicitly clear it, matching the TOML override syntax below.
+Unchanged masked credentials retain their existing values and follow the normal
+secret encryption lifecycle. A stale editor must reload before saving.
+
+Saving promotes historical provider input into the canonical registries and
+retires the old provider tables, so deleted models cannot reappear on reload.
+Legacy-only configurations use the same projected model lists in Quickstart,
+agent settings, and model pickers. When historical chat, TTS, and ASR aliases
+coincide, the config boundary resolves the speech bindings to their projected
+capability keys before promotion. Explicit canonical keys remain authoritative;
+a capability mismatch is rejected rather than redirected to another model.
+Environment overrides retain their original values for persistence across this
+promotion; environment credentials are never written to the configuration file.
+Because a registry replacement
+can add, update, and remove entries, a scoped principal needs Config create,
+update, and delete grants with write access to `providers`. Dashboard saves use
+the normal configuration application/reload flow; RPC saves also prepare and
+publish updated providers for active sessions before committing the generation.
+
+V3 → V4 migration converts route-owned model IDs and credentials into ordinary
+model and connection definitions, leaving each route as `hint` → `model_ref`.
+The same conversion accepts V4 files produced before this route shape changed.
+In-memory loading and `zeroclaw config migrate` use the same conversion; loading
+alone does not rewrite the file. Routes already using `model_ref` are preserved.
+
+For Gemini OAuth, `zeroclaw auth login --model-provider gemini --profile <key>`
+reads `auth.client_id` and `auth.client_secret` from the selected Gemini
+connection (`auth.mode = "oauth"`). The key can name that connection directly
+or a configured model using it. Historical Gemini alias input is decoded by
+the config boundary; the login and token refresh flows share this resolver.
+
+## Canonical connections and models
+
+Put shared endpoint and authentication settings in a connection, then bind
+each logical model to that connection. Connections can advertise more than one
+capability; each model still declares its own capability and upstream model ID.
+Presets and fallback routes are independent registries and use the same exact
+model references.
+
+`capabilities` is optional. When omitted, it defaults to the compiled adapter
+surface for `kind`; an explicit list narrows that surface and `[]` disables it
+for this connection. Decision models use native decision endpoints only:
+`openai_decisions` is OpenAI's `POST /v1/decisions` contract and
+`system_one` is the TypeSafe/Ollama-compatible `POST /v1/systemone` contract.
+Chat Completions and Responses structured outputs are chat protocols and do
+not provide the `decision` capability. The built-in native decision defaults
+are based on documented endpoint surfaces: OpenAI, vLLM, Fireworks, LM Studio,
+and LiteLLM expose OpenAI Decisions; vLLM, Fireworks, LM Studio, LiteLLM,
+OpenRouter, Ollama, llama.cpp, and SGLang expose System One. Generic `custom`
+and `openai-compatible` connections expose both protocols so an explicit
+endpoint can be used for a compatible native implementation. An explicit
+`api.decision.wire_api` selects one supported protocol. A model still has to
+use a capability enabled by both the connection and its adapter implementation.
+
+```toml
+[providers.connections."gateway.prod"]
+kind = "openai-compatible"
+uri = "https://gateway.example.com/v1"
+capabilities = ["chat", "embedding", "tts", "asr", "decision"]
+auth = { mode = "api_key", api_key = "<API_KEY>" }
+
+[providers.connections."gateway.prod".api.chat]
+wire_api = "chat_completions"
+request_timeout_secs = 120
+read_timeout_secs = 300
+
+[providers.connections."gateway.prod".api.decision]
+wire_api = "openai_decisions"
+request_timeout_secs = 30
+
+[providers.connections."gateway.prod".api.tts]
+
+[providers.connections."gateway.prod".api.asr]
+
+[providers.model_presets."chat.balanced"]
+capability = "chat"
+options = { temperature = 0.5, max_tokens = 4096 }
+
+[providers.models."chat.fast"]
+capability = "chat"
+provider = "gateway.prod"
+model = "gpt-4o-mini"
+preset = "chat.balanced"
+metadata = { context_window = 128000 }
+
+[providers.models."embedding.semantic"]
+capability = "embedding"
+provider = "gateway.prod"
+model = "text-embedding-3-small"
+metadata = { dimensions = 1536 }
+
+[providers.models."decision.sop"]
+capability = "decision"
+provider = "gateway.prod"
+model = "decision-model"
+
+[providers.fallback]
+"chat.fast" = ["chat.backup"]
+
+[memory]
+embedding_model_ref = "embedding.semantic"
+```
+
+Embedding hints can select the same exact model key with
+`[[embedding_routes]]`, `hint = "semantic"`, and
+`model_provider = "embedding.semantic"`; set
+`memory.embedding_model = "hint:semantic"` and leave
+`memory.embedding_model_ref` unset to use that route. The model definition owns
+the upstream ID and dimensions. Saving the registry promotes existing legacy
+embedding bindings before retiring their provider profiles, preserving the
+shared connection and any explicit consumer credentials.
+
+`connections.<name>.uri` is the shared endpoint; capability tables derive
+their paths and do not define a second URI. API defaults are applied first,
+then the API preset/options, model preset/options, and finally invocation
+overrides. `request_timeout_secs` is the total request bound and
+`read_timeout_secs` is the response-read idle bound; they are independent.
+An explicit finite request deadline also covers streaming. `"null"` disables
+only the specified deadline; omitted fields inherit the API or driver baseline.
+An `openai` connection may omit `uri` and uses `https://api.openai.com/v1` for
+decision requests. Fireworks uses its documented
+`https://api.fireworks.ai/inference/v1` prefix, and OpenRouter uses
+`https://openrouter.ai/api/v1` for System One. The local adapters use their
+documented development defaults (Ollama `11434`, LM Studio `1234`, vLLM
+`8000`, SGLang `30000`, llama.cpp `8080`, and LiteLLM `4000`) when `uri` is
+omitted. `custom`, `openai-compatible`, and `system-one` connections must
+provide `uri`.
+For Gemini gateways, `uri` includes the protocol prefix, such as
+`https://gateway.example.com/v1beta` for API-key authentication or
+`https://gateway.example.com/v1internal` for OAuth Code Assist. Generation,
+API-key warmup, and OAuth project discovery use that endpoint. OAuth token
+refresh still uses Google's authentication service.
+The OpenAI-compatible capability adapters derive the standard audio paths
+from the same connection URI: `/v1/audio/speech` for TTS and
+`/v1/audio/transcriptions` for ASR. This applies to OpenAI, `custom`,
+`openai-compatible`, and vLLM connections when the server exposes those
+endpoints. The request body remains the native OpenAI speech or transcription
+contract; it is not simulated through chat completions.
+For fields that support explicit clearing, the string `"null"` means clear and
+inheritance is represented by leaving the field unset. A literal string value
+`"null"` uses `{ value = "null" }` where that field supports the escape.
 
 ## Minimal working example
 
@@ -19,8 +172,6 @@ Almost every family also takes the shared fields from `ModelProviderConfig`:
 - `timeout_secs`: HTTP request timeout in seconds. Setting it above 300 also raises the provider's streaming idle bound (the default 300-second cap on the gap between stream reads) for OpenAI Responses and OpenAI-compatible providers.
 - `max_tokens`: optional response length cap.
 - `extra_headers`: extra HTTP headers for custom gateways or auth bridges.
-- `fallback_models`: alternate model IDs on the same provider alias.
-- `fallback`: ordered list of other dotted provider aliases to try after this alias fails.
 - `wire_api`, `native_tools`, `provider_extra`, `think`, `thinking_passthrough`, and `chat_template_kwargs`: advanced protocol and request-body overrides.
 - `vision`: override the provider's image-input (vision) capability. Leave unset to use the family's built-in default. Set `false` for a text-only model served by a vision-capable family (for example, a text model behind llama.cpp) so image messages route to a configured `[multimodal] vision_model_provider` instead of erroring; set `true` to force it on. Without a configured vision provider, a non-vision turn proceeds with media markers replaced by a placeholder when none of the latest user message's image references pass the existence, data-URI-structure, or remote-fetch-policy checks (a missing file, a malformed data URI, or a remote URL while `multimodal.allow_remote_fetch` is off). A local path counts only when it is absolute, allowed by the agent's filesystem policy (the same check the file tools apply), and exists as a file; paths the policy rejects are never probed. If any reference does pass, the turn still fails with the vision capability error. The resolvability check evaluates at most 16 absolute local-path markers per turn; for those, the policy check and the existence probe run together on a blocking thread, off the async executor. A message with more such markers treats the rest as resolvable without any check, so an oversized message fails toward the capability error instead of a silent degrade.
 - `tool_result_image_policy`: handling for images attached to native `role = "tool"` results sent to compatible chat-completions providers. A tool result's images are declared in an `attachments` array beside the result text in the tool-result carrier, never recovered from the result text itself, so literal marker syntax in a tool's output is just text. Defaults to `"relocate"`: the declared image is kept but moved into a following `role = "user"` message, so endpoints that reject image parts in a tool result (HTTP 400) still receive it with no per-provider config; verified against opencode zen (mimo-v2.5) and llama.cpp. Relocation places a user message directly after a tool message: if a backend's chat template rejects that order, fall back to `"image_url"` or `"omit"`. Set to `"image_url"` to send declared images as `image_url` parts inside the tool message, or to `"omit"` to drop them and append a fixed notice. The policy reads the `attachments` array of native carriers only; a legacy tool result (no array key) passes verbatim under all settings, because it declares nothing and its body is text. This does not change direct user images or OpenAI Responses providers.
@@ -29,6 +180,71 @@ Almost every family also takes the shared fields from `ModelProviderConfig`:
 - `tls_ca_cert_path`: absolute path to a PEM-encoded CA certificate for TLS connections to this provider (a per-provider trust override, distinct from the gateway TLS `ca_cert_path`). Shell expansion such as `~` is not performed; leave unset to use the system trust store.
 
 Family-specific entries add their own typed fields on top of these shared fields.
+
+The chat `options` object accepts two ordinary boolean extraction switches:
+
+- `extract_text_reasoning`: remove `<think>...</think>` blocks from textual content. Defaults to `false`, except for the `minimax` and `groq` connection kinds, whose documented output formats can carry inline reasoning. Native reasoning fields are unaffected.
+- `extract_text_tool_calls`: recognize XML/JSON tool-call envelopes in textual content. Defaults to `false`, with the adapter-specific defaults below. Native structured tool calls are unaffected.
+
+| Connection kind | Reasoning extraction | Text tool-call extraction |
+| --- | --- | --- |
+| `minimax` | `true` | `false` |
+| `groq` | `true` | `true` |
+| `ollama`, `hailo_ollama`, `gemini`, `gemini_cli`, `grok_cli`, `kilocli`, `venice`, `atomic_chat` | `false` | `true` |
+| All other kinds, including `openai`, `openai-compatible`, `vllm`, `deepseek`, and `qwen` | `false` | `false` |
+
+Text tool-call defaults preserve the listed adapters' current prompt-guided
+tool protocol. They do not imply that the upstream lacks native function
+calling. For adapters that support the corresponding override, selecting
+`native_tools = true` or `wire_api = "responses"` disables that implicit text
+tool-call default; an explicit extraction option still wins. For a model
+served without a server-side reasoning or tool parser, enable the required
+extractor explicitly in its options or preset.
+
+Both fields can be shared through `providers.model_presets.<id>.options`, set as
+connection defaults in `api.chat.options`, and overridden in each chat model's
+`options`. They accept `true` or `false`; the `"null"` sentinel is not supported.
+The former runtime-profile `strict_tool_parsing` setting has been removed.
+
+A tool-bearing turn requires the same tool protocol across its fallback
+chain. Mixing native-tool and text-only candidates is rejected before a
+provider request is sent, because one turn builds a shared prompt and tool
+request before selecting a fallback. Configure all candidates for native
+tools or all for text tools. Scalar calls without tools are unaffected.
+
+## Hosting multiple models on one connection
+
+A connection owns the endpoint and credentials. Independently named chat models
+reference that connection through `provider`, and send their `model` identifier
+to the upstream server. Model options overlay the connection API defaults and
+the selected model preset; explicit `false` overrides an inherited `true`.
+
+Consumers reference the exact model key. Dots inside quoted keys are part of the
+name and have no path or qualification semantics:
+
+```toml
+[providers.models."chat.fast"]
+capability = "chat"
+provider = "gateway.prod"
+model = "gpt-4o-mini"
+options = { temperature = 0.3, extract_text_reasoning = true, extract_text_tool_calls = false }
+
+[providers.models."chat.big"]
+capability = "chat"
+provider = "gateway.prod"
+model = "gpt-4o"
+options = { max_tokens = 8192 }
+
+[agents.assistant]
+model_provider = "chat.fast"
+```
+
+An invocation's explicit temperature overrides the selected model's effective
+default. Model switches, hint routes, and fallback candidates resolve their own
+options when dispatched; background execution does not convert inherited
+defaults into invocation overrides. Protocol constraints such as Anthropic's
+enabled-thinking temperature still apply. Configure fallback order separately
+under `providers.fallback`, and pricing under each model's `metadata`.
 
 ## Anthropic thinking passthrough
 
@@ -40,18 +256,36 @@ history.
 
 Before reaching for this flag, check whether the gateway also exposes an
 Anthropic Messages endpoint. If it does, point a
-`[providers.models.anthropic.<alias>]` entry at it with `uri`; the native
+`[providers.models."<model-ref>"]` entry at it with `uri`; the native
 provider handles thinking, signed-block replay, and prompt caching without
 translation. `thinking_passthrough` is for gateways that offer only the Chat
 Completions surface.
 
 ```toml
-[providers.models.custom.my-gateway]
+[providers]
+
+[providers.connections]
+
+[providers.connections."custom.my-gateway"]
+kind = "custom"
 uri = "https://your-gateway.example.com"
-model = "claude-group/claude-fable-5"
+
+[providers.connections."custom.my-gateway".auth]
+mode = "api_key"
 api_key = "..."
-wire_api = "chat_completions"
+
+[providers.models]
+
+[providers.models."custom.my-gateway"]
+capability = "chat"
+provider = "custom.my-gateway"
+model = "claude-group/claude-fable-5"
+
+[providers.models."custom.my-gateway".options]
 thinking_passthrough = true
+
+[providers.models."custom.my-gateway".api]
+wire_api = "chat_completions"
 ```
 
 ### What it does
@@ -148,7 +382,7 @@ For most families, the URL is resolved in this order:
 2. **Family endpoint**: the family's `*Endpoint` enum supplies the URL (e.g. `OpenAIEndpoint::Default` -> `https://api.openai.com/v1`). Multi-region families have an `endpoint` field on the alias entry that picks the variant (e.g. `endpoint = "cn"` for Moonshot).
 3. **Templated families**: Azure takes typed inputs (`resource`, `deployment`, `api_version`) and substitutes them into the family's URI template. Missing fields fail loud at runtime.
 
-Bedrock is an exception: its endpoint hostname is constructed at request time from the signing region resolved through the AWS credential chain (`AWS_REGION`, `AWS_DEFAULT_REGION`, or the `region` from the active `credential_process` or IMDS profile). The `uri` alias field and the schema-level `providers.models.bedrock.<alias>.region` field have no effect in the current implementation.
+Bedrock is an exception: its endpoint hostname is constructed at request time from the signing region resolved through the AWS credential chain (`AWS_REGION`, `AWS_DEFAULT_REGION`, or the `region` from the active `credential_process` or IMDS profile). A canonical `providers.connections.<name>.extra.region` overrides that region for both Bearer-token routing and SigV4 signing. The legacy `uri` alias field and `providers.connections.<connection>.extra.region` field have no effect.
 
 ## Family slots
 
@@ -161,7 +395,7 @@ Supported credential input and storage forms:
 1. **Inline `api_key = "..."`** in the alias entry (fine for dev, risky for checked-in configs).
 2. **1Password references**: set a secret field to `op://vault/item/field`. ZeroClaw keeps the reference in config and resolves it at runtime with `op read`, so the 1Password CLI must be installed and signed in.
 3. **Config-level secrets store**: encrypted at `~/.zeroclaw/secrets` via a local key file.
-4. **Generic env override**: `ZEROCLAW_providers__models__<type>__<alias>__api_key=...` sets `providers.models.<type>.<alias>.api_key` at startup. See [Environment variables](../reference/env-vars.md) for the full grammar.
+4. **Generic env override**: `ZEROCLAW_providers__models__<type>__<alias>__api_key=...` sets `providers.models."<model-ref>".api_key` at startup. See [Environment variables](../reference/env-vars.md) for the full grammar.
 
 Schema-mirror env overrides win at startup. They replace the in-memory credential for that process without rewriting the stored inline, encrypted, or `op://` value on disk.
 
@@ -171,10 +405,10 @@ Schema-mirror env overrides win at startup. They replace the in-memory credentia
 
 Several providers accept OAuth or subscription-style tokens instead of raw API keys. Get the token from the vendor's own dashboard or CLI flow, then drop it into the alias entry the same way you would an API key:
 
-- **Anthropic / Claude**: Console API keys and tokens generated by `claude setup-token` for Claude Max go in `api_key` on `[providers.models.anthropic.<alias>]`. In Quickstart, pick `api_key` or `setup_token`; the saved provider entry is still the canonical `anthropic` slot.
-- **OpenAI Codex subscription**: run `zeroclaw auth login --model-provider openai-codex` (or import an existing Codex CLI login with `--import ~/.codex/auth.json`), then set `requires_openai_auth = true` and leave `api_key` unset on `[providers.models.openai.<alias>]`; the runtime reads ZeroClaw's stored `openai-codex` auth profile.
-- **Gemini CLI**: `[providers.models.gemini_cli.<alias>]` shells out to the `gemini` CLI; use the CLI's own auth flow.
-- **Grok Build CLI**: `[providers.models.grok_cli.<alias>]` shells out through the documented `grok agent stdio` ACP surface. The assembled prompt is JSON-RPC on stdin, never argv or a prompt file. Auth uses the CLI login cache by default. For API-key auth, export `XAI_API_KEY` into the daemon environment and explicitly add `env_passthrough = ["XAI_API_KEY"]` to the alias; the typed alias `api_key` remains unsupported. An existing absolute `working_directory` is required and defines both the child cwd and ACP session boundary. The child environment is cleared before spawn, and `env_passthrough` defaults to empty. Other provider-owned `XAI_*` names and all `GROK_*` names are rejected. ZeroClaw defaults to `--sandbox strict`, `--permission-mode dontAsk`, an empty built-in tool set, and fail-closed ACP permission responses. `extra_args` is the explicit per-alias opt-in for relaxing those controls. The bypass flags `--always-approve`, `--dangerously-skip-permissions`, `--yolo`, and `--permission-mode=bypassPermissions` make the headless ACP client select `allow_once`; other permission modes continue to select `reject_once`. ACP transport/model/session/cwd flags plus positional and short arguments are reserved; unknown value-taking long options use `--flag=value`. Alias `vision = true` only opts ZeroClaw into sending ACP image blocks; Grok still advertises `promptCapabilities.image = false` through 0.2.118 and does not reliably use the image content - leave unset for production; see [ACP vision / image input](./catalog.md#acp-vision--image-input-current-grok-build-behavior).
+- **Anthropic / Claude**: Console API keys and tokens generated by `claude setup-token` for Claude Max go in `api_key` on `[providers.models."<model-ref>"]`. In Quickstart, pick `api_key` or `setup_token`; the saved provider entry is still the canonical `anthropic` slot.
+- **OpenAI Codex subscription**: run `zeroclaw auth login --model-provider openai-codex` (or import an existing Codex CLI login with `--import ~/.codex/auth.json`), then set `requires_openai_auth = true` and leave `api_key` unset on `[providers.models."<model-ref>"]`; the runtime reads ZeroClaw's stored `openai-codex` auth profile.
+- **Gemini CLI**: `[providers.models."<model-ref>"]` shells out to the `gemini` CLI; use the CLI's own auth flow.
+- **Grok Build CLI**: `[providers.models."<model-ref>"]` shells out through the documented `grok agent stdio` ACP surface. The assembled prompt is JSON-RPC on stdin, never argv or a prompt file. Auth uses the CLI login cache by default. For API-key auth, export `XAI_API_KEY` into the daemon environment and explicitly add `env_passthrough = ["XAI_API_KEY"]` to the alias; the typed alias `api_key` remains unsupported. An existing absolute `working_directory` is required and defines both the child cwd and ACP session boundary. The child environment is cleared before spawn, and `env_passthrough` defaults to empty. Other provider-owned `XAI_*` names and all `GROK_*` names are rejected. ZeroClaw defaults to `--sandbox strict`, `--permission-mode dontAsk`, an empty built-in tool set, and fail-closed ACP permission responses. `extra_args` is the explicit per-alias opt-in for relaxing those controls. The bypass flags `--always-approve`, `--dangerously-skip-permissions`, `--yolo`, and `--permission-mode=bypassPermissions` make the headless ACP client select `allow_once`; other permission modes continue to select `reject_once`. ACP transport/model/session/cwd flags plus positional and short arguments are reserved; unknown value-taking long options use `--flag=value`. Alias `vision = true` only opts ZeroClaw into sending ACP image blocks; Grok still advertises `promptCapabilities.image = false` through 0.2.118 and does not reliably use the image content - leave unset for production; see [ACP vision / image input](./catalog.md#acp-vision--image-input-current-grok-build-behavior).
 - **Qwen / MiniMax**: set `auth_mode = "o_auth"` on the alias entry plus the relevant `oauth_*` fields (see [env-vars → OAuth and CLI-path fields](../reference/env-vars.md#oauth-and-cli-path-fields)).
 
 ## OpenAI Astra setup
@@ -186,27 +420,51 @@ unsupported parameters. Configure the public API route on an `openai` alias
 with an API key and an explicit Responses wire:
 
 ```toml
-[providers.models.openai.astra_api]
-api_key        = "op://platform/openai/api-key"
-model          = "gpt-6-astra"
-wire_api       = "responses"
-vision         = true
+[providers]
+
+[providers.connections]
+
+[providers.connections."openai.astra_api"]
+kind = "openai"
+
+[providers.connections."openai.astra_api".auth]
+mode = "api_key"
+api_key = "op://platform/openai/api-key"
+
+[providers.models]
+
+[providers.models."openai.astra_api"]
+capability = "chat"
+provider = "openai.astra_api"
+model = "gpt-6-astra"
+
+[providers.models."openai.astra_api".options]
+max_tokens = 32000
+
+[providers.models."openai.astra_api".metadata]
+vision = true
 context_window = 1050000
-max_tokens     = 32000
+
+[providers.models."openai.astra_api".api]
+wire_api = "responses"
 
 [runtime]
 reasoning_effort = "high"
 
+[runtime_profiles]
+
 [runtime_profiles.astra]
-agentic             = true
+agentic = true
 max_tool_iterations = 12
 max_history_messages = 80
-max_context_tokens  = 200000
+max_context_tokens = 200000
+
+[agents]
 
 [agents.astra]
-model_provider  = "openai.astra_api"
+model_provider = "openai.astra_api"
 runtime_profile = "astra"
-risk_profile    = "supervised"
+risk_profile = "supervised"
 ```
 
 The numeric values above are an intentional local budget, not a recommendation
@@ -215,9 +473,9 @@ capability and output cap, while the runtime profile keeps a smaller estimated
 input budget and bounds the tool loop. Adjust them for the workload and leave
 output headroom. The fields have separate owners:
 
-- `providers.models.openai.astra_api.context_window` records the model input
+- `providers.models."chat.astra".context_window` records the model input
   window used by provider-aware budgeting.
-- `providers.models.openai.astra_api.max_tokens` caps generated output; it is
+- `providers.models."chat.astra".max_tokens` caps generated output; it is
   not an input-history limit.
 - `runtime_profiles.astra.max_context_tokens` is ZeroClaw's estimated local
   trimming threshold. It may be smaller than `context_window`.
@@ -262,7 +520,7 @@ When ZeroClaw runs inside a container and a provider is on the host (e.g. Ollama
 
 {{#env-var container}}
 
-The `__` is the path separator; the example above sets `providers.models.ollama.home.uri`. See [Environment variables](../reference/env-vars.md) for the full grammar.
+The `__` is the path separator; the example above sets `providers.connections."ollama.home".uri`. See [Environment variables](../reference/env-vars.md) for the full grammar.
 
 ## Per-model vision capability
 
@@ -271,13 +529,35 @@ models. The value belongs to the provider alias, so routing and fallback paths
 resolve it together with that alias's endpoint, credentials, and model:
 
 ```toml
-[providers.models.openai.vision]
+[providers]
+
+[providers.connections]
+
+[providers.connections."openai.vision"]
+kind = "openai"
+
+[providers.connections."llamacpp.text"]
+kind = "llamacpp"
+
+[providers.models]
+
+[providers.models."openai.vision"]
+capability = "chat"
+provider = "openai.vision"
 model = "gpt-4o"
-wire_api = "responses"
+
+[providers.models."openai.vision".metadata]
 vision = true
 
-[providers.models.llamacpp.text]
+[providers.models."openai.vision".api]
+wire_api = "responses"
+
+[providers.models."llamacpp.text"]
+capability = "chat"
+provider = "llamacpp.text"
 model = "qwen3-4b"
+
+[providers.models."llamacpp.text".metadata]
 vision = false
 ```
 
@@ -341,7 +621,7 @@ ignores this field.
 
 Before reaching for this flag, check whether the gateway also exposes an
 Anthropic Messages endpoint. If it does, point a
-`[providers.models.anthropic.<alias>]` entry at it with `uri` and skip the
+`[providers.models."<model-ref>"]` entry at it with `uri` and skip the
 passthrough entirely; the native provider places its own breakpoints.
 `cache_passthrough` is for gateways that offer only the Chat Completions
 surface.
@@ -367,10 +647,26 @@ re-entries that route through them send unmarked requests. With the flag
 off (the default), request bodies are byte-identical to previous versions.
 
 ```toml
-[providers.models.custom.claude-via-gateway]
+[providers]
+
+[providers.connections]
+
+[providers.connections."custom.claude-via-gateway"]
+kind = "custom"
 uri = "https://<gateway-host>/v1"
-model = "<anthropic-routed model>"
+
+[providers.connections."custom.claude-via-gateway".auth]
+mode = "api_key"
 api_key = "op://platform/gateway/api-key"
+
+[providers.models]
+
+[providers.models."custom.claude-via-gateway"]
+capability = "chat"
+provider = "custom.claude-via-gateway"
+model = "<anthropic-routed model>"
+
+[providers.models."custom.claude-via-gateway".options]
 cache_passthrough = true
 ```
 
@@ -465,10 +761,26 @@ that guarantee, and any mixed lifetimes in one request must satisfy
 Anthropic's ordering rule (a 1h marker before a 5m one).
 
 ```toml
-[providers.models.custom.claude-via-gateway]
+[providers]
+
+[providers.connections]
+
+[providers.connections."custom.claude-via-gateway"]
+kind = "custom"
 uri = "https://<gateway-host>/v1"
-model = "<anthropic-routed model>"
+
+[providers.connections."custom.claude-via-gateway".auth]
+mode = "api_key"
 api_key = "op://platform/gateway/api-key"
+
+[providers.models]
+
+[providers.models."custom.claude-via-gateway"]
+capability = "chat"
+provider = "custom.claude-via-gateway"
+model = "<anthropic-routed model>"
+
+[providers.models."custom.claude-via-gateway".options]
 cache_passthrough = true
 cache_ttl = "1h"
 ```
@@ -476,8 +788,21 @@ cache_ttl = "1h"
 On a native Anthropic entry the same key works without `cache_passthrough`:
 
 ```toml
-[providers.models.anthropic.direct]
+[providers]
+
+[providers.connections]
+
+[providers.connections."anthropic.direct"]
+kind = "anthropic"
+
+[providers.models]
+
+[providers.models."anthropic.direct"]
+capability = "chat"
+provider = "anthropic.direct"
 model = "claude-sonnet-4-5"
+
+[providers.models."anthropic.direct".options]
 cache_ttl = "1h"
 ```
 
@@ -521,16 +846,38 @@ than the limit allows. Raise the limit for screenshot-heavy sessions.
 Ollama defaults to the local endpoint, so a local alias only needs the model name:
 
 ```toml
-[providers.models.ollama.local]
+[providers]
+
+[providers.connections]
+
+[providers.connections."ollama.local"]
+kind = "ollama"
+
+[providers.models]
+
+[providers.models."ollama.local"]
+capability = "chat"
+provider = "ollama.local"
 model = "llama3.1"
 ```
 
 Set `uri` when ZeroClaw is not running on the same host as Ollama:
 
 ```toml
-[providers.models.ollama.host]
-model = "llama3.1"
+[providers]
+
+[providers.connections]
+
+[providers.connections."ollama.host"]
+kind = "ollama"
 uri = "http://host.docker.internal:11434"
+
+[providers.models]
+
+[providers.models."ollama.host"]
+capability = "chat"
+provider = "ollama.host"
+model = "llama3.1"
 ```
 
 Ollama-specific optional fields are `num_ctx`, `num_predict`, and `temperature_override`.
@@ -542,11 +889,28 @@ stricter request shaping than ordinary Ollama. A local instance defaults to
 `http://localhost:8000`; model discovery reads its live `/api/tags` response.
 
 ```toml
-[providers.models.hailo_ollama.edge]
+[providers]
+
+[providers.connections]
+
+[providers.connections."hailo_ollama.edge"]
+kind = "hailo_ollama"
+
+[providers.models]
+
+[providers.models."hailo_ollama.edge"]
+capability = "chat"
+provider = "hailo_ollama.edge"
 model = "qwen3:1.7b"
-context_window = 2048
+
+[providers.models."hailo_ollama.edge".options]
 max_tokens = 256
-timeout_secs = 90
+
+[providers.models."hailo_ollama.edge".metadata]
+context_window = 2048
+
+[providers.models."hailo_ollama.edge".api]
+request_timeout_secs = 90
 queue_timeout_secs = 30
 ```
 
@@ -598,12 +962,30 @@ rejects an oversized protocol instead of sending truncated tool instructions.
 Azure OpenAI computes its endpoint from the typed Azure fields:
 
 ```toml
-[providers.models.azure.work]
+[providers]
+
+[providers.connections]
+
+[providers.connections."azure.work"]
+kind = "azure"
+
+[providers.connections."azure.work".auth]
+mode = "api_key"
 api_key = "op://platform/azure-openai/api-key"
-model = "gpt-4o"
+
+[providers.connections."azure.work".extra]
 resource = "example-resource"
-deployment = "gpt-4o-prod"
 api_version = "2024-10-21"
+
+[providers.models]
+
+[providers.models."azure.work"]
+capability = "chat"
+provider = "azure.work"
+model = "gpt-4o"
+
+[providers.models."azure.work".extra]
+deployment = "gpt-4o-prod"
 ```
 
 The `resource`, `deployment`, and `api_version` values live in this typed config, they are not read from Azure-specific environment variables. Use `uri` only when you need to override the computed endpoint completely.
@@ -613,7 +995,18 @@ The `resource`, `deployment`, and `api_version` values live in this typed config
 Bedrock needs an alias with a model; endpoint region currently comes from the Bedrock auth environment/profile path:
 
 ```toml
-[providers.models.bedrock.work]
+[providers]
+
+[providers.connections]
+
+[providers.connections."bedrock.work"]
+kind = "bedrock"
+
+[providers.models]
+
+[providers.models."bedrock.work"]
+capability = "chat"
+provider = "bedrock.work"
 model = "anthropic.claude-sonnet-4-6"
 ```
 
@@ -624,7 +1017,7 @@ The Bedrock provider uses the credential paths implemented in `crates/zeroclaw-p
 3. `credential_process` in the active profile from `~/.aws/config`, or from `AWS_CONFIG_FILE`, uses SigV4. `AWS_PROFILE` selects the profile and defaults to `default`.
 4. EC2 IMDSv2 instance credentials are the final SigV4 fallback.
 
-The config schema additionally defines a `providers.models.bedrock.<alias>.region`
+The config schema additionally defines a `providers.connections.<connection>.extra.region`
 field, but the current implementation does not read it. The endpoint region is
 always resolved from the AWS credential chain (environment variables,
 `credential_process`, or IMDS) as described above.
@@ -654,9 +1047,9 @@ The `custom` slot requires `uri`. See [Custom providers](./custom.md).
 
 ## Picking which provider an agent uses
 
-Agents reference a provider by dotted alias. Provider entries on their own do nothing.
+Agents reference a provider by dotted alias: two-segment `<type>.<alias>` for the profile, or three-segment `<type>.<alias>.<model_alias>` to select a model in its `models` subtable. Provider entries on their own do nothing.
 
-`risk_profile` and `runtime_profile` reference independent alias maps, so their names need not match (`runtime_profile` is also optional). `Config::validate()` fails loud at startup if `model_provider` doesn't resolve to a configured `[providers.models.<type>.<alias>]` entry, or if `risk_profile` doesn't resolve to a configured `[risk_profiles.<alias>]` entry.
+`risk_profile` and `runtime_profile` reference independent alias maps, so their names need not match (`runtime_profile` is also optional). `Config::validate()` fails loud at startup if `model_provider` doesn't resolve to a configured `[providers.models."<model-ref>"]` entry (or, for a three-segment ref, to a configured `[providers.models."<model-ref>".models.<model_alias>]` model entry), or if `risk_profile` doesn't resolve to a configured `[risk_profiles.<alias>]` entry.
 
 For multiple agents pointing at different providers, see [Routing](./routing.md).
 
@@ -674,85 +1067,44 @@ Responses and Anthropic send the control in streaming and non-streaming requests
 
 ## Fallback on failure
 
-When a request to a provider fails after exhausting its retries (provider down,
-key rate-limited, model unavailable), the alias can fall over to alternatives
-you declare on the alias entry. Two independent, ordered axes:
+When a request fails after its retries are exhausted, ZeroClaw follows the
+explicit exact-key graph under `[providers.fallback]`. Each source and target is
+a complete model reference, so every candidate resolves its own connection,
+model identifier, presets, options, metadata, credentials, and capability
+policy. Connection descriptors may be reused during one construction pass, but
+a candidate never inherits another model's resolved policy.
 
-- **`fallback_models`**: alternate model IDs tried on *this* provider, using the
-  same endpoint, key, and headers. Only the model identifier changes. Use it when
-  a provider serves a backup model (a smaller or older variant) that should be
-  tried before leaving the provider entirely.
-- **`fallback`**: an ordered list of *other* provider aliases (dotted
-  `<type>.<alias>` references into `[providers.models]`). Each fallback alias
-  resolves with **its own** credentials, endpoint, and model, a fallback never
-  inherits the failing alias's key.
-
-### Order of attempts
-
-The walk is depth-first: an alias's entire model list is exhausted before leaving
-it, then each `fallback` alias is descended in turn, applying that alias's own
-`fallback_models` and `fallback` recursively. Suppose `anthropic.prod` serves
-`claude-sonnet-4-5`, lists `claude-haiku-4-5` in its `fallback_models`, and
-names `openai.backup` (serving `gpt-4.1`) in its `fallback`. The attempt order
-is then:
-
-```
-anthropic.prod/claude-sonnet-4-5
-  -> anthropic.prod/claude-haiku-4-5
-  -> openai.backup/gpt-4.1
-  -> (request fails)
+```toml
+[providers.fallback]
+"chat.primary" = ["chat.backup", "chat.last"]
+"chat.backup" = ["chat.last"]
 ```
 
-Fallback aliases can themselves declare `fallback`, so the chain is as long as
-your config makes it, up to a maximum depth of **3 aliases**. A chain that loops
-back on itself (`a` -> `b` -> `a`) is detected and the cycle edge is pruned, and
-an acyclic chain deeper than the limit has its remaining links pruned; neither
-ever loops, hangs, or overflows the stack.
-
-### Misconfiguration
-
-A `fallback` entry that names an alias which is not configured, one that closes a
-cycle, or a chain that exceeds the maximum depth is **non-fatal**:
-`Config::validate()` still succeeds, the offending edge is skipped at runtime, and
-the issue is surfaced as a validation warning (`dangling_fallback_ref` /
-`fallback_cycle` / `max_fallback_depth_exceeded`) on the CLI and in the dashboard.
-A `fallback_models` entry that is blank or duplicates the alias's primary `model`
-is likewise skipped at runtime and surfaced (`empty_fallback_model` /
-`fallback_model_duplicates_primary`). A bad fallback link degrades gracefully, it
-never prevents the agent from running.
+The graph is traversed depth-first. Missing targets, duplicate edges, cycles,
+and paths beyond the configured depth are reported during validation and
+pruned at admission; they never cause an unbounded walk. Model switching uses
+the same exact-key construction path, so changing a model rematerializes its
+complete definition instead of mutating only the wire model string.
 
 ### Anthropic refusals and fallback
 
 Native Anthropic requests can come back as a *refusal*: an HTTP 200 whose
-`stop_reason` is `"refusal"`, emitted by Fable's safety classifiers rather than
-a normal completion. ZeroClaw treats a refusal as a typed error so fallback can
-recover it two ways:
+`stop_reason` is `"refusal"`, emitted by Fable's safety classifiers rather
+than a normal completion. ZeroClaw treats a refusal as a typed error so the
+canonical fallback graph can recover it. Anthropic's native
+`server_fallback_models` remains a separate server-side feature on the
+Anthropic connection/model adapter; it is not part of the client-side graph.
 
-- **Client-side** (`fallback_models`, above): the refusal surfaces as an error,
-  and ZeroClaw advances to the next model or alias just as it does for any other
-  provider failure, so the reply comes from a different model.
-- **Server-side** (`server_fallback_models` on
-  `[providers.models.anthropic.<alias>]`): Anthropic retries the refused request
-  against a listed model on its side, in a single non-streaming call. Entries
-  must name permitted fallback targets, for example mapping `claude-fable-5` to
-  `claude-opus-4-8`.
-
-Either way the delivered reply carries a short footer naming the requested and
-served models, so the switch is visible to the user. In the web dashboard chat
-the same switch surfaces as an inline notice just before the answer, showing
-only the requested and served model names. When an ordinary provider failure
-already moved the request to a client-side fallback before Anthropic switched
-models on its side, the reply keeps the ordinary fallback notice as well, so
-the originally requested model stays visible and the two causes are not
-conflated.
-
-Streaming has a limit: a refusal that arrives after streamed output has begun
+Either path carries a short footer naming the requested and served models, so
+the switch is visible to the user. Streaming has a limit: a refusal that
+arrives after streamed output has begun
+ a refusal that arrives after streamed output has begun
 keeps the existing interrupted-reply behavior; fallback applies only to refusals
 detected before output starts.
 
 OpenAI-compatible and Responses wires cannot carry Anthropic's native
 refusal/fallback metadata; route Anthropic models through
-`[providers.models.anthropic.<alias>]` to get this behavior.
+`[providers.models."<model-ref>"]` to get this behavior.
 
 ## See also
 
@@ -761,3 +1113,31 @@ refusal/fallback metadata; route Anthropic models through
 - [Streaming](./streaming.md)
 - [Routing](./routing.md)
 - [Custom providers](./custom.md)
+
+## Registry CLI editing
+
+Provider commands address an exact key in one canonical registry:
+
+```bash
+zeroclaw providers list --registry models
+zeroclaw providers create connections 'gateway.prod' '{"kind":"custom","uri":"https://gateway.example.com/v1"}'
+zeroclaw providers create models 'chat.fast.v2' '{"capability":"chat","provider":"gateway.prod","model":"wire-model"}'
+zeroclaw providers rename models 'chat.fast.v2' 'chat.primary'
+zeroclaw providers delete models 'chat.unused' --dry-run
+zeroclaw providers delete models 'chat.unused' --yes
+```
+
+The registry argument is `connections`, `models`, `model-presets`, or `fallback`.
+Create accepts a complete JSON definition and refuses an existing key. Rename
+rewrites exact registry and configuration references, preserving credentials;
+it never rewrites other keys sharing a dotted prefix. External SOP files or
+other operator-managed references must be updated separately. Delete refuses
+referenced entries; remove their bindings explicitly before deleting. Entries
+with environment overrides cannot be renamed or deleted until their environment
+configuration is updated. `--dry-run` validates the deletion without saving.
+The old category/family/alias CLI syntax has been removed.
+
+Provider CLI mutations (including `models set`) acquire exclusive offline
+configuration ownership and reload before editing. While a daemon owns the
+configuration, use its configuration editor, or stop it before using these
+commands. This prevents a connection/model rename from racing live sessions.

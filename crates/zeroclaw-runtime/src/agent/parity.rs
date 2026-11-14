@@ -154,7 +154,7 @@ async fn parity_l1_engine_honors_excluded_tools() {
                 provider_name: "mock",
                 model: "mock-model",
                 dispatch_model: "mock-model",
-                temperature: None,
+                temperature: None.into(),
             },
             ResolvedIo {
                 tools_registry: &tools_registry,
@@ -174,7 +174,7 @@ async fn parity_l1_engine_honors_excluded_tools() {
                 excluded_tools: &excluded,
                 dedup_exempt_tools: &[],
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools: false,
                 max_tool_result_chars: 30_000,
                 keep_tool_context_turns: 2,
@@ -408,7 +408,7 @@ async fn parity_l2_sop_live_step_agent_isolation() {
             .expect("per-agent policy must resolve for the restricted step agent"),
     );
     // Scoped comparison: the two paths' FULL built sets differ by construction —
-    // the helper builds the agent's real tools via `all_tools_with_runtime`, this
+    // the helper builds the agent's real tools via `build_native_registry`, this
     // direct call uses a controlled fixture of real built-in names — so the
     // security-relevant comparison is over that shared name universe.
     let universe = ["file_read", "shell", "memory_recall"];

@@ -53,6 +53,7 @@ catalog! {
     // Cron
     CronIdParams, CronPatchParams, CronDeleteResult, CronRunsParams, CronTriggerResult,
     // Config
+    RegistryEdit,
     ConfigGetParams, ConfigGetPropResult, ConfigSetParams, ConfigSetResult, ConfigSetManyParams, ConfigSetManyResult, ConfigValidateResult,
     ConfigReloadResult, ConfigListParams, ConfigListResult, ConfigDeleteParams, ConfigDeleteResult,
     ConfigMapKeysParams, ConfigMapKeysResult, ConfigResolveAliasSourceParams,

@@ -14,7 +14,6 @@ use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::turn_stop::{TurnStop, TurnStopCode};
 use zeroclaw_config::schema::{Config, MultimodalConfig, PacingConfig, ResolvedContextLimits};
 use zeroclaw_providers::{ChatMessage, ModelProvider};
-use zeroclaw_tool_call_parser::{strip_think_tags, strip_trailing_terminal_markers};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum CompletionLimit {
@@ -75,7 +74,8 @@ pub(crate) async fn finish_after_max_iterations(
     provider_name: &str,
     model: &str,
     dispatch_model: &str,
-    temperature: Option<f64>,
+    temperature: impl Into<zeroclaw_providers::temperature::Temperature> + Send,
+    fallback_temperature: Option<f64>,
     pacing: &PacingConfig,
     cancellation_token: Option<&CancellationToken>,
     limit: CompletionLimit,
@@ -97,6 +97,8 @@ pub(crate) async fn finish_after_max_iterations(
     observer: &dyn crate::observability::Observer,
     vision_source: Option<super::VisionProviderSource<'_>>,
 ) -> Result<String> {
+    let temperature = temperature.into();
+    let sampling_config = config.map(|config| std::sync::Arc::new(config.clone()));
     let exhaustion = limit.explanation();
     ::zeroclaw_log::record!(
         WARN,
@@ -376,16 +378,38 @@ pub(crate) async fn finish_after_max_iterations(
                 } else {
                     &selected_model
                 },
-                temperature,
+                temperature: fallback_temperature.into(),
             };
             // Route the graceful-summary call through the metered provider seam. This
             // was the one tool-loop provider call that skipped the budget check and
             // recorded no cost; through the seam it now fails closed when the turn's
             // budget is exhausted and its token usage is charged like any in-loop
             // call. Metering is a no-op when the turn is unscoped.
-            access
-                .run_model_query(summary_request, &mut summary_attempts)
-                .await
+            let resolver: std::sync::Arc<
+                dyn Fn(&str) -> zeroclaw_api::TextExtraction + Send + Sync,
+            > = match config {
+                Some(config) => {
+                    let config = std::sync::Arc::new(config.clone());
+                    std::sync::Arc::new(move |model: &str| config.model_text_extraction(model))
+                }
+                None => std::sync::Arc::new(|_: &str| zeroclaw_api::TextExtraction {
+                    reasoning: true,
+                    tool_calls: false,
+                }),
+            };
+            zeroclaw_api::scope_text_extraction(
+                Some(resolver),
+                access.run_model_query_with_sampling(
+                    summary_request,
+                    &mut summary_attempts,
+                    temperature.for_call_with_fallback(
+                        sampling_config.clone(),
+                        provider_name,
+                        fallback_temperature,
+                    ),
+                ),
+            )
+            .await
         };
         match pacing.step_timeout_secs {
             Some(step_secs) if step_secs > 0 => {
@@ -483,14 +507,20 @@ pub(crate) async fn finish_after_max_iterations(
     // The summary is raw provider text, and emitting it as a chunk makes this
     // a new automatic display sink: ACP renders `agent_message_chunk` live,
     // while gateway and RPC forward the same chunk without another
-    // normalization step. Apply the display hygiene the ordinary final
-    // response already gets before anything is emitted -- strip hidden think
-    // content and trailing terminal markers, then withhold text that looks
-    // like an internal tool-protocol envelope. The summary call passes
-    // `tools: None`, so the tools-free detector is the matching contract.
-    let display_text = strip_trailing_terminal_markers(&strip_think_tags(&raw_text));
-    let protocol_suppressed =
-        super::protocol_detect::detect_internal_protocol_without_tools(&display_text).is_some();
+    // normalization step. Apply the accepted model's extraction policy before
+    // emitting anything, just as for an ordinary final response.
+    let served_ref = summary_attempts
+        .iter()
+        .rev()
+        .find(|attempt| attempt.accepted)
+        .map_or(provider_name, |attempt| attempt.provider_ref.as_str());
+    let extraction: zeroclaw_config::provider_registry::TextExtraction = config
+        .map_or_else(Default::default, |config| {
+            config.model_text_extraction(served_ref)
+        });
+    let display_text = zeroclaw_providers::response::normalize_text(&raw_text, extraction);
+    let protocol_suppressed = extraction.tool_calls
+        && super::protocol_detect::detect_internal_protocol_without_tools(&display_text).is_some();
     if protocol_suppressed {
         ::zeroclaw_log::record!(
             WARN,
@@ -620,8 +650,153 @@ mod graceful_summary_metering_tests {
         }
     }
 
-    /// Provider that omits `usage` entirely, like llama.cpp and other
-    /// local OpenAI-compatible servers.
+    #[tokio::test]
+    async fn graceful_vision_summary_resolves_selected_sampling_on_wire() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        use zeroclaw_config::schema::{Config, ModelEntryConfig};
+        use zeroclaw_providers::temperature::Temperature;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "vision summary"}}]
+            })))
+            .mount(&server)
+            .await;
+        let mut config = Config::default();
+        let text = config.providers.models.ensure("custom", "text").unwrap();
+        text.uri = Some(server.uri());
+        text.model = Some("text-id".into());
+        text.temperature = Some(0.2);
+        text.vision = Some(false);
+        let vision = config.providers.models.ensure("custom", "vision").unwrap();
+        vision.uri = Some(server.uri());
+        vision.temperature = Some(0.7);
+        vision.models.insert(
+            "selected".into(),
+            ModelEntryConfig {
+                id: Some("vision-id".into()),
+                temperature: Some(0.8),
+                ..Default::default()
+            },
+        );
+        config.multimodal.vision_model_provider = Some("custom.vision.selected".into());
+        let primary = zeroclaw_providers::model::build_raw_provider(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "custom.text",
+            Default::default(),
+        )
+        .map(|resolved| resolved.provider)
+        .unwrap();
+        for (input, expected) in [
+            (Temperature::from(None), 0.8),
+            (Temperature::from(Some(0.2)), 0.2),
+            (Temperature::adjusted(None, 0.1), 0.9),
+        ] {
+            let mut history = vec![ChatMessage::user(
+                "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]",
+            )];
+            let out = finish_after_max_iterations(
+                &mut None,
+                primary.as_ref(),
+                &mut history,
+                "custom.text",
+                "text-id",
+                "text-id",
+                input,
+                None,
+                &PacingConfig::default(),
+                None,
+                CompletionLimit::LocalIterations(2),
+                String::new(),
+                "vision-sampling-summary",
+                &LoopKnobs::default(),
+                None,
+                None,
+                None,
+                Some(&zeroclaw_config::migration::admit_test_input(&config)),
+                &config.multimodal,
+                None,
+                None,
+                None,
+                None,
+                |_, _| ResolvedContextLimits::legacy_fallback(0),
+                &mut false,
+                None,
+                &crate::observability::NoopObserver,
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(out.contains("vision summary"));
+            let requests = server.received_requests().await.unwrap();
+            let body: serde_json::Value =
+                serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+            assert_eq!(body["model"], "vision-id");
+            assert!((body["temperature"].as_f64().unwrap() - expected).abs() < 1e-9);
+        }
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_preserves_bare_family_admitted_temperature() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        use zeroclaw_config::schema::Config;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "summary"}}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = Config::default();
+        let profile = config.providers.models.ensure("custom", "primary").unwrap();
+        profile.uri = Some(server.uri());
+        profile.model = Some("model-id".into());
+        let provider = zeroclaw_providers::model::build_raw_provider(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "custom.primary",
+            Default::default(),
+        )
+        .map(|resolved| resolved.provider)
+        .unwrap();
+        let output = finish_after_max_iterations(
+            &mut None,
+            provider.as_ref(),
+            &mut vec![ChatMessage::user("finish")],
+            "custom",
+            "model-id",
+            "model-id",
+            zeroclaw_providers::temperature::Temperature::adjusted(None, 0.1),
+            Some(0.7),
+            &PacingConfig::default(),
+            None,
+            CompletionLimit::LocalIterations(2),
+            String::new(),
+            "bare-family-summary",
+            &LoopKnobs::default(),
+            None,
+            None,
+            None,
+            Some(&zeroclaw_config::migration::admit_test_input(&config)),
+            &config.multimodal,
+            None,
+            None,
+            None,
+            None,
+            |_, _| ResolvedContextLimits::legacy_fallback(0),
+            &mut false,
+            None,
+            &crate::observability::NoopObserver,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(output.contains("summary"));
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["temperature"], 0.7);
+    }
+
     struct UsageOmittingProvider;
 
     #[async_trait]
@@ -670,6 +845,22 @@ mod graceful_summary_metering_tests {
         let pacing = PacingConfig::default();
         let knobs = LoopKnobs::default(); // GracefulSummary
         let multimodal_config = MultimodalConfig::default();
+        let config = zeroclaw_config::schema::Config {
+            providers: toml::from_str(
+                r#"
+[connections.fixture]
+kind = "custom"
+capabilities = ["chat"]
+[models.custom]
+capability = "chat"
+provider = "fixture"
+model = "test-model"
+options = { extract_text_reasoning = true, extract_text_tool_calls = true }
+"#,
+            )
+            .unwrap(),
+            ..Default::default()
+        };
         finish_after_max_iterations(
             &mut None,
             provider,
@@ -677,6 +868,7 @@ mod graceful_summary_metering_tests {
             "custom",
             "test-model",
             "test-model",
+            None,
             None,
             &pacing,
             None,
@@ -687,7 +879,7 @@ mod graceful_summary_metering_tests {
             event_tx,
             on_delta,
             None,
-            None,
+            Some(&config),
             &multimodal_config,
             None,
             None,
@@ -1039,6 +1231,7 @@ mod graceful_summary_metering_tests {
                 "original-model",
                 "hint:original-model",
                 None,
+                None,
                 &PacingConfig::default(),
                 None,
                 CompletionLimit::ExecutionTree,
@@ -1189,6 +1382,7 @@ mod graceful_summary_metering_tests {
                 "original-model",
                 "original-model",
                 None,
+                None,
                 &PacingConfig::default(),
                 None,
                 CompletionLimit::LocalIterations(2),
@@ -1263,6 +1457,7 @@ mod graceful_summary_metering_tests {
                 "custom",
                 "test-model",
                 "test-model",
+                None,
                 None,
                 &PacingConfig::default(),
                 None,
@@ -1360,6 +1555,7 @@ mod graceful_summary_metering_tests {
             "test-model",
             "test-model",
             None,
+            None,
             &pacing,
             None,
             CompletionLimit::LocalIterations(2),
@@ -1443,6 +1639,7 @@ mod graceful_summary_metering_tests {
             "custom",
             "test-model",
             "test-model",
+            None,
             None,
             &pacing,
             None,
@@ -1543,6 +1740,7 @@ mod graceful_summary_metering_tests {
             "test-model",
             "test-model",
             None,
+            None,
             &pacing,
             None,
             CompletionLimit::LocalIterations(2),
@@ -1624,6 +1822,7 @@ mod graceful_summary_metering_tests {
             "custom",
             "test-model",
             "test-model",
+            None,
             None,
             &pacing,
             None,
@@ -1717,6 +1916,7 @@ mod graceful_summary_metering_tests {
             "test-model",
             "test-model",
             None,
+            None,
             &pacing,
             None,
             CompletionLimit::LocalIterations(2),
@@ -1771,6 +1971,7 @@ mod graceful_summary_metering_tests {
             "custom",
             "test-model",
             "test-model",
+            None,
             None,
             &pacing,
             None,
@@ -1858,6 +2059,7 @@ mod graceful_summary_metering_tests {
             "custom",
             "test-model",
             "test-model",
+            None,
             None,
             &pacing,
             None,
@@ -1948,6 +2150,7 @@ mod graceful_summary_metering_tests {
             "custom",
             "test-model",
             "test-model",
+            None,
             None,
             &pacing,
             None,

@@ -10,8 +10,12 @@ This lets one trigger (a webhook path, a channel, an MQTT topic) feed several
 SOPs, with the model deciding which of them the event is really for and how
 much human supervision each run gets.
 
-ZeroClaw speaks the "System One" typed-decision API (`POST <base_url>/v1/systemone`).
-Two models implement it:
+Canonical provider models can use either native typed-decision protocol:
+OpenAI's Decisions API (`POST <base_url>/v1/decisions`) or System One
+(`POST <base_url>/v1/systemone`). Chat Completions and Responses structured
+outputs are not substituted for either protocol.
+
+Two services implement System One:
 
 | Model | Where it runs | Notes |
 |---|---|---|
@@ -20,32 +24,43 @@ Two models implement it:
 
 ## Configure models
 
-Declare each model under an alias in `config.toml` and pick its `provider`:
-
-| `provider` | Service | `base_url` default | `model` default | Key |
-|---|---|---|---|---|
-| `jev` (default) | TypeSafe Jev, hosted | `https://api.typesafe.ai` | `jev-latest` | `api_key` required |
-| `laya` | Laya via `laya-serve` | `http://127.0.0.1:8000` | `laya` | none |
-| `custom` | Any other System One-compatible endpoint | required | `jev-latest` | optional |
+Declare reusable connections and exact model keys under `providers`:
 
 ```toml
-[decision_models.jev]
-provider = "jev"
-# api_key is a secret; set it with `zeroclaw config` or
-# ZEROCLAW_decision_models__jev__api_key.
+[providers.connections.typesafe]
+kind = "system-one"
+uri = "https://api.typesafe.ai"
 
-[decision_models.laya]
-provider = "laya"
+[providers.connections.typesafe.auth]
+mode = "api_key"
+# Set api_key with `zeroclaw config` or
+# ZEROCLAW_providers__connections__typesafe__auth__api_key.
 
-[decision_models.gpu_box]
-provider = "custom"
-base_url = "http://10.0.0.5:8000"
+[providers.connections.local]
+kind = "system-one"
+uri = "http://127.0.0.1:8000"
+
+[providers.models.jev]
+capability = "decision"
+provider = "typesafe"
+model = "jev-latest"
+
+[providers.models.laya]
+capability = "decision"
+provider = "local"
 model = "laya"
 ```
 
-`base_url` and `model` override the provider defaults. A `custom` entry without
-a `base_url` is ignored, and SOPs selecting it fall back to their strictest mode.
-The aliases can also be managed from the dashboard's Config page.
+Connections with `kind = "system-one"` default to the System One protocol.
+OpenAI, custom and vLLM connections use the native OpenAI Decisions protocol
+by default; `api.decision.wire_api` selects `openai_decisions` or `system_one`.
+Decision models reuse connection authentication, HTTP headers and timeouts.
+The dashboard's model selector lists exact decision model keys only.
+
+V3 `[decision_models.<alias>]` input is migrated to a canonical connection and
+decision model during configuration loading. The alias remains the exact model
+key, including dots. Runtime, CLI validation and the dashboard read only the
+canonical registry; saved configuration no longer contains `decision_models`.
 
 ## Select a model in an SOP
 
@@ -68,7 +83,7 @@ min_confidence = 0.7
 
 | Field | Default | Effect |
 |---|---:|---|
-| `model` | required | Alias from `[decision_models]`. |
+| `model` | required | Exact decision model key from `[providers.models]`. |
 | `gate` | unset | Yes/no question. The run starts only when the model's "yes" probability reaches `gate_threshold`; otherwise the event is recorded as skipped for this SOP. |
 | `gate_threshold` | `0.7` | Minimum "yes" probability to start. |
 | `gate_on_error` | `run_strict` | When the model cannot answer: `run_strict` starts the run in its fail-closed mode, `skip` does not start it. |

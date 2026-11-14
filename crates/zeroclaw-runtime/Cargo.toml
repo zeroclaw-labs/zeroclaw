@@ -149,7 +149,10 @@ sandbox-bubblewrap = []
 # zeroclaw-channels and zeroclaw-gateway). Off by default and never enabled by
 # any production dependency edge, so these helpers are absent from shipped
 # builds.
-test-util = []
+test-util = [
+    "zeroclaw-config/test-helpers",
+    "zeroclaw-providers/test-helpers",
+]
 
 [dev-dependencies]
 opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "logs"] }
@@ -177,6 +180,8 @@ wiremock = "0.6"
 # retry-regression tests. Not in default deps so
 # the helper is unreachable from production builds.
 zeroclaw-tools = { workspace = true, features = ["test-helpers"] }
+# Keep OAuth endpoint injection confined to deterministic construction tests.
+zeroclaw-providers = { workspace = true, features = ["test-helpers"] }
 # Test-only config fault injection for the config/set post-rename sync
 # regression. Same pattern as zeroclaw-tools above.
 zeroclaw-config = { workspace = true, features = ["test-helpers"] }

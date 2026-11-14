@@ -19,19 +19,21 @@ Multi-model configuration is useful for:
 
 ## Core idea: per-agent dispatch
 
-Each `[agents.<alias>]` entry starts from one `[providers.models.<type>.<alias>]`. That provider profile can declare alternate models with `fallback_models` and other provider profiles with `fallback`. See [Routing](../providers/routing.md) for the full pattern.
+Each `[agents.<alias>]` entry references one exact-key model under `[providers.models."<model-ref>"]`. Reusable fallback edges live in `[providers.fallback]`, where every target is a complete model reference. See [Routing](../providers/routing.md) for the full pattern.
 
 To run multiple models, run multiple agents, each binding to one model provider. Each channel binds to one agent at a time. To move a channel to a different agent, edit the `channels` list on the agent that should pick it up; `Config::validate()` makes sure references resolve at startup.
 
+A single provider entry can host several models that share its endpoint and credential: add a `models.<model_alias>` subtable per model and address it with a three-segment ref `<type>.<alias>.<model_alias>`. See [Hosting multiple models on one provider entry](../providers/configuration.md#hosting-multiple-models-on-one-provider-entry).
+
 ## Cross-provider reliability
 
-For non-streaming calls, ZeroClaw can walk an ordered fallback graph across provider profiles. Each fallback profile keeps its own endpoint, credentials, model, headers, capability overrides, and nested fallback declarations. The runtime retries or advances according to the error classification and profile cooldown state.
+For non-streaming calls, ZeroClaw walks an ordered exact-key graph under `[providers.fallback]`. Every target keeps its own connection, credentials, model, headers, presets, options, and capability policy. The runtime retries or advances according to the error classification and cooldown state.
 
 OpenRouter remains a first-class provider and can perform vendor selection behind one endpoint. It is an optional external routing layer, not a requirement for ZeroClaw's first-party fallback.
 
 ## Non-streaming retry and fallback
 
-For transient errors such as a network failure, `503`, or timeout, a non-streaming call retries with bounded exponential backoff, configurable globally under `reliability` (defaults: 2 retries, 500 ms initial backoff). After an entry is exhausted, the reliable wrapper advances through the profile's `fallback_models` and fallback profiles.
+For transient errors such as a network failure, `503`, or timeout, a non-streaming call retries with bounded exponential backoff, configurable globally under `reliability` (defaults: 2 retries, 500 ms initial backoff). After an entry is exhausted, the reliable wrapper advances through the exact-key `[providers.fallback]` graph.
 
 ## Streaming recovery boundary
 
@@ -81,8 +83,9 @@ a catalog name may differ from an Ollama tag or a server's model ID.
 
 For Ollama, follow the [Ollama configuration example](../providers/configuration.md#ollama).
 The [local-small profile below](#local-small-no-text-fallback-profile) shows
-how `providers.models.ollama.local` connects to `agents.local` through
-`model_provider = "ollama.local"`, together with risk and runtime profiles.
+how an `ollama.local` connection and the exact model reference
+`chat.ollama.local` connect to `agents.local`, together with risk and runtime
+profiles.
 Replace its example model with your selected, installed Ollama tag. Set
 `num_ctx` on the Ollama provider to the context length you intend to test,
 and review the runtime profile's prompt and history limits alongside it.
@@ -137,12 +140,17 @@ The `dev` agent runs from the CLI (no channel binding required, `zeroclaw agent 
 Small local models usually need a runtime profile, not a provider-specific mode. Keep the Ollama provider focused on connection details, then use `[runtime_profiles.<alias>]` to tighten the prompt/tool loop behavior. ZeroClaw exposes a built-in `local_small` runtime preset for code paths that install runtime presets directly. If you edit config by hand, use this equivalent block:
 
 ```toml
-[providers.models.ollama.local]
-uri   = "http://localhost:11434"
+[providers.connections."ollama.local"]
+kind = "ollama"
+uri = "http://localhost:11434"
+
+[providers.models."chat.ollama.local"]
+capability = "chat"
+provider = "ollama.local"
 model = "qwen2.5-coder:7b"
 
 [agents.local]
-model_provider  = "ollama.local"
+model_provider  = "chat.ollama.local"
 risk_profile    = "supervised"
 runtime_profile = "local_small"
 
@@ -156,7 +164,6 @@ block_high_risk_commands         = true
 agentic                 = true
 compact_context          = true
 prompt_injection_mode    = "compact"
-strict_tool_parsing      = true
 max_tool_iterations      = 4
 max_actions_per_hour     = 10
 max_cost_per_day_cents   = 100
@@ -177,12 +184,13 @@ This profile composes existing primitives:
 
 - `compact_context` keeps startup context small by capping each workspace bootstrap file at 6000 characters on agent-loop and channel turns, before `max_system_prompt_chars` applies; `zeroclaw doctor` warns when a file is over the cap.
 - `prompt_injection_mode = "compact"` keeps skill metadata inline and loads full instructions on demand when `read_skill` is available; providers without that loader retain the existing full-injection fallback.
-- `strict_tool_parsing` treats XML/JSON-looking fallback text as assistant text unless the provider returns native tool calls.
 - `max_tool_iterations`, `max_system_prompt_chars`, and `max_tool_result_chars` bound runaway loops and oversized prompt/tool context. `max_context_tokens` remains the absolute proactive-trim budget; set `context_compact_ratio` explicitly to opt into a model-relative threshold. Every positive effective threshold is capped by the selected model's configured context capacity; `max_context_tokens = 0` remains the proactive-trimming disable sentinel.
 - `max_actions_per_hour`, `max_cost_per_day_cents`, and the timeout/delegation fields keep local runs on the same budget shape as the built-in preset.
 - `parallel_tools = false` and `keep_tool_context_turns = 1` keep local runs sequential and send tool-call and tool-result rows for the running turn and one prior turn only; older turns are sent as prompt, tool-exchange summary and final reply (see [History management](../agents/history-management.md#tool-context-retention)).
 
-With Ollama, this is a no-text-fallback profile: authorized tools remain configured in `risk_profile`, but text-form tool markup from the model is not executed. Use it for chat-first local agents, or for providers that return native/structured tool calls. If a local model must use ZeroClaw's text fallback tool syntax, set `strict_tool_parsing = false` and keep the other small-model limits.
+Text tool-call extraction is configured per canonical chat model through its
+`options` or an inherited `model_preset`. Set `extract_text_tool_calls = false`
+for a model whose textual tool markup must remain ordinary assistant text.
 
 ## Cost tiering: heavy model when needed, fast model otherwise
 
@@ -226,8 +234,8 @@ zeroclaw doctor traces --contains "model_provider"
 ## Best practices
 
 1. **One agent per routing intent.** If two channels need different model behavior, name two agents.
-2. **Give fallback profiles explicit ownership.** Keep each endpoint, credential, model, and capability override on the profile that serves it.
-3. **Treat OpenRouter as an optional routing layer.** Use it when server-side vendor selection is useful; use ZeroClaw fallback profiles when the runtime should own the order.
+2. **Give fallback models explicit ownership.** Keep each connection, credential, model, preset, option, and capability override on the model definition that serves it.
+3. **Treat OpenRouter as an optional routing layer.** Use it when server-side vendor selection is useful; use the exact-key `[providers.fallback]` graph when the runtime should own the order.
 4. **Do not rely on `reliability.api_keys`.** Use separately constructed profiles until [issue #9190](https://github.com/zeroclaw-labs/zeroclaw/issues/9190) is fixed.
 5. **Smoke-test each agent in isolation.** `zeroclaw agent -a <alias>` runs an agent without channel plumbing in the way.
 6. **Document agent intent.** Add `# comment` lines explaining which channels each agent serves and why.
@@ -242,7 +250,7 @@ Each provider entry resolves credentials in this order:
 2. **Secrets store** at `~/.zeroclaw/secrets`.
 3. **Generic env override**: `ZEROCLAW_providers__models__<type>__<alias>__api_key=...` at startup. If your shell already exports `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, or a similar vendor-default name, bridge it into this schema-mirror variable before startup unless the provider family explicitly documents a native runtime env bridge. See [Environment variables](../reference/env-vars.md) for the full grammar and bridge examples.
 
-Credentials are not shared between provider profiles; set them per profile. A route-level `model_routes[].api_key` is a higher-precedence override when its routed target is constructed. Route targets are deduplicated by `model_provider`, so the first matching route credential can construct the provider shared by several hints. Prefer profile-owned credentials when routes share a target.
+Credentials are owned by the canonical model's connection. A `[[model_routes]]` entry contains only `hint` and exact `model_ref`, so it cannot introduce a second credential or silently override the target model. When several hints use the same reference, they naturally share that model definition; different references are materialized independently.
 
 ## Related Documentation
 

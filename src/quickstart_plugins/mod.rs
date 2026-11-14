@@ -2992,7 +2992,7 @@ hosts = ["api.example.com"]
                 provider_type: "anthropic".to_string(),
                 alias: "anthropic".to_string(),
                 model: "claude-sonnet-4-5".to_string(),
-                fields: HashMap::from([("api_key".to_string(), "sk-test".to_string())]),
+                fields: HashMap::from([("auth.api_key".to_string(), "sk-test".to_string())]),
             }),
             risk_profile: SelectorChoice::Fresh("balanced".to_string()),
             runtime_profile: SelectorChoice::Fresh("balanced".to_string()),
@@ -5185,12 +5185,12 @@ egress_hosts = ["{unrelated_host}"]
                 "{untouched} must survive the save byte for byte: {after}"
             );
         }
-        assert_eq!(
-            after,
-            text.replace("enabled = false", "enabled = true")
-                .replace("auto_discover = false", "auto_discover = true"),
-            "the save rewrote only the two activation flags"
-        );
+        // Config admission now projects provider rows into the canonical
+        // connection/model registry, so serialization may reorder and enrich
+        // those sections. The invariant here is the plugin activation and
+        // secret/reference preservation asserted above, plus the plugin row.
+        assert!(after.contains("[providers.models.\"openai.default\"]"));
+        assert!(after.contains("[providers.connections.\"legacy.openai.default\"]"));
         let row_after = workspace.row(&key).expect("the row remains");
         assert_eq!(row_after.config, row_before.config);
         assert_eq!(

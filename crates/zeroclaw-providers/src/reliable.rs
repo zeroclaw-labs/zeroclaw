@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use zeroclaw_api::model_provider::CallSampling;
 use zeroclaw_api::turn_stop::{TurnStop, TurnStopCode, tag, turn_stop};
 
 /// Info about a model_provider fallback that occurred during a request.
@@ -135,6 +136,10 @@ enum RetryDecision {
 /// rejected attempt can have been billed even when Reliable eventually fails.
 #[derive(Debug, Default)]
 pub(crate) struct ReliableCallAccounting {
+    /// The candidate selected for the stream before a terminal `Final` event
+    /// arrives. Runtime uses this to choose extraction and model policy for
+    /// the first chunk; it is never emitted as an accepted billing route.
+    provisional_route: Option<AcceptedRoute>,
     accepted_route: Option<AcceptedRoute>,
     stream_resume_after: Option<ReliableEntryId>,
     stream_recovery_semantic_empty: bool,
@@ -230,7 +235,29 @@ where
 /// A later direct/primary recovery supersedes a stream's provisional fallback
 /// candidate. Presentation still waits for runtime semantic acceptance.
 pub(crate) fn clear_provisional_provider_route() {
-    let _ = RELIABLE_CALL_ACCOUNTING.try_with(|accounting| accounting.lock().accepted_route = None);
+    let _ = RELIABLE_CALL_ACCOUNTING.try_with(|accounting| {
+        let mut accounting = accounting.lock();
+        accounting.provisional_route = None;
+        accounting.accepted_route = None;
+    });
+}
+
+pub(crate) fn current_provisional_provider_route() -> Option<AcceptedRoute> {
+    RELIABLE_CALL_ACCOUNTING
+        .try_with(|accounting| {
+            let accounting = accounting.lock();
+            accounting
+                .provisional_route
+                .clone()
+                .or_else(|| accounting.accepted_route.clone())
+        })
+        .ok()
+        .flatten()
+}
+
+fn record_provisional_provider_route(route: AcceptedRoute) {
+    let _ = RELIABLE_CALL_ACCOUNTING
+        .try_with(|accounting| accounting.lock().provisional_route = Some(route));
 }
 
 fn record_accepted_attempt(
@@ -242,7 +269,8 @@ fn record_accepted_attempt(
         entry.cooldown_key.clone(),
         entry.served_model(model).to_string(),
         fallback,
-    );
+    )
+    .with_selection_ref(entry.selection_ref.as_deref());
     let _ = RELIABLE_CALL_ACCOUNTING
         .try_with(|accounting| accounting.lock().accepted_route = Some(route));
 }
@@ -523,6 +551,7 @@ where
     T: Send + 'static,
     IsFinal: Fn(&T) -> bool + Send + 'static,
 {
+    record_provisional_provider_route(accepted_route.clone());
     stream::unfold(
         (
             stream,
@@ -602,7 +631,7 @@ fn provider_exhausted(err: anyhow::Error) -> anyhow::Error {
 pub fn transient_error_hint(err: &anyhow::Error) -> Option<&'static str> {
     if crate::model_refusal_from_error(err).is_some() {
         return Some(
-            "The model's safety system declined this request. Rephrase it, or configure fallback_models on the provider to auto-switch models.",
+            "The model's safety system declined this request. Rephrase it, or configure a target in [providers.fallback] to auto-switch models.",
         );
     }
     let msg = err.to_string();
@@ -1725,8 +1754,12 @@ fn is_empty_completion(resp: &ChatResponse) -> bool {
     resp.is_semantically_empty_terminal()
 }
 
-fn is_empty_text_completion(text: &str) -> bool {
-    zeroclaw_api::model_provider::strip_think_tags(text).is_empty()
+fn normalize_completion(resp: &mut ChatResponse, model: &str) {
+    crate::response::normalize_response(resp, zeroclaw_api::text_extraction_for(model));
+}
+
+fn normalize_text_completion(text: String, model: &str) -> String {
+    crate::response::normalize_text(&text, zeroclaw_api::text_extraction_for(model))
 }
 
 fn is_semantic_empty_completion_error(error: &anyhow::Error) -> bool {
@@ -1959,6 +1992,9 @@ pub(crate) struct ReliableModelProviderEntry {
     /// provider family and model while still being distinct fallback candidates.
     candidate_name: String,
     cooldown_key: String,
+    /// Construction selection (including a nested entry), distinct from billing
+    /// and cooldown identity. Sampling is resolved from Config at attempt time.
+    selection_ref: Option<String>,
     provider: ReliableModelProviderEntryProvider,
 }
 
@@ -1973,10 +2009,12 @@ impl ReliableModelProviderEntry {
             candidate_name: display_name.clone(),
             display_name,
             cooldown_key: cooldown_key.into(),
+            selection_ref: None,
             provider: ReliableModelProviderEntryProvider::Direct(provider),
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_candidate(
         display_name: impl Into<String>,
         cooldown_key: impl Into<String>,
@@ -1987,6 +2025,7 @@ impl ReliableModelProviderEntry {
             display_name: display_name.into(),
             candidate_name: candidate_name.into(),
             cooldown_key: cooldown_key.into(),
+            selection_ref: None,
             provider: ReliableModelProviderEntryProvider::Direct(provider),
         }
     }
@@ -2007,6 +2046,7 @@ impl ReliableModelProviderEntry {
             display_name: display_name.into(),
             candidate_name: cooldown_key.clone(),
             cooldown_key,
+            selection_ref: None,
             provider: ReliableModelProviderEntryProvider::Pinned(
                 crate::model_pin::ModelPinnedProvider::builder(alias)
                     .pinned_model(pinned_model)
@@ -2029,6 +2069,7 @@ impl ReliableModelProviderEntry {
             display_name: display_name.into(),
             candidate_name: cooldown_key.clone(),
             cooldown_key,
+            selection_ref: None,
             provider: ReliableModelProviderEntryProvider::DispatchObservedPinned {
                 pinned_model: pinned_model.into(),
                 provider,
@@ -2040,6 +2081,26 @@ impl ReliableModelProviderEntry {
     /// the entry is model-pinned, otherwise the requested model unchanged.
     fn served_model<'a>(&'a self, requested_model: &'a str) -> &'a str {
         self.provider.served_model(requested_model)
+    }
+
+    pub(crate) fn with_selection_ref(mut self, selection_ref: &str) -> Self {
+        self.selection_ref = Some(selection_ref.to_string());
+        self
+    }
+
+    fn temperature(&self, sampling: &CallSampling) -> Option<f64> {
+        sampling.resolve_for(Some(
+            self.selection_ref
+                .as_deref()
+                .unwrap_or(&self.candidate_name),
+        ))
+    }
+
+    /// Resolve model-owned response parsing against the exact configured
+    /// candidate when one exists. The upstream model ID alone is ambiguous
+    /// when two profiles serve the same wire model with different options.
+    fn text_extraction_ref<'a>(&'a self, requested_model: &'a str) -> &'a str {
+        self.selection_ref.as_deref().unwrap_or(requested_model)
     }
 
     fn candidate_name(&self) -> &str {
@@ -2109,7 +2170,7 @@ impl ReliableModelProvider {
 
     /// Build a provider whose entries mirror `push_pinned_entries`: every entry
     /// shares ONE `cooldown_key` (the `<family>.<alias>` reference) and differs
-    /// only in its pinned model, exactly as a `fallback_models` list produces.
+    /// only in its pinned model, exactly as a canonical `[providers.fallback]` edge produces.
     ///
     /// Exposed for cross-crate regressions that need the same-alias
     /// pinned-model failover shape; the production builder reaches
@@ -2524,6 +2585,22 @@ impl ModelProvider for ReliableModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        self.chat_with_system_with_sampling(
+            system_prompt,
+            message,
+            model,
+            CallSampling::Explicit(temperature),
+        )
+        .await
+    }
+
+    async fn chat_with_system_with_sampling(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: CallSampling,
+    ) -> anyhow::Result<String> {
         mark_current_dispatch_composite();
         let models = self.model_chain(model);
         let mut failures = FailureEvents::default();
@@ -2568,13 +2645,15 @@ impl ModelProvider for ReliableModelProvider {
                             system_prompt,
                             message,
                             current_model,
-                            temperature,
+                            entry.temperature(&temperature),
                         ),
                     )
                     .await
                     {
                         Ok(resp) => {
-                            if is_empty_text_completion(&resp) {
+                            let policy_model = entry.text_extraction_ref(current_model);
+                            let resp = normalize_text_completion(resp, policy_model);
+                            if resp.trim().is_empty() {
                                 if attempt < self.max_retries {
                                     self.backoff_after_empty_completion(
                                         &mut failures,
@@ -2823,6 +2902,16 @@ impl ModelProvider for ReliableModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        self.chat_with_history_with_sampling(messages, model, CallSampling::Explicit(temperature))
+            .await
+    }
+
+    async fn chat_with_history_with_sampling(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: CallSampling,
+    ) -> anyhow::Result<String> {
         mark_current_dispatch_composite();
         let models = self.model_chain(model);
         let mut failures = FailureEvents::default();
@@ -2864,13 +2953,15 @@ impl ModelProvider for ReliableModelProvider {
                         ProviderDispatch::from_ref(entry.provider()).chat_with_history(
                             &effective_messages,
                             current_model,
-                            temperature,
+                            entry.temperature(&temperature),
                         ),
                     )
                     .await
                     {
                         Ok(resp) => {
-                            if is_empty_text_completion(&resp) {
+                            let policy_model = entry.text_extraction_ref(current_model);
+                            let resp = normalize_text_completion(resp, policy_model);
+                            if resp.trim().is_empty() {
                                 if attempt < self.max_retries {
                                     self.backoff_after_empty_completion(
                                         &mut failures,
@@ -3255,6 +3346,22 @@ impl ModelProvider for ReliableModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
+        self.chat_with_tools_with_sampling(
+            messages,
+            tools,
+            model,
+            CallSampling::Explicit(temperature),
+        )
+        .await
+    }
+
+    async fn chat_with_tools_with_sampling(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        model: &str,
+        temperature: CallSampling,
+    ) -> anyhow::Result<ChatResponse> {
         mark_current_dispatch_composite();
         let models = self.model_chain(model);
         let mut failures = FailureEvents::default();
@@ -3305,12 +3412,14 @@ impl ModelProvider for ReliableModelProvider {
                             &effective_messages,
                             tools,
                             current_model,
-                            temperature,
+                            entry.temperature(&temperature),
                         ),
                     )
                     .await
                     {
                         Ok(mut resp) => {
+                            let policy_model = entry.text_extraction_ref(current_model);
+                            normalize_completion(&mut resp, policy_model);
                             if is_empty_completion(&resp) {
                                 if let Some(usage) = resp.usage.clone()
                                     && !has_reliable_call_accounting()
@@ -3582,7 +3691,17 @@ impl ModelProvider for ReliableModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
-        self.chat_with_tool_round_policy(
+        self.chat_with_sampling(request, model, CallSampling::Explicit(temperature))
+            .await
+    }
+
+    async fn chat_with_sampling(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: CallSampling,
+    ) -> anyhow::Result<ChatResponse> {
+        self.chat_with_sampling_and_tool_round_policy(
             request,
             model,
             temperature,
@@ -3596,6 +3715,22 @@ impl ModelProvider for ReliableModelProvider {
         request: ChatRequest<'_>,
         model: &str,
         temperature: Option<f64>,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> anyhow::Result<ChatResponse> {
+        self.chat_with_sampling_and_tool_round_policy(
+            request,
+            model,
+            CallSampling::Explicit(temperature),
+            policy,
+        )
+        .await
+    }
+
+    async fn chat_with_sampling_and_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: CallSampling,
         policy: zeroclaw_api::model_provider::ToolRoundPolicy,
     ) -> anyhow::Result<ChatResponse> {
         mark_current_dispatch_composite();
@@ -3681,13 +3816,15 @@ impl ModelProvider for ReliableModelProvider {
                         ProviderDispatch::from_ref(entry.provider()).chat_with_tool_round_policy(
                             req,
                             current_model,
-                            temperature,
+                            entry.temperature(&temperature),
                             policy,
                         ),
                     )
                     .await
                     {
                         Ok(mut resp) => {
+                            let policy_model = entry.text_extraction_ref(current_model);
+                            normalize_completion(&mut resp, policy_model);
                             if is_empty_completion(&resp) {
                                 if let Some(usage) = resp.usage.clone()
                                     && !has_reliable_call_accounting()
@@ -3981,7 +4118,17 @@ impl ModelProvider for ReliableModelProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
-        self.stream_chat_with_tool_round_policy(
+        self.stream_chat_with_sampling(request, model, CallSampling::Explicit(temperature), options)
+    }
+
+    fn stream_chat_with_sampling(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: CallSampling,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        self.stream_chat_with_sampling_and_tool_round_policy(
             request,
             model,
             temperature,
@@ -3995,6 +4142,23 @@ impl ModelProvider for ReliableModelProvider {
         request: ChatRequest<'_>,
         model: &str,
         temperature: Option<f64>,
+        options: StreamOptions,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        self.stream_chat_with_sampling_and_tool_round_policy(
+            request,
+            model,
+            CallSampling::Explicit(temperature),
+            options,
+            policy,
+        )
+    }
+
+    fn stream_chat_with_sampling_and_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: CallSampling,
         options: StreamOptions,
         policy: zeroclaw_api::model_provider::ToolRoundPolicy,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
@@ -4056,7 +4220,7 @@ impl ModelProvider for ReliableModelProvider {
                 ProviderDispatch::from_ref(model_provider).stream_chat_with_tool_round_policy(
                     req,
                     &served_model,
-                    temperature,
+                    entry.temperature(&temperature),
                     options,
                     policy,
                 ),
@@ -4077,7 +4241,8 @@ impl ModelProvider for ReliableModelProvider {
                 fallback_record
                     .as_ref()
                     .map(ProviderFallbackRecord::attribution),
-            );
+            )
+            .with_selection_ref(entry.selection_ref.as_deref());
             // Usage is billing metadata, not stream acceptance. A provider can
             // report usage and then fail before Final; recording the fallback
             // at Usage would leak a route that never produced an accepted
@@ -4107,6 +4272,23 @@ impl ModelProvider for ReliableModelProvider {
         message: &str,
         model: &str,
         temperature: Option<f64>,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        self.stream_chat_with_system_with_sampling(
+            system_prompt,
+            message,
+            model,
+            CallSampling::Explicit(temperature),
+            options,
+        )
+    }
+
+    fn stream_chat_with_system_with_sampling(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: CallSampling,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
         mark_current_dispatch_composite();
@@ -4160,7 +4342,7 @@ impl ModelProvider for ReliableModelProvider {
                     system_prompt,
                     message,
                     &served_model,
-                    temperature,
+                    entry.temperature(&temperature),
                     options,
                 ),
             );
@@ -4170,7 +4352,8 @@ impl ModelProvider for ReliableModelProvider {
                 fallback_record
                     .as_ref()
                     .map(ProviderFallbackRecord::attribution),
-            );
+            )
+            .with_selection_ref(entry.selection_ref.as_deref());
 
             return stream_with_success_recording(
                 stream,
@@ -4196,6 +4379,21 @@ impl ModelProvider for ReliableModelProvider {
         messages: &[ChatMessage],
         model: &str,
         temperature: Option<f64>,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        self.stream_chat_with_history_with_sampling(
+            messages,
+            model,
+            CallSampling::Explicit(temperature),
+            options,
+        )
+    }
+
+    fn stream_chat_with_history_with_sampling(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: CallSampling,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
         mark_current_dispatch_composite();
@@ -4245,7 +4443,7 @@ impl ModelProvider for ReliableModelProvider {
                 ProviderDispatch::from_ref(model_provider).stream_chat_with_history(
                     messages,
                     &served_model,
-                    temperature,
+                    entry.temperature(&temperature),
                     options,
                 ),
             );
@@ -4255,7 +4453,8 @@ impl ModelProvider for ReliableModelProvider {
                 fallback_record
                     .as_ref()
                     .map(ProviderFallbackRecord::attribution),
-            );
+            )
+            .with_selection_ref(entry.selection_ref.as_deref());
 
             return stream_with_success_recording(
                 stream,
@@ -5230,7 +5429,7 @@ mod tests {
         assert!(!model_provider.has_stable_request_identity("requested-model"));
     }
 
-    /// A `fallback_models` downgrade uses model-PINNED entries on one
+    /// A canonical `[providers.fallback]` downgrade uses model-PINNED entries on one
     /// provider: the model swap happens inside `ModelPinnedProvider`, so the
     /// failover loop must read the entry's pinned model to record the
     /// downgrade. Regression test for the case where the requested model's
@@ -7125,7 +7324,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_with_system_retries_think_only_text_then_succeeds() {
+    async fn chat_with_system_keeps_think_only_text_without_admitted_policy() {
         let calls = Arc::new(AtomicUsize::new(0));
         let model_provider = ReliableModelProvider::new(
             "test",
@@ -7141,14 +7340,14 @@ mod tests {
         let result = model_provider
             .chat_with_system(None, "hello", "test", Some(0.0))
             .await
-            .expect("think-only text must retry through the Reliable path");
+            .expect("config-free injection must not infer a reasoning parser");
 
-        assert_eq!(result, "recovered");
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(result, "<think>internal reasoning</think>");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
-    async fn chat_with_system_falls_back_after_think_only_text() {
+    async fn chat_with_system_does_not_fallback_for_unparsed_think_text() {
         let primary_calls = Arc::new(AtomicUsize::new(0));
         let fallback_calls = Arc::new(AtomicUsize::new(0));
         let model_provider = ReliableModelProvider::new(
@@ -7180,11 +7379,11 @@ mod tests {
         let result = model_provider
             .chat_with_system(None, "hello", "test", Some(0.0))
             .await
-            .expect("think-only text must advance to provider fallback");
+            .expect("config-free injection must accept ordinary text");
 
-        assert_eq!(result, "from fallback");
+        assert_eq!(result, "<think>internal reasoning</think>");
         assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

@@ -6,7 +6,13 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use reqwest::header::HeaderValue;
 
+use zeroclaw_api::tts::TtsProvider;
+use zeroclaw_config::provider_registry::{
+    ModelDefinition, Override, ProviderConnection, ResolvedTts,
+};
 use zeroclaw_config::schema::{Config, TtsProviderConfig};
+
+use crate::transport::HttpTransportConfig;
 
 /// Maximum text length before synthesis is rejected (default: 4096 chars).
 const DEFAULT_MAX_TEXT_LENGTH: usize = 4096;
@@ -20,28 +26,39 @@ const GOOGLE_TTS_API_KEY_HEADER: &str = "x-goog-api-key";
 /// Maximum time allowed for a local ffmpeg transcode.
 const FFMPEG_TRANSCODE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-// ── TtsProvider trait ────────────────────────────────────────────
+/// Canonical construction input for OpenAI-compatible speech synthesis.
+/// Endpoint, authentication and headers come from the admitted connection;
+/// model options come from the registry resolver.
+#[derive(Clone)]
+pub(crate) struct CanonicalTtsConfig {
+    pub(crate) transport: HttpTransportConfig,
+    pub(crate) model: Option<String>,
+    pub(crate) voice: Option<String>,
+    pub(crate) speed: Option<f64>,
+    pub(crate) response_format: Option<String>,
+}
 
-/// Trait for pluggable TTS backends.
-#[async_trait::async_trait]
-pub trait TtsProvider: Send + Sync + ::zeroclaw_api::attribution::Attributable {
-    /// ModelProvider identifier (e.g. `"openai"`, `"elevenlabs"`).
-    fn name(&self) -> &str;
-
-    /// Synthesize `text` using the given `voice`, returning raw audio bytes.
-    async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>>;
-
-    /// The audio container/format of the bytes returned by
-    /// [`synthesize`](Self::synthesize) (e.g. `"opus"`, `"wav"`, `"mp3"`).
-    /// Channels use this to pick the correct upload MIME type and Telegram
-    /// send method — only `opus`/`ogg` is a true voice note.
-    fn output_format(&self) -> &str;
-
-    /// Voices supported by this model_provider.
-    fn supported_voices(&self) -> Vec<String>;
-
-    /// Audio output formats supported by this model_provider.
-    fn supported_formats(&self) -> Vec<String>;
+impl CanonicalTtsConfig {
+    pub fn from_resolved(resolved: &ResolvedTts<'_>) -> anyhow::Result<Self> {
+        let options = &resolved.options;
+        Ok(Self {
+            transport: HttpTransportConfig::from_connection(resolved.selection.connection, None)?,
+            model: resolved
+                .selection
+                .model
+                .upstream_model()
+                .map(ToOwned::to_owned),
+            voice: options.voice.clone(),
+            speed: match &options.speed {
+                None => Some(1.0),
+                value => tts_override(value),
+            },
+            response_format: match &options.format {
+                None => Some("opus".into()),
+                value => tts_override(value),
+            },
+        })
+    }
 }
 
 // ── OpenAI TTS ───────────────────────────────────────────────────
@@ -49,20 +66,27 @@ pub trait TtsProvider: Send + Sync + ::zeroclaw_api::attribution::Attributable {
 /// OpenAI TTS model_provider (`POST /v1/audio/speech`).
 pub struct OpenAiTtsProvider {
     alias: String,
-    api_key: String,
-    model: String,
-    speed: f64,
-    /// Full endpoint URL. Defaults to the OpenAI production endpoint; can be
-    /// overridden via `[providers.tts.openai.<alias>].uri` to point at any
-    /// OpenAI-compatible TTS backend (Groq, Azure, self-hosted proxies).
-    base_url: String,
-    /// Audio response format. Defaults to `"opus"`; override to `"wav"` for
-    /// Orpheus-class models or `"mp3"` for broader compatibility.
-    response_format: String,
-    client: reqwest::Client,
+    client: crate::protocols::openai::audio::SpeechClient,
 }
 
 impl OpenAiTtsProvider {
+    fn from_canonical_config(alias: &str, config: &CanonicalTtsConfig) -> Result<Self> {
+        Ok(Self {
+            alias: alias.to_owned(),
+            client: crate::protocols::openai::audio::SpeechClient {
+                transport: config.transport.clone(),
+                endpoint: config.transport.endpoint("audio/speech")?,
+                model: config
+                    .model
+                    .clone()
+                    .filter(|model| !model.trim().is_empty())
+                    .unwrap_or_else(|| "tts-1".into()),
+                speed: config.speed,
+                response_format: config.response_format.clone(),
+            },
+        })
+    }
+
     /// Create a new OpenAI TTS model_provider from config. Reads
     /// `[tts_providers.openai.<alias>].api_key` (or via the schema-mirror
     /// env grammar). Legacy `OPENAI_API_KEY` env-var fallback eradicated
@@ -76,30 +100,28 @@ impl OpenAiTtsProvider {
             )?;
 
         Ok(Self {
-            alias: alias.to_string(),
-            api_key,
-            model: config
-                .model
-                .clone()
-                .filter(|m| !m.trim().is_empty())
-                .unwrap_or_else(|| "tts-1".to_string()),
-            speed: config.speed.unwrap_or(1.0),
-            base_url: config
-                .uri
-                .clone()
-                .filter(|u| !u.trim().is_empty())
-                .unwrap_or_else(|| "https://api.openai.com/v1/audio/speech".to_string()),
-            response_format: config
-                .response_format
-                .clone()
-                .filter(|f| !f.trim().is_empty())
-                .unwrap_or_else(|| "opus".to_string()),
-            client: zeroclaw_config::schema::apply_runtime_proxy_to_builder(
-                reqwest::Client::builder().timeout(TTS_HTTP_TIMEOUT),
-                "channel.tts.openai",
-            )
-            .build()
-            .context("Failed to build HTTP client for OpenAI TTS")?,
+            alias: alias.to_owned(),
+            client: crate::protocols::openai::audio::SpeechClient {
+                transport: HttpTransportConfig::with_base_url("", Some(api_key)),
+                endpoint: config
+                    .uri
+                    .clone()
+                    .filter(|uri| !uri.trim().is_empty())
+                    .unwrap_or_else(|| "https://api.openai.com/v1/audio/speech".into()),
+                model: config
+                    .model
+                    .clone()
+                    .filter(|model| !model.trim().is_empty())
+                    .unwrap_or_else(|| "tts-1".into()),
+                speed: Some(config.speed.unwrap_or(1.0)),
+                response_format: Some(
+                    config
+                        .response_format
+                        .clone()
+                        .filter(|format| !format.trim().is_empty())
+                        .unwrap_or_else(|| "opus".into()),
+                ),
+            },
         })
     }
 }
@@ -111,44 +133,11 @@ impl TtsProvider for OpenAiTtsProvider {
     }
 
     fn output_format(&self) -> &str {
-        &self.response_format
+        self.client.response_format.as_deref().unwrap_or("mp3")
     }
 
     async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>> {
-        let body = serde_json::json!({
-            "model": self.model,
-            "input": text,
-            "voice": voice,
-            "speed": self.speed,
-            "response_format": self.response_format,
-        });
-
-        let resp = self
-            .client
-            .post(&self.base_url)
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .context("Failed to send OpenAI TTS request")?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let error_body: serde_json::Value = resp
-                .json()
-                .await
-                .unwrap_or_else(|_| serde_json::json!({"error": "unknown"}));
-            let msg = error_body["error"]["message"]
-                .as_str()
-                .unwrap_or("unknown error");
-            bail!("OpenAI TTS API error ({}): {}", status, msg);
-        }
-
-        let bytes = resp
-            .bytes()
-            .await
-            .context("Failed to read OpenAI TTS response body")?;
-        Ok(bytes.to_vec())
+        self.client.synthesize(text, voice).await
     }
 
     fn supported_voices(&self) -> Vec<String> {
@@ -1005,6 +994,99 @@ impl TtsProvider for PiperTtsProvider {
     }
 }
 
+fn tts_override<T: Clone>(value: &Option<Override<T>>) -> Option<T> {
+    match value {
+        Some(Override::Set(value)) => Some(value.clone()),
+        Some(Override::Clear) | None => None,
+    }
+}
+
+fn canonical_tts_endpoint(uri: Option<&str>) -> Option<String> {
+    uri.map(|uri| {
+        let uri = uri.trim_end_matches('/');
+        if uri.ends_with("/audio/speech") {
+            uri.to_owned()
+        } else {
+            format!("{uri}/audio/speech")
+        }
+    })
+}
+
+/// Construct one TTS adapter from an admitted canonical model.  The registry
+/// has already merged connection API defaults, presets and model options, so
+/// this function only translates the resolved values into the existing wire
+/// adapters.  It intentionally does not inspect the legacy `[providers.tts]`
+/// maps.
+fn build_canonical_tts_provider(
+    model_ref: &str,
+    resolved: &ResolvedTts<'_>,
+) -> Result<(Box<dyn TtsProvider>, Option<String>)> {
+    if matches!(resolved.selection.connection, ProviderConnection::OpenAi(_)) {
+        anyhow::ensure!(
+            resolved
+                .selection
+                .connection
+                .api_key()
+                .is_some_and(|key| !key.trim().is_empty()),
+            "Missing OpenAI TTS API key: set the model connection auth.api_key"
+        );
+    }
+    if matches!(
+        resolved.selection.connection,
+        ProviderConnection::OpenAi(_)
+            | ProviderConnection::OpenAiCompatible(_)
+            | ProviderConnection::Custom(_)
+            | ProviderConnection::Vllm(_)
+    ) {
+        let config = CanonicalTtsConfig::from_resolved(resolved)?;
+        let voice = config.voice.clone();
+        let provider = OpenAiTtsProvider::from_canonical_config(model_ref, &config)?;
+        return Ok((Box::new(provider), voice));
+    }
+
+    let mut config = TtsProviderConfig {
+        api_key: resolved
+            .selection
+            .connection
+            .api_key()
+            .map(ToOwned::to_owned),
+        model: resolved
+            .selection
+            .model
+            .upstream_model()
+            .map(ToOwned::to_owned),
+        voice: resolved.options.voice.clone(),
+        speed: tts_override(&resolved.options.speed),
+        stability: tts_override(&resolved.options.stability),
+        similarity_boost: tts_override(&resolved.options.similarity_boost),
+        language_code: resolved.options.language.clone(),
+        binary_path: resolved
+            .selection
+            .connection
+            .tts_command()
+            .map(ToOwned::to_owned),
+        response_format: tts_override(&resolved.options.format),
+        uri: canonical_tts_endpoint(resolved.selection.connection.uri()),
+    };
+
+    let provider: Box<dyn TtsProvider> = match resolved.selection.connection {
+        ProviderConnection::ElevenLabs(_) => {
+            Box::new(ElevenLabsTtsProvider::new(model_ref, &config)?)
+        }
+        ProviderConnection::Google(_) => Box::new(GoogleTtsProvider::new(model_ref, &config)?),
+        ProviderConnection::Edge(_) => Box::new(EdgeTtsProvider::new(model_ref, &config)?),
+        ProviderConnection::Piper(_) => Box::new(PiperTtsProvider::new(model_ref, &config)),
+        other => {
+            return Err(anyhow::Error::msg(format!(
+                "canonical TTS model `{model_ref}` uses unsupported connection kind `{}`",
+                other.kind()
+            )));
+        }
+    };
+    let voice = config.voice.take();
+    Ok((provider, voice))
+}
+
 // ── TtsManager ───────────────────────────────────────────────────
 
 async fn write_audio_and_wait_with_output(
@@ -1089,55 +1171,66 @@ pub struct TtsManager {
     max_text_length: usize,
 }
 
-impl TtsManager {
-    pub fn from_config(config: &Config) -> Result<Self> {
-        Self::from_config_for_agent(config, None)
-    }
+/// Canonical models enable this capability directly; the legacy enable flag
+/// applies to the legacy section. Consumers share this admission rule.
+#[must_use]
+pub fn is_enabled(config: &Config) -> bool {
+    config.tts.enabled
+        || config.provider_registry().is_ok_and(|registry| {
+            registry
+                .models
+                .values()
+                .any(|model| model.capability() == zeroclaw_api::capability::Capability::Tts)
+        })
+}
 
+impl TtsManager {
     pub fn from_config_for_agent(config: &Config, agent_alias: Option<&str>) -> Result<Self> {
+        #[cfg(test)]
+        let admitted_config;
+        #[cfg(test)]
+        let config = {
+            admitted_config = zeroclaw_config::migration::admit_test_input(config);
+            &admitted_config
+        };
         let mut tts_providers: HashMap<String, Box<dyn TtsProvider>> = HashMap::new();
         let mut voice_by_alias: HashMap<String, String> = HashMap::new();
 
-        // Typed dispatch over the TtsProviders container's named slots. The
-        // unknown-type warn-and-skip arm is gone — the typed container can't
-        // hold an unrecognized family.
-        for (family, alias, instance) in config.providers.tts.iter_entries() {
-            let dotted = format!("{family}.{alias}");
-            let result: Result<Box<dyn TtsProvider>> = match family {
-                "openai" => OpenAiTtsProvider::new(alias, instance).map(|p| Box::new(p) as _),
-                "elevenlabs" => {
-                    ElevenLabsTtsProvider::new(alias, instance).map(|p| Box::new(p) as _)
-                }
-                "google" => GoogleTtsProvider::new(alias, instance).map(|p| Box::new(p) as _),
-                "edge" => EdgeTtsProvider::new(alias, instance).map(|p| Box::new(p) as _),
-                "piper" => Ok(Box::new(PiperTtsProvider::new(alias, instance)) as _),
-                _ => Err(anyhow::Error::msg(format!(
-                    "unsupported typed TTS family: {family}"
-                ))),
-            };
-            match result {
-                Ok(p) => {
-                    tts_providers.insert(dotted.clone(), p);
-                    if let Some(voice) = instance
-                        .voice
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|v| !v.is_empty())
-                    {
-                        voice_by_alias.insert(dotted, voice.to_string());
+        let binding = agent_alias
+            .or_else(|| config.resolved_runtime_agent_alias())
+            .and_then(|alias| config.agents.get(alias))
+            .map(|agent| agent.tts_provider.as_str())
+            .unwrap_or_default();
+        let agent_tts_provider = if binding.is_empty() {
+            String::new()
+        } else {
+            config
+                .capability_model_ref(binding, zeroclaw_api::capability::Capability::Tts)?
+                .to_string()
+        };
+        let registry = config.provider_registry()?;
+        for (reference, model) in &registry.models {
+            if !matches!(model, ModelDefinition::Tts(_)) {
+                continue;
+            }
+            let built = registry
+                .resolve_tts(reference)
+                .map_err(anyhow::Error::from)
+                .and_then(|resolved| build_canonical_tts_provider(reference.as_str(), &resolved));
+            match built {
+                Ok((provider, voice)) => {
+                    if let Some(voice) = voice {
+                        voice_by_alias.insert(reference.to_string(), voice);
                     }
+                    tts_providers.insert(reference.to_string(), provider);
                 }
-                Err(e) => {
-                    let config_path = format!("[providers.tts.{dotted}]");
-                    ::zeroclaw_log::record!(
-                        WARN,
+                Err(error) if reference.as_str() == agent_tts_provider => return Err(error),
+                Err(error) => {
+                    ::zeroclaw_log::record!(WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(
-                                ::serde_json::json!({"error": e.to_string(), "config_path": config_path})
-                            ),
-                        "typed TTS provider skipped (config error)"
-                    );
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"model_ref":reference.as_str(),"error":error.to_string()})),
+                        "unselected TTS model is unavailable");
                 }
             }
         }
@@ -1147,16 +1240,6 @@ impl TtsManager {
         } else {
             config.tts.max_text_length
         };
-
-        // Per-agent join: bind to the channel-owning agent's `tts_provider`
-        // when known, else the runtime-active agent. Empty (or no resolved
-        // agent) = no TTS; `synthesize` fails loud rather than silently
-        // pick a provider.
-        let agent_tts_provider = agent_alias
-            .or_else(|| config.resolved_runtime_agent_alias())
-            .and_then(|alias| config.agents.get(alias))
-            .map(|a| a.tts_provider.as_str().to_string())
-            .unwrap_or_default();
 
         Ok(Self {
             tts_providers,
@@ -1186,8 +1269,8 @@ impl TtsManager {
         if provider_alias.is_empty() {
             bail!(
                 "Agent has no tts_provider configured. Set \
-                 `agent.<alias>.tts_provider = \"<type>.<alias>\"` referencing a \
-                 [providers.tts.<type>.<alias>] entry."
+                 `agent.<alias>.tts_provider = \"<model-key>\"` referencing a \
+                 [providers.models.<model-key>] TTS definition."
             );
         }
         let voice = self
@@ -1205,8 +1288,8 @@ impl TtsManager {
         if provider_alias.is_empty() {
             bail!(
                 "Agent has no tts_provider configured. Set \
-                 `agent.<alias>.tts_provider = \"<type>.<alias>\"` referencing a \
-                 [providers.tts.<type>.<alias>] entry."
+                 `agent.<alias>.tts_provider = \"<model-key>\"` referencing a \
+                 [providers.models.<model-key>] TTS definition."
             );
         }
         self.synthesize_with_provider(text, provider_alias, voice)
@@ -1368,7 +1451,13 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            OpenAiTtsProvider::new("test", &config).unwrap().api_key,
+            OpenAiTtsProvider::new("test", &config)
+                .unwrap()
+                .client
+                .transport
+                .api_key
+                .as_deref()
+                .unwrap(),
             "synthetic-tts-key"
         );
         assert_eq!(
@@ -1606,21 +1695,27 @@ mod tests {
     }
 
     fn config_with_edge_alias() -> Config {
-        let mut cfg = Config::default();
+        let mut cfg = Config {
+            providers: toml::from_str(
+                r#"
+[connections."edge.default"]
+kind = "edge"
+[connections."edge.default".api.tts]
+command = "edge-tts"
+[models."edge.default"]
+capability = "tts"
+provider = "edge.default"
+model = "default"
+"#,
+            )
+            .expect("canonical edge TTS fixture parses"),
+            ..Config::default()
+        };
         cfg.agents.insert(
             "default".into(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 tts_provider: "edge.default".into(),
                 ..Default::default()
-            },
-        );
-        cfg.providers.tts.edge.insert(
-            "default".to_string(),
-            zeroclaw_config::schema::EdgeTtsProviderConfig {
-                base: TtsProviderConfig {
-                    binary_path: Some("edge-tts".to_string()),
-                    ..TtsProviderConfig::default()
-                },
             },
         );
         cfg
@@ -1764,21 +1859,27 @@ mod tests {
     }
 
     fn config_with_piper_alias() -> Config {
-        let mut cfg = Config::default();
+        let mut cfg = Config {
+            providers: toml::from_str(
+                r#"
+[connections."piper.default"]
+kind = "piper"
+uri = "http://127.0.0.1:5000/v1/audio/speech"
+[connections."piper.default".api.tts]
+[models."piper.default"]
+capability = "tts"
+provider = "piper.default"
+model = "default"
+"#,
+            )
+            .expect("canonical piper TTS fixture parses"),
+            ..Config::default()
+        };
         cfg.agents.insert(
             "default".into(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 tts_provider: "piper.default".into(),
                 ..Default::default()
-            },
-        );
-        cfg.providers.tts.piper.insert(
-            "default".to_string(),
-            zeroclaw_config::schema::PiperTtsProviderConfig {
-                base: TtsProviderConfig {
-                    uri: Some("http://127.0.0.1:5000/v1/audio/speech".to_string()),
-                    ..TtsProviderConfig::default()
-                },
             },
         );
         cfg
@@ -1787,14 +1888,45 @@ mod tests {
     #[test]
     fn tts_manager_creation_with_defaults() {
         let config = Config::default();
-        let manager = TtsManager::from_config(&config).unwrap();
+        let manager = TtsManager::from_config_for_agent(&config, None).unwrap();
         assert!(manager.available_providers().is_empty());
+    }
+
+    #[test]
+    fn projected_legacy_voice_does_not_override_a_canonical_selection() {
+        let mut config = Config {
+            providers: toml::from_str(
+                r#"
+[connections.gateway]
+kind = "openai"
+auth = { mode = "api_key", api_key = "test-key" }
+[models."openai.voice"]
+capability = "tts"
+provider = "gateway"
+model = "tts-1"
+[tts.openai.voice]
+api_key = "legacy-test-key"
+voice = "legacy-voice"
+"#,
+            )
+            .unwrap(),
+            ..Config::default()
+        };
+        let manager = TtsManager::from_config_for_agent(&config, None).unwrap();
+        assert!(manager.tts_providers.contains_key("openai.voice"));
+        assert!(!manager.voice_by_alias.contains_key("openai.voice"));
+        assert_eq!(manager.voice_by_alias["tts.openai.voice"], "legacy-voice");
+
+        config.providers.models = Default::default();
+        let manager = TtsManager::from_config_for_agent(&config, None).unwrap();
+        assert!(manager.tts_providers.contains_key("openai.voice"));
+        assert_eq!(manager.voice_by_alias["openai.voice"], "legacy-voice");
     }
 
     #[test]
     fn tts_manager_registers_alias_keyed_provider() {
         let cfg = config_with_edge_alias();
-        let manager = TtsManager::from_config(&cfg).unwrap();
+        let manager = TtsManager::from_config_for_agent(&cfg, None).unwrap();
         assert_eq!(manager.available_providers(), vec!["edge.default"]);
     }
 
@@ -1838,7 +1970,7 @@ mod tests {
     #[tokio::test]
     async fn tts_rejects_empty_text() {
         let cfg = config_with_edge_alias();
-        let manager = TtsManager::from_config(&cfg).unwrap();
+        let manager = TtsManager::from_config_for_agent(&cfg, None).unwrap();
         let err = manager
             .synthesize_with_provider("", "edge.default", "en-US-AriaNeural")
             .await
@@ -1853,7 +1985,7 @@ mod tests {
     async fn tts_rejects_text_exceeding_max_length() {
         let mut cfg = config_with_edge_alias();
         cfg.tts.max_text_length = 10;
-        let manager = TtsManager::from_config(&cfg).unwrap();
+        let manager = TtsManager::from_config_for_agent(&cfg, None).unwrap();
         let long_text = "a".repeat(11);
         let err = manager
             .synthesize_with_provider(&long_text, "edge.default", "en-US-AriaNeural")
@@ -1868,7 +2000,7 @@ mod tests {
     #[tokio::test]
     async fn tts_rejects_unknown_provider() {
         let cfg = Config::default();
-        let manager = TtsManager::from_config(&cfg).unwrap();
+        let manager = TtsManager::from_config_for_agent(&cfg, None).unwrap();
         let err = manager
             .synthesize_with_provider("hello", "nonexistent.alias", "voice")
             .await
@@ -1897,14 +2029,14 @@ mod tests {
     #[test]
     fn tts_manager_with_piper_alias() {
         let cfg = config_with_piper_alias();
-        let manager = TtsManager::from_config(&cfg).unwrap();
+        let manager = TtsManager::from_config_for_agent(&cfg, None).unwrap();
         assert_eq!(manager.available_providers(), vec!["piper.default"]);
     }
 
     #[tokio::test]
     async fn tts_rejects_empty_text_for_piper() {
         let cfg = config_with_piper_alias();
-        let manager = TtsManager::from_config(&cfg).unwrap();
+        let manager = TtsManager::from_config_for_agent(&cfg, None).unwrap();
         let err = manager
             .synthesize_with_provider("", "piper.default", "default")
             .await
@@ -1978,13 +2110,13 @@ mod tests {
     #[test]
     fn agent_output_format_resolves_active_provider() {
         let cfg = config_with_openai_wav_alias();
-        let manager = TtsManager::from_config(&cfg).unwrap();
+        let manager = TtsManager::from_config_for_agent(&cfg, None).unwrap();
         assert_eq!(manager.agent_output_format(), Some("wav"));
     }
 
     #[test]
     fn agent_output_format_none_when_no_provider() {
-        let manager = TtsManager::from_config(&Config::default()).unwrap();
+        let manager = TtsManager::from_config_for_agent(&Config::default(), None).unwrap();
         assert_eq!(manager.agent_output_format(), None);
     }
 
@@ -1992,7 +2124,7 @@ mod tests {
     fn tts_manager_max_text_length_zero_uses_default() {
         let mut cfg = Config::default();
         cfg.tts.max_text_length = 0;
-        let manager = TtsManager::from_config(&cfg).unwrap();
+        let manager = TtsManager::from_config_for_agent(&cfg, None).unwrap();
         assert_eq!(manager.max_text_length, DEFAULT_MAX_TEXT_LENGTH);
     }
 
@@ -2074,8 +2206,11 @@ mod tests {
             ..TtsProviderConfig::default()
         };
         let provider = OpenAiTtsProvider::new("test", &cfg).unwrap();
-        assert_eq!(provider.base_url, "https://api.openai.com/v1/audio/speech");
-        assert_eq!(provider.response_format, "opus");
+        assert_eq!(
+            provider.client.endpoint,
+            "https://api.openai.com/v1/audio/speech"
+        );
+        assert_eq!(provider.output_format(), "opus");
     }
 
     #[test]
@@ -2101,7 +2236,7 @@ mod tests {
             },
         );
 
-        let manager = TtsManager::from_config(&cfg).unwrap();
+        let manager = TtsManager::from_config_for_agent(&cfg, None).unwrap();
         assert!(
             manager.available_providers().is_empty(),
             "keyless openai provider must not register: {:?}",
@@ -2111,10 +2246,10 @@ mod tests {
         let events: Vec<serde_json::Value> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         let event = events
             .iter()
-            .find(|value| value["attributes"]["config_path"] == "[providers.tts.openai.stoa]")
+            .find(|value| value["attributes"]["model_ref"] == "openai.stoa")
             .unwrap_or_else(|| panic!("expected a skip record for openai.stoa: {events:?}"));
         assert_eq!(
-            event["message"], "typed TTS provider skipped (config error)",
+            event["message"], "unselected TTS model is unavailable",
             "event: {event:?}"
         );
         assert!(

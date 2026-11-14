@@ -18,6 +18,7 @@ pub use zeroclaw_api::runtime_status::{
 };
 pub use zeroclaw_config::cost::types::CostSummary;
 pub use zeroclaw_config::presets::BuilderSubmission;
+pub use zeroclaw_config::provider_registry::editor::RegistryEdit;
 pub use zeroclaw_config::traits::{ConfigFieldEntry, PropKind};
 
 // ── Derive helper ────────────────────────────────────────────────────

@@ -51,7 +51,7 @@ zeroclaw auth login --model-provider openai-codex
 ```
 
 For scripted setup, `openai-codex` is accepted as a quickstart input alias and
-writes the canonical `[providers.models.openai.<alias>]` entry:
+writes the canonical connection and model entries:
 
 ```sh
 zeroclaw quickstart --model-provider openai-codex --model gpt-5.4 --agent assistant
@@ -69,9 +69,9 @@ zeroclaw quickstart --model-provider anthropic --model claude-sonnet-4-5 --agent
 
 Choose **Anthropic**, set **Authentication** to `setup_token`, then paste the
 token from `claude setup-token` into the API key/token prompt. Scripted input
-may use `--model-provider claude` as an alias. Quickstart still writes the
-canonical `[providers.models.anthropic.<alias>]` entry; the token is stored
-through the same credential path as `api_key`.
+may use `--model-provider claude` as an alias. Quickstart writes canonical
+connection and model entries; the token is stored through the same credential
+path as `api_key`.
 
 ### Plugins
 

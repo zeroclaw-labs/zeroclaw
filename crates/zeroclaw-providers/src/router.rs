@@ -11,6 +11,7 @@ use futures_util::StreamExt;
 use futures_util::stream::{self, BoxStream};
 use std::collections::HashMap;
 use std::sync::Arc;
+use zeroclaw_api::model_provider::CallSampling;
 use zeroclaw_api::model_provider::StreamError;
 
 /// Score a model against a user-keyed pricing map. Sums any entry matching
@@ -177,7 +178,9 @@ impl RouterModelProvider {
             .map(|(name, provider)| (name, Arc::from(provider)))
             .collect();
 
-        // Build model_provider name → index lookup.
+        // Build the hint-target lookup. A default slot may have the same
+        // reference but different invocation overrides, so the later canonical
+        // target wins here; direct calls always use default_index.
         let provider_indices: HashMap<String, usize> = model_providers
             .iter()
             .enumerate()
@@ -294,11 +297,14 @@ impl RouterModelProvider {
                 "Unknown route hint, falling back to default model_provider"
             );
         }
-        let index = self
-            .provider_indices
-            .get(&resolved.provider_name)
-            .copied()
-            .unwrap_or(self.default_index);
+        let index = if resolved.kind == RouteResolutionKind::MatchedHint {
+            self.provider_indices
+                .get(&resolved.provider_name)
+                .copied()
+                .unwrap_or(self.default_index)
+        } else {
+            self.default_index
+        };
         (index, resolved.model)
     }
 }
@@ -372,10 +378,27 @@ impl ModelProvider for RouterModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        self.chat_with_system_with_sampling(
+            system_prompt,
+            message,
+            model,
+            CallSampling::Explicit(temperature),
+        )
+        .await
+    }
+
+    async fn chat_with_system_with_sampling(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: CallSampling,
+    ) -> anyhow::Result<String> {
         mark_current_dispatch_composite();
         let (provider_idx, resolved_model) = self.resolve(model);
 
         let (provider_name, model_provider) = &self.model_providers[provider_idx];
+        let temperature = temperature.for_target(provider_name);
         // `provider_name` is the configured `<type>.<alias>` key the
         // caller registered with `RouterModelProvider::new` — already a
         // composite. Layer's `set_composite` splits it on emit.
@@ -384,7 +407,7 @@ impl ModelProvider for RouterModelProvider {
         with_exact_dispatch_route(
             provider_name.clone(),
             resolved_model.clone(),
-            ProviderDispatch::from_ref(&**model_provider).chat_with_system(
+            ProviderDispatch::from_ref(&**model_provider).chat_with_system_with_sampling(
                 system_prompt,
                 message,
                 &resolved_model,
@@ -400,13 +423,24 @@ impl ModelProvider for RouterModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        self.chat_with_history_with_sampling(messages, model, CallSampling::Explicit(temperature))
+            .await
+    }
+
+    async fn chat_with_history_with_sampling(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: CallSampling,
+    ) -> anyhow::Result<String> {
         mark_current_dispatch_composite();
         let (provider_idx, resolved_model) = self.resolve(model);
         let (provider_name, model_provider) = &self.model_providers[provider_idx];
+        let temperature = temperature.for_target(provider_name);
         with_exact_dispatch_route(
             provider_name.clone(),
             resolved_model.clone(),
-            ProviderDispatch::from_ref(&**model_provider).chat_with_history(
+            ProviderDispatch::from_ref(&**model_provider).chat_with_history_with_sampling(
                 messages,
                 &resolved_model,
                 temperature,
@@ -421,7 +455,17 @@ impl ModelProvider for RouterModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
-        self.chat_with_tool_round_policy(
+        self.chat_with_sampling(request, model, CallSampling::Explicit(temperature))
+            .await
+    }
+
+    async fn chat_with_sampling(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: CallSampling,
+    ) -> anyhow::Result<ChatResponse> {
+        self.chat_with_sampling_and_tool_round_policy(
             request,
             model,
             temperature,
@@ -437,13 +481,30 @@ impl ModelProvider for RouterModelProvider {
         temperature: Option<f64>,
         policy: zeroclaw_api::model_provider::ToolRoundPolicy,
     ) -> anyhow::Result<ChatResponse> {
+        self.chat_with_sampling_and_tool_round_policy(
+            request,
+            model,
+            CallSampling::Explicit(temperature),
+            policy,
+        )
+        .await
+    }
+
+    async fn chat_with_sampling_and_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: CallSampling,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> anyhow::Result<ChatResponse> {
         mark_current_dispatch_composite();
         let (provider_idx, resolved_model) = self.resolve(model);
         let (provider_name, model_provider) = &self.model_providers[provider_idx];
+        let temperature = temperature.for_target(provider_name);
         with_exact_dispatch_route(
             provider_name.clone(),
             resolved_model.clone(),
-            ProviderDispatch::from_ref(&**model_provider).chat_with_tool_round_policy(
+            ProviderDispatch::from_ref(&**model_provider).chat_with_sampling_and_tool_round_policy(
                 request,
                 &resolved_model,
                 temperature,
@@ -460,13 +521,30 @@ impl ModelProvider for RouterModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
+        self.chat_with_tools_with_sampling(
+            messages,
+            tools,
+            model,
+            CallSampling::Explicit(temperature),
+        )
+        .await
+    }
+
+    async fn chat_with_tools_with_sampling(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        model: &str,
+        temperature: CallSampling,
+    ) -> anyhow::Result<ChatResponse> {
         mark_current_dispatch_composite();
         let (provider_idx, resolved_model) = self.resolve(model);
         let (provider_name, model_provider) = &self.model_providers[provider_idx];
+        let temperature = temperature.for_target(provider_name);
         with_exact_dispatch_route(
             provider_name.clone(),
             resolved_model.clone(),
-            ProviderDispatch::from_ref(&**model_provider).chat_with_tools(
+            ProviderDispatch::from_ref(&**model_provider).chat_with_tools_with_sampling(
                 messages,
                 tools,
                 &resolved_model,
@@ -503,13 +581,31 @@ impl ModelProvider for RouterModelProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+        self.stream_chat_with_system_with_sampling(
+            system_prompt,
+            message,
+            model,
+            CallSampling::Explicit(temperature),
+            options,
+        )
+    }
+
+    fn stream_chat_with_system_with_sampling(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: CallSampling,
+        options: StreamOptions,
+    ) -> BoxStream<'static, StreamResult<StreamChunk>> {
         mark_current_dispatch_composite();
         let (provider_idx, resolved_model) = self.resolve(model);
         let (provider_name, model_provider) = &self.model_providers[provider_idx];
+        let temperature = temperature.for_target(provider_name);
         stream_with_exact_dispatch_route(
             provider_name.clone(),
             resolved_model.clone(),
-            ProviderDispatch::from_ref(&**model_provider).stream_chat_with_system(
+            ProviderDispatch::from_ref(&**model_provider).stream_chat_with_system_with_sampling(
                 system_prompt,
                 message,
                 &resolved_model,
@@ -526,13 +622,29 @@ impl ModelProvider for RouterModelProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+        self.stream_chat_with_history_with_sampling(
+            messages,
+            model,
+            CallSampling::Explicit(temperature),
+            options,
+        )
+    }
+
+    fn stream_chat_with_history_with_sampling(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: CallSampling,
+        options: StreamOptions,
+    ) -> BoxStream<'static, StreamResult<StreamChunk>> {
         mark_current_dispatch_composite();
         let (provider_idx, resolved_model) = self.resolve(model);
         let (provider_name, model_provider) = &self.model_providers[provider_idx];
+        let temperature = temperature.for_target(provider_name);
         stream_with_exact_dispatch_route(
             provider_name.clone(),
             resolved_model.clone(),
-            ProviderDispatch::from_ref(&**model_provider).stream_chat_with_history(
+            ProviderDispatch::from_ref(&**model_provider).stream_chat_with_history_with_sampling(
                 messages,
                 &resolved_model,
                 temperature,
@@ -548,7 +660,17 @@ impl ModelProvider for RouterModelProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamEvent>> {
-        self.stream_chat_with_tool_round_policy(
+        self.stream_chat_with_sampling(request, model, CallSampling::Explicit(temperature), options)
+    }
+
+    fn stream_chat_with_sampling(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: CallSampling,
+        options: StreamOptions,
+    ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+        self.stream_chat_with_sampling_and_tool_round_policy(
             request,
             model,
             temperature,
@@ -565,9 +687,27 @@ impl ModelProvider for RouterModelProvider {
         options: StreamOptions,
         policy: zeroclaw_api::model_provider::ToolRoundPolicy,
     ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+        self.stream_chat_with_sampling_and_tool_round_policy(
+            request,
+            model,
+            CallSampling::Explicit(temperature),
+            options,
+            policy,
+        )
+    }
+
+    fn stream_chat_with_sampling_and_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: CallSampling,
+        options: StreamOptions,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> BoxStream<'static, StreamResult<StreamEvent>> {
         mark_current_dispatch_composite();
         let (provider_idx, resolved_model) = self.resolve(model);
         let (provider_name, model_provider) = &self.model_providers[provider_idx];
+        let temperature = temperature.for_target(provider_name);
         if options.enabled && !model_provider.supports_streaming() {
             // Only an ENABLED stream synthesizes. Capabilities describe the
             // served route: a resolved route that disclaims streaming is
@@ -600,12 +740,13 @@ impl ModelProvider for RouterModelProvider {
                 match with_exact_dispatch_route(
                     provider_name,
                     resolved_model.clone(),
-                    ProviderDispatch::from_ref(&*provider).chat_with_tool_round_policy(
-                        request,
-                        &resolved_model,
-                        temperature,
-                        policy,
-                    ),
+                    ProviderDispatch::from_ref(&*provider)
+                        .chat_with_sampling_and_tool_round_policy(
+                            request,
+                            &resolved_model,
+                            temperature,
+                            policy,
+                        ),
                 )
                 .await
                 {
@@ -630,13 +771,14 @@ impl ModelProvider for RouterModelProvider {
         stream_with_exact_dispatch_route(
             provider_name.clone(),
             resolved_model.clone(),
-            ProviderDispatch::from_ref(&**model_provider).stream_chat_with_tool_round_policy(
-                request,
-                &resolved_model,
-                temperature,
-                options,
-                policy,
-            ),
+            ProviderDispatch::from_ref(&**model_provider)
+                .stream_chat_with_sampling_and_tool_round_policy(
+                    request,
+                    &resolved_model,
+                    temperature,
+                    options,
+                    policy,
+                ),
         )
     }
 
@@ -1155,6 +1297,27 @@ mod tests {
 
         // Route should not exist
         assert!(!router.route_resolver().has_hint("broken"));
+    }
+
+    #[test]
+    fn direct_and_hint_calls_keep_distinct_slots_for_the_same_model_reference() {
+        let (router, _) = make_router(
+            vec![
+                ("chat.primary", "invocation"),
+                ("chat.primary", "canonical"),
+            ],
+            vec![("configured", "chat.primary", "configured-model")],
+        );
+
+        assert_eq!(
+            router.resolve("override-model"),
+            (0, "override-model".into())
+        );
+        assert_eq!(
+            router.resolve("hint:configured"),
+            (1, "configured-model".into())
+        );
+        assert_eq!(router.resolve("hint:missing"), (0, "hint:missing".into()));
     }
 
     #[test]

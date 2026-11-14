@@ -35,145 +35,182 @@ pub use zeroclaw_api::agent::TurnEvent;
 /// type (see `crate::agent::turn::ContextLimitsResolver`).
 use crate::agent::loop_::ContextLimitsResolver;
 
-/// Provider handle, its `<type>.<alias>` reference, the resolved model name,
-/// and the route resolver bound to that provider — the four values a session
-/// needs to swap a model provider while keeping route-aware limits correct.
-type SessionModelProvider = (
-    Box<dyn ModelProvider>,
-    String,
-    String,
-    Arc<zeroclaw_providers::router::ModelRouteResolver>,
-);
+/// A model binding and the runtime dispatcher selected for its capabilities.
+pub(crate) struct ModelRuntime {
+    model: zeroclaw_providers::model::BuiltModel,
+    tool_dispatcher: Box<dyn ToolDispatcher>,
+}
 
 struct TurnModelSelection {
     selector: String,
     allowed_provider_refs: Option<Arc<HashSet<String>>>,
 }
 
-/// [`build_session_model_provider`] with the provider obtained from
-/// `capabilities`, resolved for `agent_alias` and `principal`. For session
-/// surfaces (RPC) that swap a session's provider for a connection principal.
-///
-/// The reference and model are validated and resolved exactly as there; the
-/// route resolver is derived from the same config routes the routed provider
-/// is built from.
-pub fn build_session_model_provider_with_capabilities(
-    capabilities: &crate::composition::RuntimeCapabilities,
+impl ModelRuntime {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        model: zeroclaw_providers::model::BuiltModel,
+        tool_dispatcher: Box<dyn ToolDispatcher>,
+    ) -> Self {
+        Self {
+            model,
+            tool_dispatcher,
+        }
+    }
+}
+
+/// Invocation inputs. Config remains the source of configured defaults.
+#[derive(Clone, Copy, Default)]
+pub struct ModelOverrides<'a> {
+    pub provider: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub temperature: Option<f64>,
+}
+
+/// Construction capabilities and invocation inputs, independent of Config defaults.
+pub struct AgentBuildContext<'a> {
+    pub session_cwd: Option<&'a Path>,
+    pub initialize_mcp: bool,
+    pub approval_backchannel: bool,
+    pub exclude_memory: bool,
+    pub acp_delivery: bool,
+    pub tui_env: Option<std::collections::HashMap<String, String>>,
+    pub sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+    pub sop_audit: Option<Arc<SopAuditLogger>>,
+    pub canvas_store: Option<tools::CanvasStore>,
+    pub acp_session_store: Option<Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>>,
+    pub live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
+    /// Set only for session surfaces whose model binding follows live updates.
+    pub live_model_config: Option<zeroclaw_config::live::LiveConfigHandle>,
+    pub principal_allowed_tools: Option<Vec<String>>,
+    pub execution_capability: Option<AgentExecutionCapability>,
+    pub model_overrides: ModelOverrides<'a>,
+    pub capabilities: Option<crate::composition::BoundCapabilities>,
+}
+
+impl Default for AgentBuildContext<'_> {
+    fn default() -> Self {
+        Self {
+            session_cwd: None,
+            initialize_mcp: true,
+            approval_backchannel: false,
+            exclude_memory: false,
+            acp_delivery: false,
+            tui_env: None,
+            sop_engine: None,
+            sop_audit: None,
+            canvas_store: None,
+            acp_session_store: None,
+            live_config: None,
+            live_model_config: None,
+            principal_allowed_tools: None,
+            execution_capability: None,
+            model_overrides: ModelOverrides::default(),
+            capabilities: None,
+        }
+    }
+}
+
+/// One prepared replacement, bound to the exact config used for construction.
+pub(crate) struct PreparedModelUpdate {
+    runtime: ModelRuntime,
+    config: Arc<Config>,
+    temperature_override: Option<f64>,
+}
+
+impl PreparedModelUpdate {
+    pub(crate) async fn build(
+        config: Arc<Config>,
+        agent_alias: &str,
+        provider_ref: &str,
+        model_override: Option<&str>,
+        temperature_override: Option<f64>,
+    ) -> Result<Self> {
+        let runtime = build_model_nonblocking(
+            Arc::clone(&config),
+            agent_alias,
+            provider_ref,
+            model_override,
+        )
+        .await?;
+        Ok(Self {
+            runtime,
+            config,
+            temperature_override,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        runtime: ModelRuntime,
+        config: Arc<Config>,
+        temperature_override: Option<f64>,
+    ) -> Self {
+        Self {
+            runtime,
+            config,
+            temperature_override,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ModelSwitchOutcome {
+    Unchanged,
+    SelectorChanged(String),
+    Rebuilt(String),
+}
+
+/// Adapt the providers-owned model construction to the agent's existing
+/// dispatcher boundary. Selection, connection and tuning stay providers-owned.
+pub(crate) fn build_model(
     config: &Config,
     agent_alias: &str,
     model_provider_ref: &str,
     model_override: Option<&str>,
-    principal: Option<&zeroclaw_api::principal::PrincipalId>,
-) -> Result<SessionModelProvider> {
-    let SessionModel { model_name, .. } =
-        resolve_session_model(config, model_provider_ref, model_override)?;
-    let model_provider = capabilities.model_provider(&crate::composition::ProviderRequest {
+) -> Result<ModelRuntime> {
+    #[cfg(test)]
+    let admitted_config;
+    #[cfg(test)]
+    let config = {
+        admitted_config = zeroclaw_config::migration::admit_test_input(config);
+        &admitted_config
+    };
+    let model = zeroclaw_providers::model::build_model(
         config,
         agent_alias,
-        provider_ref: Some(model_provider_ref),
-        model: Some(&model_name),
-        principal,
-    })?;
-    let model_route_resolver = zeroclaw_providers::model_route_resolver(
         model_provider_ref,
-        &config.model_routes,
-        &model_name,
-    );
-    Ok((
-        model_provider,
-        model_provider_ref.to_string(),
-        model_name,
-        model_route_resolver,
-    ))
-}
-
-/// A validated `<type>.<alias>` reference, its configured entry if any, and
-/// the model a session on it serves.
-struct SessionModel<'c> {
-    family: String,
-    alias: String,
-    entry: Option<&'c zeroclaw_config::schema::ModelProviderConfig>,
-    model_name: String,
-}
-
-/// Validate a `<type>.<alias>` reference and resolve the model a session on it
-/// serves: the override when one is given, else the entry's configured model.
-fn resolve_session_model<'c>(
-    config: &'c Config,
-    model_provider_ref: &str,
-    model_override: Option<&str>,
-) -> Result<SessionModel<'c>> {
-    let (model_provider_name, model_provider_alias) = model_provider_ref
-        .split_once('.')
-        .map(|(t, a)| (t.to_string(), a.to_string()))
-        .ok_or_else(|| {
-            anyhow::Error::msg(format!(
-                "model_provider reference `{model_provider_ref}` must be `<type>.<alias>`"
-            ))
-        })?;
-
-    let entry = config
-        .providers
-        .models
-        .find(&model_provider_name, &model_provider_alias);
-    let model_name = model_override
-        .map(str::trim)
-        .filter(|m| !m.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            entry
-                .and_then(|e| e.model.as_deref())
-                .map(str::trim)
-                .filter(|m| !m.is_empty())
-                .map(str::to_string)
-        })
-        .ok_or_else(|| {
-            anyhow::Error::msg(format!(
-                "model_provider `{model_provider_ref}` has no `model` configured and no model \
-                 override was supplied"
-            ))
-        })?;
-    Ok(SessionModel {
-        family: model_provider_name,
-        alias: model_provider_alias,
-        entry,
-        model_name,
+        model_override,
+    )?;
+    let agent_cfg = config
+        .resolved_agent_config(agent_alias)
+        .unwrap_or_default();
+    let tool_dispatcher =
+        tool_dispatcher_for_provider(&agent_cfg, model.provider(), model.model_name());
+    Ok(ModelRuntime {
+        model,
+        tool_dispatcher,
     })
 }
 
-pub fn build_session_model_provider(
-    config: &Config,
-    model_provider_ref: &str,
+async fn build_model_nonblocking(
+    config: Arc<Config>,
+    agent_alias: &str,
+    provider_ref: &str,
     model_override: Option<&str>,
-) -> Result<SessionModelProvider> {
-    let SessionModel {
-        family,
-        alias,
-        entry,
-        model_name,
-    } = resolve_session_model(config, model_provider_ref, model_override)?;
-
-    let model_provider_runtime_options =
-        zeroclaw_providers::provider_runtime_options_for_alias(config, &family, &alias);
-
-    let (model_provider, model_route_resolver) =
-        zeroclaw_providers::create_routed_model_provider_with_options_and_resolver(
-            config,
-            model_provider_ref,
-            entry.and_then(|e| e.api_key.as_deref()),
-            entry.and_then(|e| e.uri.as_deref()),
-            &config.reliability,
-            &config.model_routes,
-            &model_name,
-            &model_provider_runtime_options,
-        )?;
-
-    Ok((
-        model_provider,
-        model_provider_ref.to_string(),
-        model_name,
-        model_route_resolver,
-    ))
+) -> Result<ModelRuntime> {
+    let agent_alias = agent_alias.to_string();
+    let provider_ref = provider_ref.to_string();
+    let model_override = model_override.map(str::to_string);
+    zeroclaw_providers::model::build_nonblocking(move || {
+        build_model(
+            &config,
+            &agent_alias,
+            &provider_ref,
+            model_override.as_deref(),
+        )
+    })
+    .await
 }
 
 /// Resolve the tool dispatcher with the same provider-capability fallback
@@ -571,6 +608,10 @@ pub struct Agent {
     multimodal_config: zeroclaw_config::schema::MultimodalConfig,
     model_name: String,
     model_provider_name: String,
+    /// Identity of the currently running model selection — the
+    /// "did the model change" key for in-session switches. `None` on
+    /// builder-constructed agents that never resolved a selection.
+    model_identity: Option<zeroclaw_config::schema::ModelIdentity>,
     temperature: Option<f64>,
     workspace_dir: std::path::PathBuf,
     /// Per-agent persona workspace (`<install>/agents/<alias>/workspace/`).
@@ -747,29 +788,6 @@ enum CapabilityBinding {
     },
 }
 
-/// Where an agent constructor's capabilities came from.
-#[derive(Clone, Copy)]
-enum CapabilityOrigin<'a> {
-    /// An old entry point built the config-backed set. The agent keeps the
-    /// config-snapshot model-switch rebuild it always had.
-    Adapter,
-    /// The caller supplied the capabilities, and the principal to resolve for.
-    Supplied {
-        principal: Option<&'a zeroclaw_api::principal::PrincipalId>,
-    },
-}
-
-impl<'a> CapabilityOrigin<'a> {
-    /// The principal the constructor resolves for: the supplied one, or
-    /// none on the adapter path.
-    fn principal(self) -> Option<&'a zeroclaw_api::principal::PrincipalId> {
-        match self {
-            CapabilityOrigin::Supplied { principal } => principal,
-            CapabilityOrigin::Adapter => None,
-        }
-    }
-}
-
 #[derive(Clone, Default)]
 pub struct ProviderSwitchConfig {
     pub config: Option<std::sync::Arc<zeroclaw_config::schema::Config>>,
@@ -864,6 +882,7 @@ pub struct AgentBuilder {
     multimodal_config: Option<zeroclaw_config::schema::MultimodalConfig>,
     model_name: Option<String>,
     model_provider_name: Option<String>,
+    model_identity: Option<zeroclaw_config::schema::ModelIdentity>,
     temperature: Option<f64>,
     workspace_dir: Option<std::path::PathBuf>,
     agent_workspace_dir: Option<std::path::PathBuf>,
@@ -929,6 +948,7 @@ impl AgentBuilder {
             multimodal_config: None,
             model_name: None,
             model_provider_name: None,
+            model_identity: None,
             temperature: None,
             workspace_dir: None,
             agent_workspace_dir: None,
@@ -1062,6 +1082,29 @@ impl AgentBuilder {
 
     pub fn model_provider_name(mut self, name: String) -> Self {
         self.model_provider_name = Some(name);
+        self
+    }
+
+    pub fn model_identity(mut self, identity: zeroclaw_config::schema::ModelIdentity) -> Self {
+        self.model_identity = Some(identity);
+        self
+    }
+
+    /// Install one factory-produced model binding during construction.
+    pub(crate) fn model_runtime(mut self, runtime: ModelRuntime) -> Self {
+        let ModelRuntime {
+            model,
+            tool_dispatcher,
+        } = runtime;
+        let (provider, identity, model_route_resolver) = model.into_parts();
+        let provider_name = identity.provider_ref();
+        let model_name = identity.model_id.clone();
+        self.model_provider = Some(provider);
+        self.model_provider_name = Some(provider_name);
+        self.model_name = Some(model_name);
+        self.model_identity = Some(identity);
+        self.model_route_resolver = Some(model_route_resolver);
+        self.tool_dispatcher = Some(tool_dispatcher);
         self
     }
 
@@ -1414,6 +1457,7 @@ impl AgentBuilder {
             multimodal_config: self.multimodal_config.unwrap_or_default(),
             model_name,
             model_provider_name,
+            model_identity: self.model_identity,
             temperature: self.temperature,
             // Default for test callers that don't call workspace_dir().
             workspace_dir: self
@@ -1524,6 +1568,16 @@ impl Agent {
         self.provider_switch_config
             .as_ref()
             .and_then(|cfg| cfg.config.as_deref())
+    }
+
+    /// Share the configuration generation admitted with the active model.
+    /// Background work derived from a turn must use this generation for its
+    /// provider and policy, even when a newer live configuration is available.
+    pub fn admitted_model_config(&self) -> Option<Arc<zeroclaw_config::schema::Config>> {
+        self.provider_switch_config
+            .as_ref()
+            .and_then(|cfg| cfg.config.as_ref())
+            .cloned()
     }
 
     fn turn_pacing(&self) -> zeroclaw_config::schema::PacingConfig {
@@ -1797,11 +1851,58 @@ impl Agent {
         )
     }
 
+    /// Full provider/model reference for rebuilding the active selection.
+    #[must_use]
+    pub fn selected_model_provider_ref(&self) -> String {
+        self.model_identity.as_ref().map_or_else(
+            || self.model_provider_name.clone(),
+            zeroclaw_config::schema::ModelIdentity::provider_ref,
+        )
+    }
+
+    /// Derive transient construction overrides from an in-turn selection.
+    /// A binding equal to its configured/session selection inherits edits;
+    /// a later selection inherits its own configured model unless its active
+    /// model ID differs from that admitted selection.
+    pub(crate) fn model_selection_override(
+        &self,
+        provider_override: Option<&str>,
+        model_override: Option<&str>,
+    ) -> Option<(String, Option<String>)> {
+        let active = self.model_identity.as_ref()?;
+        let config = self.full_config()?;
+        let configured_ref = provider_override.or_else(|| {
+            config
+                .agent(&self.agent_alias)
+                .map(|agent| agent.model_provider.as_str())
+        })?;
+        let configured = zeroclaw_providers::model::resolve_model_identity(
+            config,
+            &self.agent_alias,
+            configured_ref,
+            model_override,
+        );
+        if configured.as_ref() == Some(active) {
+            return None;
+        }
+        let active_ref = active.provider_ref();
+        let active_default = zeroclaw_providers::model::resolve_model_identity(
+            config,
+            &self.agent_alias,
+            &active_ref,
+            None,
+        )
+        .map(|identity| identity.model_id);
+        let active_model_override = (active_default.as_deref() != Some(active.model_id.as_str()))
+            .then(|| active.model_id.clone());
+        Some((active_ref, active_model_override))
+    }
+
     /// Capacity and proactive-trim budget for the currently selected route.
     /// This is resolved on demand so a model/provider switch cannot leave a
     /// stale snapshot in a long-lived session.
     pub fn context_limits(&self) -> zeroclaw_config::schema::ResolvedContextLimits {
-        self.context_limits_for_route(&self.model_provider_name, &self.model_name)
+        self.context_limits_for_route(&self.selected_model_provider_ref(), &self.model_name)
     }
 
     /// Build a limits resolver bound to a config generation CELL. Kept next to
@@ -1858,7 +1959,16 @@ impl Agent {
     ) -> zeroclaw_config::schema::ResolvedContextLimits {
         self.context_limits_resolver.as_ref().map_or_else(
             || self.config.resolved.context_limits(),
-            |resolve| resolve(provider_name, model),
+            |resolve| {
+                // External reporting may pass the normalized billing name.
+                // Derive the selected reference from the existing identity;
+                // explicit hint routes continue to resolve their own entries.
+                if provider_name == self.model_provider_name && model == self.model_name {
+                    resolve(&self.selected_model_provider_ref(), model)
+                } else {
+                    resolve(provider_name, model)
+                }
+            },
         )
     }
 
@@ -1917,7 +2027,7 @@ impl Agent {
         // Bypass the cache when a per-turn memory preamble the key cannot see
         // will be injected downstream (see `memory_injection_active`), or when
         // hooks/tools can change the final provider request after this point.
-        if self.temperature != Some(0.0)
+        if self.effective_temperature() != Some(0.0)
             || self.response_cache.is_none()
             || self.memory_injection_active()
             || zeroclaw_api::NATIVE_THINKING_OVERRIDE
@@ -1945,14 +2055,39 @@ impl Agent {
         }
 
         let transcript = Self::encode_response_cache_transcript(messages);
+        // Resolve at use time: full selection and all provider configuration
+        // affect the request, even when two entries share a wire model ID.
+        // Hash the canonical config without persisting connection credentials.
+        // Serialization failure bypasses caching rather than reusing a weak key.
+        let selected = self.model_route_resolver.resolve(effective_model);
+        let config_fingerprint = if let Some(config) = self.full_config() {
+            use sha2::{Digest, Sha256};
+            let options = zeroclaw_providers::model::runtime_options(
+                config,
+                &self.agent_alias,
+                &selected.provider_name,
+            )
+            .ok()?;
+            // Include shared construction defaults (reasoning, multimodal,
+            // secrets directory) through the existing options materializer.
+            let mut provider_config = serde_json::to_value((&config.providers, options)).ok()?;
+            provider_config.sort_all_objects();
+            let bytes = serde_json::to_vec(&provider_config).ok()?;
+            format!("{:x}", Sha256::digest(bytes))
+        } else {
+            String::new()
+        };
         let provider_model_identity = format!(
-            "provider={}:{};alias={}:{};model={}:{}",
+            "provider={}:{};alias={}:{};model={}:{};selection={}:{};config={}",
             self.model_provider_name.len(),
             self.model_provider_name,
             self.model_provider.alias().len(),
             self.model_provider.alias(),
             effective_model.len(),
             effective_model,
+            selected.provider_name.len(),
+            selected.provider_name,
+            config_fingerprint,
         );
 
         Some(zeroclaw_memory::response_cache::ResponseCache::cache_key(
@@ -2003,24 +2138,50 @@ impl Agent {
         self.memory_session_id = session_id;
     }
 
+    /// Replace the complete binding under the owner's existing Agent lock.
+    fn install_model_runtime(&mut self, runtime: ModelRuntime) {
+        let ModelRuntime {
+            model,
+            tool_dispatcher,
+        } = runtime;
+        let (provider, identity, model_route_resolver) = model.into_parts();
+        let provider_name = identity.provider_ref();
+        let model_name = identity.model_id.clone();
+        self.model_provider = provider;
+        self.model_provider_name = provider_name;
+        self.model_name = model_name;
+        self.model_identity = Some(identity);
+        self.model_route_resolver = model_route_resolver;
+        self.tool_dispatcher = tool_dispatcher;
+    }
+
+    pub(crate) fn install_model_update(&mut self, update: PreparedModelUpdate) {
+        self.install_model_runtime(update.runtime);
+        self.multimodal_config = update.config.multimodal.clone();
+        self.set_config_generation(update.config);
+        self.temperature = update.temperature_override;
+    }
+
+    fn effective_temperature(&self) -> Option<f64> {
+        let selected = self.model_route_resolver.resolve(&self.model_name);
+        zeroclaw_providers::temperature::Temperature::from(self.temperature)
+            .resolve(self.full_config(), &selected.provider_name)
+    }
+
     pub fn set_temperature(&mut self, temperature: Option<f64>) {
         self.temperature = temperature;
     }
 
     pub fn refresh_memory_embedder(
         &self,
-        model_provider: &str,
-        api_key: Option<&str>,
-        model: &str,
-        dimensions: usize,
+        embedder: std::sync::Arc<dyn zeroclaw_api::embedding::EmbeddingProvider>,
     ) {
-        self.memory
-            .refresh_embedder(model_provider, api_key, model, dimensions);
+        self.memory.refresh_embedder(embedder);
     }
 
     #[cfg(test)]
     pub fn temperature_for_test(&self) -> Option<f64> {
-        self.temperature
+        self.effective_temperature()
     }
 
     #[cfg(test)]
@@ -2028,6 +2189,7 @@ impl Agent {
         &self.multimodal_config
     }
 
+    #[cfg(any(test, feature = "test-util"))]
     pub fn set_model_name(&mut self, model_name: String) {
         self.model_name = model_name;
     }
@@ -2037,45 +2199,18 @@ impl Agent {
         self.automatic_model_routing = false;
     }
 
+    #[cfg(any(test, feature = "test-util"))]
     pub fn set_model_provider(&mut self, model_provider: Box<dyn ModelProvider>) {
         self.model_provider = model_provider;
     }
 
-    pub fn set_model_provider_name(&mut self, model_provider_name: String) {
-        self.model_provider_name = model_provider_name;
-    }
-
-    /// Refreshes the `[multimodal]` policy snapshot alongside a live provider
-    /// swap. The provider boundary carries its own clone of the same policy,
-    /// so both must move together or the runtime preparation pass and the
-    /// provider boundary disagree after a refresh.
-    pub fn set_multimodal_config(&mut self, config: zeroclaw_config::schema::MultimodalConfig) {
-        self.multimodal_config = config;
-    }
-
-    /// Install the route resolver that belongs to a newly swapped provider.
-    /// The resolver holds the hint→provider/model route table bound to a
-    /// specific provider set, so it MUST be replaced together with the provider
-    /// box (see `set_model_provider`); otherwise a routed hint resolves through
-    /// the previous provider's table while the new provider serves the call.
-    pub fn set_model_route_resolver(
-        &mut self,
-        model_route_resolver: Arc<zeroclaw_providers::router::ModelRouteResolver>,
-    ) {
-        self.model_route_resolver = model_route_resolver;
-    }
-
-    /// Publish the config generation a freshly swapped provider box was built
-    /// from. MUST be called in the same state transition as
-    /// `set_model_provider` / `set_model_route_resolver` (see
-    /// `SessionStore::apply_model_provider`): it moves the provider-rebuild
-    /// snapshot and the limits generation together, so a later explicit
-    /// `model_switch` cannot rebuild dispatch from stale profiles and routes
+    /// Publish the config generation inside `install_model_update`, under the
+    /// same Agent lock as the complete provider/identity/resolver binding.
+    /// It moves the provider-rebuild snapshot and limits generation together,
+    /// so a later explicit `model_switch` cannot rebuild from stale profiles
+    /// and routes
     /// while `context_limits_for_route` reports the new config's capacity.
-    pub fn set_config_generation(
-        &mut self,
-        config_generation: Arc<zeroclaw_config::schema::Config>,
-    ) {
+    fn set_config_generation(&mut self, config_generation: Arc<zeroclaw_config::schema::Config>) {
         if let Some(generation) = self.config_generation.as_ref() {
             *generation.write() = Arc::clone(&config_generation);
         }
@@ -2104,6 +2239,7 @@ impl Agent {
         self.model_route_resolver.resolve(selector)
     }
 
+    #[cfg(any(test, feature = "test-util"))]
     pub fn set_tool_dispatcher(&mut self, tool_dispatcher: Box<dyn ToolDispatcher>) {
         self.tool_dispatcher = tool_dispatcher;
         self.refresh_system_prompt();
@@ -2532,6 +2668,22 @@ impl Agent {
         Self::from_config_with_session_cwd(config, agent_alias, None).await
     }
 
+    pub async fn from_config_with_model_overrides(
+        config: &Config,
+        agent_alias: &str,
+        overrides: ModelOverrides<'_>,
+    ) -> Result<Self> {
+        Self::from_config_with_context(
+            config,
+            agent_alias,
+            AgentBuildContext {
+                model_overrides: overrides,
+                ..AgentBuildContext::default()
+            },
+        )
+        .await
+    }
+
     pub async fn from_config_with_session_cwd(
         config: &Config,
         agent_alias: &str,
@@ -2546,25 +2698,14 @@ impl Agent {
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
     ) -> Result<Self> {
-        Self::from_config_with_session_cwd_and_mcp_approval_mode(
+        Self::from_config_with_context(
             config,
             agent_alias,
-            session_cwd,
-            initialize_mcp,
-            false,
-            false,
-            // Non-ACP construction path: `deliver_file` has no transport here.
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            CapabilityBinding::ConfigBacked,
+            AgentBuildContext {
+                session_cwd,
+                initialize_mcp,
+                ..AgentBuildContext::default()
+            },
         )
         .await
     }
@@ -2607,24 +2748,21 @@ impl Agent {
         canvas_store: Option<tools::CanvasStore>,
         execution_capability: Option<AgentExecutionCapability>,
     ) -> Result<Self> {
-        Self::from_config_with_session_cwd_and_mcp_approval_mode(
+        Self::from_config_with_context(
             config,
             agent_alias,
-            session_cwd,
-            initialize_mcp,
-            true,
-            exclude_memory,
-            acp_delivery,
-            None,
-            sop_engine,
-            sop_audit,
-            canvas_store,
-            None,
-            None,
-            None,
-            None,
-            execution_capability,
-            CapabilityBinding::ConfigBacked,
+            AgentBuildContext {
+                session_cwd,
+                initialize_mcp,
+                approval_backchannel: true,
+                exclude_memory,
+                acp_delivery,
+                sop_engine,
+                sop_audit,
+                canvas_store,
+                execution_capability,
+                ..AgentBuildContext::default()
+            },
         )
         .await
     }
@@ -2641,24 +2779,21 @@ impl Agent {
         canvas_store: Option<tools::CanvasStore>,
         acp_session_store: Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
     ) -> Result<Self> {
-        Self::from_config_with_session_cwd_and_mcp_approval_mode(
+        Self::from_config_with_context(
             config,
             agent_alias,
-            session_cwd,
-            initialize_mcp,
-            true,
-            exclude_memory,
-            acp_delivery,
-            None,
-            sop_engine,
-            sop_audit,
-            canvas_store,
-            Some(acp_session_store),
-            None,
-            None,
-            None,
-            None,
-            CapabilityBinding::ConfigBacked,
+            AgentBuildContext {
+                session_cwd,
+                initialize_mcp,
+                approval_backchannel: true,
+                exclude_memory,
+                acp_delivery,
+                sop_engine,
+                sop_audit,
+                canvas_store,
+                acp_session_store: Some(acp_session_store),
+                ..AgentBuildContext::default()
+            },
         )
         .await
     }
@@ -2704,25 +2839,21 @@ impl Agent {
         canvas_store: Option<tools::CanvasStore>,
         execution_capability: Option<AgentExecutionCapability>,
     ) -> Result<Self> {
-        let config = live_config.read().clone();
-        Self::from_config_with_session_cwd_and_mcp_approval_mode(
-            &config,
+        Self::from_live_config_with_context(
+            live_config,
             agent_alias,
-            session_cwd,
-            initialize_mcp,
-            true,
-            exclude_memory,
-            acp_delivery,
-            None,
-            sop_engine,
-            sop_audit,
-            canvas_store,
-            None,
-            Some(live_config),
-            None,
-            None,
-            execution_capability,
-            CapabilityBinding::ConfigBacked,
+            AgentBuildContext {
+                session_cwd,
+                initialize_mcp,
+                approval_backchannel: true,
+                exclude_memory,
+                acp_delivery,
+                sop_engine,
+                sop_audit,
+                canvas_store,
+                execution_capability,
+                ..AgentBuildContext::default()
+            },
         )
         .await
     }
@@ -2796,25 +2927,22 @@ impl Agent {
         acp_session_store: Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
         execution_capability: Option<AgentExecutionCapability>,
     ) -> Result<Self> {
-        let config = live_config.read().clone();
-        Self::from_config_with_session_cwd_and_mcp_approval_mode(
-            &config,
+        Self::from_live_config_with_context(
+            live_config,
             agent_alias,
-            session_cwd,
-            initialize_mcp,
-            true,
-            exclude_memory,
-            acp_delivery,
-            None,
-            sop_engine,
-            sop_audit,
-            canvas_store,
-            Some(acp_session_store),
-            Some(live_config),
-            None,
-            None,
-            execution_capability,
-            CapabilityBinding::ConfigBacked,
+            AgentBuildContext {
+                session_cwd,
+                initialize_mcp,
+                approval_backchannel: true,
+                exclude_memory,
+                acp_delivery,
+                sop_engine,
+                sop_audit,
+                canvas_store,
+                acp_session_store: Some(acp_session_store),
+                execution_capability,
+                ..AgentBuildContext::default()
+            },
         )
         .await
     }
@@ -2858,25 +2986,20 @@ impl Agent {
         sop_audit: Option<Arc<SopAuditLogger>>,
         execution_capability: Option<AgentExecutionCapability>,
     ) -> Result<Self> {
-        Self::from_config_with_session_cwd_and_mcp_approval_mode(
+        Self::from_config_with_context(
             config,
             agent_alias,
-            session_cwd,
-            initialize_mcp,
-            true,
-            exclude_memory,
-            // TUI turns never transport an ACP file attachment.
-            false,
-            tui_env,
-            sop_engine,
-            sop_audit,
-            None,
-            None,
-            None,
-            None,
-            None,
-            execution_capability,
-            CapabilityBinding::ConfigBacked,
+            AgentBuildContext {
+                session_cwd,
+                initialize_mcp,
+                approval_backchannel: true,
+                exclude_memory,
+                tui_env,
+                sop_engine,
+                sop_audit,
+                execution_capability,
+                ..AgentBuildContext::default()
+            },
         )
         .await
     }
@@ -3027,20 +3150,34 @@ impl Agent {
         binding: CapabilityBinding,
     ) -> Result<Self> {
         let config = Box::new(live_config.read().clone());
-        Self::from_snapshot_with_tui_env_bound(
+        let capabilities = match binding {
+            CapabilityBinding::ConfigBacked => None,
+            CapabilityBinding::Supplied {
+                capabilities,
+                principal,
+            } => Some(crate::composition::BoundCapabilities {
+                capabilities,
+                principal,
+            }),
+        };
+        Self::from_snapshot_with_context(
             &config,
-            live_config,
             agent_alias,
-            session_cwd,
-            initialize_mcp,
-            exclude_memory,
-            tui_env,
-            sop_engine,
-            sop_audit,
-            principal_allowed_tools,
-            None,
-            acp_session_store,
-            binding,
+            AgentBuildContext {
+                session_cwd,
+                initialize_mcp,
+                approval_backchannel: true,
+                exclude_memory,
+                tui_env,
+                sop_engine,
+                sop_audit,
+                principal_allowed_tools,
+                acp_session_store,
+                capabilities,
+                live_config: Some(live_config.clone()),
+                live_model_config: Some(live_config),
+                ..Default::default()
+            },
         )
         .await
     }
@@ -3060,25 +3197,16 @@ impl Agent {
         capabilities: &crate::composition::RuntimeCapabilities,
         principal: Option<&zeroclaw_api::principal::PrincipalId>,
     ) -> Result<Self> {
-        Self::build_with_capabilities(
+        Self::from_config_with_context(
             config,
             agent_alias,
-            capabilities,
-            CapabilityOrigin::Supplied { principal },
-            None,
-            true,
-            false,
-            false,
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            AgentBuildContext {
+                capabilities: Some(crate::composition::BoundCapabilities {
+                    capabilities: capabilities.clone(),
+                    principal: principal.cloned(),
+                }),
+                ..Default::default()
+            },
         )
         .await
     }
@@ -3129,40 +3257,54 @@ impl Agent {
         execution_capability: Option<AgentExecutionCapability>,
         acp_session_store: Option<Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>>,
     ) -> Result<Self> {
-        Self::from_snapshot_with_tui_env_bound(
+        Self::from_snapshot_with_context(
             config,
-            live_config,
             agent_alias,
-            session_cwd,
-            initialize_mcp,
-            exclude_memory,
-            tui_env,
-            sop_engine,
-            sop_audit,
-            principal_allowed_tools,
-            execution_capability,
-            acp_session_store,
-            CapabilityBinding::ConfigBacked,
+            AgentBuildContext {
+                session_cwd,
+                initialize_mcp,
+                approval_backchannel: true,
+                exclude_memory,
+                tui_env,
+                sop_engine,
+                sop_audit,
+                principal_allowed_tools,
+                execution_capability,
+                acp_session_store,
+                live_config: Some(live_config.clone()),
+                live_model_config: Some(live_config),
+                ..Default::default()
+            },
         )
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn from_snapshot_with_tui_env_bound(
+    pub(crate) async fn from_snapshot_with_context(
         config: &Config,
-        live_config: zeroclaw_config::live::LiveConfigHandle,
         agent_alias: &str,
-        session_cwd: Option<&Path>,
-        initialize_mcp: bool,
-        exclude_memory: bool,
-        tui_env: Option<std::collections::HashMap<String, String>>,
-        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
-        sop_audit: Option<Arc<SopAuditLogger>>,
-        principal_allowed_tools: Option<Vec<String>>,
-        execution_capability: Option<AgentExecutionCapability>,
-        acp_session_store: Option<Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>>,
-        binding: CapabilityBinding,
+        context: AgentBuildContext<'_>,
     ) -> Result<Self> {
+        let AgentBuildContext {
+            session_cwd,
+            initialize_mcp,
+            approval_backchannel,
+            exclude_memory,
+            acp_delivery,
+            tui_env,
+            sop_engine,
+            sop_audit,
+            canvas_store,
+            acp_session_store,
+            live_config,
+            live_model_config,
+            principal_allowed_tools,
+            execution_capability,
+            model_overrides,
+            capabilities: supplied_capabilities,
+        } = context;
+        let provider_override = model_overrides.provider.map(str::to_owned);
+        let model_override = model_overrides.model.map(str::to_owned);
+        let temperature = model_overrides.temperature;
         // Keep deep Agent construction off the transport's default worker stack.
         // Carry the caller's exact snapshot; rereading live config here would
         // invalidate its construction witness and split the route generation.
@@ -3179,24 +3321,31 @@ impl Agent {
             if let Some(admission) = &construction_admission {
                 admission.revalidate()?;
             }
-            let result = handle.block_on(Self::from_config_with_session_cwd_and_mcp_approval_mode(
+            let result = handle.block_on(Self::from_config_with_context(
                 &config,
                 &agent_alias,
-                session_cwd.as_deref(),
-                initialize_mcp,
-                true,
-                exclude_memory,
-                false,
-                tui_env,
-                sop_engine,
-                sop_audit,
-                None,
-                acp_session_store,
-                Some(live_config.clone()),
-                Some(live_config),
-                principal_allowed_tools,
-                execution_capability,
-                binding,
+                AgentBuildContext {
+                    session_cwd: session_cwd.as_deref(),
+                    initialize_mcp,
+                    approval_backchannel,
+                    exclude_memory,
+                    acp_delivery,
+                    tui_env,
+                    sop_engine,
+                    sop_audit,
+                    acp_session_store,
+                    live_config,
+                    live_model_config,
+                    principal_allowed_tools,
+                    execution_capability,
+                    canvas_store,
+                    capabilities: supplied_capabilities,
+                    model_overrides: ModelOverrides {
+                        provider: provider_override.as_deref(),
+                        model: model_override.as_deref(),
+                        temperature,
+                    },
+                },
             ));
             drop(construction_admission);
             result
@@ -3205,53 +3354,47 @@ impl Agent {
         .map_err(|join| anyhow::Error::msg(format!("agent construction task failed: {join}")))?
     }
 
-    /// The snapshot constructors' shared builder. With
-    /// [`CapabilityBinding::ConfigBacked`] it is the compatibility adapter:
-    /// the config-backed capabilities reproduce the provider, memory and
-    /// observer construction this path performed inline.
-    #[allow(clippy::too_many_arguments)]
-    async fn from_config_with_session_cwd_and_mcp_approval_mode(
+    /// Read one model generation while tools retain the canonical live source.
+    pub async fn from_live_config_with_context(
+        live_config: zeroclaw_config::live::LiveConfigHandle,
+        agent_alias: &str,
+        mut context: AgentBuildContext<'_>,
+    ) -> Result<Self> {
+        let config = Box::new(live_config.read().clone());
+        context.live_config = Some(live_config);
+        Self::from_config_with_context(&config, agent_alias, context).await
+    }
+
+    pub async fn from_config_with_context(
         config: &Config,
         agent_alias: &str,
-        session_cwd: Option<&Path>,
-        initialize_mcp: bool,
-        approval_backchannel: bool,
-        exclude_memory: bool,
-        acp_delivery: bool,
-        tui_env: Option<std::collections::HashMap<String, String>>,
-        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
-        sop_audit: Option<Arc<SopAuditLogger>>,
-        canvas_store: Option<tools::CanvasStore>,
-        acp_session_store: Option<Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>>,
-        live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
-        live_model_config: Option<zeroclaw_config::live::LiveConfigHandle>,
-        principal_allowed_tools: Option<Vec<String>>,
-        execution_capability: Option<AgentExecutionCapability>,
-        binding: CapabilityBinding,
+        context: AgentBuildContext<'_>,
     ) -> Result<Self> {
-        let (capabilities, principal, supplied) = match binding {
-            CapabilityBinding::ConfigBacked => (
-                crate::composition::RuntimeCapabilities::config_backed(config),
-                None,
-                false,
-            ),
-            CapabilityBinding::Supplied {
-                capabilities,
-                principal,
-            } => (capabilities, principal, true),
+        // Unit tests still build a number of historical typed fixtures by
+        // hand. Admit those fixtures at this explicit test boundary so the
+        // production constructor and registry getter remain canonical-only.
+        #[cfg(test)]
+        let admitted_config;
+        #[cfg(test)]
+        let config = {
+            admitted_config = zeroclaw_config::migration::admit_test_input(config);
+            &admitted_config
         };
-        let origin = if supplied {
-            CapabilityOrigin::Supplied {
-                principal: principal.as_ref(),
-            }
-        } else {
-            CapabilityOrigin::Adapter
-        };
-        Self::build_with_capabilities(
+        // Keep construction state out of enclosing RPC/delegation futures.
+        Box::pin(Self::from_config_with_context_body(
             config,
             agent_alias,
-            &capabilities,
-            origin,
+            context,
+        ))
+        .await
+    }
+
+    async fn from_config_with_context_body(
+        config: &Config,
+        agent_alias: &str,
+        context: AgentBuildContext<'_>,
+    ) -> Result<Self> {
+        let AgentBuildContext {
             session_cwd,
             initialize_mcp,
             approval_backchannel,
@@ -3266,38 +3409,41 @@ impl Agent {
             live_model_config,
             principal_allowed_tools,
             execution_capability,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn build_with_capabilities(
-        config: &Config,
-        agent_alias: &str,
-        capabilities: &crate::composition::RuntimeCapabilities,
-        origin: CapabilityOrigin<'_>,
-        session_cwd: Option<&Path>,
-        initialize_mcp: bool,
-        approval_backchannel: bool,
-        exclude_memory: bool,
-        acp_delivery: bool,
-        tui_env: Option<std::collections::HashMap<String, String>>,
-        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
-        sop_audit: Option<Arc<SopAuditLogger>>,
-        canvas_store: Option<tools::CanvasStore>,
-        acp_session_store: Option<Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>>,
-        live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
-        live_model_config: Option<zeroclaw_config::live::LiveConfigHandle>,
-        // The caller principal's tool selector (RFC 7141 composition by
-        // intersection): `None` = unrestricted, `Some(list)` keeps only the
-        // named tools from the assembled surface (empty = a tool-less
-        // agent). Fed by the RPC dispatcher from the resolved grants.
-        principal_allowed_tools: Option<Vec<String>>,
-        execution_capability: Option<AgentExecutionCapability>,
-    ) -> Result<Self> {
+            model_overrides,
+            capabilities: supplied_capabilities,
+        } = context;
         let agent_cfg = config
             .agent(agent_alias)
             .with_context(|| format!("agents.{agent_alias} is not configured"))?;
+        let model_ref = model_overrides
+            .provider
+            .unwrap_or(agent_cfg.model_provider.as_str());
+        let config_generation: ConfigGeneration =
+            Arc::new(parking_lot::RwLock::new(Arc::new(config.clone())));
+        let model_config = Arc::clone(&config_generation.read());
+        let bound = supplied_capabilities.clone().unwrap_or_else(|| {
+            crate::composition::BoundCapabilities {
+                capabilities: crate::composition::RuntimeCapabilities::config_backed(config),
+                principal: None,
+            }
+        });
+        let capabilities = &bound.capabilities;
+        let model = bound
+            .build_model(
+                model_config,
+                agent_alias,
+                model_ref,
+                model_overrides.model,
+                crate::composition::ModelBuildIntent::AgentDefault,
+            )
+            .await
+            .with_context(|| format!("agents.{agent_alias}.model_provider"))?;
+        let tool_dispatcher =
+            tool_dispatcher_for_provider(agent_cfg, model.provider(), model.model_name());
+        let entry_rt = ModelRuntime {
+            model,
+            tool_dispatcher,
+        };
         let risk_profile = config
             .risk_profile_for_agent(agent_alias)
             .with_context(|| {
@@ -3349,27 +3495,7 @@ impl Agent {
             policy
         });
 
-        let (provider_name, provider_alias, agent_model_provider) =
-            match config.resolved_model_provider_for_agent(agent_alias) {
-                Some(resolved) => (resolved.0, resolved.1, Some(resolved.2)),
-                None => {
-                    let agent_ref = agent_cfg.model_provider.as_str();
-                    if !agent_ref.is_empty() {
-                        anyhow::bail!(
-                            "agents.{agent_alias}.model_provider = \"{agent_ref}\" does not \
-                             resolve to a configured [providers.models.<type>.<alias>] entry"
-                        );
-                    }
-                    // V3 schema requires every agent to set model_provider.
-                    // Empty is a config error rather than a silent fallback.
-                    anyhow::bail!(
-                        "agents.{agent_alias}.model_provider is empty — set it to a \
-                         configured \"<type>.<alias>\" (e.g. \"anthropic.{agent_alias}\")"
-                    );
-                }
-            };
         let memory: Arc<dyn Memory> = capabilities.agent_memory(config, agent_alias).await?;
-
         let tool_config = Arc::new(config.clone());
         let tool_request = crate::composition::ToolRequest {
             config: &tool_config,
@@ -3391,11 +3517,8 @@ impl Agent {
                 if construction == crate::composition::RegistryConstruction::NativeCompat
                     && config.sop.runtime_enabled() =>
             {
-                let (engine, audit) = crate::sop::build_sop_engine_with_capability(
-                    config.sop.clone(),
-                    &config.decision_models,
-                    &config.data_dir,
-                    &config.install_root_dir(),
+                let (engine, audit) = crate::sop::build_sop_engine(
+                    config,
                     Arc::clone(&memory),
                     Default::default(),
                     execution_capability.clone(),
@@ -3409,6 +3532,10 @@ impl Agent {
         let tui_env = tui_env.map(Arc::new);
         let all_tools_result = match selected_recipe {
             Some(recipe) => recipe(crate::composition::NativeRecipeInputs {
+                model_config: Some({
+                    let generation = Arc::clone(&config_generation);
+                    Arc::new(move || Arc::clone(&generation.read()))
+                }),
                 request: &tool_request,
                 workspace_dir: &security.workspace_dir,
                 canvas_store,
@@ -3430,7 +3557,7 @@ impl Agent {
             all_tools_result,
             construction,
             &tool_request,
-            origin.principal(),
+            bound.principal.as_ref(),
         )?;
         let skills = if construction == crate::composition::RegistryConstruction::NativeCompat {
             crate::skills::load_skills_for_agent_from_config(config, agent_alias)
@@ -3510,37 +3637,12 @@ impl Agent {
         // takes a `ScopedToolRegistry`, so no `into_inner()` unwrap here.
         let tools = registry;
 
-        let model_name = match agent_model_provider
-            .and_then(|e| e.model.as_deref())
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-        {
-            Some(m) => m.to_string(),
-            None => anyhow::bail!(
-                "agents.{agent_alias}.model_provider resolves to a model_provider entry \
-                 with no `model` set. Configure [providers.models.{provider_name}.<alias>] \
-                 model = \"...\".",
-            ),
-        };
-
-        let provider_ref = format!("{provider_name}.{provider_alias}");
-        let principal = origin.principal();
-        let model_provider = capabilities.model_provider(&crate::composition::ProviderRequest {
-            config,
-            agent_alias,
-            provider_ref: None,
-            model: Some(&model_name),
-            principal,
-        })?;
-        let model_route_resolver = zeroclaw_providers::model_route_resolver(
-            &provider_ref,
-            &config.model_routes,
-            &model_name,
-        );
-
-        let tool_dispatcher =
-            tool_dispatcher_for_provider(agent_cfg, model_provider.as_ref(), &model_name);
-
+        // Build the complete model runtime from the agent's configured ref —
+        // the same constructor every other path uses (switches, live
+        // refresh, session overrides). The raw ref reaches the construction
+        // chain so a three-segment agent ref carries the selected entry's
+        // tuning. Credentials always come from the selected target profile or
+        // its configured route.
         let response_cache = if config.memory.response_cache_enabled {
             zeroclaw_memory::response_cache::ResponseCache::with_hot_cache(
                 &config.data_dir,
@@ -3569,28 +3671,13 @@ impl Agent {
         // `config` is the immutable snapshot captured by the live constructor
         // before async setup. Seed the generation cell from that same snapshot
         // so provider/resolver/limits cannot be split across two commits.
-        let config_generation: Option<ConfigGeneration> = live_config
-            .as_ref()
-            .map(|_| Arc::new(parking_lot::RwLock::new(Arc::new(config.clone()))));
         let live_config_for_generation = live_model_config;
 
         let context_limits_resolver: ContextLimitsResolver =
-            if let Some(generation) = config_generation.as_ref().map(Arc::clone) {
-                Arc::new(Agent::context_generation_limits_resolver(
-                    generation,
-                    agent_alias.to_string(),
-                ))
-            } else {
-                let limit_config = config.clone();
-                let limit_agent_alias = agent_alias.to_string();
-                Arc::new(move |provider_ref, model| {
-                    limit_config.resolved_context_limits_for_route(
-                        &limit_agent_alias,
-                        provider_ref,
-                        model,
-                    )
-                })
-            };
+            Arc::new(Agent::context_generation_limits_resolver(
+                Arc::clone(&config_generation),
+                agent_alias.to_string(),
+            ));
 
         let structured_history_turn_limit_resolver: Arc<dyn Fn() -> usize + Send + Sync> =
             if let Some(cap_config) = live_config.clone() {
@@ -3605,17 +3692,18 @@ impl Agent {
                 Arc::new(move || max)
             };
 
+        let admitted_model_config = Arc::clone(&config_generation.read());
         let builder = Agent::builder();
         let builder = builder.delegate_tool(built_delegate_tool);
-        let mut builder = builder
-            .model_provider(model_provider)
+        let builder = builder
+            .model_runtime(entry_rt)
+            .temperature(model_overrides.temperature)
             .allowed_tools(principal_allowed_tools)
             .tools(tools)
             .memory(memory.clone())
             .memory_security(Arc::clone(&security))
             .observer(observer)
             .response_cache(response_cache)
-            .tool_dispatcher(tool_dispatcher)
             .memory_inject_cfg(
                 crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
                     &config.memory,
@@ -3633,18 +3721,9 @@ impl Agent {
             .context_limits_resolver(context_limits_resolver)
             .multimodal_config(config.multimodal.clone())
             .agent_alias(agent_alias.to_string())
-            .model_name(model_name)
-            // Store the full "type.alias" ref so the live provider identity
-            // (attribution_fields().1) carries the same key the config
-            // provider registry is keyed by, and wire-emission paths can
-            // resolve model_context_window / cost pricing for the provider
-            // that actually served the call.
-            .model_provider_name(provider_ref.clone())
-            .temperature(agent_model_provider.and_then(|e| e.temperature))
             .workspace_dir(security.workspace_dir.clone())
             .agent_workspace_dir(agent_workspace.clone())
             .classification_config(config.query_classification.clone())
-            .model_route_resolver(model_route_resolver)
             .identity_config(agent_cfg.identity.clone())
             .skills(skills)
             .skills_prompt_mode(config.effective_skills_prompt_mode(agent_alias))
@@ -3667,23 +3746,16 @@ impl Agent {
             // resolver above reads, and both are republished together by
             // `sync_config_generation`.
             .provider_switch_config(ProviderSwitchConfig {
-                config: Some(
-                    config_generation
-                        .as_ref()
-                        .map_or_else(|| Arc::new(config.clone()), |cell| Arc::clone(&cell.read())),
-                ),
+                config: Some(admitted_model_config),
                 live_config: live_config.clone(),
                 live: live_config_for_generation,
-            });
-        if let Some(generation) = config_generation {
-            builder = builder.config_generation(generation);
-        }
-        if let CapabilityOrigin::Supplied { principal } = origin {
-            builder = builder.supplied_capabilities(crate::composition::BoundCapabilities {
-                capabilities: capabilities.clone(),
-                principal: principal.cloned(),
-            });
-        }
+            })
+            .config_generation(config_generation);
+        let builder = if let Some(supplied) = supplied_capabilities {
+            builder.supplied_capabilities(supplied)
+        } else {
+            builder
+        };
         let mut agent = builder.build()?;
 
         agent.forwarded_environment = tui_env;
@@ -3816,7 +3888,8 @@ impl Agent {
 
     /// Append a user-visible notice when the resilient provider wrapper served
     /// this turn with a different model or provider than requested (silent
-    /// model downgrade, e.g. a `fallback_models` entry kicking in). The record
+    /// model downgrade, e.g. a target in the canonical `[providers.fallback]`
+    /// graph kicking in). The record
     /// is consumed from the `zeroclaw_providers::reliable` task-local (single
     /// source of truth); nothing is stored.
     ///
@@ -3911,8 +3984,11 @@ impl Agent {
         dispatcher: &dyn ToolDispatcher,
         max_chars: usize,
     ) -> Result<String> {
-        let expose_text_tool_protocol =
-            !self.config.resolved.strict_tool_parsing || dispatcher.should_send_tool_specs();
+        let expose_text_tool_protocol = self.full_config().is_none_or(|config| {
+            config
+                .model_text_extraction(&self.selected_model_provider_ref())
+                .tool_calls
+        }) || dispatcher.should_send_tool_specs();
         let no_tools: Vec<Box<dyn Tool>> = Vec::new();
         // Both arms resolve to `&[Box<dyn Tool>]`: the sealed registry derefs to
         // the same slice the raw `Vec` used to expose, so downstream prompt
@@ -4024,25 +4100,59 @@ impl Agent {
         Ok(())
     }
 
-    /// This agent's provider source for its vision route: the supplied
-    /// source and principal of a capability-built agent, or `None` for an
-    /// adapter-built agent, which keeps the config-built vision route.
+    /// Apply an in-session model switch requested through the `model_switch`
+    /// tool: rebuild the complete model runtime from the agent's captured
+    /// config and commit it wholesale.
+    ///
+    /// Only the ref and model arrive from the request; target profile and route
+    /// credentials, the entry overlay, temperature, dispatcher, and identity
+    /// are all derived by [`build_model`]. A switch whose resolved identity
+    /// equals the current binding can still change a hint-selected route.
+    /// Successful no-ops are distinct from construction failures.
     fn vision_provider_source(&self) -> Option<crate::agent::turn::VisionProviderSource<'_>> {
         self.supplied_capabilities.as_ref().map(|supplied| {
             crate::agent::turn::VisionProviderSource::from_binding(supplied, &self.agent_alias)
         })
     }
 
-    fn try_apply_model_switch(
+    async fn try_apply_model_switch(
         &mut self,
         current_effective_model: &str,
         new_model_provider: String,
         new_model: String,
-    ) -> Option<String> {
-        // Same-provider, same-model: nothing to do. The request is owned by
-        // the completed tool-loop scope, so there is no persistent slot to clear.
-        if new_model_provider == self.model_provider_name && new_model == current_effective_model {
-            return None;
+    ) -> Result<ModelSwitchOutcome> {
+        let full_config = self
+            .provider_switch_config
+            .as_ref()
+            .and_then(|cfg| cfg.config.as_ref())
+            .cloned()
+            .context("model_switch requested but agent has no provider config generation")?;
+
+        // Identity-keyed no-op: a switch to the model that is already
+        // running — however the ref spells it — leaves the runtime untouched.
+        // The request is owned by the completed tool-loop scope, so there is
+        // no persistent slot to clear.
+        let next_identity = zeroclaw_providers::model::resolve_model_identity(
+            &full_config,
+            &self.agent_alias,
+            &new_model_provider,
+            Some(&new_model),
+        );
+        if let Some(current) = &self.model_identity
+            && Some(current) == next_identity.as_ref()
+        {
+            let route = self.model_route_resolver.resolve(current_effective_model);
+            let route_identity = zeroclaw_providers::model::resolve_model_identity(
+                &full_config,
+                &self.agent_alias,
+                &route.provider_name,
+                Some(&route.model),
+            );
+            return Ok(if route_identity == next_identity {
+                ModelSwitchOutcome::Unchanged
+            } else {
+                ModelSwitchOutcome::SelectorChanged(self.model_name.clone())
+            });
         }
 
         ::zeroclaw_log::record!(
@@ -4054,73 +4164,46 @@ impl Agent {
             )
         );
 
-        let switch_outcome: anyhow::Result<(
-            Box<dyn ModelProvider>,
-            Arc<zeroclaw_providers::router::ModelRouteResolver>,
-        )> = match (
-            self.provider_switch_config
-                .as_ref()
-                .and_then(|cfg| cfg.config.as_ref()),
-            self.supplied_capabilities.as_ref(),
-        ) {
-            // A capability-built agent asks the source it was built from, so a
-            // switch cannot step outside the embedder's providers.
-            (Some(full_config), Some(supplied)) => supplied
-                .capabilities
-                .providers
-                .switched_model_provider(&crate::composition::ProviderRequest {
-                    config: full_config,
-                    agent_alias: &self.agent_alias,
-                    provider_ref: Some(&new_model_provider),
-                    model: Some(&new_model),
-                    principal: supplied.principal.as_ref(),
-                })
-                .map(|provider| {
-                    (
-                        Box::new(provider) as Box<dyn ModelProvider>,
-                        zeroclaw_providers::model_route_resolver(
-                            &new_model_provider,
-                            &full_config.model_routes,
-                            &new_model,
-                        ),
-                    )
-                }),
-            (Some(full_config), None) => config_switch_provider(
-                full_config.as_ref(),
+        let rt = if let Some(supplied) = &self.supplied_capabilities {
+            let model = supplied
+                .build_model(
+                    full_config,
+                    &self.agent_alias,
+                    &new_model_provider,
+                    Some(&new_model),
+                    crate::composition::ModelBuildIntent::Switch,
+                )
+                .await?;
+            let tool_dispatcher =
+                tool_dispatcher_for_provider(&self.config, model.provider(), model.model_name());
+            ModelRuntime {
+                model,
+                tool_dispatcher,
+            }
+        } else {
+            build_model_nonblocking(
+                full_config,
                 &self.agent_alias,
                 &new_model_provider,
-                &new_model,
-            ),
-            (None, _) => Err(anyhow::Error::msg(
-                "model_switch requested but agent has no provider_switch_config; \
-                 cannot rebuild provider safely",
-            )),
+                Some(&new_model),
+            )
+            .await?
         };
+        let model_name = rt.model.model_name().to_string();
+        self.install_model_runtime(rt);
+        Ok(ModelSwitchOutcome::Rebuilt(model_name))
+    }
 
-        match switch_outcome {
-            Ok((new_prov, new_route_resolver)) => {
-                // Commit state only after the provider was built
-                // successfully.
-                self.model_provider = new_prov;
-                self.model_route_resolver = new_route_resolver;
-                self.model_provider_name = new_model_provider;
-                self.model_name = new_model.clone();
-                Some(new_model)
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"err": e.to_string()})),
-                    &format!(
-                        "Failed to apply model_switch in turn_streamed; staying on {} {}",
-                        self.model_provider_name, current_effective_model
-                    )
-                );
-                None
-            }
-        }
+    #[cfg(test)]
+    pub(crate) async fn apply_model_switch_for_test(
+        &mut self,
+        provider_ref: &str,
+        model: &str,
+    ) -> Result<()> {
+        let current_model = self.model_name.clone();
+        self.try_apply_model_switch(&current_model, provider_ref.to_string(), model.to_string())
+            .await?;
+        Ok(())
     }
 
     fn classify_model(&self, user_message: &str) -> Result<TurnModelSelection> {
@@ -4157,8 +4240,8 @@ impl Agent {
             })?;
             let selector = format!("hint:{}", selection.route.hint);
             let installed_route = self.model_route_resolver.resolve(&selector);
-            if installed_route.provider_name != selection.route.model_provider
-                || installed_route.model != selection.route.model
+            if installed_route.provider_name != selection.route.model_ref
+                || installed_route.model != selection.route.effective_model(config)
             {
                 return Err(anyhow::Error::msg(
                     "effort routing changed after this provider generation was installed; retry after the model configuration refresh completes",
@@ -4167,7 +4250,7 @@ impl Agent {
             super::eval::log_effort_route_selection(&selection, user_message.len(), "agent");
             return Ok(TurnModelSelection {
                 selector,
-                allowed_provider_refs: Some(Arc::new(selection.allowed_provider_refs)),
+                allowed_provider_refs: Some(Arc::new(selection.allowed_profile_refs(config))),
             });
         }
 
@@ -4383,6 +4466,12 @@ impl Agent {
     }
 
     pub async fn turn(&mut self, user_message: &str) -> Result<String> {
+        // A caller may keep several sequential turn futures in one state
+        // machine. Store the large turn state on the heap at this boundary.
+        Box::pin(self.turn_body(user_message)).await
+    }
+
+    async fn turn_body(&mut self, user_message: &str) -> Result<String> {
         if user_message.trim().is_empty() {
             ::zeroclaw_log::record!(
                 WARN,
@@ -4586,7 +4675,7 @@ impl Agent {
                                 provider_name: &selected_route.provider_name,
                                 model: &selected_route.model,
                                 dispatch_model: &effective_model,
-                                temperature: self.temperature,
+                                temperature: self.temperature.into(),
                             },
                             crate::agent::loop_::ResolvedIo {
                                 tools_registry: &self.tools,
@@ -4613,7 +4702,7 @@ impl Agent {
                                 excluded_tools: &[],
                                 dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
                                 pacing: &pacing,
-                                strict_tool_parsing: self.config.resolved.strict_tool_parsing,
+                                text_tool_calls_disabled: false,
                                 parallel_tools: self.config.resolved.parallel_tools,
                                 max_tool_result_chars: self.config.resolved.max_tool_result_chars,
                                 keep_tool_context_turns: self
@@ -4897,12 +4986,12 @@ impl Agent {
         steering_rx: Option<&mut tokio::sync::mpsc::Receiver<crate::agent::SteeringInput>>,
     ) -> std::result::Result<StreamedTurnSuccess, StreamedTurnError> {
         let mut steering = CloseSteeringOnExit(steering_rx);
-        self.turn_streamed_with_steering_body(
+        Box::pin(self.turn_streamed_with_steering_body(
             user_message,
             event_tx,
             cancel_token,
             steering.0.as_deref_mut(),
-        )
+        ))
         .await
     }
 
@@ -5231,7 +5320,7 @@ impl Agent {
                                     provider_name: &selected_route.provider_name,
                                     model: &selected_route.model,
                                     dispatch_model: &effective_model,
-                                    temperature: self.temperature,
+                                    temperature: self.temperature.into(),
                                 },
                                 crate::agent::loop_::ResolvedIo {
                                     tools_registry: &self.tools,
@@ -5267,7 +5356,7 @@ impl Agent {
                                         .resolved
                                         .tool_call_dedup_exempt,
                                     pacing: &pacing,
-                                    strict_tool_parsing: self.config.resolved.strict_tool_parsing,
+                                    text_tool_calls_disabled: false,
                                     parallel_tools: self.config.resolved.parallel_tools,
                                     max_tool_result_chars: self
                                         .config
@@ -5600,7 +5689,7 @@ impl Agent {
                     }
                     continue;
                 }
-                Err(error) => {
+                Err(mut error) => {
                     // Model switch requested mid-turn: the unified loop
                     // signals a pending `model_switch` by returning
                     // `ModelSwitchRequested`. The
@@ -5612,36 +5701,45 @@ impl Agent {
                     // error) falls through to the normal error handling below.
                     if let Some((new_model_provider, new_model)) =
                         crate::agent::loop_::is_model_switch_requested(&error)
-                        && let Some(new_effective_model) = self.try_apply_model_switch(
-                            &effective_model,
-                            new_model_provider,
-                            new_model,
-                        )
                     {
-                        // Rebuild the per-turn protocol prompts too: a capped
-                        // native request is built from them, so keeping the
-                        // turn-start pair would send the pre-switch model
-                        // label and workspace instructions.
-                        let refreshed = self
-                            .rebuild_streamed_system_prompt_for_active_provider(&mut loop_history)
-                            .and_then(|()| self.tool_protocol_prompts());
-                        match refreshed {
-                            Ok(prompts) => tool_protocol_prompts = prompts,
-                            Err(error) => {
-                                let notice = self.trim_history(Some(&turn_id));
-                                forward_history_trim_notice(&event_tx, notice).await;
-                                return Err(StreamedTurnError {
-                                    error,
-                                    committed_response,
-                                    new_messages: new_msgs,
-                                });
+                        let switched = self
+                            .try_apply_model_switch(&effective_model, new_model_provider, new_model)
+                            .await;
+                        if let Ok(outcome) = switched {
+                            let new_effective_model = match outcome {
+                                ModelSwitchOutcome::Unchanged => effective_model.clone(),
+                                ModelSwitchOutcome::SelectorChanged(model)
+                                | ModelSwitchOutcome::Rebuilt(model) => model,
+                            };
+                            // Rebuild the per-turn protocol prompts too: a capped
+                            // native request is built from them, so keeping the
+                            // turn-start pair would send the pre-switch model
+                            // label and workspace instructions.
+                            let refreshed = self
+                                .rebuild_streamed_system_prompt_for_active_provider(
+                                    &mut loop_history,
+                                )
+                                .and_then(|()| self.tool_protocol_prompts());
+                            match refreshed {
+                                Ok(prompts) => tool_protocol_prompts = prompts,
+                                Err(error) => {
+                                    let notice = self.trim_history(Some(&turn_id));
+                                    forward_history_trim_notice(&event_tx, notice).await;
+                                    return Err(StreamedTurnError {
+                                        error,
+                                        committed_response,
+                                        new_messages: new_msgs,
+                                    });
+                                }
                             }
+                            let notice = self.trim_history(Some(&turn_id));
+                            forward_history_trim_notice(&event_tx, notice).await;
+                            effective_model = new_effective_model;
+                            selected_route = self.model_route_resolver.resolve(&effective_model);
+                            continue;
+                        } else if let Err(switch_error) = switched {
+                            error = switch_error;
                         }
-                        let notice = self.trim_history(Some(&turn_id));
-                        forward_history_trim_notice(&event_tx, notice).await;
-                        effective_model = new_effective_model;
-                        selected_route = self.model_route_resolver.resolve(&effective_model);
-                        continue;
                     }
                     // Rebuild the committed text from the failed round's plain
                     // assistant output (e.g. a persisted stream partial) when
@@ -5771,83 +5869,6 @@ impl Agent {
     }
 }
 
-/// Rebuild an agent's provider for a mid-session model switch from config.
-///
-/// A dotted target profile is the canonical source of endpoint and
-/// credentials; the current agent's profile is the fallback only for a
-/// legacy bare-family switch. A `model_routes` entry naming the switched
-/// provider and model (or hint) supplies the credential first. The
-/// config-backed provider source's switch recipe is this function, so an
-/// agent built from supplied config-backed capabilities switches exactly as
-/// an adapter-built agent does.
-pub(crate) fn config_switch_provider(
-    config: &Config,
-    agent_alias: &str,
-    new_model_provider: &str,
-    new_model: &str,
-) -> Result<(
-    Box<dyn ModelProvider>,
-    Arc<zeroclaw_providers::router::ModelRouteResolver>,
-)> {
-    let target_entry = new_model_provider
-        .split_once('.')
-        .and_then(|(family, alias)| config.providers.models.find(family, alias));
-    let current_agent_entry = config
-        .resolved_model_provider_for_agent(agent_alias)
-        .map(|(_ty, _alias, entry)| entry);
-    let target_or_current = target_entry.or(current_agent_entry);
-    let default_api_key = target_or_current.and_then(|entry| entry.api_key.as_deref());
-    let default_base_url = target_or_current.and_then(|entry| entry.uri.as_deref());
-
-    let route_api_key = config
-        .model_routes
-        .iter()
-        .find(|r| {
-            r.model_provider.eq_ignore_ascii_case(new_model_provider)
-                && (r.model.eq_ignore_ascii_case(new_model)
-                    || r.hint.eq_ignore_ascii_case(new_model))
-        })
-        .and_then(|r| r.api_key.as_deref());
-    let api_key = route_api_key.or(default_api_key);
-
-    let runtime_options = switch_runtime_options(config, new_model_provider);
-
-    zeroclaw_providers::create_routed_model_provider_with_options_and_resolver(
-        config,
-        new_model_provider,
-        api_key,
-        default_base_url,
-        &config.reliability,
-        &config.model_routes,
-        new_model,
-        &runtime_options,
-    )
-}
-
-/// Runtime options for the provider a live model switch rebuilds.
-///
-/// Dotted aliases resolve their entry through `provider_runtime_options_for_alias`;
-/// a bare family reference has no entry, and must take the config-owned
-/// `[multimodal]` policy through `provider_runtime_options_for_bare_family`
-/// rather than `ModelProviderRuntimeOptions::default()`. The default embeds
-/// `max_images = 4` / `max_image_size_mb = 5`, so a bare-family switch built
-/// on defaults would re-normalize already-prepared history under narrower
-/// caps than the operator configured and silently drop images.
-///
-/// A free function so a regression can pin the switch path's options
-/// directly — the rebuilt provider box is opaque to the runtime's tests.
-fn switch_runtime_options(
-    config: &zeroclaw_config::schema::Config,
-    new_model_provider: &str,
-) -> zeroclaw_providers::ModelProviderRuntimeOptions {
-    match new_model_provider.split_once('.') {
-        Some((family, alias)) => {
-            zeroclaw_providers::provider_runtime_options_for_alias(config, family, alias)
-        }
-        None => zeroclaw_providers::provider_runtime_options_for_bare_family(config),
-    }
-}
-
 pub async fn run(
     config: Config,
     agent_alias: &str,
@@ -5857,31 +5878,16 @@ pub async fn run(
     temperature: Option<f64>,
 ) -> Result<()> {
     let explicit_model_selection = provider_override.is_some() || model_override.is_some();
-    let mut effective_config = config;
-    if let Some(ref p) = provider_override {
-        // When a model_provider override is specified, ensure that model_provider type exists
-        // in models and update the agent's model_provider to reference it.
-        let (type_key, alias_key) = p.split_once('.').unwrap_or((p.as_str(), agent_alias));
-        effective_config
-            .providers
-            .models
-            .ensure(type_key, alias_key);
-        if let Some(agent_cfg) = effective_config.agents.get_mut(agent_alias) {
-            agent_cfg.model_provider = format!("{type_key}.{alias_key}").into();
-        }
-    }
-    // Apply model/temperature overrides to the agent's resolved provider entry.
-    if let Some(agent_cfg) = effective_config.agents.get(agent_alias)
-        && let Some((fam, ali)) = agent_cfg.model_provider.split_once('.')
-        && let Some(entry) = effective_config.providers.models.ensure(fam, ali)
-    {
-        if let Some(m) = model_override {
-            entry.model = Some(m);
-        }
-        entry.temperature = temperature;
-    }
-
-    let mut agent = Agent::from_config(&effective_config, agent_alias).await?;
+    let mut agent = Agent::from_config_with_model_overrides(
+        &config,
+        agent_alias,
+        ModelOverrides {
+            provider: provider_override.as_deref(),
+            model: model_override.as_deref(),
+            temperature,
+        },
+    )
+    .await?;
     if explicit_model_selection {
         agent.disable_automatic_model_routing();
     }
@@ -5940,32 +5946,180 @@ mod tests {
         }
     }
 
-    #[test]
-    fn build_session_model_provider_rejects_undotted_ref() {
-        let config = Config::default();
-        let err = match build_session_model_provider(&config, "anthropic", Some("m")) {
-            Ok(_) => panic!("undotted ref must error"),
-            Err(e) => e,
+    fn build_test_agent(
+        initial_provider_name: &str,
+        initial_model_name: &str,
+        switch_config: Option<ProviderSwitchConfig>,
+    ) -> Agent {
+        let provider = Box::new(MockModelProvider {
+            responses: Mutex::new(vec![]),
+        });
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
         };
-        assert!(err.to_string().contains("<type>.<alias>"), "got: {err}");
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, Path::new("/tmp"))
+                .expect("memory creation"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut builder = Agent::builder()
+            .model_provider(provider)
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(Path::new("/tmp").to_path_buf())
+            .model_provider_name(initial_provider_name.to_string())
+            .model_name(initial_model_name.to_string());
+        if let Some(cfg) = switch_config {
+            builder = builder.provider_switch_config(cfg);
+        }
+        builder.build().expect("agent builder")
+    }
+
+    fn generation_config(window: usize, model: &str) -> zeroclaw_config::schema::Config {
+        let mut cfg = zeroclaw_config::schema::Config::default();
+        cfg.providers.models.custom.insert(
+            "large".to_string(),
+            zeroclaw_config::schema::CustomModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    uri: Some("http://127.0.0.1:1/v1".to_string()),
+                    model: Some(model.to_string()),
+                    context_window: Some(window),
+                    ..zeroclaw_config::schema::ModelProviderConfig::default()
+                },
+            },
+        );
+        cfg
+    }
+
+    fn direct_live_generation_config(
+        data_dir: &Path,
+        provider_alias: &str,
+        model: &str,
+        window: usize,
+        history_cap: usize,
+    ) -> zeroclaw_config::schema::Config {
+        let provider_ref = format!("custom.{provider_alias}");
+        let mut cfg = zeroclaw_config::schema::Config {
+            config_path: data_dir.join("config.toml"),
+            data_dir: data_dir.to_path_buf(),
+            memory: zeroclaw_config::schema::MemoryConfig {
+                backend: "none".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cfg.providers.models.custom.insert(
+            provider_alias.to_string(),
+            zeroclaw_config::schema::CustomModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    uri: Some("http://127.0.0.1:1/v1".to_string()),
+                    model: Some(model.to_string()),
+                    context_window: Some(window),
+                    ..Default::default()
+                },
+            },
+        );
+        cfg.risk_profiles.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        cfg.runtime_profiles.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                context_compact_ratio: Some(0.5),
+                max_history_messages: Some(history_cap),
+                ..Default::default()
+            },
+        );
+        cfg.agents.insert(
+            "direct".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: provider_ref.clone().into(),
+                risk_profile: "default".into(),
+                runtime_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        zeroclaw_config::migration::bind_test_route_model(&mut cfg, &provider_ref, model, None);
+        cfg.model_routes = vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "fast".to_string(),
+            model_ref: provider_ref,
+        }];
+        cfg
     }
 
     #[test]
-    fn build_session_model_provider_requires_a_model() {
-        // No configured entry and no override → cannot resolve a model name.
+    fn build_model_requires_a_model() {
+        // An unconfigured reference fails at the canonical registry boundary.
         let config = Config::default();
-        let err = match build_session_model_provider(&config, "anthropic.default", None) {
+        let err = match build_model(&config, "tester", "anthropic.default", None) {
             Ok(_) => panic!("missing model must error"),
             Err(e) => e,
         };
         assert!(
-            err.to_string().contains("no `model` configured"),
+            err.to_string().contains("unknown model reference"),
             "got: {err}"
         );
     }
 
+    #[tokio::test]
+    async fn build_model_dotted_alias_keeps_model_credentials_and_endpoint_together() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{header, method},
+        };
+        let selected = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header("authorization", "Bearer dotted-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "dotted response"}}]
+            })))
+            .expect(1)
+            .mount(&selected)
+            .await;
+        let sibling = MockServer::start().await;
+        let mut config = Config::default();
+        let prefix = config.providers.models.ensure("custom", "edge").unwrap();
+        prefix.api_key = Some("sibling-key".into());
+        prefix.uri = Some(sibling.uri());
+        prefix.model = Some("sibling-model".into());
+        let entry = config.providers.models.ensure("custom", "edge.v2").unwrap();
+        entry.api_key = Some("dotted-key".into());
+        entry.uri = Some(selected.uri());
+        entry.model = Some("dotted-model".into());
+        let runtime = build_model(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "worker",
+            "custom.edge.v2",
+            None,
+        )
+        .unwrap();
+        assert_eq!(runtime.model.provider_name(), "custom.edge.v2");
+        let response = zeroclaw_providers::ProviderDispatch::from_ref(runtime.model.provider())
+            .simple_chat(
+                "hello",
+                runtime.model.model_name(),
+                config
+                    .resolve_model_selection(&runtime.model.identity().provider_ref())
+                    .and_then(|s| s.temperature()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response, "dotted response");
+        assert_eq!(selected.received_requests().await.unwrap().len(), 1);
+        assert!(sibling.received_requests().await.unwrap().is_empty());
+        let body: serde_json::Value =
+            serde_json::from_slice(&selected.received_requests().await.unwrap()[0].body).unwrap();
+        assert_eq!(body["model"], "dotted-model");
+    }
+
     #[test]
-    fn build_session_model_provider_returns_full_canonical_ref() {
+    fn build_model_returns_full_canonical_ref() {
         use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
 
         let mut config = Config::default();
@@ -5980,11 +6134,1142 @@ mod tests {
             },
         );
 
-        let (_provider, provider_ref, model, _route_resolver) =
-            build_session_model_provider(&config, "openai.fast", None).unwrap();
+        let runtime = build_model(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "tester",
+            "openai.fast",
+            None,
+        )
+        .unwrap();
+        assert_eq!(runtime.model.provider_name(), "openai.fast");
+        assert_eq!(runtime.model.model_name(), "gpt-4o-mini");
+    }
 
-        assert_eq!(provider_ref, "openai.fast");
-        assert_eq!(model, "gpt-4o-mini");
+    #[tokio::test]
+    async fn bare_family_inherits_agent_model_key_and_endpoint() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{header, method},
+        };
+        use zeroclaw_config::schema::{AliasedAgentConfig, ModelEntryConfig, WireApi};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header("authorization", "Bearer fixture-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "done"}}]
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let mut config = Config::default();
+        let profile = config.providers.models.ensure("openai", "gw").unwrap();
+        profile.api_key = Some("fixture-key".into());
+        profile.uri = Some(server.uri());
+        profile.model = Some("legacy-id".into());
+        profile.wire_api = Some(WireApi::ChatCompletions);
+        profile.models.insert(
+            "default".into(),
+            ModelEntryConfig {
+                id: Some("nested-id".into()),
+                temperature: Some(0.25),
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "worker".into(),
+            AliasedAgentConfig {
+                model_provider: "openai.gw".into(),
+                ..Default::default()
+            },
+        );
+        for (override_model, expected) in
+            [(None, "nested-id"), (Some("explicit-id"), "explicit-id")]
+        {
+            let runtime = build_model(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                "worker",
+                "openai",
+                override_model,
+            )
+            .unwrap();
+            assert_eq!(runtime.model.provider_name(), "openai");
+            assert_eq!(runtime.model.identity().provider_ref(), "openai");
+            zeroclaw_providers::ProviderDispatch::from_ref(runtime.model.provider())
+                .simple_chat(
+                    "hello",
+                    runtime.model.model_name(),
+                    config
+                        .agent("worker")
+                        .and_then(|agent| config.resolve_model_selection(&agent.model_provider))
+                        .and_then(|s| s.temperature()),
+                )
+                .await
+                .unwrap();
+            let requests = server.received_requests().await.unwrap();
+            let body: serde_json::Value =
+                serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+            assert_eq!(body["model"], expected);
+            assert_eq!(body["temperature"], 0.25);
+        }
+    }
+
+    #[tokio::test]
+    async fn bare_family_turn_capacity_inherits_selection_without_changing_billing() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        use zeroclaw_config::schema::{AliasedAgentConfig, ModelEntryConfig};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                if body["stream"] == true {
+                    ResponseTemplate::new(200).insert_header("content-type", "text/event-stream")
+                        .set_body_string("data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "choices": [{"message": {"content": "done"}}]
+                    }))
+                }
+            }).mount(&server).await;
+        let mut config = Config::default();
+        let profile = config.providers.models.ensure("custom", "gw").unwrap();
+        profile.uri = Some(server.uri());
+        profile.context_window = Some(128_000);
+        profile.models.insert(
+            "selected".into(),
+            ModelEntryConfig {
+                id: Some("selected-id".into()),
+                temperature: Some(0.2),
+                context_window: Some(8_000),
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "worker".into(),
+            AliasedAgentConfig {
+                model_provider: "custom.gw.selected".into(),
+                ..Default::default()
+            },
+        );
+        for override_model in [None, Some("different-id")] {
+            for streamed in [false, true] {
+                let limits_config = config.clone();
+                let mut agent = Agent::builder()
+                    .agent_alias("worker".into())
+                    .model_runtime(
+                        build_model(
+                            &zeroclaw_config::migration::admit_test_input(&config),
+                            "worker",
+                            "custom",
+                            override_model,
+                        )
+                        .unwrap(),
+                    )
+                    .context_limits_resolver(Arc::new(move |provider, model| {
+                        limits_config.resolved_context_limits_for_route("worker", provider, model)
+                    }))
+                    .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                        Vec::new(),
+                    ))
+                    .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+                    .observer(Arc::new(crate::observability::NoopObserver))
+                    .provider_switch_config(ProviderSwitchConfig {
+                        config: Some(Arc::new(zeroclaw_config::migration::admit_test_input(
+                            &config,
+                        ))),
+                        live_config: None,
+                        live: None,
+                    })
+                    .build()
+                    .unwrap();
+                let expected_window = if override_model.is_none() {
+                    8_000
+                } else {
+                    zeroclaw_config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK
+                };
+                assert_eq!(agent.context_limits().model_context_window, expected_window);
+                assert_eq!(agent.attribution_fields().1, "custom");
+                if streamed {
+                    let (tx, _rx) = tokio::sync::mpsc::channel(128);
+                    let outcome = agent
+                        .turn_streamed_with_steering_state("hello", tx, None, None)
+                        .await
+                        .unwrap();
+                    assert_eq!(outcome.response, "done");
+                    assert_eq!(
+                        outcome.final_context_limits.unwrap().model_context_window,
+                        expected_window
+                    );
+                } else {
+                    assert_eq!(agent.turn("hello").await.unwrap(), "done");
+                }
+                assert_eq!(agent.context_limits().model_context_window, expected_window);
+            }
+        }
+        // Capacity follows the canonical selection after a config edit too.
+        config
+            .providers
+            .models
+            .ensure("custom", "gw")
+            .unwrap()
+            .models
+            .get_mut("selected")
+            .unwrap()
+            .context_window = Some(16_000);
+        assert_eq!(
+            config
+                .resolved_context_limits_for_route("worker", "custom", "selected-id")
+                .model_context_window,
+            16_000
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_temperature_follows_hint_fallback_and_explicit_override_on_wire() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{body_partial_json, method},
+        };
+        use zeroclaw_config::schema::{AliasedAgentConfig, ModelRouteConfig};
+        let primary = MockServer::start().await;
+        let target = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("fixture failure"))
+            .mount(&primary)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(serde_json::json!({"stream": true})))
+            .respond_with(ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n",
+                )))
+            .mount(&target).await;
+        Mock::given(method("POST"))
+            .and(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                body["stream"] != true
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "done"}}]
+            })))
+            .mount(&target)
+            .await;
+        let mut config = Config::default();
+        config.reliability.provider_retries = 0;
+        config.providers = toml::from_str(&format!(
+            r#"
+[connections."primary"]
+kind = "custom"
+uri = "{primary_uri}"
+capabilities = ["chat"]
+auth = {{ mode = "api_key", api_key = "primary-fixture-key" }}
+
+[connections."primary".api.chat.options]
+temperature = 0.2
+provider_extra = {{ profile_only = true }}
+chat_template_kwargs = {{ profile_only = true }}
+
+[connections."target"]
+kind = "custom"
+uri = "{target_uri}"
+capabilities = ["chat"]
+auth = {{ mode = "api_key", api_key = "target-fixture-key" }}
+
+[connections."target".api.chat.options]
+temperature = 0.9
+max_tokens = 999
+provider_extra = {{ profile_only = true }}
+chat_template_kwargs = {{ profile_only = true }}
+
+[models."custom.primary"]
+capability = "chat"
+provider = "primary"
+model = "primary-id"
+
+[models."custom.target.default"]
+capability = "chat"
+provider = "target"
+model = "shared-id"
+metadata = {{ context_window = 128000 }}
+options = {{ temperature = 0.4 }}
+
+[models."custom.target.selected"]
+capability = "chat"
+provider = "target"
+model = "shared-id"
+metadata = {{ context_window = 8000, vision = false }}
+options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_only = true }}, chat_template_kwargs = {{ enable_thinking = false }}, native_tools = false }}
+
+[fallback]
+"custom.primary" = ["custom.target.selected"]
+"#,
+            primary_uri = primary.uri(),
+            target_uri = target.uri(),
+        ))
+        .unwrap();
+        config.agents.insert(
+            "worker".into(),
+            AliasedAgentConfig {
+                model_provider: "custom.primary".into(),
+                ..Default::default()
+            },
+        );
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut config,
+            "custom.target.selected",
+            "shared-id",
+            None,
+        );
+        config.model_routes = vec![ModelRouteConfig {
+            hint: "target".into(),
+            model_ref: "custom.target.selected".into(),
+        }];
+        // The explicit value deliberately equals the primary's default. Its
+        // provenance, not numerical equality, determines whether it survives.
+        for override_value in [None, Some(0.2)] {
+            for selector in ["primary-id", "hint:target"] {
+                for streamed in [false, true] {
+                    let rt = build_model(&config, "worker", "custom.primary", None).unwrap();
+                    let limits_config = config.clone();
+                    let mut agent = Agent::builder()
+                        .model_runtime(rt)
+                        .agent_alias("worker".into())
+                        .context_limits_resolver(Arc::new(move |provider, model| {
+                            limits_config
+                                .resolved_context_limits_for_route("worker", provider, model)
+                        }))
+                        .temperature(override_value)
+                        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                            Vec::new(),
+                        ))
+                        .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+                        .observer(Arc::new(crate::observability::NoopObserver))
+                        .provider_switch_config(ProviderSwitchConfig {
+                            config: Some(Arc::new(config.clone())),
+                            live_config: None,
+                            live: None,
+                        })
+                        .build()
+                        .unwrap();
+                    agent.model_name = selector.into();
+                    if streamed {
+                        let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+                        let outcome = agent
+                            .turn_streamed_with_steering_state("hello", tx, None, None)
+                            .await
+                            .unwrap();
+                        assert!(outcome.response.starts_with("done"));
+                        assert_eq!(
+                            outcome.final_context_limits.unwrap().model_context_window,
+                            8_000
+                        );
+                        let mut reported = Vec::new();
+                        while let Ok(event) = rx.try_recv() {
+                            if let TurnEvent::Usage {
+                                model_context_window: Some(window),
+                                ..
+                            } = event
+                            {
+                                reported.push(window);
+                            }
+                        }
+                        assert!(!reported.is_empty());
+                        assert!(reported.iter().all(|window| *window == 8_000));
+                    } else {
+                        assert!(agent.turn("hello").await.unwrap().starts_with("done"));
+                    }
+                    let requests = target.received_requests().await.unwrap();
+                    let request = requests.last().unwrap();
+                    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    assert_eq!(body["model"], "shared-id");
+                    assert_eq!(
+                        body["temperature"],
+                        override_value.unwrap_or(0.8),
+                        "{selector}, streamed={streamed}"
+                    );
+                    assert_eq!(body["max_tokens"], 77);
+                    assert_eq!(body["selected_only"], true);
+                    assert_eq!(
+                        body["chat_template_kwargs"],
+                        serde_json::json!({"enable_thinking": false})
+                    );
+                    assert!(
+                        body.get("profile_only").is_none(),
+                        "JSON fields replace the profile's field as a whole"
+                    );
+                    assert_eq!(
+                        request.headers["authorization"],
+                        "Bearer target-fixture-key"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dedicated_vision_route_resolves_selected_temperature_on_wire() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        use zeroclaw_config::schema::ModelEntryConfig;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                if body["stream"] == true {
+                    ResponseTemplate::new(200).insert_header("content-type", "text/event-stream")
+                        .set_body_string("data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "choices": [{"message": {"content": "done"}}]
+                    }))
+                }
+            })
+            .mount(&server).await;
+        let mut config = Config::default();
+        let text = config.providers.models.ensure("custom", "text").unwrap();
+        text.uri = Some(server.uri());
+        text.model = Some("text-id".into());
+        text.temperature = Some(0.2);
+        text.vision = Some(false);
+        let vision = config.providers.models.ensure("custom", "vision").unwrap();
+        vision.uri = Some(server.uri());
+        vision.temperature = Some(0.7);
+        vision.models.insert(
+            "selected".into(),
+            ModelEntryConfig {
+                id: Some("vision-id".into()),
+                temperature: Some(0.8),
+                ..Default::default()
+            },
+        );
+        config.multimodal.vision_model_provider = Some("custom.vision.selected".into());
+        for override_value in [None, Some(0.2)] {
+            for streamed in [false, true] {
+                let mut agent = Agent::builder()
+                    .model_runtime(
+                        build_model(
+                            &zeroclaw_config::migration::admit_test_input(&config),
+                            "worker",
+                            "custom.text",
+                            None,
+                        )
+                        .unwrap(),
+                    )
+                    .temperature(override_value)
+                    .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                        Vec::new(),
+                    ))
+                    .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+                    .observer(Arc::new(crate::observability::NoopObserver))
+                    .multimodal_config(config.multimodal.clone())
+                    .provider_switch_config(ProviderSwitchConfig {
+                        config: Some(Arc::new(zeroclaw_config::migration::admit_test_input(
+                            &config,
+                        ))),
+                        live_config: None,
+                        live: None,
+                    })
+                    .build()
+                    .unwrap();
+                let message = "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]";
+                if streamed {
+                    let (tx, _rx) = tokio::sync::mpsc::channel(128);
+                    assert_eq!(
+                        agent.turn_streamed(message, tx, None).await.unwrap().0,
+                        "done"
+                    );
+                } else {
+                    assert_eq!(agent.turn(message).await.unwrap(), "done");
+                }
+                let requests = server.received_requests().await.unwrap();
+                let body: serde_json::Value =
+                    serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+                assert_eq!(body["model"], "vision-id");
+                assert_eq!(body["temperature"], override_value.unwrap_or(0.8));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn response_cache_separates_same_id_selections_and_reloaded_tuning_on_wire() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        use zeroclaw_config::schema::ModelEntryConfig;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let mut answer = format!("tokens-{}", body["max_tokens"]);
+                if let Some(effort) = body["reasoning_effort"].as_str() {
+                    answer.push_str(&format!("-{effort}"));
+                }
+                if body["stream"] == true {
+                    let event = serde_json::json!({"choices": [{"delta": {"content": answer}, "finish_reason": "stop"}]});
+                    ResponseTemplate::new(200).insert_header("content-type", "text/event-stream")
+                        .set_body_string(format!("data: {event}\n\ndata: [DONE]\n\n"))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "choices": [{"message": {"content": answer}}]
+                    }))
+                }
+            })
+            .mount(&server).await;
+        let temp = tempfile::tempdir().unwrap();
+        let cache = Arc::new(
+            zeroclaw_memory::response_cache::ResponseCache::new(temp.path(), 60, 100).unwrap(),
+        );
+        let mut config = Config::default();
+        let profile = config.providers.models.ensure("custom", "cache").unwrap();
+        profile.uri = Some(server.uri());
+        profile.reasoning_effort_passthrough = true;
+        for (name, max_tokens) in [("first", 11), ("second", 77)] {
+            profile.models.insert(
+                name.into(),
+                ModelEntryConfig {
+                    id: Some("shared-id".into()),
+                    temperature: Some(0.0),
+                    max_tokens: Some(max_tokens),
+                    ..Default::default()
+                },
+            );
+        }
+        let build = |config: &Config, reference: &str| {
+            Agent::builder()
+                .model_runtime(build_model(config, "worker", reference, None).unwrap())
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    Vec::new(),
+                ))
+                .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+                .observer(Arc::new(crate::observability::NoopObserver))
+                .response_cache(Some(Arc::clone(&cache)))
+                .workspace_dir(temp.path().to_path_buf())
+                .turn_datetime(fixed_response_cache_turn_datetime)
+                .provider_switch_config(ProviderSwitchConfig {
+                    config: Some(Arc::new(zeroclaw_config::migration::admit_test_input(
+                        config,
+                    ))),
+                    live_config: None,
+                    live: None,
+                })
+                .build()
+                .unwrap()
+        };
+        for streamed in [false, true] {
+            let message = format!("same cache request streamed={streamed}");
+            let before = server.received_requests().await.unwrap().len();
+            let mut current_config = config.clone();
+            let mut agent = build(
+                &zeroclaw_config::migration::admit_test_input(&current_config),
+                "custom.cache.first",
+            );
+            for (reference, tokens, reload, effort) in [
+                ("custom.cache.first", 11, false, None),
+                ("custom.cache.second", 77, false, None),
+                ("custom.cache.second", 77, false, None),
+                ("custom.cache.second", 99, true, None),
+                ("custom.cache.second", 99, false, None),
+                ("custom.cache.second", 99, false, Some("high")),
+                ("custom.cache.second", 99, false, Some("high")),
+            ] {
+                if reload {
+                    current_config
+                        .providers
+                        .models
+                        .ensure("custom", "cache")
+                        .unwrap()
+                        .models
+                        .get_mut("second")
+                        .unwrap()
+                        .max_tokens = Some(tokens);
+                }
+                current_config.runtime.reasoning_effort = effort.map(str::to_string);
+                agent.install_model_runtime(
+                    build_model(
+                        &zeroclaw_config::migration::admit_test_input(&current_config),
+                        "worker",
+                        reference,
+                        None,
+                    )
+                    .unwrap(),
+                );
+                agent.set_config_generation(Arc::new(
+                    zeroclaw_config::migration::admit_test_input(&current_config),
+                ));
+                agent.history.clear();
+                let answer = if streamed {
+                    let (tx, _rx) = tokio::sync::mpsc::channel(128);
+                    agent.turn_streamed(&message, tx, None).await.unwrap().0
+                } else {
+                    agent.turn(&message).await.unwrap()
+                };
+                let expected = effort.map_or_else(
+                    || format!("tokens-{tokens}"),
+                    |value| format!("tokens-{tokens}-{value}"),
+                );
+                assert_eq!(answer, expected);
+            }
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(
+                requests.len() - before,
+                4,
+                "unchanged selections must still reuse the cache"
+            );
+            let tokens: Vec<_> = requests[before..]
+                .iter()
+                .map(|request| {
+                    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    body["max_tokens"].as_u64().unwrap()
+                })
+                .collect();
+            assert_eq!(tokens, [11, 77, 99, 99]);
+            let final_body: serde_json::Value =
+                serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+            assert_eq!(final_body["reasoning_effort"], "high");
+        }
+    }
+
+    #[tokio::test]
+    async fn profiles_sharing_endpoint_keep_their_system_message_policy_on_wire() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "done"}}]
+            })))
+            .mount(&server)
+            .await;
+        let mut config = Config::default();
+        for (alias, merge) in [("plain", false), ("merged", true)] {
+            let profile = config.providers.models.ensure("custom", alias).unwrap();
+            profile.uri = Some(server.uri());
+            profile.model = Some("fixture-model".into());
+            profile.merge_system_into_user = merge;
+        }
+        for (alias, merge) in [("plain", false), ("merged", true)] {
+            let rt = build_model(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                "worker",
+                &format!("custom.{alias}"),
+                None,
+            )
+            .unwrap();
+            zeroclaw_providers::ProviderDispatch::from_ref(rt.model.provider())
+                .chat_with_system(Some("fixture system"), "hello", rt.model.model_name(), None)
+                .await
+                .unwrap();
+            let requests = server.received_requests().await.unwrap();
+            let body: serde_json::Value =
+                serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+            assert_eq!(
+                body["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|message| message["role"] == "system"),
+                !merge
+            );
+            assert!(body.to_string().contains("fixture system"));
+        }
+    }
+
+    #[tokio::test]
+    async fn model_install_preserves_override_and_unset_temperature_inherits_profile_on_wire() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        use zeroclaw_config::schema::ModelEntryConfig;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "done"}}]
+            })))
+            .mount(&server)
+            .await;
+        let mut config = Config::default();
+        let profile = config.providers.models.ensure("custom", "gw").unwrap();
+        profile.uri = Some(server.uri());
+        profile.temperature = Some(0.9);
+        profile.models = HashMap::from([
+            (
+                "first".into(),
+                ModelEntryConfig {
+                    id: Some("first-id".into()),
+                    temperature: Some(0.2),
+                    ..Default::default()
+                },
+            ),
+            (
+                "second".into(),
+                ModelEntryConfig {
+                    id: Some("second-id".into()),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        for override_value in [None, Some(0.42)] {
+            let rt = build_model(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                "worker",
+                "custom.gw.first",
+                None,
+            )
+            .unwrap();
+            let mut agent = Agent::builder()
+                .model_runtime(rt)
+                .temperature(override_value)
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    Vec::new(),
+                ))
+                .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+                .observer(Arc::new(crate::observability::NoopObserver))
+                .provider_switch_config(ProviderSwitchConfig {
+                    config: Some(Arc::new(zeroclaw_config::migration::admit_test_input(
+                        &config,
+                    ))),
+                    live_config: None,
+                    live: None,
+                })
+                .build()
+                .unwrap();
+            agent.turn("hello").await.unwrap();
+            agent.install_model_runtime(
+                build_model(
+                    &zeroclaw_config::migration::admit_test_input(&config),
+                    "worker",
+                    "custom.gw.second",
+                    None,
+                )
+                .unwrap(),
+            );
+            agent.turn("hello again").await.unwrap();
+            let requests = server.received_requests().await.unwrap();
+            let bodies: Vec<serde_json::Value> = requests
+                .iter()
+                .rev()
+                .take(2)
+                .map(|request| serde_json::from_slice(&request.body).unwrap())
+                .collect();
+            assert_eq!(bodies[1]["temperature"], override_value.unwrap_or(0.2));
+            assert_eq!(bodies[0]["temperature"], override_value.unwrap_or(0.9));
+            assert_eq!(bodies[0]["model"], "second-id");
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_same_id_capacity_survives_real_turn_and_default_route() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        use zeroclaw_config::schema::{AliasedAgentConfig, ModelEntryConfig, ModelRouteConfig};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":1,\"total_tokens\":5}}\n\n",
+                    "data: [DONE]\n\n",
+                )))
+            .mount(&server)
+            .await;
+        let mut config = Config::default();
+        let profile = config.providers.models.ensure("custom", "gw").unwrap();
+        profile.uri = Some(server.uri());
+        profile.models = HashMap::from([
+            (
+                "default".into(),
+                ModelEntryConfig {
+                    id: Some("shared-id".into()),
+                    context_window: Some(128_000),
+                    ..Default::default()
+                },
+            ),
+            (
+                "small".into(),
+                ModelEntryConfig {
+                    id: Some("shared-id".into()),
+                    context_window: Some(8_000),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        config.agents.insert(
+            "worker".into(),
+            AliasedAgentConfig {
+                model_provider: "custom.gw.small".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            config.configured_model_context_window("worker"),
+            Some(8_000)
+        );
+        // Exercise the no-router reliable primary and the routed path, including
+        // a hint back to the default entry with the identical provider-local ID.
+        for routed in [false, true] {
+            zeroclaw_config::migration::bind_test_route_model(
+                &mut config,
+                "custom.gw",
+                "shared-id",
+                None,
+            );
+            config.model_routes = if routed {
+                vec![ModelRouteConfig {
+                    hint: "large".into(),
+                    model_ref: "custom.gw".into(),
+                }]
+            } else {
+                Vec::new()
+            };
+            let rt = build_model(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                "worker",
+                "custom.gw.small",
+                None,
+            )
+            .unwrap();
+            let limits_config = config.clone();
+            let mut agent = Agent::builder()
+                .model_runtime(rt)
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    Vec::new(),
+                ))
+                .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+                .observer(Arc::new(crate::observability::NoopObserver))
+                .context_limits_resolver(Arc::new(move |provider, model| {
+                    limits_config.resolved_context_limits_for_route("worker", provider, model)
+                }))
+                .provider_switch_config(ProviderSwitchConfig {
+                    config: Some(Arc::new(zeroclaw_config::migration::admit_test_input(
+                        &config,
+                    ))),
+                    live_config: None,
+                    live: None,
+                })
+                .build()
+                .unwrap();
+            assert_eq!(agent.context_limits().model_context_window, 8_000);
+            for (model, expected_window) in if routed {
+                vec![("shared-id", 8_000), ("hint:large", 128_000)]
+            } else {
+                vec![("shared-id", 8_000)]
+            } {
+                agent.model_name = model.into();
+                let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+                let outcome = agent
+                    .turn_streamed_with_steering_state("hello", tx, None, None)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    outcome.final_context_limits.unwrap().model_context_window,
+                    expected_window
+                );
+                let mut reported = Vec::new();
+                while let Ok(event) = rx.try_recv() {
+                    if let TurnEvent::Usage {
+                        model_context_window: Some(window),
+                        ..
+                    } = event
+                    {
+                        reported.push(window);
+                    }
+                }
+                assert!(!reported.is_empty());
+                assert!(
+                    reported
+                        .iter()
+                        .all(|window| *window == expected_window as u64),
+                    "{reported:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn build_model_resolves_derived_values_from_the_selected_entry() {
+        use zeroclaw_config::schema::{
+            ModelEntryConfig, ModelProviderConfig, OpenAIModelProviderConfig,
+        };
+
+        // The profile carries one temperature/window; the entries carry
+        // their own. What the runtime derives must follow the selected
+        // entry, not the profile defaults.
+        let mut config = Config::default();
+        let mut entries = HashMap::new();
+        entries.insert(
+            "default".to_string(),
+            ModelEntryConfig {
+                id: Some("gpt-4o".to_string()),
+                ..Default::default()
+            },
+        );
+        entries.insert(
+            "cheap".to_string(),
+            ModelEntryConfig {
+                id: Some("gpt-4o-mini".to_string()),
+                temperature: Some(0.2),
+                context_window: Some(8_000),
+                ..Default::default()
+            },
+        );
+        config.providers.models.openai.insert(
+            "gw".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some("https://gw.internal/v1".to_string()),
+                    api_key: Some("test-key".to_string()),
+                    temperature: Some(0.9),
+                    context_window: Some(100_000),
+                    models: entries,
+                    ..Default::default()
+                },
+            },
+        );
+
+        // Three-segment ref: the selected entry's tuning wins.
+        let rt = build_model(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "tester",
+            "openai.gw.cheap",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            config
+                .resolve_model_selection(&rt.model.identity().provider_ref())
+                .and_then(|s| s.temperature()),
+            Some(0.2),
+            "entry temperature beats profile"
+        );
+        assert_eq!(
+            config.effective_model_context_window_for_route(
+                &rt.model.identity().provider_ref(),
+                rt.model.model_name()
+            ),
+            8_000,
+            "entry context window beats profile"
+        );
+
+        // Two-segment ref: the profile's values (default entry sets none).
+        let rt = build_model(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "tester",
+            "openai.gw",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            config
+                .resolve_model_selection(&rt.model.identity().provider_ref())
+                .and_then(|s| s.temperature()),
+            Some(0.9)
+        );
+        assert_eq!(
+            config.effective_model_context_window_for_route(
+                &rt.model.identity().provider_ref(),
+                rt.model.model_name()
+            ),
+            100_000
+        );
+
+        // Unconfigured window falls back to the shared stub.
+        let mut bare = Config::default();
+        bare.providers.models.openai.insert(
+            "minimal".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("m".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        let rt = build_model(
+            &zeroclaw_config::migration::admit_test_input(&bare),
+            "tester",
+            "openai.minimal",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            bare.effective_model_context_window_for_route(
+                &rt.model.identity().provider_ref(),
+                rt.model.model_name()
+            ),
+            zeroclaw_config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK
+        );
+    }
+
+    #[test]
+    fn build_model_keeps_selected_entry_tuning_over_default_entry() {
+        use zeroclaw_config::schema::{
+            ModelEntryConfig, ModelProviderConfig, OpenAIModelProviderConfig,
+        };
+
+        // `default` carries a tuning field; a three-segment ref selecting
+        // `cheap` must not have that field clobbered by the default entry.
+        // Before build_model passed the raw ref through, the providers chain
+        // re-resolved the normalised two-segment name, picked `models.default`,
+        // and overlaid ITS tuning on top of the selected entry's.
+        let mut config = Config::default();
+        let mut entries = HashMap::new();
+        entries.insert(
+            "default".to_string(),
+            ModelEntryConfig {
+                id: Some("gpt-4o".to_string()),
+                vision: Some(false),
+                ..Default::default()
+            },
+        );
+        entries.insert(
+            "cheap".to_string(),
+            ModelEntryConfig {
+                id: Some("gpt-4o-mini".to_string()),
+                vision: Some(true),
+                ..Default::default()
+            },
+        );
+        config.providers.models.openai.insert(
+            "gw".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some("https://gw.internal/v1".to_string()),
+                    api_key: Some("test-key".to_string()),
+                    models: entries,
+                    ..Default::default()
+                },
+            },
+        );
+
+        let rt = build_model(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "tester",
+            "openai.gw.cheap",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(rt.model.provider_name(), "openai.gw.cheap");
+        assert_eq!(rt.model.model_name(), "gpt-4o-mini");
+        assert!(
+            rt.model
+                .provider()
+                .capabilities_for_model(rt.model.model_name())
+                .vision,
+            "the selected entry's vision tuning must survive construction; a clobber by \
+             `models.default` (vision=false) means the raw ref did not reach the providers chain"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_model_switch_uses_only_target_profile_endpoint_and_credentials() {
+        use wiremock::{Mock, MockServer, matchers::method};
+        use zeroclaw_config::schema::{AliasedAgentConfig, ModelEntryConfig};
+
+        let source = MockServer::start().await;
+        let target = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {"content": "from target"}}]
+                })),
+            )
+            .expect(2)
+            .mount(&target)
+            .await;
+
+        let mut config = Config::default();
+        {
+            let source_entry = config
+                .providers
+                .models
+                .ensure("custom", "source")
+                .expect("custom source profile");
+            source_entry.uri = Some(source.uri());
+            source_entry.api_key = Some("source-secret".into());
+            source_entry.model = Some("source-model".into());
+        }
+        {
+            let target_entry = config
+                .providers
+                .models
+                .ensure("custom", "target")
+                .expect("custom target profile");
+            target_entry.uri = Some(target.uri());
+            target_entry.api_key = Some("target-secret".into());
+            target_entry.models.insert(
+                "cheap".into(),
+                ModelEntryConfig {
+                    id: Some("target-model".into()),
+                    max_tokens: Some(123),
+                    ..Default::default()
+                },
+            );
+        }
+        config.agents.insert(
+            "tester".into(),
+            AliasedAgentConfig {
+                model_provider: "custom.source".into(),
+                ..Default::default()
+            },
+        );
+
+        let rt = build_model(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "tester",
+            "custom.target.cheap",
+            None,
+        )
+        .expect("target profile builds");
+        let response = zeroclaw_providers::ProviderDispatch::from_ref(rt.model.provider())
+            .simple_chat(
+                "hello",
+                rt.model.model_name(),
+                config
+                    .resolve_model_selection(&rt.model.identity().provider_ref())
+                    .and_then(|s| s.temperature()),
+            )
+            .await
+            .expect("target profile responds");
+        assert_eq!(response, "from target");
+
+        config
+            .providers
+            .models
+            .ensure("custom", "target")
+            .expect("custom target profile")
+            .api_key = None;
+        let keyless_rt = build_model(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "tester",
+            "custom.target.cheap",
+            None,
+        )
+        .expect("keyless target profile builds");
+        zeroclaw_providers::ProviderDispatch::from_ref(keyless_rt.model.provider())
+            .simple_chat(
+                "hello again",
+                keyless_rt.model.model_name(),
+                config
+                    .resolve_model_selection(&keyless_rt.model.identity().provider_ref())
+                    .and_then(|s| s.temperature()),
+            )
+            .await
+            .expect("keyless target profile responds");
+
+        assert!(source.received_requests().await.unwrap().is_empty());
+        let requests = target.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let first_auth = requests[0]
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok());
+        assert_eq!(first_auth, Some("Bearer target-secret"));
+        let second_auth = requests[1]
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok());
+        assert_ne!(second_auth, Some("Bearer source-secret"));
+        for request in requests {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["model"], "target-model");
+            assert_eq!(body["max_tokens"], 123);
+        }
     }
 
     /// Regression: trim write-back must never persist the provider-only
@@ -6460,7 +7745,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -6475,6 +7760,31 @@ mod tests {
             .workspace_dir(std::path::PathBuf::from("/tmp"))
             .build()
             .expect("agent builder should succeed with valid config")
+    }
+
+    #[tokio::test]
+    async fn injected_agent_preserves_reasoning_syntax_without_a_model_policy() {
+        for streamed in [false, true] {
+            let text = "<think>literal content</think>";
+            let mut agent = blank_input_agent(Box::new(MockModelProvider {
+                responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                    text: Some(text.into()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                }]),
+            }));
+            let result = if streamed {
+                let (tx, _rx) = tokio::sync::mpsc::channel(16);
+                agent
+                    .turn_streamed("return literal syntax", tx, None)
+                    .await
+                    .map(|(text, _)| text)
+            } else {
+                agent.turn("return literal syntax").await
+            };
+            assert_eq!(result.unwrap(), text, "streamed={streamed}");
+        }
     }
 
     #[tokio::test]
@@ -6758,31 +8068,27 @@ mod tests {
         skills: &[crate::skills::Skill],
     ) -> crate::tools::scoped::ScopedToolRegistry {
         let config = Config::default();
-        let built = crate::tools::all_tools_with_runtime_context(
-            Arc::new(config.clone()),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "default",
-            Arc::new(crate::platform::NativeRuntime::new()),
-            memory,
-            None,
-            None,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &security.workspace_dir,
-            &config.agents,
-            None,
-            &config,
-            None,
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        let built = {
+            let registry_config = Arc::new(config.clone());
+            let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
+                Arc::new(crate::platform::NativeRuntime::new());
+            let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = memory;
+            let registry_request = crate::composition::ToolRequest {
+                config: &registry_config,
+                agent_alias: "default",
+                security: &security,
+                runtime: &registry_runtime,
+                memory: &registry_memory,
+            };
+            let registry_inputs = crate::composition::NativeRecipeInputs::new(
+                &registry_request,
+                &security.workspace_dir,
+            );
+            crate::tools::build_native_registry(
+                registry_inputs,
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )
+        }
         .unwrap();
         crate::tools::scoped::ScopedToolRegistry::assemble(crate::tools::scoped::ScopedAssembly {
             config: &config,
@@ -6995,7 +8301,7 @@ mod tests {
             "session".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig::default(),
         );
-        let memory = zeroclaw_memory::create_memory_for_agent(&config, "session", None)
+        let memory = zeroclaw_memory::create_memory_for_agent(&config, "session")
             .await
             .expect("per-agent memory stack");
 
@@ -7084,31 +8390,27 @@ mod tests {
         workspace: &std::path::Path,
     ) -> Agent {
         let config = Config::default();
-        let built = crate::tools::all_tools_with_runtime_context(
-            Arc::new(config.clone()),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "default",
-            Arc::new(crate::platform::NativeRuntime::new()),
-            Arc::clone(&shared),
-            None,
-            None,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &security.workspace_dir,
-            &config.agents,
-            None,
-            &config,
-            None,
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        let built = {
+            let registry_config = Arc::new(config.clone());
+            let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
+                Arc::new(crate::platform::NativeRuntime::new());
+            let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = Arc::clone(&shared);
+            let registry_request = crate::composition::ToolRequest {
+                config: &registry_config,
+                agent_alias: "default",
+                security: &security,
+                runtime: &registry_runtime,
+                memory: &registry_memory,
+            };
+            let registry_inputs = crate::composition::NativeRecipeInputs::new(
+                &registry_request,
+                &security.workspace_dir,
+            );
+            crate::tools::build_native_registry(
+                registry_inputs,
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )
+        }
         .unwrap();
         let registry = crate::tools::scoped::ScopedToolRegistry::assemble(
             crate::tools::scoped::ScopedAssembly {
@@ -7276,25 +8578,44 @@ mod tests {
         memory: Arc<dyn Memory>,
         security: &Arc<crate::security::SecurityPolicy>,
     ) -> crate::tools::scoped::ScopedToolRegistry {
-        let built = crate::tools::all_tools(
-            Arc::new(config.clone()),
-            security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "alpha",
-            memory,
-            None,
-            None,
-            &zeroclaw_config::schema::BrowserConfig::default(),
-            &zeroclaw_config::schema::HttpRequestConfig::default(),
-            &zeroclaw_config::schema::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            config,
-            None,
-            false,
-            None,
-        )
+        let built = {
+            let registry_config = Arc::new(config.clone());
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.browser = zeroclaw_config::schema::BrowserConfig::default();
+                fixture.http_request = zeroclaw_config::schema::HttpRequestConfig::default();
+                fixture.web_fetch = zeroclaw_config::schema::WebFetchConfig::default();
+                fixture.agents = HashMap::new();
+                std::sync::Arc::new(fixture)
+            };
+            (|| -> anyhow::Result<_> {
+                let registry_environment: Option<crate::tools::ForwardedEnvironment> = None;
+                let registry_path = registry_environment
+                    .as_ref()
+                    .and_then(|env| env.get("PATH"))
+                    .map(std::ffi::OsStr::new);
+                let registry_runtime: std::sync::Arc<
+                    dyn zeroclaw_config::platform::RuntimeAdapter,
+                > = std::sync::Arc::from(zeroclaw_config::platform::create_runtime_with_path(
+                    &registry_config.runtime,
+                    registry_path,
+                )?);
+                let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = memory;
+                let registry_request = crate::composition::ToolRequest {
+                    config: &registry_config,
+                    agent_alias: "alpha",
+                    security,
+                    runtime: &registry_runtime,
+                    memory: &registry_memory,
+                };
+                let registry_inputs =
+                    crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+                crate::tools::build_native_registry(
+                    registry_inputs,
+                    &zeroclaw_config::schema::RiskProfileConfig::default(),
+                )
+            })()
+        }
         .expect("the tool factory builds");
         crate::tools::scoped::ScopedToolRegistry::assemble(crate::tools::scoped::ScopedAssembly {
             config,
@@ -7789,29 +9110,35 @@ mod tests {
         let shared_audit =
             with_audit.then(|| Arc::new(crate::sop::SopAuditLogger::new(Arc::clone(&shared))));
         let security = Arc::new(crate::security::SecurityPolicy::default());
-        let built = crate::tools::all_tools_with_runtime(
-            Arc::new(config.clone()),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "alpha",
-            Arc::new(crate::platform::NativeRuntime::new()),
-            Arc::clone(&shared),
-            None,
-            None,
-            &zeroclaw_config::schema::BrowserConfig::default(),
-            &zeroclaw_config::schema::HttpRequestConfig::default(),
-            &zeroclaw_config::schema::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &config,
-            None,
-            false,
-            None,
-            Some(Arc::clone(&engine)),
-            shared_audit,
-            None,
-        )
+        let built = {
+            let registry_config = Arc::new(config.clone());
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.browser = zeroclaw_config::schema::BrowserConfig::default();
+                fixture.http_request = zeroclaw_config::schema::HttpRequestConfig::default();
+                fixture.web_fetch = zeroclaw_config::schema::WebFetchConfig::default();
+                fixture.agents = HashMap::new();
+                std::sync::Arc::new(fixture)
+            };
+            let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
+                Arc::new(crate::platform::NativeRuntime::new());
+            let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = Arc::clone(&shared);
+            let registry_request = crate::composition::ToolRequest {
+                config: &registry_config,
+                agent_alias: "alpha",
+                security: &security,
+                runtime: &registry_runtime,
+                memory: &registry_memory,
+            };
+            let mut registry_inputs =
+                crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+            registry_inputs.sop_engine = Some(Arc::clone(&engine));
+            registry_inputs.sop_audit = shared_audit;
+            crate::tools::build_native_registry(
+                registry_inputs,
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )
+        }
         .expect("the tool factory builds");
         let registry = crate::tools::scoped::ScopedToolRegistry::assemble(
             crate::tools::scoped::ScopedAssembly {
@@ -9361,7 +10688,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let memory: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("test memory must initialize"),
         );
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -9501,7 +10828,6 @@ mod tests {
                         ..Default::default()
                     },
                     std::path::Path::new("/tmp"),
-                    None,
                 )
                 .expect("test memory must initialize"),
             ))
@@ -9700,6 +11026,12 @@ mod tests {
                 ..Default::default()
             },
         );
+        for (reference, model) in [
+            ("custom.local", "local-model"),
+            ("custom.cloud", "cloud-model"),
+        ] {
+            zeroclaw_config::migration::bind_test_route_model(&mut config, reference, model, None);
+        }
         let agent_config = config
             .resolved_agent_config("effort-agent")
             .expect("effort agent must resolve");
@@ -9709,8 +11041,8 @@ mod tests {
                 (
                     route.hint.clone(),
                     zeroclaw_providers::router::Route {
-                        provider_name: route.model_provider.clone(),
-                        model: route.model.clone(),
+                        provider_name: route.model_ref.clone(),
+                        model: route.effective_model(&config),
                     },
                 )
             })
@@ -9725,7 +11057,7 @@ mod tests {
             ..Default::default()
         };
         let memory: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed"),
         );
         let config = Arc::new(config);
@@ -9756,15 +11088,11 @@ mod tests {
         vec![
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "local".into(),
-                model_provider: "custom.local".into(),
-                model: "local-model".into(),
-                api_key: None,
+                model_ref: "custom.local".into(),
             },
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "cloud".into(),
-                model_provider: "custom.cloud".into(),
-                model: "cloud-model".into(),
-                api_key: None,
+                model_ref: "custom.cloud".into(),
             },
         ]
     }
@@ -10697,15 +12025,28 @@ mod tests {
         agent.model_provider_name = "custom.rounds".into();
         agent.model_name = "round-model".into();
         // The blank builder's resolver still points at its unconfigured provider.
-        agent.set_model_route_resolver(Arc::new(
-            zeroclaw_providers::router::ModelRouteResolver::new(
-                vec![],
-                agent.model_provider_name.clone(),
-                agent.model_name.clone(),
-            ),
+        agent.model_route_resolver = Arc::new(zeroclaw_providers::router::ModelRouteResolver::new(
+            vec![],
+            agent.model_provider_name.clone(),
+            agent.model_name.clone(),
         ));
         agent.config.resolved.max_tool_iterations = 3;
-        let mut config = Config::default();
+        let mut config = Config {
+            providers: toml::from_str(
+                r#"
+[connections.rounds]
+kind = "custom"
+capabilities = ["chat"]
+[models."custom.rounds"]
+capability = "chat"
+provider = "rounds"
+model = "round-model"
+options = { extract_text_tool_calls = true }
+"#,
+            )
+            .unwrap(),
+            ..Default::default()
+        };
         config.agents.insert(
             "round-agent".into(),
             zeroclaw_config::schema::AliasedAgentConfig {
@@ -11136,7 +12477,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -11858,7 +13199,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -11879,70 +13220,6 @@ mod tests {
         assert_eq!(response, "hello");
     }
 
-    #[tokio::test]
-    async fn direct_agent_strict_tool_parsing_ignores_xml_dispatcher_calls() {
-        let provider = Box::new(MockModelProvider {
-            responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
-                text: Some(
-                    r#"<tool_call>{"name":"echo","arguments":{"value":"ignored"}}</tool_call>"#
-                        .into(),
-                ),
-                tool_calls: vec![],
-                usage: None,
-                reasoning_content: None,
-            }]),
-        });
-
-        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
-            backend: "none".into(),
-            ..zeroclaw_config::schema::MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
-                .expect("memory creation should succeed with valid config"),
-        );
-        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let calls = Arc::new(AtomicUsize::new(0));
-        let agent_config = zeroclaw_config::schema::AliasedAgentConfig {
-            resolved: zeroclaw_config::schema::ResolvedRuntime {
-                strict_tool_parsing: true,
-                ..Default::default()
-            },
-            ..zeroclaw_config::schema::AliasedAgentConfig::default()
-        };
-        let mut agent = Agent::builder()
-            .model_provider(provider)
-            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
-                vec![Box::new(CountingTool {
-                    calls: Arc::clone(&calls),
-                })],
-            ))
-            .memory(mem)
-            .observer(observer)
-            .tool_dispatcher(Box::new(XmlToolDispatcher))
-            .config(agent_config)
-            .workspace_dir(std::path::PathBuf::from("/tmp"))
-            .build()
-            .expect("agent builder should succeed with valid config");
-
-        let system_prompt = agent
-            .build_system_prompt()
-            .expect("system prompt should render");
-        assert!(
-            !system_prompt.contains("## Tools"),
-            "strict parsing should not advertise text tool instructions"
-        );
-        assert!(
-            !system_prompt.contains("<tool_call"),
-            "strict parsing should not advertise XML tool calls"
-        );
-
-        let response = agent.turn("hi").await.unwrap();
-
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-        assert!(response.contains("<tool_call>"));
-    }
-
     #[test]
     fn native_agent_prompt_omits_duplicate_tools_section() {
         let memory_cfg = zeroclaw_config::schema::MemoryConfig {
@@ -11951,7 +13228,7 @@ mod tests {
         };
         let workspace = tempfile::TempDir::new().expect("temp dir");
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+            zeroclaw_memory::create_memory(&memory_cfg, workspace.path())
                 .expect("memory creation should succeed with valid config"),
         );
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -12000,7 +13277,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+            zeroclaw_memory::create_memory(&memory_cfg, workspace.path())
                 .expect("memory creation should succeed"),
         );
         let risk_profile = zeroclaw_config::schema::RiskProfileConfig {
@@ -12513,7 +13790,7 @@ mod tests {
             };
             let workspace = tempfile::TempDir::new().expect("temp dir");
             let mem: Arc<dyn Memory> = Arc::from(
-                zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+                zeroclaw_memory::create_memory(&memory_cfg, workspace.path())
                     .expect("memory creation should succeed"),
             );
             let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -12554,7 +13831,7 @@ mod tests {
                 ..zeroclaw_config::schema::MemoryConfig::default()
             };
             let mem: Arc<dyn Memory> = Arc::from(
-                zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+                zeroclaw_memory::create_memory(&memory_cfg, workspace.path())
                     .expect("memory creation should succeed"),
             );
             let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -12712,7 +13989,7 @@ mod tests {
                 ..zeroclaw_config::schema::MemoryConfig::default()
             };
             let mem: Arc<dyn Memory> = Arc::from(
-                zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+                zeroclaw_memory::create_memory(&memory_cfg, workspace.path())
                     .expect("memory creation should succeed"),
             );
             let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -12755,7 +14032,7 @@ mod tests {
                 ..zeroclaw_config::schema::MemoryConfig::default()
             };
             let mem: Arc<dyn Memory> = Arc::from(
-                zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+                zeroclaw_memory::create_memory(&memory_cfg, workspace.path())
                     .expect("memory creation should succeed"),
             );
             let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -12853,18 +14130,12 @@ mod tests {
                 ..zeroclaw_config::schema::MemoryConfig::default()
             };
             let mem: Arc<dyn Memory> = Arc::from(
-                zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+                zeroclaw_memory::create_memory(&memory_cfg, workspace.path())
                     .expect("memory creation should succeed"),
             );
             let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
             let (provider, _) = capturing_provider(false);
-            let config = zeroclaw_config::schema::AliasedAgentConfig {
-                resolved: zeroclaw_config::schema::ResolvedRuntime {
-                    strict_tool_parsing: true,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
+            let config = zeroclaw_config::schema::AliasedAgentConfig::default();
             let skills = vec![crate::skills::Skill {
                 name: "deploy".into(),
                 description: "Release safely".into(),
@@ -13083,7 +14354,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -13133,7 +14404,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -13384,9 +14655,7 @@ mod tests {
 
         let routes = vec![zeroclaw_config::schema::ModelRouteConfig {
             hint: "local".into(),
-            model_provider: "custom.local".into(),
-            model: "local-model".into(),
-            api_key: None,
+            model_ref: "custom.local".into(),
         }];
         let (mut agent, observations) =
             effort_routing_test_agent(CloudEscalationPolicy::Auto, routes);
@@ -13451,7 +14720,7 @@ mod tests {
         };
         let workspace = tempfile::tempdir().expect("temp workspace");
         let memory: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+            zeroclaw_memory::create_memory(&memory_cfg, workspace.path())
                 .expect("memory creation should succeed"),
         );
         let mut hooks = crate::hooks::HookRunner::new();
@@ -13601,9 +14870,12 @@ mod tests {
         };
         config.agents.insert("test-agent".to_string(), agent_cfg);
 
-        let mut agent = Agent::from_config(&config, "test-agent")
-            .await
-            .expect("agent from config");
+        let mut agent = Agent::from_config(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "test-agent",
+        )
+        .await
+        .expect("agent from config");
         let response = agent.turn("hello").await.expect("agent turn");
 
         assert_eq!(response, "hello from mock");
@@ -13623,6 +14895,158 @@ mod tests {
         );
 
         server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn from_config_model_override_builds_without_a_default_model() {
+        use zeroclaw_config::schema::{AliasedAgentConfig, RiskProfileConfig};
+        let workspace = tempfile::TempDir::new().unwrap();
+        let mut config = Config {
+            config_path: workspace.path().join("config.toml"),
+            data_dir: workspace.path().join("data"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".into();
+        let profile = config.providers.models.ensure("openai", "chosen").unwrap();
+        profile.api_key = Some("test-key".into());
+        profile.temperature = Some(0.3);
+        config
+            .risk_profiles
+            .insert("test".into(), RiskProfileConfig::default());
+        config.agents.insert(
+            "worker".into(),
+            AliasedAgentConfig {
+                model_provider: "openai.chosen".into(),
+                risk_profile: "test".into(),
+                ..Default::default()
+            },
+        );
+        let agent = Agent::from_config_with_model_overrides(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "worker",
+            ModelOverrides {
+                model: Some("explicit-model"),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the explicit model must be used by the initial construction");
+        assert_eq!(agent.attribution_fields().2, "explicit-model");
+        assert_eq!(agent.effective_temperature(), Some(0.3));
+        assert!(
+            zeroclaw_config::migration::admit_test_input(&config)
+                .resolve_model_id("openai.chosen")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn registered_model_tools_follow_installed_config_generation() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        use zeroclaw_config::schema::{AliasedAgentConfig, ModelEntryConfig, RiskProfileConfig};
+        let workspace = tempfile::TempDir::new().unwrap();
+        let old_endpoint = MockServer::start().await;
+        let new_endpoint = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "updated"}}]
+            })))
+            .expect(1)
+            .mount(&new_endpoint)
+            .await;
+        let mut config = Config {
+            config_path: workspace.path().join("config.toml"),
+            data_dir: workspace.path().join("data"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".into();
+        let profile = config.providers.models.ensure("custom", "gateway").unwrap();
+        profile.api_key = Some("test-key".into());
+        profile.uri = Some(old_endpoint.uri());
+        profile.models.insert(
+            "original".into(),
+            ModelEntryConfig {
+                id: Some("old-model".into()),
+                ..Default::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("test".into(), RiskProfileConfig::default());
+        config.agents.insert(
+            "worker".into(),
+            AliasedAgentConfig {
+                model_provider: "custom.gateway.original".into(),
+                risk_profile: "test".into(),
+                ..Default::default()
+            },
+        );
+        let mut agent = Agent::from_config(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "worker",
+        )
+        .await
+        .unwrap();
+        let profile = config.providers.models.ensure("custom", "gateway").unwrap();
+        profile.models.remove("original");
+        profile.models.insert(
+            "renamed".into(),
+            ModelEntryConfig {
+                id: Some("updated-model".into()),
+                temperature: Some(0.8),
+                ..Default::default()
+            },
+        );
+        profile.uri = Some(new_endpoint.uri());
+        config.agents.get_mut("worker").unwrap().model_provider = "custom.gateway.renamed".into();
+        agent.install_model_update(
+            PreparedModelUpdate::build(
+                Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
+                "worker",
+                "custom.gateway.renamed",
+                None,
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+
+        let pending = Arc::new(std::sync::Mutex::new(None));
+        let switch_tool = agent
+            .tools
+            .iter()
+            .find(|tool| tool.name() == "model_switch")
+            .unwrap();
+        let switched = crate::agent::turn::scope_model_switch_state(
+            Arc::clone(&pending),
+            switch_tool.execute(serde_json::json!({
+                "action": "set",
+                "model_provider": "custom.gateway.renamed",
+                "model": "updated-model"
+            })),
+        )
+        .await
+        .unwrap();
+        assert!(switched.success, "{:?}", switched.error);
+        assert_eq!(
+            pending.lock().unwrap().as_ref(),
+            Some(&("custom.gateway.renamed".into(), "updated-model".into()))
+        );
+        let llm_task = agent
+            .tools
+            .iter()
+            .find(|tool| tool.name() == "llm_task")
+            .unwrap();
+        let result = llm_task
+            .execute(serde_json::json!({"prompt": "hello"}))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert!(old_endpoint.received_requests().await.unwrap().is_empty());
+        let requests = new_endpoint.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["model"], "updated-model");
+        assert_eq!(body["temperature"], 0.8);
     }
 
     #[tokio::test]
@@ -13667,7 +15091,11 @@ mod tests {
             },
         );
 
-        let result = Agent::from_config(&config, "test-agent").await;
+        let result = Agent::from_config(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "test-agent",
+        )
+        .await;
 
         assert!(
             result.is_ok(),
@@ -13743,7 +15171,7 @@ mod tests {
             .unwrap();
 
         let agent = Agent::from_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions(
-            &config,
+            &zeroclaw_config::migration::admit_test_input(&config),
             "test-agent",
             Some(&data_dir),
             false,
@@ -13881,13 +15309,20 @@ mod tests {
             },
         );
 
-        let agent = Agent::from_config(&config, "test-agent").await.unwrap();
+        let agent = Agent::from_config(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "test-agent",
+        )
+        .await
+        .unwrap();
         assert_eq!(agent.model_provider_name, "openai.fast");
 
         let tracker = Arc::new(CostTracker::new(config.cost.clone(), &config.data_dir).unwrap());
         let context = ToolLoopCostTrackingContext::new(
             Arc::clone(&tracker),
-            Arc::new(build_model_provider_pricing(&config)),
+            Arc::new(build_model_provider_pricing(
+                &zeroclaw_config::migration::admit_test_input(&config),
+            )),
         );
         let usage = zeroclaw_providers::traits::TokenUsage {
             input_tokens: Some(1_000_000),
@@ -13911,6 +15346,126 @@ mod tests {
         assert!((summary.daily_cost_usd - 0.75).abs() < 1e-12);
     }
 
+    /// Same-family pricing regression at the turn level: two `custom.*`
+    /// aliases with distinct rates, the agent bound to one of them, and a
+    /// real `Agent::turn` driven against a mock endpoint. The recorded cost
+    /// must come from the selected alias's pricing slot — a bare-family
+    /// lookup would be ambiguous here and record zero.
+    #[tokio::test]
+    async fn turn_bills_selected_same_family_alias_rate() {
+        use crate::agent::cost::{
+            TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext,
+            build_model_provider_pricing,
+        };
+        use crate::cost::CostTracker;
+        use axum::{Json, Router, routing::post};
+        use tempfile::TempDir;
+        use tokio::net::TcpListener;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
+
+        // OpenAI-compatible mock returning a fixed completion with exact
+        // usage: 1M input + 1M output tokens.
+        let app = Router::new().route(
+            "/chat/completions",
+            post(|| async {
+                Json(serde_json::json!({
+                    "choices": [{"message": {"content": "hello from mock"}}],
+                    "usage": {"prompt_tokens": 1_000_000_u64, "completion_tokens": 1_000_000_u64}
+                }))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = listener.local_addr().unwrap();
+        let server_handle = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let mut config = Config {
+            data_dir: workspace_dir,
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config.cost.enabled = true;
+        config
+            .risk_profiles
+            .insert("test-profile".to_string(), RiskProfileConfig::default());
+        {
+            let cheap = config
+                .providers
+                .models
+                .ensure("custom", "cheap")
+                .expect("custom cheap slot");
+            cheap.api_key = Some("test-key".to_string());
+            cheap.model = Some("cheap-model".to_string());
+            cheap.uri = Some(format!("http://{mock_addr}"));
+            cheap.pricing = HashMap::from([
+                ("cheap-model.input".to_string(), 0.15),
+                ("cheap-model.output".to_string(), 0.60),
+            ]);
+        }
+        {
+            let premium = config
+                .providers
+                .models
+                .ensure("custom", "premium")
+                .expect("custom premium slot");
+            premium.api_key = Some("test-key".to_string());
+            premium.model = Some("premium-model".to_string());
+            premium.uri = Some(format!("http://{mock_addr}"));
+            premium.pricing = HashMap::from([
+                ("premium-model.input".to_string(), 2.50),
+                ("premium-model.output".to_string(), 10.00),
+            ]);
+        }
+        config.agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.premium".into(),
+                risk_profile: "test-profile".into(),
+                ..Default::default()
+            },
+        );
+
+        let mut agent = Agent::from_config(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "test-agent",
+        )
+        .await
+        .expect("agent from config");
+        assert_eq!(agent.model_provider_name, "custom.premium");
+
+        let tracker = Arc::new(CostTracker::new(config.cost.clone(), &config.data_dir).unwrap());
+        let context = ToolLoopCostTrackingContext::new(
+            Arc::clone(&tracker),
+            Arc::new(build_model_provider_pricing(
+                &zeroclaw_config::migration::admit_test_input(&config),
+            )),
+        );
+        let response = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(context), agent.turn("hello"))
+            .await
+            .expect("agent turn");
+
+        assert_eq!(response, "hello from mock");
+        // 1M input @ $2.50/Mtok + 1M output @ $10.00/Mtok = $12.50 from the
+        // selected `custom.premium` slot. The sibling alias would bill $0.75
+        // and a bare-family lookup (ambiguous between two aliases) zero.
+        let summary = tracker.get_summary().unwrap();
+        assert!(
+            (summary.daily_cost_usd - 12.50).abs() < 1e-12,
+            "turn must bill the selected alias's rates, got {}",
+            summary.daily_cost_usd
+        );
+
+        server_handle.abort();
+    }
+
     #[test]
     fn builder_allowed_tools_none_keeps_all_tools() {
         let model_provider = Box::new(MockModelProvider {
@@ -13922,7 +15477,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -13955,7 +15510,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -14021,7 +15576,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -14070,7 +15625,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -14122,7 +15677,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -14517,7 +16072,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -14636,7 +16191,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -14720,7 +16275,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -14907,7 +16462,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -15062,7 +16617,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -15138,7 +16693,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -15201,7 +16756,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -15243,7 +16798,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         let agent_config = zeroclaw_config::schema::AliasedAgentConfig {
@@ -15479,7 +17034,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         let capturing = Arc::new(CapturingObserver::default());
@@ -15904,7 +17459,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -16060,7 +17615,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -16113,11 +17668,11 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem_a: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         let mem_b: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -16208,7 +17763,7 @@ mod tests {
         };
         let memory = || -> Arc<dyn Memory> {
             Arc::from(
-                zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                     .expect("memory creation should succeed"),
             )
         };
@@ -16355,7 +17910,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let memory: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+            zeroclaw_memory::create_memory(&memory_cfg, tmp.path())
                 .expect("memory creation should succeed"),
         );
         let mut hooks = crate::hooks::HookRunner::new();
@@ -16457,19 +18012,45 @@ mod tests {
 
     #[tokio::test]
     async fn before_llm_hook_uses_selected_route_for_complete_tool_protocol() {
+        assert_hook_selected_tool_protocol(false).await;
+    }
+
+    #[tokio::test]
+    async fn before_llm_hook_can_replace_a_mixed_default_with_a_valid_tool_route() {
+        assert_hook_selected_tool_protocol(true).await;
+    }
+
+    async fn assert_hook_selected_tool_protocol(mixed_default: bool) {
         let tmp = tempfile::tempdir().expect("temp workspace");
         let default_requests: CapturedToolProtocolRequests = Arc::new(Mutex::new(Vec::new()));
         let text_requests: CapturedToolProtocolRequests = Arc::new(Mutex::new(Vec::new()));
+        let default_provider: Box<dyn ModelProvider> = Box::new(HookProtocolCaptureProvider {
+            supports_native: true,
+            requests: Arc::clone(&default_requests),
+        });
+        let default_provider: Box<dyn ModelProvider> = if mixed_default {
+            Box::new(zeroclaw_providers::reliable::ReliableModelProvider::new(
+                "mixed-default",
+                vec![
+                    ("native".into(), default_provider),
+                    (
+                        "text-backup".into(),
+                        Box::new(HookProtocolCaptureProvider {
+                            supports_native: false,
+                            requests: Arc::clone(&default_requests),
+                        }),
+                    ),
+                ],
+                0,
+                0,
+            ))
+        } else {
+            default_provider
+        };
         let router = zeroclaw_providers::router::RouterModelProvider::new(
             "hook-router",
             vec![
-                (
-                    "default".into(),
-                    Box::new(HookProtocolCaptureProvider {
-                        supports_native: true,
-                        requests: Arc::clone(&default_requests),
-                    }) as Box<dyn ModelProvider>,
-                ),
+                ("default".into(), default_provider),
                 (
                     "text".into(),
                     Box::new(HookProtocolCaptureProvider {
@@ -16492,7 +18073,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let memory: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+            zeroclaw_memory::create_memory(&memory_cfg, tmp.path())
                 .expect("memory creation should succeed"),
         );
         let mut hooks = crate::hooks::HookRunner::new();
@@ -16553,105 +18134,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn before_llm_hook_rejects_strict_mixed_selected_route_before_dispatch() {
-        let tmp = tempfile::tempdir().expect("temp workspace");
-        let default_requests: CapturedToolProtocolRequests = Arc::new(Mutex::new(Vec::new()));
-        let native_requests: CapturedToolProtocolRequests = Arc::new(Mutex::new(Vec::new()));
-        let text_requests: CapturedToolProtocolRequests = Arc::new(Mutex::new(Vec::new()));
-        let mixed = zeroclaw_providers::reliable::ReliableModelProvider::new(
-            "mixed",
-            vec![
-                (
-                    "native".into(),
-                    Box::new(HookProtocolCaptureProvider {
-                        supports_native: true,
-                        requests: Arc::clone(&native_requests),
-                    }) as Box<dyn ModelProvider>,
-                ),
-                (
-                    "text".into(),
-                    Box::new(HookProtocolCaptureProvider {
-                        supports_native: false,
-                        requests: Arc::clone(&text_requests),
-                    }) as Box<dyn ModelProvider>,
-                ),
-            ],
-            0,
-            0,
-        );
-        let router = zeroclaw_providers::router::RouterModelProvider::new(
-            "hook-router",
-            vec![
-                (
-                    "default".into(),
-                    Box::new(HookProtocolCaptureProvider {
-                        supports_native: true,
-                        requests: Arc::clone(&default_requests),
-                    }) as Box<dyn ModelProvider>,
-                ),
-                ("mixed".into(), Box::new(mixed) as Box<dyn ModelProvider>),
-            ],
-            vec![(
-                "mixed".into(),
-                zeroclaw_providers::router::Route {
-                    provider_name: "mixed".into(),
-                    model: "mixed-model".into(),
-                },
-            )],
-            "native-model".into(),
-        );
-        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
-            backend: "none".into(),
-            ..zeroclaw_config::schema::MemoryConfig::default()
-        };
-        let memory: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
-                .expect("memory creation should succeed"),
-        );
-        let mut hooks = crate::hooks::HookRunner::new();
-        hooks.register(Box::new(SelectingBeforeLlmHook {
-            model: "hint:mixed".into(),
-            system_suffix: None,
-        }));
-        let config = zeroclaw_config::schema::AliasedAgentConfig {
-            resolved: zeroclaw_config::schema::ResolvedRuntime {
-                strict_tool_parsing: true,
-                ..Default::default()
-            },
-            ..zeroclaw_config::schema::AliasedAgentConfig::default()
-        };
-        let mut agent = Agent::builder()
-            .model_provider(Box::new(router))
-            .model_provider_name("hook-router".into())
-            .model_name("native-model".into())
-            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
-                vec![Box::new(MockTool)],
-            ))
-            .memory(memory)
-            .observer(Arc::from(crate::observability::NoopObserver {}))
-            .hook_runner(Some(Arc::new(hooks)))
-            .tool_dispatcher(Box::new(NativeToolDispatcher))
-            .config(config)
-            .workspace_dir(tmp.path().to_path_buf())
-            .build()
-            .expect("agent should build");
-
-        let error = agent
-            .turn("use the selected mixed route")
-            .await
-            .expect_err("strict mixed selected route must fail before dispatch");
-        assert!(
-            error
-                .to_string()
-                .contains("Strict tool parsing cannot run a fallback chain"),
-            "unexpected error: {error}"
-        );
-        assert!(default_requests.lock().is_empty());
-        assert!(native_requests.lock().is_empty());
-        assert!(text_requests.lock().is_empty());
-    }
-
-    #[tokio::test]
     async fn before_llm_hook_selected_model_attributes_provider_failure() {
         let tmp = tempfile::tempdir().expect("temp workspace");
         let memory_cfg = zeroclaw_config::schema::MemoryConfig {
@@ -16659,7 +18141,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let memory: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+            zeroclaw_memory::create_memory(&memory_cfg, tmp.path())
                 .expect("memory creation should succeed"),
         );
         let mut hooks = crate::hooks::HookRunner::new();
@@ -16723,7 +18205,7 @@ mod tests {
         };
         let memory = || -> Arc<dyn Memory> {
             Arc::from(
-                zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+                zeroclaw_memory::create_memory(&memory_cfg, tmp.path())
                     .expect("memory creation should succeed"),
             )
         };
@@ -16783,7 +18265,6 @@ mod tests {
                     ..zeroclaw_config::schema::MemoryConfig::default()
                 },
                 workspace,
-                None,
             )
             .expect("memory creation should succeed"),
         );
@@ -16929,7 +18410,7 @@ mod tests {
         };
         let memory = || -> Arc<dyn Memory> {
             Arc::from(
-                zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+                zeroclaw_memory::create_memory(&memory_cfg, tmp.path())
                     .expect("memory creation should succeed"),
             )
         };
@@ -17008,7 +18489,7 @@ mod tests {
         };
         let memory = || -> Arc<dyn Memory> {
             Arc::from(
-                zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+                zeroclaw_memory::create_memory(&memory_cfg, tmp.path())
                     .expect("memory creation should succeed"),
             )
         };
@@ -17086,7 +18567,7 @@ mod tests {
         };
         let memory = || -> Arc<dyn Memory> {
             Arc::from(
-                zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+                zeroclaw_memory::create_memory(&memory_cfg, tmp.path())
                     .expect("memory creation should succeed"),
             )
         };
@@ -17153,7 +18634,7 @@ mod tests {
         };
         let memory = || -> Arc<dyn Memory> {
             Arc::from(
-                zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+                zeroclaw_memory::create_memory(&memory_cfg, tmp.path())
                     .expect("memory creation should succeed"),
             )
         };
@@ -17224,7 +18705,7 @@ mod tests {
         };
         let memory = || -> Arc<dyn Memory> {
             Arc::from(
-                zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+                zeroclaw_memory::create_memory(&memory_cfg, tmp.path())
                     .expect("memory creation should succeed"),
             )
         };
@@ -17301,7 +18782,7 @@ mod tests {
         };
         let memory = || -> Arc<dyn Memory> {
             Arc::from(
-                zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+                zeroclaw_memory::create_memory(&memory_cfg, tmp.path())
                     .expect("memory creation should succeed"),
             )
         };
@@ -17396,7 +18877,7 @@ mod tests {
         };
         let memory = || -> Arc<dyn Memory> {
             Arc::from(
-                zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+                zeroclaw_memory::create_memory(&memory_cfg, tmp.path())
                     .expect("memory creation should succeed"),
             )
         };
@@ -17475,7 +18956,7 @@ mod tests {
         };
         let memory = || -> Arc<dyn Memory> {
             Arc::from(
-                zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+                zeroclaw_memory::create_memory(&memory_cfg, tmp.path())
                     .expect("memory creation should succeed"),
             )
         };
@@ -17736,7 +19217,7 @@ mod tests {
         };
         let none_mem = || -> Arc<dyn Memory> {
             Arc::from(
-                zeroclaw_memory::create_memory(&none_cfg, std::path::Path::new("/tmp"), None)
+                zeroclaw_memory::create_memory(&none_cfg, std::path::Path::new("/tmp"))
                     .expect("none memory"),
             )
         };
@@ -17776,7 +19257,6 @@ mod tests {
                         ..zeroclaw_config::schema::MemoryConfig::default()
                     },
                     std::path::Path::new("/tmp"),
-                    None,
                 )
                 .expect("memory"),
             ))
@@ -17796,6 +19276,41 @@ mod tests {
         ];
         let key = agent.response_cache_key_for_messages(&plain_messages, "test-model");
         assert!(key.is_some(), "plain text prompt must produce a cache key");
+
+        let mut config = Config {
+            providers: serde_json::from_value(serde_json::json!({
+                "connections": {"gateway.prod": {"kind": "custom", "uri": "https://first.invalid/v1"}},
+                "models": {"chat.fast.us": {"capability": "chat", "provider": "gateway.prod", "model": "test-model", "preset": "chat-defaults"}},
+                "model_presets": {"chat-defaults": {"capability": "chat", "options": {"temperature": 0.2}}},
+            })).unwrap(),
+            ..Config::default()
+        };
+        let install = |agent: &mut Agent, config: &Config| {
+            agent.provider_switch_config = Some(ProviderSwitchConfig {
+                config: Some(Arc::new(config.clone())),
+                ..Default::default()
+            });
+            agent
+                .response_cache_key_for_messages(&plain_messages, "test-model")
+                .unwrap()
+        };
+        let original_key = install(&mut agent, &config);
+        let mut providers = serde_json::to_value(&config.providers).unwrap();
+        providers["connections"]["gateway.prod"]["uri"] = "https://second.invalid/v1".into();
+        config.providers = serde_json::from_value(providers.clone()).unwrap();
+        let changed_endpoint = install(&mut agent, &config);
+        assert_ne!(
+            original_key, changed_endpoint,
+            "same wire model on another endpoint must miss cache"
+        );
+        providers["model_presets"]["chat-defaults"]["options"]["temperature"] = 0.8.into();
+        config.providers = serde_json::from_value(providers).unwrap();
+        assert_ne!(
+            changed_endpoint,
+            install(&mut agent, &config),
+            "inherited request options must affect cache identity"
+        );
+        agent.provider_switch_config = None;
 
         let structurally_distinct_a = vec![
             ChatMessage::system("s"),
@@ -17849,7 +19364,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         let observer = Arc::new(CapturingObserver::default());
@@ -17998,7 +19513,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         let model_provider = Box::new(StreamingSteeringModelProvider {
@@ -18097,7 +19612,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -18309,7 +19824,7 @@ mod tests {
                 })],
             ))
             .memory(Arc::from(
-                zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                     .expect("memory creation should succeed with valid config"),
             ))
             .observer(Arc::from(crate::observability::NoopObserver {}))
@@ -18488,7 +20003,7 @@ mod tests {
                 })],
             ))
             .memory(Arc::from(
-                zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                     .expect("memory creation should succeed with valid config"),
             ))
             .observer(Arc::from(crate::observability::NoopObserver {}))
@@ -18538,7 +20053,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         let calls = Arc::new(AtomicUsize::new(0));
@@ -18601,7 +20116,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -18693,7 +20208,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         let calls = AtomicUsize::new(0);
@@ -18808,7 +20323,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         let (started_tx, mut started_rx) = tokio::sync::mpsc::channel(1);
@@ -18861,7 +20376,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -18929,7 +20444,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -19003,7 +20518,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -19068,7 +20583,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -19126,7 +20641,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -19231,7 +20746,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -19653,7 +21168,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -19939,11 +21454,11 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem_a: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         let mem_b: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -20025,7 +21540,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         let capturing = Arc::new(CapturingObserver::default());
@@ -20114,7 +21629,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         let workspace = tempfile::TempDir::new().expect("temp dir");
@@ -20216,7 +21731,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         let workspace = tempfile::TempDir::new().expect("temp dir");
@@ -20316,7 +21831,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         let capturing = Arc::new(CapturingObserver::default());
@@ -20356,7 +21871,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -20404,7 +21919,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
 
@@ -20460,7 +21975,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         // Single response with no token usage.
@@ -20534,7 +22049,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         // Single response carrying usage WITHOUT token counts (kilocli-style).
@@ -20587,7 +22102,7 @@ mod tests {
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         // Call 1: a tool request WITH usage (drives iteration 2 and emits a
@@ -20840,7 +22355,7 @@ vision_model_provider = "custom.vision"
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, temp.path(), None)
+            zeroclaw_memory::create_memory(&memory_cfg, temp.path())
                 .expect("memory creation should succeed"),
         );
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -21180,7 +22695,7 @@ model_provider = "custom.primary"
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, temp.path(), None)
+            zeroclaw_memory::create_memory(&memory_cfg, temp.path())
                 .expect("memory creation should succeed"),
         );
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -21258,356 +22773,6 @@ model_provider = "custom.primary"
             Some((Some(8_000), Some(8_000))),
             "the usage-less fallback must publish a terminal snapshot carrying ITS window"
         );
-    }
-
-    /// A same-alias `fallback_models` failover must re-key the context limits
-    /// to the model that actually served.
-    ///
-    /// `push_pinned_entries` builds the primary and every `fallback_models`
-    /// entry under ONE provider alias (one shared `cooldown_key`), differing
-    /// only in the pinned model. `AcceptedRoute.provider_ref` is that shared
-    /// key, so an alias-only comparison reports "route unchanged" even though a
-    /// different model answered. The limits, the terminal snapshot, and the
-    /// recovery arithmetic would then all keep the primary model's capacity.
-    ///
-    /// Observable difference: `context_window` describes only the model
-    /// configured on the alias, so the fallback model resolves to the explicit
-    /// compatibility fallback rather than borrowing the primary's 200k. Before
-    /// the fix the terminal frame reported the primary's 200,000-token window
-    /// while naming `small-model`.
-    #[tokio::test]
-    async fn served_limits_follow_a_same_alias_pinned_model_fallback() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        // One alias. `model` pins the primary and carries the only configured
-        // capacity; `fallback_models` adds a second pinned entry under the very
-        // same alias.
-        let config: zeroclaw_config::schema::Config = toml::from_str(
-            r#"
-schema_version = 4
-[providers.models.custom.only]
-model = "large-model"
-context_window = 200000
-fallback_models = ["small-model"]
-[agents.coder]
-enabled = true
-model_provider = "custom.only"
-"#,
-        )
-        .expect("config parses");
-
-        // Fails for the primary pinned model, answers for the fallback one.
-        // Streaming, because that is the path that records an accepted route.
-        struct PinnedByModel {
-            small_calls: Arc<AtomicUsize>,
-        }
-        #[async_trait]
-        impl ModelProvider for PinnedByModel {
-            async fn chat_with_system(
-                &self,
-                _s: Option<&str>,
-                _m: &str,
-                _model: &str,
-                _t: Option<f64>,
-            ) -> Result<String> {
-                Ok(String::new())
-            }
-            async fn chat(
-                &self,
-                _request: ChatRequest<'_>,
-                model: &str,
-                _t: Option<f64>,
-            ) -> Result<zeroclaw_providers::ChatResponse> {
-                if model == "small-model" {
-                    self.small_calls.fetch_add(1, Ordering::SeqCst);
-                    return Ok(zeroclaw_providers::ChatResponse {
-                        text: Some("fallback model answered".to_string()),
-                        tool_calls: Vec::new(),
-                        usage: None,
-                        reasoning_content: None,
-                    });
-                }
-                anyhow::bail!("large-model is down")
-            }
-            fn supports_streaming(&self) -> bool {
-                true
-            }
-            fn stream_chat(
-                &self,
-                _request: zeroclaw_providers::ChatRequest<'_>,
-                model: &str,
-                _t: Option<f64>,
-                _options: zeroclaw_providers::traits::StreamOptions,
-            ) -> futures_util::stream::BoxStream<
-                'static,
-                zeroclaw_providers::traits::StreamResult<zeroclaw_api::model_provider::StreamEvent>,
-            > {
-                if model == "small-model" {
-                    self.small_calls.fetch_add(1, Ordering::SeqCst);
-                    return Box::pin(futures_util::stream::iter(vec![
-                        Ok(zeroclaw_api::model_provider::StreamEvent::TextDelta(
-                            zeroclaw_api::model_provider::StreamChunk {
-                                delta: "fallback model answered".to_string(),
-                                reasoning: None,
-                                is_final: false,
-                                token_count: 0,
-                            },
-                        )),
-                        Ok(zeroclaw_api::model_provider::StreamEvent::Final),
-                    ]));
-                }
-                Box::pin(futures_util::stream::iter(vec![Err(
-                    zeroclaw_api::model_provider::StreamError::ModelProvider(
-                        "large-model is down".to_string(),
-                    ),
-                )]))
-            }
-        }
-        impl zeroclaw_api::attribution::Attributable for PinnedByModel {
-            fn role(&self) -> zeroclaw_api::attribution::Role {
-                zeroclaw_api::attribution::Role::Provider(
-                    zeroclaw_api::attribution::ProviderKind::Model(
-                        zeroclaw_api::attribution::ModelProviderKind::Custom,
-                    ),
-                )
-            }
-            fn alias(&self) -> &str {
-                "only"
-            }
-        }
-
-        let small_calls = Arc::new(AtomicUsize::new(0));
-        let inner: Arc<dyn ModelProvider> = Arc::new(PinnedByModel {
-            small_calls: Arc::clone(&small_calls),
-        });
-        // Mirror `push_pinned_entries`: both entries share ONE cooldown key
-        // (the alias) and differ only in the pinned model.
-        let reliable = zeroclaw_providers::reliable::ReliableModelProvider::new_pinned_for_test(
-            "custom.only",
-            vec![
-                ("custom.only", "only", "large-model", Arc::clone(&inner)),
-                ("custom.only", "only", "small-model", Arc::clone(&inner)),
-            ],
-            0,
-            1,
-        );
-
-        let temp = tempfile::tempdir().expect("tempdir");
-        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
-            backend: "none".into(),
-            ..zeroclaw_config::schema::MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, temp.path(), None)
-                .expect("memory creation should succeed"),
-        );
-        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut agent = Agent::builder()
-            .model_provider(Box::new(reliable))
-            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
-                Vec::new(),
-            ))
-            .tool_dispatcher(Box::new(NativeToolDispatcher))
-            .memory(mem)
-            .observer(observer)
-            .workspace_dir(temp.path().to_path_buf())
-            .agent_alias("coder".into())
-            .model_provider_name("custom.only".into())
-            .model_name("large-model".into())
-            .provider_switch_config(ProviderSwitchConfig {
-                config: Some(Arc::new(config.clone())),
-                live_config: None,
-                live: None,
-            })
-            .build()
-            .expect("agent builder should succeed with valid config");
-        let limit_config = Arc::new(config);
-        agent.context_limits_resolver = Some(Arc::new(move |provider_ref, model| {
-            limit_config.resolved_context_limits_for_route("coder", provider_ref, model)
-        }));
-
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
-        let outcome = agent
-            .turn_streamed_with_steering_state("hello", event_tx, None, None)
-            .await
-            .expect("the pinned fallback model must carry the turn");
-
-        assert_eq!(
-            small_calls.load(Ordering::SeqCst),
-            1,
-            "the small-model entry must have served the call"
-        );
-
-        // The alias is unchanged by construction — that is the whole point.
-        assert_eq!(
-            outcome.provider_name, "custom.only",
-            "harness invariant: both pinned entries share one alias, so an \
-             alias-only comparison cannot detect this failover"
-        );
-        assert_eq!(
-            outcome.model, "small-model",
-            "the outcome must attribute the pinned model that actually answered"
-        );
-
-        // `context_window` describes only `large-model`, so the served
-        // `small-model` route resolves to the explicit compatibility fallback.
-        // Before the fix this was the primary's 200_000.
-        let final_limits = outcome
-            .final_context_limits
-            .expect("a served call must publish final limits");
-        assert_ne!(
-            final_limits.model_context_window, 200_000,
-            "the primary's capacity must not be reported for a different served model"
-        );
-        assert_eq!(
-            final_limits.model_context_window_source,
-            zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
-            "an unconfigured served model must be explicit compatibility fallback, \
-             never borrowed metadata from the alias's configured model"
-        );
-        assert_eq!(
-            final_limits.configured_model_context_window(),
-            None,
-            "unknown capacity must be omitted from the wire rather than presented \
-             as model truth"
-        );
-
-        // The terminal frame consumers read must agree with the outcome.
-        let mut terminal = None;
-        while let Ok(ev) = event_rx.try_recv() {
-            if let TurnEvent::Usage {
-                context_token_budget,
-                model_context_window,
-                ..
-            } = ev
-            {
-                terminal = Some((context_token_budget, model_context_window));
-            }
-        }
-        let (budget, window) = terminal.expect("the usage-less fallback must publish a snapshot");
-        assert_eq!(
-            window, None,
-            "the terminal frame must omit capacity for the served model rather \
-             than carrying the primary's window"
-        );
-        assert_eq!(
-            budget,
-            Some(final_limits.context_token_budget as u64),
-            "the terminal budget must agree with the re-keyed served limits"
-        );
-    }
-
-    fn build_test_agent(
-        initial_provider_name: &str,
-        initial_model_name: &str,
-        switch_config: Option<ProviderSwitchConfig>,
-    ) -> Agent {
-        let provider = Box::new(MockModelProvider {
-            responses: Mutex::new(vec![]),
-        });
-        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
-            backend: "none".into(),
-            ..zeroclaw_config::schema::MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
-                .expect("memory creation"),
-        );
-        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut builder = Agent::builder()
-            .model_provider(provider)
-            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
-                vec![Box::new(MockTool)],
-            ))
-            .memory(mem)
-            .observer(observer)
-            .tool_dispatcher(Box::new(NativeToolDispatcher))
-            .workspace_dir(std::path::PathBuf::from("/tmp"))
-            .model_provider_name(initial_provider_name.to_string())
-            .model_name(initial_model_name.to_string());
-        if let Some(cfg) = switch_config {
-            builder = builder.provider_switch_config(cfg);
-        }
-        builder.build().expect("agent builder")
-    }
-
-    /// Build a config whose `ollama.large` route carries `window` capacity, so a
-    /// generation swap is observable in both dispatch (the route's model) and the
-    /// resolved limits.
-    fn generation_config(window: usize, model: &str) -> zeroclaw_config::schema::Config {
-        let mut cfg = zeroclaw_config::schema::Config::default();
-        cfg.providers.models.custom.insert(
-            "large".to_string(),
-            zeroclaw_config::schema::CustomModelProviderConfig {
-                base: zeroclaw_config::schema::ModelProviderConfig {
-                    // The custom slot has no family-default endpoint, so a
-                    // provider rebuild fails without a uri.
-                    uri: Some("http://127.0.0.1:1/v1".to_string()),
-                    model: Some(model.to_string()),
-                    context_window: Some(window),
-                    ..zeroclaw_config::schema::ModelProviderConfig::default()
-                },
-            },
-        );
-        cfg
-    }
-
-    fn direct_live_generation_config(
-        data_dir: &Path,
-        provider_alias: &str,
-        model: &str,
-        window: usize,
-        history_cap: usize,
-    ) -> zeroclaw_config::schema::Config {
-        let provider_ref = format!("custom.{provider_alias}");
-        let mut cfg = zeroclaw_config::schema::Config {
-            config_path: data_dir.join("config.toml"),
-            data_dir: data_dir.to_path_buf(),
-            memory: zeroclaw_config::schema::MemoryConfig {
-                backend: "none".into(),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        cfg.providers.models.custom.insert(
-            provider_alias.to_string(),
-            zeroclaw_config::schema::CustomModelProviderConfig {
-                base: zeroclaw_config::schema::ModelProviderConfig {
-                    uri: Some("http://127.0.0.1:1/v1".to_string()),
-                    model: Some(model.to_string()),
-                    context_window: Some(window),
-                    ..Default::default()
-                },
-            },
-        );
-        cfg.risk_profiles.insert(
-            "default".to_string(),
-            zeroclaw_config::schema::RiskProfileConfig::default(),
-        );
-        cfg.runtime_profiles.insert(
-            "default".to_string(),
-            zeroclaw_config::schema::RuntimeProfileConfig {
-                context_compact_ratio: Some(0.5),
-                max_history_messages: Some(history_cap),
-                ..Default::default()
-            },
-        );
-        cfg.agents.insert(
-            "direct".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                model_provider: provider_ref.clone().into(),
-                risk_profile: "default".into(),
-                runtime_profile: "default".into(),
-                ..Default::default()
-            },
-        );
-        cfg.model_routes = vec![zeroclaw_config::schema::ModelRouteConfig {
-            hint: "fast".to_string(),
-            model_provider: provider_ref,
-            model: model.to_string(),
-            api_key: None,
-        }];
-        cfg
     }
 
     #[test]
@@ -21797,8 +22962,8 @@ model_provider = "custom.only"
     /// construction-time snapshot, so a `config/set` followed by an explicit
     /// model switch dispatched on the old profiles while reporting the new
     /// capacity.
-    #[test]
-    fn config_set_then_model_switch_dispatches_and_reports_one_generation() {
+    #[tokio::test]
+    async fn config_set_then_model_switch_dispatches_and_reports_one_generation() {
         let live = zeroclaw_config::live::LiveConfig::new(generation_config(200_000, "large-v1"));
         let generation: ConfigGeneration =
             Arc::new(parking_lot::RwLock::new(Arc::new(live.snapshot())));
@@ -21846,14 +23011,16 @@ model_provider = "custom.only"
         // The next turn boundary republishes it.
         agent.sync_config_generation();
 
-        let switched = agent.try_apply_model_switch(
-            "large-v1",
-            "custom.large".to_string(),
-            "large-v2".to_string(),
-        );
+        let switched = agent
+            .try_apply_model_switch(
+                "large-v1",
+                "custom.large".to_string(),
+                "large-v2".to_string(),
+            )
+            .await;
         assert_eq!(
-            switched.as_deref(),
-            Some("large-v2"),
+            switched.unwrap(),
+            ModelSwitchOutcome::Rebuilt("large-v2".into()),
             "the switch must rebuild from the refreshed generation, which knows large-v2"
         );
 
@@ -21979,29 +23146,155 @@ model_provider = "custom.only"
         );
     }
 
-    #[test]
-    fn try_apply_model_switch_noop_when_identical_to_current() {
-        let mut agent = build_test_agent("openai", "gpt-4o-mini", None);
-        let result = agent.try_apply_model_switch(
-            "gpt-4o-mini",
-            "openai".to_string(),
-            "gpt-4o-mini".to_string(),
+    #[tokio::test]
+    async fn try_apply_model_switch_noop_when_identical_to_current() {
+        // Switching to the same exact model reference must not rebuild.
+        use zeroclaw_config::schema::{
+            ModelEntryConfig, ModelProviderConfig, OpenAIModelProviderConfig,
+        };
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.openai.insert(
+            "default".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o-mini".to_string()),
+                    models: HashMap::from([(
+                        "default".to_string(),
+                        ModelEntryConfig {
+                            id: Some("gpt-4o-mini".to_string()),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                },
+            },
         );
-        assert_eq!(result, None, "same-provider/same-model is a no-op");
+        let identity = zeroclaw_providers::model::resolve_model_identity(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            "test",
+            "openai.default",
+            None,
+        )
+        .unwrap();
+
+        let mut agent = build_test_agent(
+            "openai.default",
+            "gpt-4o-mini",
+            Some(ProviderSwitchConfig {
+                config: Some(std::sync::Arc::new(
+                    zeroclaw_config::migration::admit_test_input(&config),
+                )),
+                live: None,
+                live_config: None,
+            }),
+        );
+        agent.model_identity = Some(identity);
+        let result = agent
+            .try_apply_model_switch(
+                "gpt-4o-mini",
+                "openai.default".to_string(),
+                "gpt-4o-mini".to_string(),
+            )
+            .await;
+        assert_eq!(
+            result.unwrap(),
+            ModelSwitchOutcome::Unchanged,
+            "a switch to the already-running exact model reference is a no-op"
+        );
     }
 
-    #[test]
-    fn try_apply_model_switch_preserves_agent_without_switch_config() {
+    #[tokio::test]
+    async fn try_apply_model_switch_rebuilds_between_entries_of_one_profile() {
+        // Two entries under one profile sharing a model id are different
+        // models: once provider names normalise to two segments, the entry
+        // name is the only thing distinguishing them, so the switch must
+        // rebuild (and pick up the entry's own tuning) rather than no-op.
+        use zeroclaw_config::schema::{
+            ModelEntryConfig, ModelProviderConfig, OpenAIModelProviderConfig,
+        };
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        let mut entries = HashMap::new();
+        entries.insert(
+            "default".to_string(),
+            ModelEntryConfig {
+                id: Some("gpt-4o-mini".to_string()),
+                ..Default::default()
+            },
+        );
+        entries.insert(
+            "cheap".to_string(),
+            ModelEntryConfig {
+                id: Some("gpt-4o-mini".to_string()),
+                temperature: Some(0.4),
+                ..Default::default()
+            },
+        );
+        config.providers.models.openai.insert(
+            "gw".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some("http://127.0.0.1:1".to_string()),
+                    models: entries,
+                    ..Default::default()
+                },
+            },
+        );
+        let identity = config
+            .resolve_model_selection("openai.gw.default")
+            .unwrap()
+            .identity(None);
+
+        let mut agent = build_test_agent(
+            "openai.gw",
+            "gpt-4o-mini",
+            Some(ProviderSwitchConfig {
+                config: Some(std::sync::Arc::new(
+                    zeroclaw_config::migration::admit_test_input(&config),
+                )),
+                live: None,
+                live_config: None,
+            }),
+        );
+        agent.model_identity = Some(identity);
+        let result = agent
+            .try_apply_model_switch(
+                "gpt-4o-mini",
+                "openai.gw.cheap".to_string(),
+                "gpt-4o-mini".to_string(),
+            )
+            .await;
+
+        assert_eq!(
+            result.unwrap(),
+            ModelSwitchOutcome::Rebuilt("gpt-4o-mini".into()),
+            "switching between entries of one profile is a real switch"
+        );
+        assert_eq!(
+            agent.model_provider_name, "openai.gw.cheap",
+            "the committed name is the selected exact model reference"
+        );
+        assert_eq!(
+            agent.effective_temperature(),
+            Some(0.4),
+            "the selected entry's temperature moves with the switch"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_apply_model_switch_preserves_agent_without_switch_config() {
         // Agent has NO provider_switch_config — cannot rebuild provider.
         let mut agent = build_test_agent("openai", "gpt-4o-mini", None);
-        let result = agent.try_apply_model_switch(
-            "gpt-4o-mini",
-            "anthropic".to_string(),
-            "claude-haiku".to_string(),
-        );
+        let result = agent
+            .try_apply_model_switch(
+                "gpt-4o-mini",
+                "anthropic".to_string(),
+                "claude-haiku".to_string(),
+            )
+            .await;
 
-        // Returns None (failed switch) and leaves the agent unchanged.
-        assert_eq!(result, None);
+        assert!(result.is_err());
         assert_eq!(
             agent.model_provider_name, "openai",
             "provider_name must NOT change when provider rebuild is not possible"
@@ -22106,19 +23399,26 @@ model_provider = "custom.only"
         );
 
         let switch_config = ProviderSwitchConfig {
-            config: Some(Arc::new(config)),
+            config: Some(Arc::new(zeroclaw_config::migration::admit_test_input(
+                &config,
+            ))),
             live_config: None,
             live: None,
         };
         let mut agent = build_test_agent("openai.primary", "current-model", Some(switch_config));
         agent.agent_alias = "switcher".to_string();
 
-        let switched = agent.try_apply_model_switch(
-            "current-model",
-            "hailo_ollama.edge".to_string(),
-            "edge-model".to_string(),
+        let switched = agent
+            .try_apply_model_switch(
+                "current-model",
+                "hailo_ollama.edge".to_string(),
+                "edge-model".to_string(),
+            )
+            .await;
+        assert_eq!(
+            switched.unwrap(),
+            ModelSwitchOutcome::Rebuilt("edge-model".into())
         );
-        assert_eq!(switched.as_deref(), Some("edge-model"));
         let response = agent
             .model_provider
             .chat_with_system(None, "hello", "edge-model", None)
@@ -22133,27 +23433,34 @@ model_provider = "custom.only"
         );
     }
 
-    #[test]
-    fn try_apply_model_switch_succeeds_with_switch_config() {
+    #[tokio::test]
+    async fn try_apply_model_switch_succeeds_with_switch_config() {
+        let mut config = Config::default();
+        config.providers.models.ensure("ollama", "local").unwrap();
         let switch_cfg = ProviderSwitchConfig {
-            config: Some(std::sync::Arc::new(
-                zeroclaw_config::schema::Config::default(),
-            )),
+            config: Some(Arc::new(zeroclaw_config::migration::admit_test_input(
+                &config,
+            ))),
             live_config: None,
             live: None,
         };
 
-        let mut agent = build_test_agent("openai", "gpt-4o-mini", Some(switch_cfg));
-        let result =
-            agent.try_apply_model_switch("gpt-4o-mini", "ollama".to_string(), "llama3".to_string());
+        let mut agent = build_test_agent("openai.default", "gpt-4o-mini", Some(switch_cfg));
+        let result = agent
+            .try_apply_model_switch(
+                "gpt-4o-mini",
+                "ollama.local".to_string(),
+                "llama3".to_string(),
+            )
+            .await;
 
         assert_eq!(
-            result.as_deref(),
-            Some("llama3"),
+            result.unwrap(),
+            ModelSwitchOutcome::Rebuilt("llama3".into()),
             "successful switch must return the new effective model"
         );
         assert_eq!(
-            agent.model_provider_name, "ollama",
+            agent.model_provider_name, "ollama.local",
             "provider_name must reflect the switched provider after success"
         );
         assert_eq!(
@@ -22168,8 +23475,8 @@ model_provider = "custom.only"
 
     /// Regression: model_provider_context_window_opt follows the in-turn
     /// provider switch, not the static agent alias.
-    #[test]
-    fn model_context_window_follows_in_turn_model_switch() {
+    #[tokio::test]
+    async fn model_context_window_follows_in_turn_model_switch() {
         let mut cfg = Config::default();
         let provider_a = cfg
             .providers
@@ -22186,7 +23493,7 @@ model_provider = "custom.only"
         provider_b.context_window = Some(1_000_000);
         provider_b.model = Some("llama3".into());
 
-        let cfg_arc = std::sync::Arc::new(cfg);
+        let cfg_arc = std::sync::Arc::new(zeroclaw_config::migration::admit_test_input(&cfg));
         let switch_cfg = ProviderSwitchConfig {
             config: Some(cfg_arc.clone()),
             live_config: None,
@@ -22204,14 +23511,16 @@ model_provider = "custom.only"
         assert_eq!(window_before, Some(128_000));
 
         // Apply in-turn switch
-        let result = agent.try_apply_model_switch(
-            "gpt-4o-mini",
-            "ollama.provider-b".to_string(),
-            "llama3".to_string(),
-        );
+        let result = agent
+            .try_apply_model_switch(
+                "gpt-4o-mini",
+                "ollama.provider-b".to_string(),
+                "llama3".to_string(),
+            )
+            .await;
         assert_eq!(
-            result.as_deref(),
-            Some("llama3"),
+            result.unwrap(),
+            ModelSwitchOutcome::Rebuilt("llama3".into()),
             "switch must return the new effective model (proves switch ran, not short-circuited)"
         );
 
@@ -22224,30 +23533,34 @@ model_provider = "custom.only"
         assert_eq!(window_after, Some(1_000_000));
     }
 
-    #[test]
-    fn try_apply_model_switch_succeeds_on_provider_only_change() {
+    #[tokio::test]
+    async fn try_apply_model_switch_succeeds_on_provider_only_change() {
+        let mut config = Config::default();
+        config.providers.models.ensure("ollama", "second").unwrap();
         let switch_cfg = ProviderSwitchConfig {
-            config: Some(std::sync::Arc::new(
-                zeroclaw_config::schema::Config::default(),
-            )),
+            config: Some(Arc::new(zeroclaw_config::migration::admit_test_input(
+                &config,
+            ))),
             live_config: None,
             live: None,
         };
 
-        let mut agent = build_test_agent("openai", "shared-name", Some(switch_cfg));
-        let result = agent.try_apply_model_switch(
-            "shared-name",
-            "ollama".to_string(),
-            "shared-name".to_string(),
-        );
+        let mut agent = build_test_agent("openai.first", "shared-name", Some(switch_cfg));
+        let result = agent
+            .try_apply_model_switch(
+                "shared-name",
+                "ollama.second".to_string(),
+                "shared-name".to_string(),
+            )
+            .await;
 
         assert_eq!(
-            result.as_deref(),
-            Some("shared-name"),
+            result.unwrap(),
+            ModelSwitchOutcome::Rebuilt("shared-name".into()),
             "provider-only switch must also be treated as a successful switch"
         );
         assert_eq!(
-            agent.model_provider_name, "ollama",
+            agent.model_provider_name, "ollama.second",
             "provider_name must update on a provider-only switch"
         );
         assert_eq!(agent.model_name, "shared-name");
@@ -22266,7 +23579,7 @@ model_provider = "custom.only"
         config.multimodal.max_images = 8;
         config.multimodal.max_image_size_mb = 10;
 
-        let options = switch_runtime_options(&config, "ollama");
+        let options = zeroclaw_providers::model::runtime_options(&config, "", "ollama").unwrap();
 
         assert_eq!(
             options.multimodal.max_images, 8,
@@ -22278,12 +23591,14 @@ model_provider = "custom.only"
         );
     }
 
-    #[test]
-    fn model_switch_re_resolves_context_limits_for_new_route() {
+    #[tokio::test]
+    async fn model_switch_re_resolves_context_limits_for_new_route() {
+        let mut config = Config::default();
+        config.providers.models.ensure("ollama", "small").unwrap();
         let switch_cfg = ProviderSwitchConfig {
-            config: Some(std::sync::Arc::new(
-                zeroclaw_config::schema::Config::default(),
-            )),
+            config: Some(Arc::new(zeroclaw_config::migration::admit_test_input(
+                &config,
+            ))),
             live_config: None,
             live: None,
         };
@@ -22312,10 +23627,14 @@ model_provider = "custom.only"
         }));
 
         assert_eq!(agent.context_limits().context_token_budget, 180_000);
-        let switched =
-            agent.try_apply_model_switch("large", "ollama.small".to_string(), "small".to_string());
+        let switched = agent
+            .try_apply_model_switch("large", "ollama.small".to_string(), "small".to_string())
+            .await;
 
-        assert_eq!(switched.as_deref(), Some("small"));
+        assert_eq!(
+            switched.unwrap(),
+            ModelSwitchOutcome::Rebuilt("small".into())
+        );
         let selected = agent.model_route_resolver.resolve("small");
         assert_eq!(selected.provider_name, "ollama.small");
         assert_eq!(selected.model, "small");
@@ -22331,38 +23650,52 @@ model_provider = "custom.only"
         );
     }
 
-    #[test]
-    fn try_apply_model_switch_prefers_route_api_key() {
+    #[tokio::test]
+    async fn try_apply_model_switch_uses_referenced_connection_credentials() {
         let route = zeroclaw_config::schema::ModelRouteConfig {
-            model_provider: "ollama".to_string(),
-            model: "tinyllama".to_string(),
+            model_ref: "ollama.local".to_string(),
+
             hint: "fast".to_string(),
-            api_key: Some("route-specific-key".to_string()),
         };
 
-        let route_config = zeroclaw_config::schema::Config {
+        let mut route_config = zeroclaw_config::schema::Config {
             model_routes: vec![route],
             ..zeroclaw_config::schema::Config::default()
         };
+        route_config
+            .providers
+            .models
+            .ensure("ollama", "local")
+            .unwrap();
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut route_config,
+            "ollama.local",
+            "tinyllama",
+            Some("connection-key"),
+        );
         let switch_cfg = ProviderSwitchConfig {
-            config: Some(std::sync::Arc::new(route_config)),
+            config: Some(std::sync::Arc::new(
+                zeroclaw_config::migration::admit_test_input(&route_config),
+            )),
             live_config: None,
             live: None,
         };
 
-        let mut agent = build_test_agent("openai", "gpt-4o-mini", Some(switch_cfg));
-        let result = agent.try_apply_model_switch(
-            "gpt-4o-mini",
-            "ollama".to_string(),
-            "tinyllama".to_string(),
-        );
+        let mut agent = build_test_agent("openai.default", "gpt-4o-mini", Some(switch_cfg));
+        let result = agent
+            .try_apply_model_switch(
+                "gpt-4o-mini",
+                "ollama.local".to_string(),
+                "tinyllama".to_string(),
+            )
+            .await;
 
         assert_eq!(
-            result.as_deref(),
-            Some("tinyllama"),
+            result.unwrap(),
+            ModelSwitchOutcome::Rebuilt("tinyllama".into()),
             "switch must succeed when a model_routes entry matches the target"
         );
-        assert_eq!(agent.model_provider_name, "ollama");
+        assert_eq!(agent.model_provider_name, "ollama.local");
     }
 
     /// Streamed mock whose first call emits a tool call (queuing a model
@@ -22371,6 +23704,7 @@ model_provider = "custom.only"
     /// for exactly the first call — the next call goes to the switched one.
     struct StreamSwitchTriggerProvider {
         call_count: Arc<Mutex<usize>>,
+        models: Arc<Mutex<Vec<String>>>,
     }
 
     #[async_trait]
@@ -22388,12 +23722,13 @@ model_provider = "custom.only"
         async fn chat(
             &self,
             _request: ChatRequest<'_>,
-            _model: &str,
+            model: &str,
             _temperature: Option<f64>,
         ) -> Result<zeroclaw_providers::ChatResponse> {
             // The unified loop drives the streaming wrapper through `chat`
             // (stream events are synthesized post-hoc), so the tool call that
             // queues the switch is emitted here on the first call.
+            self.models.lock().push(model.to_string());
             let mut count = self.call_count.lock();
             *count += 1;
             if *count == 1 {
@@ -22515,6 +23850,100 @@ model_provider = "custom.only"
         }
     }
 
+    #[tokio::test]
+    async fn turn_streamed_accepts_equivalent_switch_and_returns_from_hint_route() {
+        use zeroclaw_config::schema::{
+            ClassificationRule, ModelEntryConfig, QueryClassificationConfig,
+        };
+        for hinted in [false, true] {
+            let mut config = Config::default();
+            let profile = config.providers.models.ensure("openai", "primary").unwrap();
+            profile.models.insert(
+                "default".into(),
+                ModelEntryConfig {
+                    id: Some("primary-model".into()),
+                    ..Default::default()
+                },
+            );
+            config
+                .providers
+                .models
+                .ensure("openai", "reasoning")
+                .unwrap()
+                .model = Some("reasoning-model".into());
+            let identity = zeroclaw_providers::model::resolve_model_identity(
+                &zeroclaw_config::migration::admit_test_input(&config),
+                "test",
+                "openai.primary",
+                None,
+            )
+            .unwrap();
+            let calls = Arc::new(Mutex::new(0));
+            let models = Arc::new(Mutex::new(Vec::new()));
+            let resolver = Arc::new(zeroclaw_providers::router::ModelRouteResolver::new(
+                vec![(
+                    "reasoning".into(),
+                    zeroclaw_providers::router::Route {
+                        provider_name: "openai.reasoning".into(),
+                        model: "reasoning-model".into(),
+                    },
+                )],
+                "openai.primary".into(),
+                "primary-model".into(),
+            ));
+            let workspace = tempfile::TempDir::new().unwrap();
+            let mut agent = Agent::builder()
+                .model_provider(Box::new(StreamSwitchTriggerProvider {
+                    call_count: Arc::clone(&calls),
+                    models: Arc::clone(&models),
+                }))
+                .model_provider_name("openai.primary".into())
+                .model_name("primary-model".into())
+                .model_identity(identity)
+                .model_route_resolver(resolver)
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![Box::new(ModelSwitchTriggerTool {
+                        target_provider: "openai.primary".into(),
+                        target_model: "primary-model".into(),
+                    })],
+                ))
+                .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+                .observer(Arc::new(crate::observability::NoopObserver))
+                .workspace_dir(workspace.path().to_path_buf())
+                .classification_config(QueryClassificationConfig {
+                    enabled: hinted,
+                    rules: vec![ClassificationRule {
+                        hint: "reasoning".into(),
+                        keywords: vec!["switch".into()],
+                        priority: 1,
+                        ..Default::default()
+                    }],
+                })
+                .provider_switch_config(ProviderSwitchConfig {
+                    config: Some(Arc::new(zeroclaw_config::migration::admit_test_input(
+                        &config,
+                    ))),
+                    ..Default::default()
+                })
+                .build()
+                .unwrap();
+            let (events, _receiver) = tokio::sync::mpsc::channel(128);
+            agent
+                .turn_streamed("switch to the primary", events, None)
+                .await
+                .expect("a successful no-op or selector change must resume the turn");
+            assert_eq!(*calls.lock(), 2);
+            assert_eq!(
+                models.lock().last().map(String::as_str),
+                Some("primary-model")
+            );
+            let (_, provider, model) = agent.attribution_fields();
+            assert_eq!(model, "primary-model");
+            assert_eq!(provider, "openai.primary");
+        }
+    }
+
     /// A tool that queues a model switch and, in the same call, a steering
     /// message. The switch must still apply: steering waits for the switched
     /// provider instead of resuming on the old one.
@@ -22557,13 +23986,14 @@ model_provider = "custom.only"
         let initial_calls = Arc::new(Mutex::new(0usize));
         let provider = Box::new(StreamSwitchTriggerProvider {
             call_count: Arc::clone(&initial_calls),
+            models: Arc::default(),
         });
         let memory_cfg = zeroclaw_config::schema::MemoryConfig {
             backend: "none".into(),
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation"),
         );
         let switch_cfg = ProviderSwitchConfig {
@@ -22637,6 +24067,7 @@ model_provider = "custom.only"
         let initial_calls = Arc::new(Mutex::new(0usize));
         let provider = Box::new(StreamSwitchTriggerProvider {
             call_count: Arc::clone(&initial_calls),
+            models: Arc::default(),
         });
 
         let memory_cfg = zeroclaw_config::schema::MemoryConfig {
@@ -22644,31 +24075,37 @@ model_provider = "custom.only"
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation"),
         );
         let capturing = Arc::new(CapturingObserver::default());
         let observer: Arc<dyn Observer> = capturing.clone();
 
-        let switch_cfg = ProviderSwitchConfig {
-            config: Some(std::sync::Arc::new(zeroclaw_config::schema::Config {
+        let switch_config = {
+            let mut cfg = zeroclaw_config::schema::Config {
                 reliability: zeroclaw_config::schema::ReliabilityConfig {
                     provider_retries: 0,
                     provider_backoff_ms: 0,
                     ..zeroclaw_config::schema::ReliabilityConfig::default()
                 },
                 ..zeroclaw_config::schema::Config::default()
-            })),
+            };
+            let provider = cfg
+                .providers
+                .models
+                .ensure("ollama", "local")
+                .expect("ollama provider slot exists");
+            provider.uri = Some("http://127.0.0.1:1".into());
+            provider.model = Some("llama3".into());
+            provider.temperature = Some(0.55);
+            cfg
+        };
+        let switch_cfg = ProviderSwitchConfig {
+            config: Some(std::sync::Arc::new(switch_config)),
             live_config: None,
             live: None,
         };
-        let agent_config = zeroclaw_config::schema::AliasedAgentConfig {
-            resolved: zeroclaw_config::schema::ResolvedRuntime {
-                strict_tool_parsing: true,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
+        let agent_config = zeroclaw_config::schema::AliasedAgentConfig::default();
         let skills = vec![crate::skills::Skill {
             name: "deploy".into(),
             description: "Release safely".into(),
@@ -22687,7 +24124,7 @@ model_provider = "custom.only"
             .model_provider(provider)
             .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
                 vec![Box::new(ModelSwitchTriggerTool {
-                    target_provider: "ollama".to_string(),
+                    target_provider: "ollama.local".to_string(),
                     target_model: "llama3".to_string(),
                 })],
             ))
@@ -22722,12 +24159,18 @@ model_provider = "custom.only"
         // `turn_streamed` itself must have consumed the pending switch and
         // committed the rebuilt provider/model via `ProviderSwitchConfig`.
         assert_eq!(
-            agent.model_provider_name, "ollama",
+            agent.model_provider_name, "ollama.local",
             "turn_streamed must commit the switched provider after the tool result"
         );
         assert_eq!(
             agent.model_name, "llama3",
             "turn_streamed must commit the switched model after the tool result"
+        );
+        assert_eq!(
+            agent.effective_temperature(),
+            Some(0.55),
+            "turn_streamed must move the temperature to the switched profile's — \
+             this value is what the post-switch request in the same turn sends"
         );
         let prompt = match agent.history.first() {
             Some(ConversationMessage::Chat(message)) if message.role == "system" => {
@@ -22757,13 +24200,13 @@ model_provider = "custom.only"
             matches!(
                 e,
                 ObserverEvent::LlmRequest { model_provider, model, .. }
-                    if model_provider == "ollama" && model == "llama3"
+                    if model_provider == "ollama.local" && model == "llama3"
             )
         });
         assert!(
             switched_request,
             "turn_streamed must issue the next provider call against the switched \
-             provider/model (ollama/llama3); captured events: {events:?}"
+             provider/model (ollama.local/llama3); captured events: {events:?}"
         );
         drop(events);
     }
@@ -22844,7 +24287,9 @@ model_provider = "custom.only"
             entry.wire_api = Some(zeroclaw_config::schema::WireApi::ChatCompletions);
         }
         let switch_cfg = ProviderSwitchConfig {
-            config: Some(Arc::new(config)),
+            config: Some(Arc::new(zeroclaw_config::migration::admit_test_input(
+                &config,
+            ))),
             live_config: None,
             live: None,
         };
@@ -22853,7 +24298,6 @@ model_provider = "custom.only"
         let cap = 200_000;
         let agent_config = zeroclaw_config::schema::AliasedAgentConfig {
             resolved: zeroclaw_config::schema::ResolvedRuntime {
-                strict_tool_parsing: true,
                 max_system_prompt_chars: cap,
                 ..Default::default()
             },
@@ -22865,13 +24309,13 @@ model_provider = "custom.only"
         };
         let workspace = tempfile::TempDir::new().expect("temp dir");
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
-                .expect("memory creation"),
+            zeroclaw_memory::create_memory(&memory_cfg, workspace.path()).expect("memory creation"),
         );
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(Box::new(StreamSwitchTriggerProvider {
                 call_count: Arc::new(Mutex::new(0usize)),
+                models: Arc::default(),
             }))
             .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
                 vec![Box::new(ModelSwitchTriggerTool {
@@ -22938,7 +24382,7 @@ model_provider = "custom.only"
             ..zeroclaw_config::schema::MemoryConfig::default()
         };
         let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"))
                 .expect("memory creation should succeed with valid config"),
         );
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -23786,14 +25230,8 @@ mod capability_construction_tests {
                 .contains("actual-memory-identity")
         );
 
-        let (engine, audit) = crate::sop::build_sop_engine(
-            config.sop.clone(),
-            &config.decision_models,
-            &config.data_dir,
-            &config.install_root_dir(),
-            Arc::clone(&actual),
-            Default::default(),
-        );
+        let (engine, audit) =
+            crate::sop::build_sop_engine(&config, Arc::clone(&actual), Default::default(), None);
         let expected_engine = Arc::downgrade(&engine);
         let expected_audit = Arc::downgrade(&audit);
         let source = StatefulRecipe {
@@ -24252,9 +25690,11 @@ mod capability_construction_tests {
 
         // A model switch asks the same source through its switch entry, still
         // for the same principal.
-        let switched =
-            agent.try_apply_model_switch("gpt-4o-mini", "openai.smart".into(), "gpt-4o".into());
-        assert_eq!(switched.as_deref(), Some("gpt-4o"));
+        let switched = agent
+            .try_apply_model_switch("gpt-4o-mini", "openai.smart".into(), "gpt-4o".into())
+            .await
+            .unwrap();
+        assert_eq!(switched, ModelSwitchOutcome::Rebuilt("gpt-4o".into()));
         assert_eq!(
             *providers.switches.lock(),
             vec![SeenProviderRequest {
@@ -24384,13 +25824,18 @@ mod capability_construction_tests {
     async fn config_backed_capabilities_construct_and_switch_like_the_adapter() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = two_provider_config(&tmp);
+        zeroclaw_config::migration::bind_test_route_model(
+            &mut config,
+            "chat.ollama",
+            "tinyllama",
+            Some("route-specific-key"),
+        );
         config
             .model_routes
             .push(zeroclaw_config::schema::ModelRouteConfig {
-                model_provider: "ollama".to_string(),
-                model: "tinyllama".to_string(),
+                model_ref: "chat.ollama".to_string(),
+
                 hint: "fast".to_string(),
-                api_key: Some("route-specific-key".to_string()),
             });
 
         let mut supplied = Agent::from_config_with_capabilities(
@@ -24425,18 +25870,19 @@ mod capability_construction_tests {
         assert_eq!(construction(&supplied), construction(&adapter));
 
         for agent in [&mut supplied, &mut adapter] {
-            let switched = agent.try_apply_model_switch(
-                "gpt-4o-mini",
-                "ollama".to_string(),
-                "tinyllama".to_string(),
-            );
-            assert_eq!(switched.as_deref(), Some("tinyllama"));
-            assert_eq!(agent.model_provider_name, "ollama");
+            let switched = agent
+                .try_apply_model_switch(
+                    "gpt-4o-mini",
+                    "chat.ollama".to_string(),
+                    "tinyllama".to_string(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(switched, ModelSwitchOutcome::Rebuilt("tinyllama".into()));
+            assert_eq!(agent.model_provider_name, "chat.ollama");
             assert_eq!(
                 agent.model_route_resolver.resolve("hint:fast"),
-                config_switch_provider(&config, "test-agent", "ollama", "tinyllama")
-                    .expect("the shared switch recipe builds")
-                    .1
+                zeroclaw_providers::model_route_resolver(&config, "chat.ollama", "tinyllama",)
                     .resolve("hint:fast"),
                 "both agents carry the switch recipe's route resolver"
             );
@@ -24465,7 +25911,7 @@ mod capability_construction_tests {
         let principal = PrincipalId::for_oidc("https://issuer.example", "subject-spawn");
 
         let agent = Agent::from_config_with_capabilities(
-            &config,
+            &zeroclaw_config::migration::admit_test_input(&config),
             "test-agent",
             &capabilities(Arc::clone(&providers), Arc::clone(&memory)),
             Some(&principal),
@@ -24536,7 +25982,8 @@ mod capability_construction_tests {
             .expect("the registry built a delegate");
 
         delegate
-            .build_target_provider("test-agent", "openai.smart", "openai", None)
+            .build_target_provider("test-agent", None, "openai.smart")
+            .await
             .expect("the target resolves for the requesting principal");
         assert_eq!(
             *providers.served.lock(),
@@ -24601,9 +26048,11 @@ mod capability_construction_tests {
         );
         agent.sync_config_generation();
 
-        let switched =
-            agent.try_apply_model_switch("gpt-4o-mini", "openai.smart".into(), "gpt-4.1".into());
-        assert_eq!(switched.as_deref(), Some("gpt-4.1"));
+        let switched = agent
+            .try_apply_model_switch("gpt-4o-mini", "openai.smart".into(), "gpt-4.1".into())
+            .await
+            .unwrap();
+        assert_eq!(switched, ModelSwitchOutcome::Rebuilt("gpt-4.1".into()));
         assert_eq!(
             *providers.switch_target_models.lock(),
             vec![Some("gpt-4.1".to_string())],

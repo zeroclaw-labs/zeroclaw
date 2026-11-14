@@ -2444,22 +2444,22 @@
         "description": "Model provider selection submitted by the Quickstart builder.",
         "properties": {
           "alias": {
-            "description": "User-named alias. Defaults to `\"default\"` in the UI; users\noverride when stacking multiple aliases of the same provider\ntype (e.g. `anthropic-work`, `anthropic-personal`).",
+            "description": "Name suffix for the new connection and model. The generated\n`<kind>.<alias>` is one exact registry key, including any literal dots.",
             "type": "string"
           },
           "fields": {
             "additionalProperties": {
               "type": "string"
             },
-            "description": "Round-trip of every field the daemon described in\n`quickstart/fields`. Surfaces echo back exactly what was\nemitted; the daemon writes each entry under `<prefix>.<key>`\nusing its own schema knowledge.",
+            "description": "Round-trip of every field the daemon described in\n`quickstart/fields`. Surfaces echo back exactly what was\nemitted, such as `auth.api_key` and `uri`; the daemon constructs a\ntyped canonical connection using its own schema knowledge.",
             "type": "object"
           },
           "model": {
-            "description": "Model id written to `providers.models.<type>.<alias>.model` at\napply time.",
+            "description": "Upstream model ID written to the new canonical model's `model` field.",
             "type": "string"
           },
           "provider_type": {
-            "description": "Provider type identifier (`anthropic`, `openai`, `openrouter`,\n`ollama`, etc.). Used as the type segment in the TOML path.",
+            "description": "Provider type identifier (`anthropic`, `openai`, `openrouter`,\n`ollama`, etc.). Written as the new connection's `kind`.",
             "type": "string"
           }
         },
@@ -3028,6 +3028,22 @@
         },
         "required": [
           "submission"
+        ],
+        "type": "object"
+      },
+      "RegistryEdit": {
+        "additionalProperties": false,
+        "properties": {
+          "expected": {
+            "description": "Masked document originally read by the editor. Compared under the\nexisting config commit lock so a stale editor cannot overwrite changes."
+          },
+          "registry": {
+            "description": "Complete canonical registry candidate."
+          }
+        },
+        "required": [
+          "expected",
+          "registry"
         ],
         "type": "object"
       },
@@ -6300,6 +6316,62 @@
       "x-zeroclaw-params": {
         "shape": "typed",
         "type": "ConfigGetParams"
+      }
+    },
+    {
+      "name": "config/provider-registry",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "Free-form JSON shaped by the daemon at runtime."
+        },
+        "x-zeroclaw-shape": "untyped"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "config",
+        "verb": "read"
+      },
+      "x-zeroclaw-params": {
+        "shape": "none"
+      }
+    },
+    {
+      "name": "config/provider-registry-set",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "expected",
+          "required": true,
+          "schema": {
+            "description": "Masked document originally read by the editor. Compared under the\nexisting config commit lock so a stale editor cannot overwrite changes."
+          }
+        },
+        {
+          "name": "registry",
+          "required": true,
+          "schema": {
+            "description": "Complete canonical registry candidate."
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "Free-form JSON shaped by the daemon at runtime."
+        },
+        "x-zeroclaw-shape": "untyped"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "config",
+        "verb": "update"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "RegistryEdit"
       }
     },
     {

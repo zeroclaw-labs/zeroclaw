@@ -32,7 +32,7 @@ pub use binding::{
 pub use capability::{
     CapabilityContext, CapabilityInfo, CapabilityResult, SopCapability, SopCapabilityRegistry,
 };
-pub use decision::{DecisionModel, SopDecision, SopDecisionSpec, SystemOneClient};
+pub use decision::{Answer, Answers, DecisionModel, Question, SopDecision, SopDecisionSpec};
 pub use engine::{
     CancelOutcome, MaintenanceSummary, OrphanedRunSettlement, SopEngine,
     err_is_cancellation_persistence_retained, err_is_resume_at_capacity,
@@ -76,7 +76,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use types::{SopManifest, SopMeta};
-use zeroclaw_config::schema::SopConfig;
 use zeroclaw_memory::traits::Memory;
 
 /// Build the tool-spec map an SOP graph projection uses to type step pins.
@@ -115,8 +114,8 @@ pub struct SopEngineAdapters {
     /// Runs one bounded model call as a pipeline step (`llm.generate`).
     pub llm: Option<Arc<dyn capability::LlmGenerateAdapter>>,
     /// Extra decision models by alias, added to (and overriding) the ones built
-    /// from `[decision_models]`. Used by tests and embedders.
-    pub decision: std::collections::HashMap<String, Arc<dyn decision::DecisionModel>>,
+    /// from the canonical provider registry. Used by tests and embedders.
+    pub decision: std::collections::HashMap<String, Arc<dyn zeroclaw_api::decision::DecisionModel>>,
 }
 
 /// Build a single shared SopEngine + SopAuditLogger pair.
@@ -125,55 +124,18 @@ pub struct SopEngineAdapters {
 /// handles — never call `SopEngine::new` or `SopAuditLogger::new`
 /// directly outside this module.
 ///
-/// The two directory arguments serve different roles and must not be conflated:
-/// - `data_dir` is the daemon state dir. It anchors the durable run store, which
-///   lands at `<data_dir>/sop/runs.db` unless `[sop] run_state_dir` overrides it.
-/// - `install_root` is the install root (`config.install_root_dir()`, i.e.
-///   `config_path`'s parent). It anchors SOP-*definition* loading, so a relative
-///   `[sop] sops_dir` (documented `shared/sops`) resolves to `<install>/shared/sops`
-///   — the same directory the web/RPC SOP author writes to. Passing `data_dir` for
-///   both (the historical bug) made the engine load definitions from `<data_dir>/sops`,
-///   which authored SOPs never populate, so every manual trigger reported "no
-///   matching manual trigger".
+/// Configuration owns the SOP settings, provider registry and both directory
+/// roots. Callers supply only resources and execution authority they own.
 pub fn build_sop_engine(
-    config: SopConfig,
-    decision_models: &std::collections::HashMap<
-        String,
-        zeroclaw_config::schema::SopDecisionModelConfig,
-    >,
-    data_dir: &Path,
-    install_root: &Path,
-    audit_memory: Arc<dyn Memory>,
-    adapters: SopEngineAdapters,
-) -> (Arc<Mutex<SopEngine>>, Arc<SopAuditLogger>) {
-    build_sop_engine_with_capability(
-        config,
-        decision_models,
-        data_dir,
-        install_root,
-        audit_memory,
-        adapters,
-        None,
-    )
-}
-
-/// Build a SOP engine with the daemon-owned execution capability already
-/// attached. Managed startup must use this constructor before maintenance or
-/// any producer can create an action; `None` remains for unmanaged source and
-/// test callers only.
-pub fn build_sop_engine_with_capability(
-    config: SopConfig,
-    decision_models: &std::collections::HashMap<
-        String,
-        zeroclaw_config::schema::SopDecisionModelConfig,
-    >,
-    data_dir: &Path,
-    install_root: &Path,
+    config: &zeroclaw_config::schema::Config,
     audit_memory: Arc<dyn Memory>,
     adapters: SopEngineAdapters,
     execution_capability: Option<crate::live_config_authority::AgentExecutionCapability>,
 ) -> (Arc<Mutex<SopEngine>>, Arc<SopAuditLogger>) {
-    let mut decision_models = decision::models_from_config(decision_models);
+    let mut decision_models = decision::models_from_config(config);
+    let data_dir = &config.data_dir;
+    let install_root = config.install_root_dir();
+    let config = config.sop.clone();
     let SopEngineAdapters {
         route: route_adapter,
         forge: forge_adapter,
@@ -225,7 +187,7 @@ pub fn build_sop_engine_with_capability(
     if let Some(execution_capability) = execution_capability {
         engine = engine.with_execution_capability(execution_capability);
     }
-    engine.reload(install_root);
+    engine.reload(&install_root);
     engine.restore_runs();
     let engine = Arc::new(Mutex::new(engine));
     let audit = Arc::new(SopAuditLogger::new(audit_memory));
@@ -2127,7 +2089,7 @@ mod tests {
             Sop, SopAdmissionPolicy, SopEvent, SopExecutionMode, SopPriority, SopRunAction,
             SopStep, SopStepKind, SopTriggerSource,
         };
-        let mut engine = SopEngine::new(crate::sop::SopConfig::default());
+        let mut engine = SopEngine::new(zeroclaw_config::schema::SopConfig::default());
         engine.set_sops_for_test(vec![Sop {
             name: "detail-test".into(),
             description: "run detail lookup regression".into(),

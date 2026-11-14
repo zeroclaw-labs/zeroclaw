@@ -30,11 +30,33 @@ pub struct TurnUsage {
 pub fn build_model_provider_pricing(config: &Config) -> ModelProviderPricing {
     let mut pricing: ModelProviderPricing = HashMap::new();
 
-    for (type_k, alias_k, profile) in config.providers.models.iter_entries() {
-        let mut slot = profile.pricing.clone();
-        apply_rate_sheet_pricing(config, type_k, &mut slot);
-        if !slot.is_empty() {
-            pricing.insert(format!("{type_k}.{alias_k}"), slot);
+    // Input migration has already normalized the registry. Every billing owner
+    // is an exact model reference.
+    if let Ok(registry) = config.provider_registry() {
+        for (model_ref, model) in &registry.models {
+            let zeroclaw_config::provider_registry::ModelDefinition::Chat(chat) = model else {
+                continue;
+            };
+            let mut slot = HashMap::new();
+            let model_id = chat.model.as_deref().unwrap_or(model_ref.as_str());
+            if let Some(rates) = chat.metadata.pricing.as_ref() {
+                if let Some(input) = rates.input_per_mtok {
+                    slot.insert(format!("{model_id}.input"), input);
+                }
+                if let Some(output) = rates.output_per_mtok {
+                    slot.insert(format!("{model_id}.output"), output);
+                }
+                if let Some(cached) = rates.cached_input_per_mtok {
+                    slot.insert(format!("{model_id}.cached_input"), cached);
+                }
+                if let Some(write) = rates.cache_write_per_mtok {
+                    slot.insert(format!("{model_id}.cache_write"), write);
+                }
+            }
+            if let Some(connection) = registry.connections.get(&chat.provider) {
+                apply_rate_sheet_pricing(config, connection.kind(), &mut slot);
+            }
+            pricing.insert(model_ref.to_string(), slot);
         }
     }
 
@@ -58,55 +80,20 @@ pub fn tool_loop_cost_tracking_context_from_tracker(
         .with_agent_alias(agent_alias)
 }
 
-pub fn build_type_level_model_provider_pricing(config: &Config) -> ModelProviderPricing {
-    let mut pricing: ModelProviderPricing = HashMap::new();
-
-    for (type_k, _alias_k, profile) in config.providers.models.iter_entries() {
-        if profile.pricing.is_empty() {
-            continue;
-        }
-        let slot = pricing.entry(type_k.to_string()).or_default();
-        merge_pricing(slot, &profile.pricing);
-    }
-
-    for (provider_type, _model_id, _rates) in config.cost.rates.providers.models.iter_entries() {
-        let slot = pricing.entry(provider_type.to_string()).or_default();
-        apply_rate_sheet_pricing(config, provider_type, slot);
-    }
-
-    pricing
-}
-
 pub fn provider_pricing<'a>(
     pricing: &'a ModelProviderPricing,
     model_provider_name: &str,
 ) -> Option<&'a HashMap<String, f64>> {
-    if let Some(slot) = pricing.get(model_provider_name) {
-        return Some(slot);
-    }
+    provider_pricing_entry(pricing, model_provider_name).map(|(_, slot)| slot)
+}
 
-    // Type-keyed maps are still used in the channels path; when the lookup
-    // arrives as `<type>.<alias>`, fall back to the bare provider family.
-    if let Some((provider_type, _alias)) = model_provider_name.split_once('.')
-        && let Some(slot) = pricing.get(provider_type)
-    {
-        return Some(slot);
-    }
-
-    // Some call sites surface only the bare provider type while the
-    // pricing view is keyed by `<type>.<alias>`. Fall back only when the
-    // type resolves to exactly one alias entry so pricing stays deterministic.
-    let prefix = format!("{model_provider_name}.");
-    let mut matches = pricing
-        .iter()
-        .filter(|(key, _)| key.starts_with(&prefix))
-        .map(|(_, slot)| slot);
-    let first = matches.next()?;
-    if matches.next().is_none() {
-        Some(first)
-    } else {
-        None
-    }
+fn provider_pricing_entry<'a>(
+    pricing: &'a ModelProviderPricing,
+    model_provider_name: &str,
+) -> Option<(&'a str, &'a HashMap<String, f64>)> {
+    pricing
+        .get_key_value(model_provider_name)
+        .map(|(model_ref, slot)| (model_ref.as_str(), slot))
 }
 
 fn apply_rate_sheet_pricing(config: &Config, provider_type: &str, slot: &mut HashMap<String, f64>) {
@@ -126,12 +113,6 @@ fn apply_rate_sheet_pricing(config: &Config, provider_type: &str, slot: &mut Has
         if let Some(write) = rates.cache_write_per_mtok {
             slot.insert(format!("{model_id}.cache_write"), write);
         }
-    }
-}
-
-fn merge_pricing(slot: &mut HashMap<String, f64>, pricing: &HashMap<String, f64>) {
-    for (key, value) in pricing {
-        slot.insert(key.clone(), *value);
     }
 }
 
@@ -386,7 +367,9 @@ fn price_usage(
         .try_with(Clone::clone)
         .ok()
         .flatten()?;
-    let pricing = provider_pricing(&ctx.model_provider_pricing, model_provider_name);
+    let pricing_entry = provider_pricing_entry(&ctx.model_provider_pricing, model_provider_name);
+    let pricing = pricing_entry.map(|(_, slot)| slot);
+    let billing_profile = pricing_entry.map_or(model_provider_name, |(profile, _)| profile);
     let config_rates = normalized_rates(
         pricing
             .map(|map| resolve_rates_opt(map, model))
@@ -402,7 +385,7 @@ fn price_usage(
         (!config_rates.is_complete() || config_rates.cache_write_per_mtok.is_none()).then_some(live)
     } else {
         (!config_rates.is_complete() || config_rates.cache_write_per_mtok.is_none())
-            .then(|| live_pricing_for(model_provider_name, model))
+            .then(|| live_pricing_for(billing_profile, model))
             .flatten()
     };
     let mut rates = normalized_rates(merge_config_and_live_rates(config_rates, live));
@@ -1297,12 +1280,58 @@ mod tests {
     }
 
     #[test]
-    fn provider_pricing_resolves_composite_and_bare_type_keys() {
+    fn pricing_does_not_infer_missing_model_refs_from_admitted_keys() {
+        let mut config = Config::default();
+        let prefix = config.providers.models.ensure("custom", "gw").unwrap();
+        prefix.pricing.insert("shared-id".into(), 1.0);
+        config.providers.models.ensure("custom", "gw.v2").unwrap();
+        let pricing =
+            build_model_provider_pricing(&zeroclaw_config::migration::admit_test_input(&config));
+        assert!(
+            provider_pricing(&pricing, "custom.gw.v2")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(provider_pricing(&pricing, "custom").is_none());
+        assert!(provider_pricing(&pricing, "custom.gw.v2.fast").is_none());
+        assert_eq!(
+            provider_pricing_entry(&pricing, "custom.gw.v2").unwrap().0,
+            "custom.gw.v2"
+        );
+    }
+
+    #[test]
+    fn provider_pricing_treats_dotted_model_keys_as_opaque() {
+        let pricing = HashMap::from([
+            (
+                "custom.gw".into(),
+                HashMap::from([("shared-id".into(), 1.0)]),
+            ),
+            (
+                "custom.gw.v2".into(),
+                HashMap::from([("shared-id".into(), 2.0)]),
+            ),
+        ]);
+        assert_eq!(
+            provider_pricing(&pricing, "custom.gw").unwrap()["shared-id"],
+            1.0
+        );
+        assert_eq!(
+            provider_pricing(&pricing, "custom.gw.v2").unwrap()["shared-id"],
+            2.0
+        );
+        assert!(provider_pricing(&pricing, "custom.gw-other.small").is_none());
+        assert!(provider_pricing(&pricing, "custom.gw.small").is_none());
+        assert!(provider_pricing(&pricing, "custom.gw.v2.small").is_none());
+    }
+
+    #[test]
+    fn provider_pricing_resolves_only_exact_registered_keys() {
         let mut model_rates: HashMap<String, f64> = HashMap::new();
         model_rates.insert("glm-5.1.input".to_string(), 1.4);
         model_rates.insert("glm-5.1.output".to_string(), 4.4);
 
-        // CLI / agent-loop builder keys by the composite `<type>.<alias>`.
+        // A migrated key remains a whole key even when it resembles a profile.
         let mut composite_keyed: ModelProviderPricing = HashMap::new();
         composite_keyed.insert("glm.default".to_string(), model_rates.clone());
         assert!(
@@ -1310,19 +1339,25 @@ mod tests {
             "composite-keyed map must resolve via the verbatim composite lookup"
         );
 
-        // Channel orchestrator builder keys by the bare provider `<type>`, yet
-        // the lookup still arrives as the composite alias — must fall back.
-        let mut type_keyed: ModelProviderPricing = HashMap::new();
-        type_keyed.insert("glm".to_string(), model_rates.clone());
+        // A unique matching prefix still does not name a configured model.
         assert!(
-            provider_pricing(&type_keyed, "glm.default").is_some(),
-            "type-keyed map must resolve the composite alias via the bare-type fallback"
+            provider_pricing(&composite_keyed, "glm").is_none(),
+            "bare-type lookup must not infer a model reference"
+        );
+
+        // Ambiguous bare-type lookup (two aliases of one type) must not guess.
+        let mut two_aliases: ModelProviderPricing = HashMap::new();
+        two_aliases.insert("glm.work".to_string(), model_rates.clone());
+        two_aliases.insert("glm.personal".to_string(), model_rates.clone());
+        assert!(
+            provider_pricing(&two_aliases, "glm").is_none(),
+            "bare-type lookup must stay deterministic and refuse to pick among aliases"
         );
 
         // An unrelated provider must not accidentally match.
         assert!(
-            provider_pricing(&type_keyed, "openai.default").is_none(),
-            "fallback must not resolve a provider type absent from the map"
+            provider_pricing(&composite_keyed, "openai.default").is_none(),
+            "lookup must not resolve a provider type absent from the map"
         );
     }
 
@@ -1383,7 +1418,8 @@ mod tests {
             },
         );
 
-        let pricing = build_model_provider_pricing(&config);
+        let pricing =
+            build_model_provider_pricing(&zeroclaw_config::migration::admit_test_input(&config));
         assert_eq!(
             provider_pricing(&pricing, "openai.fast")
                 .unwrap()
@@ -1451,6 +1487,51 @@ mod tests {
     }
 
     #[test]
+    fn canonical_model_metadata_prices_exact_refs_independently() {
+        let config = Config {
+            providers: toml::from_str(
+                r#"
+[connections."gateway.prod"]
+kind = "custom"
+[models."chat.fast.us"]
+capability = "chat"
+provider = "gateway.prod"
+model = "same-wire-id"
+[models."chat.fast.us".metadata.pricing]
+input_per_mtok = 0.0
+output_per_mtok = 2.0
+cached_input_per_mtok = 0.0
+cache_write_per_mtok = 0.5
+[models."chat.backup"]
+capability = "chat"
+provider = "gateway.prod"
+model = "same-wire-id"
+[models."chat.backup".metadata.pricing]
+input_per_mtok = 3.0
+output_per_mtok = 4.0
+"#,
+            )
+            .unwrap(),
+            ..Config::default()
+        };
+        let pricing = build_model_provider_pricing(&config);
+        let fast = resolve_rates_opt(
+            provider_pricing(&pricing, "chat.fast.us").unwrap(),
+            "same-wire-id",
+        );
+        let backup = resolve_rates_opt(
+            provider_pricing(&pricing, "chat.backup").unwrap(),
+            "same-wire-id",
+        );
+        assert_eq!(fast.input_per_mtok, Some(0.0));
+        assert_eq!(fast.output_per_mtok, Some(2.0));
+        assert_eq!(fast.cached_input_per_mtok, Some(0.0));
+        assert_eq!(fast.cache_write_per_mtok, Some(0.5));
+        assert_eq!(backup.input_per_mtok, Some(3.0));
+        assert_eq!(backup.output_per_mtok, Some(4.0));
+    }
+
+    #[test]
     fn build_model_provider_pricing_prefers_rate_sheet_over_legacy_alias_pricing() {
         let mut config = Config::default();
         config.providers.models.deepseek.insert(
@@ -1473,7 +1554,8 @@ mod tests {
             },
         );
 
-        let alias_map = build_model_provider_pricing(&config);
+        let alias_map =
+            build_model_provider_pricing(&zeroclaw_config::migration::admit_test_input(&config));
         let deepseek = alias_map
             .get("deepseek.default")
             .expect("deepseek alias pricing");
@@ -1496,6 +1578,7 @@ mod tests {
             "work".to_string(),
             DeepseekModelProviderConfig {
                 base: ModelProviderConfig {
+                    model: Some("deepseek-v4-flash".into()),
                     pricing: HashMap::from([("deepseek-v4-flash.output".into(), 0.77)]),
                     ..Default::default()
                 },
@@ -1505,13 +1588,15 @@ mod tests {
             "personal".to_string(),
             DeepseekModelProviderConfig {
                 base: ModelProviderConfig {
+                    model: Some("deepseek-v4-flash".into()),
                     pricing: HashMap::from([("deepseek-v4-flash.output".into(), 0.91)]),
                     ..Default::default()
                 },
             },
         );
 
-        let alias_map = build_model_provider_pricing(&config);
+        let alias_map =
+            build_model_provider_pricing(&zeroclaw_config::migration::admit_test_input(&config));
         let work = alias_map.get("deepseek.work").expect("work alias pricing");
         let personal = alias_map
             .get("deepseek.personal")
@@ -1525,91 +1610,125 @@ mod tests {
     }
 
     #[test]
-    fn build_type_level_model_provider_pricing_merges_aliases_and_rate_sheet() {
+    fn build_model_provider_pricing_prices_each_model_within_one_profile() {
         let mut config = Config::default();
         config.providers.models.deepseek.insert(
             "work".to_string(),
             DeepseekModelProviderConfig {
                 base: ModelProviderConfig {
+                    models: ["flash", "pro"]
+                        .into_iter()
+                        .map(|name| {
+                            (
+                                name.into(),
+                                zeroclaw_config::schema::ModelEntryConfig {
+                                    id: Some(format!("deepseek-v4-{name}")),
+                                    ..Default::default()
+                                },
+                            )
+                        })
+                        .collect(),
                     pricing: HashMap::from([
-                        ("deepseek-v4-flash.input".into(), 0.33),
                         ("deepseek-v4-flash.output".into(), 0.77),
+                        ("deepseek-v4-pro.output".into(), 1.55),
                     ]),
                     ..Default::default()
                 },
             },
         );
-        config.providers.models.deepseek.insert(
-            "personal".to_string(),
-            DeepseekModelProviderConfig {
-                base: ModelProviderConfig {
-                    pricing: HashMap::from([("deepseek-v4-flash.output".into(), 0.91)]),
-                    ..Default::default()
-                },
-            },
-        );
-        config.cost.rates.providers.models.deepseek.insert(
-            "deepseek-v4-flash".to_string(),
-            zeroclaw_config::schema::ModelCostRates {
-                input_per_mtok: Some(0.14),
-                output_per_mtok: Some(0.28),
-                cached_input_per_mtok: Some(0.0028),
-                cache_write_per_mtok: None,
-            },
-        );
+        let alias_map =
+            build_model_provider_pricing(&zeroclaw_config::migration::admit_test_input(&config));
+        let flash = alias_map
+            .get("deepseek.work.flash")
+            .expect("flash model pricing");
+        let pro = alias_map
+            .get("deepseek.work.pro")
+            .expect("pro model pricing");
+        assert_eq!(flash.get("deepseek-v4-flash.output").copied(), Some(0.77));
+        assert_eq!(pro.get("deepseek-v4-pro.output").copied(), Some(1.55));
+        assert!(!flash.contains_key("deepseek-v4-pro.output"));
+        assert!(!pro.contains_key("deepseek-v4-flash.output"));
 
-        let by_type = build_type_level_model_provider_pricing(&config);
-        let deepseek = by_type.get("deepseek").expect("deepseek type pricing");
-        assert_eq!(deepseek.get("deepseek-v4-flash.input").copied(), Some(0.14));
+        // Each exact model reference has its own prices, even on one connection.
         assert_eq!(
-            deepseek.get("deepseek-v4-flash.output").copied(),
-            Some(0.28)
+            resolve_rates_opt(flash, "deepseek-v4-flash").output_per_mtok,
+            Some(0.77)
         );
         assert_eq!(
-            deepseek.get("deepseek-v4-flash.cached_input").copied(),
-            Some(0.0028)
+            resolve_rates_opt(pro, "deepseek-v4-pro").output_per_mtok,
+            Some(1.55)
         );
     }
 
     #[test]
-    fn build_type_level_model_provider_pricing_keeps_legacy_last_alias_wins_behavior() {
+    fn multiple_custom_aliases_price_independently_end_to_end() {
+        use zeroclaw_config::schema::CustomModelProviderConfig;
+
+        // Two `custom.*` gateways of the SAME provider family, each pricing its
+        // own model id at a different rate — the classic "多个 provider.custom.*"
+        // case. Under the old type-keyed map they collided into one slot; now
+        // each `<type>.<alias>` gets its own slot.
         let mut config = Config::default();
-        config.providers.models.deepseek.insert(
-            "work".to_string(),
-            DeepseekModelProviderConfig {
+        config.providers.models.custom.insert(
+            "cheap".to_string(),
+            CustomModelProviderConfig {
                 base: ModelProviderConfig {
-                    pricing: HashMap::from([("deepseek-v4-flash.output".into(), 0.77)]),
+                    model: Some("gpt-4o-mini".into()),
+                    pricing: HashMap::from([
+                        ("gpt-4o-mini.input".into(), 0.10),
+                        ("gpt-4o-mini.output".into(), 0.40),
+                    ]),
                     ..Default::default()
                 },
             },
         );
-        config.providers.models.deepseek.insert(
-            "personal".to_string(),
-            DeepseekModelProviderConfig {
+        config.providers.models.custom.insert(
+            "premium".to_string(),
+            CustomModelProviderConfig {
                 base: ModelProviderConfig {
-                    pricing: HashMap::from([("deepseek-v4-flash.output".into(), 0.91)]),
+                    model: Some("gpt-4o".into()),
+                    pricing: HashMap::from([
+                        ("gpt-4o.input".into(), 5.0),
+                        ("gpt-4o.output".into(), 15.0),
+                    ]),
                     ..Default::default()
                 },
             },
         );
 
-        let mut expected = HashMap::new();
-        for (type_k, _alias_k, profile) in config.providers.models.iter_entries() {
-            if profile.pricing.is_empty() {
-                continue;
-            }
-            let slot = expected
-                .entry(type_k.to_string())
-                .or_insert_with(HashMap::new);
-            for (key, value) in &profile.pricing {
-                slot.insert(key.clone(), *value);
-            }
-        }
+        let map =
+            build_model_provider_pricing(&zeroclaw_config::migration::admit_test_input(&config));
 
-        let by_type = build_type_level_model_provider_pricing(&config);
-        let deepseek = by_type.get("deepseek").expect("deepseek type pricing");
-        let expected_deepseek = expected.get("deepseek").expect("expected deepseek pricing");
-        assert_eq!(deepseek, expected_deepseek);
+        // Builder keys each alias separately.
+        assert!(map.contains_key("custom.cheap"), "cheap alias has a slot");
+        assert!(
+            map.contains_key("custom.premium"),
+            "premium alias has a slot"
+        );
+
+        // Full lookup chain: exact `<type>.<alias>` provider key, then per-model id.
+        let cheap = provider_pricing(&map, "custom.cheap").expect("cheap pricing resolves");
+        assert_eq!(
+            resolve_rates_opt(cheap, "gpt-4o-mini").output_per_mtok,
+            Some(0.40)
+        );
+        // The premium model id is NOT priced under the cheap gateway — no bleed.
+        assert!(resolve_rates_opt(cheap, "gpt-4o").output_per_mtok.is_none());
+
+        let premium = provider_pricing(&map, "custom.premium").expect("premium pricing resolves");
+        assert_eq!(
+            resolve_rates_opt(premium, "gpt-4o").output_per_mtok,
+            Some(15.0)
+        );
+        assert!(
+            resolve_rates_opt(premium, "gpt-4o-mini")
+                .output_per_mtok
+                .is_none()
+        );
+
+        // Bare `custom` is ambiguous across two aliases → deterministic None
+        // (never silently bill at the wrong gateway's rate).
+        assert!(provider_pricing(&map, "custom").is_none());
     }
 
     #[test]
@@ -2009,7 +2128,8 @@ mod tests {
                 cache_write_per_mtok: None,
             },
         );
-        let mut pricing = build_model_provider_pricing(&config);
+        let mut pricing =
+            build_model_provider_pricing(&zeroclaw_config::migration::admit_test_input(&config));
         pricing.insert(
             "partial".to_string(),
             HashMap::from([("partial-model.input".to_string(), 2.0)]),

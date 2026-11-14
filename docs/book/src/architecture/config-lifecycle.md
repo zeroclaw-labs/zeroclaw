@@ -46,8 +46,8 @@ Config load has a few distinct phases:
 1. Resolve the install root from bootstrap env vars. This happens before any
    `Config` exists, so bootstrap names keep their uppercase form and do not use
    the schema-mirror grammar.
-2. Read `config.toml`, run schema migration in memory, decrypt configured
-   secrets, and record any malformed security-critical sections as degraded
+2. Read `config.toml`, run schema migration and provider-input normalization
+   in memory, decrypt configured secrets, and record any malformed security-critical sections as degraded
    security.
 3. Apply schema-mirror overrides to the in-memory config. In env vars,
    `__` maps to `.`, so `ZEROCLAW_providers__models__openai__api_key`
@@ -56,6 +56,19 @@ Config load has a few distinct phases:
 
 On a fresh install, defaults are saved before env overrides are applied. This
 keeps env-injected secrets and local CI values out of the new file.
+
+Historical provider/profile, speech-section and embedding-route input is decoded
+before `Config` escapes deserialization. The returned value owns canonical
+connections and model definitions; registry getters, validation, Quickstart and
+editors consume that value without migrating it again. Input structs share the
+same field declarations as the current schema. Programmatically constructed
+configuration must supply canonical definitions; historical shapes belong only
+to migration input and explicitly admitted test fixtures.
+
+Structural disk migration uses the same normalization and rewrites only the
+provider-related sections and references, preserving unrelated fields and
+comments. A V4 stamp alone does not exempt historical provider tables from this
+step. No schema-version bump beyond V4 is introduced.
 
 ## Env overrides are not saved
 

@@ -313,7 +313,7 @@ pub struct QQChannel {
     proxy_url: Option<String>,
     /// Optional voice transcription manager for QQ audio attachments that do
     /// not already carry QQ platform ASR text.
-    transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
+    transcription_manager: Option<Arc<zeroclaw_providers::transcription::TranscriptionManager>>,
     /// Session ID from the last READY event, used for gateway resume (opcode 6).
     session_id: Arc<RwLock<Option<String>>>,
     /// Last sequence number received, used for gateway resume (opcode 6).
@@ -363,14 +363,12 @@ impl QQChannel {
 
     /// Configure voice transcription from a `[transcription]` snapshot.
     ///
-    /// Compatibility and test path. The daemon routes every channel through
-    /// `with_transcription_manager` with a manager built from live
-    /// config and the owning agent's resolved provider; this path can only see
-    /// the legacy section, so it binds a lone registered provider and
-    /// otherwise leaves the choice unbound (see
-    /// `transcription::manager_from_snapshot`).
-    pub fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
-        let manager = super::transcription::manager_from_snapshot(&config);
+    /// Test fixture only: project historical input before constructing the
+    /// canonical manager. Production injects a manager built from the live
+    /// configuration and the owning agent's exact model reference.
+    #[cfg(test)]
+    fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
+        let manager = crate::transcription_fixture(&config);
         self.with_transcription_manager(config, manager)
     }
 
@@ -380,7 +378,7 @@ impl QQChannel {
     pub(crate) fn with_transcription_manager(
         mut self,
         _config: zeroclaw_config::schema::TranscriptionConfig,
-        manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
+        manager: Option<std::sync::Arc<zeroclaw_providers::transcription::TranscriptionManager>>,
     ) -> Self {
         if let Some(manager) = manager {
             self.transcription_manager = Some(manager);

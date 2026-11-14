@@ -27,7 +27,7 @@ Inside the runtime, all capability construction funnels through a small number o
 | `agent::loop_::run` | provider, memory, observer, tool registry |
 | `agent::loop_::process_message_shared` | provider, memory, observer, tool registry |
 | `Agent::from_config_with_session_cwd_and_mcp_approval_mode` | provider, memory, observer |
-| `Agent::try_apply_model_switch`, `build_session_model_provider` | provider |
+| `Agent::try_apply_model_switch`, `BoundCapabilities::build_model` | provider |
 | `agent::turn::assemble_owned_execution` | memory, tool registry |
 | `tools::delegate` (`build_target_provider`, `memory_for_target_agent`, `independent_agentic_tools_for_target`) | provider, memory, tool registry for a delegate target |
 | `daemon::run`, `daemon::run_heartbeat_worker` | memory, observer |

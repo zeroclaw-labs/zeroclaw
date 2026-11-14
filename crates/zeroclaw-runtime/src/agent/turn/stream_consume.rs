@@ -83,11 +83,11 @@ pub(crate) async fn consume_provider_streaming_response(
     messages: &[ChatMessage],
     request_tools: Option<&[crate::tools::ToolSpec]>,
     model: &str,
-    temperature: Option<f64>,
+    temperature: impl Into<zeroclaw_api::model_provider::CallSampling> + Send,
     cancellation_token: Option<&CancellationToken>,
     on_delta: Option<&tokio::sync::mpsc::Sender<DraftEvent>>,
     event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
-    strict_tool_parsing: bool,
+    text_tool_calls_disabled: bool,
     draft_reasoning: StreamReasoningMode,
     guard_tools: Option<&[crate::tools::ToolSpec]>,
 ) -> Result<StreamedChatOutcome> {
@@ -106,7 +106,9 @@ pub(crate) async fn consume_provider_streaming_response(
         cancellation_token,
         on_delta,
         event_tx,
-        strict_tool_parsing,
+        text_tool_calls_disabled,
+        true,
+        None,
         draft_reasoning,
         zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
         guard_tools,
@@ -122,27 +124,34 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
     model_provider: &dyn ModelProvider,
     request: ChatRequest<'_>,
     model: &str,
-    temperature: Option<f64>,
+    temperature: impl Into<zeroclaw_api::model_provider::CallSampling> + Send,
     cancellation_token: Option<&CancellationToken>,
     on_delta: Option<&tokio::sync::mpsc::Sender<DraftEvent>>,
     event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
-    strict_tool_parsing: bool,
+    text_tool_calls_disabled: bool,
+    extract_text_reasoning: bool,
+    config: Option<&zeroclaw_config::schema::Config>,
     draft_reasoning: StreamReasoningMode,
     policy: zeroclaw_api::model_provider::ToolRoundPolicy,
     guard_tools: Option<&[crate::tools::ToolSpec]>,
 ) -> Result<StreamedChatOutcome> {
     let request_tools = request.tools;
     let mut provider_stream = ProviderDispatch::from_ref(model_provider)
-        .stream_chat_with_tool_round_policy(
+        .stream_chat_with_sampling_and_tool_round_policy(
             request,
             model,
-            temperature,
+            temperature.into(),
             zeroclaw_providers::traits::StreamOptions::new(true),
             policy,
         );
     let mut outcome = StreamedChatOutcome::default();
     let mut delta_sender = on_delta;
     let mut think_stripper = StreamThinkTagStripper::default();
+    let mut extraction = zeroclaw_config::provider_registry::TextExtraction {
+        reasoning: extract_text_reasoning,
+        tool_calls: !text_tool_calls_disabled,
+    };
+    let mut extraction_model_ref: Option<String> = None;
     let mut marker_stripper = StreamTerminalMarkerStripper::new();
     let mut text_guard = StreamTextGuard::new(guard_tools);
     // Correlates PreExecutedToolCall events with their later results so both
@@ -223,15 +232,33 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
             break;
         };
 
+        // Reliable selects its stream before forwarding the first event. Use
+        // that exact candidate's model policy, not the primary's settings.
+        if let Some(config) = config
+            && let Some(route) = zeroclaw_providers::dispatch::current_provisional_provider_route()
+        {
+            let model_ref = route.selection_ref().unwrap_or(route.provider_ref());
+            if extraction_model_ref.as_deref() != Some(model_ref) {
+                extraction = config.model_text_extraction(model_ref);
+                extraction_model_ref = Some(model_ref.to_owned());
+            }
+        }
+        let text_tool_calls_disabled = !extraction.tool_calls;
         let event = match event_result {
             Ok(event) => event,
             Err(err) => {
                 if policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single
                     && super::tool_specs::exceeds_single_tool_round(
-                        &outcome.response_text,
                         outcome.tool_calls.len(),
                         request_tools.is_some_and(|tools| !tools.is_empty()),
-                        strict_tool_parsing,
+                        text_tool_calls_disabled,
+                        zeroclaw_providers::response::count_text_tool_calls(
+                            &outcome.response_text,
+                            zeroclaw_api::TextExtraction {
+                                reasoning: false,
+                                tool_calls: !text_tool_calls_disabled,
+                            },
+                        ),
                     )
                 {
                     return Err(SingleToolRoundViolation {
@@ -392,7 +419,11 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
                     continue;
                 }
 
-                let sanitized_delta = think_stripper.push(&chunk.delta);
+                let sanitized_delta = if extraction.reasoning {
+                    think_stripper.push(&chunk.delta)
+                } else {
+                    chunk.delta.clone()
+                };
                 if sanitized_delta.is_empty() {
                     continue;
                 }
@@ -403,7 +434,7 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
                 // Append the stripped text to response_text (single accumulation path)
                 outcome.response_text.push_str(&stripped);
 
-                if strict_tool_parsing {
+                if text_tool_calls_disabled {
                     forward_visible!(stripped, true);
                     continue;
                 }
@@ -418,11 +449,12 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
     }
 
     // Process trailing delta from think stripper through marker stripper
+    let text_tool_calls_disabled = !extraction.tool_calls;
     let trailing_delta = think_stripper.finish();
     if !trailing_delta.is_empty() {
         let trailing_stripped = marker_stripper.push(&trailing_delta);
         outcome.response_text.push_str(&trailing_stripped);
-        if strict_tool_parsing {
+        if text_tool_calls_disabled {
             forward_visible!(trailing_stripped, false);
         } else if let Some(forward_text) = text_guard.push(&trailing_stripped) {
             forward_visible!(forward_text, false);
@@ -433,7 +465,7 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
     let remaining = marker_stripper.finish();
     if !remaining.is_empty() {
         outcome.response_text.push_str(&remaining);
-        if strict_tool_parsing {
+        if text_tool_calls_disabled {
             forward_visible!(remaining, false);
         } else if let Some(forward_text) = text_guard.push(&remaining) {
             forward_visible!(forward_text, false);
@@ -1354,7 +1386,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strips_terminal_marker_in_strict_mode() {
+    async fn strips_terminal_marker_with_text_tool_extraction_disabled() {
         let provider = MarkerTestProvider::with_text_sequence(vec!["Summary<eom>"]);
 
         let outcome = consume_provider_streaming_response(
@@ -1366,18 +1398,61 @@ mod tests {
             None,
             None,
             None,
-            true, // strict_tool_parsing = true
+            true, // text_tool_calls_disabled = true
             StreamReasoningMode::Status,
             None,
         )
         .await
         .expect("stream consume should succeed");
 
-        // Critical: strict mode should also strip terminal markers
+        // Terminal cleanup is independent of tool extraction.
         assert_eq!(
             outcome.response_text, "Summary",
-            "terminal marker <eom> should be stripped even in strict_tool_parsing mode"
+            "terminal marker <eom> should be stripped even in text_tool_calls_disabled mode"
         );
+    }
+
+    #[tokio::test]
+    async fn text_extraction_switches_independently_control_streamed_text() {
+        let tools = [crate::tools::ToolSpec::new(
+            "shell",
+            "shell",
+            serde_json::json!({"type": "object"}),
+        )];
+        let messages = [ChatMessage::user("go")];
+        for reasoning in [false, true] {
+            for tool_calls in [false, true] {
+                let provider = MarkerTestProvider::with_text_sequence(vec![
+                    "<thi",
+                    "nk>reasoning</think>Answer\n",
+                    "<tool_call>{\"name\":\"shell\",\"arguments\":{}}</tool_call>",
+                ]);
+                let (delta_tx, _delta_rx) = tokio::sync::mpsc::channel(16);
+                let outcome = consume_provider_streaming_response_with_policy(
+                    &provider,
+                    ChatRequest::new(&messages).with_tools(&tools),
+                    "mock-model",
+                    Some(0.0),
+                    None,
+                    Some(&delta_tx),
+                    None,
+                    !tool_calls,
+                    reasoning,
+                    None,
+                    StreamReasoningMode::Status,
+                    zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+                    Some(&tools),
+                )
+                .await
+                .unwrap();
+                assert_eq!(outcome.response_text.contains("<think>"), !reasoning);
+                assert_eq!(outcome.suppressed_protocol, tool_calls);
+                assert_eq!(
+                    outcome.forwarded_visible_text.contains("<tool_call>"),
+                    !tool_calls
+                );
+            }
+        }
     }
 
     /// Provider that emits a single marker-only text delta (`<eom>`) and then
@@ -1476,7 +1551,7 @@ mod tests {
             None,
             None,      // on_delta (draft sink)
             Some(&tx), // event_tx
-            true,      // strict_tool_parsing = true
+            true,      // text_tool_calls_disabled = true
             StreamReasoningMode::Status,
             None,
         )

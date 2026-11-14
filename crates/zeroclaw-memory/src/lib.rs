@@ -17,7 +17,6 @@ pub mod conflict;
 pub mod consolidation;
 pub mod decay;
 pub mod dedup;
-pub mod embeddings;
 pub mod hygiene;
 pub mod importance;
 pub mod knowledge_graph;
@@ -55,7 +54,6 @@ pub use backend::{
     memory_backend_profile, selectable_memory_backends,
 };
 #[allow(unused_imports)]
-pub use embeddings::EmbeddingIdentity;
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
@@ -82,11 +80,27 @@ pub use traits::{
 use anyhow::Context;
 use std::path::Path;
 use std::sync::Arc;
+#[cfg(test)]
+use zeroclaw_config::migration::embedding_fixtures::{
+    ResolvedEmbeddingConfig, resolve_embedding_config,
+};
+#[cfg(test)]
 use zeroclaw_config::providers::ModelProviders;
 use zeroclaw_config::schema::{
-    ActiveStorage, Config, EmbeddingRouteConfig, MemoryConfig, MemoryPolicyConfig,
-    PostgresStorageConfig,
+    ActiveStorage, Config, MemoryConfig, MemoryPolicyConfig, PostgresStorageConfig,
 };
+
+#[cfg(test)]
+fn test_embedder(dimensions: usize) -> Arc<dyn zeroclaw_api::embedding::EmbeddingProvider> {
+    let config = serde_json::from_value(serde_json::json!({
+        "memory": {"embedding_model_ref": "embedding.fixture"},
+        "providers": {
+            "connections": {"fixture": {"kind": "openai", "auth": {"mode": "api_key", "api_key": "fixture-key"}}},
+            "models": {"embedding.fixture": {"capability": "embedding", "provider": "fixture", "model": "fixture-model", "metadata": {"dimensions": dimensions}}}
+        }
+    })).unwrap();
+    build_embedder_from_config(&config).unwrap()
+}
 
 #[cfg(feature = "memory-postgres")]
 fn build_postgres_memory(
@@ -175,7 +189,7 @@ where
         MemoryBackendKind::Postgres => {
             anyhow::bail!(
                 "postgres backend requires storage config; \
-                 call create_memory_with_storage_and_routes instead of create_memory_with_builders"
+                 call create_memory_from_config instead of create_memory_with_builders"
             )
         }
         MemoryBackendKind::Qdrant => {
@@ -279,222 +293,38 @@ fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
         .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
 }
 
-#[derive(Clone, PartialEq, Eq)]
-struct ResolvedEmbeddingConfig {
-    model_provider: String,
-    model: String,
-    dimensions: usize,
-    api_key: Option<String>,
+/// Construct the selected embedding model from the full admitted config.
+pub fn build_embedder_from_config(
+    config: &Config,
+) -> anyhow::Result<Arc<dyn zeroclaw_api::embedding::EmbeddingProvider>> {
+    Ok(resolve_canonical_embedding_config(config)?
+        .unwrap_or_else(|| Arc::new(zeroclaw_providers::embedding::NoopEmbedding)))
 }
 
-impl std::fmt::Debug for ResolvedEmbeddingConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ResolvedEmbeddingConfig")
-            .field("model_provider", &self.model_provider)
-            .field("model", &self.model)
-            .field("dimensions", &self.dimensions)
-            .finish_non_exhaustive()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EmbeddingSettings {
-    pub model_provider: String,
-    pub model: String,
-    pub dimensions: usize,
-    pub api_key: Option<String>,
-}
-
-pub fn resolve_embedding_settings(
-    config: &MemoryConfig,
-    embedding_routes: &[EmbeddingRouteConfig],
-    api_key: Option<&str>,
-    providers: Option<&ModelProviders>,
-) -> EmbeddingSettings {
-    let resolved = resolve_embedding_config(config, embedding_routes, api_key, providers);
-    EmbeddingSettings {
-        model_provider: resolved.model_provider,
-        model: resolved.model,
-        dimensions: resolved.dimensions,
-        api_key: resolved.api_key,
-    }
-}
-
-fn resolve_embedding_config(
-    config: &MemoryConfig,
-    embedding_routes: &[EmbeddingRouteConfig],
-    api_key: Option<&str>,
-    providers: Option<&ModelProviders>,
-) -> ResolvedEmbeddingConfig {
-    let inherited_api_key = api_key
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    let configured_api_key = config
-        .embedding_api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-
-    let fallback = || {
-        resolve_provider_ref(
-            config.embedding_provider.trim().to_string(),
-            config.embedding_model.trim().to_string(),
-            config.embedding_dimensions,
-            configured_api_key.clone(),
-            inherited_api_key.clone(),
-            providers,
-        )
+/// Resolve the new logical embedding model binding without flattening its
+/// connection into the legacy `[memory]` provider/model fields. The returned
+/// value is an admission snapshot for this construction only; the registry
+/// remains the source of truth for subsequent refreshes.
+fn resolve_canonical_embedding_config(
+    config: &Config,
+) -> anyhow::Result<Option<Arc<dyn zeroclaw_api::embedding::EmbeddingProvider>>> {
+    let (registry, reference) = config.embedding_registry()?;
+    let Some(model_ref) = reference else {
+        return Ok(None);
     };
-
-    let Some(hint) = config
-        .embedding_model
-        .strip_prefix("hint:")
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return fallback();
-    };
-
-    let Some(route) = embedding_routes
-        .iter()
-        .find(|route| route.hint.trim() == hint)
-    else {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"hint": hint})),
-            "Unknown embedding route hint; falling back to [memory] embedding settings"
-        );
-        return fallback();
-    };
-
-    let model_provider = route.model_provider.trim();
-    let model = route.model.trim();
-    let dimensions = route.dimensions.unwrap_or(config.embedding_dimensions);
-    if model_provider.is_empty() || model.is_empty() || dimensions == 0 {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"hint": hint})),
-            "Invalid embedding route configuration; falling back to [memory] embedding settings"
-        );
-        return fallback();
-    }
-
-    let routed_api_key = route
-        .api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|value: &&str| !value.is_empty())
-        .map(|value| value.to_string());
-
-    resolve_provider_ref(
-        model_provider.to_string(),
-        model.to_string(),
-        dimensions,
-        routed_api_key.or(configured_api_key),
-        inherited_api_key,
-        providers,
-    )
-}
-
-fn resolve_provider_ref(
-    model_provider: String,
-    model: String,
-    dimensions: usize,
-    explicit_api_key: Option<String>,
-    inherited_api_key: Option<String>,
-    providers: Option<&ModelProviders>,
-) -> ResolvedEmbeddingConfig {
-    let trimmed = model_provider.trim();
-    let is_dotted_ref =
-        !trimmed.is_empty() && !trimmed.starts_with("custom:") && trimmed.contains('.');
-    if !is_dotted_ref {
-        return ResolvedEmbeddingConfig {
-            model_provider,
-            model,
-            dimensions,
-            api_key: explicit_api_key.or(inherited_api_key),
-        };
-    }
-
-    let reference = trimmed.to_string();
-    let Some((kind, _alias, provider_cfg)) =
-        providers.and_then(|catalog| catalog.find_by_name(&reference))
-    else {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({
-                    "error_key": "memory.embedding_route_unresolved",
-                    "provider_ref": reference,
-                })),
-            "Embedding provider reference did not resolve against providers.models; \
-             embeddings disabled (keyword-only) for this profile"
-        );
-        return ResolvedEmbeddingConfig {
-            model_provider,
-            model,
-            dimensions,
-            api_key: explicit_api_key.or(inherited_api_key),
-        };
-    };
-
-    let provider_key = provider_cfg
-        .api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    let concrete_provider = match provider_cfg
-        .uri
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        Some(uri) => Some(format!("custom:{uri}")),
-        None if matches!(kind, "openai" | "openrouter") => Some(kind.to_string()),
-        None => None,
-    };
-    let Some(concrete_provider) = concrete_provider else {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({
-                    "error_key": "memory.embedding_route_no_endpoint",
-                    "provider_ref": reference,
-                    "provider_kind": kind,
-                })),
-            "Embedding provider reference resolved but has no usable embeddings \
-             endpoint (set its `uri`, or point the route at an openai/openrouter \
-             compatible profile); embeddings disabled (keyword-only) for this profile"
-        );
-        return ResolvedEmbeddingConfig {
-            model_provider,
-            model,
-            dimensions,
-            api_key: explicit_api_key.or(inherited_api_key),
-        };
-    };
-
-    ResolvedEmbeddingConfig {
-        model_provider: concrete_provider,
-        model,
-        dimensions,
-        api_key: explicit_api_key.or(provider_key).or(inherited_api_key),
-    }
+    let resolved = registry.resolve_embedding(&model_ref)?;
+    let settings = zeroclaw_providers::embedding::EmbeddingProviderConfig::from_resolved(
+        &resolved,
+        config.memory.embedding_dimensions,
+    )?;
+    Ok(Some(Arc::from(
+        zeroclaw_providers::embedding::build_embedding_provider(settings),
+    )))
 }
 
 pub fn create_memory(
     config: &MemoryConfig,
     workspace_dir: &Path,
-    api_key: Option<&str>,
 ) -> anyhow::Result<Box<dyn Memory>> {
     if config.backend.trim().contains('.') {
         anyhow::bail!(
@@ -503,31 +333,21 @@ pub fn create_memory(
         );
     }
 
-    create_memory_with_storage_and_routes(
-        config,
-        &[],
-        ActiveStorage::None,
-        workspace_dir,
-        api_key,
-        None,
-    )
+    create_memory_with_storage(config, ActiveStorage::None, workspace_dir)
 }
 
 /// Construct memory from the canonical loaded configuration.
 ///
 /// Config-aware production paths should use this entrypoint so the selected
 /// storage alias, embedding route, and provider settings are applied together.
-pub fn create_memory_from_config(
-    config: &Config,
-    api_key: Option<&str>,
-) -> anyhow::Result<Box<dyn Memory>> {
-    create_memory_with_storage_and_routes(
+pub fn create_memory_from_config(config: &Config) -> anyhow::Result<Box<dyn Memory>> {
+    let canonical_embedding = resolve_canonical_embedding_config(config)?;
+    create_memory_with_embedding(
         &config.memory,
-        &config.embedding_routes,
         config.resolve_active_storage(),
         &config.data_dir,
-        api_key,
-        Some(&config.providers.models),
+        canonical_embedding
+            .unwrap_or_else(|| Arc::new(zeroclaw_providers::embedding::NoopEmbedding)),
     )
 }
 
@@ -558,17 +378,35 @@ fn build_lucid_memory(
     )
 }
 
-pub fn create_memory_with_storage_and_routes(
+/// Construct a keyword-only backend from an already resolved storage binding.
+/// Embedding-enabled consumers must use [`create_memory_from_config`].
+pub fn create_memory_with_storage(
     config: &MemoryConfig,
-    embedding_routes: &[EmbeddingRouteConfig],
     active_storage: ActiveStorage<'_>,
     workspace_dir: &Path,
-    api_key: Option<&str>,
-    providers: Option<&ModelProviders>,
+) -> anyhow::Result<Box<dyn Memory>> {
+    anyhow::ensure!(
+        config.embedding_model_ref.is_none()
+            && config.embedding_provider == "none"
+            && !config.embedding_model.starts_with("hint:"),
+        "embedding model bindings require the full Config; use create_memory_from_config"
+    );
+    create_memory_with_embedding(
+        config,
+        active_storage,
+        workspace_dir,
+        Arc::new(zeroclaw_providers::embedding::NoopEmbedding),
+    )
+}
+
+fn create_memory_with_embedding(
+    config: &MemoryConfig,
+    active_storage: ActiveStorage<'_>,
+    workspace_dir: &Path,
+    resolved_embedding: Arc<dyn zeroclaw_api::embedding::EmbeddingProvider>,
 ) -> anyhow::Result<Box<dyn Memory>> {
     let backend_name = backend_kind_from_dotted(&config.backend);
     let backend_kind = classify_memory_backend(&backend_name);
-    let resolved_embedding = resolve_embedding_config(config, embedding_routes, api_key, providers);
 
     // Best-effort memory hygiene/retention pass (throttled by state file).
     if let Err(e) = hygiene::run_if_due(config, workspace_dir) {
@@ -652,30 +490,24 @@ fn build_memory_with_storage(
     config: &MemoryConfig,
     active_storage: ActiveStorage<'_>,
     workspace_dir: &Path,
-    resolved_embedding: Option<&ResolvedEmbeddingConfig>,
+    resolved_embedding: Option<&Arc<dyn zeroclaw_api::embedding::EmbeddingProvider>>,
 ) -> anyhow::Result<Box<dyn Memory>> {
     let backend_name = backend_kind_from_dotted(&config.backend);
     let backend_kind = classify_memory_backend(&backend_name);
 
     fn create_embedder(
-        resolved_embedding: Option<&ResolvedEmbeddingConfig>,
-    ) -> Arc<dyn embeddings::EmbeddingProvider> {
-        match resolved_embedding {
-            Some(resolved) => Arc::from(embeddings::create_embedding_provider(
-                &resolved.model_provider,
-                resolved.api_key.as_deref(),
-                &resolved.model,
-                resolved.dimensions,
-            )),
-            None => Arc::new(embeddings::NoopEmbedding),
-        }
+        resolved_embedding: Option<&Arc<dyn zeroclaw_api::embedding::EmbeddingProvider>>,
+    ) -> Arc<dyn zeroclaw_api::embedding::EmbeddingProvider> {
+        resolved_embedding
+            .cloned()
+            .unwrap_or_else(|| Arc::new(zeroclaw_providers::embedding::NoopEmbedding))
     }
 
     fn build_sqlite_memory(
         config: &MemoryConfig,
         sqlite_open_timeout_secs: Option<u64>,
         workspace_dir: &Path,
-        resolved_embedding: Option<&ResolvedEmbeddingConfig>,
+        resolved_embedding: Option<&Arc<dyn zeroclaw_api::embedding::EmbeddingProvider>>,
     ) -> anyhow::Result<SqliteMemory> {
         let embedder = create_embedder(resolved_embedding);
         let has_embedder = embedder.dimensions() > 0;
@@ -697,11 +529,7 @@ fn build_memory_with_storage(
         {
             reconcile_embedding_identity(
                 &mem,
-                &embeddings::EmbeddingIdentity {
-                    provider: resolved_embedding.model_provider.clone(),
-                    model: resolved_embedding.model.clone(),
-                    dimensions: resolved_embedding.dimensions,
-                },
+                &resolved_embedding.identity(),
                 config.auto_reindex_on_identity_change,
             );
         }
@@ -821,7 +649,7 @@ enum EmbeddingIdentityOutcome {
 
 fn reconcile_embedding_identity(
     mem: &SqliteMemory,
-    current: &embeddings::EmbeddingIdentity,
+    current: &zeroclaw_api::embedding::EmbeddingIdentity,
     auto_reindex: bool,
 ) -> EmbeddingIdentityOutcome {
     let stored = match mem.stored_embedding_identity() {
@@ -853,6 +681,32 @@ fn reconcile_embedding_identity(
             }
         },
         Some(stored) if stored == *current => EmbeddingIdentityOutcome::Match,
+        Some(stored)
+            if stored.model == current.model
+                && stored.dimensions == current.dimensions
+                && current
+                    .provider
+                    .strip_prefix(&format!("{}:", stored.provider))
+                    .is_some() =>
+        {
+            // Older stores stamped only the provider name. The current
+            // OpenAI-compatible identity also includes an endpoint/header
+            // digest, so adopt that richer identity without invalidating
+            // vectors whose model and dimensions are unchanged.
+            match mem.record_embedding_identity(current) {
+                Ok(()) => EmbeddingIdentityOutcome::Match,
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                        "memory: failed to migrate legacy embedding identity; will retry next startup"
+                    );
+                    EmbeddingIdentityOutcome::Failed
+                }
+            }
+        }
         Some(stored) => match mem.invalidate_embeddings_for_identity_change(current) {
             Ok(invalidated) => {
                 ::zeroclaw_log::record!(
@@ -943,7 +797,7 @@ pub fn create_memory_for_migration(config: &Config) -> anyhow::Result<Box<dyn Me
     // rejected so an import never stops partway through, and read-time
     // withholding is disabled so `memory list` / `get` show every stored
     // row for inspection and removal. The runtime factory
-    // (`create_memory_with_storage_and_routes`) applies the configured
+    // (`create_memory_from_config`) applies the configured
     // `[memory.policy]`, so flagged rows remain withheld from recall
     // wherever `threat_scan_load_time` is enabled.
     //
@@ -962,15 +816,12 @@ pub fn create_memory_for_migration(config: &Config) -> anyhow::Result<Box<dyn Me
     };
     operator_config.audit_enabled = false;
 
-    let qdrant_embedding = matches!(classify_memory_backend(&backend), MemoryBackendKind::Qdrant)
-        .then(|| {
-            resolve_embedding_config(
-                &operator_config,
-                &config.embedding_routes,
-                None,
-                Some(&config.providers.models),
-            )
-        });
+    let qdrant_embedding = if matches!(classify_memory_backend(&backend), MemoryBackendKind::Qdrant)
+    {
+        Some(build_embedder_from_config(config)?)
+    } else {
+        None
+    };
 
     build_memory_with_storage(
         &operator_config,
@@ -1015,11 +866,11 @@ fn wrap_in_retrieval_pipeline(memory: Arc<dyn Memory>, config: &MemoryConfig) ->
 /// Cross-backend allowlist entries are rejected at config load, so by
 /// the time we get here every entry on
 /// `agents.<alias>.workspace.read_memory_from` is guaranteed to point
-/// at a sibling on the same backend kind.
+/// at a sibling on the same backend kind. The selected embedding connection
+/// supplies its own credentials; chat model credentials are never inherited.
 pub async fn create_memory_for_agent(
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
-    api_key: Option<&str>,
 ) -> anyhow::Result<Arc<dyn Memory>> {
     use zeroclaw_config::multi_agent::MemoryBackendKind as ConfigBackend;
     let agent_cfg = config
@@ -1134,7 +985,7 @@ pub async fn create_memory_for_agent(
         )?));
     }
 
-    let inner = create_memory_from_config(config, api_key)?;
+    let inner = create_memory_from_config(config)?;
     let inner_arc: Arc<dyn Memory> = Arc::from(inner);
 
     let bound_id = inner_arc.ensure_agent_uuid(agent_alias).await?;
@@ -1200,13 +1051,141 @@ mod tests {
     use zeroclaw_config::schema::EmbeddingRouteConfig;
 
     #[test]
+    fn registry_save_keeps_the_selected_embedding_route_dispatchable() {
+        use zeroclaw_config::provider_registry::editor::{RegistryEdit, snapshot, stage};
+        let mut config = Config::default();
+        config
+            .providers
+            .models
+            .ensure("openai", "gateway.prod")
+            .unwrap()
+            .uri = Some("https://embeddings.example.test/v1".into());
+        config.memory.embedding_provider = "none".into();
+        config.memory.embedding_model = "hint:semantic.v1".into();
+        config.embedding_routes.push(EmbeddingRouteConfig {
+            hint: "semantic.v1".into(),
+            model_provider: "openai.gateway.prod".into(),
+            model: "embedding-large".into(),
+            dimensions: Some(3072),
+            api_key: None,
+        });
+        zeroclaw_config::migration::normalize_test_input(&mut config);
+        let expected = snapshot(&config).unwrap();
+        stage(
+            &mut config,
+            RegistryEdit {
+                registry: expected.clone(),
+                expected,
+            },
+        )
+        .unwrap();
+        let embedder = build_embedder_from_config(&config).unwrap();
+        assert_eq!(embedder.name(), "openai");
+        assert_eq!(embedder.dimensions(), 3072);
+        assert_eq!(embedder.identity().model, "embedding-large");
+        assert!(embedder.identity().provider.contains("openai"));
+        // Canonical model metadata, rather than the retired route fields,
+        // owns the upstream model and dimensions after the save.
+        config.embedding_routes[0].model.clear();
+        config.embedding_routes[0].dimensions = Some(1);
+        config.validate().unwrap();
+        let embedder = build_embedder_from_config(&config).unwrap();
+        assert_eq!(embedder.identity().model, "embedding-large");
+        assert_eq!(embedder.dimensions(), 3072);
+    }
+
+    #[tokio::test]
+    async fn registry_save_keeps_chat_only_compatible_embeddings_dispatchable() {
+        use zeroclaw_config::provider_registry::editor::{RegistryEdit, snapshot, stage};
+
+        let mut config = Config::default();
+        let profile = config
+            .providers
+            .models
+            .ensure("deepseek", "gateway.prod")
+            .unwrap();
+        profile.uri = Some("https://embeddings.example.test/v1".into());
+        profile.model = Some("chat-model".into());
+        config.memory.embedding_provider = "deepseek.gateway.prod".into();
+        config.memory.embedding_model = "embedding-small".into();
+        config.memory.embedding_dimensions = 1536;
+        config.embedding_routes.push(EmbeddingRouteConfig {
+            hint: "semantic.v1".into(),
+            model_provider: "deepseek.gateway.prod".into(),
+            model: "embedding-large".into(),
+            dimensions: Some(3072),
+            api_key: None,
+        });
+        zeroclaw_config::migration::normalize_test_input(&mut config);
+        let before = build_embedder_from_config(&config).unwrap().identity();
+        let mut routed = config.clone();
+        routed.memory.embedding_model_ref = Some(
+            routed.embedding_routes[0]
+                .model_provider
+                .as_str()
+                .to_owned(),
+        );
+        let route_before = build_embedder_from_config(&routed).unwrap().identity();
+        let tmp = TempDir::new().unwrap();
+        let memory = static_sqlite(tmp.path(), 1536);
+        memory.record_embedding_identity(&before).unwrap();
+        memory
+            .store(
+                "existing",
+                "existing semantic memory",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(embedded_rows(&memory), 1);
+        let expected = snapshot(&config).unwrap();
+        stage(
+            &mut config,
+            RegistryEdit {
+                registry: expected.clone(),
+                expected,
+            },
+        )
+        .unwrap();
+        let embedder = build_embedder_from_config(&config).unwrap();
+        assert_eq!(embedder.name(), "custom");
+        assert_eq!(embedder.identity().model, "embedding-small");
+        assert_eq!(embedder.dimensions(), 1536);
+        assert_eq!(embedder.identity(), before);
+        assert_eq!(
+            reconcile_embedding_identity(&memory, &embedder.identity(), false),
+            EmbeddingIdentityOutcome::Match
+        );
+        assert_eq!(embedded_rows(&memory), 1);
+        let cached: i64 = memory
+            .connection()
+            .lock()
+            .query_row("SELECT COUNT(*) FROM embedding_cache", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(cached, 1);
+
+        config.memory.embedding_model_ref = Some(
+            config.embedding_routes[0]
+                .model_provider
+                .as_str()
+                .to_owned(),
+        );
+        let embedder = build_embedder_from_config(&config).unwrap();
+        assert_eq!(embedder.name(), "custom");
+        assert_eq!(embedder.identity().model, "embedding-large");
+        assert_eq!(embedder.dimensions(), 3072);
+        assert_eq!(embedder.identity(), route_before);
+    }
+
+    #[test]
     fn factory_sqlite() {
         let tmp = TempDir::new().unwrap();
         let cfg = MemoryConfig {
             backend: "sqlite".into(),
             ..MemoryConfig::default()
         };
-        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        let mem = create_memory(&cfg, tmp.path()).unwrap();
         assert_eq!(mem.name(), "sqlite");
     }
 
@@ -1256,9 +1235,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mem = create_memory_for_agent(&config, "alpha", None)
-            .await
-            .unwrap();
+        let mem = create_memory_for_agent(&config, "alpha").await.unwrap();
         let err = mem
             .store(
                 "own-held",
@@ -1315,7 +1292,7 @@ mod tests {
         config.agents.insert("alpha".into(), alpha);
         config.agents.insert("beta".into(), beta);
 
-        let err = match create_memory_for_agent(&config, "alpha", None).await {
+        let err = match create_memory_for_agent(&config, "alpha").await {
             Ok(_) => panic!("Markdown factory must fail closed for scoped grants"),
             Err(error) => error,
         };
@@ -1332,7 +1309,7 @@ mod tests {
     struct StaticEmbedding(usize);
 
     #[async_trait::async_trait]
-    impl embeddings::EmbeddingProvider for StaticEmbedding {
+    impl zeroclaw_api::embedding::EmbeddingProvider for StaticEmbedding {
         fn name(&self) -> &str {
             "static"
         }
@@ -1358,8 +1335,12 @@ mod tests {
         .unwrap()
     }
 
-    fn ident(provider: &str, model: &str, dimensions: usize) -> embeddings::EmbeddingIdentity {
-        embeddings::EmbeddingIdentity {
+    fn ident(
+        provider: &str,
+        model: &str,
+        dimensions: usize,
+    ) -> zeroclaw_api::embedding::EmbeddingIdentity {
+        zeroclaw_api::embedding::EmbeddingIdentity {
             provider: provider.into(),
             model: model.into(),
             dimensions,
@@ -1484,7 +1465,7 @@ mod tests {
             backend: "sqlite".into(),
             ..MemoryConfig::default()
         };
-        drop(create_memory(&cfg, tmp.path(), None).unwrap());
+        drop(create_memory(&cfg, tmp.path()).unwrap());
 
         let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         assert_eq!(mem.stored_embedding_identity().unwrap(), None);
@@ -1493,33 +1474,52 @@ mod tests {
     #[test]
     fn factory_with_embedder_stamps_and_migrates_identity() {
         let tmp = TempDir::new().unwrap();
-        let mut cfg = MemoryConfig {
-            backend: "sqlite".into(),
-            embedding_provider: "openai".into(),
-            embedding_model: "model-a".into(),
-            embedding_dimensions: 4,
-            ..MemoryConfig::default()
+        let config_for = |model: &str| {
+            let mut config = Config {
+                data_dir: tmp.path().to_path_buf(),
+                ..Config::default()
+            };
+            config.memory.backend = "sqlite".into();
+            config.memory.embedding_model_ref = Some("embedding.openai".into());
+            config.memory.embedding_dimensions = 4;
+            config.providers.connections.insert(
+                "openai".into(),
+                serde_json::from_value(serde_json::json!({
+                    "kind": "openai",
+                    "auth": {"mode": "api_key", "api_key": "test-key"}
+                }))
+                .unwrap(),
+            );
+            config.providers.models.insert_canonical_model(
+                "embedding.openai".into(),
+                serde_json::from_value(serde_json::json!({
+                    "capability": "embedding",
+                    "provider": "openai",
+                    "model": model
+                }))
+                .unwrap(),
+            );
+            config
         };
-        drop(create_memory(&cfg, tmp.path(), Some("test-key")).unwrap());
+        drop(create_memory_from_config(&config_for("model-a")).unwrap());
         {
             let mem = SqliteMemory::new("test", tmp.path()).unwrap();
-            assert_eq!(
-                mem.stored_embedding_identity().unwrap(),
-                Some(ident("openai", "model-a", 4))
-            );
+            let identity = mem.stored_embedding_identity().unwrap().unwrap();
+            assert!(identity.provider.starts_with("openai:"));
+            assert_eq!(identity.model, "model-a");
+            assert_eq!(identity.dimensions, 4);
         }
 
         // Same config again → identity unchanged (Match path, no churn).
-        drop(create_memory(&cfg, tmp.path(), Some("test-key")).unwrap());
+        drop(create_memory_from_config(&config_for("model-a")).unwrap());
 
         // Model change → factory reconciles to the new identity.
-        cfg.embedding_model = "model-b".into();
-        drop(create_memory(&cfg, tmp.path(), Some("test-key")).unwrap());
+        drop(create_memory_from_config(&config_for("model-b")).unwrap());
         let mem = SqliteMemory::new("test", tmp.path()).unwrap();
-        assert_eq!(
-            mem.stored_embedding_identity().unwrap(),
-            Some(ident("openai", "model-b", 4))
-        );
+        let identity = mem.stored_embedding_identity().unwrap().unwrap();
+        assert!(identity.provider.starts_with("openai:"));
+        assert_eq!(identity.model, "model-b");
+        assert_eq!(identity.dimensions, 4);
     }
 
     #[tokio::test]
@@ -1531,7 +1531,7 @@ mod tests {
         };
         assert!(!cfg.audit_enabled, "audit must stay opt-in by default");
 
-        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        let mem = create_memory(&cfg, tmp.path()).unwrap();
         mem.store("audit_off", "value", MemoryCategory::Core, None)
             .await
             .unwrap();
@@ -1548,7 +1548,7 @@ mod tests {
             ..MemoryConfig::default()
         };
 
-        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        let mem = create_memory(&cfg, tmp.path()).unwrap();
         mem.store("audit_on", "value", MemoryCategory::Core, None)
             .await
             .unwrap();
@@ -1583,7 +1583,7 @@ mod tests {
             ..MemoryConfig::default()
         };
 
-        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        let mem = create_memory(&cfg, tmp.path()).unwrap();
         let error = mem
             .store(
                 "blocked",
@@ -1640,7 +1640,7 @@ mod tests {
             },
         );
 
-        let mem = create_memory_for_agent(&cfg, "scribe", None)
+        let mem = create_memory_for_agent(&cfg, "scribe")
             .await
             .expect("per-agent markdown memory");
         mem.store("agent_key", "agent value", MemoryCategory::Core, None)
@@ -1703,7 +1703,7 @@ mod tests {
             },
         );
 
-        let mem = create_memory_for_agent(&cfg, "scribe", None)
+        let mem = create_memory_for_agent(&cfg, "scribe")
             .await
             .expect("per-agent markdown memory");
         mem.store("agent_key", "agent value", MemoryCategory::Core, None)
@@ -1740,7 +1740,7 @@ mod tests {
             },
         );
 
-        let mem = create_memory_for_agent(&cfg, "ghost", None)
+        let mem = create_memory_for_agent(&cfg, "ghost")
             .await
             .expect("per-agent none memory");
         mem.store("ghost_key", "dropped", MemoryCategory::Core, None)
@@ -1787,7 +1787,7 @@ mod tests {
             },
         );
 
-        let err = match create_memory_for_agent(&cfg, "scribe", None).await {
+        let err = match create_memory_for_agent(&cfg, "scribe").await {
             Ok(_) => panic!("typed flags with a non-sqlite agent backend must fail startup"),
             Err(err) => err,
         };
@@ -1821,7 +1821,7 @@ mod tests {
             },
         );
 
-        create_memory_for_agent(&cfg, "scribe", None)
+        create_memory_for_agent(&cfg, "scribe")
             .await
             .expect("typed flags on the default sqlite backend must construct");
     }
@@ -1914,7 +1914,7 @@ User: how was the deploy?
             backend: "markdown".into(),
             ..MemoryConfig::default()
         };
-        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        let mem = create_memory(&cfg, tmp.path()).unwrap();
         assert_eq!(mem.name(), "markdown");
     }
 
@@ -1925,7 +1925,7 @@ User: how was the deploy?
             backend: "lucid".into(),
             ..MemoryConfig::default()
         };
-        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        let mem = create_memory(&cfg, tmp.path()).unwrap();
         assert_eq!(mem.name(), "lucid");
     }
 
@@ -2028,7 +2028,7 @@ store_timeout_ms = 40000
         assert_eq!(store_timeout, std::time::Duration::from_secs(20));
 
         let memory =
-            create_memory_from_config(&config, None).expect("build Lucid memory from parsed alias");
+            create_memory_from_config(&config).expect("build Lucid memory from parsed alias");
 
         memory
             .store(
@@ -2124,7 +2124,7 @@ store_timeout_ms = 40000
             backend: "none".into(),
             ..MemoryConfig::default()
         };
-        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        let mem = create_memory(&cfg, tmp.path()).unwrap();
         assert_eq!(mem.name(), "none");
     }
 
@@ -2141,16 +2141,9 @@ store_timeout_ms = 40000
             db_url: Some("postgres://placeholder".into()),
             ..PostgresStorageConfig::default()
         };
-        let error = create_memory_with_storage_and_routes(
-            &cfg,
-            &[],
-            ActiveStorage::Postgres(&storage),
-            tmp.path(),
-            None,
-            None,
-        )
-        .err()
-        .expect("backend=postgres without memory-postgres feature should fail");
+        let error = create_memory_with_storage(&cfg, ActiveStorage::Postgres(&storage), tmp.path())
+            .err()
+            .expect("backend=postgres without memory-postgres feature should fail");
         assert!(
             error.to_string().contains("memory-postgres"),
             "error should mention the feature flag: {error}"
@@ -2164,7 +2157,7 @@ store_timeout_ms = 40000
             backend: "postgres.default".into(),
             ..MemoryConfig::default()
         };
-        let error = create_memory(&cfg, tmp.path(), None)
+        let error = create_memory(&cfg, tmp.path())
             .err()
             .expect("dotted backend references require the full Config");
         assert!(
@@ -2180,7 +2173,7 @@ store_timeout_ms = 40000
             backend: "lucid.selected".into(),
             ..MemoryConfig::default()
         };
-        let error = create_memory(&cfg, tmp.path(), None)
+        let error = create_memory(&cfg, tmp.path())
             .err()
             .expect("dotted Lucid aliases require the full Config");
         assert!(
@@ -2190,13 +2183,36 @@ store_timeout_ms = 40000
     }
 
     #[test]
+    fn partial_factory_refuses_embedding_input_instead_of_disabling_vectors() {
+        let tmp = TempDir::new().unwrap();
+        for cfg in [
+            MemoryConfig {
+                embedding_model_ref: Some("embedding.main".into()),
+                ..Default::default()
+            },
+            MemoryConfig {
+                embedding_provider: "openai".into(),
+                ..Default::default()
+            },
+            MemoryConfig {
+                embedding_model: "hint:semantic".into(),
+                ..Default::default()
+            },
+        ] {
+            let error = create_memory(&cfg, tmp.path()).err().unwrap();
+            assert!(error.to_string().contains("full Config"));
+        }
+        assert!(!tmp.path().join("memory").exists());
+    }
+
+    #[test]
     fn factory_qdrant_without_storage_alias_errors() {
         let tmp = TempDir::new().unwrap();
         let cfg = MemoryConfig {
             backend: "qdrant.default".into(),
             ..MemoryConfig::default()
         };
-        let error = create_memory(&cfg, tmp.path(), None)
+        let error = create_memory(&cfg, tmp.path())
             .err()
             .expect("dotted backend references require the full Config");
         assert!(
@@ -2263,7 +2279,7 @@ url = "http://localhost:6333"
     /// compiled in, or without a `[storage.postgres.<alias>]` entry, the
     /// migration factory now surfaces the same storage-aware error the
     /// runtime gives — not the old unconditional "postgres backend requires
-    /// storage config; call create_memory_with_storage_and_routes instead"
+    /// storage config; call create_memory_from_config instead"
     /// bail that made `zeroclaw memory list` unusable for every Postgres
     /// user regardless of config.
     #[test]
@@ -2277,7 +2293,7 @@ url = "http://localhost:6333"
             .expect("backend=postgres without a storage alias must be rejected");
         let message = error.to_string();
         assert!(
-            !message.contains("call create_memory_with_storage_and_routes"),
+            !message.contains("call create_memory_from_config"),
             "must not surface the internal builder-only factory error: {message}"
         );
     }
@@ -2297,15 +2313,8 @@ url = "http://localhost:6333"
             url: Some("http://localhost:6333".into()),
             ..QdrantStorageConfig::default()
         };
-        let mem = create_memory_with_storage_and_routes(
-            &cfg,
-            &[],
-            ActiveStorage::Qdrant(&storage),
-            tmp.path(),
-            None,
-            None,
-        )
-        .expect("qdrant with resolved storage config must still construct");
+        let mem = create_memory_with_storage(&cfg, ActiveStorage::Qdrant(&storage), tmp.path())
+            .expect("qdrant with resolved storage config must still construct");
         assert_eq!(mem.name(), "qdrant");
     }
 
@@ -2324,7 +2333,7 @@ url = "http://localhost:6333"
             backend: "redis".into(),
             ..MemoryConfig::default()
         };
-        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        let mem = create_memory(&cfg, tmp.path()).unwrap();
         assert_eq!(mem.name(), "markdown");
     }
 
@@ -2374,7 +2383,7 @@ url = "http://localhost:6333"
             .unwrap();
         assert!(operator.get("imported").await.unwrap().is_some());
 
-        let runtime = create_memory(&MemoryConfig::default(), tmp.path(), None).unwrap();
+        let runtime = create_memory(&MemoryConfig::default(), tmp.path()).unwrap();
         assert!(runtime.get("imported").await.unwrap().is_none());
         assert!(operator.forget("imported").await.unwrap());
     }
@@ -2411,10 +2420,10 @@ url = "http://localhost:6333"
             ..MemoryConfig::default()
         };
 
-        let settings = resolve_embedding_settings(&cfg, &[], Some("base-key"), None);
+        let settings = resolve_embedding_config(&cfg, &[], Some("base-key"), None);
         assert_eq!(
             settings,
-            EmbeddingSettings {
+            ResolvedEmbeddingConfig {
                 model_provider: "openai".into(),
                 model: "text-embedding-3-small".into(),
                 dimensions: 1536,
@@ -2666,16 +2675,6 @@ url = "http://localhost:6333"
                 api_key: Some("sk-provider".into()),
             }
         );
-
-        // End-to-end: the resolved profile builds a real OpenAI-compatible
-        // embedder, not the keyword-only Noop fallback.
-        let embedder = embeddings::create_embedding_provider(
-            &resolved.model_provider,
-            resolved.api_key.as_deref(),
-            &resolved.model,
-            resolved.dimensions,
-        );
-        assert_eq!(embedder.name(), "openai");
     }
 
     #[test]
@@ -2702,14 +2701,6 @@ url = "http://localhost:6333"
         assert_eq!(resolved.model_provider, "openai");
         assert_eq!(resolved.api_key.as_deref(), Some("sk-provider"));
         assert_eq!(resolved.dimensions, 1536);
-
-        let embedder = embeddings::create_embedding_provider(
-            &resolved.model_provider,
-            resolved.api_key.as_deref(),
-            &resolved.model,
-            resolved.dimensions,
-        );
-        assert_eq!(embedder.name(), "openai");
     }
 
     #[test]
@@ -2821,17 +2812,9 @@ url = "http://localhost:6333"
         let resolved =
             resolve_embedding_config(&cfg, &routes, Some("chat-provider-key"), Some(&providers));
 
-        // It must NOT be rewritten to a bare `custom` (which would silently
-        // Noop); it is left unresolved and logged loudly. The end-to-end
-        // embedder is the keyword-only Noop, surfaced rather than hidden.
+        // Keep the unresolved reference visible. Canonical admission rejects
+        // it; construction must never silently substitute keyword-only memory.
         assert_eq!(resolved.model_provider, "custom.myembed");
-        let embedder = embeddings::create_embedding_provider(
-            &resolved.model_provider,
-            resolved.api_key.as_deref(),
-            &resolved.model,
-            resolved.dimensions,
-        );
-        assert_eq!(embedder.name(), "none");
     }
 
     #[test]
@@ -2862,13 +2845,6 @@ url = "http://localhost:6333"
 
         assert_eq!(resolved.model_provider, "custom:https://embed.local/v1");
         assert_eq!(resolved.api_key.as_deref(), Some("sk-local"));
-        let embedder = embeddings::create_embedding_provider(
-            &resolved.model_provider,
-            resolved.api_key.as_deref(),
-            &resolved.model,
-            resolved.dimensions,
-        );
-        assert_eq!(embedder.name(), "openai");
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -2944,8 +2920,8 @@ url = "http://localhost:6333"
         let tmp = TempDir::new().unwrap();
         let config = agent_config(&tmp);
 
-        let handle_a = create_memory_for_agent(&config, "ops", None).await.unwrap();
-        let handle_b = create_memory_for_agent(&config, "ops", None).await.unwrap();
+        let handle_a = create_memory_for_agent(&config, "ops").await.unwrap();
+        let handle_b = create_memory_for_agent(&config, "ops").await.unwrap();
 
         handle_a
             .store("k1", "first fact", MemoryCategory::Core, None)
@@ -3001,7 +2977,7 @@ url = "http://localhost:6333"
                 .unwrap()
                 .workspace
                 .read_memory_from = grants.into();
-            let error = match create_memory_for_agent(&candidate, "ops", None).await {
+            let error = match create_memory_for_agent(&candidate, "ops").await {
                 Ok(_) => panic!("ambiguous duplicate grants must fail closed"),
                 Err(error) => error,
             };
@@ -3017,8 +2993,8 @@ url = "http://localhost:6333"
         let mut config = agent_config(&tmp);
         config.memory.retrieval_stages = vec!["fts".to_string(), "vector".to_string()];
 
-        let handle_a = create_memory_for_agent(&config, "ops", None).await.unwrap();
-        let handle_b = create_memory_for_agent(&config, "ops", None).await.unwrap();
+        let handle_a = create_memory_for_agent(&config, "ops").await.unwrap();
+        let handle_b = create_memory_for_agent(&config, "ops").await.unwrap();
 
         handle_a
             .store("k1", "first fact", MemoryCategory::Core, None)
@@ -3053,7 +3029,7 @@ url = "http://localhost:6333"
         let mut config = agent_config(&tmp);
         config.memory.retrieval_stages = vec!["cache".to_string()];
 
-        let handle = create_memory_for_agent(&config, "ops", None).await.unwrap();
+        let handle = create_memory_for_agent(&config, "ops").await.unwrap();
         handle
             .store("k1", "first fact", MemoryCategory::Core, None)
             .await

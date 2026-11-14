@@ -38,6 +38,17 @@ test("runtimeValueForSubmit requires a runtime selection", () => {
   assert.equal(runtimeValueForSubmit({ preset_name: "local_small" }), "local_small");
 });
 
+test("configured model selection uses the global recommendation without inferring a family", () => {
+  assert.deepEqual(
+    runtimeAfterProviderChange(state, "", { preset_name: "local_small" }, true),
+    { preset_name: "balanced" },
+  );
+  assert.deepEqual(
+    runtimeAfterProviderChange(state, "", { preset_name: "unbounded" }, false),
+    { preset_name: "unbounded" },
+  );
+});
+
 test("required selections reject a missing runtime", () => {
   const complete = {
     provider: {},

@@ -99,6 +99,54 @@ pub async fn handle_config_get(State(state): State<AppState>) -> Response {
     Json(cfg).into_response()
 }
 
+/// Canonical provider editor, with exact map keys and the normal secret mask.
+pub async fn handle_registry_get(State(state): State<AppState>) -> Response {
+    match zeroclaw_config::provider_registry::editor::snapshot(&state.config.read()) {
+        Ok(document) => Json(document).into_response(),
+        Err(error) => error_response(ConfigApiError::new(
+            ConfigApiCode::ValidationFailed,
+            error.to_string(),
+        )),
+    }
+}
+
+pub async fn handle_registry_put(
+    State(state): State<AppState>,
+    principal: RequestPrincipal,
+    Json(edit): Json<zeroclaw_config::provider_registry::editor::RegistryEdit>,
+) -> Response {
+    let commit = match state.begin_config_commit().await {
+        Ok(commit) => commit,
+        Err(error) => return error_response(config_commit_admission_error(error)),
+    };
+    // A whole-registry replacement requires the union of map CRUD grants.
+    for verb in [Verb::Create, Verb::Delete] {
+        if let Err(denied) = authorize_config_write(
+            &principal,
+            ConfigWriteSet::default().with("providers", verb),
+            &commit,
+        ) {
+            return denied.into_response();
+        }
+    }
+    let writes = ConfigWriteSet::default().with("providers", Verb::Update);
+    let authorization = match authorize_config_write(&principal, writes, &commit) {
+        Ok(authorization) => authorization,
+        Err(denied) => return denied.into_response(),
+    };
+    let mut candidate = commit.current_config();
+    if let Err(error) = zeroclaw_config::provider_registry::editor::stage(&mut candidate, edit) {
+        return error_response(ConfigApiError::new(
+            ConfigApiCode::ValidationFailed,
+            format!("{error:#}"),
+        ));
+    }
+    match persist_and_swap(&state, authorization, candidate, commit).await {
+        Ok(_guard) => Json(serde_json::json!({ "saved": true })).into_response(),
+        Err(response) => response,
+    }
+}
+
 fn parse_patch_ops(value: serde_json::Value) -> Result<Vec<PatchOp>, ConfigApiError> {
     let ops = value.as_array().ok_or_else(|| {
         ConfigApiError::new(
@@ -1048,6 +1096,14 @@ pub async fn handle_prop_put(
         Err(e) => return error_response(config_commit_admission_error(e)),
     };
     let mut new_config = _cfg_guard.current_config();
+    if let Err(error) =
+        zeroclaw_config::schema::reject_retired_provider_edit_path(&new_config, &body.path)
+    {
+        return error_response(
+            ConfigApiError::new(ConfigApiCode::ValidationFailed, error.to_string())
+                .with_path(&body.path),
+        );
+    }
     if new_config.ensure_map_key_for_path(&body.path) {
         // Refused to vivify the reserved `default` agent: surface the same
         // reserved error the explicit create surfaces do, not a generic 404.
@@ -1429,6 +1485,14 @@ pub async fn handle_delete_map_key(
     principal: RequestPrincipal,
     Query(q): Query<MapKeyQuery>,
 ) -> Response {
+    if let Err(error) =
+        zeroclaw_config::schema::reject_retired_provider_edit_path(&state.config.read(), &q.path)
+    {
+        return error_response(
+            ConfigApiError::new(ConfigApiCode::ValidationFailed, error.to_string())
+                .with_path(&q.path),
+        );
+    }
     let agent_lifecycle_lease = if q.path == "agents" {
         match state.agent_lifecycle.begin_delete(q.key.clone()) {
             Ok(lease) => Some(lease),
@@ -1744,6 +1808,14 @@ pub async fn handle_map_key(
 ) -> Response {
     let path = q.path.clone();
     let key = q.key.clone();
+    if let Err(error) =
+        zeroclaw_config::schema::reject_retired_provider_edit_path(&state.config.read(), &path)
+    {
+        return error_response(
+            ConfigApiError::new(ConfigApiCode::ValidationFailed, error.to_string())
+                .with_path(&path),
+        );
+    }
     let _cfg_guard = match state.begin_config_commit().await {
         Ok(commit) => commit,
         Err(e) => return error_response(config_commit_admission_error(e)),
@@ -2053,6 +2125,14 @@ pub async fn handle_rename_map_key(
     principal: RequestPrincipal,
     axum::Json(body): axum::Json<RenameMapKeyBody>,
 ) -> Response {
+    if let Err(error) =
+        zeroclaw_config::schema::reject_retired_provider_edit_path(&state.config.read(), &body.path)
+    {
+        return error_response(
+            ConfigApiError::new(ConfigApiCode::ValidationFailed, error.to_string())
+                .with_path(&body.path),
+        );
+    }
     let agent_lifecycle_leases = if body.path == "agents" {
         let from = match state.agent_lifecycle.begin_delete(body.from.clone()) {
             Ok(lease) => lease,
@@ -2449,105 +2529,77 @@ async fn rename_agent_cascade(
 pub async fn handle_refresh_context_window(
     State(state): State<AppState>,
     principal: RequestPrincipal,
-    axum::extract::Path((provider_type, alias)): axum::extract::Path<(String, String)>,
+    axum::extract::Path(reference): axum::extract::Path<String>,
 ) -> Response {
-    let path = format!("providers.models.{provider_type}.{alias}");
-
-    // Build the minimal provider config the fetch below needs from a brief,
-    // un-witnessed read that clones what it needs out immediately (the
-    // `parking_lot` guard never survives past this block, well before the
-    // network `.await`). Deliberately NOT inside an admitted config commit:
-    // the outbound provider fetch can be slow or hang, and holding the
-    // daemon-wide writer serialization across it would block every other
-    // gateway config write process-wide for the duration -- a
-    // self-inflicted availability bottleneck.
-    let provider_config = {
-        let snapshot = state.config.read();
-        if snapshot.get_prop(&format!("{path}.model")).is_err() {
-            return error_response(
-                ConfigApiError::new(
-                    ConfigApiCode::PathNotFound,
-                    format!("model provider '{provider_type}.{alias}' not found"),
-                )
-                .with_path(&path),
-            );
-        }
-        let model = snapshot
-            .get_prop(&format!("{path}.model"))
-            .ok()
-            .unwrap_or_default();
-        let uri = snapshot.get_prop(&format!("{path}.uri")).ok();
-        // Read api_key via JSON serialization to bypass #[secret] masking in get_prop.
-        let api_key = serde_json::to_value(&snapshot.providers)
-            .ok()
-            .and_then(|v| {
-                v.pointer(&format!("/models/{provider_type}/{alias}/api_key"))
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty() && *s != "<unset>")
-                    .map(String::from)
-            });
-        zeroclaw_config::schema::ModelProviderConfig {
-            model: Some(model),
-            uri,
-            api_key,
-            ..Default::default()
-        }
-    };
-
-    // Fetch context window from provider. No config commit — nor any
-    // reader guard — is held across this await.
-    let context_window = match zeroclaw_providers::fetch_context_window(
-        &provider_type,
-        &provider_config,
-    )
-    .await
-    {
-        Some(ctx) => ctx,
-        None => {
-            return error_response(
-                ConfigApiError::new(
-                    ConfigApiCode::InvalidFormat,
-                    format!("provider '{provider_type}' does not support context window auto-detection or fetch failed"),
-                )
-                .with_path(&path),
-            );
-        }
-    };
-
-    // The commit is admitted only now, spanning just the config mutation:
-    // read-for-modify, apply the fetched value, save, publish.
-    let _cfg_guard = match state.begin_config_commit().await {
-        Ok(commit) => commit,
-        Err(e) => return error_response(config_commit_admission_error(e)),
-    };
-    let mut working = _cfg_guard.current_config();
-
-    // Re-verify: a concurrent writer could have removed this entry while
-    // the un-witnessed fetch above was in flight.
-    if working.get_prop(&format!("{path}.model")).is_err() {
-        return error_response(
-            ConfigApiError::new(
+    fn target(
+        config: &zeroclaw_config::schema::Config,
+        reference: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        let registry = config.provider_registry()?;
+        let selected = registry.resolve_chat(&reference.into())?;
+        Ok(serde_json::to_value((
+            selected.selection.model,
+            selected.selection.connection,
+            selected.options,
+        ))?)
+    }
+    // Never hold the config writer across provider I/O.
+    let snapshot = Box::new(state.config.read().clone());
+    let expected = match target(&snapshot, &reference) {
+        Ok(target) => target,
+        Err(_) => {
+            return error_response(ConfigApiError::new(
                 ConfigApiCode::PathNotFound,
-                format!("model provider '{provider_type}.{alias}' not found"),
-            )
-            .with_path(&path),
-        );
+                "chat model reference does not exist",
+            ));
+        }
+    };
+    let context_window =
+        match zeroclaw_providers::fetch_model_context_window(&snapshot, &reference).await {
+            Ok(Some(window)) => window,
+            Ok(None) => {
+                return error_response(ConfigApiError::new(
+                    ConfigApiCode::InvalidFormat,
+                    "provider does not expose a context window for this model",
+                ));
+            }
+            Err(_) => {
+                return error_response(ConfigApiError::new(
+                    ConfigApiCode::InvalidFormat,
+                    "context-window discovery failed",
+                ));
+            }
+        };
+    let commit = match state.begin_config_commit().await {
+        Ok(commit) => commit,
+        Err(error) => return error_response(config_commit_admission_error(error)),
+    };
+    let mut working = commit.current_config();
+    if target(&working, &reference).ok().as_ref() != Some(&expected) {
+        return error_response(ConfigApiError::new(
+            ConfigApiCode::InvalidFormat,
+            "model or connection changed during discovery; retry",
+        ));
     }
-
-    if let Err(e) = working.set_prop_persistent(
-        &format!("{path}.context_window"),
-        &context_window.to_string(),
-    ) {
-        return error_response(
-            ConfigApiError::new(
-                ConfigApiCode::InternalError,
-                format!("failed to persist context_window: {e}"),
-            )
-            .with_path(&path),
-        );
+    if let Err(error) =
+        zeroclaw_config::provider_registry::editor::update(&mut working, |registry| {
+            let Some(zeroclaw_config::provider_registry::ModelDefinition::Chat(model)) = registry
+                .models
+                .get_mut(&zeroclaw_config::provider_registry::ModelRef::from(
+                    reference.as_str(),
+                ))
+            else {
+                anyhow::bail!("chat model reference no longer exists");
+            };
+            model.metadata.context_window = Some(context_window);
+            Ok(())
+        })
+    {
+        return error_response(ConfigApiError::new(
+            ConfigApiCode::InvalidFormat,
+            format!("invalid model metadata: {error}"),
+        ));
     }
-
-    working.mark_dirty(&format!("{path}.context_window"));
     let before = state.config.read().clone();
     let authorization = match authorize_config_write(
         &principal,
@@ -2556,20 +2608,16 @@ pub async fn handle_refresh_context_window(
             &working,
             working.dirty_paths.iter().map(String::as_str),
         ),
-        &_cfg_guard,
+        &commit,
     ) {
         Ok(authorization) => authorization,
         Err(denied) => return denied.into_response(),
     };
-    if let Err(e) = persist_and_swap(&state, authorization, working, _cfg_guard).await {
-        return e;
+    if let Err(error) = persist_and_swap(&state, authorization, working, commit).await {
+        return error;
     }
-
-    axum::Json(serde_json::json!({
-        "path": path,
-        "context_window": context_window,
-    }))
-    .into_response()
+    axum::Json(serde_json::json!({"model_ref": reference, "context_window": context_window}))
+        .into_response()
 }
 
 pub async fn handle_patch(
@@ -2605,10 +2653,10 @@ pub async fn handle_patch(
     if !override_drift {
         let drifted = compute_drift(&working).await;
         if !drifted.is_empty() {
-            let touched: std::collections::HashSet<String> = ops
-                .iter()
-                .map(|op| json_pointer_to_dotted(&op.path))
-                .collect();
+            let mut touched = std::collections::HashSet::new();
+            for op in &ops {
+                touched.insert(json_pointer_to_dotted(&op.path));
+            }
             let conflicts: Vec<&DriftEntry> = drifted
                 .iter()
                 .filter(|d| touched.contains(&d.path))
@@ -3430,6 +3478,88 @@ mod tests {
             data_dir,
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn provider_registry_editor_masks_and_persists_through_config_lifecycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config.providers = toml::from_str(
+            r#"
+[connections."gateway.prod"]
+kind = "custom"
+uri = "https://example.test/v1"
+auth = { mode = "api_key", api_key = "test-registry-secret" }
+[models."chat.fast.us"]
+capability = "chat"
+provider = "gateway.prod"
+model = "before"
+"#,
+        )
+        .unwrap();
+        config.save().await.unwrap();
+        let state = test_state(config);
+        let response = handle_registry_get(State(state.clone())).await;
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let expected: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("test-registry-secret"));
+        let mut registry = expected.clone();
+        registry["models"]["chat.fast.us"]["model"] = serde_json::json!("after");
+        let response = handle_registry_put(
+            State(state.clone()),
+            None,
+            Json(zeroclaw_config::provider_registry::editor::RegistryEdit {
+                expected: expected.clone(),
+                registry: registry.clone(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            state
+                .config
+                .read()
+                .resolve_model_id("chat.fast.us")
+                .as_deref(),
+            Some("after")
+        );
+        let persisted = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        assert!(
+            !persisted.contains("test-registry-secret"),
+            "registry save must use normal encryption"
+        );
+        assert!(
+            state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        let response = handle_registry_put(
+            State(state.clone()),
+            None,
+            Json(zeroclaw_config::provider_registry::editor::RegistryEdit { expected, registry }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("config.toml")).unwrap(),
+            persisted
+        );
+        let expected =
+            zeroclaw_config::provider_registry::editor::snapshot(&state.config.read()).unwrap();
+        let response = handle_registry_put(
+            State(state.clone()),
+            None,
+            Json(zeroclaw_config::provider_registry::editor::RegistryEdit {
+                expected,
+                registry: serde_json::json!({}),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!state.config.read().providers.models.has_canonical_models());
+        let persisted = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        assert!(!persisted.contains("gateway.prod"));
+        assert!(!persisted.contains("chat.fast.us"));
     }
 
     fn test_state(config: zeroclaw_config::schema::Config) -> AppState {
@@ -4860,60 +4990,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_map_key_handler_cascades_model_provider_and_persists() {
+    async fn registry_put_updates_the_runtime_selected_model() {
         let tmp = tempfile::tempdir().unwrap();
         let mut config = temp_config(&tmp);
-        config
-            .providers
-            .models
-            .ensure("anthropic", "default")
-            .unwrap();
-        config
-            .providers
-            .models
-            .ensure("openai", "main")
-            .unwrap()
-            .fallback = vec!["anthropic.default".into()];
-        config.agents.insert(
-            "triage".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                classifier_provider: "anthropic.default".into(),
-                ..Default::default()
-            },
-        );
+        config.providers = toml::from_str(
+            r#"
+[connections."gateway.test"]
+kind = "custom"
+uri = "http://127.0.0.1:1/v1"
+auth = { mode = "api_key", api_key = "test-key" }
+[models."chat.migrated"]
+capability = "chat"
+provider = "gateway.test"
+model = "effective-before"
+"#,
+        )
+        .unwrap();
         config.save().await.unwrap();
-
         let state = test_state(config);
+        let expected =
+            zeroclaw_config::provider_registry::editor::snapshot(&state.config.read()).unwrap();
+        let mut registry = expected.clone();
+        registry["models"]["chat.migrated"]["model"] = serde_json::json!("effective-after");
         let (status, json) = response_json(
-            handle_delete_map_key(
-                axum::extract::State(state.clone()),
+            handle_registry_put(
+                State(state.clone()),
                 None,
-                axum::extract::Query(MapKeyQuery {
-                    path: "providers.models.anthropic".to_string(),
-                    key: "default".to_string(),
+                axum::Json(zeroclaw_config::provider_registry::editor::RegistryEdit {
+                    expected,
+                    registry,
                 }),
             )
             .await,
         )
         .await;
 
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["path"], "providers.models.anthropic");
-        assert_eq!(json["key"], "default");
-        let cfg = state.config.read();
-        assert!(cfg.providers.models.find("anthropic", "default").is_none());
-        assert!(cfg.agents["triage"].classifier_provider.is_empty());
-        assert!(
-            cfg.providers
-                .models
-                .find("openai", "main")
-                .unwrap()
-                .fallback
-                .is_empty()
+        assert_eq!(status, StatusCode::OK, "registry PUT failed: {json}");
+        let live = state.config.read();
+        assert_eq!(
+            live.resolve_model_id("chat.migrated").as_deref(),
+            Some("effective-after")
         );
-        drop(cfg);
-        let written = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
-        assert!(!written.contains("anthropic.default"));
+        let written = tokio::fs::read_to_string(tmp.path().join("config.toml"))
+            .await
+            .expect("patched config must be saved");
+        let reloaded = zeroclaw_config::migration::migrate_to_current(&written).unwrap();
+        assert_eq!(
+            reloaded.resolve_model_id("chat.migrated").as_deref(),
+            Some("effective-after")
+        );
     }
 
     #[tokio::test]
@@ -5064,7 +5189,7 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["code"], "op_not_supported");
+        assert_eq!(json["code"], "validation_failed");
         assert!(
             state
                 .config
@@ -6844,7 +6969,7 @@ mod tests {
         let mock = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/models"))
+            .and(path("/v1/models"))
             .and(header("authorization", "Bearer test-api-key-123"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -6865,24 +6990,17 @@ mod tests {
             config_path: path.clone(),
             ..Default::default()
         };
-        cfg.providers.models.groq.insert(
-            "test".to_string(),
-            zeroclaw_config::schema::GroqModelProviderConfig {
-                base: zeroclaw_config::schema::ModelProviderConfig {
-                    model: Some("llama-3.1-70b".into()),
-                    api_key: Some("test-api-key-123".into()),
-                    uri: Some(mock.uri()),
-                    ..Default::default()
-                },
-            },
-        );
+        cfg.providers = serde_json::from_value(serde_json::json!({
+            "connections": {"gateway.prod.v2": {"kind":"groq", "uri": format!("{}/v1", mock.uri()), "auth":{"mode":"api_key", "api_key":"test-api-key-123"}}},
+            "models": {"chat.fast.v2":{"capability":"chat", "provider":"gateway.prod.v2", "model":"llama-3.1-70b"}}
+        })).unwrap();
         cfg.save().await.expect("initial save");
 
         let state = crate::api::test_state(cfg);
 
         let app = axum::Router::new()
             .route(
-                "/api/config/model-providers/{type}/{alias}/refresh-context-window",
+                "/api/config/models/{model_ref}/refresh-context-window",
                 axum::routing::post(handle_refresh_context_window),
             )
             .with_state(state);
@@ -6891,7 +7009,7 @@ mod tests {
             .oneshot(
                 axum::http::Request::builder()
                     .method("POST")
-                    .uri("/api/config/model-providers/groq/test/refresh-context-window")
+                    .uri("/api/config/models/chat.fast.v2/refresh-context-window")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -6913,7 +7031,7 @@ mod tests {
         let body_str = String::from_utf8(body.to_vec()).unwrap();
         let json: serde_json::Value = serde_json::from_str(&body_str).unwrap();
 
-        assert_eq!(json["path"], "providers.models.groq.test");
+        assert_eq!(json["model_ref"], "chat.fast.v2");
         assert_eq!(json["context_window"], 4096);
         assert!(
             !body_str.contains("test-api-key-123"),

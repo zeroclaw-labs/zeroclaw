@@ -121,11 +121,7 @@ pub fn lookup<'a>(
         let models = snapshot.get(key)?;
         model_id_candidates(model_id).find_map(|id| models.get(id))
     };
-    probe(provider_ref).or_else(|| {
-        provider_ref
-            .split_once('.')
-            .and_then(|(family, _alias)| probe(family))
-    })
+    probe(provider_ref)
 }
 
 /// Replace the global snapshot. The refresher is the only production writer.
@@ -135,11 +131,16 @@ fn store_snapshot(snapshot: PriceSnapshot) {
 
 /// True when at least one model provider opts into `live_pricing`.
 fn any_live_pricing(config: &Config) -> bool {
-    config
-        .providers
-        .models
-        .iter_entries()
-        .any(|(_, _, base)| base.live_pricing)
+    config.provider_registry().is_ok_and(|registry| {
+        registry.models.values().any(|model| {
+            model.capability() == zeroclaw_api::capability::Capability::Chat
+                && registry
+                    .connections
+                    .get(model.provider())
+                    .and_then(|connection| connection.chat_api())
+                    .is_some_and(|api| api.live_pricing == Some(true))
+        })
+    })
 }
 
 /// Whether the background price refresher has been started in this process.
@@ -216,7 +217,11 @@ pub fn live_pricing_enabled() -> bool {
 /// A copy of the bound config, read under its lock at the moment of the call.
 fn bound_config() -> Option<Config> {
     let handle = CONFIG_HANDLE.read().clone()?;
-    Some(handle.snapshot())
+    let config = handle.snapshot();
+    #[cfg(test)]
+    return Some(zeroclaw_config::migration::admit_test_input(&config));
+    #[cfg(not(test))]
+    Some(config)
 }
 
 /// One refresh cycle. Re-resolves the bound handle (re-bound across daemon
@@ -229,13 +234,26 @@ async fn refresh_cycle() {
     let Some(cfg) = bound_config() else {
         return;
     };
-    let (groups, total_aliases_per_family) = enabled_pricing_groups(&cfg);
+    let groups =
+        match crate::model::build_nonblocking(move || Ok(enabled_pricing_groups(&cfg))).await {
+            Ok(groups) => groups,
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(serde_json::json!({"error": error.to_string()})),
+                    "live pricing: provider construction task failed"
+                );
+                return;
+            }
+        };
     if groups.is_empty() {
         if !current_snapshot().is_empty() {
             store_snapshot(PriceSnapshot::new());
         }
     } else {
-        refresh_once(&groups, &total_aliases_per_family).await;
+        refresh_once(&groups).await;
     }
 }
 
@@ -248,8 +266,6 @@ struct WantedModel {
     /// cannot inherit prices from an opted-in same-family alias via the
     /// bare-family fallback.
     provider_key: String,
-    /// Same as `provider_key`; kept for clarity at use sites that build handles.
-    composite: String,
     model_id: String,
     models_dev_key: Option<String>,
 }
@@ -263,102 +279,95 @@ struct GatewayGroup {
     wanted: Vec<WantedModel>,
 }
 
-fn enabled_pricing_groups(
-    config: &zeroclaw_config::schema::Config,
-) -> (Vec<GatewayGroup>, HashMap<String, usize>) {
-    // Count TOTAL aliases per family (opted-in and not), used later to decide
-    // whether a bare-family snapshot entry is safe to add.
-    let mut total_aliases_per_family: HashMap<String, usize> = HashMap::new();
-    for (ty, _alias, _base) in config.providers.models.iter_entries() {
-        *total_aliases_per_family.entry(ty.to_string()).or_default() += 1;
-    }
-
-    // gateway key -> (representative built handle, wanted models)
+fn enabled_pricing_groups(config: &zeroclaw_config::schema::Config) -> Vec<GatewayGroup> {
+    // The registry includes the compatibility projection for legacy provider
+    // profiles, so pricing has one model enumeration and one exact-key path.
     let mut groups: HashMap<String, GatewayGroup> = HashMap::new();
-    for (ty, alias, base) in config.providers.models.iter_entries() {
-        if !base.live_pricing {
-            continue;
-        }
-        // Only a model with a known id can be matched against the catalog.
-        let Some(model_id) = base
-            .model
-            .as_deref()
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-        else {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({ "provider": format!("{ty}.{alias}") })),
-                "live pricing: provider opted in but sets no `model`; nothing to price"
-            );
-            continue;
-        };
-        let composite = format!("{ty}.{alias}");
-        // Aliases on the same explicit endpoint share one call; aliases on a
-        // family default share one call per family type.
-        let gateway_key = base
-            .uri
-            .as_deref()
-            .map(str::trim)
-            .filter(|u| !u.is_empty())
-            .map_or_else(|| format!("type:{ty}"), str::to_string);
 
-        let wanted = WantedModel {
-            // Keyed by composite alias to preserve the alias boundary; the
-            // snapshot uses this directly so a non-opted-in alias can never
-            // inherit rates from an opted-in same-family alias.
-            provider_key: composite.clone(),
-            composite,
-            model_id: model_id.to_string(),
-            // models.dev provider key for this family, for the fallback path.
-            models_dev_key: crate::catalog::catalog_source_for(ty)
-                .and_then(|(md_key, _)| md_key)
-                .map(str::to_string),
-        };
-
-        if let Some(group) = groups.get_mut(&gateway_key) {
-            group.wanted.push(wanted);
-            continue;
-        }
-        // First alias for this gateway: build the representative handle.
-        let options = crate::options_for_provider_ref(
-            config,
-            &wanted.composite,
-            &crate::ModelProviderRuntimeOptions::default(),
-        );
-        match crate::create_model_provider_for_alias(
-            config,
-            ty,
-            alias,
-            base.api_key.as_deref(),
-            &options,
-        ) {
-            Ok(handle) => {
-                groups.insert(
-                    gateway_key,
-                    GatewayGroup {
-                        handle: Arc::from(handle),
-                        wanted: vec![wanted],
-                    },
-                );
+    // Canonical models own `live_pricing` on their chat API. Keep these exact
+    // model refs separate from legacy family aliases so a canonical key such
+    // as `chat.fast` never creates or inherits a bare `chat` price slot.
+    if let Ok(registry) = config.provider_registry() {
+        for (model_ref, model) in &registry.models {
+            if model.capability() != zeroclaw_api::capability::Capability::Chat {
+                continue;
             }
-            Err(error) => {
+            let Ok(resolved) = registry.resolve_chat(model_ref) else {
+                continue;
+            };
+            if resolved.live_pricing != Some(true) {
+                continue;
+            }
+            let Some(model_id) = resolved
+                .upstream_model()
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+            else {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({
-                            "provider": wanted.composite,
-                            "error": format!("{error}"),
+                            "provider": model_ref.as_str(),
                         })),
-                    "live pricing: could not build provider; skipping gateway"
+                    "live pricing: canonical model opted in but has no effective model selection"
                 );
+                continue;
+            };
+            let composite = model_ref.to_string();
+            let wanted = WantedModel {
+                provider_key: composite.clone(),
+                model_id: model_id.to_owned(),
+                models_dev_key: crate::catalog::catalog_source_for(
+                    resolved.selection.connection.kind(),
+                )
+                .and_then(|(key, _)| key)
+                .map(str::to_owned),
+            };
+            let gateway_key = resolved
+                .selection
+                .connection
+                .uri()
+                .map(str::trim)
+                .filter(|uri| !uri.is_empty())
+                .map_or_else(
+                    || format!("type:{}", resolved.selection.connection.kind()),
+                    str::to_owned,
+                );
+            if let Some(group) = groups.get_mut(&gateway_key) {
+                group.wanted.push(wanted);
+                continue;
+            }
+            match crate::model::build_raw_provider(
+                config,
+                model_ref.as_str(),
+                crate::model::ProviderOverrides::default(),
+            ) {
+                Ok(binding) => {
+                    groups.insert(
+                        gateway_key,
+                        GatewayGroup {
+                            handle: Arc::from(binding.provider),
+                            wanted: vec![wanted],
+                        },
+                    );
+                }
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "provider": model_ref.as_str(),
+                                "error": format!("{error}"),
+                            })),
+                        "live pricing: could not build canonical provider; skipping gateway"
+                    );
+                }
             }
         }
     }
-    (groups.into_values().collect(), total_aliases_per_family)
+    groups.into_values().collect()
 }
 
 /// Match a flagged model id against a `model_id -> rates` catalog through
@@ -391,21 +400,11 @@ fn rates_catalog(models: Vec<ModelInfo>) -> HashMap<String, ModelRates> {
 fn assemble_snapshot(
     gateway_results: &[(&[WantedModel], HashMap<String, ModelRates>)],
     models_dev: &HashMap<String, HashMap<String, ModelRates>>,
-    total_aliases_per_family: &HashMap<String, usize>,
 ) -> PriceSnapshot {
     let mut out = PriceSnapshot::new();
-    // Count opted-in aliases per family (each WantedModel is one <type>.<alias>).
-    let mut opted_in_per_family: HashMap<String, usize> = HashMap::new();
 
     for (wanted, catalog) in gateway_results {
         for want in *wanted {
-            let family = want
-                .provider_key
-                .split_once('.')
-                .map(|(f, _)| f)
-                .unwrap_or(&want.provider_key);
-            *opted_in_per_family.entry(family.to_string()).or_default() += 1;
-
             let gw = match_pricing(catalog, &want.model_id).copied();
             let md = want
                 .models_dev_key
@@ -431,42 +430,13 @@ fn assemble_snapshot(
         }
     }
 
-    for (family, opted_in_count) in &opted_in_per_family {
-        let total = total_aliases_per_family.get(family).copied().unwrap_or(0);
-        if *opted_in_count < total {
-            continue;
-        }
-        // Merge all composite alias entries for this family into one map.
-        let prefix = format!("{family}.");
-        let mut family_map: HashMap<String, ModelRates> = HashMap::new();
-        for (composite_key, model_map) in &out {
-            if !composite_key.starts_with(&prefix) {
-                continue;
-            }
-            for (model_id, &rates) in model_map {
-                let slot = family_map.entry(model_id.clone()).or_default();
-                *slot = ModelRates {
-                    input_per_mtok: slot.input_per_mtok.or(rates.input_per_mtok),
-                    output_per_mtok: slot.output_per_mtok.or(rates.output_per_mtok),
-                    cached_input_per_mtok: slot
-                        .cached_input_per_mtok
-                        .or(rates.cached_input_per_mtok),
-                    cache_write_per_mtok: slot.cache_write_per_mtok.or(rates.cache_write_per_mtok),
-                };
-            }
-        }
-        if !family_map.is_empty() {
-            out.insert(family.clone(), family_map);
-        }
-    }
-
     out
 }
 
 /// Poll each gateway once, fall back to models.dev for models a gateway didn't
 /// price, and publish the merged snapshot. Keeps the previous snapshot if no
 /// source succeeded (never regress good prices to empty on a transient outage).
-async fn refresh_once(groups: &[GatewayGroup], total_aliases_per_family: &HashMap<String, usize>) {
+async fn refresh_once(groups: &[GatewayGroup]) {
     // ── Gather all gateway catalogs concurrently (one `/models` call per
     // gateway; first-fill latency is bounded by the slowest gateway, not the
     // sum of all of them) ──
@@ -544,11 +514,7 @@ async fn refresh_once(groups: &[GatewayGroup], total_aliases_per_family: &HashMa
     }
 
     if any_ok {
-        store_snapshot(assemble_snapshot(
-            &gateway_results,
-            &models_dev,
-            total_aliases_per_family,
-        ));
+        store_snapshot(assemble_snapshot(&gateway_results, &models_dev));
     }
 }
 
@@ -577,6 +543,33 @@ mod tests {
         config
     }
 
+    #[test]
+    fn canonical_models_enable_live_pricing_without_legacy_profiles() {
+        let config = Config {
+            providers: toml::from_str(
+                r#"
+[connections."gateway.prod"]
+kind = "custom"
+uri = "http://127.0.0.1:9/v1"
+capabilities = ["chat"]
+api.chat = { live_pricing = true }
+[models."chat.fast"]
+capability = "chat"
+provider = "gateway.prod"
+model = "fast-id"
+"#,
+            )
+            .unwrap(),
+            ..Default::default()
+        };
+        assert!(any_live_pricing(&config));
+        let groups = enabled_pricing_groups(&config);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].wanted[0].provider_key, "chat.fast");
+        assert_eq!(groups[0].wanted[0].model_id, "fast-id");
+        assert!(!any_live_pricing(&Config::default()));
+    }
+
     fn opt_out(config: &mut Config) {
         config
             .providers
@@ -586,6 +579,45 @@ mod tests {
             .expect("the opted-in provider exists")
             .base
             .live_pricing = false;
+    }
+
+    #[test]
+    fn pricing_groups_resolve_nested_default_and_sole_model() {
+        use zeroclaw_config::schema::ModelEntryConfig;
+        for alias in ["default", "only"] {
+            let mut config = opted_in_config();
+            let profile = config.providers.models.ensure("ollama", "priced").unwrap();
+            profile.model = None;
+            profile.models.insert(
+                alias.into(),
+                ModelEntryConfig {
+                    id: Some("nested-model".into()),
+                    ..Default::default()
+                },
+            );
+            let groups =
+                enabled_pricing_groups(&zeroclaw_config::migration::admit_test_input(&config));
+            assert_eq!(groups.len(), 1);
+            assert_eq!(groups[0].wanted.len(), 2);
+            assert!(
+                groups[0]
+                    .wanted
+                    .iter()
+                    .all(|model| model.model_id == "nested-model")
+            );
+            assert!(
+                groups[0]
+                    .wanted
+                    .iter()
+                    .any(|model| model.provider_key == "ollama.priced")
+            );
+            assert!(
+                groups[0]
+                    .wanted
+                    .iter()
+                    .any(|model| model.provider_key == format!("ollama.priced.{alias}"))
+            );
+        }
     }
 
     /// An operator's opt-out written through the bound live handle, the way
@@ -659,7 +691,7 @@ mod tests {
         let hit = lookup(&snap, "opencode", "minimax-m2.5").expect("family hit");
         assert_eq!(hit.input_per_mtok, Some(0.3));
         // A `<type>.<alias>` ref falls back to the bare family (provider_pricing parity).
-        assert!(lookup(&snap, "opencode.zen", "minimax-m2.5").is_some());
+        assert!(lookup(&snap, "opencode.zen", "minimax-m2.5").is_none());
         // A recorded `vendor/slug` id degrades to the stored slug.
         assert!(lookup(&snap, "opencode", "minimax/minimax-m2.5").is_some());
         assert!(lookup(&snap, "opencode", "other-model").is_none());
@@ -728,7 +760,6 @@ mod tests {
             // provider_key is the composite alias, matching what
             // enabled_pricing_groups now stores (not the bare family).
             provider_key: composite.to_string(),
-            composite: composite.to_string(),
             model_id: model.to_string(),
             models_dev_key: md_key.map(str::to_string),
         }
@@ -792,21 +823,21 @@ mod tests {
         // All 5 kilo aliases and the 1 x alias are in the wanted list (all opted
         // in), so bare-family entries are added for "kilo" (5==5) but not "x"
         // (x.e priced nothing, so "x" never gets a non-empty family map).
-        let total = HashMap::from([("kilo".to_string(), 5usize), ("x".to_string(), 1usize)]);
-        let snap = assemble_snapshot(&gateway_results, &models_dev, &total);
+        let snap = assemble_snapshot(&gateway_results, &models_dev);
 
         // All aliases opted in → bare "kilo" entry exists (backward compat path).
-        assert_eq!(snap["kilo"]["minimax/m2.7"].input_per_mtok, Some(0.3));
-        assert_eq!(snap["kilo"]["only-on-mdev"].input_per_mtok, Some(0.5));
-        assert_eq!(snap["kilo"]["vendor/slug"].input_per_mtok, Some(0.7));
+        assert_eq!(snap["kilo.a"]["minimax/m2.7"].input_per_mtok, Some(0.3));
+        assert_eq!(snap["kilo.b"]["only-on-mdev"].input_per_mtok, Some(0.5));
+        assert_eq!(snap["kilo.c"]["vendor/slug"].input_per_mtok, Some(0.7));
         // Per-dimension merge: gateway wins input+output, models.dev backfills
         // ONLY the cache_read dimension the gateway left unset.
-        let partial = &snap["kilo"]["partial"];
+        let partial = &snap["kilo.f"]["partial"];
         assert_eq!(partial.input_per_mtok, Some(2.0)); // gateway
         assert_eq!(partial.output_per_mtok, Some(4.0)); // gateway
         assert_eq!(partial.cached_input_per_mtok, Some(0.5)); // models.dev backfill
         // Neither source: absent from the family map (left at $0).
-        assert!(!snap["kilo"].contains_key("nowhere"));
+        assert!(!snap.contains_key("kilo.d"));
+        assert!(!snap.contains_key("kilo"));
         // Composite alias keys are also present.
         assert_eq!(snap["kilo.a"]["minimax/m2.7"].input_per_mtok, Some(0.3));
         assert_eq!(snap["kilo.b"]["only-on-mdev"].input_per_mtok, Some(0.5));
@@ -842,9 +873,8 @@ mod tests {
         gateway.insert("minimax-m2.7".to_string(), rate(0.3));
         let gateway_results = vec![(wanted.as_slice(), gateway)];
         let models_dev = HashMap::new();
-        let total = HashMap::from([("kilo".to_string(), 2usize)]);
 
-        let snap = assemble_snapshot(&gateway_results, &models_dev, &total);
+        let snap = assemble_snapshot(&gateway_results, &models_dev);
 
         // kilo.primary (opted in) has composite rates.
         assert_eq!(
@@ -889,9 +919,8 @@ mod tests {
         let gateway_results = vec![(primary_slice, gateway_a), (secondary_slice, gateway_b)];
         let models_dev = HashMap::new();
         // Both aliases opted in (2 == 2 total) -> bare "kilo" entry is added too.
-        let total = HashMap::from([("kilo".to_string(), 2usize)]);
 
-        let snap = assemble_snapshot(&gateway_results, &models_dev, &total);
+        let snap = assemble_snapshot(&gateway_results, &models_dev);
 
         // Each alias retains its own gateway's rates in the composite slot.
         assert_eq!(
@@ -916,9 +945,9 @@ mod tests {
         // The bare "kilo" entry exists (all aliases opted in) and carries merged
         // rates (first-wins per dimension); bare-family cost-path queries resolve.
         assert!(
-            snap.contains_key("kilo"),
-            "bare-family entry must exist when all aliases opted in"
+            !snap.contains_key("kilo"),
+            "only exact model keys may receive live prices"
         );
-        assert!(lookup(&snap, "kilo", "minimax-m2.7").is_some());
+        assert!(lookup(&snap, "kilo", "minimax-m2.7").is_none());
     }
 }

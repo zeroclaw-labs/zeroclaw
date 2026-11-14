@@ -1196,8 +1196,7 @@ enum Commands {
         #[arg(long, hide = true)]
         api_key: Option<String>,
 
-        /// ModelProvider name. Used as the type key for the synthesized
-        /// `[providers.models.<type>.default]` entry.
+        /// Provider kind for the synthesized connection and chat model.
         #[arg(long, hide = true)]
         model_provider: Option<String>,
 
@@ -1258,7 +1257,8 @@ Examples:
         #[arg(long)]
         model: Option<String>,
 
-        /// Temperature (0.0 - 2.0, defaults to `providers.models.<type>.<alias>.temperature`)
+        /// Temperature (0.0 - 2.0; defaults to the selected model's configured
+        /// temperature — the model entry's, else the provider profile's)
         #[arg(short, long, value_parser = parse_temperature)]
         temperature: Option<f64>,
 
@@ -1820,6 +1820,21 @@ fn quickstart_runtime_profile_for_provider(
         .to_string()
 }
 
+#[cfg(feature = "agent-runtime")]
+fn quickstart_prefill_provider_fields(
+    codex_auth: bool,
+    api_key: Option<&str>,
+) -> std::collections::HashMap<String, String> {
+    let mut fields = std::collections::HashMap::new();
+    if codex_auth {
+        fields.insert("auth.mode".to_string(), "codex".to_string());
+    }
+    if let Some(key) = api_key.filter(|key| !key.is_empty()) {
+        fields.insert("auth.api_key".to_string(), key.to_string());
+    }
+    fields
+}
+
 /// `zeroclaw quickstart` CLI entry — checklist UX, not a wizard.
 ///
 /// Mirrors the TUI Quickstart pane's structure: a single screen
@@ -1987,17 +2002,7 @@ async fn run_quickstart_cli(
     {
         let needs_key = !found.local && api_key.is_none() && !codex_auth;
         if !needs_key {
-            let mut fields: std::collections::HashMap<String, String> =
-                std::collections::HashMap::new();
-            if codex_auth {
-                fields.insert("auth_mode".to_string(), "codex".to_string());
-            }
-            if let Some(key) = api_key.as_deref().filter(|s| !s.is_empty()) {
-                // Submission field keys are snake_case (`api_key`) — the apply
-                // path round-trips them verbatim into `set_prop_persistent`,
-                // which rejects kebab-case with "Unknown property".
-                fields.insert("api_key".to_string(), key.to_string());
-            }
+            let fields = quickstart_prefill_provider_fields(codex_auth, api_key.as_deref());
             form.provider = Some(ProviderChoice::Fresh {
                 kind: found.kind.clone(),
                 display_name: found.display_name.clone(),
@@ -2345,13 +2350,13 @@ async fn run_quickstart_cli(
                     std::collections::HashMap::new();
                 let mut aborted = false;
                 for d in &descriptors {
-                    if d.key == "api_key" {
+                    if d.key == "auth.api_key" {
                         let skips_api_key =
-                            quickstart_field_value_eq(&field_buf, "auth_mode", "codex")
+                            quickstart_field_value_eq(&field_buf, "auth.mode", "codex")
                                 || (chosen.kind == "anthropic"
                                     && quickstart_field_value_eq(
                                         &field_buf,
-                                        "auth_mode",
+                                        "auth.mode",
                                         "setup_token",
                                     ));
                         if skips_api_key {
@@ -2984,10 +2989,9 @@ async fn run_quickstart_cli(
     let provider = form.provider.expect("provider satisfied");
     let provider_type = match &provider {
         ProviderChoice::Fresh { kind, .. } => kind.as_str(),
-        ProviderChoice::Existing { alias_ref } => alias_ref
-            .split_once('.')
-            .map(|(provider_type, _)| provider_type)
-            .unwrap_or(alias_ref),
+        // Exact model keys carry no provider-type information. Existing
+        // selections use the shared state default, as Web and Zerocode do.
+        ProviderChoice::Existing { .. } => "",
     };
     let runtime_profile = SelectorChoice::Fresh(quickstart_runtime_profile_for_provider(
         provider_type,
@@ -3199,19 +3203,6 @@ fn report_agent_not_created(
     ))
 }
 
-#[cfg(feature = "agent-runtime")]
-fn model_path_provider_type(path: &str) -> Option<&'static str> {
-    let parts: Vec<&str> = path.split('.').collect();
-    if parts.len() != 5 || parts[0] != "providers" || parts[1] != "models" || parts[4] != "model" {
-        return None;
-    }
-    let family = parts[2];
-    zeroclaw_providers::list_model_providers()
-        .iter()
-        .find(|p| p.name == family)
-        .map(|p| p.name)
-}
-
 #[cfg(any(feature = "agent-runtime", test))]
 fn map_key_for_prop_path<'a>(section_path: &str, prop_path: &'a str) -> Option<&'a str> {
     let tail = prop_path.strip_prefix(section_path)?.strip_prefix('.')?;
@@ -3258,6 +3249,17 @@ fn init_map_alias(config: &mut Config, section_arg: &str) -> Result<Option<Strin
     else {
         return Ok(None);
     };
+    if config.loaded_from.is_some()
+        && zeroclaw_config::schema::reject_retired_provider_edit_path(
+            config,
+            &format!("{section_path}.{alias}"),
+        )
+        .is_err()
+    {
+        anyhow::bail!(
+            "retired provider profile path `{section_path}.{alias}`; edit the canonical provider registry instead"
+        );
+    }
     match zeroclaw_config::alias_refs::create_map_key_checked(config, section_path, alias) {
         Ok(true) => Ok(Some(format!("{section_path}.{alias}"))),
         Ok(false) => Ok(None),
@@ -3290,6 +3292,18 @@ fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<
     let Some((section_path, key)) = alias_target_for_path(prop_path, map_key_for_prop_path) else {
         return Ok(false);
     };
+
+    if config.loaded_from.is_some()
+        && zeroclaw_config::schema::reject_retired_provider_edit_path(
+            config,
+            &format!("{section_path}.{key}"),
+        )
+        .is_err()
+    {
+        anyhow::bail!(
+            "retired provider profile path `{section_path}.{key}`; edit the canonical provider registry instead"
+        );
+    }
 
     // The alias already exists in the loaded config (e.g. a hyphenated cron
     // alias the TOML loader accepts and `config get`/`config list` resolve):
@@ -9135,6 +9149,57 @@ fn async_main(command: clap::Command) -> Result<()> {
         .block_on(async_main_inner(command))
 }
 
+#[cfg(not(feature = "agent-runtime"))]
+async fn build_kernel_agent_model(
+    config: &Config,
+    agent_alias: &str,
+    provider_override: Option<&str>,
+    model_override: Option<&str>,
+) -> Result<zeroclaw_providers::model::BuiltModel> {
+    let agent = config
+        .agents
+        .get(agent_alias)
+        .ok_or_else(|| anyhow::Error::msg(format!("Agent `{agent_alias}` is not configured")))?;
+    zeroclaw_providers::model::build_model_nonblocking(
+        std::sync::Arc::new(config.clone()),
+        agent_alias,
+        provider_override.unwrap_or(agent.model_provider.as_str()),
+        model_override,
+    )
+    .await
+}
+
+#[cfg(not(feature = "agent-runtime"))]
+async fn kernel_agent_chat(
+    config: &Config,
+    agent_alias: &str,
+    model: &zeroclaw_providers::model::BuiltModel,
+    temperature_override: Option<f64>,
+    message: &str,
+) -> Result<String> {
+    let provider_ref = model.identity().provider_ref();
+    // Bare-family overrides inherit the configured agent selection. Keep that
+    // derived scalar separate from invocation input so fallbacks resolve their
+    // own sampling policy from Config.
+    let selection_ref =
+        if zeroclaw_providers::model::inherits_agent_selection(config, &provider_ref) {
+            config
+                .agent(agent_alias)
+                .map_or(provider_ref.as_str(), |agent| agent.model_provider.as_str())
+        } else {
+            provider_ref.as_str()
+        };
+    let input = zeroclaw_providers::temperature::Temperature::from(temperature_override);
+    zeroclaw_providers::ProviderDispatch::from_ref(model.provider())
+        .chat_with_system_with_sampling(
+            None,
+            message,
+            model.model_name(),
+            input.for_call(Some(std::sync::Arc::new(config.clone())), selection_ref),
+        )
+        .await
+}
+
 /// True when a desktop entry's `Name` deliberately identifies ZeroClaw: it is
 /// exactly "ZeroClaw" or "ZeroClaw" followed by a separator (e.g. "ZeroClaw
 /// Companion"), case-insensitively. Matching the visible application name — not
@@ -9928,7 +9993,10 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
     };
 
     // All other commands need config loaded first
+    #[cfg(feature = "agent-runtime")]
     let mut config = Box::pin(Config::load_or_init()).await?;
+    #[cfg(not(feature = "agent-runtime"))]
+    let config = Box::pin(Config::load_or_init()).await?;
     #[cfg(feature = "agent-runtime")]
     if let Some((expected_data_dir, _)) = daemon_ownership.as_ref() {
         anyhow::ensure!(
@@ -10099,65 +10167,23 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                         "`zeroclaw agent --agent {agent_alias}` is not configured (no [agents.{agent_alias}] entry)"
                     );
                 }
-                let agent_entry = config.model_provider_for_agent(&agent_alias);
-                let final_temperature = temperature
-                    .unwrap_or_else(|| agent_entry.and_then(|e| e.temperature).unwrap_or(0.7));
-                if let Some(p) = &model_provider {
-                    // Parse --model-provider as "type.alias" or bare "type" (use agent alias as alias name).
-                    let (type_key, alias_key) =
-                        p.split_once('.').unwrap_or((p.as_str(), &agent_alias));
-                    let entry = config
-                        .providers
-                        .models
-                        .ensure(type_key, alias_key)
-                        .ok_or_else(|| {
-                            ::zeroclaw_log::record!(
-                                WARN,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Reject
-                                )
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({"family": type_key})),
-                                "ask CLI refused: --model-provider names an unknown family"
-                            );
-                            anyhow::Error::msg(format!(
-                                "Unknown model_provider family: {type_key}. \
-                             Configure a provider via `zeroclaw quickstart` or the /config editor."
-                            ))
-                        })?;
-                    if let Some(m) = &model {
-                        entry.model = Some(m.clone());
-                    }
-                    entry.temperature = Some(final_temperature);
-                    // Update the agent's model_provider to point to the override
-                    if let Some(agent_cfg) = config.agents.get_mut(&agent_alias) {
-                        agent_cfg.model_provider = format!("{type_key}.{alias_key}").into();
-                    }
-                } else if config.model_provider_for_agent(&agent_alias).is_none() {
-                    anyhow::bail!(
-                        "No model model_provider configured for agent {agent_alias}. \
-                         Pass --model-provider <type> or run `zeroclaw quickstart` to configure one."
-                    );
-                }
-
-                let (provider_name, resolved_entry) = config
-                    .resolved_model_provider_for_agent(&agent_alias)
-                    .map(|(ty, _alias, entry)| (ty, Some(entry)))
-                    .unwrap_or(("openai", None));
-                let model_provider = zeroclaw::providers::create_model_provider(
-                    provider_name,
-                    resolved_entry.and_then(|e| e.api_key.as_deref()),
-                )?;
-                let model_name = resolved_entry
-                    .and_then(|e| e.model.as_deref())
-                    .unwrap_or("default");
+                let built_model = build_kernel_agent_model(
+                    &config,
+                    &agent_alias,
+                    model_provider.as_deref(),
+                    model.as_deref(),
+                )
+                .await?;
                 match message {
                     Some(msg) => {
-                        let response =
-                            zeroclaw_providers::ProviderDispatch::from_ref(&*model_provider)
-                                .simple_chat(&msg, model_name, Some(final_temperature))
-                                .await?;
+                        let response = kernel_agent_chat(
+                            &config,
+                            &agent_alias,
+                            &built_model,
+                            temperature,
+                            &msg,
+                        )
+                        .await?;
                         println!("{response}");
                     }
                     None => {
@@ -10183,15 +10209,19 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                                     }
                                 }
                             };
-                            let response =
-                                zeroclaw_providers::ProviderDispatch::from_ref(&*model_provider)
-                                    .simple_chat(line.trim(), model_name, Some(final_temperature))
-                                    .await?;
+                            let response = kernel_agent_chat(
+                                &config,
+                                &agent_alias,
+                                &built_model,
+                                temperature,
+                                line.trim(),
+                            )
+                            .await?;
                             println!("{response}");
                         }
                     }
                 }
-                return Ok(());
+                Ok(())
             }
             Commands::Completions { .. } | Commands::MarkdownHelp | Commands::MarkdownSchema => {
                 anyhow::bail!("documentation command was not handled before runtime dispatch")
@@ -10254,11 +10284,12 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
             temperature,
             peripheral,
         } => {
-            let final_temperature: Option<f64> = temperature.or_else(|| {
-                config
-                    .model_provider_for_agent(&agent_alias)
-                    .and_then(|e| e.temperature)
-            });
+            // `temperature` reaches `run` as the explicit per-invocation
+            // override only. The config-derived default (`entry ∨ profile`)
+            // is resolved inside the run loop from the model actually in
+            // effect, so it follows `--provider`/`--model` overrides and
+            // mid-run switches.
+            let final_temperature = temperature;
 
             // Validate up-front: bail with a clear message if the alias
             // isn't configured. The runtime would error too, but this
@@ -10296,25 +10327,28 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 zeroclaw_channels::orchestrator::build_channel_map(config)
             }));
 
-            Box::pin(agent::run(
-                config,
-                &agent_alias,
-                message,
-                model_provider,
-                model,
-                final_temperature,
-                peripheral,
-                true,
-                session_state_file,
-                None,
-                zeroclaw_api::ingress::TurnOrigin::Interactive,
+            agent::run_with_request(
+                Arc::new(config),
+                agent::AgentRunRequest {
+                    message,
+                    model: zeroclaw_runtime::agent::agent::ModelOverrides {
+                        provider: model_provider.as_deref(),
+                        model: model.as_deref(),
+                        temperature: final_temperature,
+                    },
+                    peripheral_overrides: peripheral,
+                    interactive: true,
+                    session_state_file,
+                    origin: zeroclaw_api::ingress::TurnOrigin::Interactive,
+                    ..agent::AgentRunRequest::new(&agent_alias)
+                },
                 zeroclaw_runtime::agent::loop_::AgentRunOverrides {
                     execution_capability: standalone_authority
                         .as_ref()
                         .map(|authority| authority.execution_capability()),
                     ..Default::default()
                 },
-            ))
+            )
             .await
             .map(|_| ())
         }
@@ -10790,15 +10824,11 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 // (or empty) by default, so SOP runtime behavior is off until an
                 // operator opts in by setting a directory.
                 let (sop_engine, sop_audit) = if current_config.sop.runtime_enabled() {
-                    let mem: Arc<dyn zeroclaw_memory::Memory> = Arc::from(
-                        zeroclaw_memory::create_memory_from_config(&current_config, None)?,
-                    );
-                    let sop_adapters = build_sop_adapters(&current_config);
-                    let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine_with_capability(
-                        current_config.sop.clone(),
-                        &current_config.decision_models,
-                        &current_config.data_dir,
-                        &current_config.install_root_dir(),
+                    let mem: Arc<dyn zeroclaw_memory::Memory> =
+                        Arc::from(zeroclaw_memory::create_memory_from_config(&current_config)?);
+                    let sop_adapters = build_sop_adapters(&current_config, authority.live_handle());
+                    let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
+                        &current_config,
                         mem,
                         sop_adapters,
                         Some(authority.execution_capability()),
@@ -11670,31 +11700,52 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 )
             );
             println!();
+            // One ModelProvider header per profile, one Model line per
+            // configured model — nested entries each get their own line, so
+            // a profile hosting a `models` map no longer reports "(none)".
             let mut shown_provider = false;
-            for (family, alias, entry) in config.providers.models.iter_entries() {
-                let model = entry.model.as_deref().unwrap_or("(none)");
-                if shown_provider {
+            let mut shown_profile = String::new();
+            let registry = config.provider_registry()?;
+            for configured in config.configured_model_entries(None) {
+                let Some(model) = configured.model_id.as_deref() else {
+                    continue;
+                };
+                if configured.connection_id != shown_profile {
+                    // First profile uses the emoji-anchored line; later ones
+                    // the indented variant — the original layout.
+                    let (key, fallback) = if shown_provider {
+                        ("cli-status-provider-indent", "ModelProvider")
+                    } else {
+                        ("cli-status-provider", "ModelProvider")
+                    };
                     println!(
                         "{}",
                         ta(
-                            "cli-status-provider-indent",
-                            &[("family", family), ("alias", alias)],
-                            "ModelProvider"
+                            key,
+                            &[
+                                (
+                                    "family",
+                                    registry
+                                        .connections
+                                        .get(configured.connection_id.as_str())
+                                        .map_or("", |connection| connection.kind())
+                                ),
+                                ("alias", configured.connection_id.as_str()),
+                            ],
+                            fallback
                         )
                     );
-                    println!("{}", ta("cli-status-model", &[("model", model)], "Model"));
-                } else {
-                    println!(
-                        "{}",
-                        ta(
-                            "cli-status-provider",
-                            &[("family", family), ("alias", alias)],
-                            "ModelProvider"
-                        )
-                    );
-                    println!("{}", ta("cli-status-model", &[("model", model)], "Model"));
                     shown_provider = true;
+                    shown_profile = configured.connection_id;
                 }
+                println!(
+                    "{}",
+                    ta(
+                        "cli-status-model-entry",
+                        &[("alias", &configured.model_ref), ("model", model)],
+                        "Model [{$alias}]: {$model}"
+                    )
+                );
             }
             if !shown_provider {
                 println!(
@@ -12273,11 +12324,13 @@ Add pricing to the active provider profile or supply a catalog entry."
             providers_command: None,
         } => {
             let model_providers = zeroclaw_providers::list_model_providers();
-            let configured_types: std::collections::HashSet<&str> = config
-                .providers
+            let registry = config.provider_registry()?;
+            let configured_types: std::collections::HashSet<&str> = registry
                 .models
-                .iter_entries()
-                .map(|(ty, _, _)| ty)
+                .values()
+                .filter(|model| model.capability() == zeroclaw_api::capability::Capability::Chat)
+                .filter_map(|model| registry.connections.get(model.provider()))
+                .map(|connection| connection.kind())
                 .collect();
             println!(
                 "Supported model model_providers ({} total):\n",
@@ -12301,10 +12354,9 @@ Add pricing to the active provider profile or supply a catalog entry."
                     println!("  {:<19} {}{}{}", p.name, p.display_name, local_tag, marker);
                 }
             }
+            // i18n-exempt: literal config syntax example
             println!(
-                "\n  Set [providers.models.custom.<alias>] uri = \"<URL>\" for any \
-                 OpenAI-compatible endpoint, or [providers.models.anthropic.<alias>] \
-                 uri = \"<URL>\" for an Anthropic-compatible endpoint."
+                "\n  Set kind and uri under [providers.connections.<key>], then bind a capability model under [providers.models.\"<model-ref>\"]." // i18n-exempt: literal config syntax example
             );
             Ok(())
         }
@@ -12376,13 +12428,10 @@ Add pricing to the active provider profile or supply a catalog entry."
                 });
                 let (sop_engine, sop_audit) = if config.sop.runtime_enabled() {
                     let mem: Arc<dyn zeroclaw_memory::Memory> =
-                        Arc::from(zeroclaw_memory::create_memory_from_config(&config, None)?);
-                    let sop_adapters = build_sop_adapters(&config);
-                    let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine_with_capability(
-                        config.sop.clone(),
-                        &config.decision_models,
-                        &config.data_dir,
-                        &config.install_root_dir(),
+                        Arc::from(zeroclaw_memory::create_memory_from_config(&config)?);
+                    let sop_adapters = build_sop_adapters(&config, authority.live_handle());
+                    let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
+                        &config,
                         mem,
                         sop_adapters,
                         Some(authority.execution_capability()),
@@ -12816,7 +12865,14 @@ Add pricing to the active provider profile or supply a catalog entry."
                 }
             }
             ConfigCommands::List { filter, secrets } => {
-                let entries = config.prop_fields();
+                let retired = zeroclaw_config::field_visibility::excluded_paths(&config, "");
+                let entries: Vec<_> = config
+                    .prop_fields()
+                    .into_iter()
+                    .filter(|entry| {
+                        !zeroclaw_config::field_visibility::is_excluded(&entry.name, &retired)
+                    })
+                    .collect();
                 println!(
                     "{}",
                     t(
@@ -12986,58 +13042,6 @@ Add pricing to the active provider profile or supply a catalog entry."
                     dialoguer::Input::<String>::new()
                         .with_prompt(format!("Enter value for {path}"))
                         .interact_text()?
-                } else if let Some(provider_type) = model_path_provider_type(&path) {
-                    use dialoguer::{FuzzySelect, Input};
-                    let provider_ref = path
-                        .split('.')
-                        .nth(3)
-                        .map(|alias| format!("{provider_type}.{alias}"));
-                    let catalog_selector = provider_ref.as_deref().unwrap_or(provider_type);
-                    let catalog = zeroclaw_runtime::quickstart::model_catalog_with_config_result(
-                        Some(&config),
-                        catalog_selector,
-                    )
-                    .await;
-                    let (models, _pricing, live) = match catalog {
-                        Ok(catalog) => catalog,
-                        Err(error) => {
-                            let error = error.to_string();
-                            eprintln!(
-                                "{}",
-                                ta(
-                                    "cli-config-catalog-unavailable-manual",
-                                    &[("provider", catalog_selector), ("error", &error)],
-                                    format!(
-                                        "  ⚠ Catalog for {catalog_selector} is unavailable ({error}); enter the model ID manually."
-                                    ),
-                                )
-                            );
-                            (Vec::new(), None, false)
-                        }
-                    };
-                    if live && !models.is_empty() {
-                        let current = config.get_prop(&path).unwrap_or_default();
-                        let default = models.iter().position(|m| m == &current).unwrap_or(0);
-                        let Some(idx) = FuzzySelect::new()
-                            .with_prompt(format!("Model id for {provider_type}"))
-                            .items(&models)
-                            .default(default)
-                            .max_length(models.len().max(1))
-                            .interact_opt()?
-                        else {
-                            anyhow::bail!("cancelled");
-                        };
-                        models[idx].clone()
-                    } else {
-                        eprintln!(
-                            "  no live catalog for `{provider_type}` — \
-                             enter the model id manually."
-                        );
-                        Input::<String>::new()
-                            .with_prompt(format!("Model id for {provider_type}"))
-                            .allow_empty(false)
-                            .interact_text()?
-                    }
                 } else {
                     let field_info = config.prop_fields().into_iter().find(|f| f.name == path);
                     let variants = field_info.as_ref().and_then(|info| {
@@ -15187,10 +15191,10 @@ fn quickstart_inline_auth(
     alias: &str,
     fields: &std::collections::HashMap<String, String>,
 ) -> Option<InlineProviderAuth> {
-    if kind == "openai" && quickstart_field_value_eq(fields, "auth_mode", "codex") {
+    if kind == "openai" && quickstart_field_value_eq(fields, "auth.mode", "codex") {
         return Some(InlineProviderAuth::Codex);
     }
-    if kind == "anthropic" && quickstart_field_value_eq(fields, "auth_mode", "setup_token") {
+    if kind == "anthropic" && quickstart_field_value_eq(fields, "auth.mode", "setup_token") {
         return Some(InlineProviderAuth::AnthropicSetupToken {
             alias: alias.to_string(),
         });
@@ -15301,8 +15305,7 @@ async fn run_anthropic_setup_token_inline(alias: &str, config: &mut Config) -> R
         bail!("Token cannot be empty");
     }
 
-    let path = format!("providers.models.anthropic.{alias}.api_key");
-    config.set_prop_persistent(&path, token.trim())?;
+    set_quickstart_anthropic_token(config, alias, token.trim())?;
     Box::pin(config.save_dirty()).await?;
     println!(
         "{}",
@@ -15312,6 +15315,26 @@ async fn run_anthropic_setup_token_inline(alias: &str, config: &mut Config) -> R
             "  Saved Claude setup token.",
         )
     );
+    Ok(())
+}
+
+#[cfg(feature = "agent-runtime")]
+fn set_quickstart_anthropic_token(config: &mut Config, alias: &str, token: &str) -> Result<()> {
+    use zeroclaw_config::provider_registry::{ApiKeyAuth, ProviderConnection};
+
+    let connection_ref = format!("anthropic.{alias}");
+    let connection = config
+        .providers
+        .connections
+        .get_mut(connection_ref.as_str())
+        .with_context(|| format!("Anthropic connection `{connection_ref}` does not exist"))?;
+    let ProviderConnection::Anthropic(connection) = connection else {
+        bail!("connection `{connection_ref}` is not an Anthropic connection");
+    };
+    connection.auth = Some(ApiKeyAuth::ApiKey {
+        api_key: Some(token.to_owned()),
+    });
+    config.mark_dirty("providers");
     Ok(())
 }
 
@@ -15996,61 +16019,27 @@ fn gate_security_posture(
 /// - the LLM adapter, so an `llm.generate` capability step can run one bounded
 ///   model call on the default agent's resolved provider.
 ///
-/// Each field is `None` when not applicable (no channels at all; no git channel
-/// for the forge half; no resolvable default model provider for the llm half), in
-/// which case `build_sop_engine` falls back to the log-only no-op route adapter
-/// and the fail-closed `forge.comment` / `llm.generate` placeholders (unchanged
-/// behavior). MUST be called from within the tokio runtime: it captures
+/// Channel adapters are `None` when not applicable (no channels at all; no git
+/// channel for the forge half), leaving the no-op route and fail-closed forge
+/// placeholders. The LLM resolver fails closed if the current default agent
+/// has no resolvable model, and can recover after a valid config publication.
+/// MUST be called from within the tokio runtime: it captures
 /// `Handle::current()` so the sync, under-the-engine-lock adapter calls can bridge
 /// to the async channel/provider calls.
 #[cfg(feature = "agent-runtime")]
-fn build_sop_adapters(config: &Config) -> zeroclaw_runtime::sop::SopEngineAdapters {
-    // `llm.generate` runs on the DEFAULT agent's resolved model provider — the
-    // daemon-level model of record. No resolvable provider = fail-closed.
-    let llm: Option<std::sync::Arc<dyn zeroclaw_runtime::sop::capability::LlmGenerateAdapter>> =
-        config
-            .resolved_model_provider_for_agent("default")
-            .and_then(|(provider_type, alias, entry)| {
-                // Alias-aware factory WITH the alias's runtime options: the options
-                // carry zeroclaw_dir (auth-profile store) and per-alias runtime
-                // knobs — without them, OAuth/subscription providers (codex,
-                // opencode) sit unauthenticated and never answer. This mirrors the
-                // delegate tool's provider construction.
-                let options = zeroclaw::providers::provider_runtime_options_for_alias(
-                    config,
-                    provider_type,
-                    alias,
-                );
-                let provider = match zeroclaw::providers::create_model_provider_for_alias(
-                    config,
-                    provider_type,
-                    alias,
-                    entry.api_key.as_deref(),
-                    &options,
-                ) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"error": e.to_string()})),
-                            "SOP llm.generate adapter unavailable: default model provider failed to build"
-                        );
-                        return None;
-                    }
-                };
-                let model = entry.model.clone().unwrap_or_else(|| "default".to_string());
-                Some(std::sync::Arc::new(
-                    zeroclaw_runtime::sop::capability::ProviderLlmAdapter::new(
-                        std::sync::Arc::from(provider),
-                        model,
-                    ),
-                ) as _)
-            });
+fn build_sop_adapters(
+    config: &Config,
+    live_config: zeroclaw_config::live::LiveConfigHandle,
+) -> zeroclaw_runtime::sop::SopEngineAdapters {
+    // `llm.generate` runs against the DEFAULT agent's current model selection.
+    // Resolve it at call time through the canonical builder so model-entry
+    // options, credentials, endpoints and future fields stay in one place.
+    let resolver = move || Ok(live_config.snapshot());
+    let llm = Some(
+        std::sync::Arc::new(zeroclaw_runtime::sop::capability::ProviderLlmAdapter::new(
+            resolver,
+        )) as std::sync::Arc<dyn zeroclaw_runtime::sop::capability::LlmGenerateAdapter>,
+    );
 
     let channels = zeroclaw_channels::orchestrator::build_channel_map(config);
     // Startup validation: this send-only adapter's channel map omits channels that
@@ -16850,34 +16839,44 @@ fn available_gateway_restart_hint_port(host: &str, port: u16) -> Option<u16> {
     None
 }
 
-/// Persist `model` as the default for the first configured provider.
+/// Set the active agent model's upstream ID, or the first configured chat model.
 #[cfg(feature = "agent-runtime")]
 async fn handle_models_set(config: &mut Config, model: &str) -> Result<()> {
+    let _ownership = crate::alias_cli::begin_provider_edit(config).await?;
     crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
-    let (type_key, alias) = {
-        let entry = config
-            .providers
+    // Change the upstream ID of the active agent's exact model definition.
+    let reference = config
+        .resolved_runtime_agent_alias()
+        .and_then(|alias| config.agent(alias))
+        .map(|agent| agent.model_provider.as_str().to_owned())
+        .or_else(|| {
+            config
+                .provider_registry()
+                .ok()?
+                .models
+                .into_iter()
+                .find(|(_, model)| model.capability() == zeroclaw_api::capability::Capability::Chat)
+                .map(|(reference, _)| reference.to_string())
+        })
+        .ok_or_else(|| anyhow::Error::msg("No model provider configured"))?;
+    zeroclaw_config::provider_registry::editor::update(config, |registry| {
+        let reference_key = zeroclaw_config::provider_registry::ModelRef::from(reference.as_str());
+        let selected = registry
             .models
-            .iter_entries()
-            .find(|(_, _, entry)| entry.model.as_ref().map_or(false, |m| !m.trim().is_empty()))
-            .ok_or_else(|| {
-                anyhow::Error::msg(
-                    "No model provider configured. Run `zeroclaw config init` first.",
-                )
-            })?;
-        (entry.0, entry.1.to_string())
-    };
-    let prop_path = format!("providers.models.{type_key}.{alias}.model");
-    config.set_prop_persistent(&prop_path, model)?;
+            .get_mut(&reference_key)
+            .ok_or_else(|| anyhow::Error::msg("Selected model does not exist"))?;
+        let zeroclaw_config::provider_registry::ModelDefinition::Chat(selected) = selected else {
+            anyhow::bail!("Selected model is not a chat model");
+        };
+        selected.model = Some(model.to_owned());
+        Ok(())
+    })?;
     Box::pin(config.save_dirty()).await?;
     println!(
         "{}",
         crate::i18n::get_required_cli_string_with_args(
             "cli-models-set-ok",
-            &[
-                ("model", model),
-                ("provider", &format!("{type_key}.{alias}")),
-            ]
+            &[("model", model), ("provider", &reference),]
         )
     );
     Ok(())
@@ -16895,29 +16894,36 @@ async fn dispatch_models_command(model_command: ModelCommands, config: &mut Conf
         }
         ModelCommands::Set { model } => handle_models_set(config, &model).await,
         ModelCommands::Status => {
-            match config
-                .providers
-                .models
-                .iter_entries()
-                .find(|(_, _, entry)| entry.model.as_ref().map_or(false, |m| !m.trim().is_empty()))
-            {
-                Some((ty, alias, entry)) => {
-                    let model = entry.model.as_deref().unwrap_or("unknown");
-                    println!(
-                        "{}",
-                        crate::i18n::get_required_cli_string_with_args(
-                            "cli-models-status-current",
-                            &[("model", model), ("provider", &format!("{ty}.{alias}")),]
-                        )
-                    );
-                }
-                None => {
-                    println!(
-                        "{}",
-                        crate::i18n::get_required_cli_string("cli-models-status-none")
-                    );
-                }
-            }
+            // The same enumeration `models list` reports, so a nested-only
+            // configuration is no longer reported as "none". When the
+            // winning profile has a default resolution (`models.default` or
+            // a sole entry), that is the reported "Default model"; otherwise
+            // the first enumerated entry.
+            let Some(winner) = config
+                .configured_model_entries(None)
+                .into_iter()
+                .find(|entry| {
+                    entry
+                        .model_id
+                        .as_deref()
+                        .is_some_and(|m| !m.trim().is_empty())
+                })
+            else {
+                println!(
+                    "{}",
+                    crate::i18n::get_required_cli_string("cli-models-status-none")
+                );
+                return Ok(());
+            };
+            let provider = winner.model_ref;
+            let model = winner.model_id.unwrap_or_default();
+            println!(
+                "{}",
+                crate::i18n::get_required_cli_string_with_args(
+                    "cli-models-status-current",
+                    &[("model", &model), ("provider", &provider)]
+                )
+            );
             Ok(())
         }
     }
@@ -18918,16 +18924,16 @@ mod tests {
 
     #[test]
     #[cfg(feature = "agent-runtime")]
-    fn quickstart_inline_auth_uses_auth_mode_field() {
+    fn quickstart_inline_auth_uses_canonical_auth_mode_field() {
         let fields =
-            std::collections::HashMap::from([("auth_mode".to_string(), " codex ".to_string())]);
+            std::collections::HashMap::from([("auth.mode".to_string(), " codex ".to_string())]);
         assert_eq!(
             quickstart_inline_auth("openai", "codex", &fields),
             Some(InlineProviderAuth::Codex)
         );
 
         let fields =
-            std::collections::HashMap::from([("auth_mode".to_string(), "setup_token".to_string())]);
+            std::collections::HashMap::from([("auth.mode".to_string(), "setup_token".to_string())]);
         assert_eq!(
             quickstart_inline_auth("anthropic", "max", &fields),
             Some(InlineProviderAuth::AnthropicSetupToken {
@@ -18936,6 +18942,58 @@ mod tests {
         );
 
         assert_eq!(quickstart_inline_auth("openai", "api", &fields), None);
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn quickstart_flag_prefills_match_canonical_field_descriptors() {
+        let fields = quickstart_prefill_provider_fields(false, Some("quickstart-test-key"));
+        assert_eq!(fields["auth.api_key"], "quickstart-test-key");
+        let codex = quickstart_prefill_provider_fields(true, None);
+        assert_eq!(codex["auth.mode"], "codex");
+        assert_eq!(
+            quickstart_inline_auth("openai", "default", &codex),
+            Some(InlineProviderAuth::Codex)
+        );
+        let descriptors = zeroclaw_runtime::quickstart::field_shape(
+            zeroclaw_runtime::quickstart::FieldSection::ModelProvider,
+            "openai",
+        );
+        for field in fields.keys().chain(codex.keys()) {
+            assert!(
+                descriptors
+                    .iter()
+                    .any(|descriptor| &descriptor.key == field),
+                "CLI prefills must use the backend's field contract: {field}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn quickstart_anthropic_token_updates_exact_canonical_connection() {
+        let mut config = Config {
+            providers: serde_json::from_value(serde_json::json!({
+                "connections": {
+                    "anthropic.prod.us": {"kind": "anthropic"},
+                    "anthropic.prod": {"kind": "anthropic"},
+                },
+                "models": {"chat.fast.us": {
+                    "capability": "chat", "provider": "anthropic.prod.us", "model": "claude-test",
+                }},
+            }))
+            .unwrap(),
+            ..Config::default()
+        };
+        set_quickstart_anthropic_token(&mut config, "prod.us", "setup-test-token").unwrap();
+        let registry = serde_json::to_value(config.provider_registry().unwrap()).unwrap();
+        assert_eq!(
+            registry["connections"]["anthropic.prod.us"]["auth"]["api_key"],
+            "setup-test-token"
+        );
+        assert!(registry["connections"]["anthropic.prod"]["auth"].is_null());
+        assert!(config.providers.models.anthropic.is_empty());
+        assert!(set_quickstart_anthropic_token(&mut config, "missing", "other-token").is_err());
     }
 
     #[test]
@@ -21284,20 +21342,26 @@ mod tests {
             ..MemoryConfig::default()
         };
         let memory: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path()).unwrap());
         let audit = Arc::new(zeroclaw_runtime::sop::SopAuditLogger::new(memory));
         let cache = zeroclaw_runtime::sop::dispatch::SopCronCache::from_engine(&engine);
 
         let mut providers = zeroclaw_config::providers::Providers::default();
-        {
-            let base = providers
-                .models
-                .ensure("custom", "default")
-                .expect("`custom` slot must exist on ModelProviders");
-            base.api_key = Some("test-key".into());
-            base.model = Some("test-model".into());
-            base.uri = Some(server.uri());
-        }
+        providers.connections.insert(
+            "sop.custom".into(),
+            serde_json::from_value(serde_json::json!({
+                "kind":"custom", "uri":server.uri(),
+                "auth":{"mode":"api_key","api_key":"test-key"}
+            }))
+            .unwrap(),
+        );
+        providers.models.insert_canonical_model(
+            "custom.default".into(),
+            serde_json::from_value(serde_json::json!({
+                "capability":"chat", "provider":"sop.custom", "model":"test-model"
+            }))
+            .unwrap(),
+        );
         let mut agents = std::collections::HashMap::new();
         agents.insert(
             CRON_SOP_AGENT.to_string(),
@@ -22205,98 +22269,366 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "agent-runtime"))]
     #[tokio::test]
-    #[cfg(feature = "agent-runtime")]
-    async fn models_set_persists_model_and_preserves_slash_bearing_ids() {
-        use crate::config::schema::{AnthropicModelProviderConfig, Config, ModelProviderConfig};
+    async fn kernel_agent_model_uses_target_alias_uri_and_nested_options() {
+        use wiremock::{Mock, MockServer, matchers::method};
+        use zeroclaw_config::schema::{AliasedAgentConfig, ModelEntryConfig};
 
-        let tmp = tempfile::TempDir::new().expect("temp dir");
-        let config_path = tmp.path().join("config.toml");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {"content": "kernel response"}}]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
 
-        std::fs::write(
-            &config_path,
-            format!(
-                "schema_version = {}\n\n[providers.models.anthropic.default]\nmodel = \"claude-opus-4-7\"\n",
-                crate::config::migration::CURRENT_SCHEMA_VERSION,
-            ),
-        )
-        .unwrap();
-
-        let mut config = Config {
-            config_path: config_path.clone(),
-            data_dir: tmp.path().join("workspace"),
-            schema_version: crate::config::migration::CURRENT_SCHEMA_VERSION,
-            ..Config::default()
-        };
-        config.providers.models.anthropic.insert(
-            "default".to_string(),
-            AnthropicModelProviderConfig {
-                base: ModelProviderConfig {
-                    model: Some("claude-opus-4-7".to_string()),
-                    ..Default::default()
-                },
+        let mut config = Config::default();
+        let entry = config
+            .providers
+            .models
+            .ensure("custom", "edge")
+            .expect("custom edge profile");
+        entry.uri = Some(server.uri());
+        entry.api_key = Some("kernel-target-key".into());
+        entry.temperature = Some(0.8);
+        entry.models.insert(
+            "cheap".into(),
+            ModelEntryConfig {
+                id: Some("nested-model".into()),
+                temperature: Some(0.2),
+                max_tokens: Some(77),
+                native_tools: Some(false),
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "default".into(),
+            AliasedAgentConfig {
+                model_provider: "custom.edge.cheap".into(),
                 ..Default::default()
             },
         );
 
-        // ── Test 1: Normal model ID persists via the dispatch boundary ──
-        dispatch_models_command(
-            ModelCommands::Set {
-                model: "claude-sonnet-4-6".to_string(),
-            },
-            &mut config,
-        )
-        .await
-        .expect("normal model ID must persist");
-
-        let contents = std::fs::read_to_string(&config_path).unwrap();
+        let built = build_kernel_agent_model(&config, "default", None, None)
+            .await
+            .unwrap();
+        assert_eq!(built.model_name(), "nested-model");
         assert!(
-            contents.contains("claude-sonnet-4-6"),
-            "normal model ID must be persisted to config.toml; got:\n{contents}"
+            !built
+                .provider()
+                .capabilities_for_model(built.model_name())
+                .native_tool_calling
         );
+        let response = kernel_agent_chat(&config, "default", &built, None, "hello")
+            .await
+            .unwrap();
+        assert_eq!(response, "kernel response");
 
-        // ── Test 2: Slash-bearing model ID preserved as-is ──
-        dispatch_models_command(
-            ModelCommands::Set {
-                model: "anthropic/claude-sonnet-4-20250514".to_string(),
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let auth = requests[0]
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok());
+        assert_eq!(auth, Some("Bearer kernel-target-key"));
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["model"], "nested-model");
+        assert_eq!(body["temperature"], 0.2);
+        assert_eq!(body["max_tokens"], 77);
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sop_llm_resolves_live_model_configuration_on_each_call() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        use zeroclaw_config::schema::AliasedAgentConfig;
+
+        let first = MockServer::start().await;
+        let second = MockServer::start().await;
+        for server in [&first, &second] {
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {"content": "ok"}}]
+                })))
+                .mount(server)
+                .await;
+        }
+        let mut config = Config::default();
+        config.reliability.provider_retries = 0;
+        config.providers = serde_json::from_value(serde_json::json!({
+            "connections": {"gateway.v2": {
+                "kind": "custom", "uri": first.uri(),
+                "auth": {"mode": "api_key", "api_key": "sop-fixture-first-key"},
+                "api": {"chat": {"options": {
+                    "temperature": 0.7, "max_tokens": 111, "provider_extra": {"seed": 1}
+                }}}
+            }},
+            "models": {
+                "chat.base": {"capability": "chat", "provider": "gateway.v2", "model": "base-id"},
+                "chat.default": {"capability": "chat", "provider": "gateway.v2", "model": "shared-id",
+                    "options": {"temperature": 0.1, "max_tokens": 21, "provider_extra": {"seed": 2}}},
+                "chat.fast": {"capability": "chat", "provider": "gateway.v2", "model": "shared-id",
+                    "options": {"temperature": 0.2, "max_tokens": 41, "provider_extra": {"seed": 3}}}
+            }
+        })).unwrap();
+        config.agents.insert(
+            "default".into(),
+            AliasedAgentConfig {
+                model_provider: "chat.fast".into(),
+                ..Default::default()
             },
-            &mut config,
-        )
-        .await
-        .expect("slash-bearing model ID must persist");
-
-        let contents = std::fs::read_to_string(&config_path).unwrap();
-        assert!(
-            contents.contains("anthropic/claude-sonnet-4-20250514"),
-            "slash-bearing model ID must be stored as-is; got:\n{contents}"
         );
-
-        // ── Test 3: No configured provider → error surfaced by dispatch ──
-        let mut empty_config = Config {
-            config_path: tmp.path().join("empty.toml"),
-            data_dir: tmp.path().join("empty_workspace"),
-            schema_version: crate::config::migration::CURRENT_SCHEMA_VERSION,
-            ..Config::default()
-        };
-        let err = dispatch_models_command(
-            ModelCommands::Set {
-                model: "any-model".to_string(),
-            },
-            &mut empty_config,
-        )
-        .await
-        .expect_err("empty config must fail");
-        let msg = format!("{err}");
+        let mut startup = config.clone();
+        startup.agents.remove("default");
+        let authority = zeroclaw_runtime::LiveConfigAuthority::new(startup.clone());
+        let adapter = build_sop_adapters(&startup, authority.live_handle())
+            .llm
+            .unwrap();
+        let unconfigured_adapter = std::sync::Arc::clone(&adapter);
         assert!(
-            msg.contains("No model provider configured"),
-            "error must mention missing provider; got: {msg}"
+            tokio::task::spawn_blocking(move || unconfigured_adapter.generate_typed(None, "prompt"))
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert!(first.received_requests().await.unwrap().is_empty());
+        authority.publish_for_test(config.clone());
+
+        for (stage, model, temperature, limit, seed) in [
+            (0, "shared-id", Some(0.2), 41, 3),
+            (1, "updated-id", Some(0.4), 42, 4),
+            (2, "updated-id", Some(0.7), 111, 1),
+            (3, "updated-id", None, 111, 1),
+            (4, "shared-id", Some(0.1), 21, 2),
+            (5, "shared-id", Some(0.1), 21, 2),
+            (6, "base-id", None, 111, 1),
+        ] {
+            if stage > 0 {
+                let mut registry = serde_json::to_value(&config.providers).unwrap();
+                match stage {
+                    1 => {
+                        registry["connections"]["gateway.v2"]["uri"] = second.uri().into();
+                        registry["connections"]["gateway.v2"]["auth"]["api_key"] =
+                            "sop-fixture-second-key".into();
+                        registry["models"]["chat.fast"]["model"] = model.into();
+                        registry["models"]["chat.fast"]["options"] = serde_json::json!({
+                            "temperature": temperature, "max_tokens": limit, "provider_extra": {"seed": seed}
+                        });
+                    }
+                    2 => {
+                        registry["models"]["chat.fast"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("options");
+                    }
+                    3 => {
+                        registry["connections"]["gateway.v2"]["api"]["chat"]["options"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("temperature");
+                    }
+                    4 => {
+                        config.agents.get_mut("default").unwrap().model_provider =
+                            "chat.default".into();
+                    }
+                    5 => {
+                        registry["connections"]["gateway.v2"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("auth");
+                    }
+                    6 => {
+                        config.agents.get_mut("default").unwrap().model_provider =
+                            "chat.base".into();
+                    }
+                    _ => unreachable!(),
+                }
+                config.providers = serde_json::from_value(registry).unwrap();
+                authority.publish_for_test(config.clone());
+            }
+            let call_adapter = std::sync::Arc::clone(&adapter);
+            let result = tokio::task::spawn_blocking(move || {
+                call_adapter.generate_typed(Some("system"), "prompt")
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(result, "ok");
+            let server = if stage == 0 { &first } else { &second };
+            let requests = server.received_requests().await.unwrap();
+            let request = requests.iter().rev().find(|r| !r.body.is_empty()).unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["model"], model, "stage {stage}: {body}");
+            match temperature {
+                Some(value) => assert_eq!(body["temperature"], value, "stage {stage}: {body}"),
+                None => assert!(body.get("temperature").is_none(), "stage {stage}: {body}"),
+            }
+            assert_eq!(body["max_tokens"], limit, "stage {stage}: {body}");
+            assert_eq!(body["seed"], seed, "stage {stage}: {body}");
+            if stage >= 5 {
+                assert!(!request.headers.contains_key("authorization"));
+            } else {
+                let key = if stage == 0 { "first" } else { "second" };
+                assert_eq!(
+                    request
+                        .headers
+                        .get("authorization")
+                        .unwrap()
+                        .to_str()
+                        .unwrap(),
+                    format!("Bearer sop-fixture-{key}-key")
+                );
+            }
+        }
+        // A bad live reference must fail rather than reuse the previous model.
+        config.agents.get_mut("default").unwrap().model_provider = "chat.typo".into();
+        authority.publish_for_test(config);
+        let error = tokio::task::spawn_blocking(move || adapter.generate_typed(None, "prompt"))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("typo"), "{error}");
+        assert_eq!(
+            second
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| !r.body.is_empty())
+                .count(),
+            6
         );
     }
 
-    /// The in-tree tool component, for every test in this binary that needs a
-    /// real one: the plugin load-check tests below and the Quickstart plugin
-    /// step's tests. Both run with the Cranelift backend, the one that
-    /// compiles this raw component.
+    #[cfg(not(feature = "agent-runtime"))]
+    #[tokio::test]
+    async fn kernel_agent_overrides_preserve_nested_selection_without_mutating_config() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        use zeroclaw_config::schema::{AliasedAgentConfig, ModelEntryConfig};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "ok"}}]
+            })))
+            .mount(&server)
+            .await;
+        let mut config = Config::default();
+        for (alias, entry_alias, temperature, limit) in
+            [("gw", "default", 0.2, 77), ("gw.v2", "fast", 0.4, 99)]
+        {
+            let profile = config.providers.models.ensure("custom", alias).unwrap();
+            profile.uri = Some(server.uri());
+            profile.model = Some("legacy-id".into());
+            profile.models.insert(
+                entry_alias.into(),
+                ModelEntryConfig {
+                    id: Some("selected-id".into()),
+                    temperature: Some(temperature),
+                    max_tokens: Some(limit),
+                    ..Default::default()
+                },
+            );
+        }
+        config.agents.insert(
+            "default".into(),
+            AliasedAgentConfig {
+                model_provider: "custom.gw".into(),
+                ..Default::default()
+            },
+        );
+        let before = toml::to_string(&config).unwrap();
+        for (
+            provider_ref,
+            model_override,
+            temperature_override,
+            expected_model,
+            expected_temperature,
+            limit,
+        ) in [
+            (None, None, None, "selected-id", 0.2, 77),
+            (None, Some("explicit-id"), None, "explicit-id", 0.2, 77),
+            (
+                Some("custom.gw"),
+                Some("explicit-id"),
+                None,
+                "explicit-id",
+                0.2,
+                77,
+            ),
+            (
+                Some("custom.gw.v2.fast"),
+                Some("explicit-id"),
+                None,
+                "explicit-id",
+                0.4,
+                99,
+            ),
+            (
+                Some("custom.gw.v2.fast"),
+                None,
+                Some(0.6),
+                "selected-id",
+                0.6,
+                99,
+            ),
+            (Some("custom"), None, None, "selected-id", 0.2, 77),
+        ] {
+            let built = build_kernel_agent_model(&config, "default", provider_ref, model_override)
+                .await
+                .unwrap();
+            assert_eq!(
+                kernel_agent_chat(&config, "default", &built, temperature_override, "hello")
+                    .await
+                    .unwrap(),
+                "ok"
+            );
+            let requests = server.received_requests().await.unwrap();
+            let body: serde_json::Value =
+                serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+            assert_eq!(body["model"], expected_model);
+            assert_eq!(body["temperature"], expected_temperature);
+            assert_eq!(body["max_tokens"], limit);
+        }
+        for model_override in [None, Some("explicit-id")] {
+            assert!(
+                build_kernel_agent_model(
+                    &config,
+                    "default",
+                    Some("custom.gw.typo"),
+                    model_override
+                )
+                .await
+                .is_err()
+            );
+        }
+        assert_eq!(toml::to_string(&config).unwrap(), before);
+        let mut unset = config.clone();
+        unset
+            .providers
+            .models
+            .ensure("custom", "gw")
+            .unwrap()
+            .models
+            .get_mut("default")
+            .unwrap()
+            .temperature = None;
+        let built = build_kernel_agent_model(&unset, "default", None, None)
+            .await
+            .unwrap();
+        kernel_agent_chat(&unset, "default", &built, None, "hello")
+            .await
+            .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+        assert!(body.get("temperature").is_none(), "{body}");
+    }
+
     #[cfg(feature = "plugins-wasm-cranelift")]
     pub(crate) mod tool_component_fixture {
         use std::path::PathBuf;

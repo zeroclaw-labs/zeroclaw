@@ -236,4 +236,7 @@ Now when you message your Telegram bot *"Turn on the LED"* or *"Set pin 13 high"
 - **Telegram not responding**: Check bot_token, allowed_users, and that the Uno Q has internet (WiFi).
 - **Out of memory**: Keep features minimal (`--features hardware` for Uno Q); consider `compact_context = true`.
 - **GPIO commands ignored**: Ensure Bridge app is running (`zeroclaw peripheral setup-uno-q` deploys and starts it). Config must have `board = "arduino-uno-q"` and `transport = "bridge"`.
-- **LLM provider (GLM/Zhipu)**: Configure `[providers.models.glm.<alias>]` with `GLM_API_KEY` in env or config (the legacy `zhipu` synonym is collapsed onto `glm`). ZeroClaw uses the correct v4 endpoint.
+- **LLM provider (GLM/Zhipu)**: Configure a `glm` connection and a
+  `[providers.models."chat.glm.<alias>"]` model, with `GLM_API_KEY` in the
+  connection auth or environment (the legacy `zhipu` synonym is collapsed
+  onto `glm`). ZeroClaw uses the correct v4 endpoint.

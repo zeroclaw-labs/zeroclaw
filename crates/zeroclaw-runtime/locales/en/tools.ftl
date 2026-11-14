@@ -173,6 +173,12 @@ tool-memory-store = Store a fact, preference, or note in long-term memory. Use c
 tool-microsoft365 = Microsoft 365 integration: manage Outlook mail, Teams messages, Calendar events, OneDrive files, and SharePoint search via Microsoft Graph API
 
 tool-model-routing-config = Manage default model settings, scenario-based provider/model routes, classification rules, and aliased agent profiles
+tool-model-routing-config-write-busy = Another configuration update is in progress. Retry this change after it finishes.
+tool-model-routing-config-reverted = Reverted to '{$model}'.
+tool-model-routing-config-removed-new-alias = Removed the newly created alias.
+tool-model-routing-config-error-no-update = set_default requires at least one of: model_provider, model, temperature
+tool-model-routing-config-error-invalid-reference = model_provider `{$model_provider}` must use `<type>.<alias>` or `<type>.<alias>.<model>` form
+tool-model-routing-config-error-nested-reference-update = a `<type>.<alias>.<model>` model_provider requires `model` or `temperature` to set on that model entry
 tool-model-routing-config-invalid-scenario = Invalid upsert_scenario arguments. Supply nonempty strings for: { $required }. Fix missing, non-string, or blank fields: { $invalid }.
 tool-model-routing-config-error-missing-risk-profile = agent `{$agent}` references missing risk profile `{$profile}`
 tool-model-routing-config-error-shared-risk-profile = risk profile `{$profile}` is shared by another agent; refusing an agent-scoped mutation
@@ -253,6 +259,10 @@ tool-web-search-tool-anysearch-no-title = No title
 tool-web-search-tool-anysearch-no-error-details = no error details
 
 tool-workspace = Manage multi-client workspaces. Subcommands: list, switch, create, info, export. Each workspace provides isolated memory, audit, secrets, and tool restrictions.
+
+tool-llm-task-agent-missing = Unknown model_provider agent: { $agent }
+tool-llm-task-provider-invalid = Invalid model_provider reference: { $provider }
+tool-llm-task-model-missing = No model configured for model_provider: { $provider }
 
 tool-weather = Get current weather conditions and forecast for any location worldwide. Supports city names (in any language or script), IATA airport codes (e.g. 'LAX'), GPS coordinates (e.g. '51.5,-0.1'), postal/zip codes, and domain-based geolocation. Returns temperature, feels-like, humidity, wind speed/direction, precipitation, visibility, pressure, UV index, and cloud cover. Optional 0-3 day forecast with hourly breakdown. Units default to metric (°C, km/h, mm) but can be set to imperial (°F, mph, inches) per request. No API key required.
 

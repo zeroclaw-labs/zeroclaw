@@ -493,6 +493,7 @@ cli-sop-ws-subsystem-disabled = SOP 子系统未启用
 cli-sop-create-hint = {"  "}创建一个: mkdir -p <shared>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}然后添加 SOP.toml 和 SOP.md
 cli-sop-loaded-header = 已加载的 SOP ({$count}):
+cli-sop-decision-model-not-configured = [decision] 模型 '{ $model }' 未在 [providers.models] 中配置为 decision 模型；运行将回退到最严格模式
 cli-sop-none-to-validate = 未找到可验证的 SOP。
 cli-sop-valid = ✅ {$name} — 有效
 cli-sop-deleted = 已删除 SOP：{$name}
@@ -852,6 +853,7 @@ cli-status-config = 配置：      {$v}
 cli-status-provider-indent = {"   "}ModelProvider:      {$family}.{$alias}
 cli-status-provider = 🤖 ModelProvider:      {$family}.{$alias}
 cli-status-model = {"   "}模型：         {$model}
+cli-status-model-entry = {"   "}模型 [{$alias}]：{$model}
 cli-status-observability = 📊 可观测性：  {$v}
 cli-status-trace-storage = 🧾 跟踪存储：  {$mode}（{$path}）
 cli-status-agents = 🛡️  Agents:        {$v}
@@ -950,6 +952,8 @@ cli-config-capped-key-lowered = 警告：已将 {$path} 中的配置键 `{$key}`
 cli-config-capped-reason-pairing-code-ttl = 配对码最长可在 600 秒（10 分钟）内使用
 cli-config-retired-reason-nevis = Nevis IAM 集成已移除；请改为配置 `[oidc.<alias>]` 以及 `[users]` 和 `[permission_profiles]`
 cli-config-retired-reason-agent-tunable = 不再读取写在代理中的运行时调优项；运行时配置文件具有决定权，因此请在该代理的 `[runtime_profiles.<profile>]` 中设置此键
+cli-config-retired-reason-text-tool-parsing = 文本工具调用解析改为按聊天模型配置；请使用 `options.extract_text_tool_calls = false` 替代 `strict_tool_parsing = true`
+cli-config-retired-reason-profile-fallback = V4 已移除 provider profile 上的回退列表；请使用精确键 `[providers.fallback]` 图，并在那里为每个目标定义完整的模型引用
 cli-config-retired-reason-summary-model = 已弃用的裸模型 ID 没有提供商标识，且从未被读取；它已由 `summary_provider` 取代（上下文压缩本身目前尚未在运行时中实现）
 cli-config-retired-reason-node-transport = 旧版 HMAC 节点传输已移除
 cli-config-retired-reason-wati = WATI 支持已移除；请使用 Cloud API 或 WhatsApp Web 迁移到 `[channels.whatsapp.<alias>]`，然后吊销不再使用的 WATI API 令牌
@@ -1197,7 +1201,7 @@ channel-runtime-set-provider-init-failed =
     详情：{ $error }
 channel-runtime-effort-routing-invalid = ⚠️ 工作量路由配置无效。请检查已配置的本地和云端路由。
 channel-runtime-provider-ambiguous = ModelProvider `{ $family }` 有多个已配置别名。请用 `/models { $family }.<alias>` 指定其中一个：{ $list }
-channel-runtime-provider-no-alias = 未找到 `{ $provider }` 的已配置 provider 条目。请添加 `[providers.models.{ $provider }]`（含 api_key/uri），或选择一个已配置的 provider；`/models` 会列出有效项。
+channel-runtime-provider-no-alias = 未找到 `{ $provider }` 的已配置模型条目。请在 `[providers.connections."<connection>"]` 下添加连接，并在 `[providers.models."<model-ref>"]` 下添加模型，或选择已配置的模型；`/models` 会列出有效项。
 channel-runtime-provider-unknown = 未知 model_provider `{ $provider }`。使用 `/models` 查看有效的 model_provider。
 channel-runtime-scoped-model-empty = 模型 ID 不能为空。请使用 `/model --user|--agent <model-id>`。
 channel-runtime-scoped-model-switched = 已为 **{ $scope }** 范围设置模型 `{ $model }`（model_provider：`{ $provider }`）。仅会话内有效，重启后重置。
@@ -1218,7 +1222,6 @@ channel-runtime-fallback-footer =
     切换模型：/models
 channel-runtime-model-fallback-redacted = ⚡ 请求的模型不可用；此回复由备用模型生成。
 delegate-provider-fallback-warning = 警告：委派的代理已通过提供商回退机制恢复。提供商故障详细信息已记录日志，未包含在此结果中。
-turn-tool-protocol-strict-mixed-error = 严格工具解析无法运行混合 native-tool 和 text-only 候选项的回退链。请将每个可到达的候选项配置为使用相同的工具协议，或将 strict_tool_parsing 设置为 false。
 delegate-provider-fallback-header = [代理 '{ $agent }'（请求：{ $requested_provider }/{ $requested_model }；提供：{ $actual_provider }/{ $actual_model }）]
 delegate-provider-fallback-header-agentic = [代理 '{ $agent }'（请求：{ $requested_provider }/{ $requested_model }；提供：{ $actual_provider }/{ $actual_model }，代理式）]
 cli-alias-list-empty = （{$section} 下无条目）
@@ -1383,3 +1386,14 @@ tool-git-operations-error-docker-runtime-write-unsupported = Git 写入命令在
 
 turn-context-window-exceeded-error = 本次请求超过所选模型的上下文容量。请减少请求内容或启用的工具，或选择上下文容量更大的模型。
 cron-agent-job-failed = 定时任务未能完成，请重试或联系管理员查看日志。
+
+# Named model selection diagnostics.
+cli-model-switch-invalid-reference = model_provider 必须是 `<type>.<alias>` 或 `<type>.<alias>.<model>` 格式的提供商配置引用，当前为 `{ $provider_ref }`
+cli-model-switch-no-profiles = 未配置提供商配置
+cli-model-switch-profile-missing = model_provider `{ $provider_ref }` 不是已配置的提供商配置。请添加 [providers.models.{ $family }.{ $alias }]，或使用：{ $available }
+cli-model-switch-model-id-missing = 模型条目 `{ $provider_ref }` 未设置 `id`，其提供商配置也未设置 `model`
+cli-model-switch-entry-missing = model_provider `{ $provider_ref }` 引用了模型 `{ $model_alias }`，但尚未配置 [providers.models.{ $family }.{ $alias }.models.{ $model_alias }]
+cli-model-switch-model-required = 'set' 操作缺少 'model' 参数（也可使用 `<type>.<alias>.<model>` 格式的 model_provider 引用）
+cli-doctor-nested-model = { $provider_ref }：模型：{ $model }（条目 { $model_alias }）
+cli-doctor-nested-model-id-missing = { $provider_ref }：条目 { $model_alias } 缺少模型 ID（请设置其 `id` 或提供商配置的 `model`）
+cli-doctor-temperature-out-of-range = { $provider_ref }：temperature { $temperature } 超出范围（应为 0.0–2.0）

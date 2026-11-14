@@ -64,7 +64,7 @@ pub async fn handle_sop_trigger_sources(
     Json(registry).into_response()
 }
 
-/// `GET /api/sops/decision-models`: the `[decision_models]` aliases an SOP's
+/// `GET /api/sops/decision-models`: the canonical decision model keys an SOP's
 /// `[decision] model` can select, sorted by alias. Never includes the API key.
 pub async fn handle_sop_decision_models(
     State(state): State<AppState>,
@@ -75,16 +75,26 @@ pub async fn handle_sop_decision_models(
     }
     let mut models: Vec<_> = {
         let config = state.config.read();
+        let registry = match config.provider_registry() {
+            Ok(registry) => registry,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": error.to_string() })),
+                )
+                    .into_response();
+            }
+        };
         config
-            .decision_models
-            .iter()
-            .filter_map(|(alias, m)| {
-                let (base_url, model) = m.endpoint()?;
+            .providers
+            .models
+            .canonical_model_refs()
+            .filter_map(|alias| {
+                let resolved = registry.resolve_decision(alias).ok()?;
                 Some(serde_json::json!({
                     "alias": alias,
-                    "provider": m.provider,
-                    "model": model,
-                    "base_url": base_url,
+                    "provider": resolved.selection.provider_id,
+                    "model": resolved.model,
                 }))
             })
             .collect()
@@ -1114,6 +1124,33 @@ mod tests {
             HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
         );
         headers
+    }
+
+    #[tokio::test]
+    async fn decision_model_picker_lists_canonical_exact_keys_without_credentials() {
+        let config = serde_json::from_value(serde_json::json!({
+            "providers": {
+                "connections": {"native.prod": {
+                    "kind": "openai",
+                    "auth": {"mode": "api_key", "api_key": "picker-fixture-secret"}
+                }},
+                "models": {
+                    "chat.only": {"capability": "chat", "provider": "native.prod", "model": "chat"},
+                    "decision.v2": {"capability": "decision", "provider": "native.prod", "model": "decide"}
+                }
+            }
+        })).unwrap();
+        let state = crate::api::test_state(config);
+        let response = handle_sop_decision_models(State(state), HeaderMap::new()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"models": [{
+                "alias": "decision.v2", "provider": "native.prod", "model": "decide"
+            }]})
+        );
     }
 
     fn loopback_peer() -> ConnectInfo<SocketAddr> {

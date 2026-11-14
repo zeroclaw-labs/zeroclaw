@@ -494,6 +494,7 @@ cli-sop-ws-subsystem-disabled = el subsistema SOP no está habilitado
 cli-sop-create-hint = {"  "}Cree uno: mkdir -p <shared>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}luego agregue SOP.toml y SOP.md
 cli-sop-loaded-header = SOP cargados ({$count}):
+cli-sop-decision-model-not-configured = El modelo [decision] '{ $model }' no está configurado como modelo decision en [providers.models]; las ejecuciones usarán el modo más estricto
 cli-sop-none-to-validate = No se encontraron SOP para validar.
 cli-sop-valid = ✅ {$name} — válido
 cli-sop-deleted = SOP eliminado: {$name}
@@ -853,6 +854,7 @@ cli-status-config = Configuración:      {$v}
 cli-status-provider-indent = {"   "}ModelProvider:      {$family}.{$alias}
 cli-status-provider = 🤖 ModelProvider:      {$family}.{$alias}
 cli-status-model = {"   "}Modelo:         {$model}
+cli-status-model-entry = {"   "}Modelo [{$alias}]: {$model}
 cli-status-observability = 📊 Observabilidad:  {$v}
 cli-status-trace-storage = 🧾 Almacenamiento de trazas:  {$mode} ({$path})
 cli-status-agents = 🛡️  Agentes:        {$v}
@@ -951,6 +953,8 @@ cli-config-capped-key-lowered = advertencia: se redujo la clave de configuració
 cli-config-capped-reason-pairing-code-ttl = un código de emparejamiento se puede canjear durante 600 segundos (10 minutos) como máximo
 cli-config-retired-reason-nevis = se eliminó la integración de Nevis IAM; configura `[oidc.<alias>]` con `[users]` y `[permission_profiles]` en su lugar
 cli-config-retired-reason-agent-tunable = los ajustes de ejecución dentro del agente ya no se leen; los perfiles de ejecución son los que rigen, así que define esta clave en el `[runtime_profiles.<profile>]` del agente
+cli-config-retired-reason-text-tool-parsing = el análisis de herramientas en texto se configura por modelo de chat; usa `options.extract_text_tool_calls = false` en lugar de `strict_tool_parsing = true`
+cli-config-retired-reason-profile-fallback = las listas de fallback a nivel de perfil se eliminaron en V4; usa el grafo de claves exactas `[providers.fallback]` y define allí cada destino como una referencia de modelo completa
 cli-config-retired-reason-summary-model = el id de modelo suelto obsoleto no tenía identidad de proveedor y nunca se leía; `summary_provider` lo reemplazó (la compresión de contexto en sí no está implementada actualmente en el runtime)
 cli-config-retired-reason-node-transport = se eliminó el transporte de nodos HMAC heredado
 cli-config-retired-reason-wati = se eliminó la compatibilidad con WATI; migra a `[channels.whatsapp.<alias>]` con la Cloud API o WhatsApp Web y luego revoca el token de API de WATI que ya no se usa
@@ -1198,7 +1202,7 @@ channel-runtime-set-provider-init-failed =
     Detalles: { $error }
 channel-runtime-effort-routing-invalid = ⚠️ La configuración del enrutamiento por esfuerzo no es válida. Comprueba las rutas local y en la nube configuradas.
 channel-runtime-provider-ambiguous = ModelProvider `{ $family }` tiene varios alias configurados. Especifica cuál con `/models { $family }.<alias>`: { $list }
-channel-runtime-provider-no-alias = No hay una entrada de provider configurada para `{ $provider }`. Agrega `[providers.models.{ $provider }]` (con api_key/uri) o selecciona un provider configurado; `/models` lista los válidos.
+channel-runtime-provider-no-alias = No hay una entrada de modelo configurada para `{ $provider }`. Agrega una conexión en `[providers.connections."<connection>"]` y un modelo en `[providers.models."<model-ref>"]`, o selecciona un modelo configurado; `/models` lista los válidos.
 channel-runtime-provider-unknown = model_provider desconocido `{ $provider }`. Usa `/models` para listar model_providers válidos.
 channel-runtime-scoped-model-empty = El ID del modelo no puede estar vacío. Usa `/model --user|--agent <model-id>`.
 channel-runtime-scoped-model-switched = Modelo definido en `{ $model }` (model_provider: `{ $provider }`) para el ámbito **{ $scope }**. Solo para la sesión; se restablece al reiniciar.
@@ -1219,7 +1223,6 @@ channel-runtime-fallback-footer =
     Cambiar modelo: /models
 channel-runtime-model-fallback-redacted = ⚡ El modelo solicitado no estaba disponible; un modelo de respaldo generó esta respuesta.
 delegate-provider-fallback-warning = Advertencia: El agente delegado se recuperó mediante una alternativa de proveedor. Los detalles del fallo del proveedor se registraron y se omitieron de este resultado.
-turn-tool-protocol-strict-mixed-error = El análisis estricto de herramientas no puede ejecutar una cadena de alternativas que mezcle candidatos con herramientas nativas y candidatos de solo texto. Configura cada candidato accesible para que use el mismo protocolo de herramientas, o establece strict_tool_parsing en false.
 delegate-provider-fallback-header = [Agente '{ $agent }' (solicitado: { $requested_provider }/{ $requested_model }; servido: { $actual_provider }/{ $actual_model })]
 delegate-provider-fallback-header-agentic = [Agente '{ $agent }' (solicitado: { $requested_provider }/{ $requested_model }; servido: { $actual_provider }/{ $actual_model }, agentic)]
 cli-alias-list-empty = (sin entradas en {$section})
@@ -1381,3 +1384,14 @@ channel-approval-opt-allow-always = Permitir siempre
 channel-approval-opt-reject = Rechazar
 channel-approval-opt-reject-with-edit = Rechazar con edición
 tool-git-operations-error-docker-runtime-write-unsupported = Los comandos de escritura de Git no están disponibles con el entorno de ejecución Docker porque no pueden confinarse a su contenedor.
+
+# Named model selection diagnostics.
+cli-model-switch-invalid-reference = model_provider debe ser una referencia `<type>.<alias>` o `<type>.<alias>.<model>`; se recibió `{ $provider_ref }`
+cli-model-switch-no-profiles = no hay perfiles de proveedor configurados
+cli-model-switch-profile-missing = model_provider `{ $provider_ref }` no es un perfil configurado. Añade [providers.models.{ $family }.{ $alias }] o usa: { $available }
+cli-model-switch-model-id-missing = La entrada `{ $provider_ref }` no tiene `id` y su perfil no tiene `model`
+cli-model-switch-entry-missing = model_provider `{ $provider_ref }` indica el modelo `{ $model_alias }`, pero [providers.models.{ $family }.{ $alias }.models.{ $model_alias }] no está configurado
+cli-model-switch-model-required = Falta el parámetro 'model' para 'set' (o usa una referencia model_provider `<type>.<alias>.<model>`)
+cli-doctor-nested-model = { $provider_ref }: modelo: { $model } (entrada { $model_alias })
+cli-doctor-nested-model-id-missing = { $provider_ref }: la entrada { $model_alias } no tiene ID de modelo (configura su `id` o el `model` del perfil)
+cli-doctor-temperature-out-of-range = { $provider_ref }: la temperatura { $temperature } está fuera de rango (se espera 0.0–2.0)

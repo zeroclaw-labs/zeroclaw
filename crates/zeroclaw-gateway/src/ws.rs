@@ -440,48 +440,41 @@ async fn resolve_ws_memory_handle(
         return Ok(None);
     }
 
-    let api_key = config
-        .resolved_model_provider_for_agent(agent_alias)
-        .and_then(|(_, _, cfg)| cfg.api_key.clone());
-    zeroclaw_memory::create_memory_for_agent(config, agent_alias, api_key.as_deref())
+    zeroclaw_memory::create_memory_for_agent(config, agent_alias)
         .await
         .map(Some)
 }
 
-/// Provider, model, and temperature for the turn-end WS memory
-/// consolidation, resolved from the live provider reference the agent
-/// reports after the turn. A mid-session model switch replaces the agent's
-/// active provider and model together without touching the agent's
-/// configured default, so the consolidation must be built from that live
-/// pair — resolving from the configured default and overriding only the
-/// model would pair one entry's provider with another entry's model. The
-/// live model wins when non-empty; otherwise the entry's configured model
-/// is used. Returns `None` when the reference no longer resolves (e.g. the
-/// entry was removed by a config reload, or the reference is not a dotted
-/// `<family>.<alias>`), in which case consolidation is skipped rather than
-/// silently rerouted to an unrelated entry.
-fn ws_consolidation_model(
-    config: &zeroclaw_config::schema::Config,
+/// Build WS turn-end consolidation from the completed agent's admitted
+/// configuration and active provider/model pair. A model switch can change
+/// that pair without changing the agent's configured default. The active model
+/// wins when non-empty; otherwise the selected entry's configured model is used.
+/// Unresolved references skip consolidation rather than selecting another entry.
+async fn ws_consolidation_model(
+    config: Arc<zeroclaw_config::schema::Config>,
+    agent_alias: &str,
     provider_ref: &str,
     model: &str,
 ) -> Option<(
     Box<dyn zeroclaw_api::model_provider::ModelProvider>,
     String,
-    Option<f64>,
+    zeroclaw_api::model_provider::CallSampling,
 )> {
-    let (provider_type, provider_alias) = provider_ref.split_once('.')?;
-    let entry = config
-        .providers
-        .models
-        .find(provider_type, provider_alias)?;
-    let (provider, _, resolved_model, _) =
-        zeroclaw_runtime::agent::agent::build_session_model_provider(
-            config,
-            provider_ref,
-            Some(model),
-        )
-        .ok()?;
-    Some((provider, resolved_model, entry.temperature))
+    if !config.is_configured_model_ref(provider_ref) {
+        return None;
+    }
+    let sampling = zeroclaw_providers::temperature::Temperature::default()
+        .for_call(Some(Arc::clone(&config)), provider_ref);
+    let runtime = zeroclaw_providers::model::build_model_nonblocking(
+        config,
+        agent_alias,
+        provider_ref,
+        Some(model),
+    )
+    .await
+    .ok()?;
+    let (provider, identity, _) = runtime.into_parts();
+    Some((provider, identity.model_id, sampling))
 }
 
 async fn handle_ws_sop_frame<S>(
@@ -820,48 +813,47 @@ async fn handle_socket(
         state.config.clone(),
         state.agent_lifecycle.clone(),
     );
-    let mut agent =
-        match zeroclaw_runtime::agent::Agent::from_live_config_with_session_cwd_and_mcp_backchannel_with_capability(
-            state.config.clone(),
-            &agent_alias,
-            Some(&session_cwd),
-            true,
-            false,
-            // The gateway WebSocket turn does not transport ACP file attachments.
-            false,
-            state.sop_engine.clone(),
-            state.sop_audit.clone(),
-            Some(state.canvas_store.clone()),
-            Some(execution_capability),
-        )
-        .await
-        {
-            Ok(a) => a,
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "Agent initialization failed"
-                );
-                let err = serde_json::json!({
-                    "type": "error",
-                    "message": format!("Failed to initialise agent: {e}"),
-                    "code": "AGENT_INIT_FAILED"
-                });
-                let _ = sender.send(Message::Text(err.to_string().into())).await;
-                let _ = sender
-                    .send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                        code: 1011,
-                        reason: axum::extract::ws::Utf8Bytes::from_static(
-                            "Agent initialization failed",
-                        ),
-                    })))
-                    .await;
-                return;
-            }
-        };
+    let mut agent = match zeroclaw_runtime::agent::Agent::from_live_config_with_context(
+        state.config.clone(),
+        &agent_alias,
+        zeroclaw_runtime::agent::AgentBuildContext {
+            session_cwd: Some(&session_cwd),
+            approval_backchannel: true,
+            sop_engine: state.sop_engine.clone(),
+            sop_audit: state.sop_audit.clone(),
+            canvas_store: Some(state.canvas_store.clone()),
+            execution_capability: Some(execution_capability),
+            ..Default::default()
+        },
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "Agent initialization failed"
+            );
+            let err = serde_json::json!({
+                "type": "error",
+                "message": format!("Failed to initialise agent: {e}"),
+                "code": "AGENT_INIT_FAILED"
+            });
+            let _ = sender.send(Message::Text(err.to_string().into())).await;
+            let _ = sender
+                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                    code: 1011,
+                    reason: axum::extract::ws::Utf8Bytes::from_static(
+                        "Agent initialization failed",
+                    ),
+                })))
+                .await;
+            return;
+        }
+    };
     // Keep ONE ingress identity for the WebSocket turn: the turn span records
     // `channel = "wss"`, and observer events derive from `Agent.channel_name`,
     // so this must stay `wss` or a single turn is split across two names.
@@ -2573,27 +2565,26 @@ async fn process_chat_message(
             // Fire-and-forget memory consolidation so facts from WS sessions
             // are extracted to long-term memory (Daily + Core categories).
             if state.auto_save {
-                if let Some(mem) = ws_memory.clone() {
-                    // Read the live provider/model AFTER the turn: a
-                    // mid-session model switch replaces the agent's active
-                    // provider and model together (without touching the
-                    // agent's configured default), and consolidation must
-                    // follow the pair that actually finished the turn — the
-                    // same pairing the channel orchestrator hands to its
-                    // consolidation, instead of the gateway-wide boot
-                    // default.
+                if let (Some(mem), Some(config)) =
+                    (ws_memory.clone(), agent.admitted_model_config())
+                {
+                    // Capture the completed turn's provider, model, and admitted
+                    // generation before spawning. A reload can publish a newer
+                    // config while this WS agent remains on its previous model.
                     let (live_provider_ref, live_model) = {
-                        let (_, provider_ref, model) = agent.attribution_fields();
-                        (provider_ref, model)
+                        let (_, _, model) = agent.attribution_fields();
+                        (agent.selected_model_provider_ref(), model)
                     };
-                    let memory_config = state.config.read().memory.clone();
                     let user_msg = content.to_string();
                     let assistant_resp = outcome.response.clone();
-                    let live_config = state.config.clone();
                     zeroclaw_spawn::spawn!(async move {
-                        let config = live_config.read().clone();
-                        let Some((model_provider, model, temperature)) =
-                            ws_consolidation_model(&config, &live_provider_ref, &live_model)
+                        let Some((model_provider, model, sampling)) = ws_consolidation_model(
+                            Arc::clone(&config),
+                            &turn_alias,
+                            &live_provider_ref,
+                            &live_model,
+                        )
+                        .await
                         else {
                             ::zeroclaw_log::record!(
                                 DEBUG,
@@ -2605,16 +2596,17 @@ async fn process_chat_message(
                             );
                             return;
                         };
-                        if let Err(e) = zeroclaw_memory::consolidation::consolidate_turn(
-                            model_provider.as_ref(),
-                            &model,
-                            temperature,
-                            mem.as_ref(),
-                            &memory_config,
-                            &user_msg,
-                            &assistant_resp,
-                        )
-                        .await
+                        if let Err(e) =
+                            zeroclaw_memory::consolidation::consolidate_turn_with_sampling(
+                                model_provider.as_ref(),
+                                &model,
+                                sampling,
+                                mem.as_ref(),
+                                &config.memory,
+                                &user_msg,
+                                &assistant_resp,
+                            )
+                            .await
                         {
                             ::zeroclaw_log::record!(
                                 DEBUG,
@@ -3568,6 +3560,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 crate::dashboard_session::test_support::add_sign_in(&mut config, issuer);
             }
             adjust(&mut config);
+            zeroclaw_config::migration::normalize_test_input(&mut config);
 
             let backend = zeroclaw_infra::make_session_backend(&workspace, "sqlite")
                 .expect("sqlite session backend");
@@ -3608,7 +3601,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             ));
             let rpc_auth = Arc::new(
                 zeroclaw_runtime::rpc::auth::RpcInboundAuth::from_config(
-                    &config,
+                    &zeroclaw_config::migration::admit_test_input(&config),
                     Arc::clone(&pairing),
                 )
                 .expect("inbound auth builds"),
@@ -5765,8 +5758,8 @@ data: {\"type\":\"message_stop\"}\n\n",
         assert!(err.to_string().contains("cwd is not a usable directory"));
     }
 
-    #[test]
-    fn ws_consolidation_model_pairs_the_active_provider_with_its_model() {
+    #[tokio::test]
+    async fn ws_consolidation_model_pairs_the_active_provider_with_its_model() {
         use zeroclaw_api::attribution::{ModelProviderKind, ProviderKind, Role};
         use zeroclaw_config::schema::{
             AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig,
@@ -5814,12 +5807,17 @@ data: {\"type\":\"message_stop\"}\n\n",
         // The ollama family builds through the OpenAI-compatible provider,
         // so its attribution kind is Plugin; the entry alias is what pins
         // the provider to the live reference.
-        let (provider, model, temperature) =
-            ws_consolidation_model(&config, "ollama.agent", "llama3")
-                .expect("the switched reference must resolve");
+        let (provider, model, temperature) = ws_consolidation_model(
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
+            "worker",
+            "ollama.agent",
+            "llama3",
+        )
+        .await
+        .expect("the switched reference must resolve");
         assert_eq!(model, "llama3");
         assert_eq!(
-            temperature,
+            temperature.resolve_for(None),
             Some(0.3),
             "consolidation must use the switched entry's temperature"
         );
@@ -5829,42 +5827,210 @@ data: {\"type\":\"message_stop\"}\n\n",
         ));
         assert_eq!(
             provider.as_ref().alias(),
-            "agent",
+            "ollama.agent",
             "the consolidation provider must follow the live reference, not the configured default"
         );
 
         // Without a live model (empty), the switched entry's own model is used.
-        let (provider, model, temperature) = ws_consolidation_model(&config, "ollama.agent", "")
-            .expect("the switched reference must resolve");
+        let (provider, model, temperature) = ws_consolidation_model(
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
+            "worker",
+            "ollama.agent",
+            "",
+        )
+        .await
+        .expect("the switched reference must resolve");
         assert_eq!(model, "agent-entry-model");
-        assert_eq!(temperature, Some(0.3));
+        assert_eq!(temperature.resolve_for(None), Some(0.3));
         assert!(matches!(
             provider.as_ref().role(),
             Role::Provider(ProviderKind::Model(ModelProviderKind::Plugin))
         ));
-        assert_eq!(provider.as_ref().alias(), "agent");
+        assert_eq!(provider.as_ref().alias(), "ollama.agent");
 
         // The un-switched agent default resolves through the same path and
         // stays paired with its own model and temperature. The openai family
         // builds its dedicated provider, so the attribution kind differs
         // from the switched ollama entry — both must follow their own
         // reference.
-        let (provider, model, temperature) =
-            ws_consolidation_model(&config, "openai.install", "install-wide-model")
-                .expect("the configured reference must resolve");
+        let (provider, model, temperature) = ws_consolidation_model(
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
+            "worker",
+            "openai.install",
+            "install-wide-model",
+        )
+        .await
+        .expect("the configured reference must resolve");
         assert_eq!(model, "install-wide-model");
-        assert_eq!(temperature, Some(0.9));
+        assert_eq!(temperature.resolve_for(None), Some(0.9));
         assert!(matches!(
             provider.as_ref().role(),
             Role::Provider(ProviderKind::Model(ModelProviderKind::OpenAi))
         ));
-        assert_eq!(provider.as_ref().alias(), "install");
+        assert_eq!(provider.as_ref().alias(), "openai.install");
 
         // A reference that no longer resolves — or one that is not a dotted
         // `<family>.<alias>` — skips consolidation instead of falling back
         // to an unrelated entry.
-        assert!(ws_consolidation_model(&config, "ollama.gone", "m").is_none());
-        assert!(ws_consolidation_model(&config, "not-dotted", "m").is_none());
+        assert!(
+            ws_consolidation_model(
+                Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
+                "worker",
+                "ollama.gone",
+                "m"
+            )
+            .await
+            .is_none()
+        );
+        assert!(
+            ws_consolidation_model(
+                Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
+                "worker",
+                "not-dotted",
+                "m"
+            )
+            .await
+            .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_consolidation_keeps_the_completed_agents_admitted_generation() {
+        use serde_json::json;
+        use wiremock::matchers::{body_partial_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::live::LiveConfig;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, ModelEntryConfig};
+        use zeroclaw_runtime::agent::agent::{Agent, ProviderSwitchConfig};
+        use zeroclaw_runtime::tools::scoped::ScopedToolRegistry;
+
+        fn generation(endpoint: String, label: &str) -> Config {
+            let mut config = Config::default();
+            config.reliability.provider_retries = 0;
+            config.memory.consolidation_extract_facts = label == "second";
+            let profile = config.providers.models.ensure("custom", "ws").unwrap();
+            profile.uri = Some(endpoint);
+            profile.api_key = Some(format!("{label}-test-key"));
+            profile.models.insert(
+                "chosen".into(),
+                ModelEntryConfig {
+                    id: Some(format!("{label}-model")),
+                    temperature: Some(if label == "first" { 0.2 } else { 0.6 }),
+                    max_tokens: Some(if label == "first" { 128 } else { 256 }),
+                    provider_extra: Some(json!({"generation": label})),
+                    ..Default::default()
+                },
+            );
+            config.agents.insert(
+                "worker".into(),
+                AliasedAgentConfig {
+                    model_provider: "custom.ws.chosen".into(),
+                    ..Default::default()
+                },
+            );
+            config
+        }
+
+        let first = MockServer::start().await;
+        let second = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("authorization", "Bearer first-test-key"))
+            .and(body_partial_json(json!({
+                "model": "first-model",
+                "temperature": 0.2,
+                "max_tokens": 128,
+                "generation": "first",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": r#"{"history_entry":"completed turn","memory_update":null}"#,
+                    },
+                    "finish_reason": "stop",
+                }],
+            })))
+            .expect(1)
+            .mount(&first)
+            .await;
+        let live = LiveConfig::new(generation(
+            format!("{}/v1/chat/completions", first.uri()),
+            "first",
+        ));
+        let admitted = Arc::new(live.snapshot());
+        let built = zeroclaw_providers::model::build_model_nonblocking(
+            Arc::clone(&admitted),
+            "worker",
+            "custom.ws.chosen",
+            None,
+        )
+        .await
+        .unwrap();
+        let dispatcher = zeroclaw_runtime::agent::agent::tool_dispatcher_for_provider(
+            admitted.agent("worker").unwrap(),
+            built.provider(),
+            built.model_name(),
+        );
+        let (provider, identity, _) = built.into_parts();
+        let agent = Agent::builder()
+            .model_provider(provider)
+            .model_provider_name(identity.provider_ref())
+            .model_name(identity.model_id.clone())
+            .model_identity(identity)
+            .agent_alias("worker".into())
+            .tools(ScopedToolRegistry::from_raw_for_test(Vec::new()))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(zeroclaw_runtime::observability::NoopObserver))
+            .tool_dispatcher(dispatcher)
+            .provider_switch_config(ProviderSwitchConfig {
+                config: Some(Arc::clone(&admitted)),
+                live_config: Some(live.handle()),
+                live: None,
+            })
+            .build()
+            .unwrap();
+
+        live.publish(
+            live.next_revision().unwrap(),
+            generation(format!("{}/v1/chat/completions", second.uri()), "second"),
+        )
+        .unwrap();
+        assert!(live.snapshot().memory.consolidation_extract_facts);
+
+        let config = agent.admitted_model_config().unwrap();
+        assert!(Arc::ptr_eq(&config, &admitted));
+        let (_, _, model) = agent.attribution_fields();
+        let (provider, model, sampling) = ws_consolidation_model(
+            Arc::clone(&config),
+            "worker",
+            &agent.selected_model_provider_ref(),
+            &model,
+        )
+        .await
+        .unwrap();
+        zeroclaw_memory::consolidation::consolidate_turn_with_sampling(
+            provider.as_ref(),
+            &model,
+            sampling,
+            &zeroclaw_memory::NoneMemory::new("none"),
+            &config.memory,
+            "user message",
+            "assistant response",
+        )
+        .await
+        .unwrap();
+
+        let requests = first.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(
+            !body["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("\"facts\""),
+            "consolidation must use the completed agent's memory policy"
+        );
+        assert!(second.received_requests().await.unwrap().is_empty());
     }
 
     #[test]
@@ -5905,7 +6071,8 @@ data: {\"type\":\"message_stop\"}\n\n",
         );
 
         assert!(
-            needs_onboarding_ws_error(&config).is_none(),
+            needs_onboarding_ws_error(&zeroclaw_config::migration::admit_test_input(&config))
+                .is_none(),
             "current configured model must allow WebSocket agent construction to continue"
         );
     }
@@ -6461,120 +6628,6 @@ data: {\"type\":\"message_stop\"}\n\n",
         }
     }
 
-    /// Blocking (note12): same-profile fallback to a different model must not
-    /// borrow the primary model's capacity. Configures `openai.default` for
-    /// model-a with a 200k window and fallback_models=[model-b]. Serving
-    /// model-b under the same provider_ref must omit `model_context_window`
-    /// so clients fall back to the trim budget.
-    #[test]
-    fn done_frame_model_window_omitted_on_same_profile_model_fallback() {
-        use std::collections::HashMap;
-        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
-
-        let mut runtime_profiles = HashMap::new();
-        runtime_profiles.insert(
-            "coding".to_string(),
-            RuntimeProfileConfig {
-                max_context_tokens: Some(800_000),
-                ..RuntimeProfileConfig::default()
-            },
-        );
-
-        let mut agents = HashMap::new();
-        agents.insert(
-            "coder".to_string(),
-            AliasedAgentConfig {
-                enabled: true,
-                runtime_profile: "coding".into(),
-                model_provider: "openai.default".into(),
-                ..AliasedAgentConfig::default()
-            },
-        );
-
-        let mut providers = zeroclaw_config::providers::Providers::default();
-        let entry = providers
-            .models
-            .ensure("openai", "default")
-            .expect("ensure entry");
-        entry.model = Some("model-a".to_string());
-        entry.fallback_models = vec!["model-b".to_string()];
-        entry.context_window = Some(200_000);
-
-        let cfg = Config {
-            agents,
-            runtime_profiles,
-            providers,
-            ..Config::default()
-        };
-
-        // Shared resolution: primary matches, fallback does not.
-        assert_eq!(
-            cfg.model_provider_context_window_opt("openai.default", "model-a"),
-            Some(200_000)
-        );
-        assert_eq!(
-            cfg.model_provider_context_window_opt("openai.default", "model-b"),
-            None,
-            "fallback model must not borrow the primary's capacity"
-        );
-
-        // Gateway projection: drive the production fold with a model-b Usage
-        // event, then resolve exactly as the WS handler does.
-        let mut fold = UsageFold::default();
-        fold.apply(usage_event(
-            "openai.default",
-            "model-b",
-            Some(1000),
-            None,
-            Some(500),
-            Some(0.01),
-            true,
-        ));
-        assert_eq!(fold.last_provider_ref.as_deref(), Some("openai.default"));
-        assert_eq!(fold.last_model.as_deref(), Some("model-b"));
-
-        let effective_model = fold.last_model.as_deref().unwrap_or("model-a");
-        let provider_ref = fold.last_provider_ref.as_deref().unwrap();
-        let limits = cfg.resolved_context_limits_for_route("coder", provider_ref, effective_model);
-        let model_ctx_window = limits.configured_model_context_window().map(|v| v as u64);
-        assert!(
-            model_ctx_window.is_none(),
-            "gateway must omit window when served model differs from configured primary"
-        );
-
-        let max_ctx = limits.context_token_budget as u64;
-        let meta = DoneFrameMeta {
-            full_response: "ok",
-            input_tokens: Some(1000),
-            output_tokens: Some(500),
-            tokens_used: Some(1500),
-            cost_usd: Some(0.01),
-            model: effective_model,
-            provider: "openai.default",
-            provider_ref,
-            max_context_tokens: max_ctx,
-            model_context_window: model_ctx_window,
-            last_input_tokens: Some(1000),
-            last_serving_provider_ref: Some(provider_ref),
-            last_serving_model: Some(effective_model),
-        };
-        let done = build_done_frame_json(&meta, &[]);
-        let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
-        assert!(
-            v.get("model_context_window").is_none(),
-            "done-frame must omit model_context_window on same-profile fallback"
-        );
-        assert_eq!(
-            v["max_context_tokens"], 800_000,
-            "the explicit profile budget survives the same-profile fallback (#10068)"
-        );
-        assert_eq!(v["last_serving_model"], "model-b");
-    }
-
-    /// Regression: two models served under one provider_ref produce two
-    /// distinct breakdown entries keyed by (provider_ref, model). Drives the
-    /// production fold so a regression in `UsageFold::apply` is caught
-    /// (a hand-rolled map would pass even if the fold broke).
     #[test]
     fn usage_by_provider_same_provider_two_models() {
         let mut fold = UsageFold::default();

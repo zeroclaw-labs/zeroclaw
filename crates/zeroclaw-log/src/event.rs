@@ -237,17 +237,23 @@ impl ZeroclawAttribution {
         self.fields.insert(key.into(), value.into());
     }
 
-    /// Set a composite-prefixed attribution by splitting `composite` at
-    /// the first `.` — populates `<prefix>`, `<prefix>_type`, and
-    /// (when the dotted form is present) `<prefix>_alias` in one call.
+    /// Set a composite-prefixed attribution by splitting at the first dot:
+    /// segments — populates `<prefix>`, `<prefix>_type`, and (when a dotted
+    /// form is present) `<prefix>_alias` in one call. `<prefix>` keeps the
+    /// full composite. The remainder is an opaque alias that may contain dots.
+    /// Producers that know a model's resolved profile must supply that profile
+    /// reference rather than asking this config-free helper to infer it.
     pub fn set_composite(&mut self, prefix: &str, composite: &str) {
         self.set(prefix.to_string(), composite.to_string());
-        if let Some((ty, alias)) = composite.split_once('.') {
-            self.set(type_field(prefix), ty.to_string());
-            self.set(alias_field(prefix), alias.to_string());
-        } else {
-            self.set(type_field(prefix), composite.to_string());
-            self.fields.remove(&alias_field(prefix));
+        match composite.split_once('.') {
+            Some((ty, alias)) => {
+                self.set(type_field(prefix), ty.to_string());
+                self.set(alias_field(prefix), alias.to_string());
+            }
+            _ => {
+                self.set(type_field(prefix), composite.to_string());
+                self.fields.remove(&alias_field(prefix));
+            }
         }
     }
 
@@ -651,6 +657,20 @@ mod tests {
         assert_eq!(attribution.get("model_provider"), Some("anthropic.clamps"));
         assert_eq!(attribution.get("model_provider_type"), Some("anthropic"));
         assert_eq!(attribution.get("model_provider_alias"), Some("clamps"));
+    }
+
+    #[test]
+    fn set_composite_preserves_dotted_aliases() {
+        let mut attribution = ZeroclawAttribution::default();
+        attribution.set_composite("model_provider", "anthropic.clamps.fast");
+        assert_eq!(
+            attribution.get("model_provider"),
+            Some("anthropic.clamps.fast")
+        );
+        assert_eq!(attribution.get("model_provider_type"), Some("anthropic"));
+        assert_eq!(attribution.get("model_provider_alias"), Some("clamps.fast"));
+        attribution.set_composite("channel", "discord.work.v2");
+        assert_eq!(attribution.get("channel_alias"), Some("work.v2"));
     }
 
     #[test]

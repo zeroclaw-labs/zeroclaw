@@ -273,7 +273,6 @@ fn local_small_runtime() -> RuntimeProfileConfig {
         keep_tool_context_turns: Some(1),
         memory_recall_limit: Some(3),
         prompt_injection_mode: Some(SkillsPromptInjectionMode::Compact),
-        strict_tool_parsing: true,
         ..RuntimeProfileConfig::default()
     }
 }
@@ -319,19 +318,17 @@ pub use crate::multi_agent::MemoryBackendKind as MemoryChoice;
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ModelProviderChoice {
     /// Provider type identifier (`anthropic`, `openai`, `openrouter`,
-    /// `ollama`, etc.). Used as the type segment in the TOML path.
+    /// `ollama`, etc.). Written as the new connection's `kind`.
     pub provider_type: String,
-    /// User-named alias. Defaults to `"default"` in the UI; users
-    /// override when stacking multiple aliases of the same provider
-    /// type (e.g. `anthropic-work`, `anthropic-personal`).
+    /// Name suffix for the new connection and model. The generated
+    /// `<kind>.<alias>` is one exact registry key, including any literal dots.
     pub alias: String,
-    /// Model id written to `providers.models.<type>.<alias>.model` at
-    /// apply time.
+    /// Upstream model ID written to the new canonical model's `model` field.
     pub model: String,
     /// Round-trip of every field the daemon described in
     /// `quickstart/fields`. Surfaces echo back exactly what was
-    /// emitted; the daemon writes each entry under `<prefix>.<key>`
-    /// using its own schema knowledge.
+    /// emitted, such as `auth.api_key` and `uri`; the daemon constructs a
+    /// typed canonical connection using its own schema knowledge.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub fields: std::collections::HashMap<String, String>,
 }
@@ -629,7 +626,6 @@ mod tests {
             values.prompt_injection_mode,
             Some(SkillsPromptInjectionMode::Compact)
         );
-        assert!(values.strict_tool_parsing);
     }
 
     #[test]
@@ -666,7 +662,6 @@ mod tests {
             .resolved_agent_config("local_agent")
             .expect("agent should resolve");
 
-        assert!(resolved.resolved.strict_tool_parsing);
         assert_eq!(resolved.resolved.max_tool_iterations, 4);
         assert_eq!(resolved.resolved.max_history_messages, 20);
         assert_eq!(resolved.resolved.max_context_tokens, Some(8_000));
@@ -761,7 +756,7 @@ mod tests {
                 alias: "anthropic".into(),
                 model: "claude-sonnet-4-5".into(),
                 fields: std::collections::HashMap::from([(
-                    "api-key".to_string(),
+                    "auth.api_key".to_string(),
                     "sk-test".to_string(),
                 )]),
             }),

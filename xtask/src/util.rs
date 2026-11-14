@@ -329,45 +329,27 @@ pub fn build_model_provider(
         })?;
 
     let raw = std::fs::read_to_string(dir.join("config.toml"))?;
-    let mut config: zeroclaw_config::schema::Config = toml::from_str(&raw)?;
+    let mut config = zeroclaw_config::migration::migrate_to_current(&raw)?;
+    config.config_path = dir.join("config.toml");
+    config.data_dir = zeroclaw_config::schema::resolve_config_dir_for_data(&dir).1;
 
     // Decrypt secrets through the canonical store (same path the daemon uses).
     let store = zeroclaw_config::secrets::SecretStore::new(&dir, config.secrets.encrypt);
     config.decrypt_secrets(&store)?;
+    zeroclaw_config::env_overrides::apply_env_overrides(&mut config)?;
 
-    // Resolve bare-or-dotted name to a concrete `kind.alias` + its model + key.
-    let (kind, alias, model, api_key) = {
-        let (k, a, cfg) = config
-            .providers
-            .models
-            .find_by_name(provider_name)
-            .ok_or_else(|| {
-                anyhow::Error::msg(format!(
-                    "model-provider '{provider_name}' not found (or ambiguous) under \
-                     [providers.models.<kind>.<alias>] in config.toml"
-                ))
-            })?;
-        let model = cfg.model.clone().ok_or_else(|| {
-            anyhow::Error::msg(format!(
-                "model-provider '{provider_name}' has no `model` set under its \
-                 [providers.models.<kind>.<alias>] entry"
-            ))
-        })?;
-        (k, a, model, cfg.api_key.clone())
-    };
-    let dotted = format!("{kind}.{alias}");
-
-    let options = zeroclaw_providers::provider_runtime_options_for_alias(&config, kind, &alias);
-    let provider = zeroclaw_providers::create_resilient_model_provider_from_ref(
+    let reference = config.chat_catalog_ref(provider_name)?.to_string();
+    let binding = zeroclaw_providers::model::build_reliable_provider(
         &config,
-        &dotted,
-        api_key.as_deref(),
-        None,
-        &config.reliability,
-        &options,
+        &reference,
+        zeroclaw_providers::model::ProviderOverrides::default(),
     )?;
-
-    Ok((provider, model))
+    let model = binding.model.ok_or_else(|| {
+        anyhow::Error::msg(format!(
+            "model-provider '{provider_name}' has no effective model selection"
+        ))
+    })?;
+    Ok((binding.provider, model))
 }
 
 pub fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> anyhow::Result<()> {
@@ -387,6 +369,39 @@ pub fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> anyhow::Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_provider_uses_exact_canonical_model_selection() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.connections.insert(
+            "ollama.translation".into(),
+            serde_json::from_value(serde_json::json!({
+                "kind": "ollama",
+                "uri": "http://127.0.0.1:9",
+                "auth": {"mode": "api_key", "api_key": "test-key"}
+            }))
+            .unwrap(),
+        );
+        config.providers.models.insert_canonical_model(
+            "ollama.translation.fast".into(),
+            serde_json::from_value(serde_json::json!({
+                "capability": "chat",
+                "provider": "ollama.translation",
+                "model": "nested-wire-model"
+            }))
+            .unwrap(),
+        );
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            toml::to_string(&config).unwrap(),
+        )
+        .unwrap();
+
+        let (_, model) =
+            build_model_provider("ollama.translation.fast", tmp.path().to_str()).unwrap();
+        assert_eq!(model, "nested-wire-model");
+    }
 
     #[test]
     fn clear_stray_po_artifacts_removes_only_generated() {
