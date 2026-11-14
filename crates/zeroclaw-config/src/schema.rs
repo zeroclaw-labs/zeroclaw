@@ -56043,17 +56043,6 @@ impl Config {
         &self,
     ) -> Result<crate::provider_registry::ProviderRegistry, crate::provider_registry::RegistryError>
     {
-        // Unit and integration fixtures in downstream crates are often built
-        // directly with the pre-admission typed maps.  Keep that historical
-        // construction surface test-only: production callers still see only
-        // the canonical registry produced during config loading.
-        #[cfg(feature = "test-helpers")]
-        {
-            return crate::migration::admit_test_input(self)
-                .providers
-                .canonical_registry();
-        }
-        #[cfg(not(feature = "test-helpers"))]
         self.providers.canonical_registry()
     }
 }
