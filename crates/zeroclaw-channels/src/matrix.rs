@@ -2435,9 +2435,9 @@ mod inbound {
         };
         let mut content = body.clone();
         // The preamble must not change how the runtime reads the message: it
-        // goes after a leading `/think:` directive, and control messages
-        // (`/new`, `/stop`, SOP gate replies) get none. Those still count as
-        // the thread's first visit, as their own threaded reply would anyway.
+        // goes after a leading `/think:` directive, and runtime slash commands
+        // (`/new`, `/stop`) get none. Those still count as the thread's first
+        // visit, as their own threaded reply would anyway.
         if let Some(tid) = thread_id.as_ref()
             && ctx_mod::claim_first_visit(&ctx.threads_seen, tid).await
             && let Some(at) = crate::orchestrator::context_insertion_point("matrix", &body)
@@ -7894,7 +7894,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn thread_control_text_keeps_directive_and_gate_reply_semantics() {
+        async fn thread_control_text_keeps_directive_semantics() {
             let root = text_event("$root:localhost", "root text", serde_json::Value::Null);
             let thread =
                 |root: &str| serde_json::json!({ "rel_type": "m.thread", "event_id": root });
@@ -7906,7 +7906,6 @@ mod tests {
                         "/think:off explain briefly",
                         thread("$r1:localhost"),
                     ),
-                    text_event("$gate:localhost", "approve run-42", thread("$r2:localhost")),
                     text_event("$bare:localhost", "/think:off", thread("$r3:localhost")),
                 ],
                 Arc::new(TokioRwLock::new(HashSet::new())),
@@ -7918,11 +7917,7 @@ mod tests {
                 "/think:off [Thread root from @alice:localhost]: root text\n\nexplain briefly",
                 "the directive stays leading and the question keeps the root context"
             );
-            assert_eq!(
-                forwarded[1].content, "approve run-42",
-                "a SOP gate reply must stay an exact two-token answer"
-            );
-            for message in [&forwarded[0], &forwarded[2]] {
+            for message in [&forwarded[0], &forwarded[1]] {
                 assert_eq!(
                     zeroclaw_runtime::agent::thinking::parse_thinking_directive(&message.content)
                         .map(|(level, _)| level),

@@ -2854,9 +2854,9 @@ fn resolve_channel_thinking(
 /// Byte offset where a channel may insert contextual text into inbound
 /// `content` without changing how the runtime interprets it: just after a
 /// leading `/think:` directive, otherwise at the start. `None` when the rest
-/// is empty (a bare `/think:<level>`) or a control message the runtime
-/// intercepts before the model (`/stop`, a runtime command such as `/new`, or
-/// a SOP gate text reply), which must reach it verbatim.
+/// is empty (a bare `/think:<level>`) or a slash command the runtime
+/// intercepts before the model (`/stop`, or a runtime command such as `/new`),
+/// which must reach it verbatim.
 #[cfg(any(feature = "channel-matrix", test))]
 pub(crate) fn context_insertion_point(channel_name: &str, content: &str) -> Option<usize> {
     let at = zeroclaw_runtime::agent::thinking::parse_thinking_directive(content)
@@ -2864,24 +2864,8 @@ pub(crate) fn context_insertion_point(channel_name: &str, content: &str) -> Opti
     let rest = &content[at..];
     let control = rest.trim().is_empty()
         || is_stop_command(rest)
-        || parse_runtime_command(channel_name, rest).is_some()
-        || text_sop_gate_reply(rest).is_some();
+        || parse_runtime_command(channel_name, rest).is_some();
     (!control).then_some(at)
-}
-
-/// A plain-text SOP gate answer: exactly `<choice> <reference>`, where the
-/// choice carries no text payload (edit/revise stay marker-only).
-fn text_sop_gate_reply(content: &str) -> Option<(&str, &str)> {
-    let mut words = content.split_whitespace();
-    match (words.next(), words.next(), words.next()) {
-        (Some(choice), Some(reference), None)
-            if zeroclaw_api::channel::GateChoiceKind::from_id(choice)
-                .is_some_and(|k| !k.collects_text()) =>
-        {
-            Some((choice, reference))
-        }
-        _ => None,
-    }
 }
 
 fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
@@ -12089,9 +12073,15 @@ async fn dispatch_channel_sop_gate(
         // Text form: exactly two tokens, and the first must be a text-free
         // choice. Edit/Revise stay marker-only (they carry a text payload a
         // two-token reply cannot); approve/deny remain universally answerable.
-        match text_sop_gate_reply(&msg.content) {
-            Some((c, r)) => (Form::Text, c.to_ascii_lowercase(), r.to_string()),
-            None => return false,
+        let mut words = msg.content.split_whitespace();
+        match (words.next(), words.next(), words.next()) {
+            (Some(c), Some(r), None)
+                if zeroclaw_api::channel::GateChoiceKind::from_id(c)
+                    .is_some_and(|k| !k.collects_text()) =>
+            {
+                (Form::Text, c.to_ascii_lowercase(), r.to_string())
+            }
+            _ => return false,
         }
     } else {
         return false;
@@ -43312,8 +43302,6 @@ BTC is currently around $65,000 based on latest tool output."#
             "/think:off /new",
             "/think:off",
             "/think:high  ",
-            "approve run-42",
-            "deny run-42",
         ] {
             assert_eq!(
                 context_insertion_point("matrix", control),
@@ -43334,6 +43322,9 @@ BTC is currently around $65,000 based on latest tool output."#
             "/goal ship it",
             "/etc/hosts is the file",
             "approve this plan please",
+            // Gate-shaped text is only a gate answer when a run is parked on
+            // it, which ingress cannot know, so it keeps its context.
+            "approve it",
         ] {
             assert_eq!(context_insertion_point("matrix", text), Some(0), "{text}");
         }
