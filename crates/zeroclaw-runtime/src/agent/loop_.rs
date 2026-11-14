@@ -3841,6 +3841,10 @@ async fn process_message_inner(
     internal_principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
 ) -> Result<String> {
     use ::zeroclaw_log::Instrument;
+    #[cfg(test)]
+    if execution_admission.is_none() {
+        config = Arc::new(zeroclaw_config::migration::admit_test_input(&config));
+    }
     if let Some(admission) = execution_admission.as_ref() {
         admission.revalidate()?;
         anyhow::ensure!(
