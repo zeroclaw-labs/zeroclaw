@@ -195,8 +195,12 @@ canonical lifecycle store.
 ## CLI admin commands and `[gateway.tls]`
 
 When `[gateway.tls] enabled = true`, the local CLI admin commands talk to the
-gateway over HTTPS and trust the PEM at `cert_path` (so a self-signed gateway
-certificate works without disabling verification):
+gateway over HTTPS and trust only the PEM at `cert_path` (so a self-signed
+gateway certificate works without disabling verification). The webpki and
+operating-system trust stores are not consulted, so no public or enterprise CA
+that the machine already trusts can stand in for this gateway. The file is read
+as a chain, so a gateway certificate issued by a CA works when that CA is in the
+file as well:
 
 - `zeroclaw gateway get-paircode` (and `--new` / `--rotate` / `--rotate-device`)
 - `zeroclaw gateway restart` (graceful `/admin/shutdown` before relaunch)

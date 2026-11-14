@@ -15077,6 +15077,14 @@ fn gateway_admin_http_client(
         anyhow::bail!(qta("cli-gateway-admin-cert-empty", &[("path", cert_path)]));
     }
 
+    // The admin token rides these requests, so the configured PEM is the only
+    // source of trust for this gateway. Turn the built-in stores off: feature
+    // unification with the provider stack enables both the webpki roots and the
+    // OS store, and either would otherwise let a certificate the CLI was not
+    // configured with satisfy the host.
+    builder = builder
+        .tls_built_in_webpki_certs(false)
+        .tls_built_in_native_certs(false);
     for certificate in certificates {
         builder = builder.add_root_certificate(certificate);
     }
@@ -19276,6 +19284,86 @@ mod tests {
             assert!(error.downcast_ref::<reqwest::Error>().is_some());
             assert!(format!("{error:#}").contains("certificate"), "{error:#}");
         }
+    }
+
+    /// Fullchain spelling: the configured file holds the gateway's leaf followed
+    /// by the CA that signed it, and the peer presents that same leaf.
+    #[cfg(feature = "agent-runtime")]
+    async fn gateway_admin_pinned_fullchain_case() -> Result<bool> {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ca_key = KeyPair::generate().expect("ca key");
+        let mut ca_params =
+            CertificateParams::new(vec!["gateway admin pin test CA".into()]).expect("ca params");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).expect("ca certificate");
+
+        let leaf_params = CertificateParams::new(vec!["127.0.0.1".into()]).expect("leaf params");
+        let leaf_key = KeyPair::generate().expect("leaf key");
+        let leaf = leaf_params
+            .clone()
+            .signed_by(&leaf_key, &ca_cert, &ca_key)
+            .expect("pinned leaf");
+
+        // The configured file is the gateway's leaf followed by its CA.
+        let cert_path = dir.path().join("gateway.crt");
+        std::fs::write(&cert_path, format!("{}{}", leaf.pem(), ca_cert.pem()))
+            .expect("write certificate chain");
+        let server_cert_path = dir.path().join("server.crt");
+        let server_key_path = dir.path().join("server.key");
+        std::fs::write(&server_cert_path, leaf.pem()).expect("write server cert");
+        std::fs::write(&server_key_path, leaf_key.serialize_pem()).expect("write server key");
+        let acceptor = zeroclaw_tls::build_tls_acceptor(&zeroclaw_tls::ServerConfigParams {
+            cert_path: server_cert_path.to_string_lossy().into_owned(),
+            key_path: server_key_path.to_string_lossy().into_owned(),
+            client_auth: None,
+        })
+        .expect("tls acceptor");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            let (tcp, _) = listener.accept().await.expect("accept");
+            let Ok(mut tls) = acceptor.accept(tcp).await else {
+                return; // Rejected peers fail during TLS.
+            };
+            let mut buf = vec![0u8; 1024];
+            let read = tls.read(&mut buf).await.expect("read request");
+            assert!(
+                String::from_utf8_lossy(&buf[..read])
+                    .starts_with("POST /gw/admin/shutdown HTTP/1.1\r\n")
+            );
+            tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("write response");
+            let _ = tls.shutdown().await;
+        });
+        let tls = zeroclaw_config::schema::GatewayTlsConfig {
+            enabled: true,
+            cert_path: cert_path.to_string_lossy().into_owned(),
+            key_path: server_key_path.to_string_lossy().into_owned(),
+            client_auth: None,
+        };
+        let result = shutdown_gateway("127.0.0.1", port, Some("/gw"), Some(&tls)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(6), server)
+            .await
+            .expect("server completes")
+            .expect("server task");
+        result
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn gateway_admin_shutdown_trusts_the_configured_gateway_certificate() {
+        assert!(
+            gateway_admin_pinned_fullchain_case()
+                .await
+                .expect("the configured gateway certificate must be accepted")
+        );
     }
 
     #[tokio::test]
