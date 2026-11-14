@@ -40658,6 +40658,7 @@ mod tests {
 
     fn make_config_set_test_dispatcher(config: zeroclaw_config::schema::Config) -> RpcDispatcher {
         use zeroclaw_infra::session_queue::SessionActorQueue;
+        let config = zeroclaw_config::migration::admit_test_input(&config);
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
         let ctx = RpcContext::minimal(config, Arc::clone(&sessions));
@@ -40676,6 +40677,7 @@ mod tests {
         pause: Arc<crate::rpc::context::ConfigCommitPause>,
     ) -> RpcDispatcher {
         use zeroclaw_infra::session_queue::SessionActorQueue;
+        let config = zeroclaw_config::migration::admit_test_input(&config);
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
         let mut ctx_inner = Arc::try_unwrap(RpcContext::minimal(config, Arc::clone(&sessions)))
@@ -40697,6 +40699,7 @@ mod tests {
         first: &RpcContext,
         config: zeroclaw_config::schema::Config,
     ) -> RpcDispatcher {
+        let config = zeroclaw_config::migration::admit_test_input(&config);
         let authority =
             crate::LiveConfigAuthority::for_tests_sharing_writer(config, &first.config_authority);
         let ctx = RpcContext::for_authority(&authority, Arc::clone(&first.sessions));

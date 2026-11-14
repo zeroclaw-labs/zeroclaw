@@ -1695,21 +1695,27 @@ mod tests {
     }
 
     fn config_with_edge_alias() -> Config {
-        let mut cfg = Config::default();
+        let mut cfg = Config {
+            providers: toml::from_str(
+                r#"
+[connections."edge.default"]
+kind = "edge"
+[connections."edge.default".api.tts]
+command = "edge-tts"
+[models."edge.default"]
+capability = "tts"
+provider = "edge.default"
+model = "default"
+"#,
+            )
+            .expect("canonical edge TTS fixture parses"),
+            ..Config::default()
+        };
         cfg.agents.insert(
             "default".into(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 tts_provider: "edge.default".into(),
                 ..Default::default()
-            },
-        );
-        cfg.providers.tts.edge.insert(
-            "default".to_string(),
-            zeroclaw_config::schema::EdgeTtsProviderConfig {
-                base: TtsProviderConfig {
-                    binary_path: Some("edge-tts".to_string()),
-                    ..TtsProviderConfig::default()
-                },
             },
         );
         cfg
@@ -1853,21 +1859,27 @@ mod tests {
     }
 
     fn config_with_piper_alias() -> Config {
-        let mut cfg = Config::default();
+        let mut cfg = Config {
+            providers: toml::from_str(
+                r#"
+[connections."piper.default"]
+kind = "piper"
+uri = "http://127.0.0.1:5000/v1/audio/speech"
+[connections."piper.default".api.tts]
+[models."piper.default"]
+capability = "tts"
+provider = "piper.default"
+model = "default"
+"#,
+            )
+            .expect("canonical piper TTS fixture parses"),
+            ..Config::default()
+        };
         cfg.agents.insert(
             "default".into(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 tts_provider: "piper.default".into(),
                 ..Default::default()
-            },
-        );
-        cfg.providers.tts.piper.insert(
-            "default".to_string(),
-            zeroclaw_config::schema::PiperTtsProviderConfig {
-                base: TtsProviderConfig {
-                    uri: Some("http://127.0.0.1:5000/v1/audio/speech".to_string()),
-                    ..TtsProviderConfig::default()
-                },
             },
         );
         cfg

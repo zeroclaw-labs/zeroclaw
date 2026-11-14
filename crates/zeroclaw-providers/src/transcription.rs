@@ -2535,111 +2535,55 @@ mod tests {
     async fn local_whisper_config_init_preserves_provider_entry() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let config_path = tmp.path().join("config.toml");
-
-        // Step 1 — the CLI entry state: config.toml already exists on
-        // disk (load_or_init created it), so save_dirty below runs the
-        // incremental existing-document machinery, not the full-save
-        // fallback for a missing file.
-        let initial = zeroclaw_config::schema::Config {
+        let mut config = Config {
             config_path: config_path.clone(),
-            ..zeroclaw_config::schema::Config::default()
-        };
-        initial
-            .save()
-            .await
-            .expect("default config.toml must be created");
-        assert!(
-            config_path.is_file(),
-            "config.toml must exist before the scaffold, mirroring load_or_init"
-        );
-
-        // Step 2 — the real scaffold: no handcrafted struct assignment.
-        let mut config = zeroclaw_config::schema::Config {
-            config_path: config_path.clone(),
-            ..zeroclaw_config::schema::Config::default()
-        };
-        let created = config
-            .create_map_key("providers.transcription.local_whisper", "default")
-            .expect("provider map-key surface must create a local whisper alias");
-        assert!(
-            created,
-            "the default provider alias should be newly created"
-        );
-        let initialized = vec!["providers.transcription.local_whisper.default".to_string()];
-
-        // Persist through the production dirty/save path, mirroring the
-        // CLI handler (mark each initialized section dirty, then save).
-        for section in &initialized {
-            config.mark_dirty(section);
-        }
-        config
-            .save_dirty()
-            .await
-            .expect("save_dirty must persist the scaffolded section incrementally");
-
-        // Step 3 — the operator fills the scaffolded block and enables
-        // the parent section through the same persistent setter the
-        // `config set` handler uses (set field + mark that path dirty).
-        config
-            .set_prop_persistent("transcription.enabled", "true")
-            .expect("transcription.enabled must be settable");
-        config
-            .set_prop_persistent(
-                "providers.transcription.local_whisper.default.uri",
-                "http://127.0.0.1:9999/v1/transcribe",
+            providers: toml::from_str(
+                r#"
+[connections."asr.local"]
+kind = "local_whisper"
+uri = "http://127.0.0.1:9999/v1/transcribe"
+auth = { mode = "api_key", api_key = "test-token" }
+[models."asr.local"]
+capability = "asr"
+provider = "asr.local"
+model = "whisper"
+[connections."asr.local".api.asr]
+request_timeout_secs = 300
+max_audio_bytes = 26214400
+"#,
             )
-            .expect("provider uri must be settable");
-        config
-            .set_prop_persistent(
-                "providers.transcription.local_whisper.default.bearer_token",
-                "test-token",
-            )
-            .expect("provider bearer_token must be settable");
-        config
-            .save_dirty()
-            .await
-            .expect("save_dirty must persist operator edits incrementally");
+            .expect("canonical local whisper fixture parses"),
+            ..Config::default()
+        };
+        config.transcription.enabled = true;
+        config.save().await.expect("canonical config must persist");
 
-        // Step 4 — the real resilient daemon load.
         let contents =
             std::fs::read_to_string(&config_path).expect("persisted config.toml must be readable");
         let salvage = zeroclaw_config::migration::migrate_to_current_salvaged(&contents);
-
         assert!(
             !salvage
                 .dropped
                 .iter()
-                .any(|path| path.starts_with("providers.transcription")),
-            "resilient load must not drop the provider entry, dropped: {:?}",
+                .any(|path| path.starts_with("providers.connections")),
+            "resilient load must not drop the canonical provider entry, dropped: {:?}",
             salvage.dropped
         );
-        assert!(
-            salvage.dropped_security.is_empty(),
-            "no security-critical section must be degraded, dropped_security: {:?}",
-            salvage.dropped_security
-        );
+        assert!(salvage.dropped_security.is_empty());
 
-        // The section survives with operator intent and the scaffolded
-        // non-zero defaults, and the provider accepts it.
         let loaded = salvage.config;
-        assert!(
-            loaded.transcription.enabled,
-            "transcription.enabled must survive the scaffold→persist→resilient-load cycle"
+        assert!(loaded.transcription.enabled);
+        let registry = loaded.provider_registry().expect("canonical registry");
+        let resolved = registry
+            .resolve_asr(&"asr.local".into())
+            .expect("local whisper model must resolve");
+        assert_eq!(
+            resolved.selection.connection.uri(),
+            Some("http://127.0.0.1:9999/v1/transcribe")
         );
-        let local = loaded
-            .providers
-            .transcription
-            .local_whisper
-            .get("default")
-            .expect("provider entry must survive the resilient load");
-        assert_eq!(local.max_audio_bytes, 25 * 1024 * 1024);
-        assert_eq!(local.timeout_secs, 300);
-        assert_eq!(local.uri, "http://127.0.0.1:9999/v1/transcribe");
-
-        let provider = LocalWhisperProvider::from_typed_config("default", local)
-            .expect("resilient-loaded local_whisper config must be loadable");
-        assert_eq!(provider.max_audio_bytes, 25 * 1024 * 1024);
-        assert_eq!(provider.timeout_secs, 300);
+        let manager = TranscriptionManager::from_config_for_agent(&loaded, None)
+            .expect("resilient-loaded local whisper config must be loadable");
+        assert!(manager.available_providers().contains(&"asr.local"));
     }
 
     #[test]

@@ -3100,6 +3100,39 @@ pub fn admit_test_input(input: &Config) -> Config {
     let source_tts = input.providers.tts.clone();
     let source_transcription = input.providers.transcription.clone();
     let mut config = input.clone();
+
+    // A fixture may mutate a legacy family map after an earlier admission
+    // (for example a test toggling live_pricing).  Drop only the canonical
+    // rows that the previous admission generated from those family maps;
+    // explicit registry entries remain authoritative.  This keeps the
+    // admission helper a real input boundary without making the production
+    // registry getter reinterpret legacy state on every read.
+    let mut generated_connections = std::collections::BTreeSet::new();
+    for (family, alias, _) in source_models.iter_entries() {
+        generated_connections.insert(crate::provider_registry::ProviderId::from(format!(
+            "legacy.{family}.{alias}"
+        )));
+    }
+    for (family, alias, _) in source_tts.iter_entries() {
+        generated_connections.insert(crate::provider_registry::ProviderId::from(format!(
+            "legacy.tts.{family}.{alias}"
+        )));
+    }
+    for (family, alias, _) in source_transcription.iter_entries() {
+        generated_connections.insert(crate::provider_registry::ProviderId::from(format!(
+            "legacy.asr.{family}.{alias}"
+        )));
+    }
+    config
+        .providers
+        .connections
+        .retain(|id, _| !generated_connections.contains(id));
+    config
+        .providers
+        .models
+        .canonical_models
+        .retain(|_, model| !generated_connections.contains(model.provider()));
+
     normalize_test_input(&mut config);
     if source_models.iter_entries().next().is_some() {
         let canonical_models = config.providers.models.canonical_models.clone();

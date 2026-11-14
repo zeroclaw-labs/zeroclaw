@@ -4990,100 +4990,58 @@ model = "before"
     }
 
     #[tokio::test]
-    async fn patch_legacy_model_updates_the_runtime_selected_nested_entry() {
+    async fn registry_put_updates_the_runtime_selected_model() {
         let tmp = tempfile::tempdir().unwrap();
         let mut config = temp_config(&tmp);
-        let profile = config
-            .providers
-            .models
-            .ensure("openai", "migrated")
-            .expect("openai provider slot exists");
-        profile.model = Some("legacy-model".into());
-        profile.models.insert(
-            "default".into(),
-            zeroclaw_config::schema::ModelEntryConfig {
-                id: Some("effective-before".into()),
-                ..Default::default()
-            },
-        );
+        config.providers = toml::from_str(
+            r#"
+[connections."gateway.test"]
+kind = "custom"
+uri = "http://127.0.0.1:1/v1"
+auth = { mode = "api_key", api_key = "test-key" }
+[models."chat.migrated"]
+capability = "chat"
+provider = "gateway.test"
+model = "effective-before"
+"#,
+        )
+        .unwrap();
         config.save().await.unwrap();
         let state = test_state(config);
-
+        let expected =
+            zeroclaw_config::provider_registry::editor::snapshot(&state.config.read()).unwrap();
+        let mut registry = expected.clone();
+        registry["models"]["chat.migrated"]["model"] = serde_json::json!("effective-after");
         let (status, json) = response_json(
-            handle_patch(
+            handle_registry_put(
                 State(state.clone()),
-                None,
-                HeaderMap::new(),
-                axum::Json(serde_json::json!([{
-                    "op": "replace",
-                    "path": "/providers/models/openai/migrated/model",
-                    "value": "effective-after"
-                }])),
-            )
-            .await,
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::OK, "PATCH failed: {json}");
-        assert_eq!(
-            json["results"][0]["path"],
-            "providers.models.openai.migrated.models.default.id"
-        );
-        {
-            let live = state.config.read();
-            assert_eq!(
-                live.resolve_model_selection("openai.migrated")
-                    .and_then(|selection| selection.model_id)
-                    .as_deref(),
-                Some("effective-after")
-            );
-            assert_eq!(
-                live.providers
-                    .models
-                    .find("openai", "migrated")
-                    .and_then(|profile| profile.model.as_deref()),
-                Some("legacy-model"),
-                "the compatibility field must not become a second synchronized source"
-            );
-        }
-
-        let written = tokio::fs::read_to_string(tmp.path().join("config.toml"))
-            .await
-            .expect("patched config must be saved");
-        let reloaded: zeroclaw_config::schema::Config =
-            toml::from_str(&written).expect("patched config must reload");
-        assert_eq!(
-            reloaded
-                .resolve_model_selection("openai.migrated")
-                .and_then(|selection| selection.model_id)
-                .as_deref(),
-            Some("effective-after")
-        );
-
-        let (list_status, list_json) = response_json(
-            handle_list(
-                State(state),
-                Query(ListQuery {
-                    prefix: Some("providers.models.openai.migrated".into()),
+                axum::Json(zeroclaw_config::provider_registry::editor::RegistryEdit {
+                    expected,
+                    registry,
                 }),
             )
             .await,
         )
         .await;
-        assert_eq!(list_status, StatusCode::OK);
-        let listed_paths: Vec<&str> = list_json["entries"]
-            .as_array()
-            .expect("config list returns entries")
-            .iter()
-            .filter_map(|entry| entry["path"].as_str())
-            .collect();
-        assert!(
-            !listed_paths.contains(&"providers.models.openai.migrated.model"),
-            "the Web config list must hide the shadowed legacy field"
+
+        assert_eq!(status, StatusCode::OK, "registry PUT failed: {json}");
+        let live = state.config.read();
+        assert_eq!(
+            live.resolve_model_selection("chat.migrated")
+                .and_then(|selection| selection.model_id)
+                .as_deref(),
+            Some("effective-after")
         );
-        assert!(
-            listed_paths.contains(&"providers.models.openai.migrated.models.default.id"),
-            "the Web config list must expose the runtime-selected nested field"
+        let written = tokio::fs::read_to_string(tmp.path().join("config.toml"))
+            .await
+            .expect("patched config must be saved");
+        let reloaded = zeroclaw_config::migration::migrate_to_current(&written).unwrap();
+        assert_eq!(
+            reloaded
+                .resolve_model_selection("chat.migrated")
+                .and_then(|selection| selection.model_id)
+                .as_deref(),
+            Some("effective-after")
         );
     }
 
@@ -5235,7 +5193,7 @@ model = "before"
         .await;
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["code"], "op_not_supported");
+        assert_eq!(json["code"], "validation_failed");
         assert!(
             state
                 .config
