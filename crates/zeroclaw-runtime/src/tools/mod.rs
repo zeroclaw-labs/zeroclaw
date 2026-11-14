@@ -21,6 +21,8 @@ pub mod deliver_file;
 pub mod file_read;
 pub mod model_switch;
 pub mod param_options;
+#[cfg(feature = "plugins-wasm")]
+pub(crate) mod plugin_wake;
 pub mod read_skill;
 mod runtime_command_error;
 pub mod schedule;
@@ -1951,6 +1953,51 @@ pub(crate) fn plugin_host_services(
     config: Arc<Config>,
     live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
 ) -> zeroclaw_plugins::services::PluginHostServices {
+    build_plugin_host_services(host, config, live_config, None)
+}
+
+/// Host services for a registry that serves `dispatch.wake`, plus the slot its
+/// tools read inherited capabilities from.
+///
+/// Only a tool registry can serve a wake: the guest boundary requires a
+/// `ToolExecute` frame, so a channel or skill instance built through
+/// [`plugin_host_services`] keeps the fail-closed `Unavailable` wake service and
+/// never gains dispatch reach.
+///
+/// The returned slot must be pushed onto the registry's `capability_slots` so
+/// the entry point that owns this build binds the capabilities and principal a
+/// woken turn inherits. Unbound, the woken turn resolves its own sources, which
+/// is the pre-capability behavior rather than a widening.
+#[cfg(feature = "plugins-wasm")]
+pub(crate) fn plugin_host_services_with_wake(
+    host: Arc<zeroclaw_plugins::host::PluginHost>,
+    config: Arc<Config>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
+    execution_capability: Option<AgentExecutionCapability>,
+) -> (
+    zeroclaw_plugins::services::PluginHostServices,
+    crate::composition::CapabilitySlot,
+) {
+    // A live daemon handle and a fallback snapshot are mutually exclusive, so
+    // the backend never retains two config sources either.
+    let fallback_config = live_config.is_none().then(|| Arc::clone(&config));
+    let backend = plugin_wake::RuntimeAgentWakeBackend::new(
+        fallback_config,
+        live_config.clone(),
+        execution_capability,
+    );
+    let slot = backend.capabilities_slot();
+    let services = build_plugin_host_services(host, config, live_config, Some(backend));
+    (services, slot)
+}
+
+#[cfg(feature = "plugins-wasm")]
+fn build_plugin_host_services(
+    host: Arc<zeroclaw_plugins::host::PluginHost>,
+    config: Arc<Config>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
+    wake: Option<plugin_wake::RuntimeAgentWakeBackend>,
+) -> zeroclaw_plugins::services::PluginHostServices {
     let data_dir = config.data_dir.clone();
     let config_dir = config
         .config_path
@@ -1982,7 +2029,13 @@ pub(crate) fn plugin_host_services(
     let state = zeroclaw_plugins::services::PluginStateService::new(
         crate::plugin_state::PluginStateStore::new(&data_dir, &config_dir),
     );
-    zeroclaw_plugins::services::PluginHostServices::new(config, state)
+    let services = zeroclaw_plugins::services::PluginHostServices::new(config, state);
+    match wake {
+        Some(backend) => {
+            services.with_wake(zeroclaw_plugins::services::AgentWakeService::new(backend))
+        }
+        None => services,
+    }
 }
 
 /// Stack reserved for the dedicated registry-builder thread. The registry
@@ -3877,11 +3930,16 @@ fn all_tools_with_runtime_on_thread(
             ) {
                 Ok(host) => {
                     let host = Arc::new(host);
-                    let host_services = plugin_host_services(
+                    let (host_services, wake_slot) = plugin_host_services_with_wake(
                         Arc::clone(&host),
                         Arc::clone(&config),
                         live_config.clone(),
+                        execution_capability.clone(),
                     );
+                    // A woken turn runs through the capabilities and principal
+                    // the waking entry point bound, exactly as the peer and
+                    // delegate tools do.
+                    capability_slots.push(wake_slot);
                     let mut registered_names = reserved_host_names.clone();
                     registered_names.extend(tool_arcs.iter().map(|tool| tool.name().to_string()));
                     let plugin_limits = crate::plugin_runtime::plugin_limits(&config);
@@ -3895,6 +3953,7 @@ fn all_tools_with_runtime_on_thread(
                         Some(egress_service),
                         &mut registered_names,
                         &mut tool_arcs,
+                        Some(agent_alias),
                     );
                 }
                 Err(e) => {
@@ -4004,6 +4063,7 @@ fn register_plugin_tools(
     egress: Option<zeroclaw_plugins::egress::EgressHostService>,
     registered_names: &mut std::collections::HashSet<String>,
     tool_arcs: &mut Vec<Arc<dyn Tool>>,
+    caller_alias: Option<&str>,
 ) {
     let plan = match crate::plugin_runtime::PluginActivationPlan::build(config, host) {
         Ok(plan) => plan,
@@ -4061,7 +4121,15 @@ fn register_plugin_tools(
             services.clone(),
             plugin_limits,
             egress.clone(),
-        );
+        )
+        // The host-owned alias of the agent whose turn runs this tool. Without
+        // it a guest `dispatch` call reports no caller, which the wake backend
+        // records as "no agent turn behind this call" — omission narrows
+        // attribution, it never widens it.
+        .map(|tool| match caller_alias {
+            Some(alias) => tool.with_caller_alias(alias),
+            None => tool,
+        });
         match tool {
             Ok(tool) => {
                 match claim_plugin_tool_name(registered_names, tool.name()) {
@@ -5362,6 +5430,7 @@ permissions = ["http_client"]
             None,
             &mut registered_names,
             &mut tool_arcs,
+            None,
         );
         let mut probed = probed.lock().unwrap().clone();
         probed.sort();
