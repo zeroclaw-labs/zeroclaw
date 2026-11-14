@@ -27,6 +27,10 @@ pub struct SteeringPosture {
     /// Remove nested entry points that do not yet carry a principal's
     /// selectors (see `Agent::disable_principal_unaware_nested_tools`).
     pub disable_principal_unaware_nested_tools: bool,
+    /// Withhold every tool that requires an unrestricted principal, including
+    /// skill aliases and delegate children (see
+    /// `Agent::withhold_unrestricted_tools`).
+    pub withhold_unrestricted_tools: bool,
 }
 
 /// Re-resolves a steering sender's authority. Called when the message is
