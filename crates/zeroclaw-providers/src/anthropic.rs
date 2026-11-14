@@ -89,6 +89,7 @@ pub struct AnthropicModelProvider {
     alias: String,
     credential: Option<String>,
     base_url: String,
+    single_tool_rounds_supported: bool,
     max_tokens: u32,
     timeout_secs: u64,
     /// Opt-in Anthropic server-side fallback targets, sent as the native
@@ -183,8 +184,8 @@ struct NativeThinkingConfig {
     #[serde(rename = "type")]
     kind: &'static str,
     /// Fixed token budget for `enabled` thinking. Absent for `adaptive`
-    /// thinking, which lets the model pace itself — adaptive-only models
-    /// (Opus 4.7, Fable 5.1) reject `enabled` with HTTP 400.
+    /// thinking, which lets the model pace itself — models numbered 4.7 or
+    /// later reject `enabled` with HTTP 400.
     #[serde(skip_serializing_if = "Option::is_none")]
     budget_tokens: Option<u32>,
     /// Anthropic's `thinking.display` beta field. `None` leaves the key out
@@ -267,9 +268,9 @@ fn anthropic_beta_features(
     }
 }
 
-/// Anthropic thinking request styles. Adaptive-only models (Opus 4.7, the
-/// whole Fable 5 family) reject the fixed-budget `enabled` shape with HTTP
-/// 400 and require `adaptive`; budget-based models require `enabled`.
+/// Anthropic thinking request styles. Models numbered 4.7 or later reject
+/// the fixed-budget `enabled` shape with HTTP 400 and require `adaptive`;
+/// earlier models, and IDs with no such version, require `enabled`.
 ///
 /// Shared crate-wide: the OpenAI-compatible passthrough builder resolves the
 /// same style so gateway requests match the native provider's shapes.
@@ -279,18 +280,54 @@ pub(crate) enum AnthropicThinkingStyle {
     Adaptive,
 }
 
-/// Substring matching on purpose: gateway model IDs may carry routing
-/// prefixes (`claude-group/claude-opus-4-7`) that must resolve to the same
-/// style as the bare model name. The whole Fable 5 family is adaptive-only,
-/// so the bare `claude-fable-5` substring intentionally covers `fable-5` and
-/// `fable-5-1` alike; a hypothetical future budget-shaped member of the
-/// family would need this matcher revisited.
+/// Adaptive thinking for every Claude model numbered 4.7 or later, whatever
+/// the family. Anthropic rejects `enabled` + `budget_tokens` with HTTP 400
+/// on those models. 4.6 and earlier, and IDs that carry no such version
+/// (Mythos Preview, non-Claude models), keep the budget shape.
+///
+/// The version is the first `claude-<family>-<major>[-<minor>]` token.
+/// Text before it (gateway prefixes, `anthropic.`, `us.`) and after it
+/// (snapshot dates, `-v1:0`, `@...`, `-latest`, `-fast`) is ignored, so a
+/// decorated ID resolves the same way as the bare name.
 pub(crate) fn anthropic_thinking_style(model: &str) -> AnthropicThinkingStyle {
-    if model.contains("claude-opus-4-7") || model.contains("claude-fable-5") {
-        AnthropicThinkingStyle::Adaptive
-    } else {
-        AnthropicThinkingStyle::Budget
+    match claude_model_version(model) {
+        Some(version) if version >= (4, 7) => AnthropicThinkingStyle::Adaptive,
+        _ => AnthropicThinkingStyle::Budget,
     }
+}
+
+/// `(major, minor)` of the first `claude-<family>-<major>[-<minor>]` token
+/// in a model ID. A missing minor is `0`.
+fn claude_model_version(model: &str) -> Option<(u32, u32)> {
+    const FAMILIES: [&str; 5] = ["opus", "sonnet", "haiku", "fable", "mythos"];
+    model.match_indices("claude-").find_map(|(at, token)| {
+        let rest = &model[at + token.len()..];
+        let family = FAMILIES
+            .iter()
+            .copied()
+            .find(|family| rest.starts_with(family))?;
+        let rest = rest[family.len()..].strip_prefix('-')?;
+        let (major, rest) = leading_version_number(rest)?;
+        // A minor is one or two digits after `-` or `.`. An eight-digit
+        // snapshot date is not a minor, and neither is a later component
+        // such as the `2` in `claude-opus-4-5-2`.
+        let minor = rest
+            .strip_prefix('-')
+            .or_else(|| rest.strip_prefix('.'))
+            .and_then(leading_version_number)
+            .map_or(0, |(minor, _)| minor);
+        Some((major, minor))
+    })
+}
+
+/// Splits a leading run of one or two ASCII digits off `s`. A longer run is
+/// a date or build number, not a version component.
+fn leading_version_number(s: &str) -> Option<(u32, &str)> {
+    let digits = s.bytes().take_while(u8::is_ascii_digit).count();
+    if !(1..=2).contains(&digits) {
+        return None;
+    }
+    Some((s[..digits].parse().ok()?, &s[digits..]))
 }
 
 /// Characters legal between `data:` and `;base64,` in a data URI header: the
@@ -630,6 +667,7 @@ pub struct AnthropicBuilder {
     alias: String,
     credential: Option<String>,
     base_url: Option<String>,
+    single_tool_rounds_supported: bool,
     max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
     server_fallback_models: Vec<String>,
@@ -637,6 +675,11 @@ pub struct AnthropicBuilder {
 }
 
 impl AnthropicBuilder {
+    pub(crate) fn single_tool_rounds_supported(mut self, supported: bool) -> Self {
+        self.single_tool_rounds_supported = supported;
+        self
+    }
+
     /// Explicit API credential. Whitespace-only inputs are normalized
     /// to `None` so a stray `Some("   ")` from config cannot produce a
     /// bogus `Bearer    ` header.
@@ -689,6 +732,7 @@ impl AnthropicBuilder {
             alias: self.alias,
             credential: self.credential,
             base_url: self.base_url.unwrap_or_else(|| BASE_URL.to_string()),
+            single_tool_rounds_supported: self.single_tool_rounds_supported,
             max_tokens: self
                 .max_tokens
                 .unwrap_or(zeroclaw_api::model_provider::BASELINE_MAX_TOKENS),
@@ -710,6 +754,7 @@ impl AnthropicModelProvider {
             alias: alias.to_string(),
             credential: None,
             base_url: None,
+            single_tool_rounds_supported: false,
             max_tokens: None,
             timeout_secs: None,
             server_fallback_models: Vec::new(),
@@ -2828,6 +2873,10 @@ impl AnthropicModelProvider {
 
 #[async_trait]
 impl ModelProvider for AnthropicModelProvider {
+    fn supports_single_tool_rounds(&self, _model: &str) -> bool {
+        self.single_tool_rounds_supported
+    }
+
     fn supports_exact_request_replay(
         &self,
         request: crate::traits::ChatRequest<'_>,
@@ -2943,6 +2992,22 @@ impl ModelProvider for AnthropicModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
+        self.chat_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+        .await
+    }
+
+    async fn chat_with_tool_round_policy(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> anyhow::Result<ProviderChatResponse> {
         commit_safeguard_fallback(None);
         if let Some(refusal) = crate::reliable::take_stream_refusal_recovery() {
             crate::dispatch::accounting::suppress_current_attempt();
@@ -2977,7 +3042,15 @@ impl ModelProvider for AnthropicModelProvider {
             .flatten();
         let native_tools = self.convert_tools(request.tools);
         let tools_count = native_tools.as_ref().map_or(0, Vec::len);
-        let tool_choice = if native_tools.is_some() {
+        let tool_choice = if tools_count > 0
+            && policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single
+            && self.supports_single_tool_rounds(model)
+        {
+            Some(serde_json::json!({
+                "type": tool_choice_override.as_deref().unwrap_or("auto"),
+                "disable_parallel_tool_use": true,
+            }))
+        } else if native_tools.is_some() {
             tool_choice_override.map(|tc| serde_json::json!({ "type": tc }))
         } else {
             None
@@ -3170,6 +3243,23 @@ impl ModelProvider for AnthropicModelProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        self.stream_chat_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            options,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+    }
+
+    fn stream_chat_with_tool_round_policy(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         commit_safeguard_fallback(None);
         if !options.enabled {
             return stream::once(async { Ok(StreamEvent::Final) }).boxed();
@@ -3200,7 +3290,15 @@ impl ModelProvider for AnthropicModelProvider {
             .flatten();
         let native_tools = self.convert_tools(request.tools);
         let tools_count = native_tools.as_ref().map_or(0, Vec::len);
-        let tool_choice = if native_tools.is_some() {
+        let tool_choice = if tools_count > 0
+            && policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single
+            && self.supports_single_tool_rounds(model)
+        {
+            Some(serde_json::json!({
+                "type": tool_choice_override.as_deref().unwrap_or("auto"),
+                "disable_parallel_tool_use": true,
+            }))
+        } else if native_tools.is_some() {
             tool_choice_override.map(|tc| serde_json::json!({ "type": tc }))
         } else {
             None
@@ -4555,46 +4653,55 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn anthropic_thinking_style_matrix() {
-        // Adaptive-only families: fixed-budget `enabled` returns 400.
-        assert_eq!(
-            anthropic_thinking_style("claude-opus-4-7"),
-            AnthropicThinkingStyle::Adaptive
-        );
-        assert_eq!(
-            anthropic_thinking_style("claude-opus-4-7-20260101"),
-            AnthropicThinkingStyle::Adaptive
-        );
-        assert_eq!(
-            anthropic_thinking_style("claude-fable-5-1"),
-            AnthropicThinkingStyle::Adaptive
-        );
-        assert_eq!(
-            anthropic_thinking_style("claude-fable-5-1-20260815"),
-            AnthropicThinkingStyle::Adaptive
-        );
-        // The whole Fable 5 family is adaptive-only: bare fable-5 and
-        // gateway-prefixed IDs resolve like fable-5-1.
-        assert_eq!(
-            anthropic_thinking_style("claude-fable-5"),
-            AnthropicThinkingStyle::Adaptive
-        );
-        assert_eq!(
-            anthropic_thinking_style("claude-group/claude-fable-5"),
-            AnthropicThinkingStyle::Adaptive
-        );
-        // Budget-based families keep the `enabled` shape.
-        assert_eq!(
-            anthropic_thinking_style("claude-opus-4-6"),
-            AnthropicThinkingStyle::Budget
-        );
-        assert_eq!(
-            anthropic_thinking_style("claude-sonnet-4-6"),
-            AnthropicThinkingStyle::Budget
-        );
-        assert_eq!(
-            anthropic_thinking_style("claude-haiku-4-5"),
-            AnthropicThinkingStyle::Budget
-        );
+        // Models numbered 4.7 or later reject `enabled`. Prefixes and
+        // suffixes must not change the answer; 4.6 and earlier, and IDs
+        // with no version, keep the budget shape.
+        let cases = [
+            ("claude-opus-4-7", AnthropicThinkingStyle::Adaptive),
+            ("claude-opus-4-7-20260101", AnthropicThinkingStyle::Adaptive),
+            ("claude-opus-4-7@20260101", AnthropicThinkingStyle::Adaptive),
+            ("claude-opus-4.7", AnthropicThinkingStyle::Adaptive),
+            ("claude-opus-5", AnthropicThinkingStyle::Adaptive),
+            ("claude-opus-5-5", AnthropicThinkingStyle::Adaptive),
+            ("claude-opus-5-5-20260101", AnthropicThinkingStyle::Adaptive),
+            ("claude-opus-5-5-fast", AnthropicThinkingStyle::Adaptive),
+            (
+                "anthropic.claude-opus-4-7-v1:0",
+                AnthropicThinkingStyle::Adaptive,
+            ),
+            ("claude-fable-5", AnthropicThinkingStyle::Adaptive),
+            ("claude-fable-5-1", AnthropicThinkingStyle::Adaptive),
+            (
+                "claude-fable-5-1-20260815",
+                AnthropicThinkingStyle::Adaptive,
+            ),
+            ("claude-fable-5-2-fast", AnthropicThinkingStyle::Adaptive),
+            (
+                "claude-group/claude-fable-5",
+                AnthropicThinkingStyle::Adaptive,
+            ),
+            ("claude-mythos-5-2", AnthropicThinkingStyle::Adaptive),
+            ("claude-sonnet-5", AnthropicThinkingStyle::Adaptive),
+            ("claude-sonnet-5-5", AnthropicThinkingStyle::Adaptive),
+            ("claude-haiku-5-5", AnthropicThinkingStyle::Adaptive),
+            (
+                "us.anthropic.claude-haiku-5-5",
+                AnthropicThinkingStyle::Adaptive,
+            ),
+            ("claude-opus-4-6", AnthropicThinkingStyle::Budget),
+            // A trailing component is not the version. Reading from the end
+            // would misread this as 5.2.
+            ("claude-opus-4-5-2", AnthropicThinkingStyle::Budget),
+            ("claude-opus-4-20250514", AnthropicThinkingStyle::Budget),
+            ("claude-sonnet-4-6", AnthropicThinkingStyle::Budget),
+            ("claude-sonnet-4-6-latest", AnthropicThinkingStyle::Budget),
+            ("claude-haiku-4-5", AnthropicThinkingStyle::Budget),
+            ("claude-mythos-preview", AnthropicThinkingStyle::Budget),
+            ("gpt-4o", AnthropicThinkingStyle::Budget),
+        ];
+        for (model, expected) in cases {
+            assert_eq!(anthropic_thinking_style(model), expected, "{model}");
+        }
     }
 
     #[test]
@@ -4617,6 +4724,52 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(config.display, None);
         assert_eq!(temp, Some(1.0));
         assert_eq!(max_tokens, provider.max_tokens);
+    }
+
+    #[test]
+    fn resolve_thinking_emits_adaptive_shape_for_4_7_families_and_decorated_ids() {
+        // The config this returns is what the messages request serializes.
+        // Qualified and fast-mode IDs must not fall back to `enabled`.
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build();
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 10_000,
+            display: None,
+        };
+        for model in [
+            "claude-opus-5-5",
+            "claude-fable-5-2-fast",
+            "anthropic.claude-opus-4-7-v1:0",
+            "claude-sonnet-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+        ] {
+            let (temp, config, max_tokens) =
+                provider.resolve_thinking(Some(params), Some(0.7_f64), model);
+            let config = config.unwrap_or_else(|| panic!("thinking config for {model}"));
+            assert_eq!(
+                serde_json::to_value(&config).unwrap(),
+                serde_json::json!({"type": "adaptive"}),
+                "{model} must emit adaptive with no budget"
+            );
+            assert_eq!(temp, Some(1.0), "{model}");
+            assert_eq!(max_tokens, provider.max_tokens, "{model}");
+        }
+
+        for model in [
+            "claude-opus-4-20250514",
+            "claude-mythos-preview",
+            "claude-sonnet-4-6",
+        ] {
+            let (_, config, _) = provider.resolve_thinking(Some(params), Some(0.7_f64), model);
+            let config = config.unwrap_or_else(|| panic!("thinking config for {model}"));
+            assert_eq!(
+                serde_json::to_value(&config).unwrap(),
+                serde_json::json!({"type": "enabled", "budget_tokens": 10_000}),
+                "{model} must keep the budget shape"
+            );
+        }
     }
 
     #[test]

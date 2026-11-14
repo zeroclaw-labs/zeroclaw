@@ -291,14 +291,15 @@ where
     let mut extracted_bytes = 0_u64;
     for i in 0..archive.len() {
         let mut file = archive.by_index(i)?;
-        let enclosed = enclosed_zip_path(file.name(), &file)?;
+        let raw_name = file.name()?.into_owned();
+        let enclosed = enclosed_zip_path(&raw_name, &file)?;
         let out_path = dest.join(enclosed);
         if file.is_dir() {
             std::fs::create_dir_all(&out_path)?;
             continue;
         }
         let Some(parent) = out_path.parent() else {
-            bail!("plugin archive entry has no parent: {}", file.name());
+            bail!("plugin archive entry has no parent: {raw_name}");
         };
         if extracted_bytes.saturating_add(file.size()) > max_extracted_bytes {
             bail!("plugin archive exceeds extracted size limit of {max_extracted_bytes} bytes");

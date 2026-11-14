@@ -6,6 +6,8 @@ Every model provider lives at `[providers.models.<type>.<alias>]`. `<type>` is a
 
 The smallest config that loads clean has four section headers: a provider entry, an agent that references it, and a risk profile the agent gates against. Configure them through the gateway, zerocode, or `zeroclaw config set`; the [config reference](../reference/config.md#providers) has the full field index.
 
+If you write `config.toml` by hand, make `schema_version = 4` its first line. The tools above add it for you. Without it, ZeroClaw has to guess the file's version: it reads a file whose sections are plainly in the current shape as version 3, migrates it from there and warns you to add the key (`zeroclaw config migrate` writes it), but any other file is read as the oldest version and migrated.
+
 ## Field reference: provider entry
 
 Almost every family also takes the shared fields from `ModelProviderConfig`:
@@ -21,7 +23,7 @@ Almost every family also takes the shared fields from `ModelProviderConfig`:
 - `fallback`: ordered list of other dotted provider aliases to try after this alias fails.
 - `wire_api`, `native_tools`, `provider_extra`, `think`, `thinking_passthrough`, and `chat_template_kwargs`: advanced protocol and request-body overrides.
 - `vision`: override the provider's image-input (vision) capability. Leave unset to use the family's built-in default. Set `false` for a text-only model served by a vision-capable family (for example, a text model behind llama.cpp) so image messages route to a configured `[multimodal] vision_model_provider` instead of erroring; set `true` to force it on. Without a configured vision provider, a non-vision turn proceeds with media markers replaced by a placeholder when none of the latest user message's image references pass the existence, data-URI-structure, or remote-fetch-policy checks (a missing file, a malformed data URI, or a remote URL while `multimodal.allow_remote_fetch` is off). A local path counts only when it is absolute, allowed by the agent's filesystem policy (the same check the file tools apply), and exists as a file; paths the policy rejects are never probed. If any reference does pass, the turn still fails with the vision capability error. The resolvability check evaluates at most 16 absolute local-path markers per turn; for those, the policy check and the existence probe run together on a blocking thread, off the async executor. A message with more such markers treats the rest as resolvable without any check, so an oversized message fails toward the capability error instead of a silent degrade.
-- `tool_result_image_policy`: handling for images attached to native `role = "tool"` results sent to compatible chat-completions providers. A tool result's images are declared in an `attachments` array beside the result text in the tool-result carrier, never recovered from the result text itself, so literal marker syntax in a tool's output is just text. Defaults to `"image_url"` (send declared images as `image_url` parts); set to `"omit"` to drop them and append a fixed notice. The policy reads the `attachments` array of native carriers only; a legacy tool result (no array key) passes verbatim under both settings, because it declares nothing and its body is text. This does not change direct user images or OpenAI Responses providers.
+- `tool_result_image_policy`: handling for images attached to native `role = "tool"` results sent to compatible chat-completions providers. A tool result's images are declared in an `attachments` array beside the result text in the tool-result carrier, never recovered from the result text itself, so literal marker syntax in a tool's output is just text. Defaults to `"relocate"`: the declared image is kept but moved into a following `role = "user"` message, so endpoints that reject image parts in a tool result (HTTP 400) still receive it with no per-provider config; verified against opencode zen (mimo-v2.5) and llama.cpp. Relocation places a user message directly after a tool message: if a backend's chat template rejects that order, fall back to `"image_url"` or `"omit"`. Set to `"image_url"` to send declared images as `image_url` parts inside the tool message, or to `"omit"` to drop them and append a fixed notice. The policy reads the `attachments` array of native carriers only; a legacy tool result (no array key) passes verbatim under all settings, because it declares nothing and its body is text. This does not change direct user images or OpenAI Responses providers.
 - `cache_passthrough`: opt into Anthropic prompt caching on chat-completions gateways that translate to the Anthropic Messages API. Adds at most two `cache_control` breakpoints per request and surfaces gateway-reported cache reads in token usage. Default `false`, requests unchanged. Requires route qualification before production use; see [Prompt cache passthrough](#prompt-cache-passthrough-chat-completions-gateways).
 - `cache_ttl`: cache entry lifetime requested for Anthropic prompt-cache markers. `"5m"` (default) or `"1h"`. Applies to the native Anthropic provider directly, and to chat-completions gateways behind `cache_passthrough`; without passthrough it is inert. Providers that emit their own cache markers by other means (openrouter) ignore the setting. See [Choosing a 1h cache lifetime](#choosing-a-1h-cache-lifetime).
 - `tls_ca_cert_path`: absolute path to a PEM-encoded CA certificate for TLS connections to this provider (a per-provider trust override, distinct from the gateway TLS `ca_cert_path`). Shell expansion such as `~` is not performed; leave unset to use the system trust store.
@@ -120,12 +122,13 @@ thinking_passthrough = true
   when wire-first streaming support lands.
 - **Thinking shape follows the model.** The injected object matches the
   native provider's style resolution: fixed-budget models get
-  `{"type": "enabled", "budget_tokens": N}`, adaptive-only models
-  (Opus 4.7, the whole Fable 5 family) get `{"type": "adaptive"}` with no
-  budget key. Gateway model IDs may carry routing prefixes
-  (`claude-group/...`); resolution matches on substrings, so prefixed IDs
-  resolve to the same shape as bare names. When the runtime requests a
-  display mode, the snake_case `display` key rides on both shapes
+  `{"type": "enabled", "budget_tokens": N}`, and every Claude model numbered
+  4.7 or later gets `{"type": "adaptive"}` with no budget key. The version
+  is read immediately after the family token, so gateway prefixes
+  (`claude-group/...`, `anthropic.`) and suffixes (`-fast`, `-v1:0`,
+  snapshot dates, `-latest`) resolve to the same shape as the bare name.
+  When the runtime requests a display mode, the snake_case `display` key
+  rides on both shapes
   (`omitted`, `updates`, `summarized`); with no display requested the key
   is omitted entirely.
 - **Escape hatch**: for shapes this feature does not cover, `provider_extra`
@@ -656,6 +659,18 @@ Agents reference a provider by dotted alias. Provider entries on their own do no
 `risk_profile` and `runtime_profile` reference independent alias maps, so their names need not match (`runtime_profile` is also optional). `Config::validate()` fails loud at startup if `model_provider` doesn't resolve to a configured `[providers.models.<type>.<alias>]` entry, or if `risk_profile` doesn't resolve to a configured `[risk_profiles.<alias>]` entry.
 
 For multiple agents pointing at different providers, see [Routing](./routing.md).
+
+## Single-tool-round support
+
+The agent runtime profile's `single_tool_rounds` setting is default-off. See [Single-tool rounds](../agents/internals.md#single-tool-rounds) for configuration, accounting, and rollback behavior. It requests one call per response only when the actual model route and every reachable fallback honor a native control.
+
+| Configured provider path | Native control | Support |
+| --- | --- | --- |
+| `openai`, API-key auth, official OpenAI endpoint, chat-completions or Responses wire | `parallel_tool_calls: false` | Supported |
+| `anthropic`, official Anthropic endpoint | `tool_choice.disable_parallel_tool_use: true` | Supported |
+| Custom or compatible endpoints, OVH, Codex subscription auth, and other adapters | No verified control | Batch with a visible limitation notice |
+
+Responses and Anthropic send the control in streaming and non-streaming requests. OpenAI chat-completions uses its existing non-streaming implementation, including when a router projects that response as stream events. Requests without tools keep their existing wire shape. Sharing an adapter with a supported provider does not establish support for another endpoint. A mixed fallback chain stays batch even if its primary provider supports the control.
 
 ## Fallback on failure
 

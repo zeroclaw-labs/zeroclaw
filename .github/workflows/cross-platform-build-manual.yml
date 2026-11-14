@@ -11,6 +11,14 @@ on:
         options:
           - dist
           - dist-broad
+      qualification_profile:
+        description: Normal matrix or nonpublishing Stable GNU Ubuntu22 qualification
+        required: true
+        type: choice
+        default: normal
+        options:
+          - normal
+          - stable-gnu-ubuntu22
       release_tools_only:
         description: Skip release builds and run only the native release-tool smoke
         required: false
@@ -22,13 +30,14 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: 0
 
 jobs:
   release-tool-smoke:
     name: Verify release tool / ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
+    env:
+      CARGO_INCREMENTAL: 0
     strategy:
       fail-fast: false
       matrix:
@@ -41,6 +50,31 @@ jobs:
             tool: tauri-cli
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Validate manual qualification inputs
+        shell: bash
+        env:
+          QUALIFICATION_PROFILE: ${{ inputs.qualification_profile }}
+          DISTRIBUTION: ${{ inputs.distribution }}
+          RELEASE_TOOLS_ONLY: ${{ inputs.release_tools_only }}
+        run: |
+          case "$QUALIFICATION_PROFILE" in
+            normal|stable-gnu-ubuntu22) ;;
+            *) echo "invalid qualification profile" >&2; exit 2 ;;
+          esac
+          case "$DISTRIBUTION" in
+            dist|dist-broad) ;;
+            *) echo "invalid distribution" >&2; exit 2 ;;
+          esac
+          case "$RELEASE_TOOLS_ONLY" in
+            true|false) ;;
+            *) echo "invalid release-tools-only value" >&2; exit 2 ;;
+          esac
+          if [ "$QUALIFICATION_PROFILE" = stable-gnu-ubuntu22 ] && {
+            [ "$DISTRIBUTION" != dist ] || [ "$RELEASE_TOOLS_ONLY" != false ]
+          }; then
+            echo "Stable GNU qualification requires dist and release_tools_only=false" >&2
+            exit 2
+          fi
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           toolchain: 1.98.0
@@ -56,6 +90,10 @@ jobs:
             echo "- Revision: \`$GITHUB_SHA\`"
             echo "- Runner: \`$RUNNER_OS/$RUNNER_ARCH\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify current release archive baseline
+        shell: bash
+        run: bash scripts/ci/package_release_archive.test.sh
 
       - name: Resolve Cargo bin directory
         shell: bash
@@ -109,9 +147,11 @@ jobs:
 
   web:
     name: Build Web Dashboard
-    if: ${{ !inputs.release_tools_only }}
+    if: ${{ inputs.qualification_profile == 'normal' && !inputs.release_tools_only }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
@@ -142,9 +182,11 @@ jobs:
   build:
     name: Build ${{ inputs.distribution }} / ${{ matrix.target }}
     needs: [web]
-    if: ${{ !inputs.release_tools_only }}
+    if: ${{ inputs.qualification_profile == 'normal' && !inputs.release_tools_only }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: ${{ inputs.distribution == 'dist-broad' && 90 || 40 }}
+    timeout-minutes: ${{ (matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-apple-darwin') && 180 || 90 }}
+    env:
+      CARGO_INCREMENTAL: 0
     strategy:
       fail-fast: false
       matrix:
@@ -233,11 +275,19 @@ jobs:
       - name: Configure target environment
         shell: bash
         run: |
+          dist_build_jobs=""
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            case "${{ matrix.target }}" in
+              aarch64-unknown-linux-gnu|aarch64-unknown-linux-musl)
+                dist_build_jobs=" --jobs 2"
+                ;;
+            esac
+          fi
           {
             if [ "${{ matrix.use_cross || 'false' }}" = "true" ]; then
-              echo "BUILD_CMD=cross build"
+              echo "BUILD_CMD=cross build${dist_build_jobs}"
             else
-              echo "BUILD_CMD=cargo build"
+              echo "BUILD_CMD=cargo build${dist_build_jobs}"
             fi
             if [ -n "${{ matrix.linker_env || '' }}" ] && [ -n "${{ matrix.linker || '' }}" ]; then
               echo "${{ matrix.linker_env }}=${{ matrix.linker }}"
@@ -251,6 +301,13 @@ jobs:
               echo "CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS=-C target-feature=-neon"
             fi
           } >> "$GITHUB_ENV"
+
+      - name: Prepare bounded Linux ARM64 build memory
+        id: dist_memory
+        timeout-minutes: 5
+        if: runner.os == 'Linux' && (matrix.target == 'aarch64-unknown-linux-gnu' || matrix.target == 'aarch64-unknown-linux-musl')
+        shell: bash
+        run: bash scripts/ci/dist_runner_memory.sh prepare
 
       - name: Build release
         shell: bash
@@ -272,6 +329,7 @@ jobs:
             echo "- Resolved features: \`$FEATURES\`"
             echo "- SHA-256: $sha256"
           } >> "$GITHUB_STEP_SUMMARY"
+          printf 'RELEASE_ARCHIVE_FEATURES=%s\n' "$FEATURES" >> "$GITHUB_ENV"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: zeroclaw-manual-${{ inputs.distribution }}-${{ matrix.target }}
@@ -300,3 +358,1013 @@ jobs:
           path: target/${{ matrix.target }}/release/${{ runner.os == 'Windows' && 'zerorelay.exe' || 'zerorelay' }}
           if-no-files-found: error
           retention-days: 1
+
+      - name: Check standard main binary size
+        if: inputs.distribution == 'dist'
+        shell: bash
+        env:
+          BINARY_SIZE_HARD_LIMIT: "83886080"
+        run: bash scripts/ci/check_binary_size.sh "target/${{ matrix.target }}/release/${{ runner.os == 'Windows' && 'zeroclaw.exe' || 'zeroclaw' }}" "${{ matrix.target }}"
+
+      - name: Package and verify standard release archive
+        if: inputs.distribution == 'dist'
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive_python=""
+          for candidate in python3 python; do
+            if command -v "$candidate" >/dev/null 2>&1 \
+              && "$candidate" -c 'import sys; sys.exit(sys.version_info < (3, 8))' 2>/dev/null; then
+              archive_python="$candidate"
+              break
+            fi
+          done
+          test -n "$archive_python"
+          target="${{ matrix.target }}"
+          main="${{ runner.os == 'Windows' && 'zeroclaw.exe' || 'zeroclaw' }}"
+          ext="${{ runner.os == 'Windows' && 'zip' || 'tar.gz' }}"
+          suffix="${{ runner.os == 'Windows' && '.exe' || '' }}"
+          companions=()
+          if [ "$target" != aarch64-linux-android ]; then
+            companions=(--companion "target/$target/release/zerocode$suffix"
+              --companion "target/$target/release/zerorelay$suffix")
+          fi
+          "$archive_python" scripts/ci/verify_release_archive.py manifest \
+            --binary "target/$target/release/$main" "${companions[@]}" \
+            --web-dist web/dist --source "$GITHUB_SHA" --target "$target" \
+            --run "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --features "$RELEASE_ARCHIVE_FEATURES" --output archive-evidence/input-manifest.json
+          bash scripts/ci/package_release_archive.sh "$target" "$main" "$ext" "$RUNNER_OS"
+          extract_dir="$(mktemp -d "$RUNNER_TEMP/zeroclaw-archive-check.XXXXXX")"
+          trap 'rm -rf -- "$extract_dir"' EXIT
+          "$archive_python" scripts/ci/verify_release_archive.py verify \
+            --archive "zeroclaw-$target.$ext" --manifest archive-evidence/input-manifest.json \
+            --extract-dir "$extract_dir" --expected-source "$GITHUB_SHA" --expected-target "$target" \
+            --expected-run "$GITHUB_RUN_ID" --expected-attempt "$GITHUB_RUN_ATTEMPT" \
+            --evidence archive-evidence/validation.json
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: inputs.distribution == 'dist'
+        with:
+          name: zeroclaw-manual-archive-dist-${{ matrix.target }}
+          path: |
+            zeroclaw-${{ matrix.target }}.${{ runner.os == 'Windows' && 'zip' || 'tar.gz' }}
+            archive-evidence/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Report and release owned Linux ARM64 build memory
+        timeout-minutes: 5
+        if: always() && runner.os == 'Linux' && (matrix.target == 'aarch64-unknown-linux-gnu' || matrix.target == 'aarch64-unknown-linux-musl')
+        shell: bash
+        env:
+          ZC_DIST_SWAP_FILE: ${{ steps.dist_memory.outputs.swap_file }}
+          ZC_DIST_SWAP_IDENTITY: ${{ steps.dist_memory.outputs.swap_identity }}
+        run: bash scripts/ci/dist_runner_memory.sh cleanup
+
+  # Rehearsal of the release's plugin smoke: the same packages and the same
+  # script run against the binary each build leg uploaded, on a runner that
+  # executes that target natively, so a distribution change is measured and
+  # proven from one dispatch.
+  plugin-smoke-packages:
+    name: Build Plugin Smoke Packages
+    if: ${{ inputs.qualification_profile == 'normal' && !inputs.release_tools_only }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.98.0
+          targets: wasm32-wasip2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: plugin-smoke-packages
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Build plugin smoke packages
+        run: bash scripts/ci/build_plugin_smoke_packages.sh "$RUNNER_TEMP/plugin-smoke-packages"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: plugin-smoke-packages
+          path: ${{ runner.temp }}/plugin-smoke-packages
+          if-no-files-found: error
+          retention-days: 7
+
+  # The build matrix has legs without a smoke leg (ARM32, Android), so the
+  # rehearsal does not depend on every build leg succeeding: a leg whose
+  # binary is missing fails on its own download instead.
+  plugin-smoke:
+    name: Plugin Smoke ${{ inputs.distribution }} / ${{ matrix.target }}
+    needs: [build, plugin-smoke-packages]
+    if: ${{ !cancelled() && inputs.qualification_profile == 'normal' && !inputs.release_tools_only && needs.plugin-smoke-packages.result == 'success' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: 0
+    strategy:
+      fail-fast: false
+      matrix:
+        # The same legs as the stable release; an xtask test keeps both lists
+        # equal to the registry's per-target plugin policy.
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: inputs.distribution != 'dist'
+        with:
+          name: zeroclaw-manual-${{ inputs.distribution }}-${{ matrix.target }}
+          path: binary
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: inputs.distribution == 'dist'
+        with:
+          name: zeroclaw-manual-archive-dist-${{ matrix.target }}
+          path: archive
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: plugin-smoke-packages
+          path: plugin-smoke-packages
+      - name: Verify and extract standard release archive
+        if: inputs.distribution == 'dist'
+        id: archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive_python=""
+          for candidate in python3 python; do
+            if command -v "$candidate" >/dev/null 2>&1 \
+              && "$candidate" -c 'import sys; sys.exit(sys.version_info < (3, 8))' 2>/dev/null; then
+              archive_python="$candidate"
+              break
+            fi
+          done
+          test -n "$archive_python"
+          target="${{ matrix.target }}"
+          main="${{ runner.os == 'Windows' && 'zeroclaw.exe' || 'zeroclaw' }}"
+          ext="${{ runner.os == 'Windows' && 'zip' || 'tar.gz' }}"
+          extract_dir="$(mktemp -d "$RUNNER_TEMP/zeroclaw-archive-smoke.XXXXXX")"
+          "$archive_python" scripts/ci/verify_release_archive.py verify \
+            --archive "archive/zeroclaw-$target.$ext" --manifest archive/archive-evidence/input-manifest.json \
+            --extract-dir "$extract_dir" --expected-source "$GITHUB_SHA" --expected-target "$target" \
+            --expected-run "$GITHUB_RUN_ID" --expected-attempt "$GITHUB_RUN_ATTEMPT" \
+            --evidence "archive-validation-$target.json"
+          printf 'binary=%s\n' "$extract_dir/$main" >> "$GITHUB_OUTPUT"
+          printf 'archive=%s\n' "archive/zeroclaw-$target.$ext" >> "$GITHUB_OUTPUT"
+      - name: Run scripted provider tests
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          provider_python=""
+          for candidate in python3 python; do
+            if command -v "$candidate" >/dev/null 2>&1 \
+              && "$candidate" -c 'import sys; sys.exit(sys.version_info < (3, 8))' 2>/dev/null; then
+              provider_python="$candidate"
+              break
+            fi
+          done
+          if [ -z "$provider_python" ]; then
+            echo "python 3.8 or newer is required" >&2
+            exit 1
+          fi
+          "$provider_python" scripts/ci/plugin_smoke_provider_test.py -v
+
+      - name: Run the plugin smoke against the built binary
+        shell: bash
+        env:
+          SMOKE_DISTRIBUTION: ${{ inputs.distribution }}
+          SMOKE_BINARY: ${{ steps.archive.outputs.binary }}
+          SMOKE_ARCHIVE: ${{ steps.archive.outputs.archive }}
+          SMOKE_BINARY_NAME: ${{ runner.os == 'Windows' && 'zeroclaw.exe' || 'zeroclaw' }}
+          SMOKE_LABEL: ${{ inputs.distribution }} / ${{ matrix.target }}
+          SMOKE_EVIDENCE: plugin-smoke-${{ matrix.target }}.md
+        run: |
+          set -euo pipefail
+          if [ "$SMOKE_DISTRIBUTION" = dist ]; then
+            binary="$SMOKE_BINARY"
+          else
+            binary="binary/$SMOKE_BINARY_NAME"
+          fi
+          chmod +x "$binary"
+          archive_args=()
+          if [ "$SMOKE_DISTRIBUTION" = dist ]; then
+            archive_args=(--archive "$SMOKE_ARCHIVE")
+          fi
+          bash scripts/ci/plugin_artifact_smoke.sh \
+            --binary "$binary" \
+            --expect host \
+            --packages plugin-smoke-packages \
+            --label "$SMOKE_LABEL" \
+            ${archive_args[@]+"${archive_args[@]}"} \
+            --evidence "$SMOKE_EVIDENCE"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: plugin-smoke-${{ inputs.distribution }}-${{ matrix.target }}
+          path: |
+            plugin-smoke-${{ matrix.target }}.md
+            archive-validation-${{ matrix.target }}.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  stable-gnu-web:
+    name: Stable GNU Ubuntu22 / Web
+    needs: [release-tool-smoke]
+    if: ${{ inputs.qualification_profile == 'stable-gnu-ubuntu22' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # stable
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        id: cache
+        with:
+          shared-key: web
+          save-if: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: '.nvmrc'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build web dashboard
+        run: cargo web build
+      - name: Record same-run web inputs
+        shell: bash
+        env:
+          QUALIFICATION_CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          assert os.environ["CARGO_INCREMENTAL"] == "0"
+          assert subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() == os.environ["GITHUB_SHA"]
+          root = pathlib.Path("web/dist")
+          files = {}
+          for path in sorted(root.rglob("*")):
+              assert not path.is_symlink()
+              if path.is_file():
+                  files[path.relative_to(root).as_posix()] = {"bytes": path.stat().st_size, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+          assert files
+          binding = {"source": os.environ["GITHUB_SHA"], "tree": subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], text=True).strip(), "run": int(os.environ["GITHUB_RUN_ID"]), "attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]), "profile": "stable-gnu-ubuntu22"}
+          receipt = {"binding": binding, "role": "web", "files": files, "cache": {"shared_key": "web", "save_if": False, "hit": os.environ["QUALIFICATION_CACHE_HIT"], "cargo_incremental": os.environ["CARGO_INCREMENTAL"]}}
+          pathlib.Path("qualification-web.json").write_text(json.dumps(receipt, sort_keys=True, indent=2) + "\n")
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stable-gnu-ubuntu22-web-dist
+          path: web/dist/
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stable-gnu-ubuntu22-web-receipt
+          path: qualification-web.json
+          if-no-files-found: error
+          retention-days: 7
+
+  stable-gnu-plugin-smoke-packages:
+    name: Stable GNU Ubuntu22 / Plugin Smoke Packages
+    needs: [release-tool-smoke]
+    if: ${{ inputs.qualification_profile == 'stable-gnu-ubuntu22' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # stable
+        with:
+          toolchain: 1.98.0
+          targets: wasm32-wasip2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        id: cache
+        with:
+          shared-key: plugin-smoke-packages
+          prefix-key: plugin-smoke-packages
+          save-if: false
+      - name: Build plugin smoke packages
+        run: bash scripts/ci/build_plugin_smoke_packages.sh "$RUNNER_TEMP/plugin-smoke-packages"
+      - name: Record same-run fixture inputs
+        shell: bash
+        env:
+          QUALIFICATION_CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          assert os.environ["CARGO_INCREMENTAL"] == "0"
+          assert subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() == os.environ["GITHUB_SHA"]
+          root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "plugin-smoke-packages"
+          files = {}
+          for path in sorted(root.rglob("*")):
+              assert not path.is_symlink()
+              if path.is_file():
+                  files[path.relative_to(root).as_posix()] = {"bytes": path.stat().st_size, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+          assert files
+          binding = {"source": os.environ["GITHUB_SHA"], "tree": subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], text=True).strip(), "run": int(os.environ["GITHUB_RUN_ID"]), "attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]), "profile": "stable-gnu-ubuntu22"}
+          receipt = {"binding": binding, "role": "plugin-smoke-packages", "files": files, "cache": {"shared_key": "plugin-smoke-packages", "prefix_key": "plugin-smoke-packages", "save_if": False, "hit": os.environ["QUALIFICATION_CACHE_HIT"], "cargo_incremental": os.environ["CARGO_INCREMENTAL"]}}
+          pathlib.Path("qualification-fixtures.json").write_text(json.dumps(receipt, sort_keys=True, indent=2) + "\n")
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stable-gnu-ubuntu22-plugin-smoke-packages
+          path: ${{ runner.temp }}/plugin-smoke-packages
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stable-gnu-ubuntu22-fixtures-receipt
+          path: qualification-fixtures.json
+          if-no-files-found: error
+          retention-days: 7
+
+  stable-gnu-build:
+    name: Stable GNU Ubuntu22 / Build ${{ matrix.target }}
+    needs: [release-tool-smoke, stable-gnu-web]
+    if: ${{ inputs.qualification_profile == 'stable-gnu-ubuntu22' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact: zeroclaw
+            ext: tar.gz
+          - os: ubuntu-22.04
+            target: aarch64-unknown-linux-gnu
+            artifact: zeroclaw
+            ext: tar.gz
+            cross_compiler: gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+            linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
+            linker: aarch64-linux-gnu-gcc
+          - os: ubuntu-22.04
+            target: armv7-unknown-linux-gnueabihf
+            artifact: zeroclaw
+            ext: tar.gz
+            cross_compiler: gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
+            linker_env: CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER
+            linker: arm-linux-gnueabihf-gcc
+          - os: ubuntu-22.04
+            target: arm-unknown-linux-gnueabihf
+            artifact: zeroclaw
+            ext: tar.gz
+            cross_compiler: gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
+            linker_env: CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_LINKER
+            linker: arm-linux-gnueabihf-gcc
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # stable
+        with:
+          toolchain: 1.98.0
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        id: cache
+        with:
+          shared-key: build
+          prefix-key: ${{ matrix.os }}-${{ matrix.target }}
+          save-if: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: stable-gnu-ubuntu22-web-dist
+          path: web/dist/
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: stable-gnu-ubuntu22-web-receipt
+          path: web-receipt/
+      - name: Install cross compiler
+        if: matrix.cross_compiler
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ${{ matrix.cross_compiler }}
+      - name: Capture GNU ARM64 runner baseline
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        timeout-minutes: 1
+        shell: bash
+        env:
+          BASELINE_SOURCE: ${{ github.sha }}
+          BASELINE_RUN_ID: ${{ github.run_id }}
+          BASELINE_RUN_ATTEMPT: ${{ github.run_attempt }}
+          BASELINE_TARGET: ${{ matrix.target }}
+          BASELINE_DISTRIBUTION: ${{ inputs.distribution }}
+          BASELINE_PROFILE: ${{ inputs.qualification_profile }}
+          BASELINE_RELEASE_TOOLS_ONLY: ${{ inputs.release_tools_only }}
+        run: |
+          python3 - <<'PY'
+          import datetime
+          import hashlib
+          import json
+          import os
+          import re
+          import select
+          import stat
+          import subprocess
+          import time
+          from pathlib import Path
+
+          READ_LIMIT = 4096
+          JSON_LIMIT = 16384
+          PACKAGES = (
+              "gcc-aarch64-linux-gnu", "gcc-11-aarch64-linux-gnu",
+              "g++-aarch64-linux-gnu", "g++-11-aarch64-linux-gnu",
+              "binutils-aarch64-linux-gnu", "libc6-arm64-cross", "libc6-dev-arm64-cross",
+          )
+
+
+          def unknown(reason):
+              return {"status": "UNKNOWN", "reason": reason}
+
+
+          def metadata_command(args):
+              # Four seconds for capture, one for killing/reaping this foreground child.
+              deadline = time.monotonic() + 4
+              try:
+                  child = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                           stderr=subprocess.DEVNULL)
+              except OSError:
+                  return unknown("unavailable")
+              data = bytearray()
+              try:
+                  while True:
+                      remaining = deadline - time.monotonic()
+                      if remaining <= 0 or not select.select([child.stdout], [], [], remaining)[0]:
+                          return unknown("timeout")
+                      chunk = os.read(child.stdout.fileno(), min(1024, READ_LIMIT - len(data)))
+                      if not chunk:
+                          break
+                      data.extend(chunk)
+                      if len(data) >= READ_LIMIT:
+                          return unknown("at-read-limit")
+                  if child.wait(timeout=max(0, deadline - time.monotonic())) != 0:
+                      return unknown("command-failed")
+                  return data.decode("ascii")
+              except (OSError, UnicodeError, subprocess.TimeoutExpired):
+                  return unknown("unavailable")
+              finally:
+                  if child.poll() is None:
+                      try:
+                          child.kill()
+                      except ProcessLookupError:
+                          pass
+                      child.wait(timeout=1)
+                  child.stdout.close()
+
+
+          def read_metadata(path):
+              try:
+                  with open(path, "rb", buffering=0) as handle:
+                      data = handle.read(READ_LIMIT)
+                  if len(data) >= READ_LIMIT:
+                      return unknown("at-read-limit")
+                  return data.decode("ascii")
+              except (OSError, UnicodeError):
+                  return unknown("unavailable")
+
+
+          def number(value):
+              if not re.fullmatch(r"[0-9]{1,20}", value) or int(value) > 2**64 - 1:
+                  raise ValueError("invalid number")
+              return int(value)
+
+
+          def selected_numbers(text, names, unit=""):
+              if not isinstance(text, str):
+                  return text
+              values = {}
+              try:
+                  for line in text.splitlines():
+                      key = line.split(":", 1)[0] if unit else line.split(" ", 1)[0]
+                      if key not in names:
+                          continue
+                      if key in values:
+                          raise ValueError("duplicate field")
+                      match = re.fullmatch(re.escape(key) + (r":\s+([0-9]+) kB" if unit else r" ([0-9]+)"), line)
+                      if not match:
+                          raise ValueError("malformed field")
+                      values[key] = number(match[1])
+                  return {key: values.get(key, unknown("missing")) for key in names}
+              except ValueError:
+                  return unknown("malformed")
+
+
+          def scalar(path, allow_max=False):
+              text = read_metadata(path)
+              if not isinstance(text, str):
+                  return text
+              try:
+                  value = text.strip()
+                  return "max" if allow_max and value == "max" else number(value)
+              except ValueError:
+                  return unknown("malformed")
+
+
+          def os_release():
+              text = read_metadata("/etc/os-release")
+              if not isinstance(text, str):
+                  return text
+              values = {}
+              for line in text.splitlines():
+                  key, separator, value = line.partition("=")
+                  if key not in ("ID", "VERSION_ID"):
+                      continue
+                  if not separator or key in values:
+                      return unknown("malformed")
+                  if value.startswith('"') and value.endswith('"'):
+                      value = value[1:-1]
+                  if not re.fullmatch(r"[a-zA-Z0-9._-]{1,80}", value):
+                      return unknown("malformed")
+                  values[key] = value
+              return {key: values.get(key, unknown("missing")) for key in ("ID", "VERSION_ID")}
+
+
+          def cpu_max():
+              text = read_metadata("/sys/fs/cgroup/cpu.max")
+              if not isinstance(text, str):
+                  return text
+              try:
+                  quota, period = text.strip().split(" ")
+                  result = {"quota": "max" if quota == "max" else number(quota), "period": number(period)}
+                  return result if result["period"] > 0 else unknown("malformed")
+              except ValueError:
+                  return unknown("malformed")
+
+
+          def packages():
+              text = metadata_command(["dpkg-query", "-W", "-f=${Package}\t${Version}\t${db:Status-Status}\n", *PACKAGES])
+              if not isinstance(text, str):
+                  return text
+              values = {}
+              for line in text.splitlines():
+                  fields = line.split("\t")
+                  if (len(fields) != 3 or fields[0] not in PACKAGES or fields[0] in values
+                          or not re.fullmatch(r"[0-9][A-Za-z0-9.+:~_-]{0,127}", fields[1])
+                          or fields[2] != "installed"):
+                      return unknown("malformed")
+                  values[fields[0]] = {"version": fields[1], "status": fields[2]}
+              return values if set(values) == set(PACKAGES) else unknown("missing")
+
+
+          def public_image(key):
+              value = os.environ.get(key, "")
+              return value if re.fullmatch(r"[A-Za-z0-9._-]{1,80}", value) else unknown("unavailable")
+
+
+          def main():
+              if (os.environ.get("GITHUB_ACTIONS") != "true"
+                      or os.environ.get("RUNNER_OS") != "Linux"
+                      or os.environ.get("RUNNER_ARCH") != "X64"):
+                  raise ValueError("runner identity")
+              expected = {
+                  "BASELINE_TARGET": "aarch64-unknown-linux-gnu",
+                  "BASELINE_DISTRIBUTION": "dist",
+                  "BASELINE_PROFILE": "stable-gnu-ubuntu22",
+                  "BASELINE_RELEASE_TOOLS_ONLY": "false",
+                  "GITHUB_JOB": "stable-gnu-build",
+              }
+              if any(os.environ.get(key) != value for key, value in expected.items()):
+                  raise ValueError("input identity")
+              source = os.environ.get("GITHUB_SHA", "")
+              if not re.fullmatch(r"[0-9a-f]{40}", source) or source != os.environ.get("BASELINE_SOURCE"):
+                  raise ValueError("source identity")
+              run = os.environ.get("GITHUB_RUN_ID", "")
+              attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "")
+              if (not re.fullmatch(r"[1-9][0-9]{0,19}", run)
+                      or not re.fullmatch(r"[1-9][0-9]{0,19}", attempt)
+                      or run != os.environ.get("BASELINE_RUN_ID")
+                      or attempt != os.environ.get("BASELINE_RUN_ATTEMPT")):
+                  raise ValueError("run identity")
+              checkout = metadata_command(["git", "--no-optional-locks", "rev-parse", "HEAD"])
+              tree = metadata_command(["git", "--no-optional-locks", "rev-parse", "HEAD^{tree}"])
+              if (not isinstance(checkout, str) or checkout.strip() != source
+                      or not isinstance(tree, str) or not re.fullmatch(r"[0-9a-f]{40}\n?", tree)):
+                  raise ValueError("checkout identity")
+              root = Path(os.environ["RUNNER_TEMP"])
+              if not root.is_absolute():
+                  raise ValueError("temporary directory")
+              root = root.resolve(strict=True)
+              try:
+                  cpu_count = os.cpu_count()
+                  cpu = cpu_count if type(cpu_count) is int and 0 < cpu_count <= 1048576 else unknown("unavailable")
+                  affinity_count = len(os.sched_getaffinity(0))
+                  affinity = affinity_count if 0 < affinity_count <= 1048576 else unknown("unavailable")
+              except (AttributeError, OSError):
+                  cpu, affinity = unknown("unavailable"), unknown("unavailable")
+              try:
+                  disk = os.statvfs(root)
+                  available = disk.f_bavail * disk.f_frsize
+                  disk_bytes = available if 0 <= available <= 2**64 - 1 else unknown("unavailable")
+              except OSError:
+                  disk_bytes = unknown("unavailable")
+              report = {
+                  "schema_version": 1,
+                  "binding": {"source": source, "tree": tree.strip(), "run": int(run), "attempt": int(attempt),
+                              "job_key": "stable-gnu-build", "target": os.environ["BASELINE_TARGET"]},
+                  "inputs": {"distribution": os.environ["BASELINE_DISTRIBUTION"],
+                             "qualification_profile": os.environ["BASELINE_PROFILE"], "release_tools_only": False},
+                  "observed_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                  "runner": {"os": "Linux", "arch": "X64", "image_os": public_image("ImageOS"),
+                             "image_version": public_image("ImageVersion")},
+                  "snapshot": {
+                      "cpu_count": cpu, "affinity_count": affinity, "available_disk_bytes": disk_bytes,
+                      "os_release": os_release(),
+                      "memory_kib": selected_numbers(read_metadata("/proc/meminfo"),
+                                                    ("MemTotal", "MemAvailable", "SwapTotal", "SwapFree"), "kB"),
+                      "visible_cgroup": {
+                          "memory_max": scalar("/sys/fs/cgroup/memory.max", True),
+                          "memory_current": scalar("/sys/fs/cgroup/memory.current"),
+                          "memory_events": selected_numbers(read_metadata("/sys/fs/cgroup/memory.events"),
+                                                           ("low", "high", "max", "oom", "oom_kill", "oom_group_kill")),
+                          "cpu_max": cpu_max(),
+                      },
+                      "packages": packages(),
+                  },
+                  "scope": "Initial visible metadata only; not effective-limit, peak, failure-cause or repair proof.",
+              }
+              data = (json.dumps(report, sort_keys=True, indent=2, allow_nan=False) + "\n").encode("utf-8")
+              if len(data) > JSON_LIMIT:
+                  raise ValueError("JSON size")
+              digest = hashlib.sha256(data).hexdigest()
+              directory = root / ("gnu-arm64-baseline-" + run + "-" + attempt)
+              os.umask(0o077)
+              directory.mkdir(mode=0o700)
+              info = directory.lstat()
+              if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+                  raise ValueError("directory ownership")
+              for name, content in (("baseline.json", data), ("baseline.sha256", (digest + "  baseline.json\n").encode("ascii"))):
+                  descriptor = os.open(directory / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                  with os.fdopen(descriptor, "wb") as handle:
+                      info = os.fstat(handle.fileno())
+                      if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                              or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600):
+                          raise ValueError("file ownership")
+                      handle.write(content)
+              print("ARM64 runner baseline recorded: bytes=" + str(len(data)) + " sha256=" + digest)
+
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except Exception:
+                  raise SystemExit("ARM64 runner baseline capture refused") from None
+          PY
+      - name: Upload GNU ARM64 runner baseline before build
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        timeout-minutes: 2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: runner-baseline-gnu-arm64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/gnu-arm64-baseline-${{ github.run_id }}-${{ github.run_attempt }}/baseline.json
+            ${{ runner.temp }}/gnu-arm64-baseline-${{ github.run_id }}-${{ github.run_attempt }}/baseline.sha256
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
+      - name: Prepare bounded Linux ARM64 build memory
+        id: dist_memory
+        timeout-minutes: 5
+        if: runner.os == 'Linux' && matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: bash scripts/ci/dist_runner_memory.sh prepare
+
+      - name: Build release
+        id: payloads
+        uses: ./.github/actions/build-release-payloads
+        with:
+          target: ${{ matrix.target }}
+          linker_env: ${{ matrix.linker_env || '' }}
+          linker: ${{ matrix.linker || '' }}
+          use_cross: ${{ matrix.use_cross || 'false' }}
+          emit_features: 'true'
+          cargo-jobs: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && '2' || '' }}
+      - name: Check standard main binary size
+        shell: bash
+        env:
+          BINARY_SIZE_HARD_LIMIT: "83886080"
+        run: bash scripts/ci/check_binary_size.sh "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "${{ matrix.target }}"
+      - name: Record input manifest and ABI observations
+        shell: bash
+        env:
+          FEATURES: ${{ steps.payloads.outputs.features }}
+        run: |
+          set -euo pipefail
+          test -n "$FEATURES"
+          target="${{ matrix.target }}"
+          python3 scripts/ci/verify_release_archive.py manifest \
+            --binary "target/$target/release/zeroclaw" \
+            --companion "target/$target/release/zerocode" \
+            --companion "target/$target/release/zerorelay" \
+            --web-dist web/dist --source "$GITHUB_SHA" --target "$target" \
+            --run "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --features "$FEATURES" --output archive-evidence/input-manifest.json
+          mkdir -p archive-evidence/abi
+          compiler="${{ matrix.linker || 'gcc' }}"
+          for name in zeroclaw zerocode zerorelay; do
+            binary="target/$target/release/$name"
+            {
+              sha256sum "$binary"
+              readelf --file-header --program-headers --dynamic --version-info "$binary"
+              printf 'compiler=%s\n' "$compiler"
+              "$compiler" --version
+              printf 'sysroot='
+              "$compiler" -print-sysroot
+              uname -a
+              ldd --version
+              free -m
+              df -h
+              ulimit -a
+            } > "archive-evidence/abi/$name.txt"
+            test -s "archive-evidence/abi/$name.txt"
+          done
+      - name: Package and verify standard release archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          bash scripts/ci/package_release_archive.sh "$target" "${{ matrix.artifact }}" "${{ matrix.ext }}" "$RUNNER_OS"
+          extract_dir="$(mktemp -d "$RUNNER_TEMP/zeroclaw-archive-check.XXXXXX")"
+          trap 'rm -rf -- "$extract_dir"' EXIT
+          python3 scripts/ci/verify_release_archive.py verify \
+            --archive "zeroclaw-$target.tar.gz" --manifest archive-evidence/input-manifest.json \
+            --extract-dir "$extract_dir" --expected-source "$GITHUB_SHA" --expected-target "$target" \
+            --expected-run "$GITHUB_RUN_ID" --expected-attempt "$GITHUB_RUN_ATTEMPT" \
+            --evidence archive-evidence/validation.json
+      - name: Bind archive qualification receipts
+        shell: bash
+        env:
+          QUALIFICATION_TARGET: ${{ matrix.target }}
+          QUALIFICATION_FEATURES: ${{ steps.payloads.outputs.features }}
+          QUALIFICATION_CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          def record(path):
+              return {"bytes": path.stat().st_size, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+          assert os.environ["CARGO_INCREMENTAL"] == "0"
+          assert subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() == os.environ["GITHUB_SHA"]
+          binding = {"source": os.environ["GITHUB_SHA"], "tree": subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], text=True).strip(), "run": int(os.environ["GITHUB_RUN_ID"]), "attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]), "profile": "stable-gnu-ubuntu22"}
+          target = os.environ["QUALIFICATION_TARGET"]
+          manifest_path = pathlib.Path("archive-evidence/input-manifest.json")
+          manifest = json.loads(manifest_path.read_text())
+          web_path = pathlib.Path("web-receipt/qualification-web.json")
+          web = json.loads(web_path.read_text())
+          assert web["binding"] == binding and web["role"] == "web"
+          assert {name[len("web/dist/"):]: value for name, value in manifest["files"].items() if name.startswith("web/dist/")} == web["files"]
+          assert manifest["features"] == os.environ["QUALIFICATION_FEATURES"] and manifest["features"]
+          observations = {}
+          for name in ("zeroclaw", "zerocode", "zerorelay"):
+              observations[name] = {"input": manifest["files"][name], "output": record(pathlib.Path("archive-evidence/abi") / (name + ".txt"))}
+          receipt = {"binding": binding, "role": "build", "target": target, "features": manifest["features"], "manifest": record(manifest_path), "web_receipt": record(web_path), "archive": record(pathlib.Path("zeroclaw-" + target + ".tar.gz")), "validation": record(pathlib.Path("archive-evidence/validation.json")), "observations": observations, "cache": {"shared_key": "build", "prefix_key": "ubuntu-22.04-" + target, "save_if": False, "hit": os.environ["QUALIFICATION_CACHE_HIT"], "cargo_incremental": os.environ["CARGO_INCREMENTAL"]}}
+          pathlib.Path("archive-evidence/qualification.json").write_text(json.dumps(receipt, sort_keys=True, indent=2) + "\n")
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stable-gnu-ubuntu22-archive-${{ matrix.target }}
+          path: |
+            zeroclaw-${{ matrix.target }}.tar.gz
+            archive-evidence/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Report and release owned Linux ARM64 build memory
+        timeout-minutes: 5
+        if: always() && runner.os == 'Linux' && matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        env:
+          ZC_DIST_SWAP_FILE: ${{ steps.dist_memory.outputs.swap_file }}
+          ZC_DIST_SWAP_IDENTITY: ${{ steps.dist_memory.outputs.swap_identity }}
+        run: bash scripts/ci/dist_runner_memory.sh cleanup
+
+  stable-gnu-plugin-smoke:
+    name: Stable GNU Ubuntu22 / Native ${{ matrix.target }}
+    needs: [release-tool-smoke, stable-gnu-build, stable-gnu-plugin-smoke-packages]
+    if: ${{ inputs.qualification_profile == 'stable-gnu-ubuntu22' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: stable-gnu-ubuntu22-archive-${{ matrix.target }}
+          path: archive/
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: stable-gnu-ubuntu22-plugin-smoke-packages
+          path: plugin-smoke-packages/
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: stable-gnu-ubuntu22-fixtures-receipt
+          path: fixture-receipt/
+      - name: Verify and extract standard release archive
+        id: archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p native
+          target="${{ matrix.target }}"
+          extract_dir="$(mktemp -d "$RUNNER_TEMP/zeroclaw-archive-smoke.XXXXXX")"
+          python3 scripts/ci/verify_release_archive.py verify \
+            --archive "archive/zeroclaw-$target.tar.gz" --manifest archive/archive-evidence/input-manifest.json \
+            --extract-dir "$extract_dir" --expected-source "$GITHUB_SHA" --expected-target "$target" \
+            --expected-run "$GITHUB_RUN_ID" --expected-attempt "$GITHUB_RUN_ATTEMPT" \
+            --evidence native/archive-validation.json
+          printf 'binary=%s\n' "$extract_dir/zeroclaw" >> "$GITHUB_OUTPUT"
+          printf 'archive=%s\n' "archive/zeroclaw-$target.tar.gz" >> "$GITHUB_OUTPUT"
+      - name: Verify same-run fixture inputs
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          receipt = json.loads(pathlib.Path("fixture-receipt/qualification-fixtures.json").read_text())
+          binding = {"source": os.environ["GITHUB_SHA"], "tree": subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], text=True).strip(), "run": int(os.environ["GITHUB_RUN_ID"]), "attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]), "profile": "stable-gnu-ubuntu22"}
+          assert receipt["binding"] == binding and receipt["role"] == "plugin-smoke-packages"
+          root = pathlib.Path("plugin-smoke-packages")
+          files = {}
+          for path in sorted(root.rglob("*")):
+              assert not path.is_symlink()
+              if path.is_file():
+                  files[path.relative_to(root).as_posix()] = {"bytes": path.stat().st_size, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+          assert files == receipt["files"] and files
+          PY
+      - name: Run scripted provider tests
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          provider_python=""
+          for candidate in python3 python; do
+            if command -v "$candidate" >/dev/null 2>&1 \
+              && "$candidate" -c 'import sys; sys.exit(sys.version_info < (3, 8))' 2>/dev/null; then
+              provider_python="$candidate"
+              break
+            fi
+          done
+          test -n "$provider_python"
+          "$provider_python" scripts/ci/plugin_smoke_provider_test.py -v 2>&1 | tee native/provider-tests.log
+      - name: Run the plugin smoke against the built binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="${{ steps.archive.outputs.binary }}"
+          chmod +x "$binary"
+          bash scripts/ci/plugin_artifact_smoke.sh \
+            --binary "$binary" \
+            --expect host \
+            --packages plugin-smoke-packages \
+            --label "stable-gnu-ubuntu22 / ${{ matrix.target }}" \
+            --archive "${{ steps.archive.outputs.archive }}" \
+            --evidence native/plugin-smoke.md
+      - name: Bind native qualification receipts
+        shell: bash
+        env:
+          QUALIFICATION_TARGET: ${{ matrix.target }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          def record(path):
+              assert path.is_file() and path.stat().st_size > 0
+              return {"bytes": path.stat().st_size, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+          assert subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() == os.environ["GITHUB_SHA"]
+          binding = {"source": os.environ["GITHUB_SHA"], "tree": subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], text=True).strip(), "run": int(os.environ["GITHUB_RUN_ID"]), "attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]), "profile": "stable-gnu-ubuntu22"}
+          target = os.environ["QUALIFICATION_TARGET"]
+          receipt = {"binding": binding, "role": "native", "target": target, "runner_os": os.environ["RUNNER_OS"], "runner_arch": os.environ["RUNNER_ARCH"], "manifest": record(pathlib.Path("archive/archive-evidence/input-manifest.json")), "archive": record(pathlib.Path("archive/zeroclaw-" + target + ".tar.gz")), "fixtures_receipt": record(pathlib.Path("fixture-receipt/qualification-fixtures.json")), "validation": record(pathlib.Path("native/archive-validation.json")), "provider_log": record(pathlib.Path("native/provider-tests.log")), "smoke_evidence": record(pathlib.Path("native/plugin-smoke.md"))}
+          pathlib.Path("native/qualification.json").write_text(json.dumps(receipt, sort_keys=True, indent=2) + "\n")
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: stable-gnu-ubuntu22-native-${{ matrix.target }}
+          path: native/
+          if-no-files-found: error
+          retention-days: 7
+
+  stable-gnu-complete:
+    name: Stable GNU Ubuntu22 / Completeness
+    needs: [release-tool-smoke, stable-gnu-web, stable-gnu-plugin-smoke-packages, stable-gnu-build, stable-gnu-plugin-smoke]
+    if: ${{ always() && inputs.qualification_profile == 'stable-gnu-ubuntu22' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Require selected role success
+        shell: bash
+        env:
+          TOOLS_RESULT: ${{ needs.release-tool-smoke.result }}
+          WEB_RESULT: ${{ needs.stable-gnu-web.result }}
+          FIXTURES_RESULT: ${{ needs.stable-gnu-plugin-smoke-packages.result }}
+          BUILD_RESULT: ${{ needs.stable-gnu-build.result }}
+          NATIVE_RESULT: ${{ needs.stable-gnu-plugin-smoke.result }}
+        run: |
+          case "$TOOLS_RESULT/$WEB_RESULT/$FIXTURES_RESULT/$BUILD_RESULT/$NATIVE_RESULT" in
+            success/success/success/success/success) ;;
+            *) echo "every selected qualification role must succeed" >&2; exit 2 ;;
+          esac
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: stable-gnu-ubuntu22-web-receipt
+          path: producers/web/
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: stable-gnu-ubuntu22-fixtures-receipt
+          path: producers/fixtures/
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: stable-gnu-ubuntu22-archive-*
+          path: archives/
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: stable-gnu-ubuntu22-native-*
+          path: natives/
+      - name: Verify finite same-run qualification inventory
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess, tempfile
+          def record(path):
+              assert path.is_file() and not path.is_symlink() and path.stat().st_size > 0
+              return {"bytes": path.stat().st_size, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+          def read(path):
+              return json.loads(path.read_text())
+          assert subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() == os.environ["GITHUB_SHA"]
+          binding = {"source": os.environ["GITHUB_SHA"], "tree": subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], text=True).strip(), "run": int(os.environ["GITHUB_RUN_ID"]), "attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]), "profile": "stable-gnu-ubuntu22"}
+          web_path = pathlib.Path("producers/web/qualification-web.json")
+          fixture_path = pathlib.Path("producers/fixtures/qualification-fixtures.json")
+          web, fixtures = read(web_path), read(fixture_path)
+          for receipt, role in ((web, "web"), (fixtures, "plugin-smoke-packages")):
+              assert receipt["binding"] == binding and receipt["role"] == role and receipt["files"]
+              assert receipt["cache"]["shared_key"] == role and receipt["cache"]["save_if"] is False
+              assert receipt["cache"]["cargo_incremental"] == "0"
+          targets = ("x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "armv7-unknown-linux-gnueabihf", "arm-unknown-linux-gnueabihf")
+          assert {path.name for path in pathlib.Path("archives").iterdir()} == {"stable-gnu-ubuntu22-archive-" + target for target in targets}
+          inputs = 0
+          for target in targets:
+              root = pathlib.Path("archives") / ("stable-gnu-ubuntu22-archive-" + target)
+              evidence = root / "archive-evidence"
+              manifest_path = evidence / "input-manifest.json"
+              manifest, receipt = read(manifest_path), read(evidence / "qualification.json")
+              archive = root / ("zeroclaw-" + target + ".tar.gz")
+              assert receipt["binding"] == binding and receipt["role"] == "build" and receipt["target"] == target
+              assert receipt["manifest"] == record(manifest_path) and receipt["archive"] == record(archive)
+              assert receipt["validation"] == record(evidence / "validation.json") and receipt["web_receipt"] == record(web_path)
+              assert receipt["features"] == manifest["features"] and receipt["features"]
+              assert {name[len("web/dist/"):]: value for name, value in manifest["files"].items() if name.startswith("web/dist/")} == web["files"]
+              assert receipt["cache"]["shared_key"] == "build" and receipt["cache"]["prefix_key"] == "ubuntu-22.04-" + target
+              assert receipt["cache"]["save_if"] is False and receipt["cache"]["cargo_incremental"] == "0"
+              assert set(receipt["observations"]) == {"zeroclaw", "zerocode", "zerorelay"}
+              for name, observation in receipt["observations"].items():
+                  assert observation["input"] == manifest["files"][name]
+                  assert observation["output"] == record(evidence / "abi" / (name + ".txt"))
+                  inputs += 1
+              with tempfile.TemporaryDirectory() as destination:
+                  subprocess.run(["python3", "scripts/ci/verify_release_archive.py", "verify", "--archive", str(archive), "--manifest", str(manifest_path), "--extract-dir", destination, "--expected-source", binding["source"], "--expected-target", target, "--expected-run", str(binding["run"]), "--expected-attempt", str(binding["attempt"])], check=True)
+          assert inputs == 12
+          native_targets = {"x86_64-unknown-linux-gnu": "X64", "aarch64-unknown-linux-gnu": "ARM64"}
+          assert {path.name for path in pathlib.Path("natives").iterdir()} == {"stable-gnu-ubuntu22-native-" + target for target in native_targets}
+          for target, arch in native_targets.items():
+              root = pathlib.Path("natives") / ("stable-gnu-ubuntu22-native-" + target)
+              archive_root = pathlib.Path("archives") / ("stable-gnu-ubuntu22-archive-" + target)
+              receipt = read(root / "qualification.json")
+              assert receipt["binding"] == binding and receipt["role"] == "native" and receipt["target"] == target
+              assert receipt["runner_os"] == "Linux" and receipt["runner_arch"] == arch
+              assert receipt["manifest"] == record(archive_root / "archive-evidence/input-manifest.json")
+              assert receipt["archive"] == record(archive_root / ("zeroclaw-" + target + ".tar.gz"))
+              assert receipt["fixtures_receipt"] == record(fixture_path)
+              assert receipt["validation"] == record(root / "archive-validation.json")
+              assert receipt["provider_log"] == record(root / "provider-tests.log") and receipt["smoke_evidence"] == record(root / "plugin-smoke.md")
+          print("PASS finite source/run inventory: four verified archives, twelve input/ABI observations, two native carriers")
+          PY

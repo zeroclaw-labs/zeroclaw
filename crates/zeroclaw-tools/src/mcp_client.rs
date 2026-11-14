@@ -876,6 +876,12 @@ impl McpServer {
 
 // ── McpRegistry ───────────────────────────────────────────────────────────
 
+/// Joins an MCP server's name to one of its tools' names in the callable name
+/// the registry exposes: `<server>__<tool>`. MCP tools join a tool registry
+/// after plugin tools, so the plugin host refuses any plugin tool name that
+/// contains this separator.
+pub const MCP_TOOL_NAME_SEPARATOR: &str = "__";
+
 /// Registry of all connected MCP servers, with a flat tool index.
 pub struct McpRegistry {
     servers: Vec<McpServer>,
@@ -901,7 +907,8 @@ impl McpRegistry {
                     let tools = server.tools().await;
                     for tool in &tools {
                         // Prefix prevents name collisions across servers
-                        let prefixed = format!("{}__{}", config.name, tool.name);
+                        let prefixed =
+                            format!("{}{MCP_TOOL_NAME_SEPARATOR}{}", config.name, tool.name);
                         tool_index.insert(prefixed, (server_idx, tool.name.clone()));
                     }
                     servers.push(server);
@@ -1047,7 +1054,7 @@ impl McpRegistry {
             let name = server.name().await;
             let tools = server.tools().await;
             for tool in &tools {
-                let prefixed = format!("{}__{}", name, tool.name);
+                let prefixed = format!("{name}{MCP_TOOL_NAME_SEPARATOR}{}", tool.name);
                 tool_index.insert(prefixed, (idx, tool.name.clone()));
             }
             server_index.insert(name, idx);
@@ -1216,9 +1223,15 @@ impl McpRegistry {
         }
     }
 
-    /// All prefixed tool names across all connected servers.
+    /// All prefixed tool names across all connected servers, sorted.
+    ///
+    /// Sorted because callers render this list into the system prompt and the
+    /// tool specs; `HashMap` order differs per registry instance, which would
+    /// change the prompt on every session and defeat provider prompt caching.
     pub fn tool_names(&self) -> Vec<String> {
-        self.tool_index.keys().cloned().collect()
+        let mut names: Vec<String> = self.tool_index.keys().cloned().collect();
+        names.sort_unstable();
+        names
     }
 
     /// Tool definition for a given prefixed name (cloned).
@@ -1336,7 +1349,7 @@ impl McpRegistry {
     /// Split a `<server>__<rest>` prefixed name. Returns None if no prefix.
     pub fn split_prefixed(prefixed: &str) -> Option<(String, String)> {
         prefixed
-            .split_once("__")
+            .split_once(MCP_TOOL_NAME_SEPARATOR)
             .map(|(s, r)| (s.to_string(), r.to_string()))
     }
 
@@ -1739,6 +1752,26 @@ mod tests {
             .await
             .expect("connect_all should succeed");
         assert!(registry.tool_names().is_empty());
+    }
+
+    #[test]
+    fn tool_names_are_sorted_regardless_of_insertion_order() {
+        let names = [
+            "zeta__b", "alpha__z", "mid__a", "alpha__a", "zeta__a", "beta__c",
+        ];
+        let registry = |order: &mut dyn Iterator<Item = &&str>| McpRegistry {
+            servers: Vec::new(),
+            tool_index: order
+                .map(|n| ((*n).to_string(), (0usize, (*n).to_string())))
+                .collect(),
+            server_index: HashMap::new(),
+        };
+        let forward = registry(&mut names.iter()).tool_names();
+        let reverse = registry(&mut names.iter().rev()).tool_names();
+        let mut expected: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
+        expected.sort();
+        assert_eq!(forward, expected);
+        assert_eq!(reverse, expected);
     }
 
     #[tokio::test]

@@ -65,7 +65,7 @@ fn degraded_config_guidance_is_bound_to_running_executable_when_path_disagrees()
     let config_dir = tempfile::tempdir().expect("temp config dir");
     std::fs::write(
         config_dir.path().join("config.toml"),
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [gateway]
 require_pairing = false
@@ -129,7 +129,7 @@ fn degraded_config_guidance_keeps_executable_path_without_runtime_i18n() {
     let config_dir = tempfile::tempdir().expect("temp config dir");
     std::fs::write(
         config_dir.path().join("config.toml"),
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [risk_profiles.example]
 level = "autonomous"

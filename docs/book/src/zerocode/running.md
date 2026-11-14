@@ -63,6 +63,7 @@ In the **Chat** and **Code** panes you can load or switch existing sessions with
 - Use the list-navigation keys to move the selection (defaults: Up/Down).
 - **Enter** switches to the highlighted session.
 - **New session** opens the same add-agent picker as the sidebar `[+]` and adds a session for the agent you choose, leaving the focused session tracked (default chord: Ctrl+N; rebindable).
+- **`/load-session [name|id]`** resumes a saved session from the pane's own store without opening the list. It matches, in order: the exact session id, the exact name, the name ignoring case, then a unique id prefix. If several sessions match, the list opens showing only those; with no argument, it opens the full list, like **Switch session**. The command never starts a new session. Code sessions don't have names yet, so in the **Code** pane only id and id-prefix matching work today.
 
 Clicking a session row's body focuses it; clicking its right-edge `✕` closes that specific session without focusing it first.
 Use the Sessions header `[+]` to add a sibling session and `[-]` to close the focused session in the active pane.
