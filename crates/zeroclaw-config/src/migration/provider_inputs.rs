@@ -216,7 +216,12 @@ fn project_provider_tables(
                 })?,
         );
     }
-    ProviderRegistry::from_raw_parts(
+    // Projection only decodes the historical shape.  Semantic validation is
+    // performed by `normalize_definitions_inner` after all legacy sections
+    // have been folded together.  Keeping this intermediate view
+    // unvalidated is also what lets Doctor inspect an invalid candidate and
+    // report its exact field instead of losing the whole projection.
+    ProviderRegistry::from_raw_parts_unvalidated(
         connections,
         models,
         providers.model_presets.clone(),
@@ -873,6 +878,9 @@ fn normalize_definitions_inner(config: &mut Config, validate: bool) -> Result<()
         config.providers.canonical_registry()?;
         return Ok(());
     }
+    if validate {
+        validate_legacy_numeric_fields(config)?;
+    }
     let current = project(config)?;
     let mut registry = current.clone();
     promote_embedding_bindings(config, &current, &mut registry)?;
@@ -919,6 +927,43 @@ fn normalize_definitions_inner(config: &mut Config, validate: bool) -> Result<()
     config.transcription.assemblyai = None;
     config.transcription.google = None;
     config.transcription.local_whisper = None;
+    Ok(())
+}
+
+/// Validate numeric values while they still live in the historical typed
+/// provider maps. JSON is used as the migration interchange format, and JSON
+/// cannot represent IEEE NaN; checking after projection would silently turn a
+/// malformed temperature into `null` and lose the field-level error.
+fn validate_legacy_numeric_fields(config: &Config) -> Result<()> {
+    fn check_temperature(reference: &str, value: Option<f64>) -> Result<()> {
+        if let Some(value) = value
+            && (!value.is_finite() || !(0.0..=2.0).contains(&value))
+        {
+            anyhow::bail!(
+                "providers.models.{reference}.options.temperature: temperature must be finite and between 0.0 and 2.0 (got {value})"
+            );
+        }
+        Ok(())
+    }
+    fn check_context_window(reference: &str, value: Option<usize>) -> Result<()> {
+        if value == Some(0) {
+            anyhow::bail!(
+                "providers.models.{reference}.metadata.context_window: context window must be greater than 0"
+            );
+        }
+        Ok(())
+    }
+
+    for (family, alias, profile) in config.providers.models.iter_entries() {
+        let profile_ref = format!("{family}.{alias}");
+        check_temperature(&profile_ref, profile.temperature)?;
+        check_context_window(&profile_ref, profile.context_window)?;
+        for (model_alias, entry) in &profile.models {
+            let model_ref = format!("{profile_ref}.{model_alias}");
+            check_temperature(&model_ref, entry.temperature)?;
+            check_context_window(&model_ref, entry.context_window)?;
+        }
+    }
     Ok(())
 }
 

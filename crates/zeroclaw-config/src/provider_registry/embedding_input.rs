@@ -9,17 +9,43 @@ impl Config {
     /// provider construction. Historical provider syntax is never interpreted.
     pub fn embedding_input_warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
-        let registry = match self.provider_registry() {
-            Ok(registry) => registry,
-            Err(error) => return vec![error.to_string()],
-        };
+        let registry = self.provider_registry().ok();
         for route in &self.embedding_routes {
             if route.hint.trim().is_empty() {
                 warnings.push("embedding route with empty hint".into());
             }
-            if let Err(error) = registry.resolve_embedding(&route.model_provider.trim().into()) {
-                warnings.push(format!("embedding route \"{}\": {error}", route.hint));
+            if route.model.trim().is_empty() {
+                warnings.push(format!(
+                    "embedding route \"{}\" has empty model",
+                    route.hint
+                ));
             }
+            let invalid = registry.as_ref().is_none_or(|registry| {
+                registry
+                    .resolve_embedding(&route.model_provider.trim().into())
+                    .is_err()
+            });
+            if invalid {
+                warnings.push(format!(
+                    "embedding route \"{}\" uses invalid model_provider \"{}\"",
+                    route.hint, route.model_provider
+                ));
+            }
+        }
+        if let Some(hint) = self
+            .memory
+            .embedding_model
+            .strip_prefix("hint:")
+            .map(str::trim)
+            .filter(|hint| !hint.is_empty())
+            && !self
+                .embedding_routes
+                .iter()
+                .any(|route| route.hint.trim() == hint)
+        {
+            warnings.push(format!(
+                "embedding model hint \"{hint}\" has no matching [[embedding_routes]] entry exists"
+            ));
         }
         warnings
     }

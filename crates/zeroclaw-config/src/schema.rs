@@ -56053,6 +56053,15 @@ impl Config {
         // builds never reinterpret legacy state here.
         #[cfg(feature = "test-helpers")]
         {
+            // Once a fixture has crossed the input boundary, the canonical
+            // registry is authoritative. Re-projecting the still-retained
+            // legacy maps here would silently discard an editor mutation
+            // made to the canonical row (and makes tests observe stale
+            // provider/model state). Fresh legacy-only fixtures still enter
+            // through the explicit admission helper below.
+            if !self.providers.models.canonical_models.is_empty() {
+                return self.providers.canonical_registry();
+            }
             if let Ok(admitted) = crate::migration::try_admit_test_input(self) {
                 admitted.providers.canonical_registry()
             } else {
@@ -56075,6 +56084,9 @@ impl Config {
     {
         #[cfg(feature = "test-helpers")]
         {
+            if !self.providers.models.canonical_models.is_empty() {
+                return self.providers.canonical_registry_unvalidated();
+            }
             if let Ok(admitted) = crate::migration::try_admit_test_input(self) {
                 admitted.providers.canonical_registry_unvalidated()
             } else {

@@ -1056,6 +1056,52 @@ fn check_degraded_sections(config: &Config, items: &mut Vec<DiagItem>) {
 fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "config";
 
+    // A legacy input can contain IEEE NaN, which cannot survive the JSON
+    // projection used by the canonical registry. Inspect those two numeric
+    // fields at the migration boundary so Doctor can still report the exact
+    // model row; all normal construction and persistence remains canonical.
+    let mut legacy_numeric = Vec::new();
+    for (family, alias, profile) in config.providers.models.iter_entries() {
+        let profile_ref = format!("{family}.{alias}");
+        legacy_numeric.push((
+            profile_ref.clone(),
+            profile.temperature,
+            profile.context_window,
+        ));
+        for (model_alias, entry) in &profile.models {
+            legacy_numeric.push((
+                format!("{profile_ref}.{model_alias}"),
+                entry.temperature,
+                entry.context_window,
+            ));
+        }
+    }
+    for (reference, temperature, context_window) in legacy_numeric {
+        if let Some(temperature) = temperature
+            && (!temperature.is_finite() || !(0.0..=2.0).contains(&temperature))
+        {
+            let message = crate::i18n::get_required_cli_string_with_args(
+                "cli-doctor-temperature-out-of-range",
+                &[
+                    ("provider_ref", reference.as_str()),
+                    ("temperature", &format!("{temperature:.1}")),
+                ],
+            );
+            if !items.iter().any(|item| item.message == message) {
+                items.push(DiagItem::error(cat, message));
+            }
+        }
+        if context_window == Some(0) {
+            let message = crate::i18n::get_required_cli_string_with_args(
+                "cli-doctor-context-window-zero",
+                &[("provider_ref", reference.as_str())],
+            );
+            if !items.iter().any(|item| item.message == message) {
+                items.push(DiagItem::error(cat, message));
+            }
+        }
+    }
+
     // Config file exists
     if config.config_path.exists() {
         items.push(DiagItem::ok(

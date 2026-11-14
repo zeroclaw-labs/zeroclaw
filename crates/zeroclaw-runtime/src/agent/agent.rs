@@ -2068,7 +2068,7 @@ impl Agent {
                 &self.agent_alias,
                 &selected.provider_name,
             )
-            .ok()?;
+            .ok();
             // Include shared construction defaults (reasoning, multimodal,
             // secrets directory) through the existing options materializer.
             let mut provider_config = serde_json::to_value((&config.providers, options)).ok()?;
