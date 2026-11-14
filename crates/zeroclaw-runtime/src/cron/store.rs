@@ -15,6 +15,19 @@ use zeroclaw_api::conversation_binding::ConversationBinding;
 use zeroclaw_config::schema::{Config, CronShellOutputFormat};
 
 const MAX_CRON_OUTPUT_BYTES: usize = 16 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    static PATCH_WRITER_WAIT: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Only the worker thread's next patch transaction installs this notifier.
+/// Its first SQLite busy callback proves an actual writer wait, not arrival
+/// somewhere before the database acquisition.
+#[cfg(test)]
+pub(crate) fn notify_patch_writer_wait_for_test(sender: std::sync::mpsc::Sender<()>) {
+    PATCH_WRITER_WAIT.set(Some(sender));
+}
 const TRUNCATED_OUTPUT_MARKER: &str = "\n...[truncated]";
 
 static CRON_PROCESS_LOCK_OWNER: OnceLock<String> = OnceLock::new();
@@ -147,10 +160,11 @@ pub fn add_shell_job(
         command,
         delivery,
         CronShellOutputFormat::default(),
+        || Ok(()),
     )
 }
 
-pub fn add_shell_job_with_format(
+pub(super) fn add_shell_job_with_format<G>(
     config: &Config,
     agent_alias: &str,
     name: Option<String>,
@@ -158,10 +172,11 @@ pub fn add_shell_job_with_format(
     command: &str,
     delivery: Option<DeliveryConfig>,
     shell_output_format: CronShellOutputFormat,
+    authorize: impl FnOnce() -> Result<G>,
 ) -> Result<CronJob> {
     let now = Utc::now();
-    validate_schedule(&schedule, now)?;
     validate_delivery_config(delivery.as_ref())?;
+    validate_schedule(&schedule, now)?;
     let next_run = next_run_for_schedule(&schedule, now)?;
     let id = Uuid::new_v4().to_string();
     let expression = schedule_cron_expression(&schedule).unwrap_or_default();
@@ -180,7 +195,9 @@ pub fn add_shell_job_with_format(
     };
 
     with_initialized_connection(config, |conn| {
-        conn.execute(
+        let tx = begin_immediate(conn, "shell job insert")?;
+        let _authority = authorize()?;
+        tx.execute(
             "INSERT INTO cron_jobs (
                 id, expression, command, schedule, job_type, prompt, name, session_target, model,
                 enabled, delivery, delete_after_run, agent_alias, created_at, next_run, shell_output_format
@@ -200,7 +217,7 @@ pub fn add_shell_job_with_format(
             ],
         )
         .context("Failed to insert cron shell job")?;
-        Ok(())
+        tx.commit().context("Failed to commit cron shell job")
     })?;
 
     get_job(config, &id)
@@ -408,26 +425,22 @@ pub fn get_job_for_agent(config: &Config, job_id: &str, agent_alias: &str) -> Re
 /// Raw DB row for a job, with no config overlay applied. `shell_output_format`
 /// on the returned job is exactly what's stored in the `cron_jobs` column —
 /// for a declarative job that is a stale/default value, not the canonical
-/// one from `config.cron`. Used by [`update_job`] (through [`select_job_raw`])
+/// one from `config.cron`. Used by [`update_job`] (through [`get_job_raw_on`])
 /// so unrelated patches don't re-persist a config-resolved snapshot into a
 /// column declarative jobs don't own; every other caller should use
 /// [`get_job`] instead.
 fn get_job_raw(config: &Config, job_id: &str) -> Result<CronJob> {
-    let Some(job) = with_read_connection(config, |conn| select_job_raw(conn, job_id))? else {
-        return Err(job_not_found(job_id));
-    };
-    Ok(job)
+    with_read_connection(config, |conn| get_job_raw_on(conn, job_id))?
+        .ok_or_else(|| job_not_found(job_id))
 }
 
-/// The SELECT behind [`get_job_raw`], on a connection the caller holds, so
-/// [`update_job`] can read the row inside the transaction that writes it.
-fn select_job_raw(conn: &Connection, job_id: &str) -> Result<CronJob> {
+fn get_job_raw_on(conn: &Connection, job_id: &str) -> Result<CronJob> {
     let mut stmt = conn.prepare(
-        "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                 enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                 allowed_tools, source, uses_memory, agent_alias, shell_output_format
-         FROM cron_jobs WHERE id = ?1",
-    )?;
+            "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
+                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
+                     allowed_tools, source, uses_memory, agent_alias, shell_output_format
+             FROM cron_jobs WHERE id = ?1",
+        )?;
 
     let mut rows = stmt.query(params![job_id])?;
     if let Some(row) = rows.next()? {
@@ -838,18 +851,30 @@ fn update_job_inner(
     owner: Option<&str>,
     patch: CronJobPatch,
 ) -> Result<CronJob> {
-    // Read the row and write it back in one IMMEDIATE transaction: the write
-    // lock is held from before the read, so the patch is applied to the row
-    // as it stands and no concurrent write is overwritten with stale values.
-    // An existing connection only, so an update on an empty workspace does
-    // not create the database.
-    let written = with_existing_initialized_connection(config, |conn| {
-        let tx = begin_immediate(conn, "job update")?;
-        // Start from the raw DB row, not the config-resolved `get_job()` view:
-        // for a declarative job, `shell_output_format` isn't DB-owned, so an
-        // unrelated patch (e.g. toggling `enabled`) must not re-persist the
-        // resolved config value into the column and recreate a second owner.
-        let mut job = select_job_raw(&tx, job_id)?;
+    update_job_authorized(config, job_id, owner, patch, |_| Ok(()))
+}
+
+pub(crate) fn update_job_authorized<G>(
+    config: &Config,
+    job_id: &str,
+    owner: Option<&str>,
+    patch: CronJobPatch,
+    authorize: impl FnOnce(&CronJob) -> Result<G>,
+) -> Result<CronJob> {
+    // Start from the raw DB row, not the config-resolved `get_job()` view:
+    // for a declarative job, `shell_output_format` isn't DB-owned, so an
+    // unrelated patch (e.g. toggling `enabled`) must not re-persist the
+    // resolved config value into the column and recreate a second owner.
+    with_initialized_connection(config, |connection| {
+        let tx = begin_immediate(connection, "job patch")?;
+        let conn = &tx;
+        let mut job = get_job_raw_on(conn, job_id)?;
+        if owner.is_some_and(|owner| owner != job.agent_alias) {
+            return Err(job_not_found(job_id));
+        }
+        // Resolve current authority only after SQLite grants the writer, and hold
+        // it through the UPDATE, its commit, and the returned row projection.
+        let _authority = authorize(&job)?;
         let mut schedule_changed = false;
         // Whether this patch changes what a run is told, what it may use, or
         // where its output goes. See the binding rule at the write below.
@@ -980,7 +1005,7 @@ fn update_job_inner(
                     job.expression,
                     job.command,
                     serde_json::to_string(&job.schedule)?,
-                    <JobType as Into<&str>>::into(job.job_type).to_string(),
+                    <JobType as Into<&str>>::into(job.job_type.clone()).to_string(),
                     job.prompt,
                     job.name,
                     job.session_target.as_str(),
@@ -1011,7 +1036,7 @@ fn update_job_inner(
                     job.expression,
                     job.command,
                     serde_json::to_string(&job.schedule)?,
-                    <JobType as Into<&str>>::into(job.job_type).to_string(),
+                    <JobType as Into<&str>>::into(job.job_type.clone()).to_string(),
                     job.prompt,
                     job.name,
                     job.session_target.as_str(),
@@ -1041,13 +1066,9 @@ fn update_job_inner(
             anyhow::bail!("Cron job '{job_id}' not found");
         }
         tx.commit().context("Failed to commit cron job update")?;
-        Ok(())
-    })?;
-    if written.is_none() {
-        return Err(job_not_found(job_id));
-    }
-
-    get_job(config, job_id)
+        resolve_declarative_shell_output_format(config, &mut job);
+        Ok(job)
+    })
 }
 
 pub fn record_last_run(
@@ -2583,6 +2604,18 @@ const MIGRATION_CONTENTION_CONTEXT: &str = concat!(
 /// transaction's read-to-write upgrade, which SQLite fails immediately
 /// without consulting the busy handler.
 fn begin_immediate<'c>(conn: &'c Connection, phase: &str) -> Result<Transaction<'c>> {
+    #[cfg(test)]
+    if phase == "job patch" && PATCH_WRITER_WAIT.with(|sender| sender.borrow().is_some()) {
+        conn.busy_handler(Some(|attempt| {
+            PATCH_WRITER_WAIT.with(|sender| {
+                if let Some(sender) = sender.borrow_mut().take() {
+                    let _ = sender.send(());
+                }
+            });
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            attempt < 500
+        }))?;
+    }
     Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .with_context(|| format!("Failed to begin cron {phase} transaction"))
 }

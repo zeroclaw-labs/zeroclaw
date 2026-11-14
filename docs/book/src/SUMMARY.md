@@ -126,6 +126,7 @@
 - [Security & Autonomy](./security/overview.md)
   - [The security model](./security/model.md)
   - [Authentication & principals](./security/authentication.md)
+    - [Identity providers](./security/identity-providers.md)
   - [Autonomy levels](./security/autonomy.md)
   - [Sandboxing](./security/sandboxing.md)
   - [Tool receipts](./security/tool-receipts.md)
