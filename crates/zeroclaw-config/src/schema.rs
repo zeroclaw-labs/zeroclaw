@@ -4453,16 +4453,15 @@ impl Default for AliasedAgentConfig {
 }
 
 impl AliasedAgentConfig {
-    /// True when this agent has the bindings required to dispatch a turn:
-    /// enabled, non-empty `model_provider`, `risk_profile`, and
-    /// `runtime_profile`. `Config::validate()` emits the per-field errors
-    /// that, when all passed, mean this returns `true`.
+    /// True when this agent can take a turn: enabled, with a non-empty
+    /// `model_provider` and `risk_profile`. A `runtime_profile` is optional;
+    /// a turn without one runs on the global runtime defaults, and
+    /// `Config::validate()` accepts an enabled agent that omits one.
     #[must_use]
     pub fn is_dispatchable(&self) -> bool {
         self.enabled
             && !self.model_provider.trim().is_empty()
             && !self.risk_profile.trim().is_empty()
-            && !self.runtime_profile.trim().is_empty()
     }
 }
 
@@ -55102,6 +55101,36 @@ model_provider = \"ollama.default\"
             ..Default::default()
         };
         assert!(agent.is_dispatchable());
+    }
+
+    #[test]
+    async fn an_enabled_agent_without_a_runtime_profile_is_dispatchable() {
+        let agent = AliasedAgentConfig {
+            enabled: true,
+            risk_profile: "default".into(),
+            runtime_profile: Default::default(),
+            model_provider: "gpt4".into(),
+            ..Default::default()
+        };
+        assert!(agent.is_dispatchable());
+    }
+
+    #[test]
+    async fn a_disabled_agent_or_one_missing_risk_profile_is_not_dispatchable() {
+        let disabled = AliasedAgentConfig {
+            enabled: false,
+            risk_profile: "default".into(),
+            model_provider: "gpt4".into(),
+            ..Default::default()
+        };
+        assert!(!disabled.is_dispatchable());
+        let no_risk = AliasedAgentConfig {
+            enabled: true,
+            risk_profile: "   ".into(),
+            model_provider: "gpt4".into(),
+            ..Default::default()
+        };
+        assert!(!no_risk.is_dispatchable());
     }
 
     fn effort_routing_config() -> super::Config {
