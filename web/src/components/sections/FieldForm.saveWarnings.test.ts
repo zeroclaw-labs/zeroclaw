@@ -53,6 +53,7 @@ test("config saves and toggles retain warnings only for the relevant result", as
     "browser.timeout_ms": "5000",
   };
   let mode: "warning" | "none" | "error" = "warning";
+  let failNextReload = false;
   const previousFetch = globalThis.fetch;
   globalThis.fetch = async (input, init) => {
     const url = String(input);
@@ -61,6 +62,10 @@ test("config saves and toggles retain warnings only for the relevant result", as
       return Response.json({ sections: [{ key: "browser", label: "Browser" }] });
     }
     if (url === "/api/config/list?prefix=browser") {
+      if (failNextReload) {
+        failNextReload = false;
+        return Response.json({ code: "reload_failed", message: "fixture reload failed" }, { status: 500 });
+      }
       return Response.json({
         entries: Object.entries(values).map(([path, value]) => ({
           path, value, populated: true, is_secret: false,
@@ -148,6 +153,11 @@ test("config saves and toggles retain warnings only for the relevant result", as
       /nodes\.mdns\.peer_ttl_secs.*fixture retained diagnostic/,
     );
     assert.equal(form.querySelector('[role="status"]')?.getAttribute("aria-live"), "polite");
+    await edit("6500");
+    failNextReload = true;
+    await click(form, "Save");
+    assert.match(form.textContent ?? "", /fixture reload failed/);
+    assert.match(form.querySelector('[role="status"]')?.textContent ?? "", /fixture retained diagnostic/);
     mode = "none";
     await edit("7000");
     await click(form, "Save");

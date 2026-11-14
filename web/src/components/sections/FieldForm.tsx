@@ -1692,7 +1692,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
                 {saving ? t("fieldform.saving") : t("common.save")}
               </Button>
             </div>
-            {!topError && <ConfigSaveWarnings warnings={saveWarnings} />}
+            <ConfigSaveWarnings warnings={saveWarnings} />
           </div>
         )}
       </div>
