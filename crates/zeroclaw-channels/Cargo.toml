@@ -94,7 +94,7 @@ reqwest = { version = "0.12", default-features = false, features = [
   "rustls-tls-webpki-roots-no-provider",
   "stream",
 ] }
-rusqlite = { version = "0.40", optional = true, features = ["bundled", "fallible_uint"] }
+rusqlite = { version = "0.41", optional = true, features = ["bundled", "fallible_uint"] }
 rustls = { version = "0.23", default-features = false, features = [
   "logging",
   "ring",
@@ -316,7 +316,7 @@ matrix-sdk = { version = "0.19", default-features = false, features = [
 matrix-sdk-base = { version = "0.19", default-features = false, features = ["e2e-encryption"] }
 matrix-sdk-test = "0.19"
 rcgen = "0.13"
-rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
+rusqlite = { version = "0.41", features = ["bundled", "fallible_uint"] }
 tempfile = "3.26"
 toml = "1.0"
 wiremock = "0.6"

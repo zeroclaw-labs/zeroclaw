@@ -75,7 +75,7 @@ hex = "0.4"
 zeroize.workspace = true
 
 # Database (session queue)
-rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
+rusqlite = { version = "0.41", features = ["bundled", "fallible_uint"] }
 
 # Misc
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
