@@ -10,7 +10,14 @@ use zeroclaw_providers::ChatMessage;
 /// the model feedback on its own output (see the malformed-protocol retry in
 /// `turn/mod.rs`). They are user-role only because no `tool_call_id` exists to
 /// attach them to, and they belong to the turn they interrupt.
-pub(crate) const RUNTIME_FEEDBACK_PREFIXES: &[&str] = &["[Tool call parse error]"];
+pub(crate) const RUNTIME_FEEDBACK_PREFIXES: &[&str] =
+    &[TOOL_CALL_PARSE_ERROR_PREFIX, TOOL_CALL_NOT_EXECUTED_PREFIX];
+
+/// Feedback for a withheld reply whose payload could not be read as a call.
+pub(crate) const TOOL_CALL_PARSE_ERROR_PREFIX: &str = "[Tool call parse error]";
+
+/// Feedback for a withheld reply that wrote a known tool's call as text.
+pub(crate) const TOOL_CALL_NOT_EXECUTED_PREFIX: &str = "[Tool call not executed]";
 
 /// Prefix of the prompt a live SOP step appends to the caller's history
 /// (`format_step_context` in the SOP engine). A step runs inside the caller's
@@ -2002,8 +2009,8 @@ mod collapse_tests {
     #[test]
     fn runtime_feedback_rows_do_not_split_the_running_turn() {
         // The running turn already holds a tool round when the loop appends
-        // its own feedback row (twice, the retry budget). With the smallest
-        // window the model must still see that round.
+        // its own feedback row (twice, the retry budget, one of each kind).
+        // With the smallest window the model must still see that round.
         let mut h = native_turn(1);
         h.extend(native_turn(2));
         h.pop();
@@ -2011,7 +2018,7 @@ mod collapse_tests {
             "[Tool call parse error]\nYour previous response looked like...",
         ));
         h.push(user(
-            "[Tool call parse error]\nYour previous response looked like...",
+            "[Tool call not executed]\nYour previous response was withheld...",
         ));
         let c = collapse_tool_context_older_than(&h, 0, false, &known());
         assert_eq!(c.collapsed_turns, 1, "only the prior turn collapses");
