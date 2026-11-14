@@ -6,6 +6,15 @@
 use super::spec::{self, Selection};
 use std::path::Path;
 
+/// A per-tag override of the `release` cargo profile's LTO mode and codegen-unit
+/// count. Emitted into the tag table only when set, so a tag that keeps the
+/// defaults carries no override and the Dockerfile's fat-LTO defaults apply.
+#[derive(Clone, Copy)]
+struct ReleaseProfile {
+    lto: &'static str,
+    codegen_units: u8,
+}
+
 /// A published image tag bound to a selection and the dockerfile that builds it.
 struct TagSpec {
     stem: &'static str,
@@ -16,6 +25,10 @@ struct TagSpec {
     /// image without emulating the Rust build under QEMU; `Containerfile` is
     /// amd64-only until the same cross-build support lands there.
     platforms: &'static str,
+    /// Release-profile override for tags whose default build does not fit the
+    /// runner. `None` keeps the Dockerfile defaults, which reproduce the
+    /// committed `[profile.release]` exactly.
+    release: Option<ReleaseProfile>,
 }
 
 const MULTI_ARCH: &str = "linux/amd64,linux/arm64";
@@ -30,24 +43,43 @@ fn tag_specs() -> Vec<TagSpec> {
             selection: Selection::Minimal,
             dockerfile: "Dockerfile",
             platforms: MULTI_ARCH,
+            release: None,
         },
         TagSpec {
             stem: "default-features",
             selection: Selection::Full,
             dockerfile: "Dockerfile",
             platforms: MULTI_ARCH,
+            release: None,
         },
         TagSpec {
             stem: "dist",
             selection: Selection::Dist,
             dockerfile: "Dockerfile",
             platforms: MULTI_ARCH,
+            release: None,
+        },
+        // Broad channel set: `dist` plus the full channel aggregate, for
+        // deployments whose channel is outside the lean standard distribution.
+        // Multi-arch through `Dockerfile`; the kitchen sink stays `all-features`.
+        // Fat LTO is SIGKILLed while linking arm64 under the runner's 16 GB, so
+        // this tag builds with thin LTO instead (same codegen-units).
+        TagSpec {
+            stem: "dist-broad",
+            selection: Selection::DistBroad,
+            dockerfile: "Dockerfile",
+            platforms: MULTI_ARCH,
+            release: Some(ReleaseProfile {
+                lto: "thin",
+                codegen_units: 1,
+            }),
         },
         TagSpec {
             stem: "all-features",
             selection: Selection::All,
             dockerfile: "Containerfile",
             platforms: AMD64_ONLY,
+            release: None,
         },
     ]
 }
@@ -71,7 +103,14 @@ pub fn render(root: &Path) -> anyhow::Result<String> {
         out.push_str(&format!("dockerfile = \"{}\"\n", ts.dockerfile));
         out.push_str(&format!("platforms = \"{}\"\n", ts.platforms));
         out.push_str(&format!("flags = \"{flags}\"\n"));
-        out.push_str(&format!("features = \"{features}\"\n\n"));
+        out.push_str(&format!("features = \"{features}\"\n"));
+        // Emitted only for tags that override the release profile; the publish
+        // workflow maps these to the Dockerfile's release-profile build args.
+        if let Some(rel) = ts.release {
+            out.push_str(&format!("lto = \"{}\"\n", rel.lto));
+            out.push_str(&format!("codegen_units = {}\n", rel.codegen_units));
+        }
+        out.push('\n');
     }
     while out.ends_with('\n') {
         out.pop();
@@ -219,5 +258,71 @@ mod tests {
             );
         }
         assert!(all["features"].as_str().unwrap().contains("hardware"));
+    }
+
+    #[test]
+    fn broad_tag_flags_match_the_dist_broad_selection() {
+        let s = render(&root()).unwrap();
+        let v: toml::Value = toml::from_str(&s).unwrap();
+        let tags = v["tags"].as_array().unwrap();
+        let broad = tags
+            .iter()
+            .find(|t| t["stem"].as_str() == Some("dist-broad"))
+            .unwrap();
+        // The publish workflow builds from `flags`, so compare the whole flag
+        // string against the selection, not `features` (human-readable only):
+        // a substring match on `features` would let `channel-wecom-ws` hide a
+        // missing `channel-wecom`.
+        assert_eq!(
+            broad["flags"].as_str().unwrap(),
+            spec::resolve_flags(&root(), &Selection::DistBroad).unwrap(),
+        );
+        // dist-broad is the one tag whose default build does not fit the arm64
+        // runner, so it is the one tag that overrides the release profile.
+        assert_eq!(broad["lto"].as_str(), Some("thin"));
+        assert_eq!(broad["codegen_units"].as_integer(), Some(1));
+        for t in tags {
+            let stem = t["stem"].as_str().unwrap();
+            if stem == "dist-broad" {
+                continue;
+            }
+            assert!(
+                t.get("lto").is_none() && t.get("codegen_units").is_none(),
+                "{stem} must build with the default release profile, not an override"
+            );
+        }
+    }
+
+    // The override is only useful if the whole chain carries it: the Dockerfile
+    // exposes the build args, and the publish workflow feeds the matrix values
+    // into them.
+    #[test]
+    fn release_override_is_plumbed_from_dockerfile_to_workflow() {
+        let dockerfile = std::fs::read_to_string(root().join("Dockerfile")).unwrap();
+        assert!(
+            dockerfile.contains("ARG ZEROCLAW_RELEASE_LTO=\"fat\"")
+                && dockerfile.contains("ARG ZEROCLAW_RELEASE_CODEGEN_UNITS=\"1\""),
+            "the Dockerfile must default to the committed fat/codegen-units=1 profile"
+        );
+        assert!(
+            dockerfile.contains("CARGO_PROFILE_RELEASE_LTO=${ZEROCLAW_RELEASE_LTO}")
+                && dockerfile.contains(
+                    "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${ZEROCLAW_RELEASE_CODEGEN_UNITS}"
+                ),
+            "the Dockerfile must map the build args onto the cargo profile env vars"
+        );
+
+        let wf =
+            std::fs::read_to_string(root().join(".github/workflows/docker-publish.yml")).unwrap();
+        let (_, publish) = wf
+            .split_once("Build and push pinned + floating tags")
+            .expect("the main build-push step must exist");
+        let publish = publish.split("\n      - name:").next().unwrap_or(publish);
+        assert!(
+            publish.contains("format('ZEROCLAW_RELEASE_LTO={0}', matrix.lto)")
+                && publish
+                    .contains("format('ZEROCLAW_RELEASE_CODEGEN_UNITS={0}', matrix.codegen_units)"),
+            "the publish step must pass the matrix release override as build args"
+        );
     }
 }
