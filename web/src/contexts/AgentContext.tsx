@@ -3,6 +3,7 @@ import type {
   ApprovalDecision,
   PendingApproval,
   SessionMessagesResponse,
+  SessionStateResponse,
   WsMessage,
 } from '@/types/api';
 import {
@@ -26,6 +27,7 @@ import {
   listProps,
   getStatus,
   getSessionMessages,
+  getSessionState,
   abortSession,
   deleteSession,
   renameSession,
@@ -248,6 +250,8 @@ export interface AgentSessionRuntime {
     autoReconnect?: boolean;
   }): SessionSocket;
   getMessages(sessionId: string): Promise<SessionMessagesResponse>;
+  /** Whether the session's turn is still running on the gateway. */
+  getState(sessionId: string, signal?: AbortSignal): Promise<SessionStateResponse>;
   delete(sessionId: string): Promise<{ deleted: boolean }>;
   rename(sessionId: string, name: string): Promise<{ session_id: string; name: string }>;
   mintId(): string;
@@ -256,10 +260,37 @@ export interface AgentSessionRuntime {
 const defaultSessionRuntime: AgentSessionRuntime = {
   createSocket: (options) => new WebSocketClient(options),
   getMessages: getSessionMessages,
+  getState: getSessionState,
   delete: deleteSession,
   rename: renameSession,
   mintId: newSessionId,
 };
+
+/** How often a page that shows a turn running on the gateway, but not on its
+ * own socket, asks whether that turn has ended. */
+export const DETACHED_TURN_POLL_MS = 2_000;
+
+/** How long one such check may take. A check without an answer by then reads
+ * as "not running", like a failed one, so a stuck request cannot keep the page
+ * waiting on it. */
+export const STATE_CHECK_TIMEOUT_MS = 10_000;
+
+/** Resolves after `ms`, or as soon as `signal` aborts. */
+function delay(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    const done = () => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal.addEventListener('abort', done, { once: true });
+  });
+}
 
 /** Shared empty array so panes with no siblings keep a stable context value. */
 const NO_RESERVED_SESSIONS: readonly string[] = [];
@@ -321,6 +352,18 @@ export function AgentProvider({
   // again: the turn may have finished on the server while no socket listened.
   const [transcriptVersion, setTranscriptVersion] = useState(0);
   const resyncOnOpenRef = useRef(false);
+  // Set while the page shows a turn that runs on the gateway but streams to
+  // no socket of this page (its socket closed mid-turn, or the page loaded
+  // while it ran). Aborting it ends the watch without a reload: the next
+  // hydration, a conversation switch or clear, a model switch, unmount and
+  // the close of the socket do that (the reopen reloads and asks again).
+  const detachedTurnWatchRef = useRef<AbortController | null>(null);
+  // Set while a hydration may still start such a watch: from its first state
+  // check until it has loaded the transcript. A clear or model switch in that
+  // window aborts it, so a late `running` answer cannot start a watch the
+  // page no longer wants. Kept apart from `detachedTurnWatchRef` because a
+  // conversation switch leaves only a watched turn running.
+  const pendingTurnCheckRef = useRef<AbortController | null>(null);
   // The last definite answer on whether the gateway stores transcripts.
   // `sessionPersistence` is null again while each reload is in flight, and a
   // `session_start` arriving then still needs to know.
@@ -403,9 +446,42 @@ export function AgentProvider({
     setSessionPersistence(null);
     setHydratedSessionId(null);
     hydrationFailedRef.current = null;
+    const watch = new AbortController();
+    // Whether the gateway is still running this conversation's turn. Any
+    // failure, including the 404 of a gateway without session persistence,
+    // reads as no: the page then keeps its single transcript load. So does a
+    // check without an answer by its deadline, or one the watch ends: each
+    // check is cancelled and stops being awaited, whatever its request does.
+    const turnStillRunning = async (): Promise<boolean> => {
+      if (watch.signal.aborted) return false;
+      const check = new AbortController();
+      const end = () => check.abort();
+      const deadline = setTimeout(end, STATE_CHECK_TIMEOUT_MS);
+      watch.signal.addEventListener('abort', end);
+      try {
+        const ended = new Promise<never>((_, reject) => {
+          check.signal.addEventListener('abort', () => reject(new Error('state check ended')));
+        });
+        const res = await Promise.race([sessionRuntime.getState(sid, check.signal), ended]);
+        return res.state === 'running';
+      } catch {
+        return false;
+      } finally {
+        clearTimeout(deadline);
+        watch.signal.removeEventListener('abort', end);
+      }
+    };
 
     (async () => {
+      let watching = false;
+      pendingTurnCheckRef.current = watch;
       try {
+        // Ask before loading the transcript. The gateway stores a turn before
+        // it leaves `running`, so a turn that ends after this answer is either
+        // in the transcript or caught by the watch; asked afterwards, a turn
+        // ending between the two reads would leave its answer unloaded.
+        const runningBeforeLoad = await turnStillRunning();
+        if (cancelled) return;
         const res = await sessionRuntime.getMessages(sid);
         if (cancelled) return;
         serverKeepsTranscriptsRef.current = res.session_persistence;
@@ -421,6 +497,16 @@ export function AgentProvider({
             // snapshot that predates the prompt this browser already showed.
             // Keep that uncommitted tail instead of replacing it.
             setMessages([...hydrated, ...uncommittedLocalTail(snapshotUsers, browserCopy)]);
+          }
+          // A turn running on the gateway may not be in this snapshot, and its
+          // answer will not reach this page's socket. Show it as running before
+          // the composer unlocks, instead of offering to send into it, unless
+          // a clear or model switch has ended the watch since.
+          if (runningBeforeLoad && !watch.signal.aborted && !typingRef.current) {
+            watching = true;
+            detachedTurnWatchRef.current = watch;
+            typingRef.current = true;
+            setTyping(true);
           }
         } else if (!res.session_persistence) {
           setMessages((prev) => {
@@ -446,12 +532,31 @@ export function AgentProvider({
           }
         }
       } finally {
+        if (pendingTurnCheckRef.current === watch) pendingTurnCheckRef.current = null;
         if (!cancelled) setHydratedSessionId(sid);
       }
+
+      if (!watching) return;
+      // Ask until the turn leaves `running`. The watch ends without a reload
+      // when it is aborted: by the next hydration, a conversation switch or
+      // clear, unmount, or a close of the socket (whose reopen reloads).
+      do {
+        await delay(DETACHED_TURN_POLL_MS, watch.signal);
+        // A check once the watch has ended answers no, without a request.
+      } while (await turnStillRunning());
+      // Aborted while the last check was out: whatever it said is not ours.
+      if (watch.signal.aborted) return;
+      // The gateway leaves `running` only after it has stored the turn, so
+      // this load has the answer.
+      detachedTurnWatchRef.current = null;
+      typingRef.current = false;
+      setTyping(false);
+      setTranscriptVersion((v) => v + 1);
     })();
 
     return () => {
       cancelled = true;
+      watch.abort();
     };
   }, [sessionId, sessionRuntime, transcriptVersion, perSocket]);
 
@@ -897,6 +1002,10 @@ export function AgentProvider({
         setStreamingContent('');
         setStreamingThinking('');
         foldTurnStream({ type: 'reset' });
+        // A turn this page was watching on the gateway: the reopen below
+        // reloads and asks again.
+        detachedTurnWatchRef.current?.abort();
+        detachedTurnWatchRef.current = null;
         // A socket that is one conversation reopens onto a new one: there is
         // nothing to catch up on.
         if (!perSocket) resyncOnOpenRef.current = true;
@@ -1245,6 +1354,10 @@ export function AgentProvider({
       setStreamingThinking('');
       setTyping(false);
       typingRef.current = false;
+      detachedTurnWatchRef.current?.abort();
+      detachedTurnWatchRef.current = null;
+      pendingTurnCheckRef.current?.abort();
+      pendingTurnCheckRef.current = null;
       // The old socket's request_id no longer maps to anything on the server
       // after we tear it down. Clear here explicitly because we null out the
       // old socket's callbacks below, so its onClose will not fire to do it.
@@ -1313,6 +1426,10 @@ export function AgentProvider({
    */
   const resetTranscriptState = useCallback(() => {
     localMessageMutationVersionRef.current += 1;
+    detachedTurnWatchRef.current?.abort();
+    detachedTurnWatchRef.current = null;
+    pendingTurnCheckRef.current?.abort();
+    pendingTurnCheckRef.current = null;
     setMessages([]);
     foldTurnStream({ type: 'reset' });
     setStreamingContent('');
@@ -1437,7 +1554,10 @@ export function AgentProvider({
     // conversation no longer exists, so staying put is not a valid fallback.
     if (!force && sessionPersistenceRef.current !== true) return false;
 
-    if (typingRef.current) {
+    // A turn streaming on this page's socket is aborted. A detached turn the
+    // page only watches was never this page's to stop: it kept running when
+    // its socket went, and keeps running when the page moves on.
+    if (typingRef.current && !detachedTurnWatchRef.current) {
       void abortSession(currentSessionId).catch(() => {
         // Best-effort: never block the switch on a failed abort.
       });
