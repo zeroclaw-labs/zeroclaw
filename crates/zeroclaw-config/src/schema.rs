@@ -7971,6 +7971,11 @@ pub struct GatewayConfig {
     #[serde(default = "default_gateway_websocket_ping_interval_secs")]
     pub websocket_ping_interval_secs: u64,
 
+    /// Global browser dictation silence timeout in seconds. 0 disables automatic sending.
+    /// Applies to every paired device; accepted range: 0..=300. Default: 15.
+    #[serde(default = "default_voice_silence_timeout_secs")]
+    pub voice_silence_timeout_secs: u64,
+
     /// Pairing-code generation policy (`[gateway.pairing_code]`). The one
     /// source of truth for the length and character family of every code
     /// the gateway issues.
@@ -8041,6 +8046,10 @@ fn default_gateway_long_running_request_timeout_secs() -> u64 {
     600
 }
 
+fn default_voice_silence_timeout_secs() -> u64 {
+    15
+}
+
 fn default_gateway_websocket_ping_interval_secs() -> u64 {
     30
 }
@@ -8105,6 +8114,7 @@ impl Default for GatewayConfig {
             session_persistence: true,
             session_ttl_hours: 0,
             websocket_ping_interval_secs: default_gateway_websocket_ping_interval_secs(),
+            voice_silence_timeout_secs: default_voice_silence_timeout_secs(),
             pairing_code: PairingCodePolicy::default(),
             pairing_dashboard: PairingDashboardConfig::default(),
             dashboard_sign_in: DashboardSignInConfig::default(),
@@ -24691,6 +24701,10 @@ impl Config {
             }
         }
 
+        if self.gateway.voice_silence_timeout_secs > 300 {
+            let path = "gateway.voice_silence_timeout_secs";
+            validation_bail!(InvalidNumericRange, path, "{path} must be 0..=300");
+        }
         let websocket_ping_interval_secs = self.gateway.websocket_ping_interval_secs;
         if websocket_ping_interval_secs > GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS {
             let path = "gateway.websocket_ping_interval_secs";
@@ -32990,6 +33004,18 @@ enabled = true
     }
 
     #[test]
+    async fn validate_global_voice_silence_timeout_bounds() {
+        let mut config = Config::default();
+        assert_eq!(config.gateway.voice_silence_timeout_secs, 15);
+        for seconds in [0, 1, 15, 300] {
+            config.gateway.voice_silence_timeout_secs = seconds;
+            config.validate().expect("valid voice timeout");
+        }
+        config.gateway.voice_silence_timeout_secs = 301;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     async fn validate_rejects_websocket_ping_interval_above_upper_bound() {
         let mut config = Config::default();
         config.gateway.websocket_ping_interval_secs = GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS + 1;
@@ -38151,6 +38177,7 @@ allowed_numbers = ["+1", "+2"]
             session_persistence: true,
             session_ttl_hours: 0,
             websocket_ping_interval_secs: 30,
+            voice_silence_timeout_secs: 15,
             pairing_code: PairingCodePolicy::default(),
             pairing_dashboard: PairingDashboardConfig::default(),
             dashboard_sign_in: DashboardSignInConfig::default(),

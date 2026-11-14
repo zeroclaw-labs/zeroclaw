@@ -57,6 +57,8 @@ import {
 } from '@/lib/chatHistoryStorage';
 
 export interface ChatMessage {
+  /** Materialized from persisted history; not a newly completed live reply. */
+  fromHistory?: boolean;
   id: string;
   role: 'user' | 'agent';
   content: string;

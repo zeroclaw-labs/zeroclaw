@@ -98,3 +98,53 @@ and `structuredClone()`.
 - Edge 111+
 - Firefox 113+
 - Safari 16.2+
+
+## Browser voice controls
+
+Paired browsers can open **Config → Voice and audio** to enable microphone and
+speaker controls in chat. Preferences live in the gateway's `devices.db`, on the
+existing paired-device record, and survive page reloads and gateway restarts.
+`GET` and `PUT /api/devices/me/voice` resolve that record from the authenticated
+paired bearer token; the own-device route cannot choose a different device ID. The device selector
+uses `GET/PUT /api/devices/{id}/voice` under the same operator authorization as
+listing/revoking devices. The selected record is distinct from the calling
+browser: chat controls always load their own paired record. Revoking
+or rotating a device removes its preferences along with the existing device
+record. Cookie-only OIDC sessions and unpaired access do not have a paired-device
+identity and cannot use the own-device preference API. Administrator sessions
+may manage registered devices through the operator routes; non-administrators
+are refused. The selector shows each record’s saved voice; choosing/sampling
+available OS voices is performed in that device’s own browser.
+
+Dictation defaults to on-device recognition. It requires HTTPS (or localhost),
+a compatible browser, microphone permission, and an available language pack.
+Downloading a pack requires an explicit action. An unavailable local recognizer
+never silently falls back to a network service. Users can explicitly choose the
+browser-service mode, which may send microphone audio to the browser provider.
+The gateway does not receive microphone audio; final transcriptions enter the
+message draft. By default, 15 seconds of silence after recognized speech sends
+that draft automatically. The shared timeout is adjustable in Browser voice and
+audio settings; set it to `0` for manual-only sending. Click the microphone again
+to stop dictation and review the draft, or use Send to submit it manually.
+Stopping dictation manually cancels its pending automatic send. Empty capture is
+never submitted, and hiding or leaving the conversation cancels capture.
+
+Reading uses a voice reported by the browser. The selector identifies local and
+online voices; availability can change with the OS or browser. No particular
+voice or gender is guaranteed. Click the speaker to read the latest assistant
+reply or stop active reading. Hold it to enable continuous reading; click again
+to disable it. Shift+Enter on the focused speaker toggles continuous reading.
+This chat-scoped override does not alter the saved automatic-reading default.
+Automatic reading excludes historical hydration, tool output, and reasoning.
+Capture and playback stop when their chat closes, changes session, or becomes
+hidden. Permissions Policy allows microphone and on-device speech recognition
+only for the gateway origin; user microphone consent remains required.
+
+History materialized into chat bubbles is marked at the hydration boundary, so
+reconnection cannot make regenerated message IDs look like new live answers.
+Returning to a browser tab/window reloads voice preferences from the gateway;
+controls remain inactive until that read succeeds. Other tabs also receive an
+invalidation-only BroadcastChannel notification and fetch their own record.
+No browser preference store
+or cross-tab copy becomes an additional source of truth. Device-registry schema
+and I/O failures are returned to gateway startup with context instead of panicking.

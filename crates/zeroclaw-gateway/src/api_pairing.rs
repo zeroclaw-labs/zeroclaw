@@ -32,6 +32,21 @@ pub struct DeviceInfo {
     pub capabilities: Option<Vec<String>>,
 }
 
+#[derive(Clone, Copy)]
+enum VoiceDeviceKey<'a> {
+    TokenHash(&'a str),
+    DeviceId(&'a str),
+}
+
+impl<'a> VoiceDeviceKey<'a> {
+    fn column_and_value(self) -> (&'static str, &'a str) {
+        match self {
+            Self::TokenHash(value) => ("token_hash", value),
+            Self::DeviceId(value) => ("id", value),
+        }
+    }
+}
+
 /// Registry of paired devices backed by SQLite.
 #[derive(Debug)]
 pub struct DeviceRegistry {
@@ -40,9 +55,9 @@ pub struct DeviceRegistry {
 }
 
 impl DeviceRegistry {
-    pub fn new(workspace_dir: &Path) -> Self {
+    pub fn new(workspace_dir: &Path) -> Result<Self, rusqlite::Error> {
         let db_path = workspace_dir.join("devices.db");
-        let conn = Connection::open(&db_path).expect("Failed to open device registry database");
+        let conn = Connection::open(&db_path)?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
@@ -57,59 +72,65 @@ impl DeviceRegistry {
                 ip_address TEXT,
                 capabilities TEXT
             )",
-        )
-        .expect("Failed to create devices table");
+        )?;
 
-        // Additive migration for DBs created before the capabilities column existed.
-        // SQLite has no IF NOT EXISTS for columns; the duplicate-column error here is benign.
-        let _ = conn.execute("ALTER TABLE devices ADD COLUMN capabilities TEXT", []);
+        // Additive migrations are checked explicitly; I/O/schema failures return
+        // to gateway startup rather than panicking or being treated as duplicates.
+        let columns = conn
+            .prepare("PRAGMA table_info(devices)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for column in ["capabilities", "voice_preferences"] {
+            if !columns.iter().any(|name| name == column) {
+                conn.execute(&format!("ALTER TABLE devices ADD COLUMN {column} TEXT"), [])?;
+            }
+        }
 
         // Warm the in-memory cache from DB
         let mut cache = HashMap::new();
         let mut stmt = conn
             .prepare("SELECT token_hash, id, name, device_type, paired_at, last_seen, ip_address, capabilities FROM devices")
-            .expect("Failed to prepare device select");
-        let rows = stmt
-            .query_map([], |row| {
-                let token_hash: String = row.get(0)?;
-                let id: String = row.get(1)?;
-                let name: Option<String> = row.get(2)?;
-                let device_type: Option<String> = row.get(3)?;
-                let paired_at_str: String = row.get(4)?;
-                let last_seen_str: String = row.get(5)?;
-                let ip_address: Option<String> = row.get(6)?;
-                let capabilities_json: Option<String> = row.get(7)?;
-                let paired_at = DateTime::parse_from_rfc3339(&paired_at_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now());
-                let last_seen = DateTime::parse_from_rfc3339(&last_seen_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now());
-                let capabilities = capabilities_json
-                    .as_deref()
-                    .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok());
-                Ok((
-                    token_hash,
-                    DeviceInfo {
-                        id,
-                        name,
-                        device_type,
-                        paired_at,
-                        last_seen,
-                        ip_address,
-                        capabilities,
-                    },
-                ))
-            })
-            .expect("Failed to query devices");
-        for (hash, info) in rows.flatten() {
+            ?;
+        let rows = stmt.query_map([], |row| {
+            let token_hash: String = row.get(0)?;
+            let id: String = row.get(1)?;
+            let name: Option<String> = row.get(2)?;
+            let device_type: Option<String> = row.get(3)?;
+            let paired_at_str: String = row.get(4)?;
+            let last_seen_str: String = row.get(5)?;
+            let ip_address: Option<String> = row.get(6)?;
+            let capabilities_json: Option<String> = row.get(7)?;
+            let paired_at = DateTime::parse_from_rfc3339(&paired_at_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+            let last_seen = DateTime::parse_from_rfc3339(&last_seen_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+            let capabilities = capabilities_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok());
+            Ok((
+                token_hash,
+                DeviceInfo {
+                    id,
+                    name,
+                    device_type,
+                    paired_at,
+                    last_seen,
+                    ip_address,
+                    capabilities,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (hash, info) = row?;
             cache.insert(hash, info);
         }
 
-        Self {
+        Ok(Self {
             cache: Mutex::new(cache),
             db_path,
-        }
+        })
     }
 
     #[cfg(test)]
@@ -128,6 +149,52 @@ impl DeviceRegistry {
              PRAGMA temp_store = MEMORY;",
         )?;
         Ok(conn)
+    }
+
+    fn voice_preferences(
+        &self,
+        key: VoiceDeviceKey<'_>,
+    ) -> anyhow::Result<Option<DeviceVoicePreferences>> {
+        use rusqlite::OptionalExtension;
+        let (column, value) = key.column_and_value();
+        let conn = self.open_db()?;
+        let row: Option<(String, Option<String>)> = conn
+            .query_row(
+                &format!("SELECT id, voice_preferences FROM devices WHERE {column} = ?1"),
+                [value],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        row.map(|(device_id, json)| {
+            Ok(DeviceVoicePreferences {
+                device_id,
+                preferences: match json {
+                    Some(json) => serde_json::from_str(&json)?,
+                    None => VoicePreferences::default(),
+                },
+            })
+        })
+        .transpose()
+    }
+
+    fn save_voice_preferences_authorized<R>(
+        &self,
+        key: VoiceDeviceKey<'_>,
+        preferences: &VoicePreferences,
+        authorize: impl FnOnce() -> Result<(), R>,
+    ) -> anyhow::Result<Result<bool, R>> {
+        let (column, value) = key.column_and_value();
+        let mut conn = self.open_db()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Err(refusal) = authorize() {
+            return Ok(Err(refusal));
+        }
+        let updated = tx.execute(
+            &format!("UPDATE devices SET voice_preferences = ?1 WHERE {column} = ?2"),
+            rusqlite::params![serde_json::to_string(preferences)?, value],
+        )? == 1;
+        tx.commit()?;
+        Ok(Ok(updated))
     }
 
     pub fn register(&self, token_hash: String, info: DeviceInfo) -> Result<(), rusqlite::Error> {
@@ -513,9 +580,20 @@ pub async fn list_devices(State(state): State<AppState>, headers: HeaderMap) -> 
         None => Vec::new(),
     };
 
+    let current_device_id = extract_bearer_token(&headers).and_then(|token| {
+        let hash = super::PairingGuard::token_hash(token);
+        state
+            .device_registry
+            .as_ref()?
+            .cache
+            .lock()
+            .get(&hash)
+            .map(|device| device.id.clone())
+    });
     let count = devices.len();
     Json(serde_json::json!({
         "devices": devices,
+        "current_device_id": current_device_id,
         "count": count
     }))
     .into_response()
@@ -785,6 +863,316 @@ pub async fn rotate_token(
     }
 }
 
+/// Voice choices belong to an authenticated paired device, never global agent configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct VoicePreferences {
+    pub dictation: bool,
+    pub reading: bool,
+    pub automatic: bool,
+    pub language: String,
+    pub recognition: RecognitionMode,
+    pub voice: String,
+    pub rate: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RecognitionMode {
+    #[default]
+    Local,
+    Browser,
+}
+
+impl Default for VoicePreferences {
+    fn default() -> Self {
+        Self {
+            dictation: false,
+            reading: false,
+            automatic: false,
+            language: "en-US".into(),
+            recognition: RecognitionMode::Local,
+            voice: String::new(),
+            rate: 1.0,
+        }
+    }
+}
+
+impl VoicePreferences {
+    fn valid(&self) -> bool {
+        let mut parts = self.language.split('-');
+        let first = parts.next().unwrap_or_default();
+        (2..=3).contains(&first.len())
+            && first.bytes().all(|b| b.is_ascii_alphabetic())
+            && self.language.len() <= 64
+            && parts.all(|part| {
+                (2..=8).contains(&part.len()) && part.bytes().all(|b| b.is_ascii_alphanumeric())
+            })
+            && self.voice.len() <= 1024
+            && self.rate.is_finite()
+            && (0.5..=2.0).contains(&self.rate)
+    }
+}
+
+#[derive(Serialize)]
+struct DeviceVoicePreferences {
+    device_id: String,
+    preferences: VoicePreferences,
+}
+
+fn device_voice_preferences(
+    state: &AppState,
+    headers: &HeaderMap,
+    preferences: Option<VoicePreferences>,
+) -> axum::response::Response {
+    let Some(token) = extract_bearer_token(headers) else {
+        return (
+            StatusCode::FORBIDDEN,
+            "Voice preferences require a paired device",
+        )
+            .into_response();
+    };
+    let hash = super::PairingGuard::token_hash(token);
+    let held = state.pairing.hold_paired_tokens();
+    if !held.contains_hash(&hash) {
+        return (
+            StatusCode::FORBIDDEN,
+            "Voice preferences require a paired device",
+        )
+            .into_response();
+    }
+    let Some(registry) = state.device_registry.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Device registry is disabled",
+        )
+            .into_response();
+    };
+    registry_voice_preferences(registry, VoiceDeviceKey::TokenHash(&hash), preferences)
+}
+
+fn registry_voice_preferences(
+    registry: &DeviceRegistry,
+    key: VoiceDeviceKey<'_>,
+    preferences: Option<VoicePreferences>,
+) -> axum::response::Response {
+    registry_voice_preferences_authorized(registry, key, preferences, || Ok(()))
+}
+
+fn registry_voice_preferences_authorized(
+    registry: &DeviceRegistry,
+    key: VoiceDeviceKey<'_>,
+    preferences: Option<VoicePreferences>,
+    authorize: impl FnOnce() -> Result<(), Box<axum::response::Response>>,
+) -> axum::response::Response {
+    if let Some(preferences) = preferences {
+        if !preferences.valid() {
+            return (StatusCode::BAD_REQUEST, "Invalid voice preferences").into_response();
+        }
+        match registry.save_voice_preferences_authorized(key, &preferences, authorize) {
+            Ok(Err(refusal)) => return *refusal,
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => {
+                return (StatusCode::NOT_FOUND, "Paired device not registered").into_response();
+            }
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                    "Failed to persist device voice preferences"
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Could not save voice preferences",
+                )
+                    .into_response();
+            }
+        }
+    }
+    match registry.voice_preferences(key) {
+        Ok(Some(preferences)) => (
+            [(axum::http::header::CACHE_CONTROL, "no-store")],
+            Json(preferences),
+        )
+            .into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "Paired device not registered").into_response(),
+        Err(error) => {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                "Failed to read device voice preferences"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not read voice preferences",
+            )
+                .into_response()
+        }
+    }
+}
+
+pub async fn get_my_voice_preferences(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    device_voice_preferences(&state, &headers, None)
+}
+
+pub async fn put_my_voice_preferences(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(preferences): Json<VoicePreferences>,
+) -> impl IntoResponse {
+    device_voice_preferences(&state, &headers, Some(preferences))
+}
+
+// Device management uses the same operator admission as list/revoke. A paired
+// bearer is held live through the effect; an administrator cookie may manage
+// registered devices without pretending to be one of them.
+fn managed_voice_preferences(
+    state: &AppState,
+    headers: &HeaderMap,
+    device_id: &str,
+    preferences: Option<VoicePreferences>,
+) -> axum::response::Response {
+    managed_voice_preferences_authorized(state, headers, device_id, preferences, || Ok(()))
+}
+
+fn managed_voice_preferences_authorized(
+    state: &AppState,
+    headers: &HeaderMap,
+    device_id: &str,
+    preferences: Option<VoicePreferences>,
+    authorize: impl FnOnce() -> Result<(), Box<axum::response::Response>>,
+) -> axum::response::Response {
+    if let Err(error) = require_auth(state, headers) {
+        return error.into_response();
+    }
+    let caller_hash = extract_bearer_token(headers).map(super::PairingGuard::token_hash);
+    let held = state.pairing.hold_paired_tokens();
+    if caller_hash
+        .as_deref()
+        .is_some_and(|hash| !held.contains_hash(hash))
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            "Paired operator credential is no longer live",
+        )
+            .into_response();
+    }
+    let Some(registry) = state.device_registry.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Device registry is disabled",
+        )
+            .into_response();
+    };
+    registry_voice_preferences_authorized(
+        registry,
+        VoiceDeviceKey::DeviceId(device_id),
+        preferences,
+        authorize,
+    )
+}
+
+async fn current_operator_voice_preferences(
+    state: &AppState,
+    headers: &HeaderMap,
+    device_id: &str,
+    preferences: Option<VoicePreferences>,
+    dashboard: Option<&DashboardAuth>,
+) -> axum::response::Response {
+    let Some(DashboardCaller::Session(mut session)) = crate::dashboard_session::current_caller()
+    else {
+        return managed_voice_preferences(state, headers, device_id, preferences);
+    };
+    if !state.pairing.require_pairing() {
+        return managed_voice_preferences(state, headers, device_id, preferences);
+    }
+    let Some(dashboard) = dashboard else {
+        return SessionRejection::Invalid.body().into_response();
+    };
+    let mut commit = match state.begin_config_commit().await {
+        Ok(commit) => commit,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Voice preferences write not admitted",
+            )
+                .into_response();
+        }
+    };
+    if dashboard
+        .operator_at_write(state, &session, &commit)
+        .is_none()
+    {
+        drop(commit);
+        session = match dashboard.recheck(state, &session).await {
+            DashboardCaller::Session(fresh) => fresh,
+            DashboardCaller::Rejected(rejection) => return rejection.body().into_response(),
+        };
+        commit = match state.begin_config_commit().await {
+            Ok(commit) => commit,
+            Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Voice preferences write not admitted",
+                )
+                    .into_response();
+            }
+        };
+    }
+    let authorize = || {
+        dashboard
+            .operator_at_write(state, &session, &commit)
+            .unwrap_or_else(|| Err(SessionRejection::Expired.body()))
+            .map_err(|denied| Box::new(denied.into_response()))
+    };
+    if let Err(refusal) = authorize() {
+        return *refusal;
+    }
+    // The callback runs again after SQLite acquires its writer. The config
+    // commit fences mapping changes until the effect finishes.
+    managed_voice_preferences_authorized(state, headers, device_id, preferences, authorize)
+}
+
+pub async fn get_device_voice_preferences(
+    State(state): State<AppState>,
+    dashboard: Option<Extension<Arc<DashboardAuth>>>,
+    headers: HeaderMap,
+    axum::extract::Path(device_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    current_operator_voice_preferences(
+        &state,
+        &headers,
+        &device_id,
+        None,
+        dashboard.as_ref().map(|Extension(auth)| auth.as_ref()),
+    )
+    .await
+}
+
+pub async fn put_device_voice_preferences(
+    State(state): State<AppState>,
+    dashboard: Option<Extension<Arc<DashboardAuth>>>,
+    headers: HeaderMap,
+    axum::extract::Path(device_id): axum::extract::Path<String>,
+    Json(preferences): Json<VoicePreferences>,
+) -> impl IntoResponse {
+    current_operator_voice_preferences(
+        &state,
+        &headers,
+        &device_id,
+        Some(preferences),
+        dashboard.as_ref().map(|Extension(auth)| auth.as_ref()),
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -796,6 +1184,191 @@ mod tests {
     use std::sync::Arc;
     use zeroclaw_config::pairing::PairingGuard;
     use zeroclaw_config::schema::Config;
+
+    #[tokio::test]
+    async fn selected_device_voice_settings_are_isolated_from_the_calling_device() {
+        let (_dir, state, a, b) = voice_state();
+        let (_, own) = response_json(device_voice_preferences(&state, &a, None)).await;
+        let (_, other) = response_json(device_voice_preferences(&state, &b, None)).await;
+        let own_id = own["device_id"].as_str().unwrap();
+        let other_id = other["device_id"].as_str().unwrap();
+        let first = VoicePreferences {
+            reading: true,
+            voice: "first-voice".into(),
+            ..Default::default()
+        };
+        let second = VoicePreferences {
+            reading: false,
+            voice: "second-voice".into(),
+            rate: 1.4,
+            ..Default::default()
+        };
+        assert_eq!(
+            managed_voice_preferences(&state, &a, own_id, Some(first.clone())).status(),
+            StatusCode::OK
+        );
+        let (status, saved) = response_json(managed_voice_preferences(
+            &state,
+            &a,
+            other_id,
+            Some(second.clone()),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(saved["device_id"], other_id);
+        let (_, still_own) = response_json(device_voice_preferences(&state, &a, None)).await;
+        let (_, from_other_browser) =
+            response_json(device_voice_preferences(&state, &b, None)).await;
+        assert_eq!(
+            still_own["preferences"],
+            serde_json::to_value(first).unwrap()
+        );
+        assert_eq!(
+            from_other_browser["preferences"],
+            serde_json::to_value(second).unwrap()
+        );
+        let (_, inventory) =
+            response_json(list_devices(State(state.clone()), a).await.into_response()).await;
+        assert_eq!(inventory["current_device_id"], own_id);
+        assert_eq!(inventory["count"], 2);
+    }
+
+    #[tokio::test]
+    async fn managing_voice_preferences_requires_operator_auth_and_an_existing_device() {
+        let (_dir, state, a, _) = voice_state();
+        let (_, own) = response_json(device_voice_preferences(&state, &a, None)).await;
+        let id = own["device_id"].as_str().unwrap();
+        assert_eq!(
+            managed_voice_preferences(&state, &HeaderMap::new(), id, None).status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            managed_voice_preferences(&state, &a, "missing-device", Some(Default::default()))
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            managed_voice_preferences(&state, &a, "' OR 1=1 --", None).status(),
+            StatusCode::NOT_FOUND
+        );
+        state
+            .pairing
+            .revoke_token_hash(&PairingGuard::token_hash("voice-test-a"));
+        assert_eq!(
+            managed_voice_preferences(&state, &a, id, Some(Default::default())).status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[test]
+    fn device_registry_startup_returns_io_and_migration_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(DeviceRegistry::new(&tmp.path().join("missing/parent")).is_err());
+        let db = Connection::open(tmp.path().join("devices.db")).unwrap();
+        db.execute_batch("CREATE TABLE devices(token_hash TEXT PRIMARY KEY, id TEXT NOT NULL, name TEXT, device_type TEXT, paired_at TEXT NOT NULL, last_seen TEXT NOT NULL, ip_address TEXT, capabilities TEXT); PRAGMA journal_mode=WAL; BEGIN IMMEDIATE;").unwrap();
+        assert!(
+            DeviceRegistry::new(tmp.path()).is_err(),
+            "a blocked schema write must return an error, not panic"
+        );
+        db.execute_batch("ROLLBACK").unwrap();
+        assert!(DeviceRegistry::new(tmp.path()).is_ok());
+    }
+
+    fn voice_state() -> (tempfile::TempDir, AppState, HeaderMap, HeaderMap) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_state(Config::default());
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            &["voice-test-a".into(), "voice-test-b".into()],
+            Default::default(),
+        ));
+        let registry = Arc::new(DeviceRegistry::new(dir.path()).unwrap());
+        registry
+            .reconcile_from_token_hashes(&state.pairing.tokens())
+            .unwrap();
+        state.device_registry = Some(registry);
+        let mut a = HeaderMap::new();
+        a.insert("authorization", "Bearer voice-test-a".parse().unwrap());
+        let mut b = HeaderMap::new();
+        b.insert("authorization", "Bearer voice-test-b".parse().unwrap());
+        (dir, state, a, b)
+    }
+
+    #[tokio::test]
+    async fn voice_preferences_persist_per_paired_device_and_revoke_with_it() {
+        let (dir, mut state, a, b) = voice_state();
+        let prefs = VoicePreferences {
+            reading: true,
+            language: "pt-BR".into(),
+            ..Default::default()
+        };
+        let response = device_voice_preferences(&state, &a, Some(prefs.clone()));
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["preferences"]["reading"], true);
+        let id = body["device_id"].as_str().unwrap().to_owned();
+        assert!(!body.to_string().contains("voice-test-a"));
+        let (_, other) = response_json(device_voice_preferences(&state, &b, None)).await;
+        assert_eq!(other["preferences"]["reading"], false);
+        assert_ne!(body["device_id"], other["device_id"]);
+        state.device_registry = Some(Arc::new(DeviceRegistry::new(dir.path()).unwrap()));
+        let (_, restored) = response_json(device_voice_preferences(&state, &a, None)).await;
+        assert_eq!(restored, body);
+        state
+            .pairing
+            .revoke_token_hash(&PairingGuard::token_hash("voice-test-a"));
+        assert_eq!(
+            device_voice_preferences(&state, &a, None).status(),
+            StatusCode::FORBIDDEN
+        );
+        state.device_registry.as_ref().unwrap().revoke(&id).unwrap();
+        assert!(
+            state
+                .device_registry
+                .as_ref()
+                .unwrap()
+                .voice_preferences(VoiceDeviceKey::TokenHash(&PairingGuard::token_hash(
+                    "voice-test-a"
+                )))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn voice_preferences_reject_unpaired_identity_invalid_input_and_database_failure() {
+        let (_dir, mut state, a, _) = voice_state();
+        assert_eq!(
+            device_voice_preferences(&state, &HeaderMap::new(), None).status(),
+            StatusCode::FORBIDDEN
+        );
+        let bad = VoicePreferences {
+            rate: 99.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            device_voice_preferences(&state, &a, Some(bad)).status(),
+            StatusCode::BAD_REQUEST
+        );
+        let bad = VoicePreferences {
+            language: "../../etc".into(),
+            ..Default::default()
+        };
+        assert!(!bad.valid());
+        assert!(
+            serde_json::from_value::<VoicePreferences>(
+                serde_json::json!({"device_id":"someone-else"})
+            )
+            .is_err()
+        );
+        state.device_registry = Some(Arc::new(DeviceRegistry::with_db_path(PathBuf::from(
+            "/nonexistent-voice-test/devices.db",
+        ))));
+        assert_eq!(
+            device_voice_preferences(&state, &a, Some(Default::default())).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
 
     /// Build an `AppState` whose device-registry points at a non-existent
     /// path so every SQLite write fails. Pairing enabled so a freshly
@@ -823,7 +1396,7 @@ mod tests {
     #[test]
     fn device_revoke_checks_authority_while_holding_the_sqlite_writer() {
         let tmp = tempfile::tempdir().unwrap();
-        let registry = DeviceRegistry::new(tmp.path());
+        let registry = DeviceRegistry::new(tmp.path()).unwrap();
         registry
             .reconcile_from_token_hashes(&["synthetic-token-hash".into()])
             .unwrap();
