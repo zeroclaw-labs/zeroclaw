@@ -16,7 +16,7 @@ Configure a Mattermost channel (`url` plus a `bot_token` secret, see [Authentica
 
 1. Auto-discovery of every channel the bot can read across every team it belongs to.
 2. DM and group-DM channels auto-discovered and polled alongside team channels.
-3. New DMs (created after the bot starts) picked up at the next 60-second discovery refresh.
+3. New DMs (created after the bot starts) picked up at the next 60-second discovery refresh, with posts sent before that refresh still delivered.
 4. `mention_only` bypassed inside DM and group-DM channels (so 1:1 conversations don't need the bot to be @-mentioned).
 
 To restrict the bot, narrow with `channel_ids`, `team_ids`, or `discover_dms`.
@@ -35,10 +35,12 @@ To restrict the bot, narrow with `channel_ids`, `team_ids`, or `discover_dms`.
 
 There are two scoping modes.
 
-1. **Auto-discovery** (when `channel_ids` is empty or `["*"]`). On startup and every 60 seconds thereafter, the bot calls `GET /api/v4/users/me/channels`, filters the result by `team_ids` (public/private channels) and `discover_dms` (DMs/group DMs), and polls each surviving channel. New DMs created mid-runtime appear at the next refresh.
+1. **Auto-discovery** (when `channel_ids` is empty or `["*"]`). On startup and every 60 seconds thereafter, the bot calls `GET /api/v4/users/me/channels`, filters the result by `team_ids` (public/private channels) and `discover_dms` (DMs/group DMs), and polls each surviving channel. New DMs created mid-runtime appear at the next refresh, and posts already sent to them are delivered then.
 2. **Explicit** (when `channel_ids` is a non-empty list of IDs other than `*`). On startup the bot calls `GET /api/v4/channels/{id}` for each entry to learn its `type` (so it knows which are DMs for the `mention_only` bypass), then polls exactly those channels forever. No periodic re-discovery.
 
 In both modes each channel has its own `since` cursor: the bot tracks the highest `create_at` it has processed per channel and passes that as `since=<ms>` on the next `GET /api/v4/channels/{id}/posts` call. Cursors do not leak across channels, so a slow-moving channel doesn't suppress posts on a busy one.
+
+A channel's cursor starts at its first poll, so history from before startup is not replayed. A DM or group DM that a refresh finds after startup starts earlier, at the moment the bot started listening: it was not listed then, so it holds no older posts and none of its posts are skipped. A team channel found by a refresh still starts at its first poll.
 
 ## WebSocket mode
 
@@ -49,7 +51,7 @@ Set `listen_mode = "websocket"` to switch from REST polling to a persistent WebS
 - Returns failed sessions to the shared channel supervisor, which reconnects with bounded exponential backoff using the configured `reliability.channel_initial_backoff_secs` and `reliability.channel_max_backoff_secs` values.
 - Requires Mattermost v4.0+ (the `/api/v4/websocket` endpoint).
 
-Channel discovery, `mention_only`, `thread_replies`, audio transcription, and peer-group authorization work identically in both modes.
+Channel discovery, `mention_only`, `thread_replies`, audio transcription, and peer-group authorization work identically in both modes. One timing difference: with auto-discovery and `discover_dms` on, WebSocket mode accepts a new DM or group DM from its first `posted` event instead of waiting for the next refresh.
 
 **Trade-offs:**
 
