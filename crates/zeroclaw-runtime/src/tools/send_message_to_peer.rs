@@ -195,13 +195,12 @@ impl Tool for SendMessageToPeerTool {
             })?
             .to_string();
 
-        let fallback_channel_type = channel.split_once('.').map(|(t, _)| t);
+        // `is_known_peer` already inherits type-wide grants onto a dotted
+        // alias, so a second lookup on the bare type would let an
+        // instance-specific ignore be overridden by that grant.
         let resolved = resolve_peer_set(&self.config, &self.sender_alias);
 
-        if !resolved.is_known_peer(&channel, &target)
-            && !fallback_channel_type
-                .is_some_and(|channel_type| resolved.is_known_peer(channel_type, &target))
-        {
+        if !resolved.is_known_peer(&channel, &target) {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -653,12 +652,24 @@ pub fn render_sender_peer_map_for_channel(
         };
 
         let group_names = group_names_for_channel(config, sender_alias, &channel_key);
-        let agent_peers = agent_peers_for_current_channel(
+        let agent_peers: Vec<String> = agent_peers_for_current_channel(
             config,
             resolved.agent_peers.get(&channel_key),
             current_channel_ref,
-        );
-        let external_peers = set_values(resolved.external_peers.get(&channel_key));
+        )
+        .into_iter()
+        .filter(|peer| {
+            !resolved.is_ignored(&channel_key, peer)
+                && !resolved.is_ignored(current_channel_ref, peer)
+        })
+        .collect();
+        let external_peers: Vec<String> = set_values(resolved.external_peers.get(&channel_key))
+            .into_iter()
+            .filter(|peer| {
+                !resolved.is_ignored(&channel_key, peer)
+                    && !resolved.is_ignored(current_channel_ref, peer)
+            })
+            .collect();
 
         rows.push(format!(
             "- Channel scope {}: {channel_hint}; peer groups: {}; agent peers: {}; external peers: {}.",
@@ -1173,6 +1184,59 @@ mod tests {
         assert!(!description.contains("\"@Operator\""));
         assert!(!description.contains("\"gamma\""));
         assert!(description.contains("Do not pass peer group names as the `channel` parameter"));
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_a_peer_ignored_on_the_dotted_alias() {
+        // A type-wide grant on `discord` plus an instance ignore on
+        // `discord.main` must fail the send gate. Looking the bare type
+        // up again would wrongly allow the ignored peer through.
+        let mut config = Config::default();
+        config.agents.insert(
+            "assistant".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["discord.main".into()],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.peer_groups.insert(
+            "allow".to_string(),
+            PeerGroupConfig {
+                channel: "discord".into(),
+                agents: vec![AgentAlias::new("assistant")],
+                external_peers: vec![PeerUsername::new("alice")],
+                ..PeerGroupConfig::default()
+            },
+        );
+        config.peer_groups.insert(
+            "deny".to_string(),
+            PeerGroupConfig {
+                channel: "discord.main".into(),
+                agents: vec![AgentAlias::new("assistant")],
+                ignore: vec![PeerUsername::new("alice")],
+                ..PeerGroupConfig::default()
+            },
+        );
+
+        let tool = SendMessageToPeerTool::new(Arc::new(config), "assistant");
+        let result = tool
+            .execute(json!({
+                "channel": "discord.main",
+                "target": "alice",
+                "message": "hello"
+            }))
+            .await
+            .expect("ignored peers fail closed as a tool error, not a panic");
+
+        assert!(
+            !result.success,
+            "instance ignore must reject the send: {result:?}"
+        );
+        let error = result.error.expect("rejected send should carry an error");
+        assert!(
+            error.contains("not on agent") && error.contains("discord.main"),
+            "error should name the unresolved peer and channel, got {error:?}"
+        );
     }
 
     #[test]

@@ -91,11 +91,20 @@ fn peer_targets(
     let mut entries = Vec::new();
     let mut seen = BTreeSet::new();
 
+    let deny_channel = filter
+        .as_ref()
+        .map(|(exact, _)| exact.as_str())
+        .unwrap_or("");
     for (channel_key, peers) in &resolved.agent_peers {
         if !keep(channel_key) {
             continue;
         }
         for peer in peers {
+            if resolved.is_ignored(channel_key, peer)
+                || (!deny_channel.is_empty() && resolved.is_ignored(deny_channel, peer))
+            {
+                continue;
+            }
             if seen.insert(peer.clone()) {
                 entries.push(OptionEntry::new(peer.clone()).with_hint("peer agent"));
             }
@@ -106,6 +115,11 @@ fn peer_targets(
             continue;
         }
         for peer in peers {
+            if resolved.is_ignored(channel_key, peer)
+                || (!deny_channel.is_empty() && resolved.is_ignored(deny_channel, peer))
+            {
+                continue;
+            }
             let handle = format!("@{peer}");
             if seen.insert(handle.clone()) {
                 entries.push(OptionEntry::new(handle).with_hint("external peer"));
