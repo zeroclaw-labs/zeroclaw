@@ -304,6 +304,7 @@ where
     let open_wedged = Control::Open {
         conn_id: WEDGED_CONN,
         peer_hint: None,
+        client_addr: None,
     };
     if ws.send(Message::text(open_wedged.to_json())).await.is_err() {
         return;
@@ -330,6 +331,7 @@ where
         let open = Control::Open {
             conn_id: 100 + offset,
             peer_hint: None,
+            client_addr: None,
         };
         if ws.send(Message::text(open.to_json())).await.is_err() {
             return;
@@ -419,6 +421,7 @@ where
     let open_sibling = Control::Open {
         conn_id: SIBLING_CONN,
         peer_hint: Some(PEER_HINT_ENROLL.to_string()),
+        client_addr: None,
     };
     ws.send(Message::text(open_sibling.to_json()))
         .await
@@ -544,6 +547,7 @@ fn bridge_config(
         data_dir: data_dir.to_path_buf(),
         node_id_rotation_days: 0,
         rotation_allowed: false,
+        dashboard: None,
     }
 }
 

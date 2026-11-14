@@ -143,6 +143,128 @@ pub(crate) fn dispatch_tool_name(name: &str, dispatch: ToolDispatchContext<'_>) 
     }
 }
 
+/// The active headless SOP step's exclusions merged over `dispatch`'s, or
+/// `None` outside a step. Sequential execution re-derives these per call, as a
+/// `tool_search` earlier in the batch may have activated a tool the step denies.
+fn step_scoped_exclusions(dispatch: ToolDispatchContext<'_>) -> Option<Vec<String>> {
+    crate::sop::active_scope::active_headless_step_scope().map(|scope| {
+        let mut merged = dispatch.excluded_tools.to_vec();
+        crate::agent::loop_::merge_sop_step_exclusions(
+            &mut merged,
+            dispatch.tools_registry,
+            dispatch.activated_tools,
+            Some(&scope),
+        );
+        merged
+    })
+}
+
+fn record_tool_call_start(
+    call_name: &str,
+    tool_call_id_owned: Option<String>,
+    full_args: &str,
+    meta: &TurnMeta<'_>,
+    observer: &dyn Observer,
+) {
+    observer.record_event(&ObserverEvent::ToolCallStart {
+        tool: call_name.to_string(),
+        tool_call_id: tool_call_id_owned,
+        arguments: Some(full_args.to_string()),
+        channel: Some(meta.channel_name.to_string()),
+        agent_alias: meta.agent_alias.map(|s| s.to_string()),
+        parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
+        turn_id: Some(meta.turn_id.to_string()),
+    });
+}
+
+/// The answer sequential execution would give a call this turn cannot
+/// dispatch, recorded with the same observer events; `None` when the name
+/// resolves. Approval preparation uses it so nobody is asked to approve a
+/// call that would run nothing.
+pub(crate) fn undispatchable_tool_outcome(
+    call_name: &str,
+    call_arguments: &serde_json::Value,
+    tool_call_id: Option<&str>,
+    dispatch: ToolDispatchContext<'_>,
+    meta: &TurnMeta<'_>,
+    observer: &dyn Observer,
+) -> Option<ToolExecutionOutcome> {
+    let step_exclusions = step_scoped_exclusions(dispatch);
+    let dispatch = ToolDispatchContext {
+        excluded_tools: step_exclusions
+            .as_deref()
+            .unwrap_or(dispatch.excluded_tools),
+        ..dispatch
+    };
+    let unknown = match resolve_dispatch_tool(call_name, dispatch, tool_call_id) {
+        DispatchResolution::Available(_) => return None,
+        DispatchResolution::Unavailable => false,
+        DispatchResolution::Unknown => true,
+    };
+    let full_args = call_arguments.to_string();
+    let tool_call_id_owned = tool_call_id.map(str::to_string);
+    record_tool_call_start(
+        call_name,
+        tool_call_id_owned.clone(),
+        &full_args,
+        meta,
+        observer,
+    );
+    // Nothing ran; execution's duration here is only the lookup.
+    let duration = Duration::ZERO;
+    Some(if unknown {
+        unknown_tool_outcome(
+            call_name,
+            tool_call_id_owned,
+            &full_args,
+            meta,
+            observer,
+            duration,
+        )
+    } else {
+        unavailable_tool_outcome(
+            call_name,
+            tool_call_id_owned,
+            &full_args,
+            meta,
+            observer,
+            duration,
+        )
+    })
+}
+
+fn unknown_tool_outcome(
+    call_name: &str,
+    tool_call_id_owned: Option<String>,
+    full_args: &str,
+    meta: &TurnMeta<'_>,
+    observer: &dyn Observer,
+    duration: Duration,
+) -> ToolExecutionOutcome {
+    let reason = format!("Unknown tool: {call_name}");
+    observer.record_event(&ObserverEvent::ToolCall {
+        tool: call_name.to_string(),
+        tool_call_id: tool_call_id_owned,
+        duration,
+        success: false,
+        arguments: Some(full_args.to_string()),
+        result: Some(scrub_credentials(&reason)),
+        channel: Some(meta.channel_name.to_string()),
+        agent_alias: meta.agent_alias.map(|s| s.to_string()),
+        parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
+        turn_id: Some(meta.turn_id.to_string()),
+    });
+    ToolExecutionOutcome {
+        output: reason.clone(),
+        success: false,
+        error_reason: Some(reason),
+        duration,
+        receipt: None,
+        output_data: None,
+        attachments: Vec::new(),
+    }
+}
+
 fn unavailable_tool_outcome(
     call_name: &str,
     tool_call_id_owned: Option<String>,
@@ -253,15 +375,13 @@ async fn execute_one_tool_with_provenance(
 ) -> Result<CompletedToolExecution> {
     let full_args = call_arguments.to_string();
     let tool_call_id_owned = tool_call_id.map(str::to_string);
-    observer.record_event(&ObserverEvent::ToolCallStart {
-        tool: call_name.to_string(),
-        tool_call_id: tool_call_id_owned.clone(),
-        arguments: Some(full_args.clone()),
-        channel: Some(meta.channel_name.to_string()),
-        agent_alias: meta.agent_alias.map(|s| s.to_string()),
-        parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
-        turn_id: Some(meta.turn_id.to_string()),
-    });
+    record_tool_call_start(
+        call_name,
+        tool_call_id_owned.clone(),
+        &full_args,
+        meta,
+        observer,
+    );
     let start = Instant::now();
 
     let resolved = match resolve_dispatch_tool(call_name, dispatch, tool_call_id) {
@@ -280,31 +400,16 @@ async fn execute_one_tool_with_provenance(
             });
         }
         DispatchResolution::Unknown => {
-            let reason = format!("Unknown tool: {call_name}");
-            let duration = start.elapsed();
-            observer.record_event(&ObserverEvent::ToolCall {
-                tool: call_name.to_string(),
-                tool_call_id: tool_call_id_owned.clone(),
-                duration,
-                success: false,
-                arguments: Some(full_args.clone()),
-                result: Some(scrub_credentials(&reason)),
-                channel: Some(meta.channel_name.to_string()),
-                agent_alias: meta.agent_alias.map(|s| s.to_string()),
-                parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
-                turn_id: Some(meta.turn_id.to_string()),
-            });
             return Ok(CompletedToolExecution {
                 executed_tool_name: None,
-                outcome: ToolExecutionOutcome {
-                    output: reason.clone(),
-                    success: false,
-                    error_reason: Some(reason),
-                    duration,
-                    receipt: None,
-                    output_data: None,
-                    attachments: Vec::new(),
-                },
+                outcome: unknown_tool_outcome(
+                    call_name,
+                    tool_call_id_owned,
+                    &full_args,
+                    meta,
+                    observer,
+                    start.elapsed(),
+                ),
             });
         }
     };
@@ -683,17 +788,7 @@ pub(crate) async fn execute_tools_sequential(
         // and that snapshot does not know about it. Without this, the denied
         // tool executes and the step's boundary is only re-derived in time for
         // the NEXT provider request — one call too late.
-        let rescoped_exclusions: Option<Vec<String>> =
-            crate::sop::active_scope::active_headless_step_scope().map(|scope| {
-                let mut merged = dispatch.excluded_tools.to_vec();
-                crate::agent::loop_::merge_sop_step_exclusions(
-                    &mut merged,
-                    dispatch.tools_registry,
-                    dispatch.activated_tools,
-                    Some(&scope),
-                );
-                merged
-            });
+        let rescoped_exclusions = step_scoped_exclusions(dispatch);
         let call_dispatch = ToolDispatchContext {
             tools_registry: dispatch.tools_registry,
             activated_tools: dispatch.activated_tools,
