@@ -5015,6 +5015,7 @@ model = "effective-before"
         let (status, json) = response_json(
             handle_registry_put(
                 State(state.clone()),
+                None,
                 axum::Json(zeroclaw_config::provider_registry::editor::RegistryEdit {
                     expected,
                     registry,
