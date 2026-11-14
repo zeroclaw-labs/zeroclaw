@@ -442,6 +442,8 @@ async fn exercise(entry: &str, native: bool) -> (Evidence, NativeTraps, tempfile
                 None,
                 None,
                 None,
+                // interactive: trap probes are unattended
+                false,
             )
             .await
             .expect("the owned SOP step assembles");
@@ -579,6 +581,7 @@ async fn assemble_native_compat(
     );
     let assembled = crate::tools::scoped::ScopedToolRegistry::assemble_prepared(
         crate::tools::scoped::ScopedAssembly {
+            interactive: false,
             config,
             agent_alias: AGENT,
             security: &security,

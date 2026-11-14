@@ -1675,6 +1675,7 @@ pub async fn run_gateway_with_plugin_webhooks(
             ) {
                 Ok(all_tools_result) => {
                     let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
+                        interactive: false,
                         config: &config,
                         agent_alias,
                         security: &security,
@@ -1845,6 +1846,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         // enumerated for their specs, never invoked, so the returned channel
         // handles, deferred section, and activation handle are unused.
         let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
+            interactive: false,
             config: &config,
             agent_alias: &alias,
             security: &security,
