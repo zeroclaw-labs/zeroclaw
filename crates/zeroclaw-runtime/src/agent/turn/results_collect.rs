@@ -38,6 +38,7 @@ pub(crate) struct CollectedResults {
     pub(crate) tool_results: String,
     /// Concatenated non-ignored outputs feeding the identical-output hash.
     pub(crate) detection_relevant_output: String,
+    pub(crate) loop_stopped: bool,
 }
 
 /// Collect this round's tool results (upstream loop body, results-collection
@@ -47,8 +48,8 @@ pub(crate) struct CollectedResults {
 /// forms.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_tool_results(
-    ordered_results: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>>,
-    tool_calls: &[ParsedToolCall],
+    ordered_results: &[Option<(String, Option<String>, ToolExecutionOutcome)>],
+    executed_calls: &[Option<ParsedToolCall>],
     history: &mut Vec<ChatMessage>,
     loop_detector: &mut LoopDetector,
     loop_ignore_tools: &HashSet<&str>,
@@ -61,27 +62,24 @@ pub(crate) fn collect_tool_results(
     let mut tool_results = String::new();
     let mut individual_results: Vec<ToolRoundResult> = Vec::new();
     let mut detection_relevant_output = String::new();
+    let mut loop_stopped = false;
     // Use enumerate *before* filter_map so result_index stays aligned with
     // tool_calls even when some ordered_results entries are None.
     for (result_index, (tool_name, tool_call_id, outcome)) in ordered_results
-        .into_iter()
+        .iter()
         .enumerate()
-        .filter_map(|(i, opt)| opt.map(|v| (i, v)))
+        .filter_map(|(i, opt)| opt.as_ref().map(|v| (i, v)))
     {
-        if !loop_ignore_tools.contains(tool_name.as_str()) {
+        if let Some(call) = executed_calls.get(result_index).and_then(Option::as_ref)
+            && !loop_ignore_tools.contains(call.name.as_str())
+        {
             if outcome.success {
                 detection_relevant_output.push_str(&outcome.output);
             }
 
-            let args = tool_calls
-                .get(result_index)
-                .map(|c| &c.arguments)
-                .unwrap_or(&serde_json::Value::Null);
-            let det_result = if outcome.success {
-                loop_detector.record(&tool_name, args, &outcome.output)
-            } else {
-                crate::agent::loop_detector::LoopDetectionResult::Ok
-            };
+            let args = &call.arguments;
+            // Failed attempts also form retry loops; do not grant failures unlimited retries.
+            let det_result = loop_detector.record(&call.name, args, &outcome.output);
             match det_result {
                 crate::agent::loop_detector::LoopDetectionResult::Ok => {}
                 crate::agent::loop_detector::LoopDetectionResult::Warning(ref msg) => {
@@ -108,7 +106,14 @@ pub(crate) fn collect_tool_results(
                             ),
                         "loop detector blocked tool call"
                     );
-                    // Replace the tool output with the block message.
+                    // Equal output from different arguments is ambiguous (empty
+                    // searches and successful silent commands). Keep that advisory;
+                    // only an exact-repeat preflight refusal ends the tool phase.
+                    loop_stopped |= matches!(
+                        loop_detector.check_before_call(&call.name, args),
+                        crate::agent::loop_detector::LoopDetectionResult::Block(_)
+                    );
+                    // Retain the actual outcome for the tools-free closeout.
                     // We still continue the loop so the LLM sees the block feedback.
                     append_or_merge_system_message(
                         history,
@@ -130,11 +135,8 @@ pub(crate) fn collect_tool_results(
                             })),
                         "loop_detector_circuit_breaker"
                     );
-                    return Err(TurnStop::close_out(
-                        TurnStopCode::LoopDetector,
-                        format!("Agent loop aborted by loop detector: {msg}"),
-                    )
-                    .into());
+                    loop_stopped = true;
+                    append_or_merge_system_message(history, format!("[Loop Detection] {msg}"));
                 }
             }
         }
@@ -177,7 +179,7 @@ pub(crate) fn collect_tool_results(
             }
         }
         individual_results.push(ToolRoundResult {
-            tool_call_id,
+            tool_call_id: tool_call_id.clone(),
             output: result_output.clone(),
             attachments,
         });
@@ -192,6 +194,7 @@ pub(crate) fn collect_tool_results(
         individual_results,
         tool_results,
         detection_relevant_output,
+        loop_stopped,
     })
 }
 
@@ -308,8 +311,8 @@ mod tests {
             )));
         }
         let collected = collect_tool_results(
-            ordered,
-            &tool_calls,
+            &ordered,
+            &tool_calls.iter().cloned().map(Some).collect::<Vec<_>>(),
             &mut history,
             &mut detector,
             &ignore,
@@ -420,7 +423,7 @@ mod tests {
         let ignore: HashSet<&str> = HashSet::new();
         for iteration in 0..n {
             let mut history: Vec<ChatMessage> = Vec::new();
-            let tool_calls = vec![ParsedToolCall {
+            let tool_calls = [ParsedToolCall {
                 name: "file_read".to_string(),
                 arguments: serde_json::json!({ "path": format!("file_{iteration}.rs") }),
                 tool_call_id: None,
@@ -431,8 +434,8 @@ mod tests {
                 outcome(output, success),
             ))];
             let collected = collect_tool_results(
-                ordered,
-                &tool_calls,
+                &ordered,
+                &tool_calls.iter().cloned().map(Some).collect::<Vec<_>>(),
                 &mut history,
                 &mut detector,
                 &ignore,
@@ -475,15 +478,15 @@ mod tests {
         let mut detector = LoopDetector::new(LoopDetectorConfig::default());
         let ignore: HashSet<&str> = HashSet::new();
         let mut history: Vec<ChatMessage> = Vec::new();
-        let tool_calls = vec![ParsedToolCall {
+        let tool_calls = [ParsedToolCall {
             name: "shell".to_string(),
             arguments: serde_json::json!({ "command": "cat source.txt" }),
             tool_call_id: None,
         }];
         let ordered = vec![Some(("shell".to_string(), None, outcome(&output, true)))];
         let collected = collect_tool_results(
-            ordered,
-            &tool_calls,
+            &ordered,
+            &tool_calls.iter().cloned().map(Some).collect::<Vec<_>>(),
             &mut history,
             &mut detector,
             &ignore,
@@ -528,8 +531,8 @@ mod tests {
             ordered.push(Some(("shell".to_string(), None, outcome("same", true))));
         }
         let err = collect_tool_results(
-            ordered,
-            &tool_calls,
+            &ordered,
+            &tool_calls.iter().cloned().map(Some).collect::<Vec<_>>(),
             &mut history,
             &mut detector,
             &ignore,
@@ -539,20 +542,10 @@ mod tests {
             0,
             "turn-test",
         );
-        let err = match err {
-            Ok(_) => panic!("identical tool+args must break the turn"),
-            Err(e) => e,
-        };
-
-        assert_eq!(
-            turn_stop(&err).expect("break must be typed").code,
-            TurnStopCode::LoopDetector
-        );
-        assert!(
-            err.to_string()
-                .starts_with("Agent loop aborted by loop detector:"),
-            "the message must not change: {err}"
-        );
+        let collected = err.expect("completed tool outcomes must be retained");
+        assert!(collected.loop_stopped);
+        assert_eq!(collected.individual_results.len(), 6);
+        assert!(collected.tool_results.contains("same"));
     }
 
     #[test]
@@ -573,5 +566,97 @@ mod tests {
     #[test]
     fn a_plain_error_stays_untyped_for_the_string_fallback() {
         assert!(turn_stop(&anyhow::Error::msg("upstream returned 500")).is_none());
+    }
+    #[test]
+    fn repeated_failures_close_out_and_retain_every_result() {
+        let calls: Vec<_> = (0..4)
+            .map(|_| ParsedToolCall {
+                name: "shell".into(),
+                arguments: serde_json::json!({"command":"ssh target hostname"}),
+                tool_call_id: None,
+            })
+            .collect();
+        let outcomes: Vec<_> = (0..4)
+            .map(|_| Some(("shell".into(), None, outcome("connection refused", false))))
+            .collect();
+        let collected = collect_tool_results(
+            &outcomes,
+            &calls.iter().cloned().map(Some).collect::<Vec<_>>(),
+            &mut Vec::new(),
+            &mut LoopDetector::new(Default::default()),
+            &HashSet::new(),
+            10000,
+            None,
+            "test",
+            0,
+            "turn-test",
+        )
+        .expect("failed outcomes preserved");
+        assert!(collected.loop_stopped);
+        assert_eq!(collected.individual_results.len(), 4);
+        assert!(collected.detection_relevant_output.is_empty());
+    }
+    #[test]
+    fn silent_distinct_commands_are_advisory_not_a_terminal_loop() {
+        let calls: Vec<_> = (0..8)
+            .map(|index| ParsedToolCall {
+                name: "shell".into(),
+                arguments: serde_json::json!({"command":format!("check-{index}")}),
+                tool_call_id: None,
+            })
+            .collect();
+        let outcomes: Vec<_> = (0..8)
+            .map(|_| Some(("shell".into(), None, outcome("(no output)", true))))
+            .collect();
+        let collected = collect_tool_results(
+            &outcomes,
+            &calls.iter().cloned().map(Some).collect::<Vec<_>>(),
+            &mut Vec::new(),
+            &mut LoopDetector::new(Default::default()),
+            &HashSet::new(),
+            10000,
+            None,
+            "test",
+            0,
+            "turn-test",
+        )
+        .expect("silent results retained");
+        assert!(
+            !collected.loop_stopped,
+            "different commands with equal output do not prove a loop"
+        );
+        assert_eq!(collected.individual_results.len(), 8);
+    }
+
+    #[test]
+    fn skipped_results_do_not_advance_the_execution_detector() {
+        let call = ParsedToolCall {
+            name: "file_read".into(),
+            arguments: serde_json::json!({"path":"same"}),
+            tool_call_id: None,
+        };
+        let ordered: Vec<_> = (0..4)
+            .map(|_| Some(("file_read".into(), None, outcome("same", true))))
+            .collect();
+        let mut detector = LoopDetector::new(LoopDetectorConfig::default());
+        let collected = collect_tool_results(
+            &ordered,
+            &[Some(call.clone()), None, None, None],
+            &mut Vec::new(),
+            &mut detector,
+            &HashSet::new(),
+            10000,
+            None,
+            "test",
+            0,
+            "turn-test",
+        )
+        .unwrap();
+        assert!(!collected.loop_stopped);
+        assert_eq!(collected.individual_results.len(), 4);
+        assert!(matches!(
+            detector.check_before_call(&call.name, &call.arguments),
+            crate::agent::loop_detector::LoopDetectionResult::Ok
+        ));
     }
 }

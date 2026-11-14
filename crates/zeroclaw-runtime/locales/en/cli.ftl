@@ -1390,7 +1390,7 @@ channel-runtime-conversation-busy = This conversation has too many pending messa
 channel-runtime-model-empty = Model ID cannot be empty. Use `/model <model-id>`.
 channel-runtime-model-switched = Model switched to `{ $model }` (model_provider: `{ $provider }`). Context preserved.
 channel-runtime-agent-scope-rejected = Sender `{ $sender }` is not authorized for `/model --agent` on agent `{ $agent }`. Use `/model --user { $model }` for a session-only override, or ask an admin to mark a peer group `admin_for_agent_scope = true` with you as a member.
-channel-runtime-request-timeout = ⚠️ Request timed out while waiting for the model. Please try again.
+channel-runtime-task-deadline = ⚠️ The task reached its processing deadline. Some actions may have completed; verify their state before retrying.
 channel-runtime-no-reply-refused = 🚫 I can't help with that request.
 channel-runtime-no-reply-failed = ⚠️ I couldn't complete that request.
 channel-runtime-current-model-status =
@@ -1759,8 +1759,16 @@ cli-sop-run-unavailable = SOP run unavailable in this session.
 cli-sop-step-owner-principal-mismatch = SOP step refused: this run belongs to a different principal than the one this turn's capabilities act for.
 cli-sop-step-owner-memory-unavailable = SOP step failed: the memory of this run's owner is unavailable ({ $error }).
 
+turn-loop-detected = Repeated tool calls were stopped. Completed work is retained; unresolved actions remain pending.
+
+turn-loop-repeat-refused = Refused repeated tool { $tool } before execution after { $repeats } identical calls. Stop retrying and report completed, failed and pending work.
+
 # Result-aware Agent loop recovery
 turn-repeated-success-advisory = The same tool call returned the same successful result repeatedly. Reconsider whether another call will help. Polling may continue when needed.
 turn-repeated-failure-recovery = The same tool call failed with the same result repeatedly. Change the approach or explain the blocker. One further identical retry is available before this turn stops.
 turn-repeated-failure-exhausted = The recovery retry failed with the same result, so this turn has stopped. Completed tool results have been preserved. You can retry in a new turn.
 turn-repeated-failure-retry-skipped = Skipped an additional identical call in this recovery batch. Only one recovery retry is available.
+channel-runtime-still-working = Still working on your request ({ $seconds } seconds elapsed). No final result yet.
+
+
+tool-shell-ssh-broker-sandbox-unsupported = Sandboxed shell execution is unavailable while a host SSH broker owns this turn. Use a separate isolated runtime without host-broker access.

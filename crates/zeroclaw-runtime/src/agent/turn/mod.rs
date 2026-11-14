@@ -65,7 +65,7 @@ pub(crate) use parse_response::{
     interpret_chat_response, record_accepted_chat_response, resolve_display_text,
     unforwarded_narration,
 };
-pub(crate) use post_exec::record_executed_outcomes;
+use post_exec::{notify_executed_outcomes, retain_executed_outcomes};
 pub(crate) use provider_call::{
     ProviderCallOutcome, announce_budget_warning, announce_llm_request, call_provider,
     enforce_tool_loop_budget,
@@ -1635,23 +1635,40 @@ pub(crate) fn run_tool_call_loop_with_initial_ingress<'a>(
     subject: InitialIngressSubject<'a>,
     reported_usage: Option<ReportedRequestUsage>,
     repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
-) -> impl std::future::Future<Output = Result<String>> + 'a {
-    run_tool_call_loop_impl(p, Some(subject), reported_usage, repetition_guard)
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+    Box::pin(zeroclaw_tools::task_ssh::scope(Box::pin(
+        run_tool_call_loop_impl(p, Some(subject), reported_usage, repetition_guard),
+    )))
 }
 
-/// Non-streamed Agent turns own the guard without steering ingress.
-/// Low-level and nested SOP callers use the public wrapper without a guard.
 pub(crate) fn run_tool_call_loop_with_guard<'a>(
     p: ToolLoop<'a>,
     repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
-) -> impl std::future::Future<Output = Result<String>> + 'a {
-    run_tool_call_loop_impl(p, None, None, repetition_guard)
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+    Box::pin(zeroclaw_tools::task_ssh::scope(Box::pin(
+        run_tool_call_loop_impl(p, None, None, repetition_guard),
+    )))
+}
+
+/// Recovery evidence owned by one logical turn, including model switches.
+/// Contains only hashed completed-dispatch evidence, never tool arguments.
+#[derive(Default)]
+pub struct ToolLoopRecovery(std::sync::Mutex<repetition::RepetitionGuard>);
+
+/// Run a channel turn with the same result-aware recovery used by Agent APIs.
+pub fn run_tool_call_loop_with_recovery<'a>(
+    p: ToolLoop<'a>,
+    recovery: &'a ToolLoopRecovery,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+    run_tool_call_loop_with_guard(p, Some(&recovery.0))
 }
 
 pub fn run_tool_call_loop(
     p: ToolLoop<'_>,
-) -> impl std::future::Future<Output = Result<String>> + '_ {
-    run_tool_call_loop_impl(p, None, None, None)
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + '_>> {
+    Box::pin(zeroclaw_tools::task_ssh::scope(Box::pin(
+        run_tool_call_loop_impl(p, None, None, None),
+    )))
 }
 
 async fn run_tool_call_loop_impl<'a>(
@@ -1934,6 +1951,7 @@ async fn run_tool_call_loop_impl<'a>(
     // One `BudgetWarning` per turn at most (see `announce_budget_warning`).
     let mut budget_warning_sent = false;
 
+    let mut completion_limit = max_iter::CompletionLimit::LocalIterations(max_iterations);
     // The tools this loop can execute tell a call row apart from an ordinary
     // reply whose JSON merely contains a `tool_calls` array when a request is
     // collapsed: the registry, not an iteration's offered subset, since a
@@ -3351,6 +3369,7 @@ async fn run_tool_call_loop_impl<'a>(
         }
 
         let PreparedToolCalls {
+            preflight_loop_stopped,
             mut ordered_results,
             mut executable_indices,
             mut executable_calls,
@@ -3365,6 +3384,7 @@ async fn run_tool_call_loop_impl<'a>(
             &mut prompt_approval_tool_signatures,
             iteration,
             knobs.dedup_enabled,
+            Some(&loop_detector),
         )
         .await?;
 
@@ -3446,6 +3466,11 @@ async fn run_tool_call_loop_impl<'a>(
         let allow_parallel_execution =
             parallel_tools && should_execute_tools_in_parallel(&executable_calls, approval);
 
+        let mut sequential_loop_guard = crate::agent::tool_execution::SequentialLoopGuard {
+            detector: loop_detector.clone(),
+            ignore_tools: pacing.loop_ignore_tools.clone(),
+            refused: false,
+        };
         let live_sop_queue = crate::sop::executor::new_live_action_queue();
         let execution =
             crate::sop::executor::scope_live_action_queue(live_sop_queue.clone(), async {
@@ -3483,6 +3508,7 @@ async fn run_tool_call_loop_impl<'a>(
                         cancellation_token.as_ref(),
                         receipt_generator,
                         ctx.event_tx,
+                        Some(&mut sequential_loop_guard),
                     )
                     .await
                 }
@@ -3495,6 +3521,7 @@ async fn run_tool_call_loop_impl<'a>(
             Some(budget) => ExecutionTreeBudget::scope(budget, Box::pin(execution)).await,
             None => execution.await,
         };
+        let preflight_loop_stopped = preflight_loop_stopped || sequential_loop_guard.refused;
         let executed_slots = match execution_result {
             Ok(slots) => slots,
             Err(e) if is_tool_loop_cancelled(&e) => {
@@ -3555,31 +3582,30 @@ async fn run_tool_call_loop_impl<'a>(
             repetition::RepetitionDisposition::default()
         };
 
-        record_executed_outcomes(
+        // Executor provenance distinguishes actual dispatches from approval,
+        // deduplication and recovery skips. Keep the prepared arguments.
+        let mut detection_calls = vec![None; tool_calls.len()];
+        for ((index, call), completed) in executed_completed_indices
+            .iter()
+            .zip(&executed_completed_calls)
+            .zip(&executed_completed_outcomes)
+        {
+            if let Some(name) = &completed.executed_tool_name {
+                let mut actual = call.clone();
+                actual.name = name.clone();
+                detection_calls[*index] = Some(actual);
+            }
+        }
+
+        retain_executed_outcomes(
             &ctx,
             &executed_completed_indices,
             &executed_completed_calls,
-            &executed_completed_stream_calls,
-            executed_completed_outcomes
-                .into_iter()
-                .map(|completed| completed.outcome)
-                .collect(),
+            executed_completed_outcomes,
             &mut ordered_results,
             iteration,
-        )
-        .await;
+        );
         if cancelled_mid_batch {
-            // Completed calls already received their after hook; every other
-            // executable context of the batch was interrupted before
-            // post-execution handling and gets exactly one abandonment.
-            call_prep::abandon_unexecuted_prepared_contexts(
-                &ctx,
-                iteration,
-                &executable_indices,
-                &executable_calls,
-                &executed_completed_indices,
-            )
-            .await;
             for (idx, call) in tool_calls.iter().enumerate() {
                 if ordered_results[idx].is_none() {
                     ordered_results[idx] = Some((
@@ -3599,6 +3625,60 @@ async fn run_tool_call_loop_impl<'a>(
                     ));
                 }
             }
+        }
+
+        let CollectedResults {
+            individual_results,
+            tool_results,
+            detection_relevant_output,
+            loop_stopped,
+        } = collect_tool_results(
+            &ordered_results,
+            &detection_calls,
+            turn_state.history,
+            &mut loop_detector,
+            &loop_ignore_tools,
+            max_tool_result_chars,
+            collected_receipts,
+            active_model,
+            iteration,
+            turn_id,
+        )?;
+
+        let loop_stopped = preflight_loop_stopped || loop_stopped;
+
+        turn_state.append_tool_round(
+            assistant_history_content,
+            &native_tool_calls,
+            &individual_results,
+            &tool_results,
+            use_native_tools,
+        );
+
+        // Canonical history is complete before hooks, draft backpressure or
+        // cooperative closeout can suspend/drop the enclosing future.
+        notify_executed_outcomes(
+            &ctx,
+            &executed_completed_indices,
+            &executed_completed_calls,
+            &executed_completed_stream_calls,
+            &ordered_results,
+            &detection_calls,
+            iteration,
+        )
+        .await;
+        if cancelled_mid_batch {
+            // Completed calls already received their after hook; every other
+            // executable context of the batch was interrupted before
+            // post-execution handling and gets exactly one abandonment.
+            call_prep::abandon_unexecuted_prepared_contexts(
+                &ctx,
+                iteration,
+                &executable_indices,
+                &executable_calls,
+                &executed_completed_indices,
+            )
+            .await;
             // Close pending cards only for executable calls whose terminal
             // ToolResult was never emitted by the executor. A parallel call that
             // completed before the cancellation already emitted its real result;
@@ -3627,24 +3707,7 @@ async fn run_tool_call_loop_impl<'a>(
             }
         }
 
-        let CollectedResults {
-            individual_results,
-            tool_results,
-            detection_relevant_output,
-        } = collect_tool_results(
-            ordered_results,
-            &tool_calls,
-            turn_state.history,
-            &mut loop_detector,
-            &loop_ignore_tools,
-            max_tool_result_chars,
-            collected_receipts,
-            active_model,
-            iteration,
-            turn_id,
-        )?;
-
-        if !cancelled_mid_batch && repetition_guard.is_none() {
+        if !cancelled_mid_batch && !loop_stopped && repetition_guard.is_none() {
             check_identical_output_abort(
                 &detection_relevant_output,
                 loop_started_at,
@@ -3656,14 +3719,6 @@ async fn run_tool_call_loop_impl<'a>(
                 turn_id,
             )?;
         }
-
-        turn_state.append_tool_round(
-            assistant_history_content,
-            &native_tool_calls,
-            &individual_results,
-            &tool_results,
-            use_native_tools,
-        );
 
         if cancelled_mid_batch {
             return Err(ToolLoopCancelled.into());
@@ -3690,10 +3745,9 @@ async fn run_tool_call_loop_impl<'a>(
             accumulated_display_text.push_str(&visible_reason);
             if repetition_disposition.close {
                 turn_state.push_dual(ChatMessage::assistant(reason));
-                *history_has_trim_breadcrumb = turn_state.crumb_present;
-                return Ok(accumulated_display_text);
+            } else {
+                turn_state.push_dual(ChatMessage::system(reason));
             }
-            turn_state.push_dual(ChatMessage::system(reason));
         }
 
         let queued_sop_actions = crate::sop::executor::drain_live_actions(&live_sop_queue);
@@ -3754,12 +3808,25 @@ async fn run_tool_call_loop_impl<'a>(
             turn_state.mark_all_synced();
         }
 
+        // Recovery closeout must settle authorized sibling SOP work too.
+        if repetition_disposition.close {
+            *history_has_trim_breadcrumb = turn_state.crumb_present;
+            return Ok(accumulated_display_text);
+        }
+
+        // A completed tool may have queued authorized SOP work in this batch.
+        // Settle that queue before closing, rather than orphaning a started run.
         pending_reported_usage = reported_input_tokens.map(|reported| ReportedRequestUsage {
             provider_name: served_provider.clone(),
             model: served_model_key.to_string(),
             reported_tokens: reported as usize,
             estimated_tokens: reported_population_estimated,
         });
+
+        if loop_stopped {
+            completion_limit = max_iter::CompletionLimit::LoopDetected;
+            break;
+        }
     }
 
     if let Some(budget) = shared_budget.as_ref() {
@@ -3780,7 +3847,7 @@ async fn run_tool_call_loop_impl<'a>(
         temperature,
         pacing,
         cancellation_token.as_ref(),
-        max_iter::CompletionLimit::LocalIterations(max_iterations),
+        completion_limit,
         accumulated_display_text,
         turn_id,
         knobs,
@@ -8947,7 +9014,7 @@ mod sop_step_reassembly_tests {
         start_single_step_for(Some(step_agent), None, None)
     }
 
-    fn start_single_step_with_capability(
+    pub(super) fn start_single_step_with_capability(
         step_agent: Option<&str>,
         capability: Option<crate::live_config_authority::AgentExecutionCapability>,
     ) -> (
@@ -11337,6 +11404,602 @@ mod tool_lifecycle_abandonment_tests {
             served_route_sink: None,
         })
         .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completed_round_survives_cancelled_closeout_with_full_draft_queue() {
+        struct CompletionBarrier {
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+        #[async_trait::async_trait]
+        impl crate::hooks::HookHandler for CompletionBarrier {
+            fn name(&self) -> &str {
+                "completion-barrier"
+            }
+            async fn on_after_tool_call_with_context(
+                &self,
+                _context: &ToolCallHookContext,
+                _tool: &str,
+                result: &zeroclaw_api::tool::ToolResult,
+                _duration: Duration,
+            ) {
+                assert!(result.success);
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+        }
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut runner = crate::hooks::HookRunner::new();
+        runner.register(Box::new(CompletionBarrier {
+            entered: entered.clone(),
+            release: release.clone(),
+        }));
+        let provider = &ScriptedProvider {
+            responses: Mutex::new(vec![ChatResponse {
+                text: None,
+                tool_calls: vec![tool_call(
+                    "completed-once",
+                    "performed",
+                    serde_json::json!({"result":"already-completed"}),
+                )],
+                usage: None,
+                reasoning_content: None,
+            }]),
+        };
+        let tools_registry = &registry_with(vec![Box::new(EchoTool {
+            name: "performed".into(),
+        })]);
+        let observer = &NoopObserver;
+        let hooks = Some(&runner);
+        let pacing = &zeroclaw_config::schema::PacingConfig::default();
+        let turn_id = "draft-backpressure";
+        let parallel_tools = false;
+        let cancel = CancellationToken::new();
+        let cancellation_token = Some(cancel.clone());
+        let context_token_budget = 0;
+        let image_cache = None;
+        let mut history = vec![
+            ChatMessage::system("test"),
+            ChatMessage::user("perform one operation"),
+        ];
+        let mut crumb_present = false;
+        let mut injected_preamble = None;
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel(1);
+        let multimodal_config = zeroclaw_config::schema::MultimodalConfig::default();
+        let knobs = LoopKnobs::default();
+        let mut turn = Box::pin(run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            capability_binding: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: provider,
+                    provider_name: "scripted",
+                    model: "scripted-model",
+                    dispatch_model: "scripted-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry,
+                observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &multimodal_config,
+                config: None,
+                max_tool_iterations: 3,
+                hooks,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing,
+                strict_tool_parsing: false,
+                parallel_tools,
+                max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
+                context_limits: zeroclaw_config::schema::ResolvedContextLimits {
+                    context_token_budget,
+                    ..zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0)
+                },
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs: &knobs,
+                security: None,
+            },
+            history: &mut history,
+            history_has_trim_breadcrumb: &mut crumb_present,
+            injected_memory_preamble: &mut injected_preamble,
+            channel_name: "cli",
+            channel_reply_target: None,
+            cancellation_token,
+            on_delta: Some(delta_tx.clone()),
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id,
+            served_route_sink: None,
+        }));
+        // Drain normal streaming until a real completed tool reaches its hook.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    biased;
+                    () = entered.notified() => break,
+                    result = &mut turn => panic!("turn ended before its completed result: {result:?}"),
+                    delta = delta_rx.recv() => assert!(delta.is_some()),
+                }
+            }
+        }).await.expect("tool must complete");
+        while delta_rx.try_recv().is_ok() {}
+        delta_tx
+            .try_send(StreamDelta::Status("blocked draft transport".into()))
+            .unwrap();
+        cancel.cancel();
+        release.notify_one();
+        // The receiver stays open but full for the complete cooperative-closeout
+        // window. Dropping the future must not erase the completed operation.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), &mut turn)
+                .await
+                .is_err()
+        );
+        drop(turn);
+        assert!(
+            history
+                .iter()
+                .any(|m| (m.role == "tool" || m.content.contains("<tool_result"))
+                    && m.content.contains("already-completed")),
+            "the next turn must see the completed result even when progress never drains"
+        );
+    }
+
+    async fn run_loop_review_scenario(
+        provider: &ScriptedProvider,
+        tools_registry: &crate::tools::scoped::ScopedToolRegistry,
+        hooks: Option<&crate::hooks::HookRunner>,
+        history: &mut Vec<ChatMessage>,
+        knobs: &LoopKnobs,
+    ) -> anyhow::Result<String> {
+        run_loop_review_scenario_with_context_budget(
+            provider,
+            tools_registry,
+            hooks,
+            history,
+            knobs,
+            0,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn loop_closeout_preserves_reported_usage_before_summary_dispatch() {
+        let provider = ScriptedProvider {
+            responses: Mutex::new(vec![ChatResponse {
+                text: None,
+                tool_calls: (0..4)
+                    .map(|i| {
+                        tool_call(&format!("repeat-{i}"), "repeat", serde_json::json!({"n":1}))
+                    })
+                    .collect(),
+                usage: Some(zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(100_000),
+                    ..Default::default()
+                }),
+                reasoning_content: None,
+            }]),
+        };
+        let tools = registry_with(vec![Box::new(EchoTool {
+            name: "repeat".into(),
+        })]);
+        let mut history = vec![
+            ChatMessage::system("test"),
+            ChatMessage::user(format!("discard-at-summary {}", "old ".repeat(50))),
+            ChatMessage::assistant("earlier answer"),
+            ChatMessage::user("run"),
+        ];
+        let error = run_loop_review_scenario_with_context_budget(
+            &provider,
+            &tools,
+            None,
+            &mut history,
+            &LoopKnobs {
+                dedup_enabled: false,
+                ..Default::default()
+            },
+            2_000,
+        )
+        .await
+        .expect_err("Calibration must refuse a summary whose retained minimum cannot fit");
+        let exceeded = super::context_window_exceeded_from_error(&error)
+            .expect("Summary rejection must retain its typed context-capacity cause");
+        assert_eq!(exceeded.model_context_window, 2_000);
+        assert!(exceeded.estimated_tokens > 2_000);
+        assert!(
+            !history
+                .iter()
+                .any(|m| m.content.contains("discard-at-summary")),
+            "The tools-free summary must trim with the just-reported token calibration"
+        );
+    }
+
+    async fn run_loop_review_scenario_with_context_budget(
+        provider: &ScriptedProvider,
+        tools_registry: &crate::tools::scoped::ScopedToolRegistry,
+        hooks: Option<&crate::hooks::HookRunner>,
+        history: &mut Vec<ChatMessage>,
+        knobs: &LoopKnobs,
+        context_token_budget: usize,
+    ) -> anyhow::Result<String> {
+        let observer = &NoopObserver;
+        let pacing = &zeroclaw_config::schema::PacingConfig::default();
+        let turn_id = "loop-review";
+        let parallel_tools = false;
+        let cancellation_token = None;
+        let image_cache = None;
+        let mut crumb_present = false;
+        let mut injected_preamble = None;
+        let mut context_limits =
+            zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(context_token_budget);
+        if context_token_budget > 0 {
+            context_limits.model_context_window = context_token_budget;
+            context_limits.model_context_window_source =
+                zeroclaw_config::schema::ModelContextWindowSource::Configured;
+        }
+        run_tool_call_loop(ToolLoop {
+            capability_binding: None,
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: provider,
+                    provider_name: "scripted",
+                    model: "scripted-model",
+                    dispatch_model: "scripted-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry,
+                observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 3,
+                hooks,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing,
+                strict_tool_parsing: false,
+                parallel_tools,
+                max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
+                context_limits,
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs,
+                security: None,
+            },
+            history,
+            history_has_trim_breadcrumb: &mut crumb_present,
+            injected_memory_preamble: &mut injected_preamble,
+            channel_name: "cli",
+            channel_reply_target: None,
+            cancellation_token,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id,
+            served_route_sink: None,
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_recovery_sop_scenario(
+        provider: &ScriptedProvider,
+        tools_registry: &crate::tools::scoped::ScopedToolRegistry,
+        hooks: Option<&crate::hooks::HookRunner>,
+        history: &mut Vec<ChatMessage>,
+        knobs: &LoopKnobs,
+        context_token_budget: usize,
+        recovery: &super::ToolLoopRecovery,
+        pacing: &zeroclaw_config::schema::PacingConfig,
+    ) -> anyhow::Result<String> {
+        let observer = &NoopObserver;
+        let dedup_exempt = vec!["repeat".to_string()];
+        let turn_id = "loop-review";
+        let parallel_tools = false;
+        let cancellation_token = None;
+        let image_cache = None;
+        let mut crumb_present = false;
+        let mut injected_preamble = None;
+        let mut context_limits =
+            zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(context_token_budget);
+        if context_token_budget > 0 {
+            context_limits.model_context_window = context_token_budget;
+            context_limits.model_context_window_source =
+                zeroclaw_config::schema::ModelContextWindowSource::Configured;
+        }
+        super::run_tool_call_loop_with_recovery(
+            ToolLoop {
+                capability_binding: None,
+                parent_agent_alias: None,
+                sop_reassembly: None,
+                exec: ResolvedAgentExecution {
+                    model_access: ResolvedModelAccess {
+                        model_provider: provider,
+                        provider_name: "scripted",
+                        model: "scripted-model",
+                        dispatch_model: "scripted-model",
+                        temperature: Some(0.0),
+                    },
+                    tools_registry,
+                    observer,
+                    silent: true,
+                    approval: None,
+                    multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                    config: None,
+                    max_tool_iterations: 3,
+                    hooks,
+                    excluded_tools: &[],
+                    dedup_exempt_tools: &dedup_exempt,
+                    activated_tools: None,
+                    model_switch_callback: None,
+                    pacing,
+                    strict_tool_parsing: false,
+                    parallel_tools,
+                    max_tool_result_chars: 0,
+                    keep_tool_context_turns: 2,
+                    context_limits,
+                    context_limits_resolver: None,
+                    receipt_generator: None,
+                    knobs,
+                    security: None,
+                },
+                history,
+                history_has_trim_breadcrumb: &mut crumb_present,
+                injected_memory_preamble: &mut injected_preamble,
+                channel_name: "cli",
+                channel_reply_target: None,
+                cancellation_token,
+                on_delta: None,
+                shared_budget: None,
+                channel: None,
+                collected_receipts: None,
+                event_tx: None,
+                steering: None,
+                new_messages_out: None,
+                image_cache,
+                memory: None,
+                ingress: IngressContext::sub_turn(),
+                agent_alias: None,
+                turn_id,
+                served_route_sink: None,
+            },
+            recovery,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn preflight_refusal_survives_hook_cancelled_result_before_it() {
+        let repeated = |id: &str| tool_call(id, "repeat", serde_json::json!({"n":1}));
+        let response = |tool_calls| ChatResponse {
+            text: None,
+            tool_calls,
+            usage: None,
+            reasoning_content: None,
+        };
+        let provider = ScriptedProvider {
+            responses: Mutex::new(vec![
+                response(vec![repeated("a-0"), repeated("a-1"), repeated("a-2")]),
+                response(vec![
+                    tool_call("b", "cancelled", serde_json::json!({})),
+                    repeated("a-3"),
+                ]),
+            ]),
+        };
+        let tools = registry_with(vec![
+            Box::new(EchoTool {
+                name: "repeat".into(),
+            }),
+            Box::new(EchoTool {
+                name: "cancelled".into(),
+            }),
+        ]);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let hooks = lifecycle_runner(events, vec!["cancelled".into()]);
+        let mut history = vec![ChatMessage::system("test"), ChatMessage::user("run")];
+        let output = run_loop_review_scenario(
+            &provider,
+            &tools,
+            Some(&hooks),
+            &mut history,
+            &LoopKnobs {
+                dedup_enabled: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("closeout");
+        assert!(
+            output.contains(&crate::i18n::get_required_cli_string("turn-loop-detected")),
+            "a refused dispatch stays terminal after an unrelated cancelled result: {output}"
+        );
+        assert!(
+            history
+                .iter()
+                .any(|m| m.content.contains("Refused repeated tool"))
+        );
+    }
+
+    struct QueueSopForLoopReview {
+        engine: Arc<Mutex<crate::sop::SopEngine>>,
+        action: crate::sop::types::SopRunAction,
+    }
+    impl zeroclaw_api::attribution::Attributable for QueueSopForLoopReview {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            "queue_sop"
+        }
+    }
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for QueueSopForLoopReview {
+        fn name(&self) -> &str {
+            "queue_sop"
+        }
+        fn description(&self) -> &str {
+            "queue a test SOP action"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object"})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            crate::sop::executor::enqueue_live_action(Arc::clone(&self.engine), None, &self.action);
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "queued".into(),
+                error: None,
+            })
+        }
+    }
+    #[tokio::test]
+    async fn loop_closeout_settles_sop_queued_by_a_completed_sibling_tool() {
+        let (engine, run_id, action) =
+            super::sop_step_reassembly_tests::start_single_step_with_capability(None, None);
+        let mut calls: Vec<_> = (0..4)
+            .map(|i| tool_call(&format!("repeat-{i}"), "repeat", serde_json::json!({"n":1})))
+            .collect();
+        calls.push(tool_call("sop", "queue_sop", serde_json::json!({})));
+        let provider = ScriptedProvider {
+            responses: Mutex::new(vec![ChatResponse {
+                text: None,
+                tool_calls: calls,
+                usage: None,
+                reasoning_content: None,
+            }]),
+        };
+        let tools = registry_with(vec![
+            Box::new(EchoTool {
+                name: "repeat".into(),
+            }),
+            Box::new(QueueSopForLoopReview {
+                engine: Arc::clone(&engine),
+                action,
+            }),
+        ]);
+        let mut history = vec![ChatMessage::system("test"), ChatMessage::user("run")];
+        let output = run_loop_review_scenario(
+            &provider,
+            &tools,
+            None,
+            &mut history,
+            &LoopKnobs {
+                dedup_enabled: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("closeout");
+        assert!(output.contains(&crate::i18n::get_required_cli_string("turn-loop-detected")));
+        let engine = engine.lock().expect("engine lock");
+        let run = engine.get_run(&run_id).expect("retained run");
+        assert_eq!(run.status, crate::sop::types::SopRunStatus::Completed);
+        assert_eq!(
+            run.step_results.len(),
+            1,
+            "queued SOP step cannot disappear at closeout"
+        );
+        assert_eq!(
+            run.step_results[0].status,
+            crate::sop::types::SopStepStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_closeout_settles_sop_queued_by_an_ignored_sibling() {
+        let (engine, run_id, action) =
+            super::sop_step_reassembly_tests::start_single_step_with_capability(None, None);
+        let repeat = || tool_call("repeat", "repeat", serde_json::json!({"n":1}));
+        let response = |calls| ChatResponse {
+            text: None,
+            tool_calls: calls,
+            usage: None,
+            reasoning_content: None,
+        };
+        let provider = ScriptedProvider {
+            responses: Mutex::new(vec![
+                response(vec![repeat()]),
+                response(vec![
+                    repeat(),
+                    tool_call("sop", "queue_sop", serde_json::json!({})),
+                ]),
+            ]),
+        };
+        let tools = registry_with(vec![
+            Box::new(FailingTool {
+                name: "repeat".into(),
+            }),
+            Box::new(QueueSopForLoopReview {
+                engine: Arc::clone(&engine),
+                action,
+            }),
+        ]);
+        let mut history = vec![ChatMessage::system("test"), ChatMessage::user("run")];
+        let pacing = zeroclaw_config::schema::PacingConfig {
+            loop_detection_max_repeats: 1,
+            loop_ignore_tools: vec!["queue_sop".into()],
+            ..Default::default()
+        };
+        let recovery = super::ToolLoopRecovery::default();
+        let output = run_recovery_sop_scenario(
+            &provider,
+            &tools,
+            None,
+            &mut history,
+            &LoopKnobs {
+                dedup_enabled: false,
+                ..Default::default()
+            },
+            0,
+            &recovery,
+            &pacing,
+        )
+        .await
+        .expect("recovery closes after settling SOP");
+        assert!(output.contains(&crate::i18n::get_required_cli_string(
+            "turn-repeated-failure-exhausted"
+        )));
+        let engine = engine.lock().unwrap();
+        let run = engine.get_run(&run_id).unwrap();
+        assert_eq!(run.status, crate::sop::types::SopRunStatus::Completed);
+        assert_eq!(
+            run.step_results.len(),
+            1,
+            "a reported started SOP must execute its first step"
+        );
     }
 
     fn registry_with(
